@@ -21127,6 +21127,135 @@ PartyEnds PartyNext(PartyPollFacts const& facts);
 // entered an instance", "timed out".
 char const* PartyEndsWord(PartyEnds ends);
 
+// ------------------------------------ a hunt at a spawn (class quest kills) --
+//
+// A WALK THAT ENDS AT THE CREATURE IS NOT A KILL. `walk-to-spawn` brings a bot
+// to a creature spawn and lets it go, and the bot's own grind and loot
+// strategies are then supposed to do the rest. A class quest that wants five
+// drops from one creature needs them done: the bot standing at the spawn has
+// to kill the creature and loot it, again and again, as a player grinding the
+// quest would. `hunt-spawn` is that, and only that.
+//
+// SHAPE, on kind='job' beside `walk-to-spawn`, routed on the first word:
+//
+//   kind='job'  hunt-spawn creature:<entry> [count:<n>] [max:<seconds>]
+//
+// `creature:` is a creature TEMPLATE entry (not a spawn id). `count:` is the
+// kills after which the row is done (default: no count, hunt until the clock or
+// the bridge ends the row). `max:` is the clock in seconds (default
+// HUNT_DEFAULT_SECONDS, at most HUNT_MAX_SECONDS). Each key at most once.
+//
+// WHAT A HUNT DOES. While the bot stands within HUNT_SEEK_YARDS of a living
+// creature of the entry and is not fighting, it selects the nearest one, faces
+// it and starts the auto attack through the client's own attack packet, running
+// at it when it is out of reach. Nothing else is scripted: the bot's combat
+// strategy fights, its loot strategy and its loot action take the corpse, and
+// the hunt only keeps the next target coming as mobs respawn.
+//
+// REFUSED AT THE START, and again before every new pull, by HuntGate.
+
+constexpr char const* HUNT_SPAWN_VERB = "hunt-spawn";
+
+constexpr uint32_t HUNT_DEFAULT_SECONDS = 600;
+constexpr uint32_t HUNT_MAX_SECONDS = 1800;
+constexpr uint32_t HUNT_MAX_COUNT = 200;
+// How far from the bot a creature of the entry may stand and still be hunted.
+constexpr float HUNT_SEEK_YARDS = 60.0f;
+// A target this many levels or more above the bot is the fight a lone
+// character loses: the module's own lethal level gap (LoneLegLimits).
+constexpr uint32_t HUNT_LEVEL_GAP = LoneLegLimits{}.levelGap;
+// Below this percent of health no new pull is started; the bot rests first.
+constexpr uint32_t HUNT_HEALTH_FLOOR_PCT = 50;
+// More hostiles than this already on the bot is a fight for its own AI.
+constexpr uint32_t HUNT_MAX_ATTACKERS = 2;
+
+bool IsHuntRow(std::string const& command);
+
+struct HuntRequest
+{
+    uint32_t entry{0};
+    uint32_t count{0};  // 0: no kill count, hunt until the clock or the bridge
+    uint32_t maxSeconds{HUNT_DEFAULT_SECONDS};
+    char const* error{""};
+};
+
+// `creature:` (a non-zero entry) plus optional `count:` (1..HUNT_MAX_COUNT) and
+// `max:` (1..HUNT_MAX_SECONDS), each at most once, in any order. Anything else
+// is MalformedHunt.
+HuntRequest ParseHuntRequest(std::string const& command);
+
+namespace HuntRefusal
+{
+constexpr char const* MalformedHunt = "malformed hunt-spawn command";
+constexpr char const* Disabled      = "Overseer.Hunt.Enable is off";
+constexpr char const* NotABot       = "the character is not a bot";
+constexpr char const* NotInWorld    = "the character is not in the world";
+constexpr char const* Dead          = "the character is dead";
+constexpr char const* InInstance    = "the character is in an instance";
+constexpr char const* InFlight      = "the character is in flight";
+constexpr char const* AlreadyHunting = "the character already has a hunt running";
+constexpr char const* NoTarget      = "no living creature of the entry within reach";
+constexpr char const* TooHighLevel  = "the creature is too many levels above the character";
+constexpr char const* LowHealth     = "the character is below the health floor";
+constexpr char const* TooManyAdds   = "too many hostiles are already on the character";
+}  // namespace HuntRefusal
+
+struct HuntFacts
+{
+    bool hasBotAI{true};
+    bool inWorld{true};
+    bool alive{true};
+    bool inInstance{false};
+    bool inFlight{false};
+    // Another hunt row is running on this character. Only a START cares: the
+    // poll of a hunt that is itself running leaves it false.
+    bool alreadyHunting{false};
+    // A living creature of the entry within HUNT_SEEK_YARDS.
+    bool targetFound{true};
+    // The nearest such creature's level minus the character's (may be negative).
+    int levelsAbove{0};
+    uint32_t healthPct{100};
+    uint32_t attackers{0};  // hostiles attacking the character right now
+};
+
+// "" when a pull may start, else a HuntRefusal literal. First wall wins, in
+// this order: not a bot, not in world, dead, instance, flight, no target, level
+// gap, health floor, adds.
+char const* HuntGate(HuntFacts const& facts);
+
+// Worth asking again: Later for the ones a minute fixes, Elsewhere for an
+// instance, Never for a malformed row, a non-bot and the switch being off.
+TownRetry HuntRefusalRetry(std::string const& reason);
+
+enum class HuntStep : std::uint8_t
+{
+    Done,      // the kill count is reached
+    TimedOut,  // the clock ran out
+    Refused,   // a wall that ends the hunt: not in world, dead, instance, flight
+    Fight,     // in combat or looting: leave it to the bot's own AI
+    Rest,      // below the health floor: no new pull, the bot rests
+    Wait,      // nothing alive of the entry in reach, or too many adds: look again
+    Pull,      // select, face and attack the nearest one
+};
+
+struct HuntPollFacts
+{
+    uint32_t count{0};  // the row's kill count; 0 for none
+    uint32_t kills{0};
+    uint32_t secondsUp{0};
+    uint32_t maxSeconds{HUNT_DEFAULT_SECONDS};
+    bool inCombat{false};
+    bool lootPending{false};  // a corpse of the entry within reach still holds loot
+    HuntFacts gate;
+};
+
+// One poll's decision. Order: kill count, clock, a wall that ends the hunt,
+// fighting or looting, health floor, then the rest of the gate.
+HuntStep HuntNext(HuntPollFacts const& facts);
+
+// "done", "timeout", "refused", "fighting", "resting", "waiting", "pulling".
+char const* HuntStepWord(HuntStep step);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

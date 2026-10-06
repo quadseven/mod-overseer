@@ -4220,6 +4220,71 @@ bool CouncilSteerRoll(Player* bot, Roll const* roll, RollVote& vote)
     return false;
 }
 
+// ------------------------------------------------- a hunt's kills and loot --
+//
+// What a `hunt-spawn` row has seen its character kill and loot, written by the
+// kill and loot hooks and read by the world thread's DriveHunts. Armed when the
+// row starts and removed when it ends, so a character with no hunt row is never
+// counted.
+struct HuntTally
+{
+    uint32 entry{0};
+    uint32 kills{0};
+    uint32 lootCount{0};  // items looted, junk the realm destroys at once included
+    std::vector<uint32> lootEntries;  // distinct entries still alive to read, capped
+    std::time_t lastKillAt{0};
+};
+std::mutex g_huntMutex;
+std::map<std::string, HuntTally> g_huntTallies;  // key: lowercased name
+
+void HuntArm(std::string const& name, uint32 entry)
+{
+    std::lock_guard<std::mutex> guard(g_huntMutex);
+    HuntTally tally;
+    tally.entry = entry;
+    g_huntTallies[LowerName(name)] = tally;
+}
+
+HuntTally HuntRead(std::string const& name)
+{
+    std::lock_guard<std::mutex> guard(g_huntMutex);
+    auto const it = g_huntTallies.find(LowerName(name));
+    return it == g_huntTallies.end() ? HuntTally{} : it->second;
+}
+
+void HuntDisarm(std::string const& name)
+{
+    std::lock_guard<std::mutex> guard(g_huntMutex);
+    g_huntTallies.erase(LowerName(name));
+}
+
+void NoteHuntKill(Player* killer, Creature* killed)
+{
+    if (!killer || !killed)
+        return;
+    std::lock_guard<std::mutex> guard(g_huntMutex);
+    auto const it = g_huntTallies.find(LowerName(killer->GetName()));
+    if (it == g_huntTallies.end() || it->second.entry != killed->GetEntry())
+        return;
+    ++it->second.kills;
+    it->second.lastKillAt = std::time(nullptr);
+}
+
+void NoteHuntLoot(Player const* looter, uint32 count, uint32 itemEntry)
+{
+    if (!looter)
+        return;
+    std::lock_guard<std::mutex> guard(g_huntMutex);
+    auto const it = g_huntTallies.find(LowerName(looter->GetName()));
+    if (it == g_huntTallies.end())
+        return;
+    it->second.lootCount += count;
+    if (itemEntry && it->second.lootEntries.size() < 32 &&
+        std::find(it->second.lootEntries.begin(), it->second.lootEntries.end(), itemEntry) ==
+            it->second.lootEntries.end())
+        it->second.lootEntries.push_back(itemEntry);
+}
+
 // A creature a family's raid killed, for the master looter to hand out. Only
 // kills by a roster character's raid under master loot are kept.
 void NoteCouncilKill(Player* killer, Creature* killed)
@@ -6933,6 +6998,7 @@ public:
         // A guild finder run's tally counts every loot, notable or not; only
         // the entry of a notable one is read, off the item found alive.
         NoteGuildRunLoot(player, count, live ? live->GetEntry() : 0);
+        NoteHuntLoot(player, count, live ? live->GetEntry() : 0);
         if (!live)
             return;
         RecordItemLoot(player, live, OverseerDecisions::ItemVia::Loot,
@@ -6980,6 +7046,7 @@ public:
     // calls both after the corpse's loot is filled).
     void OnPlayerCreatureKill(Player* killer, Creature* killed) override
     {
+        NoteHuntKill(killer, killed);
         NoteCouncilKill(killer, killed);
     }
 
@@ -49785,6 +49852,10 @@ private:
         // them, a member is lost, or their clock runs out.
         DriveQuestParties();
 
+        // ...and the hunts, which are driven to the end of their row: each
+        // poll reads the character and, when it is free, starts its next pull.
+        DriveHunts();
+
         // Then end any cast hold that outlived the row that placed it (#335).
         // AFTER the five above, so a hold a resolver is about to release itself
         // is released by the resolver with the reason its row can report, and
@@ -50017,6 +50088,10 @@ private:
                 // A QUEST PARTY'S WALK (see DoPartyWalk), on kind='job' beside
                 // `walk-to-spawn` and routed on its first word the same way.
                 detail = DoPartyWalk(player, command, status, rowResult, id);
+            else if (kind == "job" && OverseerDecisions::IsHuntRow(command))
+                // A HUNT AT A SPAWN (see DoHunt), on kind='job' beside
+                // `walk-to-spawn` and routed on its first word the same way.
+                detail = DoHunt(player, command, status, rowResult, id);
             else if (kind == "job" && OverseerDecisions::IsSpawnWalkRow(command))
                 // THE GUILD JOBS' WALK TO A SPAWN, on kind='job' because the
                 // place it goes is where the bot's job is (a field to gather,
@@ -67553,6 +67628,312 @@ private:
 
         _pendingQuestUses.swap(stillWaiting);
     }
+
+    // ----------------------------------------------------------------- hunt --
+    //
+    // kind='job' `hunt-spawn creature:<entry> [count:<n>] [max:<seconds>]`: a
+    // character standing near a creature kills it and loots it, again and
+    // again, as a player grinding a quest would. The grammar, every gate and
+    // each poll's decision are OverseerDecisions::ParseHuntRequest, HuntGate and
+    // HuntNext, pinned in tests/test_hunt_spawn.cpp; what is here is only the
+    // reading of the world and what a player does.
+    //
+    // WHAT A PLAYER DOES. Selects the nearest living creature of the entry
+    // (CMSG_SET_SELECTION), turns to it and starts the auto attack
+    // (CMSG_ATTACKSWING), running at it when it is out of reach. The fight is
+    // the bot's own combat strategy, never scripted here; the corpse is taken
+    // by the bot's own loot strategy and loot action, whose list this fills
+    // ("add all loot"). Nothing here grants a kill, a drop or quest credit.
+    //
+    // THE ROW STAYS 'verifying' for as long as the hunt runs, its result
+    // rewritten every HUNT_HEARTBEAT_SECONDS with the running tally, which is
+    // also what keeps the bridge's stale-claim sweep from ending it. A row the
+    // bridge has ended (it is no longer this run's verifying row) ends the hunt
+    // at the next look, with nothing written.
+    static constexpr uint32 HUNT_HEARTBEAT_SECONDS = 15;
+    static constexpr uint32 HUNT_ROW_LOOK_SECONDS = 10;
+    // A kill in the last HUNT_LOOT_GRACE_SECONDS is a corpse the bot is still
+    // looting: no new pull until then, unless its loot window is closed.
+    static constexpr uint32 HUNT_LOOT_GRACE_SECONDS = 8;
+
+    struct HuntState
+    {
+        uint32 id{0};
+        std::string character;
+        std::string request;
+        uint32 entry{0};
+        uint32 count{0};
+        uint32 maxSeconds{0};
+        std::time_t startedAt{0};
+        std::time_t wroteAt{0};
+        std::time_t lookedAt{0};
+        uint32 killsSeenForLoot{0};
+        uint32 pulls{0};
+        bool tookNewRpgOff{false};
+        bool putLootOn{false};
+        char const* lastStep{""};
+    };
+
+    std::vector<HuntState> _hunts;
+
+    static bool HuntEnabled()
+    {
+        return sConfigMgr->GetOption<bool>("Overseer.Hunt.Enable", false);
+    }
+
+    static std::string HuntJson(HuntState const& h, char const* outcome, char const* reason)
+    {
+        using OverseerDecisions::HuntRefusalRetry;
+        using OverseerDecisions::TownRetryWord;
+        HuntTally const tally = HuntRead(h.character);
+        std::ostringstream o;
+        o << "{\"outcome\":" << J(outcome)
+          << ",\"reason\":" << J(reason)
+          << ",\"retry\":" << J(*reason ? TownRetryWord(HuntRefusalRetry(reason)) : "")
+          << ",\"character\":" << J(h.character)
+          << ",\"entry\":" << h.entry
+          << ",\"count\":" << h.count
+          << ",\"kills\":" << tally.kills
+          << ",\"pulls\":" << h.pulls
+          << ",\"loot_count\":" << tally.lootCount
+          << ",\"loot_items\":[";
+        for (std::size_t i = 0; i < tally.lootEntries.size(); ++i)
+            o << (i ? "," : "") << tally.lootEntries[i];
+        o << "],\"seconds\":" << (h.startedAt ? std::time(nullptr) - h.startedAt : 0)
+          << ",\"max_seconds\":" << h.maxSeconds
+          << ",\"step\":" << J(h.lastStep)
+          << ",\"request\":" << J(h.request) << "}";
+        return o.str();
+    }
+
+    // What the gate and the poll read off the character and the ground.
+    static OverseerDecisions::HuntFacts HuntFactsOf(Player* who, uint32 entry, Creature*& target)
+    {
+        OverseerDecisions::HuntFacts facts;
+        Map* const map = who ? who->GetMap() : nullptr;
+        facts.hasBotAI = who && GET_PLAYERBOT_AI(who) != nullptr;
+        facts.inWorld = who && who->IsInWorld() && map && who->GetSession();
+        target = nullptr;
+        if (!facts.inWorld)
+        {
+            facts.targetFound = false;
+            return facts;
+        }
+        facts.alive = who->IsAlive();
+        facts.inInstance = map->Instanceable();
+        facts.inFlight = who->IsInFlight();
+        facts.healthPct = static_cast<uint32>(who->GetHealthPct());
+        facts.attackers = static_cast<uint32>(who->getAttackers().size());
+        target = who->FindNearestCreature(entry, OverseerDecisions::HUNT_SEEK_YARDS, true);
+        facts.targetFound = target != nullptr;
+        if (target)
+            facts.levelsAbove = int(target->GetLevel()) - int(who->GetLevel());
+        return facts;
+    }
+
+    char const* DoHunt(Player* who, std::string const& command, char const*& status,
+                       std::string& out, uint32 id)
+    {
+        namespace D = OverseerDecisions;
+        HuntState hunt;
+        hunt.id = id;
+        hunt.character = who->GetName();
+        hunt.request = command;
+
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            out = HuntJson(hunt, "refused", reason);
+            LOG_INFO("module.overseer", "overseer: hunt '{}' for '{}' refused: {}", command,
+                     hunt.character, reason);
+            return reason;
+        };
+
+        D::HuntRequest const request = D::ParseHuntRequest(command);
+        if (*request.error)
+            return refuse(request.error);
+        hunt.entry = request.entry;
+        hunt.count = request.count;
+        hunt.maxSeconds = request.maxSeconds;
+        if (!HuntEnabled())
+            return refuse(D::HuntRefusal::Disabled);
+
+        Creature* target = nullptr;
+        D::HuntFacts facts = HuntFactsOf(who, request.entry, target);
+        for (HuntState const& running : _hunts)
+            if (running.character == hunt.character)
+                facts.alreadyHunting = true;
+        if (char const* wall = D::HuntGate(facts); *wall)
+            return refuse(wall);
+
+        PlayerbotAI* const botAI = GET_PLAYERBOT_AI(who);
+        // The bot's own wandering would walk it off the spawn between pulls, and
+        // its loot strategy is what takes a corpse; both are handed back at the
+        // end if this changed them.
+        if (botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+        {
+            botAI->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+            hunt.tookNewRpgOff = true;
+        }
+        if (!botAI->HasStrategy("loot", BOT_STATE_NON_COMBAT))
+        {
+            botAI->ChangeStrategy("+loot", BOT_STATE_NON_COMBAT);
+            hunt.putLootOn = true;
+        }
+
+        HuntArm(hunt.character, request.entry);
+        hunt.startedAt = std::time(nullptr);
+        hunt.wroteAt = hunt.startedAt;
+        hunt.lookedAt = hunt.startedAt;
+        hunt.lastStep = "starting";
+        LOG_INFO("module.overseer", "overseer: '{}' starts hunting creature {} (count {}, {}s)",
+                 hunt.character, hunt.entry, hunt.count, hunt.maxSeconds);
+        out = HuntJson(hunt, "hunting", "");
+        _hunts.push_back(hunt);
+        status = "verifying";
+        return "";
+    }
+
+    // Select, face, swing, and run at the target when it is out of reach.
+    static void HuntPull(Player* who, Creature* target)
+    {
+        WorldSession* const session = who->GetSession();
+        if (!session)
+            return;
+        DriveSelection(session, target->GetGUID());
+        who->SetFacingToObject(target);
+        WorldPacket raw(CMSG_ATTACKSWING, 8);
+        raw << target->GetGUID();
+        raw.rpos(0);
+        session->HandleAttackSwingOpcode(raw);
+        if (!who->IsWithinMeleeRange(target))
+            who->GetMotionMaster()->MoveChase(target);
+    }
+
+    // What the hunt changed on the bot's strategies, handed back.
+    static void HuntHandBack(HuntState const& hunt, Player* who)
+    {
+        PlayerbotAI* const botAI = who ? GET_PLAYERBOT_AI(who) : nullptr;
+        if (!botAI)
+            return;
+        if (hunt.tookNewRpgOff)
+            botAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+        if (hunt.putLootOn)
+            botAI->ChangeStrategy("-loot", BOT_STATE_NON_COMBAT);
+    }
+
+    void EndHunt(HuntState const& hunt, Player* who, char const* outcome, char const* reason,
+                 char const* status)
+    {
+        HuntHandBack(hunt, who);
+        std::string const result = HuntJson(hunt, outcome, reason);
+        HuntDisarm(hunt.character);
+        LOG_INFO("module.overseer", "overseer: hunt {} for '{}' ended: {} {}", hunt.id,
+                 hunt.character, outcome, reason);
+        CharacterDatabase.Execute(
+            "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}', "
+            "updated_at = NOW() WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+            status, Esc(reason), EscLong(result), hunt.id, g_runToken);
+    }
+
+    void DriveHunts()
+    {
+        if (_hunts.empty())
+            return;
+        namespace D = OverseerDecisions;
+        std::time_t const now = std::time(nullptr);
+        std::vector<HuntState> still;
+        still.reserve(_hunts.size());
+
+        for (HuntState& hunt : _hunts)
+        {
+            Player* const who = ObjectAccessor::FindPlayerByName(hunt.character, false);
+
+            // THE BRIDGE ENDED THE ROW: it is no longer this run's verifying row.
+            if (now - hunt.lookedAt >= static_cast<std::time_t>(HUNT_ROW_LOOK_SECONDS))
+            {
+                hunt.lookedAt = now;
+                QueryResult const row = CharacterDatabase.Query(
+                    "SELECT 1 FROM overseer_command WHERE id = {} AND status = 'verifying' "
+                    "AND claimed_by = '{}'",
+                    hunt.id, g_runToken);
+                if (!row)
+                {
+                    HuntHandBack(hunt, who);
+                    HuntDisarm(hunt.character);
+                    LOG_INFO("module.overseer",
+                             "overseer: hunt {} for '{}' ended by the row, not by the hunt",
+                             hunt.id, hunt.character);
+                    continue;
+                }
+            }
+
+            Creature* target = nullptr;
+            D::HuntPollFacts poll;
+            poll.count = hunt.count;
+            poll.secondsUp = static_cast<uint32>(now - hunt.startedAt);
+            poll.maxSeconds = hunt.maxSeconds;
+            poll.gate = HuntFactsOf(who, hunt.entry, target);
+            HuntTally const tally = HuntRead(hunt.character);
+            poll.kills = tally.kills;
+            if (poll.gate.inWorld)
+            {
+                poll.inCombat = who->IsInCombat();
+                bool const looting = !who->GetLootGUID().IsEmpty();
+                bool const justKilled =
+                    tally.lastKillAt &&
+                    now - tally.lastKillAt < static_cast<std::time_t>(HUNT_LOOT_GRACE_SECONDS);
+                poll.lootPending = looting || justKilled;
+            }
+
+            D::HuntStep const step = D::HuntNext(poll);
+            hunt.lastStep = D::HuntStepWord(step);
+
+            if (step == D::HuntStep::Done)
+            {
+                EndHunt(hunt, who, "done", "", "applied");
+                continue;
+            }
+            if (step == D::HuntStep::TimedOut)
+            {
+                EndHunt(hunt, who, "timeout", "the clock ran out",
+                        tally.kills ? "applied" : "unchanged");
+                continue;
+            }
+            if (step == D::HuntStep::Refused)
+            {
+                char const* const wall = D::HuntGate(poll.gate);
+                EndHunt(hunt, who, "refused", *wall ? wall : D::HuntRefusal::NotInWorld, "error");
+                continue;
+            }
+
+            if (PlayerbotAI* const botAI = who ? GET_PLAYERBOT_AI(who) : nullptr)
+            {
+                // A new kill: hand its corpse to the bot's loot list.
+                if (tally.kills > hunt.killsSeenForLoot)
+                {
+                    hunt.killsSeenForLoot = tally.kills;
+                    botAI->DoSpecificAction("add all loot", Event("loot", "", who), true);
+                }
+                if (step == D::HuntStep::Pull && target)
+                {
+                    HuntPull(who, target);
+                    ++hunt.pulls;
+                }
+            }
+
+            if (now - hunt.wroteAt >= static_cast<std::time_t>(HUNT_HEARTBEAT_SECONDS))
+            {
+                hunt.wroteAt = now;
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_command SET result = '{}', updated_at = NOW() "
+                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                    EscLong(HuntJson(hunt, "hunting", "")), hunt.id, g_runToken);
+            }
+            still.push_back(hunt);
+        }
+        _hunts.swap(still);
+    }
+
 
     void SampleFallMovement()
     {

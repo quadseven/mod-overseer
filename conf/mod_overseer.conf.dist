@@ -456,6 +456,23 @@
 #
 #Overseer.PartyWalk.MaxParties = 4
 
+#    Overseer.Hunt.Enable
+#        Description: May a `hunt-spawn creature:<entry> [count:<n>] [max:<seconds>]`
+#                     row make a bot that stands near that creature kill and loot it
+#                     (its own combat and loot AI do the fighting; the row selects,
+#                     faces and attacks the nearest living one, then waits out the
+#                     fight and the loot and pulls the next as mobs respawn). The
+#                     row ends at the kill count, at `max` (default 600, at most
+#                     1800 seconds), or when the bridge ends it. Refused when the
+#                     bot is dead, out of the world, in an instance or in flight,
+#                     when the target is 3 or more levels above it, below half
+#                     health (it rests first) or with more than two hostiles on
+#                     it. 0 refuses every such row.
+#
+#        Default:     0
+#
+#Overseer.Hunt.Enable = 0
+
 ########################################
 #
 #    ONE MOVEMENT OWNER PER FAMILY LEADER
