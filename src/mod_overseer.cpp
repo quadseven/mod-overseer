@@ -37601,8 +37601,13 @@ private:
         for (Player* p : helpers)
         {
             std::string const name = p->GetName();
-            party.helpers.push_back(name);
             PlayerbotAI* const ai = GET_PLAYERBOT_AI(p);
+            // The gate read hasBotAI on this same thread a moment ago, so this
+            // is belt and braces: a helper with no AI is in the group but is
+            // not tracked, and leaves with the disband.
+            if (!ai)
+                continue;
+            party.helpers.push_back(name);
             ai->SetMaster(leader);
             party.helperHadFollow[name] = ai->HasStrategy("follow", BOT_STATE_NON_COMBAT);
             party.helperHadNewRpg[name] = ai->HasStrategy("new rpg", BOT_STATE_NON_COMBAT);
