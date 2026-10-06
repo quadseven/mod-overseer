@@ -111,6 +111,11 @@ void EachGateWallRefusesByName()
     f.inFlight = true;
     Check("in flight", Is(D::HuntGate(f), R::InFlight));
     f = D::HuntFacts{};
+    f.freeBagSlots = 0;
+    Check("bags full", Is(D::HuntGate(f), R::BagsFull));
+    f.freeBagSlots = D::HUNT_MIN_FREE_BAG_SLOTS;
+    Check("one free slot passes", Is(D::HuntGate(f), ""));
+    f = D::HuntFacts{};
     f.alreadyHunting = true;
     Check("already hunting", Is(D::HuntGate(f), R::AlreadyHunting));
     f = D::HuntFacts{};
@@ -148,6 +153,7 @@ void RefusalsSayWhetherToAskAgain()
     Check("disabled never", D::HuntRefusalRetry(R::Disabled) == D::TownRetry::Never);
     Check("not a bot never", D::HuntRefusalRetry(R::NotABot) == D::TownRetry::Never);
     Check("instance elsewhere", D::HuntRefusalRetry(R::InInstance) == D::TownRetry::Elsewhere);
+    Check("bags full later", D::HuntRefusalRetry(R::BagsFull) == D::TownRetry::Later);
     Check("already hunting later",
           D::HuntRefusalRetry(R::AlreadyHunting) == D::TownRetry::Later);
     Check("capacity later", D::HuntRefusalRetry(R::AtCapacity) == D::TownRetry::Later);
@@ -194,6 +200,12 @@ void ThePollDecidesTheNextMove()
         if (wall == 4) p.gate.inFlight = true;
         Check("a wall ends the hunt even in combat", D::HuntNext(p) == D::HuntStep::Refused);
     }
+
+    p = D::HuntPollFacts{};
+    p.gate.freeBagSlots = 0;
+    Check("bags filling mid-hunt end it, loot or no loot", D::HuntNext(p) == D::HuntStep::Refused);
+    p.corpseLootable = true;
+    Check("a full bag never loots", D::HuntNext(p) == D::HuntStep::Refused);
 
     p = D::HuntPollFacts{};
     p.inCombat = true;

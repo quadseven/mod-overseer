@@ -19499,6 +19499,8 @@ char const* HuntGate(HuntFacts const& f)
         return R::InInstance;
     if (f.inFlight)
         return R::InFlight;
+    if (f.freeBagSlots < HUNT_MIN_FREE_BAG_SLOTS)
+        return R::BagsFull;
     if (f.alreadyHunting)
         return R::AlreadyHunting;
     if (f.atCapacity)
@@ -19531,7 +19533,8 @@ HuntStep HuntNext(HuntPollFacts const& f)
     if (f.secondsUp >= f.maxSeconds)
         return HuntStep::TimedOut;
     HuntFacts const& g = f.gate;
-    if (!g.hasBotAI || !g.inWorld || !g.alive || g.inInstance || g.inFlight)
+    if (!g.hasBotAI || !g.inWorld || !g.alive || g.inInstance || g.inFlight ||
+        g.freeBagSlots < HUNT_MIN_FREE_BAG_SLOTS)
         return HuntStep::Refused;
     if (f.inCombat)
         return HuntStep::Fight;

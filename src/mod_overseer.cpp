@@ -68191,6 +68191,7 @@ private:
         facts.alive = who->IsAlive();
         facts.inInstance = map->Instanceable();
         facts.inFlight = who->IsInFlight();
+        facts.freeBagSlots = who->GetFreeInventorySpace();
         facts.healthPct = static_cast<uint32>(who->GetHealthPct());
         facts.attackers = static_cast<uint32>(who->getAttackers().size());
         target = who->FindNearestCreature(entry, OverseerDecisions::HUNT_SEEK_YARDS, true);
@@ -68287,11 +68288,11 @@ private:
     // bot had just killed. What was taken is read off the bags: the entries
     // offered, counted before and after, so a quest item is recorded even when
     // the loot hook could not name it.
-    static void HuntLootCorpse(Player* who, Creature* corpse)
+    static uint32 HuntLootCorpse(Player* who, Creature* corpse)
     {
         WorldSession* const session = who->GetSession();
         if (!session)
-            return;
+            return 0;
         std::map<uint32, uint32> before;
         for (LootItem const& item : corpse->loot.items)
             before[item.itemid] = who->GetItemCount(item.itemid);
@@ -68304,7 +68305,7 @@ private:
         open.rpos(0);
         session->HandleLootOpcode(open);
         if (who->GetLootGUID().IsEmpty())
-            return;
+            return 0;
 
         std::size_t const slots = corpse->loot.items.size() + corpse->loot.quest_items.size();
         for (std::size_t slot = 0; slot < slots && slot < 255; ++slot)
@@ -68325,9 +68326,14 @@ private:
             release.rpos(0);
             session->HandleLootReleaseOpcode(release);
         }
+        uint32 taken = 0;
         for (auto const& [entry, held] : before)
             if (who->GetItemCount(entry) > held)
+            {
                 NoteHuntLoot(who, 0, entry);
+                ++taken;
+            }
+        return taken;
     }
 
     // What the hunt changed on the bot's strategies, handed back.
@@ -68464,12 +68470,13 @@ private:
                     {
                         hunt.lootTried.push_back(corpse->GetGUID().GetRawValue());
                         hunt.approachPolls = 0;
-                        HuntLootCorpse(who, corpse);
+                        uint32 const taken = HuntLootCorpse(who, corpse);
                         LOG_INFO("module.overseer",
                                  "overseer: hunt {} for '{}' looted corpse of {} ({} loot item(s) "
-                                 "on it, {} quest item(s))",
+                                 "on it, {} quest item(s), {} entry(ies) taken, {} free bag slot(s))",
                                  hunt.id, hunt.character, hunt.entry, corpse->loot.items.size(),
-                                 corpse->loot.quest_items.size());
+                                 corpse->loot.quest_items.size(), taken,
+                                 who->GetFreeInventorySpace());
                     }
                     else if (++hunt.approachPolls > HUNT_CORPSE_APPROACH_POLLS)
                     {
