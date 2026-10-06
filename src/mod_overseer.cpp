@@ -67953,7 +67953,10 @@ private:
                 {
                     if (!c || c->IsAlive())
                         continue;
-                    if (c->GetRespawnTime() > now)
+                    // Every corpse seen is read, a respawn already due included
+                    // (it reads as 0 seconds to go), so the value is always the
+                    // last corpse's and never a stale earlier one.
+                    if (c->GetRespawnTime())
                         hunt.respawnAt = c->GetRespawnTime();
                     if (!c->HasDynamicFlag(UNIT_DYNFLAG_LOOTABLE) ||
                         std::find(hunt.lootTried.begin(), hunt.lootTried.end(),
@@ -68019,7 +68022,9 @@ private:
                         hunt.lootTried.push_back(corpse->GetGUID().GetRawValue());
                         hunt.approachPolls = 0;
                     }
-                    else
+                    else if (!who->isMoving())
+                        // Issued once, and again only when the bot has stopped
+                        // short; the poll count above bounds the approach.
                         who->GetMotionMaster()->MovePoint(0, corpse->GetPositionX(),
                                                           corpse->GetPositionY(),
                                                           corpse->GetPositionZ());

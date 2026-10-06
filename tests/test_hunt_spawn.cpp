@@ -235,6 +235,8 @@ void ThePollDecidesTheNextMove()
     Check("a spawn back exactly at the clock is nodrop", D::HuntNext(p) == D::HuntStep::NoDrop);
     p.secondsToRespawn = 447;
     Check("a spawn back before the clock waits", D::HuntNext(p) == D::HuntStep::Wait);
+    p.secondsToRespawn = 0;
+    Check("a respawn already due waits", D::HuntNext(p) == D::HuntStep::Wait);
     p.secondsToRespawn = -1;
     Check("an unread respawn waits", D::HuntNext(p) == D::HuntStep::Wait);
     p.secondsToRespawn = 600;
