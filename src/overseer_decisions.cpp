@@ -18646,7 +18646,8 @@ char const* StandinRefusalWord(StandinRefusal refusal)
     switch (refusal)
     {
         case StandinRefusal::None:            return "legal";
-        case StandinRefusal::Incomplete:      return "a name is empty";
+        case StandinRefusal::Incomplete:      return "the family or the member sitting out is "
+                                                     "empty";
         case StandinRefusal::NoSuchFamily:    return "no family on the roster has that head";
         case StandinRefusal::SwapsTheHead:    return "the head never sits out";
         case StandinRefusal::OutNotInFamily:  return "the member sitting out is not in that family";
@@ -18668,7 +18669,7 @@ StandinRefusal CheckStandin(std::vector<std::string> const& members, std::string
     auto has = [](std::vector<std::string> const& names, std::string const& name) {
         return std::find(names.begin(), names.end(), name) != names.end();
     };
-    if (standin.family.empty() || standin.outName.empty() || standin.inName.empty())
+    if (standin.family.empty() || standin.outName.empty())
         return StandinRefusal::Incomplete;
     if (leader.empty() || standin.family != leader)
         return StandinRefusal::NoSuchFamily;
@@ -18678,7 +18679,10 @@ StandinRefusal CheckStandin(std::vector<std::string> const& members, std::string
         return StandinRefusal::GuestIsOut;
     if (!has(members, standin.outName))
         return StandinRefusal::OutNotInFamily;
-    if (has(members, standin.inName) || has(wholeRoster, standin.inName))
+    // NO GUEST IS LEGAL (2026-10-05): the member sits out and the family runs
+    // short-handed, so there is no guest to check against the roster.
+    if (standin.HasGuest() &&
+        (has(members, standin.inName) || has(wholeRoster, standin.inName)))
         return StandinRefusal::GuestOnRoster;
     return StandinRefusal::None;
 }
@@ -18692,7 +18696,12 @@ std::vector<std::string> RunParty(std::vector<std::string> const& members,
     std::vector<std::string> party;
     party.reserve(members.size());
     for (std::string const& name : members)
-        party.push_back(name == standin->outName ? standin->inName : name);
+    {
+        if (name != standin->outName)
+            party.push_back(name);
+        else if (standin->HasGuest())
+            party.push_back(standin->inName);
+    }
     return party;
 }
 
@@ -18712,7 +18721,7 @@ StandinBook ChooseStandins(std::vector<FamilyStandin> const& rows,
             if (!roster.leader.empty() && roster.leader == row.family)
                 family = &roster;
         StandinRefusal why = StandinRefusal::NoSuchFamily;
-        if (row.family.empty() || row.outName.empty() || row.inName.empty())
+        if (row.family.empty() || row.outName.empty())
             why = StandinRefusal::Incomplete;
         else if (family)
         {
@@ -18723,7 +18732,7 @@ StandinBook ChooseStandins(std::vector<FamilyStandin> const& rows,
         }
         if (why == StandinRefusal::None && book.byHead.count(row.family))
             why = StandinRefusal::SecondForFamily;
-        if (why == StandinRefusal::None &&
+        if (why == StandinRefusal::None && row.HasGuest() &&
             std::find(guests.begin(), guests.end(), row.inName) != guests.end())
             why = StandinRefusal::GuestTaken;
         if (why != StandinRefusal::None)
@@ -18732,7 +18741,8 @@ StandinBook ChooseStandins(std::vector<FamilyStandin> const& rows,
             continue;
         }
         book.byHead[row.family] = row;
-        guests.push_back(row.inName);
+        if (row.HasGuest())
+            guests.push_back(row.inName);
     }
     return book;
 }
@@ -18768,7 +18778,7 @@ StandinStep NextFrozenStandin(StandinWindow window, FamilyStandin const& frozen,
     }
     if (frozen.Active() && frozen.SameSwap(row))
         return step;
-    if (!guestInWorld)
+    if (row.HasGuest() && !guestInWorld)
     {
         step.move = StandinMove::WaitForGuest;
         return step;
@@ -18784,6 +18794,11 @@ bool StandinGuestIsSteerable(bool registeredGuest, bool clientAttached, bool inW
     if (!registeredGuest)
         return false;
     return clientAttached || (inWorld && isBotSession);
+}
+
+std::string StandinGuestWord(FamilyStandin const& standin)
+{
+    return standin.HasGuest() ? standin.inName : std::string("nobody");
 }
 
 }  // namespace OverseerDecisions

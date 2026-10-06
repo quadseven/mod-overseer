@@ -8000,7 +8000,10 @@ private:
             if (standin)
             {
                 SendSittingOutMemberOff(*standin);
-                Player* const g = ObjectAccessor::FindPlayerByName(standin->inName);
+                // A ROW WITH NO GUEST seats nobody: the family runs short-handed.
+                Player* const g = standin->HasGuest()
+                                      ? ObjectAccessor::FindPlayerByName(standin->inName)
+                                      : nullptr;
                 if (Steerable(g))
                     guest = g;
             }
@@ -43069,11 +43072,12 @@ private:
         if (out->GetGroup())
             return;   // the core refused; asked again next poll
         LOG_INFO("module.overseer",
-                 "overseer: '{}' left the family group of '{}' to sit out ({}); '{}' stands "
+                 "overseer: '{}' left the family group of '{}' to sit out ({}); {} stands "
                  "in as {}",
                  standin.outName, standin.family,
                  standin.reason.empty() ? std::string("no reason given") : standin.reason,
-                 standin.inName, OverseerDecisions::StandinSeatWord(standin.seat));
+                 standin.HasGuest() ? "'" + standin.inName + "'" : std::string("nobody"),
+                 OverseerDecisions::StandinSeatWord(standin.seat));
     }
 
     // SEAT THE GUEST IN THE HEAD'S GROUP, modelled on PrepareRitualSummoner:
@@ -43204,9 +43208,12 @@ private:
         }
     }
 
+    // A row with no guest has nobody to let go: the member who sat out is
+    // grouped again by KeepFamilyGrouped once the frozen row is gone.
     void ReleaseStandinGuest(OverseerDecisions::FamilyStandin const& standin)
     {
-        _standinLeaving[standin.inName] = standin.family;
+        if (standin.HasGuest())
+            _standinLeaving[standin.inName] = standin.family;
     }
 
     // ONCE PER DUNGEON POLL: read the table, freeze or release each driven
@@ -43263,14 +43270,15 @@ private:
             OverseerDecisions::FamilyStandin const& wanted =
                 wantedIt == book.byHead.end() ? none : wantedIt->second;
             Player* const guest =
-                wanted.Active() ? ObjectAccessor::FindPlayerByName(wanted.inName) : nullptr;
+                wanted.HasGuest() ? ObjectAccessor::FindPlayerByName(wanted.inName) : nullptr;
             OverseerDecisions::FamilyStandin const frozen =
                 _frozenStandins.count(head) ? _frozenStandins[head] : none;
             OverseerDecisions::StandinStep const step = OverseerDecisions::NextFrozenStandin(
                 window, frozen, wanted, guest && guest->IsInWorld());
 
             std::string const rowSig =
-                wanted.Active() ? wanted.outName + ">" + wanted.inName : std::string("none");
+                wanted.Active() ? wanted.outName + ">" + OverseerDecisions::StandinGuestWord(wanted)
+                                : std::string("none");
             switch (step.move)
             {
                 case OverseerDecisions::StandinMove::Apply:
@@ -43280,35 +43288,54 @@ private:
                     {
                         LOG_INFO("module.overseer",
                                  "overseer: family of '{}' - the stand-in changes between "
-                                 "runs: '{}' stands down for '{}', who is grouped with the "
+                                 "runs: {} stands down for '{}', who is grouped with the "
                                  "family again",
-                                 head, frozen.inName, frozen.outName);
+                                 head, OverseerDecisions::StandinGuestWord(frozen),
+                                 frozen.outName);
                         ReleaseStandinGuest(frozen);
                     }
                     std::vector<std::string> names;
                     for (OverseerDecisions::FamilyMember const& member : roster->members)
                         names.push_back(member.name);
-                    LOG_INFO("module.overseer",
-                             "overseer: family of '{}' - '{}' sits out ({}) and guild member "
-                             "'{}' stands in as {}. The run's party is {}, frozen for each "
-                             "run until the row is gone and the coordinator is between runs",
-                             head, step.frozen.outName,
-                             step.frozen.reason.empty() ? std::string("no reason given")
-                                                        : step.frozen.reason,
-                             step.frozen.inName,
-                             OverseerDecisions::StandinSeatWord(step.frozen.seat),
-                             JoinNames(OverseerDecisions::RunParty(names, head, &step.frozen)));
-                    _standinLeaving.erase(step.frozen.inName);
+                    std::vector<std::string> const party =
+                        OverseerDecisions::RunParty(names, head, &step.frozen);
+                    if (step.frozen.HasGuest())
+                        LOG_INFO("module.overseer",
+                                 "overseer: family of '{}' - '{}' sits out ({}) and guild "
+                                 "member '{}' stands in as {}. The run's party is {}, frozen "
+                                 "for each run until the row is gone and the coordinator is "
+                                 "between runs",
+                                 head, step.frozen.outName,
+                                 step.frozen.reason.empty() ? std::string("no reason given")
+                                                            : step.frozen.reason,
+                                 step.frozen.inName,
+                                 OverseerDecisions::StandinSeatWord(step.frozen.seat),
+                                 JoinNames(party));
+                    else
+                        // NO GUEST (2026-10-05): the family runs short-handed.
+                        // The finder takes only a full five, so this party goes
+                        // in by the walk-in path.
+                        LOG_INFO("module.overseer",
+                                 "overseer: family of '{}' - '{}' sits out ({}) and nobody "
+                                 "stands in. The run's party is the {} left ({}), which "
+                                 "goes in by the walk-in path; frozen for each run until "
+                                 "the row is gone and the coordinator is between runs",
+                                 head, step.frozen.outName,
+                                 step.frozen.reason.empty() ? std::string("no reason given")
+                                                            : step.frozen.reason,
+                                 static_cast<uint32>(party.size()), JoinNames(party));
+                    if (step.frozen.HasGuest())
+                        _standinLeaving.erase(step.frozen.inName);
                     _standinSaid.erase("hold:" + head);
                     _standinSaid.erase("wait:" + head);
                     break;
                 }
                 case OverseerDecisions::StandinMove::Release:
                     LOG_INFO("module.overseer",
-                             "overseer: family of '{}' - the stand-in is over: '{}' stands "
+                             "overseer: family of '{}' - the stand-in is over: {} stands "
                              "down and leaves the family group, and '{}' (who sat out for: {}) "
                              "is grouped with the family again",
-                             head, frozen.inName, frozen.outName,
+                             head, OverseerDecisions::StandinGuestWord(frozen), frozen.outName,
                              frozen.reason.empty() ? std::string("no reason given")
                                                    : frozen.reason);
                     ReleaseStandinGuest(frozen);
@@ -43345,7 +43372,8 @@ private:
                                  "but a run is under way; the party frozen when it opened "
                                  "({}) holds until it ends",
                                  head, rowSig,
-                                 frozen.Active() ? frozen.outName + " out, " + frozen.inName +
+                                 frozen.Active() ? frozen.outName + " out, " +
+                                                       OverseerDecisions::StandinGuestWord(frozen) +
                                                        " in"
                                                  : std::string("the whole family"));
                     }
@@ -43371,8 +43399,9 @@ private:
             }
             LOG_INFO("module.overseer",
                      "overseer: family of '{}' is no longer on the roster with a leader, so "
-                     "stand-in '{}' stands down and '{}' no longer sits out",
-                     it->first, it->second.inName, it->second.outName);
+                     "stand-in {} stands down and '{}' no longer sits out",
+                     it->first, OverseerDecisions::StandinGuestWord(it->second),
+                     it->second.outName);
             ReleaseStandinGuest(it->second);
             it = _frozenStandins.erase(it);
         }
@@ -43381,7 +43410,8 @@ private:
             std::lock_guard<std::mutex> guard(StandinGuestLock());
             StandinGuestNames().clear();
             for (auto const& entry : _frozenStandins)
-                StandinGuestNames().insert(entry.second.inName);
+                if (entry.second.HasGuest())
+                    StandinGuestNames().insert(entry.second.inName);
         }
         SweepLeavingGuests();
     }
