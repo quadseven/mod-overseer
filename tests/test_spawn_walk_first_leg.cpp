@@ -60,7 +60,7 @@ void TheAdapterReadsTheFirstLeg()
           source.find("GroundedStep(who, WorldPosition(ev.mapId, ev.boxX, ev.boxY, ev.boxZ), "
                       "step)") == std::string::npos);
     std::size_t const fallback = source.find("D::NearWalkFallsBackToRoute(MailWalkLegStep");
-    std::size_t const guard = source.find("D::SpawnWalkFirstStepRefusal(");
+    std::size_t const guard = source.find("D::SpawnWalkFirstLegRefusal(");
     std::size_t const hold =
         source.find("HoldStillAndReport(who, ev.character, MAIL_WALK_HOLD_VERB, ev.hold,",
                     guard == std::string::npos ? 0 : guard);

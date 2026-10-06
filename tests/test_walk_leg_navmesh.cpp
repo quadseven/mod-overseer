@@ -84,8 +84,8 @@ void TheAdapterIsWired()
     Check("the module source is readable (run from the repo root)", !source.empty());
     Check("a refused leg falls back to the navmesh",
           source.find("return NavmeshLegToward(who, ev, step);") != std::string::npos);
-    Check("which takes a leg along the core's path",
-          source.find("OverseerDecisions::MailWalkPointAlongPath(") != std::string::npos);
+    Check("which takes its leg from the first waypoints of the core's path",
+          source.find("OverseerDecisions::PickFirstLegWaypoint(") != std::string::npos);
 }
 
 }  // namespace

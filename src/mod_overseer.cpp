@@ -66217,22 +66217,58 @@ private:
         return NavmeshLegToward(who, ev, step);
     }
 
-    static bool NavmeshLegToward(Player* who, MailWalkEvidence const& ev, WorldPosition& step)
+    // THE PATHFINDER'S OWN FIRST LEG, read without moving anybody. The path
+    // the core would walk toward the destination, its waypoints taken in order
+    // from the character's feet (PickFirstLegWaypoint). What is measured is the
+    // character's current ground height against the waypoint's, never the
+    // height of the far destination. `pathFound` is false when the core has no
+    // path at all; `legFound` is false for a path whose first waypoint is a
+    // lethal drop. The three heights are said once on a refusal.
+    struct NavFirstLeg
     {
+        bool pathFound{false};
+        bool legFound{false};
+        WorldPosition waypoint;
+        float botZ{0.f};
+        float waypointZ{0.f};   // the picked waypoint, or the first one when none was
+        float firstDropYards{0.f};
+    };
+
+    static NavFirstLeg NavmeshFirstLeg(Player* who, MailWalkEvidence const& ev)
+    {
+        NavFirstLeg leg;
+        leg.botZ = who->GetPositionZ();
         PathGenerator path(who);   // PathGenerator.h:61
         if (!path.CalculatePath(ev.boxX, ev.boxY, ev.boxZ))
-            return false;
+            return leg;
         if (path.GetPathType() & PATHFIND_NOPATH)
-            return false;
+            return leg;
         std::vector<OverseerDecisions::MailWalkPoint> points;
         points.reserve(path.GetPath().size());
         for (G3D::Vector3 const& point : path.GetPath())
             points.push_back(OverseerDecisions::MailWalkPoint{point.x, point.y, point.z});
-        OverseerDecisions::MailWalkPoint aim;
-        if (!OverseerDecisions::MailWalkPointAlongPath(
-                points, OverseerDecisions::MAIL_WALK_LEG_YARDS, aim))
-            return false;
-        return GroundedStep(who, WorldPosition(ev.mapId, aim.x, aim.y, aim.z), step);
+        leg.pathFound = points.size() >= 2;
+        OverseerDecisions::FirstLegPick const pick = OverseerDecisions::PickFirstLegWaypoint(
+            points, leg.botZ, OverseerDecisions::MAIL_WALK_LEG_YARDS,
+            OverseerDecisions::LethalFallYards());
+        leg.firstDropYards = pick.firstDropYards;
+        leg.legFound = pick.found;
+        if (pick.found)
+        {
+            leg.waypoint = WorldPosition(ev.mapId, pick.point.x, pick.point.y, pick.point.z);
+            leg.waypointZ = pick.point.z;
+        }
+        else if (leg.pathFound)
+            leg.waypointZ = points[1].z;
+        return leg;
+    }
+
+    static bool NavmeshLegToward(Player* who, MailWalkEvidence const& ev, WorldPosition& step)
+    {
+        NavFirstLeg const leg = NavmeshFirstLeg(who, ev);
+        if (leg.legFound)
+            step = leg.waypoint;
+        return leg.legFound;
     }
 
     // Hand the walker its next leg, if it needs one. Answers false when the
@@ -66802,10 +66838,22 @@ private:
         if (goal == D::WalkGoal::Spawn)
         {
             WorldPosition firstLeg;
-            if (char const* wall = D::SpawnWalkFirstStepRefusal(
-                    !ev.spawnIsObject, MailWalkLegStep(who, ev, firstLeg));
+            bool const probeFoundStep = MailWalkLegStep(who, ev, firstLeg);
+            NavFirstLeg nav;
+            if (!probeFoundStep)
+                nav = NavmeshFirstLeg(who, ev);
+            if (char const* wall = D::SpawnWalkFirstLegRefusal(!ev.spawnIsObject, probeFoundStep,
+                                                               nav.legFound);
                 *wall)
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: spawn walk {} for '{}' refused first leg: bot z {:.1f}, "
+                         "first waypoint z {:.1f} (drop {:.1f}, lethal {:.1f}), spawn z {:.1f}, "
+                         "path {}",
+                         id, ev.character, nav.botZ, nav.waypointZ, nav.firstDropYards,
+                         D::LethalFallYards(), ev.boxZ, nav.pathFound ? "found" : "none");
                 return refuse(wall);
+            }
         }
 
         // ---- the way there ---------------------------------------------------
