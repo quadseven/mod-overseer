@@ -16322,6 +16322,46 @@ std::vector<uint32_t> PlanClassLearns(std::vector<ClassLearnCandidate> candidate
     return plan;
 }
 
+std::vector<uint32_t> PlanRecipePurchases(std::vector<TrainerRecipeOffer> offers, uint32_t skill,
+                                          bool hasSkill, uint32_t skillValue, uint32_t level,
+                                          uint64_t purse)
+{
+    std::vector<uint32_t> plan;
+    // Never a recipe for a trade the character does not hold.
+    if (!hasSkill || skill == 0)
+        return plan;
+    std::vector<TrainerRecipeOffer> useful;
+    for (TrainerRecipeOffer const& offer : offers)
+    {
+        if (offer.skillLine != skill || offer.known || offer.startsSkill)
+            continue;
+        if (!Classic::ClassicRecipeAllowed(offer.reqSkillRank))
+            continue;
+        if (offer.reqSkillRank > skillValue || offer.reqLevel > level)
+            continue;
+        useful.push_back(offer);
+    }
+    std::stable_sort(useful.begin(), useful.end(),
+                     [](TrainerRecipeOffer const& a, TrainerRecipeOffer const& b) {
+                         if (a.cost != b.cost)
+                             return a.cost < b.cost;
+                         if (a.reqSkillRank != b.reqSkillRank)
+                             return a.reqSkillRank < b.reqSkillRank;
+                         return a.spellId < b.spellId;
+                     });
+    for (TrainerRecipeOffer const& offer : useful)
+    {
+        // Ascending cost: the first one the purse cannot carry above the floor
+        // is followed only by dearer ones.
+        if (purse < RECIPE_PURSE_FLOOR_COPPER ||
+            offer.cost > purse - RECIPE_PURSE_FLOOR_COPPER)
+            break;
+        purse -= offer.cost;
+        plan.push_back(offer.spellId);
+    }
+    return plan;
+}
+
 bool TrainingStopHoldsRepairLeg(bool stopOpen, uint32_t heldSeconds)
 {
     return stopOpen && heldSeconds < TRAINING_STOP_MAX_SECONDS;

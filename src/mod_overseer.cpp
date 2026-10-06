@@ -14220,6 +14220,66 @@ private:
         return 0;
     }
 
+    // THE RECIPES THIS TRAINER WOULD SELL THIS CHARACTER FOR ONE TRADE, in the
+    // order to buy them. The rank (TrainerSpellForSkill) raises a ceiling and
+    // teaches nothing to make; a character that bought only ranks held Tailoring
+    // and no pattern, and First Aid and no Heavy Linen Bandage. The core's
+    // CanTeachSpell answers availability (a recipe is offered once the one before
+    // it is known); the rest is OverseerDecisions::PlanRecipePurchases.
+    // `npc` may be null, which prices at the list price.
+    static std::vector<uint32> RecipesToBuy(Trainer::Trainer* trainer, Creature* npc, Player* bot,
+                                            uint32 skill)
+    {
+        float const discount = npc ? bot->GetReputationPriceDiscount(npc) : 1.0f;
+        std::vector<OverseerDecisions::TrainerRecipeOffer> offers;
+        for (Trainer::Spell const& spell : trainer->GetSpells())
+        {
+            if (spell.ReqSkillLine != skill || !trainer->CanTeachSpell(bot, &spell))
+                continue;
+            OverseerDecisions::TrainerRecipeOffer offer;
+            offer.spellId = spell.SpellId;
+            offer.skillLine = spell.ReqSkillLine;
+            offer.reqSkillRank = spell.ReqSkillRank;
+            offer.reqLevel = spell.ReqLevel;
+            offer.cost = static_cast<uint32>(spell.MoneyCost * discount);
+            offer.known = bot->HasSpell(spell.SpellId);
+            offer.startsSkill = SkillStartedBySpell(spell.SpellId, true) != 0;
+            offers.push_back(offer);
+        }
+        return OverseerDecisions::PlanRecipePurchases(
+            std::move(offers), skill, bot->HasSkill(skill),
+            static_cast<uint32>(bot->GetPureSkillValue(skill)), bot->GetLevel(), bot->GetMoney());
+    }
+
+    // Buy the recipes RecipesToBuy names through Trainer::TeachSpell, which takes
+    // the trainer's real price. Passes, because a recipe opens the next one.
+    // Each purchase is read back with HasSpell: TeachSpell reports only to a
+    // client. Returns how many the character now holds that it did not.
+    static uint32 BuyRecipes(Trainer::Trainer* trainer, Creature* npc, Player* bot, uint32 skill)
+    {
+        uint32 bought = 0;
+        for (uint32 pass = 0; pass < OverseerDecisions::RECIPE_MAX_PASSES; ++pass)
+        {
+            uint32 boughtThisPass = 0;
+            for (uint32 spellId : RecipesToBuy(trainer, npc, bot, skill))
+            {
+                trainer->TeachSpell(npc, bot, spellId);
+                if (bot->HasSpell(spellId))
+                {
+                    ++bought;
+                    ++boughtThisPass;
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' bought recipe {} of {} ({}) from creature {} at the "
+                             "trainer's price, not a grant",
+                             bot->GetName(), spellId, SkillName(skill), skill, npc->GetEntry());
+                }
+            }
+            if (!boughtThisPass)
+                break;
+        }
+        return bought;
+    }
+
     // Every enabled character the roster has an OPINION about, name -> plan.
     //
     // READ ON ITS OWN, like LoadQuestAims and TravelAimBook::Load and for the same
@@ -14672,6 +14732,20 @@ private:
         uint32 const spellId = TrainerSpellForSkill(trainer, bot, skill);
         if (!spellId)
         {
+            // NO RANK FOR SALE IS NOT NO ERRAND: a character at its ceiling can
+            // still lack the recipes the trainer teaches (Heavy Linen Bandage).
+            // Only when neither is on offer does the errand drop.
+            if (uint32 const recipes = BuyRecipes(trainer, npc, bot, skill))
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' bought {} recipe(s) of {} ({}) from '{}' (creature {}); "
+                         "no rank was on offer", name, recipes, skillName, skill,
+                         npc->GetName(), entry);
+                RecordEvent(bot, "learn", skill, skillName,
+                            "bought the recipes this trainer teaches, at the trainer's price");
+                ClearLearnAim(name);
+                return true;
+            }
             LOG_WARN("module.overseer",
                      "overseer: '{}' reached '{}' (creature {}) and it cannot teach {} ({}) "
                      "to this character. Dropping the errand so a fresh one can pick a "
@@ -14725,6 +14799,10 @@ private:
                     alreadyHasSkill
                         ? "trained the next tier of this skill from a trainer it was sent to"
                         : "learned this profession from a trainer it was sent to");
+        // THE RECIPES THE RANK JUST OPENED, bought with what the rank left.
+        if (uint32 const recipes = BuyRecipes(trainer, npc, bot, skill))
+            RecordEvent(bot, "learn", skill, skillName,
+                        "bought the recipes this trainer teaches, at the trainer's price");
         ClearLearnAim(name);
         return true;
     }
@@ -47924,7 +48002,8 @@ private:
                 if (plan == plans.end() || !plan->second.learnSkill)
                     continue;
                 if (!trainer || !trainer->IsTrainerValidForPlayer(bot) ||
-                    !TrainerSpellForSkill(trainer, bot, plan->second.learnSkill))
+                    (!TrainerSpellForSkill(trainer, bot, plan->second.learnSkill) &&
+                     RecipesToBuy(trainer, nullptr, bot, plan->second.learnSkill).empty()))
                     continue;
             }
             if (!bot->FindNearestCreature(leg.entry, TRAVEL_ARRIVED_YARDS))
@@ -47986,10 +48065,12 @@ private:
             }
             bool const held = bot->HasSkill(plans.at(name).learnSkill);
             uint32 const before = static_cast<uint32>(bot->GetPureMaxSkillValue(plans.at(name).learnSkill));
+            uint64 const purseBefore = bot->GetMoney();
             TrainOnArrival(name, bot, leg.entry, plans.at(name));
             uint32 const skill = plans.at(name).learnSkill;
-            if (held ? static_cast<uint32>(bot->GetPureMaxSkillValue(skill)) > before
-                     : bot->HasSkill(skill))
+            if ((held ? static_cast<uint32>(bot->GetPureMaxSkillValue(skill)) > before
+                      : bot->HasSkill(skill)) ||
+                bot->GetMoney() < purseBefore)
                 ++learned;
         }
         std::string awayList;
