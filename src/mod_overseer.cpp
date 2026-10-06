@@ -7052,6 +7052,7 @@ public:
 
     void OnPlayerCreatureKilledByPet(Player* owner, Creature* killed) override
     {
+        NoteHuntKill(owner, killed);
         NoteCouncilKill(owner, killed);
     }
 
@@ -67652,9 +67653,11 @@ private:
     // at the next look, with nothing written.
     static constexpr uint32 HUNT_HEARTBEAT_SECONDS = 15;
     static constexpr uint32 HUNT_ROW_LOOK_SECONDS = 10;
-    // A kill in the last HUNT_LOOT_GRACE_SECONDS is a corpse the bot is still
-    // looting: no new pull until then, unless its loot window is closed.
-    static constexpr uint32 HUNT_LOOT_GRACE_SECONDS = 8;
+    // A corpse of the entry this near is looked for; it must be within
+    // INTERACTION_DISTANCE to be looted, and the hunt walks the rest.
+    static constexpr float HUNT_CORPSE_SEEK_YARDS = 30.0f;
+    // Polls spent walking to one corpse before it is given up on.
+    static constexpr uint32 HUNT_CORPSE_APPROACH_POLLS = 40;
 
     struct HuntState
     {
@@ -67667,7 +67670,10 @@ private:
         std::time_t startedAt{0};
         std::time_t wroteAt{0};
         std::time_t lookedAt{0};
-        uint32 killsSeenForLoot{0};
+        uint32 item{0};
+        std::time_t respawnAt{0};  // the last corpse's respawn, 0 when none was read
+        std::vector<uint64> lootTried;  // corpse guids already looted or given up on
+        uint32 approachPolls{0};
         uint32 pulls{0};
         bool tookNewRpgOff{false};
         bool putLootOn{false};
@@ -67701,6 +67707,7 @@ private:
           << ",\"character\":" << J(h.character)
           << ",\"entry\":" << h.entry
           << ",\"count\":" << h.count
+          << ",\"item\":" << h.item
           << ",\"kills\":" << tally.kills
           << ",\"pulls\":" << h.pulls
           << ",\"loot_count\":" << tally.lootCount
@@ -67761,6 +67768,7 @@ private:
             return refuse(request.error);
         hunt.entry = request.entry;
         hunt.count = request.count;
+        hunt.item = request.item;
         hunt.maxSeconds = request.maxSeconds;
         if (!HuntEnabled())
             return refuse(D::HuntRefusal::Disabled);
@@ -67816,6 +67824,56 @@ private:
         session->HandleAttackSwingOpcode(raw);
         if (!who->IsWithinMeleeRange(target))
             who->GetMotionMaster()->MoveChase(target);
+    }
+
+    // THE CORPSE, LOOTED THE WAY A CLIENT DOES: open the window (CMSG_LOOT), take
+    // every slot (CMSG_AUTOSTORE_LOOT_ITEM; the slots past the plain items are
+    // the quest items), take the money, close (CMSG_LOOT_RELEASE). The bot's own
+    // loot strategy was measured leaving a 100 percent quest drop on a corpse the
+    // bot had just killed. What was taken is read off the bags: the entries
+    // offered, counted before and after, so a quest item is recorded even when
+    // the loot hook could not name it.
+    static void HuntLootCorpse(Player* who, Creature* corpse)
+    {
+        WorldSession* const session = who->GetSession();
+        if (!session)
+            return;
+        std::map<uint32, uint32> before;
+        for (LootItem const& item : corpse->loot.items)
+            before[item.itemid] = who->GetItemCount(item.itemid);
+        for (LootItem const& item : corpse->loot.quest_items)
+            before[item.itemid] = who->GetItemCount(item.itemid);
+
+        ObjectGuid const guid = corpse->GetGUID();
+        WorldPacket open(CMSG_LOOT, 8);
+        open << guid;
+        open.rpos(0);
+        session->HandleLootOpcode(open);
+        if (who->GetLootGUID().IsEmpty())
+            return;
+
+        std::size_t const slots = corpse->loot.items.size() + corpse->loot.quest_items.size();
+        for (std::size_t slot = 0; slot < slots && slot < 255; ++slot)
+        {
+            WorldPacket take(CMSG_AUTOSTORE_LOOT_ITEM, 1);
+            take << uint8(slot);
+            take.rpos(0);
+            session->HandleAutostoreLootItemOpcode(take);
+            if (who->GetLootGUID().IsEmpty())
+                break;
+        }
+        if (!who->GetLootGUID().IsEmpty())
+        {
+            WorldPacket gold(CMSG_LOOT_MONEY, 0);
+            session->HandleLootMoneyOpcode(gold);
+            WorldPacket release(CMSG_LOOT_RELEASE, 8);
+            release << guid;
+            release.rpos(0);
+            session->HandleLootReleaseOpcode(release);
+        }
+        for (auto const& [entry, held] : before)
+            if (who->GetItemCount(entry) > held)
+                NoteHuntLoot(who, 0, entry);
     }
 
     // What the hunt changed on the bot's strategies, handed back.
@@ -67884,15 +67942,36 @@ private:
             poll.gate = HuntFactsOf(who, hunt.entry, target);
             HuntTally const tally = HuntRead(hunt.character);
             poll.kills = tally.kills;
+            Creature* corpse = nullptr;
             if (poll.gate.inWorld)
             {
                 poll.inCombat = who->IsInCombat();
-                bool const looting = !who->GetLootGUID().IsEmpty();
-                bool const justKilled =
-                    tally.lastKillAt &&
-                    now - tally.lastKillAt < static_cast<std::time_t>(HUNT_LOOT_GRACE_SECONDS);
-                poll.lootPending = looting || justKilled;
+                poll.lootWindowOpen = !who->GetLootGUID().IsEmpty();
+                std::list<Creature*> nearby;
+                who->GetCreatureListWithEntryInGrid(nearby, hunt.entry, HUNT_CORPSE_SEEK_YARDS);
+                for (Creature* c : nearby)
+                {
+                    if (!c || c->IsAlive())
+                        continue;
+                    if (c->GetRespawnTime() > now)
+                        hunt.respawnAt = c->GetRespawnTime();
+                    if (!c->HasDynamicFlag(UNIT_DYNFLAG_LOOTABLE) ||
+                        std::find(hunt.lootTried.begin(), hunt.lootTried.end(),
+                                  c->GetGUID().GetRawValue()) != hunt.lootTried.end())
+                        continue;
+                    if (!corpse || who->GetDistance(c) < who->GetDistance(corpse))
+                        corpse = c;
+                }
+                poll.corpseLootable = corpse != nullptr;
+                if (hunt.item)
+                {
+                    poll.itemWanted = hunt.item;
+                    poll.itemHeld = who->GetItemCount(hunt.item);
+                }
             }
+            poll.secondsToRespawn =
+                hunt.respawnAt ? static_cast<int32>(std::max<std::time_t>(0, hunt.respawnAt - now))
+                               : -1;
 
             D::HuntStep const step = D::HuntNext(poll);
             hunt.lastStep = D::HuntStepWord(step);
@@ -67908,6 +67987,11 @@ private:
                         tally.kills ? "applied" : "unchanged");
                 continue;
             }
+            if (step == D::HuntStep::NoDrop)
+            {
+                EndHunt(hunt, who, "timeout", D::HuntRefusal::NoDrop, "unchanged");
+                continue;
+            }
             if (step == D::HuntStep::Refused)
             {
                 char const* const wall = D::HuntGate(poll.gate);
@@ -67915,13 +67999,30 @@ private:
                 continue;
             }
 
-            if (PlayerbotAI* const botAI = who ? GET_PLAYERBOT_AI(who) : nullptr)
+            if (who && GET_PLAYERBOT_AI(who))
             {
-                // A new kill: hand its corpse to the bot's loot list.
-                if (tally.kills > hunt.killsSeenForLoot)
+                if (step == D::HuntStep::Loot && corpse)
                 {
-                    hunt.killsSeenForLoot = tally.kills;
-                    botAI->DoSpecificAction("add all loot", Event("loot", "", who), true);
+                    if (who->IsWithinDistInMap(corpse, INTERACTION_DISTANCE))
+                    {
+                        hunt.lootTried.push_back(corpse->GetGUID().GetRawValue());
+                        hunt.approachPolls = 0;
+                        HuntLootCorpse(who, corpse);
+                        LOG_INFO("module.overseer",
+                                 "overseer: hunt {} for '{}' looted corpse of {} ({} loot item(s) "
+                                 "on it, {} quest item(s))",
+                                 hunt.id, hunt.character, hunt.entry, corpse->loot.items.size(),
+                                 corpse->loot.quest_items.size());
+                    }
+                    else if (++hunt.approachPolls > HUNT_CORPSE_APPROACH_POLLS)
+                    {
+                        hunt.lootTried.push_back(corpse->GetGUID().GetRawValue());
+                        hunt.approachPolls = 0;
+                    }
+                    else
+                        who->GetMotionMaster()->MovePoint(0, corpse->GetPositionX(),
+                                                          corpse->GetPositionY(),
+                                                          corpse->GetPositionZ());
                 }
                 if (step == D::HuntStep::Pull && target)
                 {
