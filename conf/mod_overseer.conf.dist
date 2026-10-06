@@ -479,11 +479,12 @@
 #Overseer.Cross.AtOnce = 2
 
 #    Overseer.Hunt.Enable
-#        Description: May a `hunt-spawn creature:<entry> [count:<n>] [max:<seconds>]`
+#        Description: May a `hunt-spawn creature:<entry> [item:<entry>] [count:<n>] [max:<seconds>]`
 #                     row make a bot that stands near that creature kill and loot it
-#                     (its own combat and loot AI do the fighting; the row selects,
-#                     faces and attacks the nearest living one, then waits out the
-#                     fight and the loot and pulls the next as mobs respawn). The
+#                     (its own combat AI does the fighting; the row selects, faces
+#                     and attacks the nearest living one, loots the corpse through
+#                     the client's own loot packets, and pulls the next as mobs
+#                     respawn; it ends early when none can respawn before `max`). The
 #                     row ends at the kill count, at `max` (default 600, at most
 #                     1800 seconds), or when the bridge ends it. Refused when the
 #                     bot is dead, out of the world, in an instance or in flight,

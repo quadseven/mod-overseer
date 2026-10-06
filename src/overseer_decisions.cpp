@@ -19402,9 +19402,9 @@ HuntRequest ParseHuntRequest(std::string const& command)
     HuntRequest bad;
     bad.error = HuntRefusal::MalformedHunt;
     std::vector<std::string> const words = MailWalkWords(command);
-    if (words.empty() || words[0] != HUNT_SPAWN_VERB || words.size() > 4)
+    if (words.empty() || words[0] != HUNT_SPAWN_VERB || words.size() > 5)
         return bad;
-    bool sawEntry = false, sawCount = false, sawMax = false;
+    bool sawEntry = false, sawCount = false, sawMax = false, sawItem = false;
     for (std::size_t i = 1; i < words.size(); ++i)
     {
         std::string key, value;
@@ -19414,6 +19414,12 @@ HuntRequest ParseHuntRequest(std::string const& command)
         {
             sawEntry = true;
             if (!ErrandWalkId(value, request.entry))
+                return bad;
+        }
+        else if (key == "item" && !sawItem)
+        {
+            sawItem = true;
+            if (!ErrandWalkId(value, request.item))
                 return bad;
         }
         else if (key == "count" && !sawCount)
@@ -19476,15 +19482,24 @@ TownRetry HuntRefusalRetry(std::string const& reason)
 
 HuntStep HuntNext(HuntPollFacts const& f)
 {
-    if (f.count && f.kills >= f.count)
+    if (f.itemWanted ? f.itemHeld >= (f.count ? f.count : 1u) : (f.count && f.kills >= f.count))
         return HuntStep::Done;
     if (f.secondsUp >= f.maxSeconds)
         return HuntStep::TimedOut;
     HuntFacts const& g = f.gate;
     if (!g.hasBotAI || !g.inWorld || !g.alive || g.inInstance || g.inFlight)
         return HuntStep::Refused;
-    if (f.inCombat || f.lootPending)
+    if (f.inCombat)
         return HuntStep::Fight;
+    if (f.corpseLootable)
+        return HuntStep::Loot;
+    if (f.lootWindowOpen)
+        return HuntStep::Fight;
+    // A kill made, nothing alive to pull and the spawn not back before the clock
+    // ends: waiting is idling. (An unread respawn, -1, never ends a hunt.)
+    if (f.kills > 0 && !g.targetFound && f.secondsToRespawn >= 0 &&
+        static_cast<uint32_t>(f.secondsToRespawn) >= f.maxSeconds - f.secondsUp)
+        return HuntStep::NoDrop;
     if (g.healthPct < HUNT_HEALTH_FLOOR_PCT)
         return HuntStep::Rest;
     char const* const wall = HuntGate(g);
@@ -19506,6 +19521,8 @@ char const* HuntStepWord(HuntStep step)
         case HuntStep::Rest:     return "resting";
         case HuntStep::Wait:     return "waiting";
         case HuntStep::Pull:     return "pulling";
+        case HuntStep::Loot:     return "looting";
+        case HuntStep::NoDrop:   return "nodrop";
     }
     return "unknown";
 }
