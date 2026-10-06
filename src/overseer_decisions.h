@@ -18709,6 +18709,48 @@ uint32_t ClassLearnTier(char const* englishName);
 // spell it cannot cover is skipped and the cheaper ones behind it still buy.
 std::vector<uint32_t> PlanClassLearns(std::vector<ClassLearnCandidate> candidates, uint64_t money);
 
+// ------------------------------------------ recipes at a profession trainer --
+//
+// A profession trainer sells two kinds of thing: the RANK of the trade
+// (Journeyman, Expert, Artisan), which TrainOnArrival buys, and the RECIPES the
+// trade then allows (Heavy Linen Bandage, every tailoring pattern). The rank
+// raises a ceiling and teaches nothing to make, so a character that bought only
+// ranks never learned what to craft and its craft ladder stalled. This is the
+// decision for the second kind. It is pure: the adapter reads the trainer's
+// list, the character's book and purse, and buys what comes back through the
+// core's own Trainer::TeachSpell at the trainer's real price.
+
+// The purse a recipe purchase never spends below, in copper: 1 silver, so a
+// visit never leaves a character unable to pay for its next repair.
+constexpr uint64_t RECIPE_PURSE_FLOOR_COPPER = 100;
+
+// Passes over the trainer's list in one visit: a recipe is offered only once the
+// one before it is known, so one read holds the first links of each chain.
+constexpr uint32_t RECIPE_MAX_PASSES = 3;
+
+// One spell on the trainer's list as the character sees it.
+struct TrainerRecipeOffer
+{
+    uint32_t spellId{0};
+    uint32_t skillLine{0};      // Trainer::Spell::ReqSkillLine, the trade it belongs to
+    uint32_t reqSkillRank{0};   // skill value the recipe needs
+    uint32_t reqLevel{0};       // character level the recipe needs
+    uint64_t cost{0};           // copper the trainer would charge this character
+    bool known{false};          // the character already has the spell
+    bool startsSkill{false};    // a rank or a first rank spell: the rank path owns it
+};
+
+// Which spells a visit buys, in the order it buys them. Only a recipe of the
+// trade `skill` the character HOLDS (`hasSkill`), that is not already known, is
+// not a rank, is within the classic 300 cap, needs no more skill than
+// `skillValue` and no more level than `level`, and whose price leaves at least
+// RECIPE_PURSE_FLOOR_COPPER in `purse` after the ones before it. Cheapest
+// first, then lowest skill requirement, then spell id; the purse is spent down
+// as the list is walked, so the answer is the whole visit's shopping list.
+std::vector<uint32_t> PlanRecipePurchases(std::vector<TrainerRecipeOffer> offers, uint32_t skill,
+                                          bool hasSkill, uint32_t skillValue, uint32_t level,
+                                          uint64_t purse);
+
 // "walk", "resting" ... for the log line.
 char const* TrainingStopStepWord(TrainingStopStep step);
 

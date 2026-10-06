@@ -424,8 +424,9 @@ void TheAdapterIsWired()
               learnArrival != std::string::npos && stopArrival < respecArrival &&
               stopArrival < learnArrival);
     Check("a member is taught only by a trainer that teaches it",
-          source.find("!TrainerSpellForSkill(trainer, bot, plan->second.learnSkill))") !=
-              std::string::npos);
+          source.find("(!TrainerSpellForSkill(trainer, bot, plan->second.learnSkill) &&\n"
+                      "                     RecipesToBuy(trainer, nullptr, bot, "
+                      "plan->second.learnSkill).empty()))") != std::string::npos);
     Check("the stop is said", source.find("overseer: TRAINING STOP for {} {}") != std::string::npos);
     Check("a leg cut short gives its member one more leg in the stop",
           source.find("if (stop.retried.insert(walking->second.forMember).second)\n"
