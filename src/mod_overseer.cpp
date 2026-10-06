@@ -42920,6 +42920,7 @@ private:
     std::map<std::string, std::string> _standinLeaving;
     // What was last said, so each line is said once per change.
     std::string _standinRefusedSaid;
+    bool _standinReadFailedSaid{false};
     std::map<std::string, std::string> _standinSaid;
     // guest -> whether it carried `new rpg` when it first stood in.
     std::map<std::string, bool> _standinGuestHadRpg;
@@ -42944,14 +42945,24 @@ private:
 
     // Every row, in id order. A seat the module does not know is refused here
     // and said once, rather than read as damage.
-    std::vector<OverseerDecisions::FamilyStandin> LoadStandinRows()
+    // A READ THAT FAILED IS NOT AN EMPTY TABLE. The core aborts on a parse error
+    // or a missing table, but a lock-wait timeout returns no result without a
+    // word, and taking that for "no stand-ins" would send every guest home
+    // mid-campaign. A COUNT always answers one row when the read works, so no
+    // row from it is a failed read: false, and the caller keeps what it has.
+    bool LoadStandinRows(std::vector<OverseerDecisions::FamilyStandin>& rows)
     {
-        std::vector<OverseerDecisions::FamilyStandin> rows;
+        rows.clear();
+        QueryResult counted = CharacterDatabase.Query("SELECT COUNT(*) FROM overseer_family_standin");
+        if (!counted)
+            return false;
+        if (counted->Fetch()[0].Get<uint64>() == 0)
+            return true;
         QueryResult result = CharacterDatabase.Query(
             "SELECT `family`, out_name, in_name, seat, reason FROM overseer_family_standin "
             "ORDER BY id");
         if (!result)
-            return rows;
+            return false;
         do
         {
             Field* f = result->Fetch();
@@ -42976,7 +42987,7 @@ private:
             }
             rows.push_back(row);
         } while (result->NextRow());
-        return rows;
+        return true;
     }
 
     OverseerDecisions::FamilyStandin const* FrozenStandinFor(std::string const& head) const
@@ -43204,8 +43215,20 @@ private:
                          std::vector<OverseerDecisions::FamilyRoster const*> const& driven)
     {
         std::vector<OverseerDecisions::FamilyStandin> rows;
-        if (FamilyStandinTablePresent())
-            rows = LoadStandinRows();
+        if (FamilyStandinTablePresent() && !LoadStandinRows(rows))
+        {
+            // Nothing changes on a failed read: every frozen stand-in and every
+            // seated guest stays as it was until a read answers.
+            if (!_standinReadFailedSaid)
+            {
+                _standinReadFailedSaid = true;
+                LOG_WARN("module.overseer",
+                         "overseer: the stand-in table could not be read this poll; every "
+                         "stand-in stays as it was until a read answers");
+            }
+            return;
+        }
+        _standinReadFailedSaid = false;
         OverseerDecisions::StandinBook const book = OverseerDecisions::ChooseStandins(rows, rosters);
 
         std::string refused;
