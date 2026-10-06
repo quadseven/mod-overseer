@@ -17430,6 +17430,8 @@ constexpr char const* SpawnOutOfSeason = "the spawn belongs to a world event tha
 constexpr char const* SpawnTooFar    = "the spawn is beyond the cap";
 constexpr char const* SpawnOtherSide = "the way to the spawn crosses the other side's ground";
 constexpr char const* SpawnGround    = "the ground toward the spawn does not hold";
+// A creature spawn whose first leg has no ground under its first step.
+constexpr char const* SpawnFirstStepDrop = "the first step toward the creature goes over a drop";
 
 // Endings of a spawn walk that started.
 constexpr char const* SpawnCombat    = "entered combat on the way to the spawn";
@@ -17513,6 +17515,13 @@ bool IsFarWalk(WalkGoal goal, float yards);
 // A near walk whose straight first leg gives no step goes by the travel
 // survey instead, where a far walk may go at all.
 bool NearWalkFallsBackToRoute(bool straightLegGrounded, bool farWalkMapAllowed);
+
+// The refusal for a spawn walk whose FIRST LEG has no step, "" when it may
+// start. Only a creature spawn is guarded (a gameobject is a node or a door,
+// not a mob that stands at a rim), and only on the leg the walk takes first,
+// never on the whole distance: a spawn far off is reached by the road, and
+// whether the road starts well is the first leg's question.
+char const* SpawnWalkFirstStepRefusal(bool creatureSpawn, bool firstLegHasStep);
 
 // May this character cast its standing craft errand now? On job 'craft'
 // always (the drive's own mode). On a family's campaign jobs - 'town run', or
