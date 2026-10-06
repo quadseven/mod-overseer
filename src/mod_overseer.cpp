@@ -40323,6 +40323,7 @@ private:
         uint32 jobSteps{0};
         uint32 jobWalks{0};
         uint32 jobFineSteps{0};
+        bool jobSaidForeignWalk{false};
     };
     std::map<std::string, LoneCrossing> _loneCrossings;
 
@@ -40726,8 +40727,31 @@ private:
         uint32 const origin = route.world.originMap;
         if (!memo.crossingSince)
             memo.crossingSince = std::time(nullptr);
-        if (WalkUnderWay(name))
+        // ONLY THIS JOB'S OWN WALK (row id 0) IS LEFT TO RUN. Another verb's walk
+        // under way means the crossing waits for it, and says so once, so an
+        // operator can read why no berth step comes before the backstop speaks.
+        bool foreign = false;
+        for (MailWalkCheck const& walk : _pendingMailWalks)
+            if (walk.targetName == name)
+            {
+                if (walk.id == 0)
+                    return;
+                foreign = true;
+            }
+        if (foreign)
+        {
+            if (!memo.jobSaidForeignWalk)
+            {
+                memo.jobSaidForeignWalk = true;
+                LOG_WARN("module.overseer",
+                         "overseer: cross-to-map {} - '{}' waits for a walk that is not its "
+                         "crossing's before it goes to the berth for '{}'; the crossing is given "
+                         "up on after {}s",
+                         memo.jobRow, name, boat, CROSSING_BACKSTOP_SECONDS);
+            }
             return;
+        }
+        memo.jobSaidForeignWalk = false;
 
         bool const nearBerth =
             route.world.berthKnown && p->GetMapId() == origin &&
