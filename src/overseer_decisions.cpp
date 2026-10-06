@@ -19108,7 +19108,9 @@ CrossRequest ParseCrossRequest(std::string const& command)
         out.error = CrossRefusal::Malformed;
         return out;
     }
-    out.map = static_cast<std::uint32_t>(std::stoul(digits));
+    // At most five digits, so this cannot overflow, and it cannot throw.
+    for (char c : digits)
+        out.map = out.map * 10 + static_cast<std::uint32_t>(c - '0');
     return out;
 }
 

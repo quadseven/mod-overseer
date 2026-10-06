@@ -40691,7 +40691,10 @@ private:
     }
 
     // Writes the row's ending and lets the crossing go. The row is touched
-    // only while it is still this run's, as every row this module ends.
+    // only while it is still this run's, as every row this module ends: a row
+    // the bridge has already ended is left as it ended, and a write that does
+    // not land leaves the row 'verifying' for ExpireAbandonedClaims to end once
+    // its lease runs out (the lease is no longer kept fresh after this).
     void FinishCrossJob(std::string const& name, OverseerDecisions::CrossEnd end,
                         std::string const& reason, bool retry)
     {
@@ -40747,6 +40750,12 @@ private:
     {
         namespace D = OverseerDecisions;
         time_t const now = std::time(nullptr);
+        // A WALL CLOCK STEPPED BACK RESTARTS THE JOB'S CLOCKS rather than leaving
+        // a negative age that never reaches the backstop.
+        if (now < memo.jobStart)
+            memo.jobStart = now;
+        if (now < memo.jobTouched)
+            memo.jobTouched = now;
         if (now - memo.jobStart > time_t(CROSSING_BACKSTOP_SECONDS))
         {
             FinishCrossJob(name, D::CrossEnd::TimedOut, D::CrossRefusal::TimedOut, true);
