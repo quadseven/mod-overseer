@@ -18876,4 +18876,192 @@ std::string StandinGuestWord(FamilyStandin const& standin)
     return standin.HasGuest() ? standin.inName : std::string("nobody");
 }
 
+// ------------------------------- quest objectives that need a USE (kind='quest') --
+
+namespace
+{
+
+// Splits on spaces and tabs. The quest-use grammar has no quoting.
+std::vector<std::string> QuestUseWords(std::string const& command)
+{
+    std::vector<std::string> words;
+    std::string word;
+    for (char c : command)
+    {
+        if (c == ' ' || c == '\t')
+        {
+            if (!word.empty())
+                words.push_back(word);
+            word.clear();
+        }
+        else
+            word += c;
+    }
+    if (!word.empty())
+        words.push_back(word);
+    return words;
+}
+
+// Non-zero decimal digits, at most nine of them.
+bool QuestUseEntry(std::string const& digits, std::uint32_t& value)
+{
+    if (digits.empty() || digits.size() > 9 ||
+        digits.find_first_not_of("0123456789") != std::string::npos)
+        return false;
+    value = static_cast<std::uint32_t>(std::stoul(digits));
+    return value != 0;
+}
+
+// "key:digits" with this key.
+bool QuestUseKeyed(std::string const& word, char const* key, std::uint32_t& value)
+{
+    std::string const prefix = std::string(key) + ":";
+    if (word.rfind(prefix, 0) != 0)
+        return false;
+    return QuestUseEntry(word.substr(prefix.size()), value);
+}
+
+}  // namespace
+
+bool IsQuestUseRow(std::string const& command)
+{
+    std::vector<std::string> const words = QuestUseWords(command);
+    return !words.empty() && (words[0] == USE_ITEM_ON_VERB || words[0] == USE_GAMEOBJECT_VERB);
+}
+
+QuestUseRequest ParseQuestUseRequest(std::string const& command)
+{
+    QuestUseRequest request;
+    std::vector<std::string> const words = QuestUseWords(command);
+    if (words.empty())
+    {
+        request.error = QuestUseRefusal::MalformedItem;
+        return request;
+    }
+
+    if (words[0] == USE_GAMEOBJECT_VERB)
+    {
+        request.gameObject = true;
+        std::uint32_t entry = 0;
+        if (words.size() != 2 || !QuestUseEntry(words[1], entry))
+        {
+            request.error = QuestUseRefusal::MalformedObject;
+            return request;
+        }
+        request.target = entry;
+        return request;
+    }
+
+    std::uint32_t creature = 0;
+    std::uint32_t item = 0;
+    bool haveCreature = false;
+    bool haveItem = false;
+    bool ok = words[0] == USE_ITEM_ON_VERB && words.size() == 3;
+    for (std::size_t i = 1; ok && i < words.size(); ++i)
+    {
+        std::uint32_t value = 0;
+        if (QuestUseKeyed(words[i], "creature", value) && !haveCreature)
+        {
+            creature = value;
+            haveCreature = true;
+        }
+        else if (QuestUseKeyed(words[i], "item", value) && !haveItem)
+        {
+            item = value;
+            haveItem = true;
+        }
+        else
+            ok = false;
+    }
+    if (!ok || !haveCreature || !haveItem)
+    {
+        request.error = QuestUseRefusal::MalformedItem;
+        return request;
+    }
+    request.target = creature;
+    request.item = item;
+    return request;
+}
+
+char const* QuestUseGate(QuestUseGateFacts const& facts)
+{
+    namespace R = QuestUseRefusal;
+    if (!facts.hasBotAI)
+        return R::NoBotAI;
+    if (!facts.inWorld)
+        return R::NotInWorld;
+    if (facts.loggingOut)
+        return R::LoggingOut;
+    if (!facts.alive)
+        return R::Dead;
+    if (facts.inFlight)
+        return R::InFlight;
+    if (facts.inCombat)
+        return R::InCombat;
+    if (facts.inInstance)
+        return R::InInstance;
+    if (facts.moving)
+        return R::Moving;
+    if (facts.alreadyRunning)
+        return R::AlreadyRunning;
+    if (facts.heldByAnother)
+        return R::HeldByAnother;
+    if (!facts.targetSeen)
+        return R::NoTarget;
+    if (!facts.gameObject && !facts.targetAlive)
+        return R::TargetDead;
+    // A negative distance is an unread one and never counts as near.
+    if (facts.targetYards < 0.0f || facts.targetYards > facts.reachYards)
+        return R::TooFar;
+    if (facts.gameObject)
+        return "";
+    if (facts.wrongTarget)
+        return R::WrongTarget;
+    if (!facts.itemCarried)
+        return R::ItemMissing;
+    if (!facts.itemUsable)
+        return R::ItemUnusable;
+    if (facts.itemOnCooldown)
+        return R::ItemOnCooldown;
+    return "";
+}
+
+TownRetry QuestUseRefusalRetry(std::string const& detail)
+{
+    namespace R = QuestUseRefusal;
+    if (detail == R::MalformedItem || detail == R::MalformedObject || detail == R::NoBotAI ||
+        detail == R::WrongTarget || detail == R::ItemMissing || detail == R::ItemUnusable)
+        return TownRetry::Never;
+    if (detail == R::InInstance)
+        return TownRetry::Elsewhere;
+    return TownRetry::Later;
+}
+
+QuestUseOutcome JudgeQuestUse(QuestUseReadBack const& read)
+{
+    if (!read.readable)
+        return QuestUseOutcome::Unreadable;
+    if (read.counterMoved)
+        return QuestUseOutcome::Progressed;
+    if (read.itemConsumed || read.lootOpened || read.onCooldown)
+        return QuestUseOutcome::Spent;
+    return QuestUseOutcome::Nothing;
+}
+
+char const* QuestUseOutcomeWord(QuestUseOutcome outcome)
+{
+    switch (outcome)
+    {
+        case QuestUseOutcome::Progressed:
+            return "progressed";
+        case QuestUseOutcome::Spent:
+            return "spent";
+        case QuestUseOutcome::Nothing:
+            return "nothing";
+        case QuestUseOutcome::Unreadable:
+            break;
+    }
+    return "unreadable";
+}
+
 }  // namespace OverseerDecisions

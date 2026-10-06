@@ -6103,6 +6103,163 @@ enum class TownRetry
 // string a test pins is the string a row carries.
 char const* TownRetryWord(TownRetry retry);
 
+// ------------------------------- quest objectives that need a USE (kind='quest') --
+//
+// WHY THESE EXIST. The guild's class quests are every member's first job, and
+// the bridge walks members to a creature or a spawn and takes and hands in
+// quests with `take` and `turnin`. A large share of class quests cannot be
+// finished by walking and killing: the objective is a thing a player USES.
+// Two verbs cover the two plain forms, riding kind='quest' beside `take` and
+// `turnin` and routed on the first word, so no ENUM migration is needed:
+//
+//   kind='quest'  use-item-on creature:<entry> item:<entry>
+//   kind='quest'  use-gameobject <entry>
+//
+// `use-item-on` is a player selecting a creature and using a carried item at
+// it: the hunter's taming and pet quests, the warlock's pet-chain items, a
+// shaman's totem item used on a creature. The packet is CMSG_USE_ITEM with a
+// unit target block, the very packet a client sends. `use-gameobject` is a
+// player clicking the nearest gameobject of an entry (CMSG_GAMEOBJ_USE), which
+// is how a quest chest, an altar or a lever is operated.
+//
+// THE WALK IS THE BRIDGE'S. These verbs never move the character: they fire
+// when it already stands within reach of the target, and refuse with `the
+// target is too far` otherwise. No GM call, no direct quest credit, and no
+// spawned creature: the core's own spell or gameobject script runs, and the
+// quest counters move only when it says so.
+//
+// WHAT A SCRIPT-SUMMONED QUEST CREATURE NEEDS. A creature with no spawn row
+// (a quest boss) appears when a player does something: uses a gameobject (an
+// altar, a brazier), uses an item (a summoning item), or speaks to an NPC
+// (gossip). The first two are these verbs; the third is not covered. After a
+// verb ends `applied` with outcome `spent` the bridge waits and looks for the
+// creature with its own walk; the module builds no spawn command.
+//
+// POST-CONDITION. A parked check reads the character back after the cast has
+// had its window: quest progress (any item or kill counter or the quest's
+// status changed) is `progressed`; a spent item, an opened loot window, or a
+// started cooldown with no counter change is `spent`; none of these is
+// `nothing`. `delivered` is never written.
+
+constexpr char const* USE_ITEM_ON_VERB = "use-item-on";
+constexpr char const* USE_GAMEOBJECT_VERB = "use-gameobject";
+
+// Reach for a creature target. The item's own spell range is checked again by
+// the core, so this is the near edge of what any quest item allows.
+constexpr float QUEST_USE_CREATURE_YARDS = 8.0f;
+
+// How far the adapter looks for the target before saying `none in reach`.
+constexpr float QUEST_USE_SEARCH_YARDS = 40.0f;
+
+// First word is one of the two verbs. A malformed row still reaches the
+// parser and is refused in its words.
+bool IsQuestUseRow(std::string const& command);
+
+struct QuestUseRequest
+{
+    bool gameObject{false};   // true: use-gameobject; false: use-item-on
+    std::uint32_t target{0};  // creature entry, or gameobject entry
+    std::uint32_t item{0};    // item entry; 0 for a gameobject use
+    char const* error{""};    // a QuestUseRefusal literal; empty when it parsed
+};
+
+// `use-item-on creature:<entry> item:<entry>` (both keys, each once, any
+// order, non-zero digits) and `use-gameobject <entry>` (one non-zero entry).
+QuestUseRequest ParseQuestUseRequest(std::string const& command);
+
+namespace QuestUseRefusal
+{
+constexpr char const* MalformedItem = "malformed use-item-on command";
+constexpr char const* MalformedObject = "malformed use-gameobject command";
+constexpr char const* NoBotAI = "character has no bot AI";
+constexpr char const* NotInWorld = "character is not in the world";
+constexpr char const* LoggingOut = "character is logging out";
+constexpr char const* Dead = "character is dead";
+constexpr char const* InFlight = "character is on a flight path";
+constexpr char const* InCombat = "character is in combat";
+constexpr char const* InInstance = "character is inside an instance or battleground";
+constexpr char const* Moving = "character is moving";
+constexpr char const* AlreadyRunning = "a quest use is already under way for this character";
+constexpr char const* HeldByAnother = "character is held by another verb";
+constexpr char const* NoTarget = "no such target within reach on this map";
+constexpr char const* TargetDead = "the creature is dead";
+constexpr char const* TooFar = "the target is too far to use the item or object";
+constexpr char const* WrongTarget = "that item has no spell that takes a creature target";
+constexpr char const* ItemMissing = "the character does not carry that item";
+constexpr char const* ItemUnusable = "the core will not let this character use that item";
+constexpr char const* ItemOnCooldown = "the item's spell is on cooldown";
+// Endings.
+constexpr char const* LeftWorld = "left the world before the use could be read back";
+constexpr char const* NothingHappened = "the use changed nothing the character could be read for";
+constexpr char const* Unreadable = "the character could not be read back after the use";
+}  // namespace QuestUseRefusal
+
+struct QuestUseGateFacts
+{
+    // The character.
+    bool hasBotAI{false};
+    bool inWorld{false};
+    bool loggingOut{false};
+    bool alive{false};
+    bool inFlight{false};
+    bool inCombat{false};
+    bool inInstance{false};
+    bool moving{false};
+    bool alreadyRunning{false};
+    bool heldByAnother{false};
+    // The target.
+    bool gameObject{false};
+    bool targetSeen{false};    // one of that entry stands within the search radius
+    bool targetAlive{true};    // a creature only
+    float targetYards{-1.0f};  // negative is unread
+    float reachYards{QUEST_USE_CREATURE_YARDS};
+    bool wrongTarget{false};   // the item's spell takes no creature target
+    // The item (use-item-on only).
+    bool itemCarried{true};
+    bool itemUsable{true};
+    bool itemOnCooldown{false};
+};
+
+// "" when the use may fire; otherwise the QuestUseRefusal literal for the
+// first wall: the character's walls, then the target's, then the item's.
+char const* QuestUseGate(QuestUseGateFacts const& facts);
+
+// Worth asking again without changing the row. Moving, fighting, dying, a
+// target out of reach or dead (it respawns), a hold and a use under way are.
+// A malformed row, a wrong target, a missing or unusable item are not; an
+// instance is a place to leave first.
+TownRetry QuestUseRefusalRetry(std::string const& detail);
+
+// A reading of the quest log reduced to one number per side of the use: the sum
+// over every logged quest of its item counters, kill-or-object counters and
+// status. A use that moved any of them changed the number.
+struct QuestLogCounter
+{
+    std::uint64_t sum{0};
+};
+
+struct QuestUseReadBack
+{
+    bool readable{true};        // the character could be found when the window closed
+    bool counterMoved{false};   // QuestLogCounter differs from the one taken before
+    bool itemConsumed{false};   // fewer of the item than before (use-item-on)
+    bool lootOpened{false};     // a loot window is open on the character
+    bool onCooldown{false};     // the item's spell cooldown started (use-item-on)
+};
+
+enum class QuestUseOutcome
+{
+    Unreadable,
+    Progressed,  // a quest counter or status moved: 'applied'
+    Spent,       // something visibly happened, no counter moved: 'applied'
+    Nothing,     // none of it: 'unchanged'
+};
+
+QuestUseOutcome JudgeQuestUse(QuestUseReadBack const& read);
+
+// "unreadable", "progressed", "spent", "nothing".
+char const* QuestUseOutcomeWord(QuestUseOutcome outcome);
+
 // ------------------------------------------------------------ repair (#18) --
 //
 // WHAT A kind='repair' ROW MAY SAY.
