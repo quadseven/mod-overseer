@@ -21127,6 +21127,119 @@ PartyEnds PartyNext(PartyPollFacts const& facts);
 // entered an instance", "timed out".
 char const* PartyEndsWord(PartyEnds ends);
 
+// ----------------------------------------------------------------- cross-to-map --
+//
+// ANY BOT, GUILD OR ROSTER, CROSSES TO ANOTHER CONTINENT BY ITS FACTION'S OWN
+// BOAT OR ZEPPELIN (class quest chains start on a continent a member may not
+// stand on). No walk verb leaves the walker's map, and the family crossing only
+// serves a family member sailing to its leader; this row asks the same crossing
+// of one bot with a map for a destination.
+//
+//   kind='job'  cross-to-map map:<map id>
+//
+// THE ROUTE TABLE IS THE MODULE'S OWN CROSSING CATALOGUE, not a second list
+// here: every row of the world `transports` table whose path names two maps
+// (ReadCrossingCatalogue), priced by PriceCrossings, which already refuses a
+// transport whose crew is hostile to the walker (the faction filter), one with
+// no surveyed berth level with its deck at either end, and one that does not
+// call on both maps. `routeKnown` below is that pricing's answer.
+//
+// THE ROW'S RESULT (JSON, written when the crossing ends, or at once on a
+// refusal): {"outcome":"arrived"|"refused"|"timeout","reason":"...",
+// "retry":true|false,"map":<destination map>,"steps":<drive polls spent>}.
+constexpr char CROSS_VERB[] = "cross-to-map";
+
+// Crossings under way on the realm at once (Overseer.Cross.AtOnce).
+constexpr unsigned CROSS_AT_ONCE = 2;
+// Walks to the berth a crossing may start before it gives up on the ground.
+constexpr unsigned CROSS_BERTH_WALK_TRIES = 3;
+// Polls of the last few yards to the berth a crossing may spend.
+constexpr unsigned CROSS_FINE_STEP_TRIES = 60;
+
+bool IsCrossRow(std::string const& command);
+
+struct CrossRequest
+{
+    char const* error{""};
+    std::uint32_t map{0};
+};
+
+// Exactly `cross-to-map map:<digits>`, at most five digits. Map 0 is a map.
+CrossRequest ParseCrossRequest(std::string const& command);
+
+namespace CrossRefusal
+{
+constexpr char const* Malformed =
+    "a cross-to-map row is: cross-to-map map:<map id>";
+constexpr char const* Disabled        = "crossing is off (Overseer.Cross.Enable)";
+constexpr char const* NotABot         = "the character is not a bot";
+constexpr char const* NotInWorld      = "the character is not in the world";
+constexpr char const* Dead            = "the character is dead";
+constexpr char const* InCombat        = "the character is in combat";
+constexpr char const* InInstance      = "the character is in an instance";
+constexpr char const* InFlight        = "the character is in flight";
+constexpr char const* AlreadyThere    = "the character is already on that map";
+constexpr char const* AlreadyCrossing = "the character is already crossing";
+constexpr char const* Busy =
+    "the character is on a walk or held by another job";
+constexpr char const* NoRoute =
+    "no transport the module knows sails from this map to that map for this faction";
+constexpr char const* Campaign =
+    "the character belongs to a family whose campaign is armed or running";
+constexpr char const* AtCap =
+    "the realm already has as many crossings as it allows (Overseer.Cross.AtOnce)";
+constexpr char const* GroundGaveUp =
+    "the walk to the berth gave up on the ground";
+constexpr char const* LastYards = "the last yards to the berth gave no step";
+constexpr char const* Died = "the character died on the way";
+constexpr char const* Gone = "the character left the world on the way";
+constexpr char const* TimedOut = "the crossing took longer than it is allowed";
+}  // namespace CrossRefusal
+
+struct CrossFacts
+{
+    bool enabled{true};
+    bool isBot{true};
+    bool inWorld{true};
+    bool alive{true};
+    bool inCombat{false};
+    bool inInstance{false};
+    bool inFlight{false};
+    bool onTargetMap{false};
+    bool alreadyCrossing{false};
+    // A walk of another verb is under way, or another verb's hold stands.
+    bool busy{false};
+    // PriceCrossings found a transport for this walker from its map to the target.
+    bool routeKnown{true};
+    // A roster member whose family has a campaign armed or running, or a
+    // stand-in guest working for one.
+    bool campaignArmed{false};
+    unsigned crossingsUnderWay{0};
+    unsigned atOnce{CROSS_AT_ONCE};
+};
+
+// "" when the crossing may start; otherwise a CrossRefusal literal, the first
+// wall in the order the fields above are declared, the realm's cap last.
+char const* CrossGate(CrossFacts const& facts);
+
+// Whether asking again later can succeed: a fight, a flight, a death, a campaign
+// that ends, a full realm and a walk that gave up on the ground can all pass.
+bool CrossRefusalRetryable(std::string const& reason);
+
+enum class CrossEnd : std::uint8_t
+{
+    Arrived,
+    Refused,
+    TimedOut,
+};
+
+// "arrived", "refused", "timeout".
+char const* CrossEndWord(CrossEnd end);
+
+// The row's result JSON (see the grammar above).
+std::string CrossResultJson(CrossEnd end, std::string const& reason, bool retry,
+                            std::uint32_t map, unsigned steps);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

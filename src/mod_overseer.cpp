@@ -39674,7 +39674,8 @@ private:
             member.isLeader = name == leaderName;
 
             Player* p = ObjectAccessor::FindPlayerByName(name);
-            if (!SteerableAI(p))
+            if (!(IsCrossJob(coord) ? (p && p->IsInWorld() && GET_PLAYERBOT_AI(p) != nullptr)
+                                    : SteerableAI(p) != nullptr))
             {
                 // Unreadable, and left that way on purpose. A logged out member
                 // has no map, and a map it does not have must not be borrowed
@@ -40309,8 +40310,33 @@ private:
         time_t crossingSince{0};
         uint8 crossingSaid{255};
         time_t holdSaidAt{0};
+        // A `cross-to-map` ROW'S CROSSING (see DoCrossToMap): the row it
+        // answers, zero for a stranded member's own. A job's crossing has no
+        // leader, is steered through the bot AI alone (a guild member is not on
+        // the roster, so Steerable would never read it), walks to its berth by
+        // the guild far walk instead of the roster's travel aim, and ends by
+        // writing its row, never by walking on to anybody.
+        uint32 jobRow{0};
+        time_t jobStart{0};
+        time_t jobTouched{0};
+        time_t jobGoneSince{0};
+        uint32 jobSteps{0};
+        uint32 jobWalks{0};
+        uint32 jobFineSteps{0};
     };
     std::map<std::string, LoneCrossing> _loneCrossings;
+
+    // A job's crossing reads its member through the bot AI; every other
+    // memo (a family's coordinator, a stranded member) through Steerable.
+    static bool IsCrossJob(LoneCrossing const& memo)
+    {
+        return memo.jobRow != 0;
+    }
+    template <typename Memo>
+    static bool IsCrossJob(Memo const&)
+    {
+        return false;
+    }
     // A member whose boat home was refused, and when (LONE_CROSSING_STANDDOWN_SECONDS).
     std::map<std::string, std::pair<time_t, std::string>> _loneCrossingRefused;
     // Hearth casts asked of a stranded member this split (EXIT_HEARTH_ATTEMPTS).
@@ -40355,6 +40381,10 @@ private:
     bool DriveStrandedMember(Player* p, Player* leader, std::string const& name, bool split)
     {
         auto memo = _loneCrossings.find(name);
+        // A `cross-to-map` ROW OWNS THIS MEMBER until it ends: the party poll
+        // neither prices a boat home for it nor ends the crossing the row asked for.
+        if (memo != _loneCrossings.end() && memo->second.jobRow)
+            return true;
         // THE CHEAP QUESTION FIRST: a member beside its leader with no crossing
         // of its own is every member on every ordinary poll.
         if (!split && memo == _loneCrossings.end())
@@ -40559,6 +40589,290 @@ private:
         return true;
     }
 
+    // ================================ `cross-to-map`: any bot crosses ==
+    //
+    // ONE BOT, A MAP FOR A DESTINATION. The crossing is the stranded member's
+    // (DriveLoneCrossing above, on the coordinator's five second clock, reading
+    // the same world through ReadCrossingFromWorld and deciding through
+    // ReadCrossing): walk to the berth, wait for the transport to dock, step
+    // aboard, ride, walk off. Nothing of it is copied. What a job changes is
+    // only the four things a stranded roster member had and a guild member does
+    // not: the bot AI is read directly (Steerable is the roster's), the walk to
+    // the berth is the guild far walk (the roster's travel aim writes a roster
+    // row), the destination is a map rather than a leader, and the end is the
+    // row's result rather than a walk on to somebody. The transport is chosen by
+    // PriceCrossingTransports from the module's crossing catalogue, so a bot is
+    // only ever offered its own faction's boat.
+
+    // Is a walk of any verb under way for this character?
+    bool WalkUnderWay(std::string const& name) const
+    {
+        for (MailWalkCheck const& check : _pendingMailWalks)
+            if (check.targetName == name)
+                return true;
+        return false;
+    }
+
+    uint32 CrossJobsUnderWay() const
+    {
+        uint32 n = 0;
+        for (auto const& entry : _loneCrossings)
+            if (entry.second.jobRow)
+                ++n;
+        return n;
+    }
+
+    // Writes the row's ending and lets the crossing go. The row is touched
+    // only while it is still this run's, as every row this module ends.
+    void FinishCrossJob(std::string const& name, OverseerDecisions::CrossEnd end,
+                        std::string const& reason, bool retry)
+    {
+        auto const found = _loneCrossings.find(name);
+        if (found == _loneCrossings.end() || !found->second.jobRow)
+            return;
+        uint32 const row = found->second.jobRow;
+        uint32 const destination = found->second.crossingDestinationMap;
+        uint32 const steps = found->second.jobSteps;
+        Player* const p = ObjectAccessor::FindPlayerByName(name);
+        CancelCrossBerthWalk(name, p, "the crossing is over");
+
+        std::string shown = reason.size() > 190 ? reason.substr(0, 190) : reason;
+        char const* const status =
+            end == OverseerDecisions::CrossEnd::Arrived    ? "applied"
+            : end == OverseerDecisions::CrossEnd::TimedOut ? "unchanged"
+                                                           : "error";
+        CharacterDatabase.Execute(
+            "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}', "
+            "updated_at = NOW() WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+            status, Esc(shown),
+            EscLong(OverseerDecisions::CrossResultJson(end, reason, retry, destination, steps)),
+            row, g_runToken);
+        LOG_INFO("module.overseer",
+                 "overseer: cross-to-map {} for '{}' ends {} after {} polls{}{}", row, name,
+                 OverseerDecisions::CrossEndWord(end), steps, reason.empty() ? "" : ": ",
+                 reason);
+        EndLoneCrossing(name, "its cross-to-map row has ended");
+    }
+
+    // Ends a job's walk to the berth, if one is under way, with its hold.
+    void CancelCrossBerthWalk(std::string const& name, Player* p, char const* why)
+    {
+        bool had = false;
+        for (auto it = _pendingMailWalks.begin(); it != _pendingMailWalks.end();)
+        {
+            if (it->targetName == name && it->id == 0)
+            {
+                it = _pendingMailWalks.erase(it);
+                had = true;
+            }
+            else
+                ++it;
+        }
+        if (had)
+            ReleaseHold(name, p, why, MAIL_WALK_HOLD_VERB);
+    }
+
+    // THE JOB'S OWN CLOCKS, each poll: the row's lease kept alive, the backstop,
+    // a character gone from the world for good, a character dead. False when
+    // the job ended or has nobody to steer this poll.
+    bool StepCrossJobClock(std::string const& name, LoneCrossing& memo, Player* p)
+    {
+        namespace D = OverseerDecisions;
+        time_t const now = std::time(nullptr);
+        if (now - memo.jobStart > time_t(CROSSING_BACKSTOP_SECONDS))
+        {
+            FinishCrossJob(name, D::CrossEnd::TimedOut, D::CrossRefusal::TimedOut, true);
+            return false;
+        }
+        if (!p)
+        {
+            if (!memo.jobGoneSince)
+                memo.jobGoneSince = now;
+            else if (now - memo.jobGoneSince > time_t(COMMAND_CLAIM_LEASE_SECONDS))
+                FinishCrossJob(name, D::CrossEnd::Refused, D::CrossRefusal::Gone, true);
+            return false;
+        }
+        memo.jobGoneSince = 0;
+        if (!p->IsInWorld())
+            return false;
+        if (!p->IsAlive())
+        {
+            FinishCrossJob(name, D::CrossEnd::Refused, D::CrossRefusal::Died, true);
+            return false;
+        }
+        ++memo.jobSteps;
+        if (now - memo.jobTouched >= time_t(COMMAND_CLAIM_LEASE_SECONDS / 4))
+        {
+            memo.jobTouched = now;
+            CharacterDatabase.Execute(
+                "UPDATE overseer_command SET updated_at = NOW() "
+                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                memo.jobRow, g_runToken);
+        }
+        return true;
+    }
+
+    // A job's walk to its berth: the guild far walk to the berth's coordinates
+    // (a spawn walk's own legs, mount, flight and fight pause, resolved by
+    // ResolveMailWalks with row id 0, which no row has), and the last yards, which
+    // that walk's twenty yard arrival leaves, by the crossing's own proved step.
+    template <typename HoldFn, typename ReleaseFn>
+    void DriveCrossJobWalk(Player* p, std::string const& name, LoneCrossing& memo,
+                           CrossingRoute const& route, std::string const& boat,
+                           std::string const& why, HoldFn const& holdIt,
+                           ReleaseFn const& releaseIt)
+    {
+        namespace D = OverseerDecisions;
+        uint32 const origin = route.world.originMap;
+        if (!memo.crossingSince)
+            memo.crossingSince = std::time(nullptr);
+        if (WalkUnderWay(name))
+            return;
+
+        bool const nearBerth =
+            route.world.berthKnown && p->GetMapId() == origin &&
+            p->GetExactDist2d(route.berthX, route.berthY) <= D::SPAWN_WALK_ARRIVE_YARDS + 5.f;
+        if (nearBerth)
+        {
+            if (++memo.jobFineSteps > D::CROSS_FINE_STEP_TRIES)
+            {
+                FinishCrossJob(name, D::CrossEnd::Refused, D::CrossRefusal::LastYards, false);
+                return;
+            }
+            holdIt();
+            StepTowardBerth(p, origin, route.berthX, route.berthY, route.berthZ);
+            return;
+        }
+
+        releaseIt("it is walking to the berth again");
+        if (memo.jobWalks >= D::CROSS_BERTH_WALK_TRIES)
+        {
+            FinishCrossJob(name, D::CrossEnd::Refused, D::CrossRefusal::GroundGaveUp, true);
+            return;
+        }
+        ++memo.jobWalks;
+        if (!route.world.berthKnown || p->GetMapId() != origin)
+            return;
+
+        MailWalkEvidence ev;
+        ev.goal = D::WalkGoal::Spawn;
+        ev.character = name;
+        ev.request = D::CROSS_VERB;
+        ev.mapId = origin;
+        ev.fromX = p->GetPositionX();
+        ev.fromY = p->GetPositionY();
+        ev.fromZ = p->GetPositionZ();
+        ev.haveMailbox = true;
+        ev.mailboxName = boat + "'s berth";
+        ev.boxX = route.berthX;
+        ev.boxY = route.berthY;
+        ev.boxZ = route.berthZ;
+        ev.startYards = ev.bestYards = ev.nowYards = p->GetExactDist(ev.boxX, ev.boxY, ev.boxZ);
+        ev.far = D::FarWalkAllowedAt(origin, p->GetZoneId());
+        if (ev.far)
+        {
+            ev.travel.target = "the berth of '" + boat + "'";
+            ev.travel.mapId = origin;
+            ev.travel.x = ev.boxX;
+            ev.travel.y = ev.boxY;
+            ev.travel.z = ev.boxZ;
+            ev.travel.errandSince = std::time(nullptr);
+            ev.travel.progress.since = std::time(nullptr);
+        }
+        ev.timeoutMs = (ev.far ? D::FarWalkTimeoutSeconds(ev.startYards)
+                               : D::MailWalkTimeoutSeconds(ev.startYards)) * 1000u;
+        HoldStillAndReport(p, name, MAIL_WALK_HOLD_VERB, ev.hold,
+                           ev.timeoutMs / 1000u + MAIL_WALK_HOLD_MARGIN_SECONDS, false);
+        if (!ev.hold.applied)
+            return;
+        if (!IssueMailWalkLeg(p, ev, true))
+        {
+            ReleaseHold(name, p, "the ground toward the berth gave no step", MAIL_WALK_HOLD_VERB);
+            return;
+        }
+        MailWalkCheck check;
+        check.id = 0;
+        check.targetName = name;
+        check.ev = ev;
+        _pendingMailWalks.push_back(check);
+        LOG_INFO("module.overseer",
+                 "overseer: cross-to-map {} - '{}' walks to the berth for '{}' at ({:.1f}, "
+                 "{:.1f}, {:.1f}) on map {}, {:.0f} yards away (walk {} of {}) - {}",
+                 memo.jobRow, name, boat, route.berthX, route.berthY, route.berthZ, origin,
+                 ev.startYards, memo.jobWalks, D::CROSS_BERTH_WALK_TRIES, why);
+    }
+
+    // THE ROW. Gated on pure facts (OverseerDecisions::CrossGate), then handed
+    // to the stranded member's crossing as a job; the row stays 'verifying' and
+    // is written when the crossing ends (FinishCrossJob).
+    char const* DoCrossToMap(Player* who, std::string const& command, char const*& status,
+                             std::string& out, uint32 id)
+    {
+        namespace D = OverseerDecisions;
+        std::string const name = who->GetName();
+        D::CrossRequest const request = D::ParseCrossRequest(command);
+        auto refuse = [&](char const* why) -> char const*
+        {
+            out = D::CrossResultJson(D::CrossEnd::Refused, why, D::CrossRefusalRetryable(why),
+                                     request.map, 0);
+            status = "error";
+            LOG_INFO("module.overseer", "overseer: cross-to-map {} for '{}' refused - {}", id,
+                     name, why);
+            return why;
+        };
+        if (*request.error)
+            return refuse(request.error);
+
+        Map* const map = who->GetMap();
+        D::CrossFacts facts;
+        facts.enabled = CrossEnabled();
+        facts.isBot = GET_PLAYERBOT_AI(who) != nullptr;
+        facts.inWorld = who->IsInWorld() && map && who->GetSession();
+        facts.alive = who->IsAlive();
+        facts.inCombat = who->IsInCombat();
+        facts.inInstance = map && map->Instanceable();
+        facts.inFlight = who->IsInFlight();
+        facts.onTargetMap = who->GetMapId() == request.map;
+        facts.alreadyCrossing = CrossingAlone(name) || IsCrossingAlone(name);
+        {
+            auto const& holds = HoldsInForce();
+            auto const hold = holds.find(name);
+            facts.busy = WalkUnderWay(name) || (HeldStill(name) && hold != holds.end());
+        }
+        facts.campaignArmed = InAFamilyCampaign(name) || FamilyCrossing(FamilyOfCharacter(name));
+        facts.crossingsUnderWay = CrossJobsUnderWay();
+        facts.atOnce = CrossAtOnce();
+        facts.routeKnown = true;
+        if (facts.inWorld && !facts.onTargetMap && facts.isBot)
+        {
+            std::vector<CrossingTransportInfo const*> serving;
+            std::vector<std::pair<int, int>> stops;
+            std::string priced;
+            facts.routeKnown =
+                PriceCrossingTransports(who, who->GetMapId(), request.map, 0.f, 0.f, 0, serving,
+                                        stops, priced) >= 0;
+            if (!facts.routeKnown)
+                LOG_INFO("module.overseer",
+                         "overseer: cross-to-map {} for '{}' from map {} to map {} - priced: {}",
+                         id, name, who->GetMapId(), request.map, priced);
+        }
+        if (char const* wall = D::CrossGate(facts); *wall)
+            return refuse(wall);
+
+        LoneCrossing started;
+        started.crossingOriginMap = who->GetMapId();
+        started.crossingDestinationMap = request.map;
+        started.jobRow = id;
+        started.jobStart = std::time(nullptr);
+        started.jobTouched = started.jobStart;
+        _loneCrossings[name] = started;
+        LOG_INFO("module.overseer",
+                 "overseer: cross-to-map {} - '{}' sets out from map {} for map {}; up to {}s",
+                 id, name, who->GetMapId(), request.map, CROSSING_BACKSTOP_SECONDS);
+        status = "verifying";
+        return "";
+    }
+
     // EVERY STRANDED MEMBER'S OWN CROSSING, ON THE COORDINATOR'S CLOCK. Ends the
     // walks it stopped marking last, the same shape every other escort sweep has.
     void DriveLoneCrossings()
@@ -40594,7 +40908,10 @@ private:
             return;
         LoneCrossing& memo = found->second;
         Player* const p = ObjectAccessor::FindPlayerByName(name);
-        PlayerbotAI* const ai = SteerableAI(p);
+        PlayerbotAI* const ai = memo.jobRow ? (p ? GET_PLAYERBOT_AI(p) : nullptr)
+                                            : SteerableAI(p);
+        if (memo.jobRow && !StepCrossJobClock(name, memo, p))
+            return;
         // NOT READ AT ALL WHILE IT CANNOT BE STEERED. Reading the route with no
         // traveller would drop the transport it chose, and a member logged out
         // mid-ride must come back to the boat it is standing on.
@@ -40630,6 +40947,12 @@ private:
         OverseerDecisions::CrossingStep const step =
             OverseerDecisions::ReadCrossing(route.world, route.members, limits);
 
+        // A JOB'S WALK TO THE BERTH ENDS THE MOMENT THE CROSSING STOPS ASKING
+        // FOR IT: the walk's own hold is another verb's, and the crossing's
+        // hold (taken below) must not be refused for it.
+        if (memo.jobRow && step.action != OverseerDecisions::CrossingAction::Walk)
+            CancelCrossBerthWalk(name, p, "the crossing no longer asks for a walk");
+
         uint8 const said = static_cast<uint8>(step.action);
         bool const fresh = memo.crossingSaid != said;
         memo.crossingSaid = said;
@@ -40652,6 +40975,11 @@ private:
         {
             case OverseerDecisions::CrossingAction::Walk:
             {
+                if (memo.jobRow)
+                {
+                    DriveCrossJobWalk(p, name, memo, route, boat, why, holdIt, releaseIt);
+                    break;
+                }
                 releaseIt("it is walking to the berth again");
                 std::ostringstream aim;
                 aim << std::fixed << std::setprecision(1);
@@ -40791,6 +41119,15 @@ private:
             }
 
             case OverseerDecisions::CrossingAction::Done:
+                if (memo.jobRow)
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is ashore on map {} and off '{}' - its cross-to-map "
+                             "crossing is over",
+                             name, destination, boat);
+                    FinishCrossJob(name, OverseerDecisions::CrossEnd::Arrived, "", false);
+                    break;
+                }
                 LOG_INFO("module.overseer",
                          "overseer: '{}' is ashore on map {} and off '{}' - its crossing is "
                          "over and it walks to its leader from here (#274)",
@@ -40799,6 +41136,17 @@ private:
                 break;
 
             case OverseerDecisions::CrossingAction::Refuse:
+                if (memo.jobRow)
+                {
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' cannot sail from map {} to map {} - refused at "
+                             "'{}': {}",
+                             name, origin, destination,
+                             OverseerDecisions::CrossingLegName(step.leg), why);
+                    FinishCrossJob(name, OverseerDecisions::CrossEnd::Refused, why,
+                                   route.world.berthGuarded);
+                    break;
+                }
                 LOG_WARN("module.overseer",
                          "overseer: '{}' cannot sail from map {} to map {} - refused at '{}': "
                          "{}. Its boat home is priced again in {} minutes",
@@ -50013,6 +50361,11 @@ private:
                 detail = DoQuestUse(player, command, status, rowResult, _pendingQuestUses, id);
             else if (kind == "quest")
                 detail = DoQuest(player, command, status, rowResult);
+            else if (kind == "job" && OverseerDecisions::IsCrossRow(command))
+                // A BOT CROSSES TO ANOTHER CONTINENT BY ITS FACTION'S OWN BOAT
+                // OR ZEPPELIN (see DoCrossToMap), on kind='job' beside the walks
+                // and routed on its first word the same way.
+                detail = DoCrossToMap(player, command, status, rowResult, id);
             else if (kind == "job" && OverseerDecisions::IsPartyWalkRow(command))
                 // A QUEST PARTY'S WALK (see DoPartyWalk), on kind='job' beside
                 // `walk-to-spawn` and routed on its first word the same way.
@@ -65372,6 +65725,20 @@ private:
         static uint32 const v = sConfigMgr->GetOption<uint32>(
             "Overseer.FarWalk.AtOnce", OverseerDecisions::FAR_WALKS_AT_ONCE);
         return v;
+    }
+
+    // Overseer.Cross.Enable (default off) and Overseer.Cross.AtOnce (default
+    // CROSS_AT_ONCE): the `cross-to-map` verb's master switch and the realm's
+    // ceiling on crossings of its own under way.
+    static bool CrossEnabled()
+    {
+        return sConfigMgr->GetOption<bool>("Overseer.Cross.Enable", false);
+    }
+
+    static uint32 CrossAtOnce()
+    {
+        return sConfigMgr->GetOption<uint32>("Overseer.Cross.AtOnce",
+                                             OverseerDecisions::CROSS_AT_ONCE);
     }
 
     static uint32 FarWalkStartsPerBot()
