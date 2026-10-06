@@ -49396,6 +49396,10 @@ private:
         // reason the casts come after the conjures.
         ResolveLearnChecks(sincePollMs);
 
+        // ...and the quest uses, which wait out the item's cast and then read
+        // the quest log back for the objective they were driven at.
+        ResolveQuestUseChecks(sincePollMs);
+
         // ...and the naturalize rows, which wait for a clean logout and a
         // fresh login before they act, and for a reset's walk home after.
         ResolveNaturalizeChecks(sincePollMs);
@@ -49633,6 +49637,11 @@ private:
                 detail = DoTrade(player, targetArg, command, status, rowResult);
             else if (kind == "share")
                 detail = DoShare(player, targetArg, command, status, rowResult);
+            else if (kind == "quest" && OverseerDecisions::IsQuestUseRow(command))
+                // A QUEST OBJECTIVE THAT NEEDS A USE: an item used at a creature,
+                // or a gameobject clicked. Routed on the first word beside
+                // `take` and `turnin`, so no ENUM migration is needed.
+                detail = DoQuestUse(player, command, status, rowResult, _pendingQuestUses, id);
             else if (kind == "quest")
                 detail = DoQuest(player, command, status, rowResult);
             else if (kind == "job" && OverseerDecisions::IsSpawnWalkRow(command))
@@ -66755,6 +66764,360 @@ private:
         }
         status = "delivered";
         return "";
+    }
+
+    // ------------------------------------------------------------ quest use --
+    //
+    // kind='quest' `use-item-on creature:<entry> item:<entry>` and
+    // `use-gameobject <entry>`: the two quest objectives a player meets that
+    // are neither a kill nor a walk. The grammar, the gate and the judge are
+    // OverseerDecisions::ParseQuestUseRequest, QuestUseGate and JudgeQuestUse,
+    // pinned in tests/test_quest_use.cpp; what is here is only what a player
+    // does and the reading of the world around it.
+    //
+    // WHAT A PLAYER DOES. Selects the creature (CMSG_SET_SELECTION), turns to
+    // it, and uses the carried item at it (CMSG_USE_ITEM with a unit target
+    // block, as the cast verb writes its named target); or clicks the nearest
+    // gameobject of the entry (CMSG_GAMEOBJ_USE, whose handler re-checks the
+    // interaction distance itself). Nothing here grants quest credit, spawns a
+    // creature or moves the character: the core's own spell or gameobject
+    // script runs and the quest counters move when it says so.
+    //
+    // JUDGED LATER. A quest item's spell may carry a cast time and the credit
+    // lands on a later tick, so the row parks as 'verifying' and is judged by
+    // ResolveQuestUseChecks from a reading of the quest log taken on both sides
+    // of the use.
+    static constexpr uint32 QUEST_USE_MARGIN_MS = 3000;
+    static constexpr uint32 QUEST_USE_FLOOR_MS = 6000;
+    static constexpr uint32 QUEST_USE_WINDOW_CEILING_MS = 30000;
+    static constexpr char const* QUEST_USE_HOLD_VERB = "questuse";
+
+    struct QuestUseEvidence
+    {
+        std::string character;
+        std::string request;
+        bool gameObject{false};
+        uint32 targetEntry{0};
+        uint32 targetGuid{0};
+        float yards{-1.0f};
+        uint32 itemEntry{0};
+        uint32 spellId{0};
+        int32 itemBefore{-1};
+        int32 itemAfter{-1};
+        uint64 counterBefore{0};
+        uint64 counterAfter{0};
+        bool lootOpenBefore{false};
+        uint32 windowMs{0};
+        uint32 waitedMs{0};
+        CastHoldReport hold;
+        OverseerDecisions::QuestUseOutcome verdict{OverseerDecisions::QuestUseOutcome::Unreadable};
+    };
+
+    struct QuestUseCheck
+    {
+        uint32 id{0};
+        std::string targetName;
+        QuestUseEvidence ev;
+    };
+
+    std::vector<QuestUseCheck> _pendingQuestUses;
+
+    // One number for the whole quest log: every logged quest's status and its
+    // item and kill-or-object counters. A use that moved any of them changed it.
+    static uint64 QuestLogSum(Player* who)
+    {
+        uint64 sum = 0;
+        for (auto const& [questId, data] : who->getQuestStatusMap())
+        {
+            if (data.Status == QUEST_STATUS_NONE)
+                continue;
+            sum += uint64(questId) * 31u + uint64(data.Status) * 7919u;
+            for (uint8 i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT; ++i)
+                sum += data.ItemCount[i];
+            for (uint8 i = 0; i < QUEST_OBJECTIVES_COUNT; ++i)
+                sum += data.CreatureOrGOCount[i];
+        }
+        return sum;
+    }
+
+    static std::string QuestUseJson(QuestUseEvidence const& ev, char const* outcome,
+                                    char const* reason)
+    {
+        using OverseerDecisions::QuestUseOutcomeWord;
+        using OverseerDecisions::QuestUseRefusalRetry;
+        using OverseerDecisions::TownRetryWord;
+
+        std::ostringstream o;
+        o << "{\"outcome\":" << J(outcome)
+          << ",\"reason\":" << J(reason)
+          << ",\"retry\":" << J(*reason ? TownRetryWord(QuestUseRefusalRetry(reason)) : "")
+          << ",\"character\":" << J(ev.character)
+          << ",\"verdict\":" << J(QuestUseOutcomeWord(ev.verdict))
+          << ",\"what\":" << J(ev.gameObject ? "gameobject" : "creature")
+          << ",\"target_entry\":" << ev.targetEntry
+          << ",\"target_guid\":" << ev.targetGuid
+          << ",\"yards\":" << ev.yards
+          << ",\"item_entry\":" << ev.itemEntry
+          << ",\"spell\":" << ev.spellId
+          << ",\"item_before\":" << ev.itemBefore
+          << ",\"item_after\":" << ev.itemAfter
+          << ",\"counter_before\":" << ev.counterBefore
+          << ",\"counter_after\":" << ev.counterAfter
+          << ",\"window_ms\":" << ev.windowMs
+          << ",\"waited_ms\":" << ev.waitedMs
+          << ",\"hold_applied\":" << (ev.hold.applied ? "true" : "false")
+          << ",\"request\":" << J(ev.request) << "}";
+        return o.str();
+    }
+
+    static char const* DoQuestUse(Player* who, std::string const& command, char const*& status,
+                                  std::string& out, std::vector<QuestUseCheck>& parked,
+                                  uint32 id)
+    {
+        namespace D = OverseerDecisions;
+
+        QuestUseEvidence ev;
+        ev.character = who->GetName();
+        ev.request = command;
+
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            out = QuestUseJson(ev, "refused", reason);
+            return reason;
+        };
+
+        D::QuestUseRequest const request = D::ParseQuestUseRequest(command);
+        if (*request.error)
+            return refuse(request.error);
+        ev.gameObject = request.gameObject;
+        ev.targetEntry = request.target;
+        ev.itemEntry = request.item;
+
+        WorldSession* session = who->GetSession();
+        Map* map = who->GetMap();
+
+        D::QuestUseGateFacts gate;
+        gate.gameObject = request.gameObject;
+        gate.hasBotAI = GET_PLAYERBOT_AI(who) != nullptr;
+        gate.inWorld = session && who->IsInWorld() && map;
+        gate.loggingOut = !session || SessionIsLoggingOut(session);
+        gate.alive = who->IsAlive();
+        gate.inFlight = who->IsInFlight();
+        gate.inCombat = who->IsInCombat();
+        gate.inInstance = map && map->Instanceable();
+        gate.moving = who->isMoving();
+        for (QuestUseCheck const& running : parked)
+            if (running.targetName == ev.character)
+                gate.alreadyRunning = true;
+        {
+            auto const& holds = HoldsInForce();
+            auto const hold = holds.find(ev.character);
+            gate.heldByAnother = HeldStill(ev.character) && hold != holds.end()
+                && hold->second.verb != QUEST_USE_HOLD_VERB;
+        }
+
+        // The target, and the item. Read whatever the character walls say, so a
+        // refusal still carries what was there.
+        Creature* creature = nullptr;
+        GameObject* object = nullptr;
+        ObjectGuid targetGuid;
+        if (gate.inWorld)
+        {
+            if (request.gameObject)
+            {
+                object = who->FindNearestGameObject(request.target, D::QUEST_USE_SEARCH_YARDS,
+                                                    true);
+                gate.targetSeen = object != nullptr;
+                if (object)
+                {
+                    targetGuid = object->GetGUID();
+                    gate.targetYards = who->GetDistance(object);
+                    gate.reachYards = object->GetInteractionDistance();
+                }
+            }
+            else
+            {
+                creature = who->FindNearestCreature(request.target, D::QUEST_USE_SEARCH_YARDS,
+                                                    true);
+                gate.targetAlive = creature != nullptr;
+                if (!creature)
+                    creature = who->FindNearestCreature(request.target,
+                                                        D::QUEST_USE_SEARCH_YARDS, false);
+                gate.targetSeen = creature != nullptr;
+                if (creature)
+                {
+                    targetGuid = creature->GetGUID();
+                    gate.targetYards = who->GetDistance(creature);
+                    gate.reachYards = D::QUEST_USE_CREATURE_YARDS;
+                }
+            }
+        }
+        ev.targetGuid = targetGuid.GetCounter();
+        ev.yards = gate.targetYards;
+
+        Item* item = nullptr;
+        if (!request.gameObject)
+        {
+            item = FindCarriedItem(who, false, request.item);
+            gate.itemCarried = item != nullptr;
+            if (item)
+            {
+                ItemTemplate const* proto = item->GetTemplate();
+                for (uint8 i = 0; proto && i < MAX_ITEM_PROTO_SPELLS; ++i)
+                {
+                    if (proto->Spells[i].SpellId <= 0
+                        || proto->Spells[i].SpellTrigger != ITEM_SPELLTRIGGER_ON_USE)
+                        continue;
+                    SpellInfo const* info = sSpellMgr->GetSpellInfo(proto->Spells[i].SpellId);
+                    if (info && info->NeedsExplicitUnitTarget())
+                    {
+                        ev.spellId = uint32(proto->Spells[i].SpellId);
+                        break;
+                    }
+                }
+                gate.wrongTarget = ev.spellId == 0;
+                gate.itemUsable = who->CanUseItem(item) == EQUIP_ERR_OK;
+                gate.itemOnCooldown = ev.spellId && who->HasSpellCooldown(ev.spellId);
+            }
+        }
+
+        if (char const* wall = D::QuestUseGate(gate); *wall)
+        {
+            // A character that was still moving is stopped for the sender's next
+            // ask, as the learn and cast verbs do.
+            if (gate.moving && gate.hasBotAI && gate.inWorld)
+                HoldStillAndReport(who, ev.character, QUEST_USE_HOLD_VERB, ev.hold);
+            return refuse(wall);
+        }
+
+        ev.counterBefore = QuestLogSum(who);
+        ev.lootOpenBefore = !who->GetLootGUID().IsEmpty();
+
+        uint32 castMs = 0;
+        if (ev.spellId)
+            if (SpellInfo const* info = sSpellMgr->GetSpellInfo(ev.spellId))
+                castMs = info->CalcCastTime(who);
+        ev.windowMs = D::CastVerifyWindowMs(castMs, QUEST_USE_MARGIN_MS, QUEST_USE_FLOOR_MS,
+                                            QUEST_USE_WINDOW_CEILING_MS);
+
+        // Held for the cast, in the same breath as the packet.
+        HoldStillAndReport(who, ev.character, QUEST_USE_HOLD_VERB, ev.hold);
+
+        if (request.gameObject)
+        {
+            DriveGameObjectUse(session, targetGuid);
+        }
+        else
+        {
+            ev.itemBefore = int32(who->GetItemCount(request.item, false));
+            DriveSelection(session, targetGuid);
+            who->SetFacingToObject(creature);
+
+            // CMSG_USE_ITEM: bag, slot, castCount, spell, item guid, glyph
+            // index, castFlags, then a target block - TARGET_FLAG_UNIT and one
+            // packed guid, which is what SpellCastTargets::Read expects.
+            WorldPacket raw(CMSG_USE_ITEM, 1 + 1 + 1 + 4 + 8 + 4 + 1 + 4 + 9);
+            raw << uint8(item->GetBagSlot());
+            raw << uint8(item->GetSlot());
+            raw << uint8(1);  // castCount
+            raw << uint32(ev.spellId);
+            raw << item->GetGUID();
+            raw << uint32(0);  // glyphIndex
+            raw << uint8(0);   // castFlags
+            raw << uint32(TARGET_FLAG_UNIT);
+            raw << targetGuid.WriteAsPacked();
+            raw.rpos(0);
+            session->HandleUseItemOpcode(raw);
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is using {} {} (item {}, spell {}) at {} yards; judging in {}ms",
+                 ev.character, request.gameObject ? "gameobject" : "creature", ev.targetEntry,
+                 ev.itemEntry, ev.spellId, ev.yards, ev.windowMs);
+
+        QuestUseCheck check;
+        check.id = id;
+        check.targetName = ev.character;
+        check.ev = ev;
+        parked.push_back(check);
+
+        // Not 'delivered', which would be a postmark and not a delivery.
+        status = "verifying";
+        out = QuestUseJson(ev, "using", "");
+        return "";
+    }
+
+    void ResolveQuestUseChecks(uint32 elapsedMs)
+    {
+        namespace D = OverseerDecisions;
+
+        std::vector<QuestUseCheck> stillWaiting;
+        stillWaiting.reserve(_pendingQuestUses.size());
+
+        for (QuestUseCheck& check : _pendingQuestUses)
+        {
+            check.ev.waitedMs += elapsedMs;
+            Player* bot = ObjectAccessor::FindPlayerByName(check.targetName, false);
+
+            if (!bot)
+            {
+                char const* const gone = D::QuestUseRefusal::LeftWorld;
+                check.ev.verdict = D::QuestUseOutcome::Unreadable;
+                ReleaseHold(check.targetName, bot, "the character left the world mid-use",
+                            QUEST_USE_HOLD_VERB);
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
+                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                    Esc(gone), EscLong(QuestUseJson(check.ev, "unreadable", gone)), check.id,
+                    g_runToken);
+                continue;
+            }
+
+            if (check.ev.waitedMs < check.ev.windowMs)
+            {
+                stillWaiting.push_back(check);
+                continue;
+            }
+
+            D::QuestUseReadBack read;
+            read.readable = true;
+            check.ev.counterAfter = QuestLogSum(bot);
+            read.counterMoved = check.ev.counterAfter != check.ev.counterBefore;
+            if (!check.ev.gameObject)
+            {
+                check.ev.itemAfter = int32(bot->GetItemCount(check.ev.itemEntry, false));
+                read.itemConsumed = check.ev.itemAfter < check.ev.itemBefore;
+                read.onCooldown = check.ev.spellId && bot->HasSpellCooldown(check.ev.spellId);
+            }
+            read.lootOpened = !check.ev.lootOpenBefore && !bot->GetLootGUID().IsEmpty();
+
+            ReleaseHold(check.targetName, bot, "the quest use row ended", QUEST_USE_HOLD_VERB);
+
+            check.ev.verdict = D::JudgeQuestUse(read);
+            char const* const outcome = D::QuestUseOutcomeWord(check.ev.verdict);
+            char const* status = "applied";
+            char const* detail = "";
+            if (check.ev.verdict == D::QuestUseOutcome::Nothing)
+            {
+                status = "unchanged";
+                detail = D::QuestUseRefusal::NothingHappened;
+            }
+            else if (check.ev.verdict == D::QuestUseOutcome::Unreadable)
+            {
+                status = "error";
+                detail = D::QuestUseRefusal::Unreadable;
+            }
+            LOG_INFO("module.overseer", "overseer: quest use {} for '{}' read back as {} after {}ms",
+                     check.id, check.targetName, outcome, check.ev.waitedMs);
+
+            CharacterDatabase.Execute(
+                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
+                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                status, Esc(detail), EscLong(QuestUseJson(check.ev, outcome, detail)), check.id,
+                g_runToken);
+        }
+
+        _pendingQuestUses.swap(stillWaiting);
     }
 
     void SampleFallMovement()
