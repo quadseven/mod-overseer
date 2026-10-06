@@ -24537,7 +24537,7 @@ private:
                 // trainer does not teach it.
                 else if (auto const stopLeg = _trainingStopLegs.find(name);
                          stopLeg != _trainingStopLegs.end() &&
-                         target == "trainer:" + std::to_string(stopLeg->second.entry))
+                         target == OverseerDecisions::TrainingStopLegAim(stopLeg->second.entry))
                 {
                     if (TeachAtTrainingStop(stopLeg->second))
                     {
@@ -47751,7 +47751,7 @@ private:
             auto const walking = _trainingStopLegs.find(headName);
             if (walking != _trainingStopLegs.end())
             {
-                if (column == std::to_string(walking->second.entry))
+                if (OverseerDecisions::TrainingStopLegStillWalking(column, walking->second.entry))
                     continue;
                 LOG_INFO("module.overseer",
                          "overseer: {}'s training stop walk to creature {} for '{}' ended "
@@ -47909,7 +47909,7 @@ private:
             {
                 OverseerDecisions::TrainingStopMember const& member = members[pick.member];
                 uint32 const entry = trainers[pick.member];
-                if (!_travelAims.Claim(headName, "trainer:" + std::to_string(entry),
+                if (!_travelAims.Claim(headName, OverseerDecisions::TrainingStopLegAim(entry),
                                        OverseerDecisions::TravelOwner::TrainingStop))
                     continue;   // Claim has said why, once
                 bool const opening = stop.openedAt == 0;

@@ -43,6 +43,8 @@ using OverseerDecisions::TrainingStopEnds;
 using OverseerDecisions::TrainingStopFacts;
 using OverseerDecisions::TrainingStopHoldsRunStart;
 using OverseerDecisions::TrainingStopLegRetries;
+using OverseerDecisions::TrainingStopLegAim;
+using OverseerDecisions::TrainingStopLegStillWalking;
 using OverseerDecisions::TrainingStopMember;
 using OverseerDecisions::TrainingStopRestSeconds;
 using OverseerDecisions::TrainingStopStep;
@@ -183,6 +185,13 @@ void ALegThatTaughtNothingIsNotNothingLeft()
     Check("and no more", !TrainingStopLegRetries(28, 0, TRAINING_STOP_LEARN_TRIES));
     Check("a leg that learned something is settled", !TrainingStopLegRetries(28, 3, 0));
     Check("a leg that was offered nothing is not a failure", !TrainingStopLegRetries(0, 0, 0));
+
+    Check("the leg aim is the trainer: column text", TrainingStopLegAim(7311) == "trainer:7311");
+    Check("a column holding the leg's own aim is a leg still walking",
+          TrainingStopLegStillWalking("trainer:7311", 7311));
+    Check("a bare entry is not the aim the leg wrote", !TrainingStopLegStillWalking("7311", 7311));
+    Check("another trainer's aim is not this leg", !TrainingStopLegStillWalking("trainer:7312", 7311));
+    Check("a cleared column is a leg ended", !TrainingStopLegStillWalking("", 7311));
 
     TrainingStopFacts facts;
     facts.campaignArmed = true;
