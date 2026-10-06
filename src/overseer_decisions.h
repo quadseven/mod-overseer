@@ -6181,6 +6181,7 @@ constexpr char const* InInstance = "character is inside an instance or battlegro
 constexpr char const* Moving = "character is moving";
 constexpr char const* AlreadyRunning = "a quest use is already under way for this character";
 constexpr char const* HeldByAnother = "character is held by another verb";
+constexpr char const* AtCapacity   = "the realm already has the most hunts it allows";
 constexpr char const* NoTarget = "no such target within reach on this map";
 constexpr char const* TargetDead = "the creature is dead";
 constexpr char const* TooFar = "the target is too far to use the item or object";
@@ -21210,6 +21211,8 @@ struct HuntFacts
     // Another hunt row is running on this character. Only a START cares: the
     // poll of a hunt that is itself running leaves it false.
     bool alreadyHunting{false};
+    // The realm already has Overseer.Hunt.AtOnce hunts running (a start only).
+    bool atCapacity{false};
     // A living creature of the entry within HUNT_SEEK_YARDS.
     bool targetFound{true};
     // The nearest such creature's level minus the character's (may be negative).
