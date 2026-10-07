@@ -21320,6 +21320,8 @@ constexpr uint32_t HUNT_LEVEL_GAP = LoneLegLimits{}.levelGap;
 constexpr uint32_t HUNT_HEALTH_FLOOR_PCT = 50;
 // More hostiles than this already on the bot is a fight for its own AI.
 constexpr uint32_t HUNT_MAX_ATTACKERS = 2;
+// A hunt needs this many free bag slots to take a drop at all.
+constexpr uint32_t HUNT_MIN_FREE_BAG_SLOTS = 1;
 
 bool IsHuntRow(std::string const& command);
 
@@ -21347,6 +21349,9 @@ constexpr char const* Dead          = "the character is dead";
 constexpr char const* InInstance    = "the character is in an instance";
 constexpr char const* InFlight      = "the character is in flight";
 constexpr char const* AlreadyHunting = "the character already has a hunt running";
+// No free slot in the backpack or any bag: nothing a corpse holds can be taken,
+// a quest item included (the core refuses the store, and the bot says nothing).
+constexpr char const* BagsFull       = "the character has no free bag slot";
 constexpr char const* AtCapacity    = "the realm already has the most hunts it allows";
 constexpr char const* NoTarget      = "no living creature of the entry within reach";
 constexpr char const* TooHighLevel  = "the creature is too many levels above the character";
@@ -21363,6 +21368,8 @@ struct HuntFacts
     bool alive{true};
     bool inInstance{false};
     bool inFlight{false};
+    // Free slots in the backpack and every bag, as the core counts them.
+    uint32_t freeBagSlots{HUNT_MIN_FREE_BAG_SLOTS};
     // Another hunt row is running on this character. Only a START cares: the
     // poll of a hunt that is itself running leaves it false.
     bool alreadyHunting{false};
@@ -21377,7 +21384,7 @@ struct HuntFacts
 };
 
 // "" when a pull may start, else a HuntRefusal literal. First wall wins, in
-// this order: not a bot, not in world, dead, instance, flight, a hunt already
+// this order: not a bot, not in world, dead, instance, flight, bags full, a hunt already
 // running, the realm at its hunt ceiling, no target, level gap, health floor,
 // adds.
 char const* HuntGate(HuntFacts const& facts);

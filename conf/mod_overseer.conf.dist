@@ -487,7 +487,8 @@
 #                     respawn; it ends early when none can respawn before `max`). The
 #                     row ends at the kill count, at `max` (default 600, at most
 #                     1800 seconds), or when the bridge ends it. Refused when the
-#                     bot is dead, out of the world, in an instance or in flight,
+#                     bot is dead, out of the world, in an instance, in flight or has
+#                     no free bag slot (the core refuses every store then),
 #                     when the target is 3 or more levels above it, below half
 #                     health (it rests first) or with more than two hostiles on
 #                     it. 0 refuses every such row.
