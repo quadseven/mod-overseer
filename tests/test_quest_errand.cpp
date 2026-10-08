@@ -46,11 +46,36 @@ void TheGrammar()
     Expect(ParseQuestErrand("take quest:").verb == QuestErrandVerb::None, "no id");
     Expect(ParseQuestErrand("take quest:78a").verb == QuestErrandVerb::None, "not a number");
     Expect(ParseQuestErrand("take quest:0").verb == QuestErrandVerb::None, "zero is no quest");
-    Expect(ParseQuestErrand("abandon quest:7848").verb == QuestErrandVerb::None,
-           "only take and turnin");
+    QuestErrand const abandon = ParseQuestErrand("abandon quest:12619");
+    Expect(abandon.verb == QuestErrandVerb::Abandon && abandon.questId == 12619,
+           "abandon quest:12619");
+    Expect(ParseQuestErrand("abandon 12619").verb == QuestErrandVerb::None, "abandon needs quest:");
+    Expect(ParseQuestErrand("forget quest:7848").verb == QuestErrandVerb::None,
+           "only take, turnin and abandon");
     Expect(ParseQuestErrand("take quest:12345678901").verb == QuestErrandVerb::None,
            "an id too long to be one");
     Expect(ParseQuestErrand("").verb == QuestErrandVerb::None, "empty");
+}
+
+void TheAbandon()
+{
+    QuestErrand const abandon{QuestErrandVerb::Abandon, 12619};
+    QuestErrandFacts f;
+    f.questKnown = true;
+    f.status = 3;  // incomplete
+    Expect(QuestErrandRefusal(abandon, f).empty(), "an incomplete quest may be abandoned, no giver needed");
+    f.status = 5;  // failed
+    Expect(QuestErrandRefusal(abandon, f).empty(), "a failed quest may be abandoned");
+    f.status = 0;
+    Expect(QuestErrandRefusal(abandon, f) == "not in the quest log", "not in the log");
+    f.status = 1;
+    Expect(QuestErrandRefusal(abandon, f) == "it is complete; hand it in", "complete is handed in");
+    f.status = 3;
+    f.rewarded = true;
+    Expect(QuestErrandRefusal(abandon, f) == "already turned in", "a rewarded quest is kept");
+    f.rewarded = false;
+    f.questKnown = false;
+    Expect(QuestErrandRefusal(abandon, f) == "no such quest", "an unknown quest");
 }
 
 QuestErrandFacts Ready()
@@ -146,6 +171,8 @@ void TheAdapterSeams()
 int main()
 {
     TheGrammar();
+    TheAbandon();
+    
     TakingAtLothos();
     HandingInTheFragment();
     TheAdapterSeams();

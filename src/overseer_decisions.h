@@ -5595,6 +5595,12 @@ enum class QuestErrandVerb
     None,
     Take,
     TurnIn,
+    // `abandon quest:<id>`: the quest log's own abandon, which the core answers by
+    // taking back the item the quest handed over (2026-10-08). A death knight
+    // whose Battle-worn Sword was lost can only be given it again by taking the
+    // quest anew. Needs no giver; refused for a quest not in the log or already
+    // complete (that one is handed in).
+    Abandon,
 };
 
 struct QuestErrand
@@ -5603,7 +5609,7 @@ struct QuestErrand
     std::uint32_t questId{0};
 };
 
-// "take quest:7848" or "turnin quest:7848"; anything else is None.
+// "take quest:7848", "turnin quest:7848" or "abandon quest:7848"; anything else is None.
 QuestErrand ParseQuestErrand(std::string const& command);
 
 // What the adapter read, for one row. `status` is the core's QuestStatus
