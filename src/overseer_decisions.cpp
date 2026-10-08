@@ -15284,6 +15284,29 @@ uint32_t FarWalkTimeoutSeconds(float yards)
     return static_cast<uint32_t>(seconds);
 }
 
+uint32_t FarWalkRouteTimeoutSeconds(float routeYards)
+{
+    if (!(routeYards > 0.f))
+        return MAIL_WALK_TIMEOUT_FLOOR_SECONDS;
+    float const seconds = static_cast<float>(MAIL_WALK_TIMEOUT_FLOOR_SECONDS)
+        + routeYards / FAR_WALK_ROUTE_PACE_YARDS_PER_SECOND;
+    if (seconds >= static_cast<float>(FAR_WALK_ROUTE_TIMEOUT_CEILING_SECONDS))
+        return FAR_WALK_ROUTE_TIMEOUT_CEILING_SECONDS;
+    return static_cast<uint32_t>(seconds);
+}
+
+float RouteLengthYards(std::vector<RoutePoint> const& route)
+{
+    float yards = 0.f;
+    for (std::size_t i = 1; i < route.size(); ++i)
+    {
+        float const dx = route[i].x - route[i - 1].x;
+        float const dy = route[i].y - route[i - 1].y;
+        yards += std::sqrt(dx * dx + dy * dy);
+    }
+    return yards;
+}
+
 bool FarWalkRefusalRetryable(std::string const& reason)
 {
     namespace F = FarWalkRefusal;

@@ -17533,6 +17533,17 @@ constexpr uint32_t FAR_WALK_MAP_KALIMDOR = 1;
 constexpr uint32_t FAR_WALK_TIMEOUT_CEILING_SECONDS = 1800;
 constexpr uint32_t FAR_WALK_STALL_SECONDS = 120;
 
+// A FAR WALK THAT HAS TO GO ROUND (2026-10-08). The clock above is sized from the
+// straight line, and the stall reads the straight line too. A gnome in Dun Morogh
+// whose giver stands in Stormwind has no road that way: the surveyed route is
+// 15,442 yards of walking, and for its first stretch it leads AWAY from the
+// giver. Measured on the dev realm, the walk was ended as "stopped getting
+// nearer the spawn" with 82 legs done. A step along the route is progress, and a
+// route that long needs a clock sized from the route: a foot pace of 7 yards a
+// second, under an hour.
+constexpr float FAR_WALK_ROUTE_PACE_YARDS_PER_SECOND = 7.f;
+constexpr uint32_t FAR_WALK_ROUTE_TIMEOUT_CEILING_SECONDS = 3600;
+
 // THE BUDGET. Two far walks per bot per hour, four under way on the realm.
 constexpr uint32_t FAR_WALK_STARTS_PER_BOT = 2;
 constexpr uint32_t FAR_WALK_BUDGET_WINDOW_SECONDS = 3600;
@@ -17665,6 +17676,14 @@ bool FarWalkMapAllowed(uint32_t mapId);
 // A far walk's timeout for a destination this far away: the near walk's pace
 // and floor under FAR_WALK_TIMEOUT_CEILING_SECONDS.
 uint32_t FarWalkTimeoutSeconds(float yards);
+
+// THE CLOCK FOR A WALK THAT FOLLOWS A SURVEYED ROUTE, from the route's own
+// length. Never shorter than FarWalkTimeoutSeconds would give, so a short
+// route cannot take time away.
+uint32_t FarWalkRouteTimeoutSeconds(float routeYards);
+
+// THE LENGTH OF A ROUTE in yards, flat, summed leg by leg.
+float RouteLengthYards(std::vector<RoutePoint> const& route);
 
 namespace FarWalkRefusal
 {
