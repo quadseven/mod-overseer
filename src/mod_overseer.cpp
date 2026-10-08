@@ -60833,6 +60833,8 @@ private:
     // whatever the item's own template carries and reading it back off the item
     // is the only way to be casting the same thing the core is.
     static constexpr uint32 HEARTHSTONE_ITEM_ENTRY = 6948;
+    // The spell the stone casts (Hearthstone, 8690): cast on its own by a `recall`.
+    static constexpr uint32 HEARTHSTONE_SPELL_ID = 8690;
 
     // How close to the home a character has to read back before it has
     // arrived. Wide, and not because the spell is imprecise:
@@ -61111,19 +61113,22 @@ private:
             return refuse("character is on a transport");
 
         Item* stone = who->GetItemByEntry(HEARTHSTONE_ITEM_ENTRY);
-        if (!stone)
+        bool const recall = request.verb == HearthVerb::Recall;
+        if (recall && stone)
+            return refuse("character carries a hearthstone; use it");
+        if (!recall && !stone)
             return refuse("character carries no hearthstone");
-        ev.itemEntry = stone->GetEntry();
+        ev.itemEntry = stone ? stone->GetEntry() : 0;
 
-        ItemTemplate const* proto = stone->GetTemplate();
-        if (!proto)
+        ItemTemplate const* proto = stone ? stone->GetTemplate() : nullptr;
+        if (!recall && !proto)
             return refuse("the hearthstone has no template");
 
         // THE SPELL COMES OFF THE ITEM. Player::CastItemUseSpell casts whatever
         // proto->Spells[] carries with ITEM_SPELLTRIGGER_ON_USE, so reading the
         // same field is the only way this module is asking for the same spell
         // the core is going to run.
-        for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+        for (uint8 i = 0; proto && i < MAX_ITEM_PROTO_SPELLS; ++i)
         {
             if (proto->Spells[i].SpellId > 0
                 && proto->Spells[i].SpellTrigger == ITEM_SPELLTRIGGER_ON_USE)
@@ -61132,6 +61137,9 @@ private:
                 break;
             }
         }
+        // A character that lost its stone casts the stone's own spell.
+        if (recall)
+            ev.spellId = HEARTHSTONE_SPELL_ID;
         if (!ev.spellId)
             return refuse("the hearthstone has no on-use spell");
 
@@ -61206,6 +61214,17 @@ private:
         // because the mount is checked once, at Spell::prepare.
         HoldStillAndReport(who, ev.character, "hearth", ev.hold);
 
+        if (recall)
+        {
+            // Not triggered: the cast time, the interrupts and the cooldown are the
+            // ones a player's own cast would get.
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' lost its hearthstone and casts the hearthstone spell "
+                     "to its own bind point (hearth recall)",
+                     ev.character);
+            who->CastSpell(who, ev.spellId, false);
+        }
+        else
         {
             WorldPacket raw(CMSG_USE_ITEM, 1 + 1 + 1 + 4 + 8 + 4 + 1 + 4);
             raw << uint8(stone->GetBagSlot());

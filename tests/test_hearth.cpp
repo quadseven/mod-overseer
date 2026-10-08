@@ -22,6 +22,8 @@
 #include "overseer_decisions.h"
 
 #include <cstdio>
+#include <fstream>
+#include <sstream>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -129,10 +131,19 @@ void TheOnlyFormIsUseAndNothingAtAllMeansIt()
     CheckWord("aiming is refused by name", aimed.error.c_str(),
               "malformed hearth: use takes no arguments");
 
+    HearthRequest const recall = ParseHearthRequest("recall");
+    Check("recall is a recall", recall.verb == HearthVerb::Recall, true);
+    HearthRequest const padded_recall = ParseHearthRequest("  recall ");
+    Check("padded recall is a recall", padded_recall.verb == HearthVerb::Recall, true);
+    HearthRequest const aimed_recall = ParseHearthRequest("recall 609 1 2");
+    Check("a recall cannot be aimed either", aimed_recall.verb == HearthVerb::None, true);
+    CheckWord("aiming a recall is refused by name", aimed_recall.error.c_str(),
+              "malformed hearth: recall takes no arguments");
+
     HearthRequest const other = ParseHearthRequest("home");
     Check("another verb is not a hearth", other.verb == HearthVerb::None, true);
     CheckWord("an unknown verb says what it wanted", other.error.c_str(),
-              "malformed hearth: unknown verb (want use, or nothing at all)");
+              "malformed hearth: unknown verb (want use, recall, or nothing at all)");
 
     // Upstream's own word for the OTHER half of this, the one #286 replaced.
     // It sets a home; it never travelled to one. A row that asks for it here is
@@ -312,7 +323,7 @@ void EveryRefusalCarriesWhereToTryAgain()
     // again for as long as it exists.
     CheckWord("a malformed verb never succeeds",
               TownRetryWord(HearthRefusalRetry(
-                  "malformed hearth: unknown verb (want use, or nothing at all)")),
+                  "malformed hearth: unknown verb (want use, recall, or nothing at all)")),
               "never");
     CheckWord("an aimed hearth never succeeds",
               TownRetryWord(HearthRefusalRetry("malformed hearth: use takes no arguments")),
@@ -400,6 +411,36 @@ void TheOutcomeWordsAreTheOnesARowCarries()
 
 }  // namespace
 
+// THE EXECUTOR'S TWO RECALL GATES, pinned in the source, because DoHearth reads
+// a live character and cannot be called from here (the adapter compiles only in
+// CI). A recall is for a character that has LOST its stone: one that carries it
+// is told to use it, and a stone-less one is let through with no item and the
+// stone's own spell. The core is asked for that spell before either cast, so a
+// DBC that lacks it is a named refusal and not a blank cast.
+void TheRecallGatesAreInTheExecutor()
+{
+    std::ifstream in("src/mod_overseer.cpp");
+    std::ostringstream all;
+    all << in.rdbuf();
+    std::string const src = all.str();
+    auto at = [&](char const* needle, std::size_t from = 0) { return src.find(needle, from); };
+
+    std::size_t const fn = at("static char const* DoHearth(");
+    Check("the executor is found", fn != std::string::npos, true);
+    std::size_t const carries = at("character carries a hearthstone; use it", fn);
+    std::size_t const none = at("character carries no hearthstone", fn);
+    std::size_t const spell = at("ev.spellId = HEARTHSTONE_SPELL_ID", fn);
+    std::size_t const known = at("the core does not know that spell", fn);
+    std::size_t const cast = at("who->CastSpell(who, ev.spellId, false)", fn);
+    Check("a recall with a stone is refused", carries != std::string::npos, true);
+    Check("a normal use without a stone is still refused", none != std::string::npos, true);
+    Check("a recall casts the stone's own spell", spell != std::string::npos, true);
+    Check("the core is asked about that spell before the cast",
+          known != std::string::npos && cast != std::string::npos && spell < known && known < cast,
+          true);
+    Check("the gates come before the spell is chosen", carries < spell && none < spell, true);
+}
+
 int main()
 {
     TheOnlyFormIsUseAndNothingAtAllMeansIt();
@@ -411,6 +452,7 @@ int main()
     TheWaitComesFromTheSpellAndNotFromAConstant();
     EveryRefusalCarriesWhereToTryAgain();
     TheOutcomeWordsAreTheOnesARowCarries();
+    TheRecallGatesAreInTheExecutor();
 
     if (failures)
     {

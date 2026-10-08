@@ -10736,6 +10736,13 @@ enum class HearthVerb
 {
     None,  // not a hearth request; `error` says why
     Use,
+    // `recall`: the Hearthstone's own spell cast by a character that has lost the
+    // stone (2026-10-08). A death knight stranded on the ground below Acherus, its
+    // home, had no stone and no way to buy one, and no walk can climb 266 yards.
+    // Same spell, cast time, cooldown, interrupts and destination as the item
+    // (the character's own bind point); refused for a character that carries a
+    // stone, which must use it.
+    Recall,
 };
 
 struct HearthRequest
@@ -10745,7 +10752,8 @@ struct HearthRequest
 };
 
 // ONE FORM, AND NO DESTINATION. Whitespace-tolerant, otherwise literal: the
-// single lower-case word `use`, or an empty command meaning the same thing.
+// single lower-case word `use` (or an empty command meaning the same thing), or
+// `recall` for a character that has lost its stone.
 // There is deliberately no way to name a map, a coordinate or a town. The
 // destination of a hearthstone is the home a previous kind='bind' wrote into
 // character_homebind and nothing else, and a grammar that could ask for
