@@ -15832,7 +15832,8 @@ bool ClassicRecipeAllowed(uint32_t reqSkillRank)
 
 bool FarWalkAllowedAt(uint32_t mapId, uint32_t zoneId)
 {
-    return FarWalkMapAllowed(mapId) || Classic::IsStartingLand(mapId, zoneId);
+    return FarWalkMapAllowed(mapId) || Classic::IsStartingLand(mapId, zoneId) ||
+           mapId == DEATH_KNIGHT_START_MAP_ID;
 }
 
 ExitHearthStep ExitFailureHearthStep(ExitHearthFacts const& facts, unsigned maxAttempts)

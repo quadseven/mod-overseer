@@ -40,6 +40,8 @@ void TheDecision()
     Check("Silvermoon City", FarWalkAllowedAt(530, 3487));
     Check("Hellfire Peninsula stays refused", !FarWalkAllowedAt(530, 3483));
     Check("Northrend stays refused", !FarWalkAllowedAt(571, 3524));
+    Check("the death knight start may far walk", FarWalkAllowedAt(609, 4298));
+    Check("a dungeon still may not", !FarWalkAllowedAt(36, 0));
     Check("the classic continents still walk", FarWalkAllowedAt(0, 12) && FarWalkAllowedAt(1, 14));
     Check("a dungeon is no continent", !FarWalkAllowedAt(36, 1581));
 }

@@ -18301,6 +18301,14 @@ bool ClassicRecipeAllowed(uint32_t reqSkillRank);
 // only on the Eastern Kingdoms or Kalimdor". Outland proper stays refused.
 bool FarWalkAllowedAt(uint32_t mapId, uint32_t zoneId);
 
+// THE DEATH KNIGHT'S STARTING ZONE (2026-10-08). Map 609 is where a death knight
+// stands for its whole starting chain, and its givers lie more than the near
+// walk cap apart: Cave's Brug, a level 60 death knight, was refused the walk to
+// the giver of his first quest (about 1,100 yards) with "a far walk starts only
+// on the Eastern Kingdoms or Kalimdor" and stood idle. A far walk may start
+// there. There is no flight or boat on that map, so it goes on foot.
+constexpr uint32_t DEATH_KNIGHT_START_MAP_ID = 609;
+
 // -- a failed dungeon EXIT hearths out (2026-09-24) ---------------------------
 //
 // WHAT IT ENDS, measured on the dev realm. A leader alone inside Ragefire
