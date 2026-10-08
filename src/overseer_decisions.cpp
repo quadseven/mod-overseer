@@ -15780,6 +15780,33 @@ ExitHearthStep ExitFailureHearthStep(ExitHearthFacts const& facts, unsigned maxA
     return ExitHearthStep::Cast;
 }
 
+bool GroundGaveUpDuringWalk(std::int64_t walkSince, std::int64_t groundGaveUpAt)
+{
+    return walkSince > 0 && groundGaveUpAt >= walkSince;
+}
+
+EvacuationWay DecideEvacuationWay(bool groundGaveUp, ExitHearthStep hearth)
+{
+    if (!groundGaveUp)
+        return EvacuationWay::Walk;
+    switch (hearth)
+    {
+        case ExitHearthStep::Cast:
+        case ExitHearthStep::StopFirst:
+        case ExitHearthStep::Waiting:
+            return EvacuationWay::Hearth;
+        case ExitHearthStep::Impossible:
+        case ExitHearthStep::NotInside:
+            return EvacuationWay::Walk;
+    }
+    return EvacuationWay::Walk;
+}
+
+char const* EvacuationWayWord(EvacuationWay way)
+{
+    return way == EvacuationWay::Hearth ? "hearth" : "walk";
+}
+
 char const* ExitHearthStepWord(ExitHearthStep step)
 {
     switch (step)
