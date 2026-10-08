@@ -168,10 +168,30 @@ void TheAdapterSeams()
 
 }  // namespace
 
+// THE TAKE'S REACH IS THE WALK'S ARRIVAL RADIUS (2026-10-08). The spawn walk that
+// brings a character to a quest giver counts it arrived within
+// SPAWN_WALK_ARRIVE_YARDS; a take that asks for less refuses a character the
+// walk delivered ("no giver of that quest in reach"). Pinned in the source
+// because the executor reads a live character.
+void TheTakeReachIsTheWalksArrivalRadius()
+{
+    std::string const src = Read("src/mod_overseer.cpp");
+    std::size_t const fn = src.find("static Creature* QuestCreatureInReach(");
+    Expect(fn != std::string::npos, "the giver finder exists");
+    std::size_t const body = src.find("static char const* DoQuest(", fn);
+    std::size_t const reach = src.find("OverseerDecisions::SPAWN_WALK_ARRIVE_YARDS", fn);
+    Expect(reach != std::string::npos && reach < body,
+           "the giver is looked for within the spawn walk's arrival radius");
+    std::size_t const old = src.find("FindNearestCreature(entry, TRAVEL_ARRIVED_YARDS)", fn);
+    Expect(old == std::string::npos || old > body,
+           "and not within the travel errand's smaller one");
+}
+
 int main()
 {
     TheGrammar();
     TheAbandon();
+    TheTakeReachIsTheWalksArrivalRadius();
     
     TakingAtLothos();
     HandingInTheFragment();

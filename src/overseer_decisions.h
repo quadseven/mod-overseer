@@ -5585,8 +5585,9 @@ std::string LootCandidatesJson(std::vector<LootCandidate> const& candidates);
 // SatisfyQuestStatus, SatisfyQuestLog and CanAddQuest before
 // AddQuestAndCheckCompletion; CanRewardQuest before RewardQuest. The giver
 // must be a live creature whose quest-starter (or ender) relation names the
-// quest, within TRAVEL_ARRIVED_YARDS of the character: the radius the travel
-// errand arrives at. A quest that offers a choice of reward is refused rather
+// quest, within SPAWN_WALK_ARRIVE_YARDS of the character: the radius the walk
+// that brought it to the giver counts as arrived (it was the travel errand's 12,
+// which refused a character a spawn walk had delivered at 18.8 yards). A quest that offers a choice of reward is refused rather
 // than chosen for, since no choice here would be a player's. The outcome is
 // read back from the character's log, never assumed from the call.
 

@@ -68087,7 +68087,13 @@ private:
         {
             if (quest != questId)
                 continue;
-            Creature* npc = player->FindNearestCreature(entry, TRAVEL_ARRIVED_YARDS);
+            // THE REACH IS THE SPAWN WALK'S OWN ARRIVAL RADIUS (2026-10-08). The walk
+            // that brings a character to a giver counts it arrived within
+            // SPAWN_WALK_ARRIVE_YARDS (20), and the take used the travel errand's
+            // 12: Brug reached Instructor Razuvious at 18.8 yards and was refused
+            // 'no giver of that quest in reach'.
+            Creature* npc =
+                player->FindNearestCreature(entry, OverseerDecisions::SPAWN_WALK_ARRIVE_YARDS);
             if (npc && npc->IsAlive())
                 return npc;
         }
