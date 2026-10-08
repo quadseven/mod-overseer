@@ -68137,7 +68137,9 @@ private:
             WorldPacket raw(CMSG_QUESTLOG_REMOVE_QUEST, 1);
             raw << uint8(slot);
             raw.rpos(0);
-            session->HandleQuestLogRemoveQuest(raw);
+            WorldPackets::Quest::QuestLogRemoveQuest packet(std::move(raw));
+            packet.Read();
+            session->HandleQuestLogRemoveQuest(packet);
             if (player->GetQuestStatus(errand.questId) != QUEST_STATUS_NONE)
             {
                 describe("error", "the quest is still in the log");
