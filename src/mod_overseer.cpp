@@ -6315,16 +6315,6 @@ public:
         return static_cast<long>(it->second.routeCursor.at);
     }
 
-    // HOW LONG THE ROUTE THIS CHARACTER WALKS IS, in yards, or 0 when it walks
-    // none. Sizes the clock of a far walk that has to go round.
-    float RouteYardsOf(std::string const& name) const
-    {
-        auto const it = _state.find(name);
-        if (it == _state.end() || it->second.route.empty())
-            return 0.f;
-        return OverseerDecisions::RouteLengthYards(it->second.route);
-    }
-
     // THE SAME READING, NAMING THE PLAN IT IS ON (2026-09-24). See
     // OverseerDecisions::RouteMarkAdvanced.
     OverseerDecisions::RouteMark RouteMarkOf(std::string const& name) const
@@ -67401,14 +67391,22 @@ private:
                 bool walkedOnRoute = false;
                 if (ev.far)
                 {
-                    D::RouteMark const mark = _travelAims.RouteMarkOf(check.targetName);
+                    // THE WALK KEEPS ITS OWN ROUTE (ev.travel, advanced by RouteLeg), not
+                    // the travel-aim book's: the first version of this read the book and
+                    // never saw a mark (2026-10-08).
+                    D::RouteMark mark;
+                    if (!ev.travel.route.empty())
+                    {
+                        mark.route = ev.travel.routeSerial;
+                        mark.at = static_cast<long>(ev.travel.routeCursor.at);
+                    }
                     walkedOnRoute = D::RouteMarkAdvanced(ev.routeMark, mark);
                     ev.routeMark = mark;
                     if (!ev.routeClockSet && mark.route != 0)
                     {
                         ev.routeClockSet = true;
                         uint32 const routeMs =
-                            D::FarWalkRouteTimeoutSeconds(_travelAims.RouteYardsOf(check.targetName)) *
+                            D::FarWalkRouteTimeoutSeconds(D::RouteLengthYards(ev.travel.route)) *
                             1000u;
                         if (routeMs > ev.timeoutMs)
                         {
