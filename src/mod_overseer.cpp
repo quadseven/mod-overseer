@@ -34379,6 +34379,9 @@ private:
             coord.evacWalkSince.clear();
             coord.evacGaveUp.clear();
             coord.evacNoStone.clear();
+            for (auto it = _evacHearthing.begin(); it != _evacHearthing.end();)
+                it = std::time(nullptr) - it->second >= 30 ? _evacHearthing.erase(it)
+                                                           : std::next(it);
             coord.loggedHearthOut = false;
             return 0;   // the hold is something other than a body on the map
         }
