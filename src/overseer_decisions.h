@@ -6144,6 +6144,15 @@ char const* TownRetryWord(TownRetry retry);
 constexpr char const* USE_ITEM_ON_VERB = "use-item-on";
 constexpr char const* USE_GAMEOBJECT_VERB = "use-gameobject";
 
+// `use-item-here item:<entry>` (2026-10-08): a carried item used where the
+// character stands, with no target, as a player uses a quest item beside the
+// thing it works on. The death knight's first quest hands over a Battle-worn
+// Sword whose spell only works near a Runeforge (a spell-focus gameobject); the
+// bridge walks the character to one and this row uses the sword. The core
+// checks the focus itself, so beside no forge the cast fails and the row ends
+// `unchanged`.
+constexpr char const* USE_ITEM_HERE_VERB = "use-item-here";
+
 // Reach for a creature target. The item's own spell range is checked again by
 // the core, so this is the near edge of what any quest item allows.
 constexpr float QUEST_USE_CREATURE_YARDS = 8.0f;
@@ -6158,6 +6167,7 @@ bool IsQuestUseRow(std::string const& command);
 struct QuestUseRequest
 {
     bool gameObject{false};   // true: use-gameobject; false: use-item-on
+    bool here{false};         // true: use-item-here (no target, `item` only)
     std::uint32_t target{0};  // creature entry, or gameobject entry
     std::uint32_t item{0};    // item entry; 0 for a gameobject use
     char const* error{""};    // a QuestUseRefusal literal; empty when it parsed
@@ -6171,6 +6181,7 @@ namespace QuestUseRefusal
 {
 constexpr char const* MalformedItem = "malformed use-item-on command";
 constexpr char const* MalformedObject = "malformed use-gameobject command";
+constexpr char const* MalformedHere = "malformed use-item-here command";
 constexpr char const* NoBotAI = "character has no bot AI";
 constexpr char const* NotInWorld = "character is not in the world";
 constexpr char const* LoggingOut = "character is logging out";
@@ -6185,6 +6196,7 @@ constexpr char const* NoTarget = "no such target within reach on this map";
 constexpr char const* TargetDead = "the creature is dead";
 constexpr char const* TooFar = "the target is too far to use the item or object";
 constexpr char const* WrongTarget = "that item has no spell that takes a creature target";
+constexpr char const* NoHereSpell = "that item has no spell that needs no target";
 constexpr char const* ItemMissing = "the character does not carry that item";
 constexpr char const* ItemUnusable = "the core will not let this character use that item";
 constexpr char const* ItemOnCooldown = "the item's spell is on cooldown";

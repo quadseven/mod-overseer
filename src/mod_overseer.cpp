@@ -68180,6 +68180,7 @@ private:
         std::string character;
         std::string request;
         bool gameObject{false};
+        bool here{false};
         uint32 targetEntry{0};
         uint32 targetGuid{0};
         float yards{-1.0f};
@@ -68236,7 +68237,7 @@ private:
           << ",\"retry\":" << J(*reason ? TownRetryWord(QuestUseRefusalRetry(reason)) : "")
           << ",\"character\":" << J(ev.character)
           << ",\"verdict\":" << J(QuestUseOutcomeWord(ev.verdict))
-          << ",\"what\":" << J(ev.gameObject ? "gameobject" : "creature")
+          << ",\"what\":" << J(ev.gameObject ? "gameobject" : ev.here ? "here" : "creature")
           << ",\"target_entry\":" << ev.targetEntry
           << ",\"target_guid\":" << ev.targetGuid
           << ",\"yards\":" << ev.yards
@@ -68273,6 +68274,7 @@ private:
         if (*request.error)
             return refuse(request.error);
         ev.gameObject = request.gameObject;
+        ev.here = request.here;
         ev.targetEntry = request.target;
         ev.itemEntry = request.item;
 
@@ -68306,7 +68308,16 @@ private:
         ObjectGuid targetGuid;
         if (gate.inWorld)
         {
-            if (request.gameObject)
+            if (request.here)
+            {
+                // No target: the item is used where the character stands, and the
+                // core checks the spell's own focus and range.
+                gate.targetSeen = true;
+                gate.targetAlive = true;
+                gate.targetYards = 0.0f;
+                gate.reachYards = D::QUEST_USE_CREATURE_YARDS;
+            }
+            else if (request.gameObject)
             {
                 object = who->FindNearestGameObject(request.target, D::QUEST_USE_SEARCH_YARDS,
                                                     true);
@@ -68352,13 +68363,14 @@ private:
                         || proto->Spells[i].SpellTrigger != ITEM_SPELLTRIGGER_ON_USE)
                         continue;
                     SpellInfo const* info = sSpellMgr->GetSpellInfo(proto->Spells[i].SpellId);
-                    if (info && info->NeedsExplicitUnitTarget())
+                    if (info && info->NeedsExplicitUnitTarget() != request.here)
                     {
                         ev.spellId = uint32(proto->Spells[i].SpellId);
                         break;
                     }
                 }
-                gate.wrongTarget = ev.spellId == 0;
+                // For a here use the missing spell is its own refusal, below.
+                gate.wrongTarget = !request.here && ev.spellId == 0;
                 gate.itemUsable = who->CanUseItem(item) == EQUIP_ERR_OK;
                 gate.itemOnCooldown = ev.spellId && who->HasSpellCooldown(ev.spellId);
             }
@@ -68372,6 +68384,9 @@ private:
                 HoldStillAndReport(who, ev.character, QUEST_USE_HOLD_VERB, ev.hold);
             return refuse(wall);
         }
+
+        if (request.here && !ev.spellId)
+            return refuse(D::QuestUseRefusal::NoHereSpell);
 
         ev.counterBefore = QuestLogSum(who);
         ev.lootOpenBefore = !who->GetLootGUID().IsEmpty();
@@ -68389,6 +68404,23 @@ private:
         if (request.gameObject)
         {
             DriveGameObjectUse(session, targetGuid);
+        }
+        else if (request.here)
+        {
+            ev.itemBefore = int32(who->GetItemCount(request.item, false));
+            // CMSG_USE_ITEM with an empty target block (TARGET_FLAG_NONE): what a
+            // client sends for an item whose spell takes no target.
+            WorldPacket raw(CMSG_USE_ITEM, 1 + 1 + 1 + 4 + 8 + 4 + 1 + 4);
+            raw << uint8(item->GetBagSlot());
+            raw << uint8(item->GetSlot());
+            raw << uint8(1);  // castCount
+            raw << uint32(ev.spellId);
+            raw << item->GetGUID();
+            raw << uint32(0);  // glyphIndex
+            raw << uint8(0);   // castFlags
+            raw << uint32(TARGET_FLAG_NONE);
+            raw.rpos(0);
+            session->HandleUseItemOpcode(raw);
         }
         else
         {
@@ -68415,7 +68447,7 @@ private:
 
         LOG_INFO("module.overseer",
                  "overseer: '{}' is using {} {} (item {}, spell {}) at {} yards; judging in {}ms",
-                 ev.character, request.gameObject ? "gameobject" : "creature", ev.targetEntry,
+                 ev.character, request.gameObject ? "gameobject" : request.here ? "here" : "creature", ev.targetEntry,
                  ev.itemEntry, ev.spellId, ev.yards, ev.windowMs);
 
         QuestUseCheck check;

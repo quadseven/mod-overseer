@@ -50,6 +50,23 @@ QuestUseGateFacts Ready()
     return f;
 }
 
+void TheHereVerbParses()
+{
+    QuestUseRequest r = ParseQuestUseRequest("use-item-here item:38607");
+    Expect(*r.error == '\0' && r.here && !r.gameObject && r.item == 38607 && r.target == 0,
+           "use-item-here item:N parses with no target");
+    ExpectText("a missing item", ParseQuestUseRequest("use-item-here").error, R::MalformedHere);
+    ExpectText("a creature key is no here key",
+               ParseQuestUseRequest("use-item-here creature:5").error, R::MalformedHere);
+    ExpectText("a zero item", ParseQuestUseRequest("use-item-here item:0").error,
+               R::MalformedHere);
+    ExpectText("an extra word", ParseQuestUseRequest("use-item-here item:5 item:6").error,
+               R::MalformedHere);
+    Expect(IsQuestUseRow("use-item-here item:38607"), "use-item-here is a use row");
+    Expect(QuestUseRefusalRetry(R::MalformedHere) == TownRetry::Never, "malformed here never retried");
+    Expect(QuestUseRefusalRetry(R::NoHereSpell) == TownRetry::Never, "no here spell never retried");
+}
+
 void TheRowIsRecognisedByItsFirstWord()
 {
     Expect(IsQuestUseRow("use-item-on creature:1 item:2"), "use-item-on is a use row");
@@ -258,6 +275,7 @@ void TheJudge()
 
 int main()
 {
+    TheHereVerbParses();
     TheRowIsRecognisedByItsFirstWord();
     TheItemGrammar();
     TheObjectGrammar();
