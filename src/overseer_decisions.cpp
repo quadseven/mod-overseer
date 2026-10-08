@@ -19371,7 +19371,8 @@ bool QuestUseKeyed(std::string const& word, char const* key, std::uint32_t& valu
 bool IsQuestUseRow(std::string const& command)
 {
     std::vector<std::string> const words = QuestUseWords(command);
-    return !words.empty() && (words[0] == USE_ITEM_ON_VERB || words[0] == USE_GAMEOBJECT_VERB);
+    return !words.empty() && (words[0] == USE_ITEM_ON_VERB || words[0] == USE_GAMEOBJECT_VERB ||
+                              words[0] == USE_ITEM_HERE_VERB);
 }
 
 QuestUseRequest ParseQuestUseRequest(std::string const& command)
@@ -19394,6 +19395,19 @@ QuestUseRequest ParseQuestUseRequest(std::string const& command)
             return request;
         }
         request.target = entry;
+        return request;
+    }
+
+    if (words[0] == USE_ITEM_HERE_VERB)
+    {
+        request.here = true;
+        std::uint32_t item = 0;
+        if (words.size() != 2 || !QuestUseKeyed(words[1], "item", item))
+        {
+            request.error = QuestUseRefusal::MalformedHere;
+            return request;
+        }
+        request.item = item;
         return request;
     }
 
@@ -19474,7 +19488,8 @@ char const* QuestUseGate(QuestUseGateFacts const& facts)
 TownRetry QuestUseRefusalRetry(std::string const& detail)
 {
     namespace R = QuestUseRefusal;
-    if (detail == R::MalformedItem || detail == R::MalformedObject || detail == R::NoBotAI ||
+    if (detail == R::MalformedItem || detail == R::MalformedObject || detail == R::MalformedHere ||
+        detail == R::NoBotAI || detail == R::NoHereSpell ||
         detail == R::WrongTarget || detail == R::ItemMissing || detail == R::ItemUnusable)
         return TownRetry::Never;
     if (detail == R::InInstance)
