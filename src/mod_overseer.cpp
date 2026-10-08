@@ -67168,6 +67168,10 @@ private:
         {
             if (!D::FarWalkAllowedAt(ev.mapId, who->GetZoneId()))
                 return refuse(D::FarWalkRefusal::NotOnAContinent);
+            if (ev.mapId == D::DEATH_KNIGHT_START_MAP_ID)
+                LOG_INFO("module.overseer",
+                         "overseer: {} walk {} - '{}' far walks in the death knight start zone",
+                         noun, id, ev.character);
             if (char const* wall = armFar(); *wall)
                 return refuse(wall);
         }
