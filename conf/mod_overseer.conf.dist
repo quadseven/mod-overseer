@@ -604,6 +604,33 @@
 #
 #Overseer.Natural.Guilds = ""
 #
+#    Overseer.Rename.Offline
+#        Description: Whether a `rename-to <Name>` row (kind='job') may rename a
+#                     character that is OFFLINE. Off, such a row is refused
+#                     with `target not online`, as it always was. On, the
+#                     module logs the character in headless (the naturalize
+#                     verbs' mechanism, one row per character at a time),
+#                     renames it through the same path as an online rename
+#                     (name check, taken-name check, roster, raid seat and
+#                     the other name-keyed rows moved) and logs it out again.
+#                     Only a character of a guild in Overseer.Natural.Guilds
+#                     is renamed this way; a roster or family character is
+#                     refused, and so is one a real client holds. An online
+#                     target is not affected by this key.
+#
+#        Default:     0
+#
+#Overseer.Rename.Offline = 0
+#
+#    Overseer.Rename.OfflineMax
+#        Description: The most headless acts (offline renames and naturalize
+#                     rows together) in flight on the realm at once. A row
+#                     over the cap is refused with "retry in a minute".
+#
+#        Default:     4
+#
+#Overseer.Rename.OfflineMax = 4
+#
 #    Overseer.Retire.KeepGuilds
 #        Description: The guilds, by name, comma separated, whose members a
 #                     `retire` row (kind='job', command `retire`) never deletes.
