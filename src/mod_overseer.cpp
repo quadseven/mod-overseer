@@ -66129,6 +66129,8 @@ private:
         OverseerDecisions::RouteMark routeMark{};
         bool routeClockSet{false};
         uint32 legs{0};
+        // The last ten second mark a quest party leader's position was logged at.
+        uint32 partyPosMark{0};
         uint32 groundRefusals{0};
         bool alreadyThere{false};
         std::string reachedName;
@@ -67418,6 +67420,25 @@ private:
                             ev.timeoutMs = routeMs;
                         }
                     }
+                }
+                // A QUEST PARTY LEADER'S WALK IS LOGGED EVERY TEN SECONDS (2026-10-08, the
+                // party-walk stall): its spot, its gap to the aim, whether it is mounted,
+                // and who its master is, to set beside a solo walk of the same length.
+                if (QuestPartyOf(check.targetName) && ev.waitedMs / 10000u != ev.partyPosMark)
+                {
+                    ev.partyPosMark = ev.waitedMs / 10000u;
+                    Player* const masterOf = [&]() -> Player*
+                    {
+                        PlayerbotAI* const ai = GET_PLAYERBOT_AI(bot);
+                        return ai ? ai->GetMaster() : nullptr;
+                    }();
+                    LOG_INFO("module.overseer",
+                             "overseer: party walk {} - leader '{}' at {:.0f},{:.0f} is {:.0f} "
+                             "yards from the aim after {}s and {} leg(s); mounted {}, master '{}'",
+                             check.id, check.targetName, bot->GetPositionX(), bot->GetPositionY(),
+                             ev.nowYards, ev.waitedMs / 1000u, ev.legs,
+                             bot->IsMounted() ? "yes" : "no",
+                             masterOf ? masterOf->GetName() : std::string("none"));
                 }
                 if (walkedOnRoute)
                 {
