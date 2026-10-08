@@ -130,6 +130,26 @@ void FarIsPastTheNearCap()
     Check("a dungeon is no continent", FarWalkMapAllowed(36), false);
 }
 
+// THE WALK THAT HAS TO GO ROUND (2026-10-08). A gnome in Dun Morogh walking to a
+// giver in Stormwind: 3,321 yards in a line, 15,442 yards of surveyed route.
+void TheRouteClock()
+{
+    // 60 + 15442 / 7 = 2266: long past the straight-line clock's 1008 seconds.
+    CheckNumber("the straight-line clock is too short for the detour",
+                FarWalkTimeoutSeconds(3321.f), 1008);
+    CheckNumber("the detour's own clock", FarWalkRouteTimeoutSeconds(15442.f), 2266);
+    Check("the route clock outlasts the straight one",
+          FarWalkRouteTimeoutSeconds(15442.f) > FarWalkTimeoutSeconds(3321.f), true);
+    CheckNumber("no route, the floor", FarWalkRouteTimeoutSeconds(0.f),
+                MAIL_WALK_TIMEOUT_FLOOR_SECONDS);
+    CheckNumber("a route is capped under the hour", FarWalkRouteTimeoutSeconds(1000000.f),
+                FAR_WALK_ROUTE_TIMEOUT_CEILING_SECONDS);
+
+    std::vector<RoutePoint> route{{0.f, 0.f, 0.f}, {3.f, 4.f, 9.f}, {3.f, 14.f, 0.f}};
+    Check("a route is summed flat, leg by leg", RouteLengthYards(route) == 15.f, true);
+    Check("no route has no length", RouteLengthYards({}) == 0.f, true);
+}
+
 void TheFarClock()
 {
     CheckNumber("a far walk's floor", FarWalkTimeoutSeconds(0.f), MAIL_WALK_TIMEOUT_FLOOR_SECONDS);
@@ -357,6 +377,7 @@ int main()
     ARowMayAskForTheFarCap();
     FarIsPastTheNearCap();
     TheFarClock();
+    TheRouteClock();
     TheBudget();
     AFightPausesTheWalk();
     TheWalksOwnFlight();

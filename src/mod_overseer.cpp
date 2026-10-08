@@ -6315,6 +6315,16 @@ public:
         return static_cast<long>(it->second.routeCursor.at);
     }
 
+    // HOW LONG THE ROUTE THIS CHARACTER WALKS IS, in yards, or 0 when it walks
+    // none. Sizes the clock of a far walk that has to go round.
+    float RouteYardsOf(std::string const& name) const
+    {
+        auto const it = _state.find(name);
+        if (it == _state.end() || it->second.route.empty())
+            return 0.f;
+        return OverseerDecisions::RouteLengthYards(it->second.route);
+    }
+
     // THE SAME READING, NAMING THE PLAN IT IS ON (2026-09-24). See
     // OverseerDecisions::RouteMarkAdvanced.
     OverseerDecisions::RouteMark RouteMarkOf(std::string const& name) const
@@ -66124,6 +66134,10 @@ private:
         uint32 timeoutMs{0};
         uint32 waitedMs{0};
         uint32 sinceProgressMs{0};
+        // THE SURVEYED ROUTE THE WALKER IS ON (2026-10-08). A step along it is
+        // progress whatever the straight line says; its length sizes the clock.
+        OverseerDecisions::RouteMark routeMark{};
+        bool routeClockSet{false};
         uint32 legs{0};
         uint32 groundRefusals{0};
         bool alreadyThere{false};
@@ -67382,7 +67396,36 @@ private:
             if (facts.present && facts.sameMap)
             {
                 ev.nowYards = bot->GetExactDist(ev.boxX, ev.boxY, ev.boxZ);
-                if (D::MailWalkMadeProgress(ev.bestYards, ev.nowYards))
+                // A far walk that goes round reads its progress along the route
+                // and its clock from the route's length (2026-10-08).
+                bool walkedOnRoute = false;
+                if (ev.far)
+                {
+                    D::RouteMark const mark = _travelAims.RouteMarkOf(check.targetName);
+                    walkedOnRoute = D::RouteMarkAdvanced(ev.routeMark, mark);
+                    ev.routeMark = mark;
+                    if (!ev.routeClockSet && mark.route != 0)
+                    {
+                        ev.routeClockSet = true;
+                        uint32 const routeMs =
+                            D::FarWalkRouteTimeoutSeconds(_travelAims.RouteYardsOf(check.targetName)) *
+                            1000u;
+                        if (routeMs > ev.timeoutMs)
+                        {
+                            LOG_INFO("module.overseer",
+                                     "overseer: {} walk {} - '{}' follows a surveyed route, so "
+                                     "its clock is {}s instead of {}s",
+                                     noun, check.id, check.targetName, routeMs / 1000u,
+                                     ev.timeoutMs / 1000u);
+                            ev.timeoutMs = routeMs;
+                        }
+                    }
+                }
+                if (walkedOnRoute)
+                {
+                    ev.sinceProgressMs = 0;
+                }
+                else if (D::MailWalkMadeProgress(ev.bestYards, ev.nowYards))
                 {
                     ev.bestYards = ev.nowYards;
                     ev.sinceProgressMs = 0;
