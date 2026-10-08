@@ -67411,7 +67411,7 @@ private:
                         if (routeMs > ev.timeoutMs)
                         {
                             LOG_INFO("module.overseer",
-                                     "overseer: {} walk {} - '{}' follows a surveyed route, so "
+                                     "overseer: {} walk {} - '{}' follows its own surveyed route, so "
                                      "its clock is {}s instead of {}s",
                                      noun, check.id, check.targetName, routeMs / 1000u,
                                      ev.timeoutMs / 1000u);
