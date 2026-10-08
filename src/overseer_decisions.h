@@ -18299,6 +18299,42 @@ bool ExitHearthHoldsAdoption(std::vector<ExitHearthStep> const& steps,
                              uint32_t episodeSeconds,
                              uint32_t ceilingSeconds = EXIT_HEARTH_EPISODE_SECONDS);
 
+// -- an evacuation the ground cannot finish hearths out (2026-10-08) ---------
+//
+// MEASURED ON THE DEV REALM, 2026-10-08. A family stood at (-118, 2133, 145)
+// in Shadowfang Keep, 116 yards from the exit door, with no route from there
+// to it. The walk out was released as unreachable after eight refused polls
+// (40 seconds) and the next five-second poll of the coordinator's REPAIRING
+// leg aimed all four of them at the same door again. That repeated for eleven
+// hours: REPAIRING's evacuation had no deadline and, unlike a failed EXIT, no
+// hearth, so the operator's rule (no worldserver restart while a family is
+// inside a dungeon) blocked every roll behind it.
+//
+// A person whose walk to the door cannot be done hearths out. The wall to
+// whoever is walked out is the same one DecideStrandedWay's rule 6b names: the
+// travel drive's ground give-up. So a member whose walk out has been released
+// as unreachable since the evacuation began is no longer walked at that door:
+// it is cast for through the existing EXIT hearth step instead. A member that
+// cannot hearth (no stone, cooling down, attempts spent) keeps its walk, which
+// is what happened to every member before.
+enum class EvacuationWay
+{
+    Walk,    // escort it to the exit door, as before
+    Hearth   // stop escorting it; the exit hearth step casts for it
+};
+
+// `walkSince` is when this member was first aimed at the door in this
+// evacuation; `groundGaveUpAt` is when the travel drive last released any walk
+// of its as unreachable on the ground. Both are seconds since the epoch, zero
+// for "never". True when the give-up came after the walk began.
+bool GroundGaveUpDuringWalk(std::int64_t walkSince, std::int64_t groundGaveUpAt);
+
+// `hearth` is ExitFailureHearthStep for the member. Impossible, and
+// NotInside, leave the walk as it was: there is nothing else to try.
+EvacuationWay DecideEvacuationWay(bool groundGaveUp, ExitHearthStep hearth);
+
+char const* EvacuationWayWord(EvacuationWay way);
+
 // -- a spread family hearths to the inn most of it shares (2026-09-24) -------
 //
 // MEASURED ON THE DEV REALM, 2026-09-24 08:00-08:09. The Horde family's

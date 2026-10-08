@@ -20609,6 +20609,17 @@ private:
                it->second.purpose == EscortPurpose::LeaveInstance;
     }
 
+    // IS THIS CHARACTER BEING HEARTHED OUT OF AN INSTANCE BY AN EVACUATION whose
+    // walk the ground refused? The same question WalkingOutOfInstance answers for
+    // a walk, asked for the cast that replaces it: with the escort gone nothing
+    // else would keep the dungeon brain from walking the member back toward a
+    // boss while it casts. Expires on its own, so a poll that stops asking ends it.
+    bool HearthingOutOfInstance(std::string const& name) const
+    {
+        auto const it = _evacHearthing.find(name);
+        return it != _evacHearthing.end() && std::time(nullptr) - it->second < 30;
+    }
+
     // WHICH FOLLOWERS MAY NOT BE WALKED TO THEIR LEADER YET, AND SINCE WHEN
     // (#298). Written by the death breaker on the poll it ends a catch-up walk
     // for killing its follower; read by DriveCatchUp before it starts another.
@@ -26242,7 +26253,7 @@ private:
             // so the run row must still be touched for it. Liveness outlives
             // the work, and a signal written only on the arming path is a run
             // that goes cold with people standing in it.
-            if (WalkingOutOfInstance(name))
+            if (WalkingOutOfInstance(name) || HearthingOutOfInstance(name))
             {
                 StandDownDungeonBrain(name, bot, botAI);
                 continue;
@@ -31856,6 +31867,16 @@ private:
         // then left alone. See WalkStragglersOut.
         bool loggedWalkingOut{false};
         bool loggedNoWayOut{false};
+        bool loggedHearthOut{false};
+        // WHEN EACH MEMBER WAS FIRST AIMED AT THE EXIT DOOR in the evacuation now
+        // running, so a ground give-up can be told from one that came before it
+        // (WalkStragglersOut, OverseerDecisions::DecideEvacuationWay).
+        std::map<std::string, time_t> evacWalkSince;
+        // Members whose walk out was released as unreachable during it. Latched
+        // for the evacuation: the stranded drive clears its own give-up stamp on
+        // an ordinary party poll, and a member must not go back to the walk the
+        // ground refused because that stamp went.
+        std::set<std::string> evacGaveUp;
         // AND THE TWO THE REJOIN SAYS ONCE (#384), which are the same two
         // sentences pointed the other way: `loggedWalkingBackIn` rations why
         // anybody is being walked back TO an instance the rest of the party is
@@ -32418,6 +32439,15 @@ private:
         std::map<std::string, std::string> lastStep;
     };
     std::map<std::string, ExitHearthEpisode> _exitHearths;
+    // The hearth episode of an EVACUATION whose walk the ground refused, per
+    // family (WalkStragglersOut). Kept apart from _exitHearths: that one holds the
+    // run a failed EXIT left behind and IDLE reads it to finalize that run, and an
+    // evacuation owns no run to finalize.
+    std::map<std::string, ExitHearthEpisode> _evacHearths;
+    // Who was cast for by an evacuation on its last poll, and when, so the
+    // dungeon brain stays stood down for them while the escort that used to say
+    // so is gone (HearthingOutOfInstance).
+    std::map<std::string, time_t> _evacHearthing;
 
     static uint32 HearthstoneSpellOf(Player* who)
     {
@@ -34339,15 +34369,101 @@ private:
         OverseerDecisions::DungeonWrongSide const evacuation =
             OverseerDecisions::DungeonRunWrongSide(states);
         if (evacuation.walk.empty() && evacuation.wait.empty())
+        {
+            // Everybody is out (or was never in), so the next evacuation starts
+            // its attempts and its clocks afresh.
+            _evacHearths.erase(FamilyOfCharacter(leaderName));
+            coord.evacWalkSince.clear();
+            coord.evacGaveUp.clear();
+            coord.loggedHearthOut = false;
             return 0;   // the hold is something other than a body on the map
+        }
 
         std::ostringstream aim;
         aim << "trigger:" << portal.exitTriggerId;
         std::string const exitAim = aim.str();
 
+        // A WALK THE GROUND REFUSED IS NOT AIMED AGAIN; THE STONE IS USED (2026-10-08).
+        // Measured in Shadowfang Keep: four members 116 yards from the exit
+        // door with no route to it. The travel drive released each walk as
+        // unreachable after 40 seconds, and the next poll here aimed them at the
+        // same door again, for eleven hours, with the instance held open and the
+        // operator's rule against restarting the world behind it. A person whose
+        // walk to the door cannot be done hearths out, as a failed EXIT already
+        // does (DriveExitHearths, the same cast and the same three attempts). A
+        // member that cannot hearth keeps its walk. The escort of a member sent
+        // to the stone is simply not marked, so SweepDungeonEscorts ends it and
+        // the aim with it on the next poll.
+        std::string const family = FamilyOfCharacter(leaderName);
+        ExitHearthEpisode& episode = _evacHearths[family];
+        if (episode.mapId != portal.insideMapId)
+        {
+            episode = ExitHearthEpisode();
+            episode.mapId = portal.insideMapId;
+            episode.since = std::time(nullptr);
+        }
+        time_t const now = std::time(nullptr);
+        std::vector<std::string> hearthers;
         for (std::string const& name : evacuation.walk)
-            EscortToward(name, exitAim, splitCopy ? "SPLIT" : "RESET",
-                         EscortPurpose::LeaveInstance);
+        {
+            time_t const walkSince = coord.evacWalkSince.emplace(name, now).first->second;
+            auto const gaveUp = _strandedGroundGiveUp.find(name);
+            if (OverseerDecisions::GroundGaveUpDuringWalk(
+                    walkSince, gaveUp == _strandedGroundGiveUp.end() ? 0 : gaveUp->second))
+                coord.evacGaveUp.insert(name);
+            bool const groundGaveUp = coord.evacGaveUp.count(name) != 0;
+
+            OverseerDecisions::EvacuationWay way = OverseerDecisions::EvacuationWay::Walk;
+            if (groundGaveUp)
+            {
+                Player* bot = ObjectAccessor::FindPlayerByName(name);
+                OverseerDecisions::ExitHearthFacts facts;
+                facts.inWorld = bot && bot->IsInWorld();
+                facts.onInsideMap = facts.inWorld && bot->GetMapId() == portal.insideMapId;
+                if (facts.onInsideMap)
+                {
+                    uint32 const spellId = HearthstoneSpellOf(bot);
+                    facts.alive = bot->IsAlive();
+                    facts.carriesStone = spellId != 0;
+                    facts.onCooldown = spellId && bot->HasSpellCooldown(spellId);
+                    facts.inCombat = bot->IsInCombat();
+                    facts.moving = bot->isMoving();
+                    facts.pending = HearthPendingFor(name);
+                    facts.attempts = episode.attempts[name];
+                }
+                way = OverseerDecisions::DecideEvacuationWay(
+                    true, OverseerDecisions::ExitFailureHearthStep(facts));
+            }
+
+            if (way == OverseerDecisions::EvacuationWay::Hearth)
+            {
+                hearthers.push_back(name);
+                _evacHearthing[name] = now;
+            }
+            else
+                EscortToward(name, exitAim, splitCopy ? "SPLIT" : "RESET",
+                             EscortPurpose::LeaveInstance);
+        }
+        if (!hearthers.empty())
+        {
+            if (!coord.loggedHearthOut)
+            {
+                coord.loggedHearthOut = true;
+                LOG_WARN("module.overseer",
+                         "overseer: dungeon run {} cannot walk {} out of map {} - the walk to "
+                         "areatrigger {} was released as unreachable on the ground, so they "
+                         "USE THEIR HEARTHSTONES instead, as a player would. No teleport is "
+                         "written and no map is changed",
+                         coord.runNumber, JoinNames(hearthers), portal.insideMapId,
+                         portal.exitTriggerId);
+            }
+            if (!episode.runId)
+                episode.runId = coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId);
+            episode.campaignId = coord.campaignId;
+            episode.runNumber = coord.runNumber;
+            episode.portal = coord.portalKeyword;
+            DriveExitHearths(family, leaderName, hearthers, episode, splitCopy ? "SPLIT" : "RESET");
+        }
 
         // AND THE DOOR IS KNOCKED ON AT POLL RATE, NOT ONLY ON ARRIVAL, which
         // for the measured pair is the difference between walking eight yards
