@@ -9059,7 +9059,18 @@ HearthRequest ParseHearthRequest(std::string const& command)
         return request;
     }
 
-    request.error = "malformed hearth: unknown verb (want use, or nothing at all)";
+    if (words[0] == "recall")
+    {
+        if (words.size() == 1)
+        {
+            request.verb = HearthVerb::Recall;
+            return request;
+        }
+        request.error = "malformed hearth: recall takes no arguments";
+        return request;
+    }
+
+    request.error = "malformed hearth: unknown verb (want use, recall, or nothing at all)";
     return request;
 }
 
@@ -9159,8 +9170,11 @@ TownRetry HearthRefusalRetry(std::string const& detail)
     // have to change for the SAME row to succeed.
     static char const* const NEVER[] = {
         "malformed hearth: use takes no arguments",
-        "malformed hearth: unknown verb (want use, or nothing at all)",
+        "malformed hearth: recall takes no arguments",
+        "malformed hearth: unknown verb (want use, recall, or nothing at all)",
         "malformed hearth request",
+        // A recall for a character that carries a stone: it must use the stone.
+        "character carries a hearthstone; use it",
         // The item is the wall, which is what Never means here. Waiting does
         // not put a hearthstone in a bag and neither does walking; somebody has
         // to hand one over or an innkeeper has to replace it, and either way it

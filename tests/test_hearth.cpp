@@ -129,10 +129,19 @@ void TheOnlyFormIsUseAndNothingAtAllMeansIt()
     CheckWord("aiming is refused by name", aimed.error.c_str(),
               "malformed hearth: use takes no arguments");
 
+    HearthRequest const recall = ParseHearthRequest("recall");
+    Check("recall is a recall", recall.verb == HearthVerb::Recall, true);
+    HearthRequest const padded_recall = ParseHearthRequest("  recall ");
+    Check("padded recall is a recall", padded_recall.verb == HearthVerb::Recall, true);
+    HearthRequest const aimed_recall = ParseHearthRequest("recall 609 1 2");
+    Check("a recall cannot be aimed either", aimed_recall.verb == HearthVerb::None, true);
+    CheckWord("aiming a recall is refused by name", aimed_recall.error.c_str(),
+              "malformed hearth: recall takes no arguments");
+
     HearthRequest const other = ParseHearthRequest("home");
     Check("another verb is not a hearth", other.verb == HearthVerb::None, true);
     CheckWord("an unknown verb says what it wanted", other.error.c_str(),
-              "malformed hearth: unknown verb (want use, or nothing at all)");
+              "malformed hearth: unknown verb (want use, recall, or nothing at all)");
 
     // Upstream's own word for the OTHER half of this, the one #286 replaced.
     // It sets a home; it never travelled to one. A row that asks for it here is
@@ -312,7 +321,7 @@ void EveryRefusalCarriesWhereToTryAgain()
     // again for as long as it exists.
     CheckWord("a malformed verb never succeeds",
               TownRetryWord(HearthRefusalRetry(
-                  "malformed hearth: unknown verb (want use, or nothing at all)")),
+                  "malformed hearth: unknown verb (want use, recall, or nothing at all)")),
               "never");
     CheckWord("an aimed hearth never succeeds",
               TownRetryWord(HearthRefusalRetry("malformed hearth: use takes no arguments")),
