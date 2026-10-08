@@ -278,6 +278,7 @@
 // reach of the seller - the same three headers mod-playerbots' own
 // TravelAction.cpp:8-10 uses for its sweep.
 #include "ItemPackets.h"
+#include "QuestPackets.h"
 #include "CellImpl.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
