@@ -9869,6 +9869,7 @@ enum class RenamePlan
 {
     Refuse,           // a refusal stands, or the character is between worlds
     EvictThenRename,  // a bot: log out, rename offline, log back in
+    EvictRenameStayOut,  // a bot logged in only for this: log out, rename, stay out
     RenameThenKick,   // a real client: the core's online path
 };
 
@@ -9908,6 +9909,53 @@ std::vector<RenameTable> const& RenameTables();
 // and `oldName` arrive already escaped by the caller.
 std::string RenameRowStatement(RenameTable const& table, std::string const& newName,
                                std::string const& oldName);
+
+// A RENAME OF AN OFFLINE CHARACTER (2026-10-08). The bridge's team sync asks
+// recruits to take their approved names, and a realm keeps most of its
+// characters logged out, so `rename-to` answered `target not online` to every
+// one of them. With Overseer.Rename.Offline on, the module logs the character
+// in headlessly through the helper the naturalize verbs use (the random-bot
+// holder, one row at a time, EvictHeadlessBot at the end), asks the same
+// questions of the Player the database loaded, renames it through the plan
+// above and leaves it logged out. A character that is online keeps the
+// existing path untouched.
+struct RenameOfflineFacts
+{
+    bool online{false};         // a Player by that name is in the world now
+    bool switchOn{false};       // Overseer.Rename.Offline
+    bool exists{false};         // the character cache knows the name
+    bool guildListed{false};    // its guild is in Overseer.Natural.Guilds
+    bool inFamily{false};       // any overseer_roster row names it
+    bool clientAttached{false}; // a real game client holds its session
+    bool nameValid{false};
+    bool nameTaken{false};
+    bool sameName{false};
+    bool rowInFlight{false};    // a headless act for this character is running
+    unsigned actsInFlight{0};   // headless acts running on the realm
+    unsigned actsCap{0};        // Overseer.Rename.OfflineMax
+};
+
+enum class RenameRoute : std::uint8_t
+{
+    ExistingPath,  // online: DoRename as it always was
+    Refuse,        // answer the row with `reason`
+    HeadlessAct,   // log it in, rename, log it out
+};
+
+struct RenameOfflineVerdict
+{
+    RenameRoute route{RenameRoute::Refuse};
+    char const* reason{""};  // literal, no quotes; empty unless Refuse
+};
+
+// The first gate that fails. Switch off reads exactly as it did before this
+// verb existed: `target not online`.
+RenameOfflineVerdict RenameOfflineVerdictFor(RenameOfflineFacts const& facts);
+
+// The plan for a character this module logged in only to rename it: out,
+// name written, rows moved, and NO LogIn step, so it stays logged out.
+// `wasOffline` is false for the existing online path, which is unchanged.
+RenamePlan RenamePlanFor(bool refused, bool isBot, bool inWorld, bool wasOffline);
 
 // ---------------------------------------------------------- a retire (2026-10-05) --
 // THE FACTORY BOTS ARE RETIRED. mod-playerbots' old pre-levelling default made

@@ -8254,6 +8254,42 @@ RenamePlan RenamePlanFor(bool refused, bool isBot, bool inWorld)
     return isBot ? RenamePlan::EvictThenRename : RenamePlan::RenameThenKick;
 }
 
+RenamePlan RenamePlanFor(bool refused, bool isBot, bool inWorld, bool wasOffline)
+{
+    RenamePlan const plan = RenamePlanFor(refused, isBot, inWorld);
+    if (wasOffline && plan == RenamePlan::EvictThenRename)
+        return RenamePlan::EvictRenameStayOut;
+    return plan;
+}
+
+RenameOfflineVerdict RenameOfflineVerdictFor(RenameOfflineFacts const& f)
+{
+    using V = RenameOfflineVerdict;
+    if (f.online)
+        return V{RenameRoute::ExistingPath, ""};
+    if (!f.switchOn)
+        return V{RenameRoute::Refuse, "target not online"};
+    if (!f.exists)
+        return V{RenameRoute::Refuse, "no such character"};
+    if (f.inFamily)
+        return V{RenameRoute::Refuse, "a roster character is not renamed while offline"};
+    if (!f.guildListed)
+        return V{RenameRoute::Refuse, "not a bot of a listed guild"};
+    if (f.clientAttached)
+        return V{RenameRoute::Refuse, "a real client holds this character"};
+    if (f.rowInFlight)
+        return V{RenameRoute::Refuse, "another headless act for this character is still in flight"};
+    if (!f.nameValid)
+        return V{RenameRoute::Refuse, "invalid name"};
+    if (f.sameName)
+        return V{RenameRoute::Refuse, "that is already its name"};
+    if (f.nameTaken)
+        return V{RenameRoute::Refuse, "name already taken"};
+    if (f.actsInFlight >= f.actsCap)
+        return V{RenameRoute::Refuse, "too many headless acts running; retry in a minute"};
+    return V{RenameRoute::HeadlessAct, ""};
+}
+
 std::vector<RenameStep> const& RenameSteps(RenamePlan plan)
 {
     static std::vector<RenameStep> const none;
@@ -8261,8 +8297,12 @@ std::vector<RenameStep> const& RenameSteps(RenamePlan plan)
         RenameStep::LogOut, RenameStep::WriteName, RenameStep::MoveRows, RenameStep::LogIn};
     static std::vector<RenameStep> const client = {
         RenameStep::RenameLive, RenameStep::WriteName, RenameStep::MoveRows, RenameStep::Kick};
+    static std::vector<RenameStep> const stayOut = {
+        RenameStep::LogOut, RenameStep::WriteName, RenameStep::MoveRows};
     switch (plan)
     {
+        case RenamePlan::EvictRenameStayOut:
+            return stayOut;
         case RenamePlan::EvictThenRename:
             return bot;
         case RenamePlan::RenameThenKick:

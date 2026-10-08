@@ -50367,6 +50367,7 @@ private:
         // ...and the naturalize rows, which wait for a clean logout and a
         // fresh login before they act, and for a reset's walk home after.
         ResolveNaturalizeChecks(sincePollMs);
+        ResolveRenameChecks(sincePollMs);
 
         // ...and the retire rows, which wait for the character to stay out of
         // the world before the core deletes it.
@@ -50589,6 +50590,12 @@ private:
                 // target may be offline, and when it is online it is logged
                 // out before anything is done to it (see DoNaturalize).
                 detail = DoNaturalize(targetName, command, id, status, rowResult);
+            else if (!player && kind == "job" && OverseerDecisions::IsRenameRow(command))
+                // A RENAME OF AN OFFLINE CHARACTER (2026-10-08): a row whose
+                // target is not in the world. With Overseer.Rename.Offline off
+                // this answers `target not online`, as it always did (see
+                // DoRenameOffline); an online target takes the branch below.
+                detail = DoRenameOffline(targetName, command, id, status, rowResult);
             else if (kind == "job" && OverseerDecisions::IsRetireRow(command))
                 // A RETIRE (2026-10-05) rides kind='job', routed on its first
                 // word like a rename, so no ENUM migration is needed; and it is
@@ -56040,6 +56047,31 @@ private:
 
     std::vector<NaturalizeCheck> _pendingNaturalizes;
 
+    // A rename of an OFFLINE character in flight (see DoRenameOffline). It
+    // rides the naturalize block's headless login (the random-bot holder, the
+    // same ceilings, EvictHeadlessBot at the end) and counts against the same
+    // realm cap, so the two verbs cannot together exceed it.
+    struct RenameCheck
+    {
+        uint32 id{0};
+        ObjectGuid guid;
+        std::string name;
+        std::string command;
+        uint32 waitedMs{0};
+    };
+
+    std::vector<RenameCheck> _pendingRenames;
+
+    static bool RenameOfflineEnabled()
+    {
+        return sConfigMgr->GetOption<bool>("Overseer.Rename.Offline", false);
+    }
+
+    static unsigned RenameOfflineMax()
+    {
+        return sConfigMgr->GetOption<uint32>("Overseer.Rename.OfflineMax", 4);
+    }
+
     // Two minutes to come back into the world, and two more to land a
     // teleport. A bot login is a few seconds; a character that takes longer
     // than this is not coming, and the row says so rather than waiting forever.
@@ -56075,6 +56107,9 @@ private:
     bool NaturalizeHolds(std::string const& name) const
     {
         for (NaturalizeCheck const& check : _pendingNaturalizes)
+            if (check.name == name)
+                return true;
+        for (RenameCheck const& check : _pendingRenames)
             if (check.name == name)
                 return true;
         return false;
@@ -56218,13 +56253,19 @@ private:
         return "";
     }
 
-    void FinishNaturalize(NaturalizeCheck const& check, char const* status, std::string const& detail,
-                          std::string const& result)
+    void FinishVerifyingRow(uint32 id, char const* status, std::string const& detail,
+                            std::string const& result)
     {
         CharacterDatabase.Execute(
             "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
             "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-            status, Esc(detail), EscLong(result), check.id, g_runToken);
+            status, Esc(detail), EscLong(result), id, g_runToken);
+    }
+
+    void FinishNaturalize(NaturalizeCheck const& check, char const* status, std::string const& detail,
+                          std::string const& result)
+    {
+        FinishVerifyingRow(check.id, status, detail, result);
     }
 
     void ResolveNaturalizeChecks(uint32 elapsedMs)
@@ -59395,8 +59436,181 @@ private:
     // A real client keeps the core's online path: renamed in place, then
     // kicked, because its client holds the old name. RenamePlanFor and
     // RenameSteps (overseer_decisions) choose the plan and its order.
+    // ROW: `rename-to <Name>` for a target that is not in the world.
+    //
+    // REUSED FROM THE NATURALIZE VERBS, NOT REWRITTEN: the headless login
+    // (sRandomPlayerbotMgr.AddPlayerBot, as DoNaturalize does), the readiness
+    // test (in the world, not teleporting, a playerbots AI), the two minute
+    // login ceiling, the 'verifying' row state finished by FinishVerifyingRow,
+    // ClientAttached, GuildNameOf and EvictHeadlessBot. The rename itself is
+    // DoRename, unchanged except that a character logged in for this stays out.
+    //
+    // The gate is OverseerDecisions::RenameOfflineVerdictFor; with the switch
+    // off the row says `target not online`, which is what it said before.
+    char const* DoRenameOffline(std::string const& targetName, std::string const& command, uint32 id,
+                                char const*& status, std::string& out)
+    {
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":\"refused\",\"reason\":" << J(reason) << ",\"character\":" << J(targetName)
+              << ",\"request\":" << J(command) << '}';
+            out = o.str();
+            return reason;
+        };
+
+        // Switch off: the answer is the one this row always got, malformed or not.
+        OverseerDecisions::RenameOfflineFacts facts;
+        facts.switchOn = RenameOfflineEnabled();
+        if (!facts.switchOn)
+            return refuse(OverseerDecisions::RenameOfflineVerdictFor(facts).reason);
+
+        OverseerDecisions::RenameRequest const request = OverseerDecisions::ParseRenameRequest(command);
+        if (!request.ok)
+            return refuse(request.error.c_str());
+
+        ObjectGuid const guid = sCharacterCache->GetCharacterGuidByName(targetName);
+        if (guid && ObjectAccessor::FindConnectedPlayer(guid))
+            return refuse("logging in or out right now; retry in a minute");
+        ReadRenameOfflineFacts(guid, targetName, request.newName, nullptr, facts);
+        OverseerDecisions::RenameOfflineVerdict const verdict = OverseerDecisions::RenameOfflineVerdictFor(facts);
+        if (verdict.route != OverseerDecisions::RenameRoute::HeadlessAct)
+            return refuse(verdict.reason);
+
+        RenameCheck check;
+        check.id = id;
+        check.guid = guid;
+        check.name = targetName;
+        check.command = command;
+        _pendingRenames.push_back(check);
+        LOG_INFO("module.overseer",
+                 "overseer: rename {} for '{}' - logging the character in headless to rename it",
+                 id, targetName);
+        if (!sRandomPlayerbotMgr.GetPlayerBot(guid))
+            sRandomPlayerbotMgr.AddPlayerBot(guid, 0);
+
+        std::ostringstream o;
+        o << "{\"outcome\":\"logging_in\",\"character\":" << J(targetName) << ",\"request\":" << J(command)
+          << ",\"note\":\"renamed as the database loads it, then logged out again\"}";
+        out = o.str();
+        status = "verifying";
+        return "";
+    }
+
+    // Everything the gate asks about a character that may be logged in
+    // (`live`) or not. Asked at the start and again once the login lands.
+    void ReadRenameOfflineFacts(ObjectGuid guid, std::string const& name, std::string const& wanted,
+                                Player* live, OverseerDecisions::RenameOfflineFacts& facts) const
+    {
+        facts.switchOn = RenameOfflineEnabled();
+        facts.online = false;  // callers send an online target down the existing path
+        CharacterCacheEntry const* cache = guid ? sCharacterCache->GetCharacterCacheByGuid(guid) : nullptr;
+        facts.exists = cache != nullptr;
+        facts.actsCap = RenameOfflineMax();
+        facts.actsInFlight = static_cast<unsigned>(_pendingNaturalizes.size() + _pendingRenames.size());
+        // Asked after the login, this row already holds its place: the cap
+        // gated its start, and a naturalize row that started since must not
+        // turn a character already in the world away.
+        if (live)
+            facts.actsInFlight = 0;
+        for (RenameCheck const& pending : _pendingRenames)
+            if (pending.guid == guid && !live)
+                facts.rowInFlight = true;
+        for (NaturalizeCheck const& pending : _pendingNaturalizes)
+            if (pending.guid == guid)
+                facts.rowInFlight = true;
+        if (!cache)
+            return;
+        facts.guildListed = OverseerDecisions::NameListHas(NaturalGuilds(), GuildNameOf(guid, live));
+        facts.inFamily = CountQuery("SELECT COUNT(*) FROM overseer_roster WHERE name = '{}'", Esc(name)) > 0;
+        facts.clientAttached = live && ClientAttached(live);
+        OverseerDecisions::RenameFacts names;
+        std::string newName = wanted;
+        ReadRenameNameFacts(name, newName, names);
+        facts.nameValid = names.nameValid;
+        facts.sameName = names.sameName;
+        facts.nameTaken = names.nameTaken;
+    }
+
+    void ResolveRenameChecks(uint32 elapsedMs)
+    {
+        std::vector<RenameCheck> still;
+        still.reserve(_pendingRenames.size());
+
+        for (RenameCheck& check : _pendingRenames)
+        {
+            check.waitedMs += elapsedMs;
+            Player* player = ObjectAccessor::FindPlayer(check.guid);
+            bool const ready = player && player->IsInWorld() && !player->IsBeingTeleported() &&
+                               GET_PLAYERBOT_AI(player);
+            if (!ready)
+            {
+                if (check.waitedMs < NATURALIZE_LOGIN_CEILING_MS)
+                {
+                    still.push_back(check);
+                    continue;
+                }
+                if (player && player->IsInWorld())
+                    EvictHeadlessBot(player);   // logged in for this; do not leave it
+                FinishVerifyingRow(check.id, "error", "did not come back into the world within two minutes; retry in a minute",
+                                   "{\"outcome\":\"not_logged_in\",\"character\":" + J(check.name) + "}");
+                continue;
+            }
+
+            // Asked again of the character the login loaded: its guild, its
+            // family and its client may have changed while it logged in, and
+            // the name may have been taken.
+            OverseerDecisions::RenameOfflineFacts facts;
+            ReadRenameOfflineFacts(check.guid, check.name,
+                                   OverseerDecisions::ParseRenameRequest(check.command).newName, player, facts);
+            OverseerDecisions::RenameOfflineVerdict const verdict = OverseerDecisions::RenameOfflineVerdictFor(facts);
+            if (verdict.route != OverseerDecisions::RenameRoute::HeadlessAct)
+            {
+                std::string const said = verdict.reason;
+                EvictHeadlessBot(player);
+                FinishVerifyingRow(check.id, "error", said,
+                                   "{\"outcome\":\"refused\",\"reason\":" + J(said) + ",\"character\":" +
+                                       J(check.name) + "}");
+                continue;
+            }
+
+            char const* status = "error";
+            std::string result;
+            // DoRename logs it out, renames it offline and leaves it out. A
+            // refusal of its own (in an instance, fighting, on a run) leaves
+            // it in the world, so it is logged out here.
+            char const* const detail = DoRename(player, check.command, status, result, true);
+            if (std::string(status) != "applied")
+            {
+                if (Player* still_in = ObjectAccessor::FindPlayer(check.guid))
+                    EvictHeadlessBot(still_in);
+            }
+            FinishVerifyingRow(check.id, status, detail, result);
+        }
+
+        _pendingRenames.swap(still);
+    }
+
+    // The name questions DoRename and DoRenameOffline both ask, answered once.
+    static void ReadRenameNameFacts(std::string const& oldName, std::string& newName,
+                                    OverseerDecisions::RenameFacts& facts)
+    {
+        facts.nameValid = normalizePlayerName(newName) &&
+                          ObjectMgr::CheckPlayerName(newName, true) == CHAR_NAME_SUCCESS;
+        facts.sameName = newName == oldName;
+        if (facts.nameValid && !facts.sameName)
+        {
+            CharacterDatabasePreparedStatement* check =
+                CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHECK_NAME);
+            check->SetData(0, newName);
+            facts.nameTaken = bool(CharacterDatabase.Query(check));
+        }
+    }
+
+    // `wasOffline`: this module logged the character in only to rename it
+    // (DoRenameOffline), so it is logged out and STAYS out.
     static char const* DoRename(Player* who, std::string const& command, char const*& status,
-                                std::string& out)
+                                std::string& out, bool wasOffline = false)
     {
         using OverseerDecisions::ParseRenameRequest;
         using OverseerDecisions::RenameFacts;
@@ -59423,16 +59637,7 @@ private:
 
         std::string newName = request.newName;
         RenameFacts facts;
-        facts.nameValid = normalizePlayerName(newName) &&
-                          ObjectMgr::CheckPlayerName(newName, true) == CHAR_NAME_SUCCESS;
-        facts.sameName = newName == oldName;
-        if (facts.nameValid && !facts.sameName)
-        {
-            CharacterDatabasePreparedStatement* check =
-                CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHECK_NAME);
-            check->SetData(0, newName);
-            facts.nameTaken = bool(CharacterDatabase.Query(check));
-        }
+        ReadRenameNameFacts(oldName, newName, facts);
         Map const* map = who->GetMap();
         facts.inInstance = map && map->Instanceable();
         facts.inCombat = who->IsInCombat();
@@ -59441,7 +59646,7 @@ private:
         WorldSession* const session = who->GetSession();
         bool const isBot = session && session->IsBot();
         RenamePlan const plan =
-            OverseerDecisions::RenamePlanFor(refusal != nullptr, isBot, who->IsInWorld());
+            OverseerDecisions::RenamePlanFor(refusal != nullptr, isBot, who->IsInWorld(), wasOffline);
         if (plan == RenamePlan::Refuse)
         {
             char const* const said = refusal ? refusal : "logging in or out right now; retry in a minute";
@@ -59510,7 +59715,13 @@ private:
             }
         }
 
-        if (plan == RenamePlan::EvictThenRename)
+        if (plan == RenamePlan::EvictRenameStayOut)
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is renamed '{}' - the bot was logged in headless for it, renamed "
+                     "offline with its roster, raid seat, keep list, goals, trades and stream rows, "
+                     "and left logged out",
+                     oldName, newName);
+        else if (plan == RenamePlan::EvictThenRename)
             LOG_INFO("module.overseer",
                      "overseer: '{}' is renamed '{}' - the bot was logged out, renamed offline with "
                      "its roster, raid seat, keep list, goals, trades and stream rows, and queued "
