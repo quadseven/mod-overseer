@@ -31877,6 +31877,9 @@ private:
         // an ordinary party poll, and a member must not go back to the walk the
         // ground refused because that stamp went.
         std::set<std::string> evacGaveUp;
+        // Members already reported as having neither a way across the ground nor
+        // a stone, so that is said once and not every poll.
+        std::set<std::string> evacNoStone;
         // AND THE TWO THE REJOIN SAYS ONCE (#384), which are the same two
         // sentences pointed the other way: `loggedWalkingBackIn` rations why
         // anybody is being walked back TO an instance the rest of the party is
@@ -34375,6 +34378,7 @@ private:
             _evacHearths.erase(FamilyOfCharacter(leaderName));
             coord.evacWalkSince.clear();
             coord.evacGaveUp.clear();
+            coord.evacNoStone.clear();
             coord.loggedHearthOut = false;
             return 0;   // the hold is something other than a body on the map
         }
@@ -34404,6 +34408,11 @@ private:
         }
         time_t const now = std::time(nullptr);
         std::vector<std::string> hearthers;
+        // BOUNDED: the per-family episode map holds one entry per family and is
+        // erased when an evacuation empties; the per-name stamps are dropped as
+        // they expire.
+        for (auto it = _evacHearthing.begin(); it != _evacHearthing.end();)
+            it = now - it->second >= 30 ? _evacHearthing.erase(it) : std::next(it);
         for (std::string const& name : evacuation.walk)
         {
             time_t const walkSince = coord.evacWalkSince.emplace(name, now).first->second;
@@ -34439,6 +34448,24 @@ private:
             {
                 hearthers.push_back(name);
                 _evacHearthing[name] = now;
+            }
+            else if (groundGaveUp)
+            {
+                // THE ONE CASE LEFT WITHOUT A WAY OUT, SAID ONCE PER MEMBER: the
+                // ground refused the walk and the stone cannot be used (none
+                // carried, cooling down, or its attempts spent). It keeps the walk,
+                // which is all there is without a teleport, and an operator
+                // reading this knows why it goes on.
+                if (coord.evacNoStone.insert(name).second)
+                    LOG_ERROR("module.overseer",
+                              "overseer: dungeon run {} cannot hearth '{}' out of map {} "
+                              "either - its walk to areatrigger {} was released as "
+                              "unreachable and its hearthstone is missing, cooling down or "
+                              "out of attempts, so it keeps walking at the door until one "
+                              "of those changes",
+                              coord.runNumber, name, portal.insideMapId, portal.exitTriggerId);
+                EscortToward(name, exitAim, splitCopy ? "SPLIT" : "RESET",
+                             EscortPurpose::LeaveInstance);
             }
             else
                 EscortToward(name, exitAim, splitCopy ? "SPLIT" : "RESET",
