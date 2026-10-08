@@ -17539,9 +17539,11 @@ constexpr uint32_t FAR_WALK_STALL_SECONDS = 120;
 // 15,442 yards of walking, and for its first stretch it leads AWAY from the
 // giver. Measured on the dev realm, the walk was ended as "stopped getting
 // nearer the spawn" with 82 legs done. A step along the route is progress, and a
-// route that long needs a clock sized from the route: a foot pace of 7 yards a
-// second, under an hour.
-constexpr float FAR_WALK_ROUTE_PACE_YARDS_PER_SECOND = 7.f;
+// route that long needs a clock sized from the route: a pace of 5 yards a second,
+// under an hour. Foot speed is 7, but a party walk stops for fights and waits for
+// its helper, and a 2,995 yard party walk on the dev realm outran a 7 yard clock
+// (482s) with 240 legs done.
+constexpr float FAR_WALK_ROUTE_PACE_YARDS_PER_SECOND = 5.f;
 constexpr uint32_t FAR_WALK_ROUTE_TIMEOUT_CEILING_SECONDS = 3600;
 
 // THE BUDGET. Two far walks per bot per hour, four under way on the realm.

@@ -134,10 +134,10 @@ void FarIsPastTheNearCap()
 // giver in Stormwind: 3,321 yards in a line, 15,442 yards of surveyed route.
 void TheRouteClock()
 {
-    // 60 + 15442 / 7 = 2266: long past the straight-line clock's 1008 seconds.
+    // 60 + 15442 / 5 = 3148: long past the straight-line clock's 1008 seconds.
     CheckNumber("the straight-line clock is too short for the detour",
                 FarWalkTimeoutSeconds(3321.f), 1008);
-    CheckNumber("the detour's own clock", FarWalkRouteTimeoutSeconds(15442.f), 2266);
+    CheckNumber("the detour's own clock", FarWalkRouteTimeoutSeconds(15442.f), 3148);
     Check("the route clock outlasts the straight one",
           FarWalkRouteTimeoutSeconds(15442.f) > FarWalkTimeoutSeconds(3321.f), true);
     CheckNumber("no route, the floor", FarWalkRouteTimeoutSeconds(0.f),

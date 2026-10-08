@@ -67412,7 +67412,7 @@ private:
                         {
                             LOG_INFO("module.overseer",
                                      "overseer: {} walk {} - '{}' follows its own surveyed route, so "
-                                     "its clock is {}s instead of {}s",
+                                     "its clock is {}s instead of {}s (route pace 5 yards a second)",
                                      noun, check.id, check.targetName, routeMs / 1000u,
                                      ev.timeoutMs / 1000u);
                             ev.timeoutMs = routeMs;
