@@ -68075,6 +68075,7 @@ private:
     {
         OverseerDecisions::QuestErrand const errand = OverseerDecisions::ParseQuestErrand(command);
         bool const take = errand.verb == OverseerDecisions::QuestErrandVerb::Take;
+        bool const abandon = errand.verb == OverseerDecisions::QuestErrandVerb::Abandon;
         Quest const* quest =
             errand.questId ? sObjectMgr->GetQuestTemplate(errand.questId) : nullptr;
 
@@ -68083,7 +68084,7 @@ private:
         Creature* npc = nullptr;
         if (quest && errand.verb != OverseerDecisions::QuestErrandVerb::None)
         {
-            npc = QuestCreatureInReach(player, errand.questId, take);
+            npc = abandon ? nullptr : QuestCreatureInReach(player, errand.questId, take);
             facts.giverInReach = npc != nullptr;
             facts.rewarded = player->GetQuestRewardStatus(errand.questId);
             facts.status = static_cast<int>(player->GetQuestStatus(errand.questId));
@@ -68119,6 +68120,34 @@ private:
             LOG_INFO("module.overseer", "overseer: quest errand '{}' for '{}' refused: {}",
                      command, player->GetName(), refusal);
             return "refused";
+        }
+
+        if (abandon)
+        {
+            // What the client sends from the quest log: CMSG_QUESTLOG_REMOVE_QUEST
+            // with the log slot. The core takes back the quest's source item, drops
+            // the quest and writes the log.
+            uint16 const slot = player->FindQuestSlot(errand.questId);
+            WorldSession* const session = player->GetSession();
+            if (slot >= MAX_QUEST_LOG_SIZE || !session)
+            {
+                describe("error", "the quest has no slot in the log");
+                return "the quest has no slot in the log";
+            }
+            WorldPacket raw(CMSG_QUESTLOG_REMOVE_QUEST, 1);
+            raw << uint8(slot);
+            raw.rpos(0);
+            session->HandleQuestLogRemoveQuest(raw);
+            if (player->GetQuestStatus(errand.questId) != QUEST_STATUS_NONE)
+            {
+                describe("error", "the quest is still in the log");
+                return "the quest is still in the log";
+            }
+            LOG_INFO("module.overseer", "overseer: '{}' abandoned quest {} ({})",
+                     player->GetName(), errand.questId, quest->GetTitle());
+            describe("abandoned", "");
+            status = "delivered";
+            return "";
         }
 
         if (take)

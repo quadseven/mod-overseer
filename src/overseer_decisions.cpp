@@ -4766,6 +4766,8 @@ QuestErrand ParseQuestErrand(std::string const& command)
         out.verb = QuestErrandVerb::Take;
     else if (verb == "turnin")
         out.verb = QuestErrandVerb::TurnIn;
+    else if (verb == "abandon")
+        out.verb = QuestErrandVerb::Abandon;
     else
         return out;
     out.questId = id;
@@ -4777,11 +4779,19 @@ std::string QuestErrandRefusal(QuestErrand const& errand, QuestErrandFacts const
     constexpr int STATUS_NONE = 0;
     constexpr int STATUS_COMPLETE = 1;
     if (errand.verb == QuestErrandVerb::None)
-        return "malformed request: want take quest:<id> or turnin quest:<id>";
+        return "malformed request: want take, turnin or abandon quest:<id>";
     if (!facts.questKnown)
         return "no such quest";
     if (facts.rewarded)
         return "already turned in";
+    if (errand.verb == QuestErrandVerb::Abandon)
+    {
+        if (facts.status == STATUS_NONE)
+            return "not in the quest log";
+        if (facts.status == STATUS_COMPLETE)
+            return "it is complete; hand it in";
+        return "";
+    }
     if (!facts.giverInReach)
         return errand.verb == QuestErrandVerb::Take ? "no giver of that quest in reach"
                                                     : "no taker of that quest in reach";
