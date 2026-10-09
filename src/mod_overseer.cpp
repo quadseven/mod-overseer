@@ -32106,6 +32106,19 @@ private:
         // approach read walkable while the family may still be standing on the
         // deck, and without this the crossing would never be consulted again.
         bool crossingPassengers{false};
+        // WHEN THIS ATTEMPT'S GATHERING FIRST READ A CROSSING (2026-10-09),
+        // zero until it does. The crossing's own clock restarts whenever it
+        // refuses and walks again, so the staging clock's wait is measured from
+        // here instead: each attempt gets one crossing budget, never a fresh one
+        // per walk. Every attempt starts from a fresh state, which clears it.
+        time_t gatherCrossingSince{0};
+        // The GatheringCrossing last said, so each change is one line. 255 is
+        // "nothing said", and it is set back there whenever no crossing is read.
+        uint8 gatherCrossingSaid{255};
+        // The CrossingAction IDLE last kept a run shut for while the leader
+        // already stood on the door's map (CrossingHoldsTheFamily), so each is
+        // said once. 255 is "nothing said".
+        uint8 deckHoldSaid{255};
     };
     // ONE COORDINATOR PER FAMILY, KEYED BY THE `family` COLUMN (#555). It was
     // one state machine for the world, fed by whichever family's `lead` row
@@ -40817,6 +40830,217 @@ private:
         }
     }
 
+    // THE CAMPAIGN'S CROSSING FOR ONE POLL, READ OFF THE WORLD AND DRIVEN
+    // (#241): for IDLE before a run opens, and for GATHERING when a run under
+    // way finds its family on the wrong continent (2026-10-09). The goal on the
+    // far side is the door, by the portal's own trigger row, so the price of a
+    // crossing counts the walk from its landing to where the family is actually
+    // going. False when the leader's own hearth toward the berth holds him, in
+    // which case nothing was read and `step` is untouched.
+    bool DriveCampaignCrossing(DungeonRunCoordinatorState& coord,
+                               std::vector<std::string> const& members,
+                               std::string const& leaderName, Player* leader,
+                               std::string const& leaderJob, DungeonPortal const& portal,
+                               uint32 crossingOrigin, OverseerDecisions::CrossingStep& step)
+    {
+        AreaTrigger const* door = sObjectMgr->GetAreaTrigger(portal.entryTriggerId);
+        CrossingRoute route = ReadCrossingFromWorld(
+            coord, members, leaderName, leader, crossingOrigin, portal.outsideMapId,
+            door ? door->x : 0.f, door ? door->y : 0.f);
+
+        // A MEMBER FAR FROM THE BERTH AND BOUND NEAR IT HEARTHS FIRST
+        // (2026-09-27). While the leader's own stone is being used, the
+        // crossing is not read: aiming him at the berth would walk him out of
+        // the cast.
+        if (CrossingHearthsHoldLeader(coord, route, leaderName, members))
+            return false;
+
+        // THE BACKSTOP IS APPLIED TO THE READING, not inside it: the clock is
+        // the caller's and the verdict is the decision's.
+        time_t const now = std::time(nullptr);
+        if (coord.crossingSince && now - coord.crossingSince > time_t(CROSSING_BACKSTOP_SECONDS))
+            route.world.overdue = true;
+        route.world.leaderWaitSeconds =
+            coord.crossingSince ? static_cast<uint32>(now - coord.crossingSince) : 0;
+
+        OverseerDecisions::CrossingLimits limits;
+        limits.berthArrivedYards = CROSSING_BERTH_ARRIVED_YARDS;
+        limits.gatherYards = CROSSING_GATHER_YARDS;
+        limits.minBoardDwellMs = CROSSING_MIN_BOARD_DWELL_MS;
+        limits.fetchPastYards = CATCH_UP_FOOT_LIMIT_YARDS;
+        limits.fetchWaitSeconds = CROSSING_FETCH_WAIT_SECONDS;
+        step = OverseerDecisions::ReadCrossing(route.world, route.members, limits);
+
+        coord.crossingPassengers = step.aboard != 0;
+        DriveContinentCrossing(coord, step, route, leaderName, leader, leaderJob, portal);
+        return true;
+    }
+
+    // IDLE KEEPS THE RUN SHUT WHILE THE FAMILY IS ON A DECK (2026-10-09). Asked
+    // once the approach already reads walkable, which is the leader standing
+    // on the door's map: the run used to open there on WalkOff, drop the
+    // crossing's memo with the coordinator it replaced, and leave the hold the
+    // crossing keeps on its leader with nobody to let it go. See
+    // OverseerDecisions::CrossingHoldsTheFamily. Said once per crossing step.
+    bool RunStaysShutOnDeck(DungeonRunCoordinatorState& coord, std::string const& leaderName,
+                            OverseerDecisions::CrossingAction action)
+    {
+        if (!OverseerDecisions::CrossingHoldsTheFamily(action))
+        {
+            coord.deckHoldSaid = 255;
+            return false;
+        }
+        uint8 const said = static_cast<uint8>(action);
+        if (coord.deckHoldSaid != said)
+        {
+            coord.deckHoldSaid = said;
+            LOG_INFO("module.overseer",
+                     "overseer: the next dungeon run for '{}' stays shut until the family is "
+                     "off the deck - the crossing reads '{}' with the leader on the door's "
+                     "map, and the run opens on the poll it reads 'done', which also lets go "
+                     "of the hold the crossing keeps on him",
+                     leaderName, OverseerDecisions::CrossingActionName(action));
+        }
+        return true;
+    }
+
+    // ONE READING OF A CROSSING BY GATHERING, for the two steps below.
+    struct GatheringCrossingRead
+    {
+        OverseerDecisions::CrossingAction action{OverseerDecisions::CrossingAction::Wait};
+        OverseerDecisions::GatheringCrossing answer{OverseerDecisions::GatheringCrossing::Gather};
+        uint32 leaderMap{0};
+        uint32 seconds{0};
+    };
+
+    // GATHERING CROSSES FIRST (2026-10-09). GATHERING re-armed its leader's
+    // walk only on the door's own map, so a leader on the other continent (a
+    // hearth home, a deck that sailed back with him, a recovery that went
+    // straight to RESET) waited out the twelve minutes, attempt after attempt:
+    // measured, "GATHERING held for more than 12 minutes and never opened - Zug
+    // (on map 1 rather than map 0)" twice in a row. IDLE crosses a family before
+    // it opens a run; this asks the same question of a run already open and
+    // drives the same crossing, and the staging clock waits while the crossing
+    // moves the family, within one crossing budget per attempt. True when the
+    // crossing owns this poll and GATHERING returns.
+    bool GatheringCrossesFirst(DungeonRunCoordinatorState& coord,
+                               std::vector<std::string> const& members,
+                               std::string const& leaderName, Player* leader,
+                               std::string const& leaderJob, DungeonPortal const& portal)
+    {
+        GatheringCrossingRead read;
+        read.leaderMap = leader->GetMapId();
+        if (!OverseerDecisions::GatheringReadsCrossing(read.leaderMap, portal.outsideMapId,
+                                                       coord.crossingPassengers,
+                                                       coord.crossingOriginMap))
+        {
+            coord.gatherCrossingSaid = 255;
+            ReleaseLeftoverCrossingHold(coord, leaderName, leader);
+            return false;
+        }
+
+        time_t const now = std::time(nullptr);
+        if (!coord.gatherCrossingSince)
+            coord.gatherCrossingSince = now;
+        uint32 const origin =
+            read.leaderMap != portal.outsideMapId ? read.leaderMap : coord.crossingOriginMap;
+        OverseerDecisions::CrossingStep step;
+        if (!DriveCampaignCrossing(coord, members, leaderName, leader, leaderJob, portal, origin,
+                                   step))
+            return true;
+
+        read.action = step.action;
+        read.seconds = static_cast<uint32>(now - coord.gatherCrossingSince);
+        read.answer = OverseerDecisions::GatheringCrossingStep(read.action, read.seconds,
+                                                               CROSSING_BACKSTOP_SECONDS);
+        // A FAMILY SPLIT AT THE BERTH HAS ALREADY CLOSED THIS ATTEMPT, through
+        // EndRunAndDecide, which said why: nothing of `coord` is this run's now.
+        if (read.answer == OverseerDecisions::GatheringCrossing::Ended)
+            return true;
+        SayGatheringCrossing(coord, leaderName, portal, read);
+        return ApplyGatheringCrossing(coord, members, leaderName, leaderJob, portal, read, now);
+    }
+
+    // WHAT GATHERING DOES WITH ITS ANSWER. The clock waits the way it waits
+    // for a leader going back for a member: restarted every poll the crossing
+    // moves the family, and on the landing, which also makes the walk to the
+    // door a new leg rather than a re-armed errand (the berth aim wrote over
+    // the staging aim on purpose). Past the budget the clock runs and closes
+    // the attempt with the crossing named.
+    bool ApplyGatheringCrossing(DungeonRunCoordinatorState& coord,
+                                std::vector<std::string> const& members,
+                                std::string const& leaderName, std::string const& leaderJob,
+                                DungeonPortal const& portal, GatheringCrossingRead const& read,
+                                time_t now)
+    {
+        switch (read.answer)
+        {
+            case OverseerDecisions::GatheringCrossing::Gather:
+                return false;
+            case OverseerDecisions::GatheringCrossing::CrossHeld:
+            case OverseerDecisions::GatheringCrossing::Landed:
+                coord.stagingSince = now;
+                coord.gatherBest = -1.f;
+                coord.staging.clear();
+                coord.legAim.erase(leaderName);
+                return true;
+            case OverseerDecisions::GatheringCrossing::CrossTimed:
+                if (coord.stagingSince && now - coord.stagingSince > DUNGEON_STAGING_BACKSTOP_SECONDS)
+                    FailStaging(coord, leaderName, members, portal, "GATHERING",
+                                OverseerDecisions::GatheringCrossingBlocker(
+                                    leaderName, read.leaderMap, portal.outsideMapId, read.action,
+                                    read.seconds),
+                                IsDungeonJob(leaderJob));
+                return true;
+            case OverseerDecisions::GatheringCrossing::Ended:
+                return true;
+        }
+        return true;
+    }
+
+    // SAID ON CHANGE, the discipline the crossing's own lines keep: a crossing
+    // is minutes of five-second polls and each change is worth one line.
+    void SayGatheringCrossing(DungeonRunCoordinatorState& coord, std::string const& leaderName,
+                              DungeonPortal const& portal, GatheringCrossingRead const& read)
+    {
+        uint8 const said = static_cast<uint8>(read.answer);
+        if (coord.gatherCrossingSaid == said)
+            return;
+        coord.gatherCrossingSaid = said;
+        LOG_WARN("module.overseer",
+                 "overseer: dungeon run {} GATHERING crosses first - '{}' is on map {} and the "
+                 "'{}' door is approached from map {}; the family's crossing reads '{}' after "
+                 "{}s of this attempt's {}s crossing budget, and {}",
+                 coord.runNumber, leaderName, read.leaderMap, portal.keyword,
+                 portal.outsideMapId, OverseerDecisions::CrossingActionName(read.action),
+                 read.seconds, CROSSING_BACKSTOP_SECONDS,
+                 OverseerDecisions::GatheringCrossingMeaning(read.answer));
+    }
+
+    // A CROSSING'S HOLD THAT OUTLIVED ITS CROSSING (2026-10-09). The hold a
+    // crossing keeps on its leader from the berth to the landing is let go by
+    // the crossing itself, on Done or on a refusal. A coordinator that stops
+    // reading the crossing before then leaves it standing, and a held leader is
+    // refused every walk: measured, GATHERING watched him stand rooted at the
+    // foot of a zeppelin tower for its whole twelve minutes. GATHERING reads no
+    // crossing when this is asked, so a crossing hold on its leader is nobody's
+    // any more. A member crossing on its own keeps the hold its crossing placed.
+    void ReleaseLeftoverCrossingHold(DungeonRunCoordinatorState const& coord,
+                                     std::string const& leaderName, Player* leader)
+    {
+        auto const hold = HoldsInForce().find(leaderName);
+        if (hold == HoldsInForce().end() || hold->second.verb != CROSSING_HOLD_VERB ||
+            CrossingAlone(leaderName))
+            return;
+        LOG_WARN("module.overseer",
+                 "overseer: dungeon run {} GATHERING crosses first - '{}' still carries the "
+                 "crossing's hold with no crossing read for him, so it is let go and he walks "
+                 "to the door",
+                 coord.runNumber, leaderName);
+        ReleaseHold(leaderName, leader, "the crossing that placed this hold is over",
+                    CROSSING_HOLD_VERB);
+    }
+
     // ---------------- a member stranded on another continent (#274) --
     //
     // THE CROSSING ABOVE MOVES A DUNGEON RUN'S LEADER AND NOBODY ELSE, so a
@@ -45982,38 +46206,13 @@ private:
             if ((!finderWay && offOutsideMap) ||
                 (coord.crossingPassengers && crossingOrigin != portal->outsideMapId))
             {
-                // THE GOAL ON THE FAR SIDE IS THE DOOR, by the portal's own
-                // trigger row, so the price of a crossing counts the walk from
-                // its landing to where the family is actually going.
-                AreaTrigger const* door = sObjectMgr->GetAreaTrigger(portal->entryTriggerId);
-                CrossingRoute route = ReadCrossingFromWorld(
-                    coord, members, leaderName, leader, crossingOrigin,
-                    portal->outsideMapId, door ? door->x : 0.f, door ? door->y : 0.f);
-
-                // A MEMBER FAR FROM THE BERTH AND BOUND NEAR IT HEARTHS FIRST
-                // (2026-09-27). While the leader's own stone is being used, the
-                // crossing is not read: aiming him at the berth would walk him
-                // out of the cast.
-                if (CrossingHearthsHoldLeader(coord, route, leaderName, members))
+                // THE GOAL ON THE FAR SIDE IS THE DOOR, the hearth before the
+                // berth, the backstop on the reading: see DriveCampaignCrossing,
+                // which GATHERING drives too.
+                OverseerDecisions::CrossingStep step;
+                if (!DriveCampaignCrossing(coord, members, leaderName, leader, leaderJob,
+                                           *portal, crossingOrigin, step))
                     return;
-
-                // THE BACKSTOP IS APPLIED TO THE READING, not inside it: the
-                // clock is the caller's and the verdict is the decision's.
-                if (coord.crossingSince &&
-                    std::time(nullptr) - coord.crossingSince >
-                        time_t(CROSSING_BACKSTOP_SECONDS))
-                    route.world.overdue = true;
-                route.world.leaderWaitSeconds = coord.crossingSince
-                    ? static_cast<uint32>(std::time(nullptr) - coord.crossingSince) : 0;
-
-                OverseerDecisions::CrossingLimits limits;
-                limits.berthArrivedYards = CROSSING_BERTH_ARRIVED_YARDS;
-                limits.gatherYards = CROSSING_GATHER_YARDS;
-                limits.minBoardDwellMs = CROSSING_MIN_BOARD_DWELL_MS;
-                limits.fetchPastYards = CATCH_UP_FOOT_LIMIT_YARDS;
-                limits.fetchWaitSeconds = CROSSING_FETCH_WAIT_SECONDS;
-                OverseerDecisions::CrossingStep const step =
-                    OverseerDecisions::ReadCrossing(route.world, route.members, limits);
 
                 // ASKED AGAIN, THIS TIME HAVING LOOKED. The third answer is only
                 // ever produced when the crossing could actually take a step,
@@ -46024,19 +46223,14 @@ private:
                     leader->GetMapId(), portal->outsideMapId,
                     step.action != OverseerDecisions::CrossingAction::Refuse);
 
-                coord.crossingPassengers = step.aboard != 0;
-
-                DriveContinentCrossing(coord, step, route, leaderName, leader,
-                                       leaderJob, *portal);
-
                 // THE RUN DOES NOT OPEN WHILE THE CROSSING IS UNRESOLVED. That
                 // includes the case where the leader is already on the right map
                 // but somebody is still a passenger: opening a run around a
                 // family standing on a boat is how a run begins with members
-                // sailing away from it.
+                // sailing away from it. And the leader himself still on the deck
+                // being walked off it (2026-10-09): see RunStaysShutOnDeck.
                 if (approach != OverseerDecisions::DungeonApproach::Walkable ||
-                    step.action == OverseerDecisions::CrossingAction::Disembark ||
-                    step.action == OverseerDecisions::CrossingAction::Ride)
+                    RunStaysShutOnDeck(coord, leaderName, step.action))
                     return;
             }
 
@@ -46822,6 +47016,11 @@ private:
             // GetPositionZ  Position.h:120  float GetPositionZ() const
             bool const onTheOutsideMap = leader->GetMapId() == portal->outsideMapId;
 
+            // A FAMILY ON THE WRONG CONTINENT CROSSES BEFORE IT GATHERS
+            // (2026-10-09). See GatheringCrossesFirst.
+            if (GatheringCrossesFirst(coord, members, leaderName, leader, leaderJob, *portal))
+                return;
+
             // THE STAGING STALL ANSWER. Read while one is outstanding, until the
             // bridge answers or STAGING_STALL_ANSWER_SECONDS pass; then applied
             // once.
@@ -47212,7 +47411,7 @@ private:
             }
 
             if (!onTheOutsideMap)
-                return;  // still travelling, or on a different map entirely - keep waiting
+                return;  // on another map whose crossing refused: the backstop above bounds it
 
             // ARRIVED IS A THREE-DIMENSIONAL FACT (#217). This was
             // `distance <= DUNGEON_BARRIER_RADIUS_YARDS`, which a leader ten

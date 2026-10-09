@@ -8258,6 +8258,72 @@ CrossingStep ReadCrossing(CrossingWorld const& world,
 // that does not say which fact was missing trains an operator to ignore it.
 std::string CrossingExplanation(CrossingStep const& step, CrossingWorld const& world);
 
+// ------------------------ a run that gathers across an ocean (2026-10-09) --
+//
+// WHAT WAS MEASURED. 55 family campaign runs in 72 hours on the dev realm: 12
+// closed at GATHERING's twelve minutes with the leader on the other continent
+// ("on map 1 rather than map 0") or about 2,400 yards out. The one inside the
+// worldserver's log window shows how. The zeppelin docked at the far tower
+// with the leader on its deck, the crossing read WalkOff, and IDLE opened the
+// run on that same poll, because only Ride and Disembark kept it shut. The
+// fresh coordinator dropped the crossing's memo, so nothing read the crossing
+// again and nothing let go of the hold it keeps on the leader from the berth
+// to the landing. He was set down at the foot of the tower and stood rooted
+// under that hold for all of GATHERING, which closed 2,375 yards out. A leader
+// still on the deck when it casts off is carried back to the continent he came
+// from, and GATHERING re-armed its walk only on the door's own map, so it
+// waited out its twelve minutes there, attempt after attempt.
+
+// Is somebody in the family on a deck, or being stepped onto or off one, on
+// this reading? A run does not open around such a family. Done (ashore and off
+// every transport) is what ends a crossing, so WalkOff is not it.
+bool CrossingHoldsTheFamily(CrossingAction action);
+
+// Does GATHERING read the family's crossing on this poll? IDLE's own test,
+// asked of a run already under way: the leader is not on the door's map, or
+// somebody was a passenger on the last poll of a crossing that did not start
+// on the door's map.
+bool GatheringReadsCrossing(std::uint32_t leaderMap, std::uint32_t doorMap,
+                            bool passengersLastPoll, std::uint32_t crossingOrigin);
+
+// What GATHERING does with a crossing it has read and driven.
+enum class GatheringCrossing : std::uint8_t
+{
+    // The crossing refuses: GATHERING carries on as it always has, and its
+    // twelve-minute backstop says where the leader is.
+    Gather,
+    // The crossing is moving the family. The staging clock waits for it, as
+    // it waits for a leader going back for a member: the twelve minutes are
+    // for walking to the door, and this is not that yet.
+    CrossHeld,
+    // The crossing still has the family but no longer holds the clock: the
+    // world is not answering for somebody, or the crossing has used the whole
+    // of its budget in this attempt. The twelve minutes run.
+    CrossTimed,
+    // Ashore and off every transport. The walk to the door is a new leg on a
+    // fresh clock, not a re-armed errand.
+    Landed,
+    // The crossing closed the attempt (a family split at the berth).
+    Ended,
+};
+
+// The answer as the clause a log line ends with.
+char const* GatheringCrossingMeaning(GatheringCrossing step);
+
+// `crossingSeconds` is how long this attempt has been crossing, from the first
+// poll GATHERING read a crossing, so a crossing that refuses and starts again
+// does not hand itself a fresh budget. `budgetSeconds` is the crossing's own
+// backstop. An attempt is therefore bounded by that budget and the twelve
+// minutes after it, and never by nothing.
+GatheringCrossing GatheringCrossingStep(CrossingAction action, std::uint32_t crossingSeconds,
+                                        std::uint32_t budgetSeconds);
+
+// Who GATHERING was still waiting for when the twelve minutes ran out with a
+// crossing under way, as one blocker for the run row.
+std::string GatheringCrossingBlocker(std::string const& leader, std::uint32_t leaderMap,
+                                     std::uint32_t doorMap, CrossingAction action,
+                                     std::uint32_t crossingSeconds);
+
 // ------------------------------------------- is the transport docked (#303) --
 //
 // A MotionTransport stands still at a stop frame for exactly the interval
