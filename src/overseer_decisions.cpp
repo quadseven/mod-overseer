@@ -6862,6 +6862,96 @@ std::string CrossingExplanation(CrossingStep const& step, CrossingWorld const& w
     return "the crossing is refused";
 }
 
+bool CrossingHoldsTheFamily(CrossingAction action)
+{
+    switch (action)
+    {
+        case CrossingAction::Board:
+        case CrossingAction::Ride:
+        case CrossingAction::WalkOff:
+        case CrossingAction::StepBack:
+        case CrossingAction::Disembark:
+            return true;
+        case CrossingAction::Wait:
+        case CrossingAction::Refuse:
+        case CrossingAction::Walk:
+        case CrossingAction::Hold:
+        case CrossingAction::Fetch:
+        case CrossingAction::Done:
+            return false;
+    }
+    return true;
+}
+
+bool GatheringReadsCrossing(std::uint32_t leaderMap, std::uint32_t doorMap,
+                            bool passengersLastPoll, std::uint32_t crossingOrigin)
+{
+    return leaderMap != doorMap || (passengersLastPoll && crossingOrigin != doorMap);
+}
+
+char const* GatheringCrossingMeaning(GatheringCrossing step)
+{
+    switch (step)
+    {
+        case GatheringCrossing::Gather:
+            return "the crossing refuses, so GATHERING carries on and its own backstop "
+                   "bounds the wait";
+        case GatheringCrossing::CrossHeld:
+            return "the crossing is moving the family, so the staging clock waits for it";
+        case GatheringCrossing::CrossTimed:
+            return "the crossing still has the family but no longer holds the staging "
+                   "clock, which runs";
+        case GatheringCrossing::Landed:
+            return "the family is ashore and off every transport, so the walk to the door "
+                   "starts as a new leg on a fresh clock";
+        case GatheringCrossing::Ended:
+            return "the crossing closed the attempt";
+    }
+    return "the crossing refuses, so GATHERING carries on and its own backstop bounds the "
+           "wait";
+}
+
+GatheringCrossing GatheringCrossingStep(CrossingAction action, std::uint32_t crossingSeconds,
+                                        std::uint32_t budgetSeconds)
+{
+    switch (action)
+    {
+        case CrossingAction::Refuse:
+            return GatheringCrossing::Gather;
+        case CrossingAction::Done:
+            return GatheringCrossing::Landed;
+        case CrossingAction::Fetch:
+            return GatheringCrossing::Ended;
+        // Nothing was decided because somebody could not be read: nothing is
+        // moving the family, so nothing earns the clock.
+        case CrossingAction::Wait:
+            return GatheringCrossing::CrossTimed;
+        case CrossingAction::Walk:
+        case CrossingAction::Hold:
+        case CrossingAction::Board:
+        case CrossingAction::Ride:
+        case CrossingAction::Disembark:
+        case CrossingAction::WalkOff:
+        case CrossingAction::StepBack:
+            break;
+    }
+    return crossingSeconds <= budgetSeconds ? GatheringCrossing::CrossHeld
+                                            : GatheringCrossing::CrossTimed;
+}
+
+std::string GatheringCrossingBlocker(std::string const& leader, std::uint32_t leaderMap,
+                                     std::uint32_t doorMap, CrossingAction action,
+                                     std::uint32_t crossingSeconds)
+{
+    std::string const where =
+        leaderMap == doorMap
+            ? "on map " + std::to_string(doorMap) + " with the family still on a deck"
+            : "on map " + std::to_string(leaderMap) + " rather than map " +
+                  std::to_string(doorMap);
+    return leader + " (" + where + ", crossing for " + std::to_string(crossingSeconds / 60) +
+           " minutes; the crossing last read '" + CrossingActionName(action) + "')";
+}
+
 DockReading ReadDock(std::uint32_t pathProgressMs, std::uint32_t periodMs,
                      std::vector<TransportStop> const& stops)
 {
