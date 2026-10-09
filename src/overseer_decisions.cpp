@@ -16155,6 +16155,140 @@ bool GuildGhostDriven(bool onRoster, bool botSession, bool playerClient, bool ha
     return !onRoster && botSession && !playerClient && hasAI;
 }
 
+namespace
+{
+// Why the door is not the way this poll, or DoorAhead when it is.
+InstanceGhostReason InstanceDoorBlocked(InstanceGhostFacts const& facts,
+                                        InstanceGhostLimits const& limits)
+{
+    if (facts.choseHealer)
+        return InstanceGhostReason::HealerChosen;
+    if (!facts.corpseInDungeon)
+        return InstanceGhostReason::NotADungeon;
+    if (!facts.doorOnThisMap)
+        return InstanceGhostReason::NoDoorHere;
+    if (facts.refusedKnocks >= limits.refusedKnocks)
+        return InstanceGhostReason::DoorRefused;
+    if (facts.walkSeconds > limits.walkSeconds)
+        return InstanceGhostReason::WalkSpent;
+    if (facts.stalledSeconds > limits.stallSeconds)
+        return InstanceGhostReason::WalkStalled;
+    return InstanceGhostReason::DoorAhead;
+}
+}  // namespace
+
+InstanceGhostVerdict DecideInstanceGhost(InstanceGhostFacts const& facts,
+                                         InstanceGhostLimits const& limits)
+{
+    if (!facts.released)
+        return {InstanceGhostStep::NotMine, InstanceGhostReason::NotReleased};
+    if (!facts.corpseElsewhere)
+        return {InstanceGhostStep::NotMine, InstanceGhostReason::CorpseHere};
+    InstanceGhostReason const blocked = InstanceDoorBlocked(facts, limits);
+    if (blocked == InstanceGhostReason::DoorAhead)
+        return facts.inDoor ? InstanceGhostVerdict{InstanceGhostStep::Knock, InstanceGhostReason::InDoor}
+                            : InstanceGhostVerdict{InstanceGhostStep::WalkToDoor, blocked};
+    return {facts.healerKnown ? InstanceGhostStep::SpiritHealer : InstanceGhostStep::Stranded,
+            blocked};
+}
+
+char const* InstanceGhostStepWord(InstanceGhostStep step)
+{
+    switch (step)
+    {
+        case InstanceGhostStep::NotMine:
+            return "not_mine";
+        case InstanceGhostStep::WalkToDoor:
+            return "walk_to_door";
+        case InstanceGhostStep::Knock:
+            return "knock";
+        case InstanceGhostStep::SpiritHealer:
+            return "spirit_healer";
+        case InstanceGhostStep::Stranded:
+            return "stranded";
+    }
+    return "unknown";
+}
+
+char const* InstanceGhostReasonText(InstanceGhostReason reason)
+{
+    switch (reason)
+    {
+        case InstanceGhostReason::NotReleased:
+            return "it has not released yet";
+        case InstanceGhostReason::CorpseHere:
+            return "its corpse is on the map it stands on";
+        case InstanceGhostReason::DoorAhead:
+            return "the entrance to its corpse's map stands on this map and the walk is still "
+                   "getting closer";
+        case InstanceGhostReason::InDoor:
+            return "it stands in the entrance to its corpse's map";
+        case InstanceGhostReason::HealerChosen:
+            return "the spirit healer was already chosen for this death";
+        case InstanceGhostReason::NotADungeon:
+            return "its corpse's map is not a dungeon a ghost can walk into";
+        case InstanceGhostReason::NoDoorHere:
+            return "no entrance to its corpse's map stands on this map";
+        case InstanceGhostReason::DoorRefused:
+            return "the core turned it away at the entrance every time it knocked";
+        case InstanceGhostReason::WalkSpent:
+            return "the walk to the entrance ran out of time";
+        case InstanceGhostReason::WalkStalled:
+            return "the walk to the entrance stopped getting closer";
+    }
+    return "unknown";
+}
+
+std::vector<GhostLeg> GhostWalkLegs(float fromX, float fromY, float toX, float toY,
+                                    float reachYards, float legYards)
+{
+    std::vector<GhostLeg> legs;
+    float const dx = toX - fromX;
+    float const dy = toY - fromY;
+    float const straight = std::sqrt(dx * dx + dy * dy);
+    if (straight <= reachYards)
+        legs.push_back({toX, toY, true});
+    if (straight <= 0.f)
+        return legs;
+    for (float const share : {1.f, 2.f / 3.f, 1.f / 3.f})
+    {
+        float const yards = legYards * share;
+        if (yards <= 0.f || yards >= straight)
+            continue;
+        legs.push_back({fromX + dx * yards / straight, fromY + dy * yards / straight, false});
+    }
+    return legs;
+}
+
+RevivedInsideStep DecideRevivedInside(RevivedInsideFacts const& facts, long budgetSeconds)
+{
+    if (facts.partyAliveHere)
+        return RevivedInsideStep::Rejoin;
+    if (!facts.exitKnown || facts.seconds > budgetSeconds)
+        return RevivedInsideStep::GiveUp;
+    if (facts.inCombat)
+        return RevivedInsideStep::Hold;
+    return facts.inExit ? RevivedInsideStep::Knock : RevivedInsideStep::Walk;
+}
+
+char const* RevivedInsideStepWord(RevivedInsideStep step)
+{
+    switch (step)
+    {
+        case RevivedInsideStep::Rejoin:
+            return "rejoin";
+        case RevivedInsideStep::Walk:
+            return "walk";
+        case RevivedInsideStep::Knock:
+            return "knock";
+        case RevivedInsideStep::Hold:
+            return "hold";
+        case RevivedInsideStep::GiveUp:
+            return "give_up";
+    }
+    return "unknown";
+}
+
 int NearestTrainerSpot(std::vector<TrainerSpot> const& spots, uint32_t mapId, float x, float y,
                        float maxYards)
 {

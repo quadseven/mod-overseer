@@ -18838,6 +18838,137 @@ bool GuildGhostDriven(bool onRoster, bool botSession, bool playerClient, bool ha
 // Stormwind City for the Horde.
 bool OnOtherFactionsGround(bool alliance, uint32_t zoneId);
 
+// ---------------------- a natural guild member's corpse inside a dungeon --
+//
+// A GHOST WHOSE CORPSE LIES INSIDE A DUNGEON WAS SKIPPED ON EVERY POLL
+// (2026-10-09). Player::GetCorpse() looks the corpse up on the map the ghost
+// stands on, and a wipe releases every ghost to the graveyard outside while
+// every corpse stays on the instance map. The guild ghost drive read that null
+// as "not released yet" and moved on, forever; upstream's dead engine has the
+// same blind spot (FindCorpseAction reads GetCorpse too). Measured read-only on
+// the dev realm: 17 natural guild members ghosts for 30 to 300 minutes at a
+// dungeon's graveyard with their corpses inside, and 253 of 256 dungeon deaths
+// in 48 hours with no recovery recorded.
+//
+// What a player does: run back to the dungeon's entrance and walk in. The core
+// raises a ghost that enters the map its corpse is on
+// (WorldSession::HandleMoveWorldportAck), and raises it at the door when it
+// turns the ghost away for a full instance or a raid it is not in
+// (HandleAreaTriggerOpcode's reviveAtTrigger). Where no walk works - no entrance
+// to that map on this one, a walk that stops getting closer, a door that keeps
+// refusing - the spirit healer at the graveyard it was released to.
+enum class InstanceGhostStep : uint8_t
+{
+    NotMine,       // not released, or the corpse is on this map (the ordinary drive's)
+    WalkToDoor,    // walk toward the entrance to the corpse's map
+    Knock,         // standing in the entrance: step through it
+    SpiritHealer,  // no walk works: the spirit healer
+    Stranded,      // no walk works and no graveyard is known either
+};
+
+enum class InstanceGhostReason : uint8_t
+{
+    NotReleased,
+    CorpseHere,
+    DoorAhead,
+    InDoor,
+    HealerChosen,
+    NotADungeon,
+    NoDoorHere,
+    DoorRefused,
+    WalkSpent,
+    WalkStalled,
+};
+
+struct InstanceGhostFacts
+{
+    bool released{false};          // PLAYER_FLAGS_GHOST
+    bool corpseElsewhere{false};   // a corpse, on a map other than the one it stands on
+    bool corpseInDungeon{false};   // that map is a dungeon or a raid
+    bool doorOnThisMap{false};     // an areatrigger on this map teleports onto that one
+    bool inDoor{false};            // standing inside that trigger's own radius
+    long walkSeconds{0};           // since this death's walk began
+    long stalledSeconds{0};        // since the walk last got closer to the door
+    unsigned refusedKnocks{0};     // knocks from inside the door that changed nothing
+    bool healerKnown{false};       // a graveyard (and its spirit healer) is known
+    bool choseHealer{false};       // the spirit healer was already chosen for this death
+};
+
+struct InstanceGhostLimits
+{
+    long walkSeconds{600};      // ten minutes for a walk a ghost runs in two to five
+    long stallSeconds{120};     // two minutes without getting closer
+    unsigned refusedKnocks{3};  // three knocks the core turned down
+};
+
+struct InstanceGhostVerdict
+{
+    InstanceGhostStep step{InstanceGhostStep::NotMine};
+    InstanceGhostReason reason{InstanceGhostReason::NotReleased};
+};
+
+// One poll. Order: released, corpse elsewhere, the healer once chosen (it is
+// not unchosen), a dungeon, a door on this map, the door's refusals, the walk's
+// clock, the stall clock; then the door (knock inside it, walk outside it), or
+// the spirit healer, or stranded when no graveyard is known.
+InstanceGhostVerdict DecideInstanceGhost(InstanceGhostFacts const& facts,
+                                         InstanceGhostLimits const& limits = InstanceGhostLimits{});
+
+// "not_mine", "walk_to_door", "knock", "spirit_healer", "stranded".
+char const* InstanceGhostStepWord(InstanceGhostStep step);
+
+// A sentence fragment saying why, for the log line.
+char const* InstanceGhostReasonText(InstanceGhostReason reason);
+
+// THE LEGS OF A GHOST'S WALK, the destination first when it is close. The
+// navmesh cannot route further than its 296-yard corridor (PathGenerator's 74
+// points of 4 yards), and a MovePoint it cannot route is drawn as a straight
+// line through whatever is in the way, so a walk of several hundred yards - to
+// a dungeon's door, or back to the spirit healer - is taken a leg at a time:
+// the destination itself when it is within `reachYards` in a straight line,
+// then points `legYards`, two thirds and one third of it along the line toward
+// it, none at or past it. The adapter tries them in this order and walks the
+// first the navmesh routes to.
+struct GhostLeg
+{
+    float x{0.f};
+    float y{0.f};
+    bool arrives{false};  // the destination itself, not a point on the way
+};
+std::vector<GhostLeg> GhostWalkLegs(float fromX, float fromY, float toX, float toY,
+                                    float reachYards, float legYards);
+
+// AFTER THE RUN BACK: ALIVE INSIDE, AND USUALLY ALONE. A guild finder run that
+// wiped is disbanded half a minute later, so the ghost that walked back in is
+// raised at the entrance of an instance with nobody of its party there. A player
+// walks back out through the exit beside the entrance. Left there, a natural
+// guild member wanders into the dungeon's creatures alone and dies inside again.
+// Rejoin when a party member is alive on the same instance; give up (and say so)
+// with no exit known or after `budgetSeconds`; hold while in combat; else walk
+// to the exit and step through it.
+enum class RevivedInsideStep : uint8_t
+{
+    Rejoin,
+    Walk,
+    Knock,
+    Hold,
+    GiveUp,
+};
+
+struct RevivedInsideFacts
+{
+    bool partyAliveHere{false};  // a living party member on the same instance
+    bool exitKnown{false};       // an areatrigger here leads back to the map it came from
+    bool inExit{false};          // standing inside that trigger's radius
+    bool inCombat{false};
+    long seconds{0};             // since the knock that took it in
+};
+
+RevivedInsideStep DecideRevivedInside(RevivedInsideFacts const& facts, long budgetSeconds);
+
+// "rejoin", "walk", "knock", "hold", "give_up".
+char const* RevivedInsideStepWord(RevivedInsideStep step);
+
 // ------------------------------- a natural guild member goes to its trainer --
 //
 // A natural guild member is granted no spells (playerbots patch 0024), and

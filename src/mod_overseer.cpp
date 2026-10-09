@@ -28513,49 +28513,580 @@ private:
                 std::find(guildIds.begin(), guildIds.end(), bot->GetGuildId()) == guildIds.end())
                 continue;
             std::string const name = bot->GetName();
-            // NOT SteerableAI: that gate admits a client or a headless ROSTER
-            // bot by name, so it refused every guild member and this drive
-            // steered nobody on its first deploy. A guild member is a random
-            // bot: a bot session with an AI and no client.
-            WorldSession const* session = bot->GetSession();
             PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
-            // A family stand-in is the family's while it stands in (2026-10-05),
-            // and the family's run, not the guild's drives, directs it.
-            bool const familyDirects = OnRoster(name) || IsStandinGuest(name);
-            if (!OverseerDecisions::GuildGhostDriven(familyDirects, session && session->IsBot(),
-                                                    ClientAttached(bot) && !(session && session->IsBot()),
-                                                    botAI != nullptr))
+            if (!GuildGhostDrives(bot, botAI, name))
                 continue;
 
             if (bot->IsAlive())
             {
-                EndGhostRecovery(botAI, name);
-                ReleaseRevivalHold(botAI, name);
-                if (LeaveGuildDeathSpot(bot, name, now))
-                    continue;
-                // Resurrection Sickness is rested out, not fought through: at
-                // a quarter of its stats a member in starting gear dies to the
-                // first creature it meets.
-                DriveRevivedSickness(bot, botAI, name, /*restWhileSick*/ true);
+                GuildMemberAlive(bot, botAI, name, now);
                 continue;
             }
 
+            // NULL IS NOT "NOT RELEASED" WHEN THE CORPSE IS ON ANOTHER MAP.
+            // Player::GetCorpse() asks the map the ghost stands on, and a wipe
+            // leaves every corpse inside the instance while the ghosts land at
+            // the graveyard outside. This used to `continue` here, so every
+            // member who released out of a dungeon was skipped on every poll
+            // (2026-10-09: 17 ghosts for 30 to 300 minutes, 253 of 256 dungeon
+            // deaths in 48 hours unrecovered). Player::GetCorpseLocation() is
+            // where the core keeps the corpse across maps; see
+            // DriveInstanceCorpseGhost.
             Corpse* corpse = bot->GetCorpse();
             if (!corpse)
-                continue;  // not released yet: the dead engine releases it
-            std::vector<OverseerDecisions::GuildDeathMark>& marks = _guildDeathMarks[name];
-            OverseerDecisions::PruneGuildDeathMarks(marks, now, GHOST_REPEAT_MINUTES);
-            OverseerDecisions::NoteGuildDeath(
-                marks, {corpse->GetGhostTime(), corpse->GetMapId(), corpse->GetPositionX(),
-                        corpse->GetPositionY()});
-            unsigned const deathsHere = OverseerDecisions::CountGuildDeathsNear(
-                marks, now, corpse->GetMapId(), corpse->GetPositionX(), corpse->GetPositionY(),
-                GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES);
-            bool const hostileGround = OverseerDecisions::OnOtherFactionsGround(
-                bot->GetTeamId() == TEAM_ALLIANCE, corpse->GetZoneId());
-            DriveGhostRecovery(bot, botAI, name, corpse, deathsHere, /*ladder*/ false,
-                               hostileGround);
+            {
+                DriveInstanceCorpseGhost(bot, botAI, name, now);
+                continue;
+            }
+            DriveGuildGhostAtCorpse(bot, botAI, name, corpse, now);
         }
+    }
+
+    // Whether this drive steers `bot` (OverseerDecisions::GuildGhostDriven).
+    // NOT SteerableAI: that gate admits a client or a headless ROSTER bot by
+    // name, so it refused every guild member and this drive steered nobody on
+    // its first deploy. A guild member is a random bot: a bot session with an
+    // AI and no client. A family stand-in is the family's while it stands in
+    // (2026-10-05), and the family's run, not the guild's drives, directs it.
+    bool GuildGhostDrives(Player* bot, PlayerbotAI* botAI, std::string const& name)
+    {
+        WorldSession const* session = bot->GetSession();
+        bool const botSession = session && session->IsBot();
+        bool const familyDirects = OnRoster(name) || IsStandinGuest(name);
+        return OverseerDecisions::GuildGhostDriven(familyDirects, botSession,
+                                                   ClientAttached(bot) && !botSession,
+                                                   botAI != nullptr);
+    }
+
+    // A living member: the death is over. A member that ran back into a dungeon
+    // and stands in it alone walks back out first (WalkOutAfterRunBack).
+    void GuildMemberAlive(Player* bot, PlayerbotAI* botAI, std::string const& name, int64 now)
+    {
+        EndGhostRecovery(botAI, name);
+        _instanceGhostWalks.erase(name);
+        ReleaseRevivalHold(botAI, name);
+        if (WalkOutAfterRunBack(bot, botAI, name, now) || LeaveGuildDeathSpot(bot, name, now))
+            return;
+        // Resurrection Sickness is rested out, not fought through: at a quarter
+        // of its stats a member in starting gear dies to the first creature it
+        // meets.
+        DriveRevivedSickness(bot, botAI, name, /*restWhileSick*/ true);
+    }
+
+    // A ghost whose corpse is on the map it stands on: the ordinary decision.
+    void DriveGuildGhostAtCorpse(Player* bot, PlayerbotAI* botAI, std::string const& name,
+                                 Corpse* corpse, int64 now)
+    {
+        _instanceGhostWalks.erase(name);
+        std::vector<OverseerDecisions::GuildDeathMark>& marks = _guildDeathMarks[name];
+        OverseerDecisions::PruneGuildDeathMarks(marks, now, GHOST_REPEAT_MINUTES);
+        OverseerDecisions::NoteGuildDeath(
+            marks, {corpse->GetGhostTime(), corpse->GetMapId(), corpse->GetPositionX(),
+                    corpse->GetPositionY()});
+        unsigned const deathsHere = OverseerDecisions::CountGuildDeathsNear(
+            marks, now, corpse->GetMapId(), corpse->GetPositionX(), corpse->GetPositionY(),
+            GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES);
+        bool const hostileGround = OverseerDecisions::OnOtherFactionsGround(
+            bot->GetTeamId() == TEAM_ALLIANCE, corpse->GetZoneId());
+        DriveGhostRecovery(bot, botAI, name, corpse, deathsHere, /*ladder*/ false,
+                           hostileGround);
+    }
+
+    // --------------------------- a natural guild member's corpse in a dungeon --
+    //
+    // THE RUN BACK, AS A PLAYER DOES IT (2026-10-09). The rules and the
+    // measurement are OverseerDecisions::DecideInstanceGhost's. What is below
+    // reads the world into its facts and carries one step out:
+    //
+    //   walk_to_door   the dead engine's corpse run is leased off (it cannot
+    //                  see this corpse anyway) and the ghost is walked toward
+    //                  the areatrigger whose teleport lands on its corpse's map,
+    //                  a navmesh-routed leg at a time (GhostWalkLegs)
+    //   knock          standing in that trigger, the packet a client sends on
+    //                  touching it goes to the core's own handler
+    //                  (StepThroughAreaTrigger), which re-checks the radius and
+    //                  the map's entry rules; the core raises a ghost that
+    //                  enters the map its corpse is on
+    //   spirit_healer  the spirit healer of the graveyard the ghost was
+    //                  released to, walked back to the same routed way and
+    //                  asked the way the ordinary ghost drive asks it
+    //                  (AskSpiritHealer)
+    //   after the knock, alive inside with nobody of its party there, the
+    //                  member walks back out through the exit beside the
+    //                  entrance (WalkOutAfterRunBack)
+    //
+    // Nothing here raises, teleports or moves a character the game would not:
+    // the only movement is a routed walk on the ghost's own legs, and every
+    // crossing and resurrection is the core's answer to a client's packet.
+    struct InstanceGhostWalk
+    {
+        uint32 corpseMap{0};  // which death: the corpse's map and place
+        float corpseX{0.f};
+        float corpseY{0.f};
+        uint32 door{0};       // the entrance trigger on the ghost's map, or 0
+        float doorZ{0.f};     // the floor in that trigger, what the last leg aims at
+        int64 since{0};       // the first poll that saw this death
+        float bestYards{0.f}; // the closest the ghost has been to the door
+        int64 bestAt{0};      // and when it last got closer
+        unsigned refusedKnocks{0};
+        bool saidAny{false};
+        OverseerDecisions::InstanceGhostStep said{OverseerDecisions::InstanceGhostStep::NotMine};
+    };
+
+    // A member whose knock took it into a dungeon: where it went in, from where,
+    // and what the walk back out has done (WalkOutAfterRunBack).
+    struct RanBackInside
+    {
+        uint32 insideMap{0};
+        uint32 outsideMap{0};
+        int64 since{0};
+        uint32 exit{0};          // the trigger back out, found on the first poll inside
+        bool rpgLeased{false};   // `new rpg` was taken off for the walk out
+        bool saidAny{false};
+        OverseerDecisions::RevivedInsideStep said{OverseerDecisions::RevivedInsideStep::Rejoin};
+    };
+
+    // Ten minutes for the walk, two without getting closer, three refusals.
+    static constexpr OverseerDecisions::InstanceGhostLimits INSTANCE_GHOST_LIMITS{600, 120, 3};
+    // A leg is at most this long in a straight line, and the door itself is
+    // tried once it is this close: both under the navmesh's 296-yard corridor.
+    static constexpr float GHOST_DOOR_LEG_YARDS = 120.0f;
+    static constexpr float GHOST_DOOR_ROUTE_YARDS = 250.0f;
+    // Getting this much closer to the door restarts the stall clock.
+    static constexpr float GHOST_DOOR_PROGRESS_YARDS = 10.0f;
+    // A leg's ground is looked for from this far above the higher of the
+    // ghost and the door floor, down twice as far.
+    static constexpr float GHOST_LEG_PROBE_LIFT = 40.0f;
+    static constexpr uint32 GHOST_DOOR_POINT_ID = 0;
+    // How long a member raised inside is walked toward the exit before it is
+    // left where it stands.
+    static constexpr long RUN_BACK_EXIT_SECONDS = 180;
+    // How long the walk back to the spirit healer may take. Longer than the
+    // ordinary drive's GHOST_HEALER_WALK_SECONDS, whose ghost starts at the
+    // graveyard: this one may have stalled several hundred yards toward the door.
+    static constexpr int64 INSTANCE_GHOST_HEALER_SECONDS = 300;
+
+    // The areatrigger on the map `bot` stands on whose teleport lands on
+    // `targetMap`, nearest first; 0 when none does. Read from the core's own
+    // areatrigger and areatrigger_teleport tables, so a dungeon needs no row of
+    // this module's to be walked into or out of.
+    static uint32 NearestTriggerInto(Player* bot, uint32 targetMap)
+    {
+        uint32 best = 0;
+        float bestYards = 0.f;
+        // GetAllAreaTriggerTeleports  ObjectMgr.h:876
+        for (auto const& entry : sObjectMgr->GetAllAreaTriggerTeleports())
+        {
+            if (entry.second.target_mapId != targetMap)
+                continue;
+            AreaTrigger const* trigger = sObjectMgr->GetAreaTrigger(entry.first);
+            if (!trigger || trigger->map != bot->GetMapId())
+                continue;
+            float const yards = bot->GetExactDist2d(trigger->x, trigger->y);
+            if (!best || yards < bestYards)
+            {
+                best = entry.first;
+                bestYards = yards;
+            }
+        }
+        return best;
+    }
+
+    // THE FLOOR IN A TRIGGER, read from the map. A trigger's own z is its
+    // centre, which can stand in the floor or above it; the floor is what a
+    // walk can arrive on. Falls back to the centre.
+    static float TriggerFloorZ(Player* bot, AreaTrigger const& trigger)
+    {
+        float const reach = trigger.radius > 0.f ? trigger.radius
+                                                 : std::max(trigger.height * 0.5f, 2.0f);
+        Map* map = bot->GetMap();
+        float const ground =
+            map ? map->GetHeight(bot->GetPhaseMask(), trigger.x, trigger.y, trigger.z + reach,
+                                 true, reach * 2.0f)
+                : INVALID_HEIGHT;
+        return ground > INVALID_HEIGHT && std::fabs(ground - trigger.z) <= reach ? ground
+                                                                               : trigger.z;
+    }
+
+    // The ground at (x, y) for a leg, looked for from above the higher of the
+    // ghost and the door floor. False when the map has none there.
+    static bool LegGround(Player* bot, float x, float y, float doorZ, float& out)
+    {
+        Map* map = bot->GetMap();
+        if (!map)
+            return false;
+        float const top = std::max(bot->GetPositionZ(), doorZ) + GHOST_LEG_PROBE_LIFT;
+        float const ground =
+            map->GetHeight(bot->GetPhaseMask(), x, y, top, true, GHOST_LEG_PROBE_LIFT * 2.0f);
+        if (ground <= INVALID_HEIGHT)
+            return false;
+        out = ground;
+        return true;
+    }
+
+    // A leg the navmesh routes: not a straight line the core drew for want of a
+    // route (NOPATH, NOT_USING_PATH - which is what a Player gets over a hole in
+    // the mesh - SHORT past the 296-yard corridor, SHORTCUT), not an aim off the
+    // mesh (FARFROMPOLY_END), and ending at the height asked for. NavmeshRoutes
+    // asks the same with one more test, more than two points, which would
+    // refuse the last few yards to a door or a healer: a short walk on one
+    // polygon is a NORMAL path of two points.
+    static bool GhostLegRoutes(Player* bot, float x, float y, float z)
+    {
+        PathGenerator path(bot);  // PathGenerator.h:61
+        if (!path.CalculatePath(x, y, z))
+            return false;
+        uint32 const drawnStraight = PATHFIND_NOPATH | PATHFIND_NOT_USING_PATH | PATHFIND_SHORT |
+                                     PATHFIND_SHORTCUT | PATHFIND_FARFROMPOLY_END;
+        if (path.GetPathType() & drawnStraight)
+            return false;
+        G3D::Vector3 const& end = path.GetActualEndPosition();
+        return OverseerDecisions::TravelEndpointWithinTolerance(end.z, z,
+                                                                TRAVEL_ROUTE_ENDPOINT_YARDS);
+    }
+
+    // This death's walk, begun on the first poll that sees it: the door, its
+    // floor, and the spirit healer's graveyard (the one the ghost was released
+    // to). A new death hands back whatever the last one leased.
+    InstanceGhostWalk& InstanceGhostWalkFor(Player* bot, PlayerbotAI* botAI,
+                                            std::string const& name,
+                                            WorldLocation const& corpseAt, int64 now)
+    {
+        InstanceGhostWalk& walk = _instanceGhostWalks[name];
+        if (walk.since && walk.corpseMap == corpseAt.GetMapId() &&
+            walk.corpseX == corpseAt.GetPositionX() && walk.corpseY == corpseAt.GetPositionY())
+            return walk;
+        GhostRecoveryState& st = _ghostRecovery[name];
+        ReturnCorpseRun(botAI, st);
+        st = GhostRecoveryState{};
+        st.mapId = corpseAt.GetMapId();
+        st.corpseX = corpseAt.GetPositionX();
+        st.corpseY = corpseAt.GetPositionY();
+        st.healerGrave = sGraveyard->GetClosestGraveyard(bot, bot->GetTeamId());
+        walk = InstanceGhostWalk{};
+        walk.corpseMap = st.mapId;
+        walk.corpseX = st.corpseX;
+        walk.corpseY = st.corpseY;
+        walk.since = now;
+        walk.bestAt = now;
+        walk.door = NearestTriggerInto(bot, walk.corpseMap);
+        if (AreaTrigger const* door = walk.door ? sObjectMgr->GetAreaTrigger(walk.door) : nullptr)
+        {
+            walk.doorZ = TriggerFloorZ(bot, *door);
+            walk.bestYards = bot->GetExactDist2d(door->x, door->y);
+        }
+        return walk;
+    }
+
+    // One poll for a guild ghost whose corpse Player::GetCorpse() cannot see.
+    void DriveInstanceCorpseGhost(Player* bot, PlayerbotAI* botAI, std::string const& name,
+                                  int64 now)
+    {
+        OverseerDecisions::InstanceGhostFacts facts;
+        facts.released = bot->HasPlayerFlag(PLAYER_FLAGS_GHOST);
+        // GetCorpseLocation  Player.h:2072; HasCorpse  Player.h:2071
+        WorldLocation const corpseAt = bot->GetCorpseLocation();
+        facts.corpseElsewhere = bot->HasCorpse() && corpseAt.GetMapId() != bot->GetMapId();
+        if (!facts.released || !facts.corpseElsewhere)
+            return;  // not released yet: the dead engine releases it
+
+        InstanceGhostWalk& walk = InstanceGhostWalkFor(bot, botAI, name, corpseAt, now);
+        GhostRecoveryState& st = _ghostRecovery[name];
+        AreaTrigger const* door = walk.door ? sObjectMgr->GetAreaTrigger(walk.door) : nullptr;
+        NoteDoorProgress(bot, walk, door, now);
+        MapEntry const* inside = sMapStore.LookupEntry(walk.corpseMap);
+        facts.corpseInDungeon = inside && inside->IsDungeon();
+        facts.doorOnThisMap = door != nullptr;
+        facts.inDoor = door && bot->IsInAreaTriggerRadius(door);
+        facts.walkSeconds = static_cast<long>(now - walk.since);
+        facts.stalledSeconds = static_cast<long>(now - walk.bestAt);
+        facts.refusedKnocks = walk.refusedKnocks;
+        facts.healerKnown = st.healerGrave != nullptr;
+        facts.choseHealer = st.choseHealer;
+        OverseerDecisions::InstanceGhostVerdict const verdict =
+            OverseerDecisions::DecideInstanceGhost(facts, INSTANCE_GHOST_LIMITS);
+        SayInstanceGhost(bot, name, walk, st, verdict);
+
+        switch (verdict.step)
+        {
+            case OverseerDecisions::InstanceGhostStep::WalkToDoor:
+                WalkGhostToward(bot, botAI, st, door->x, door->y, walk.doorZ);
+                return;
+            case OverseerDecisions::InstanceGhostStep::Knock:
+                KnockGhostIn(bot, name, walk);
+                return;
+            case OverseerDecisions::InstanceGhostStep::SpiritHealer:
+                InstanceGhostToHealer(bot, botAI, name, st, walk, now);
+                return;
+            case OverseerDecisions::InstanceGhostStep::Stranded:
+                // Said once above; the dead engine gets back whatever a walk
+                // took from it.
+                ReturnCorpseRun(botAI, st);
+                return;
+            case OverseerDecisions::InstanceGhostStep::NotMine:
+                return;
+        }
+    }
+
+    // Getting GHOST_DOOR_PROGRESS_YARDS closer than ever restarts the stall clock.
+    static void NoteDoorProgress(Player* bot, InstanceGhostWalk& walk, AreaTrigger const* door,
+                                 int64 now)
+    {
+        if (!door)
+            return;
+        float const yards = bot->GetExactDist2d(door->x, door->y);
+        if (yards + GHOST_DOOR_PROGRESS_YARDS > walk.bestYards)
+            return;
+        walk.bestYards = yards;
+        walk.bestAt = now;
+    }
+
+    // Said once per death per step, so the log reads as the walk's story.
+    void SayInstanceGhost(Player* bot, std::string const& name, InstanceGhostWalk& walk,
+                          GhostRecoveryState const& st,
+                          OverseerDecisions::InstanceGhostVerdict const& verdict)
+    {
+        if (walk.saidAny && walk.said == verdict.step)
+            return;
+        walk.saidAny = true;
+        walk.said = verdict.step;
+        LOG_INFO("module.overseer",
+                 "overseer: instance corpse run-back for '{}' (level {}) is '{}' - {}. Ghost on "
+                 "map {} at ({:.0f}, {:.0f}); corpse inside map {} at ({:.0f}, {:.0f}); entrance "
+                 "areatrigger {} at {:.0f} yards (closest {:.0f}); {}s walked; {} refused "
+                 "knock(s); spirit healer graveyard '{}'",
+                 name, bot->GetLevel(), OverseerDecisions::InstanceGhostStepWord(verdict.step),
+                 OverseerDecisions::InstanceGhostReasonText(verdict.reason), bot->GetMapId(),
+                 bot->GetPositionX(), bot->GetPositionY(), walk.corpseMap, walk.corpseX,
+                 walk.corpseY, walk.door, DoorYards(bot, walk), walk.bestYards,
+                 time(nullptr) - walk.since, walk.refusedKnocks,
+                 st.healerGrave ? st.healerGrave->name : std::string("none"));
+    }
+
+    static float DoorYards(Player* bot, InstanceGhostWalk const& walk)
+    {
+        AreaTrigger const* door = walk.door ? sObjectMgr->GetAreaTrigger(walk.door) : nullptr;
+        return door ? bot->GetExactDist2d(door->x, door->y) : 0.f;
+    }
+
+    // One leg toward (x, y) and the floor `z` there, unless one is under way.
+    // The dead engine's corpse run is leased off first: its `stay` stops any
+    // movement it finds. A leg the navmesh does not route is never walked, so
+    // nothing is drawn in a straight line through a hill; when none routes
+    // from here the ghost stands, and the caller's clock decides what follows.
+    void WalkGhostToward(Player* bot, PlayerbotAI* botAI, GhostRecoveryState& st, float x,
+                         float y, float z)
+    {
+        LeaseCorpseRun(bot, botAI, st, /*walking*/ true);
+        MotionMaster* motion = bot->GetMotionMaster();
+        if (bot->isMoving() && motion->GetMotionSlotType(MOTION_SLOT_ACTIVE) == POINT_MOTION_TYPE)
+            return;
+        for (OverseerDecisions::GhostLeg const& leg : OverseerDecisions::GhostWalkLegs(
+                 bot->GetPositionX(), bot->GetPositionY(), x, y, GHOST_DOOR_ROUTE_YARDS,
+                 GHOST_DOOR_LEG_YARDS))
+        {
+            float legZ = z;
+            if (!leg.arrives && !LegGround(bot, leg.x, leg.y, z, legZ))
+                continue;
+            if (!GhostLegRoutes(bot, leg.x, leg.y, legZ))
+                continue;
+            motion->MovePoint(GHOST_DOOR_POINT_ID, leg.x, leg.y, legZ, FORCED_MOVEMENT_NONE, 0.f,
+                              0.f, /*generatePath*/ true, /*forceDestination*/ false);
+            return;
+        }
+    }
+
+    // The packet a client sends on touching the trigger, to the core's own
+    // handler. Three answers: the core raised the ghost at the door (it turned
+    // it away from a full instance or a raid it is not in), the ghost is on its
+    // way in (raised on arrival by HandleMoveWorldportAck, which for a bot runs
+    // on its next AI tick, so the map has not changed yet), or nothing happened.
+    void KnockGhostIn(Player* bot, std::string const& name, InstanceGhostWalk& walk)
+    {
+        uint32 const outside = bot->GetMapId();
+        StepThroughAreaTrigger(name, bot, "trigger:" + std::to_string(walk.door));
+        if (bot->IsAlive())
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: instance corpse run-back - '{}' was raised by the core at "
+                     "areatrigger {}, which turned the ghost away from map {} at the door",
+                     name, walk.door, walk.corpseMap);
+            return;
+        }
+        // IsBeingTeleportedFar  Player.h:2127
+        if (bot->IsBeingTeleportedFar())
+        {
+            RanBackInside& back = _ranBackInside[name];
+            back = RanBackInside{};
+            back.insideMap = walk.corpseMap;
+            back.outsideMap = outside;
+            back.since = time(nullptr);
+            LOG_INFO("module.overseer",
+                     "overseer: instance corpse run-back - '{}' stepped through areatrigger {} "
+                     "into map {}, where the core raises a ghost that enters the map its corpse "
+                     "is on",
+                     name, walk.door, walk.corpseMap);
+            return;
+        }
+        ++walk.refusedKnocks;
+        LOG_INFO("module.overseer",
+                 "overseer: instance corpse run-back - '{}' knocked in areatrigger {} and the "
+                 "core changed nothing ({} of {} refusals before the spirit healer)",
+                 name, walk.door, walk.refusedKnocks, INSTANCE_GHOST_LIMITS.refusedKnocks);
+    }
+
+    // The spirit healer at the graveyard the ghost was released to, asked the
+    // way the ordinary ghost drive asks it (AskSpiritHealer). The walk back to
+    // it is routed a leg at a time like the walk to the door, because a ghost
+    // that stalled on the way can stand hundreds of yards from it. A walk that
+    // never reaches one is said once and the corpse run handed back.
+    void InstanceGhostToHealer(Player* bot, PlayerbotAI* botAI, std::string const& name,
+                               GhostRecoveryState& st, InstanceGhostWalk const& walk, int64 now)
+    {
+        if (!st.choseHealer)
+        {
+            st.choseHealer = true;
+            st.healerSince = now;
+            // The leg toward the door that may be under way ends here.
+            bot->GetMotionMaster()->Clear();
+            bot->StopMoving();
+        }
+        if (st.healerWalkSpent)
+            return;
+        if (now - st.healerSince > INSTANCE_GHOST_HEALER_SECONDS)
+        {
+            st.healerWalkSpent = true;
+            ReturnCorpseRun(botAI, st);
+            LOG_ERROR("module.overseer",
+                      "overseer: instance corpse run-back - '{}' chose the spirit healer at '{}' "
+                      "{}s ago and never stood at one; its corpse is inside map {} and nothing "
+                      "else here can raise it",
+                      name, st.healerGrave->name, now - st.healerSince, walk.corpseMap);
+            return;
+        }
+        LeaseCorpseRun(bot, botAI, st, /*walking*/ true);
+        Creature* healer = NearestSpiritHealer(bot);
+        if (healer && bot->GetNPCIfCanInteractWith(healer->GetGUID(), UNIT_NPC_FLAG_SPIRITHEALER))
+        {
+            AskSpiritHealer(bot, botAI, name, st, healer, now,
+                            "running back to its corpse inside map " +
+                                std::to_string(walk.corpseMap));
+            return;
+        }
+        if (healer)
+            WalkGhostToward(bot, botAI, st, healer->GetPositionX(), healer->GetPositionY(),
+                            healer->GetPositionZ());
+        else
+            WalkGhostToward(bot, botAI, st, st.healerGrave->x, st.healerGrave->y,
+                            st.healerGrave->z);
+    }
+
+    // AFTER THE RUN BACK (OverseerDecisions::DecideRevivedInside). True when
+    // this poll is spoken for. The walk out leases `new rpg` off, because its
+    // status clock picks a destination of its own as soon as it is idle, and
+    // hands it back when the member is out, rejoined or given up on.
+    bool WalkOutAfterRunBack(Player* bot, PlayerbotAI* botAI, std::string const& name, int64 now)
+    {
+        auto const it = _ranBackInside.find(name);
+        if (it == _ranBackInside.end())
+            return false;
+        RanBackInside& back = it->second;
+        if (bot->GetMapId() != back.insideMap)
+        {
+            EndRunBack(botAI, name);
+            return false;
+        }
+        if (!back.exit)
+            back.exit = NearestTriggerInto(bot, back.outsideMap);
+        AreaTrigger const* exitDoor = back.exit ? sObjectMgr->GetAreaTrigger(back.exit) : nullptr;
+        OverseerDecisions::RevivedInsideFacts facts;
+        facts.partyAliveHere = PartyAliveBeside(bot);
+        facts.exitKnown = exitDoor != nullptr;
+        facts.inExit = exitDoor && bot->IsInAreaTriggerRadius(exitDoor);
+        facts.inCombat = bot->IsInCombat();
+        facts.seconds = static_cast<long>(now - back.since);
+        OverseerDecisions::RevivedInsideStep const step =
+            OverseerDecisions::DecideRevivedInside(facts, RUN_BACK_EXIT_SECONDS);
+        SayRevivedInside(name, back, facts, step);
+        switch (step)
+        {
+            case OverseerDecisions::RevivedInsideStep::Rejoin:
+            case OverseerDecisions::RevivedInsideStep::GiveUp:
+                EndRunBack(botAI, name);
+                return false;
+            case OverseerDecisions::RevivedInsideStep::Hold:
+                return true;
+            case OverseerDecisions::RevivedInsideStep::Knock:
+                StepThroughAreaTrigger(name, bot, "trigger:" + std::to_string(back.exit));
+                return true;
+            case OverseerDecisions::RevivedInsideStep::Walk:
+                WalkLivingToExit(bot, botAI, back, *exitDoor);
+                return true;
+        }
+        return false;
+    }
+
+    // Said once per step of the walk out.
+    static void SayRevivedInside(std::string const& name, RanBackInside& back,
+                                 OverseerDecisions::RevivedInsideFacts const& facts,
+                                 OverseerDecisions::RevivedInsideStep step)
+    {
+        if (back.saidAny && back.said == step)
+            return;
+        back.saidAny = true;
+        back.said = step;
+        LOG_INFO("module.overseer",
+                 "overseer: instance corpse run-back - '{}' is alive inside map {} {}s after the "
+                 "knock and is '{}' ({} of its party alive here; exit areatrigger {})",
+                 name, back.insideMap, facts.seconds,
+                 OverseerDecisions::RevivedInsideStepWord(step),
+                 facts.partyAliveHere ? "someone" : "nobody", back.exit);
+    }
+
+    // The few yards from where the core put the member to the exit beside it,
+    // with `new rpg` leased off so its status clock does not walk it elsewhere.
+    void WalkLivingToExit(Player* bot, PlayerbotAI* botAI, RanBackInside& back,
+                          AreaTrigger const& exitDoor)
+    {
+        if (botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+        {
+            botAI->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+            back.rpgLeased = true;
+        }
+        MotionMaster* motion = bot->GetMotionMaster();
+        if (bot->isMoving() && motion->GetMotionSlotType(MOTION_SLOT_ACTIVE) == POINT_MOTION_TYPE)
+            return;
+        motion->MovePoint(GHOST_DOOR_POINT_ID, exitDoor.x, exitDoor.y, TriggerFloorZ(bot, exitDoor),
+                          FORCED_MOVEMENT_NONE, 0.f, 0.f, /*generatePath*/ true,
+                          /*forceDestination*/ false);
+    }
+
+    // Hand back `new rpg` if the walk out took it, and forget the run back.
+    void EndRunBack(PlayerbotAI* botAI, std::string const& name)
+    {
+        auto const it = _ranBackInside.find(name);
+        if (it == _ranBackInside.end())
+            return;
+        if (it->second.rpgLeased && !botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+            botAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+        _ranBackInside.erase(it);
+    }
+
+    // A living member of `bot`'s party on the same instance as it.
+    static bool PartyAliveBeside(Player* bot)
+    {
+        Group* group = bot->GetGroup();
+        if (!group)
+            return false;
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->GetSource();
+            if (member && member != bot && member->IsInWorld() && member->IsAlive() &&
+                member->GetMapId() == bot->GetMapId() &&
+                member->GetInstanceId() == bot->GetInstanceId())
+                return true;
+        }
+        return false;
     }
 
     // A LIVING MEMBER THAT HAS DIED TWICE WHERE IT STANDS HEARTHS OUT
@@ -29399,56 +29930,27 @@ private:
                      name, st.healerGrave->name, now - st.healerSince);
             return false;
         }
+        return WalkGhostToSpiritHealer(
+            bot, botAI, name, st, now,
+            Acore::StringFormat("reclaiming its corpse at ({:.0f}, {:.0f})", st.corpseX,
+                                st.corpseY));
+    }
+
+    // WALK THE GHOST TO THE SPIRIT HEALER AND ASK IT, one poll, for the ordinary
+    // ghost drive. `insteadOf` says what the healer replaced, for the log.
+    // Always true: the poll is spoken for. On a resurrection the character's
+    // _ghostRecovery entry is erased, so `st` must not be touched after this
+    // returns.
+    bool WalkGhostToSpiritHealer(Player* bot, PlayerbotAI* botAI, std::string const& name,
+                                 GhostRecoveryState& st, int64 now,
+                                 std::string const& insteadOf)
+    {
         LeaseCorpseRun(bot, botAI, st, true);
 
-        // The nearest spirit healer, and whether the core would let this ghost
-        // talk to it from where it stands - the same gate its handler applies.
-        std::list<Creature*> healers;
-        SpiritHealerCheck healerCheck{bot, GHOST_HEALER_SWEEP_YARDS};
-        Acore::CreatureListSearcher<SpiritHealerCheck> healerSearcher(bot, healers, healerCheck);
-        Cell::VisitObjects(bot, healerSearcher, GHOST_HEALER_SWEEP_YARDS);
-        Creature* nearest = nullptr;
-        for (Creature* creature : healers)
-            if (!nearest || bot->GetExactDist2d(creature) < bot->GetExactDist2d(nearest))
-                nearest = creature;
-
+        Creature* nearest = NearestSpiritHealer(bot);
         if (nearest && bot->GetNPCIfCanInteractWith(nearest->GetGUID(), UNIT_NPC_FLAG_SPIRITHEALER))
         {
-            std::string const healerName = nearest->GetName();
-            WorldPacket packet(CMSG_SPIRIT_HEALER_ACTIVATE, 8);
-            packet << nearest->GetGUID();
-            bot->GetSession()->HandleSpiritHealerActivateOpcode(packet);
-            if (!bot->IsAlive())
-            {
-                LOG_WARN("module.overseer",
-                         "overseer: '{}' stands at spirit healer '{}' and the core's "
-                         "CMSG_SPIRIT_HEALER_ACTIVATE handler did not resurrect it - tried "
-                         "again next poll, and the stuck-revival ladder takes it after {}s",
-                         name, healerName, GHOST_HEALER_WALK_SECONDS);
-                return true;
-            }
-            LOG_WARN("module.overseer",
-                     "overseer: '{}' took the spirit healer's resurrection from '{}' at '{}' "
-                     "instead of reclaiming its corpse at ({:.0f}, {:.0f}) - resurrection "
-                     "sickness and durability loss included, as for any player who does",
-                     name, healerName, st.healerGrave->name, st.corpseX, st.corpseY);
-            // When this sickness ends, read from the aura the core just
-            // applied: one minute a level above 10 below level 20, ten from 20.
-            Aura const* sickness = bot->GetAura(15007);
-            int64 const sickEnds =
-                OverseerDecisions::SicknessEndsAt(now, sickness ? sickness->GetDuration() : 0);
-            // Ended sicknesses are dropped here too, so the map holds only
-            // members that are sick now.
-            for (auto it = _sicknessEndsAt.begin(); it != _sicknessEndsAt.end();)
-                it = it->second <= now ? _sicknessEndsAt.erase(it) : std::next(it);
-            if (sickEnds)
-                _sicknessEndsAt[name] = sickEnds;
-            else
-                _sicknessEndsAt.erase(name);
-            ReturnCorpseRun(botAI, st);
-            _ghostRecovery.erase(name);
-            HoldAfterRevival(bot, botAI, name, bot->GetMapId(), bot->GetPositionX(),
-                             bot->GetPositionY());
+            AskSpiritHealer(bot, botAI, name, st, nearest, now, insteadOf);
             return true;
         }
 
@@ -29469,6 +29971,66 @@ private:
         motion->MovePoint(GHOST_HEALER_POINT_ID, x, y, z, FORCED_MOVEMENT_NONE, 0.f, 0.f,
                           /*generatePath*/ true, /*forceDestination*/ false);
         return true;
+    }
+
+    // The nearest spirit healer within GHOST_HEALER_SWEEP_YARDS of the ghost.
+    static Creature* NearestSpiritHealer(Player* bot)
+    {
+        std::list<Creature*> healers;
+        SpiritHealerCheck healerCheck{bot, GHOST_HEALER_SWEEP_YARDS};
+        Acore::CreatureListSearcher<SpiritHealerCheck> healerSearcher(bot, healers, healerCheck);
+        Cell::VisitObjects(bot, healerSearcher, GHOST_HEALER_SWEEP_YARDS);
+        Creature* nearest = nullptr;
+        for (Creature* creature : healers)
+            if (!nearest || bot->GetExactDist2d(creature) < bot->GetExactDist2d(nearest))
+                nearest = creature;
+        return nearest;
+    }
+
+    // Ask `healer`, which the ghost stands at and may talk to, the way a client
+    // asks it: CMSG_SPIRIT_HEALER_ACTIVATE to the core's own handler, which
+    // applies resurrection sickness and durability loss. On a resurrection the
+    // character's _ghostRecovery entry is erased, so `st` must not be touched
+    // after this returns.
+    void AskSpiritHealer(Player* bot, PlayerbotAI* botAI, std::string const& name,
+                         GhostRecoveryState& st, Creature* healer, int64 now,
+                         std::string const& insteadOf)
+    {
+        std::string const healerName = healer->GetName();
+        WorldPacket packet(CMSG_SPIRIT_HEALER_ACTIVATE, 8);
+        packet << healer->GetGUID();
+        bot->GetSession()->HandleSpiritHealerActivateOpcode(packet);
+        if (!bot->IsAlive())
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' stands at spirit healer '{}' and the core's "
+                     "CMSG_SPIRIT_HEALER_ACTIVATE handler did not resurrect it - tried "
+                     "again next poll, and the stuck-revival ladder takes it after {}s",
+                     name, healerName, GHOST_HEALER_WALK_SECONDS);
+            return;
+        }
+        LOG_WARN("module.overseer",
+                 "overseer: '{}' took the spirit healer's resurrection from '{}' at '{}' "
+                 "instead of {} - resurrection sickness and durability loss included, as "
+                 "for any player who does",
+                 name, healerName, st.healerGrave->name, insteadOf);
+        // When this sickness ends, read from the aura the core just
+        // applied: one minute a level above 10 below level 20, ten from 20.
+        Aura const* sickness = bot->GetAura(15007);
+        int64 const sickEnds =
+            OverseerDecisions::SicknessEndsAt(now, sickness ? sickness->GetDuration() : 0);
+        // Ended sicknesses are dropped here too, so the map holds only
+        // members that are sick now.
+        for (auto it = _sicknessEndsAt.begin(); it != _sicknessEndsAt.end();)
+            it = it->second <= now ? _sicknessEndsAt.erase(it) : std::next(it);
+        if (sickEnds)
+            _sicknessEndsAt[name] = sickEnds;
+        else
+            _sicknessEndsAt.erase(name);
+        ReturnCorpseRun(botAI, st);
+        _ghostRecovery.erase(name);
+        HoldAfterRevival(bot, botAI, name, bot->GetMapId(), bot->GetPositionX(),
+                         bot->GetPositionY());
     }
 
     // ------------------------------------------------------ dungeon run: gather --
@@ -69264,6 +69826,14 @@ private:
     // saved strategy list is only ever added on top of those, so nothing this
     // module leased off is left missing.
     std::map<std::string, GhostRecoveryState> _ghostRecovery;
+    // A natural guild ghost's walk back to the dungeon its corpse is in
+    // (DriveInstanceCorpseGhost), by name, tied to one death by the corpse's
+    // place; and a member that walked back in, until it is out again or with its
+    // party (WalkOutAfterRunBack). World thread only. Lost on restart, which
+    // costs one walk begun again: the core keeps the corpse's place on the
+    // character, and a restart resets every strategy this leased.
+    std::map<std::string, InstanceGhostWalk> _instanceGhostWalks;
+    std::map<std::string, RanBackInside> _ranBackInside;
     // A natural guild member's recent deaths (DriveGuildGhostRecovery), by name.
     std::map<std::string, std::vector<OverseerDecisions::GuildDeathMark>> _guildDeathMarks;
     // The last hearth refusal LeaveGuildDeathSpot logged for a member, by name.
