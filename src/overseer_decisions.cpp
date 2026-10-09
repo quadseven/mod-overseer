@@ -19692,6 +19692,20 @@ std::uint32_t ChestOpeningSpell(std::vector<ChestLockCase> const& lock,
     return 0;
 }
 
+std::vector<std::uint8_t> ChestLootSlots(std::uint64_t opened, std::uint64_t looting,
+                                         std::size_t plain, std::size_t quest)
+{
+    std::vector<std::uint8_t> slots;
+    if (!opened || opened != looting)
+        return slots;
+    std::size_t const cap = 255;
+    for (std::size_t slot = plain; slot < plain + quest && slot < cap; ++slot)
+        slots.push_back(static_cast<std::uint8_t>(slot));
+    for (std::size_t slot = 0; slot < plain && slot < cap; ++slot)
+        slots.push_back(static_cast<std::uint8_t>(slot));
+    return slots;
+}
+
 QuestUseOutcome JudgeQuestUse(QuestUseReadBack const& read)
 {
     if (!read.readable)
