@@ -17254,7 +17254,7 @@ std::uint8_t GuildSeatRoleMask(GuildSeat seat)
 
 GuildRunRearmStep GuildRunRearmNext(GuildRunRearmFacts const& facts)
 {
-    if (!facts.armed || facts.aliveInside == 0)
+    if (!facts.armed || facts.aliveInside == 0 || facts.regrouping)
         return GuildRunRearmStep::Skip;
     return facts.secondsSinceIssued >= facts.cooldownSeconds ? GuildRunRearmStep::Issue
                                                              : GuildRunRearmStep::Wait;
@@ -17271,23 +17271,64 @@ GuildRunStrayStep GuildRunStrayNext(GuildRunStrayFacts const& facts)
     return facts.takenOut ? GuildRunStrayStep::Disband : GuildRunStrayStep::TakeOut;
 }
 
+namespace
+{
+bool GuildRunCleared(GuildRunPoll const& poll)
+{
+    return poll.finderFinished || (poll.bossesTotal && poll.bossesDone >= poll.bossesTotal) ||
+           DungeonRunCompletion(poll.expectedMask, poll.creditedMask) == DungeonCompletion::Complete;
+}
+
+// Nobody alive inside: a wipe on its corpse run, a wipe given up on, or a
+// dungeon the group has left.
+GuildRunVerdict GuildRunNobodyAlive(GuildRunPoll const& poll)
+{
+    if (poll.inside || poll.ghostsComingBack)
+        return poll.secondsRecovering < poll.recoverySeconds ? GuildRunVerdict::Running
+                                                             : GuildRunVerdict::Wiped;
+    return poll.secondsEmpty >= poll.emptySeconds ? GuildRunVerdict::Abandoned
+                                                  : GuildRunVerdict::Running;
+}
+
+// Somebody alive inside: the run goes on while its tank and healer are there,
+// or are on their way back within the window.
+GuildRunVerdict GuildRunSeats(GuildRunPoll const& poll)
+{
+    if (poll.tankAliveInside && poll.healerAliveInside)
+        return GuildRunVerdict::Running;
+    unsigned const window = poll.rolesComingBack ? poll.recoverySeconds : poll.roleRecoverySeconds;
+    return poll.secondsWithoutRoles >= window ? GuildRunVerdict::Abandoned
+                                              : GuildRunVerdict::Running;
+}
+}  // namespace
+
 GuildRunVerdict GuildRunNext(GuildRunPoll const& poll)
 {
-    if (poll.finderFinished || (poll.bossesTotal && poll.bossesDone >= poll.bossesTotal) ||
-        DungeonRunCompletion(poll.expectedMask, poll.creditedMask) == DungeonCompletion::Complete)
+    if (GuildRunCleared(poll))
         return GuildRunVerdict::Cleared;
-    if (poll.inside && poll.aliveInside == 0)
-        return GuildRunVerdict::Wiped;
     if (poll.groupGone)
-        return GuildRunVerdict::Abandoned;
-    if (!poll.inside && poll.secondsEmpty >= poll.emptySeconds)
-        return GuildRunVerdict::Abandoned;
-    if (poll.inside && (!poll.tankAliveInside || !poll.healerAliveInside) &&
-        poll.secondsWithoutRoles >= poll.roleRecoverySeconds)
         return GuildRunVerdict::Abandoned;
     if (poll.secondsInside >= poll.ceilingSeconds)
         return GuildRunVerdict::TimedOut;
-    return GuildRunVerdict::Running;
+    if (poll.aliveInside == 0)
+        return GuildRunNobodyAlive(poll);
+    return GuildRunSeats(poll);
+}
+
+bool GuildRunRecovering(unsigned aliveInside, unsigned deadInside, unsigned ghostsComingBack)
+{
+    return ghostsComingBack > 0 || (aliveInside == 0 && deadInside > 0);
+}
+
+GuildRunRecoveryStep GuildRunRecoveryNext(GuildRunRecoveryFacts const& facts)
+{
+    GuildRunRecoveryStep step;
+    step.release = facts.deadInside > 0 &&
+                   (facts.aliveInside == 0 || facts.secondsDeadInside >= facts.rezBudgetSeconds);
+    bool const inWindow = facts.secondsRecovering < facts.recoverySeconds;
+    step.walkBack = facts.ghostsComingBack > 0 && inWindow;
+    step.holdBrain = step.walkBack;
+    return step;
 }
 
 char const* GuildRunVerdictWord(GuildRunVerdict verdict)

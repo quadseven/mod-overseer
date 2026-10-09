@@ -23,6 +23,7 @@ using OverseerDecisions::FINDER_ROLE_LEADER;
 using OverseerDecisions::FINDER_ROLE_TANK;
 using OverseerDecisions::GUILD_RUN_CEILING_SECONDS;
 using OverseerDecisions::GUILD_RUN_EMPTY_SECONDS;
+using OverseerDecisions::GUILD_RUN_RECOVERY_SECONDS;
 using OverseerDecisions::GUILD_RUN_ROLE_RECOVERY_SECONDS;
 using OverseerDecisions::GuildFinderIsPug;
 using OverseerDecisions::GuildFinderKin;
@@ -207,7 +208,14 @@ void AScriptlessInstanceIsClearedByTheCoreCreditMask()
 
 void EverybodyInsideDeadIsAWipe()
 {
-    Check("three inside, none alive", GuildRunNext(Inside(3, 0)) == GuildRunVerdict::Wiped);
+    // A wipe is a corpse run first (GUILD_RUN_RECOVERY_SECONDS, and
+    // tests/test_guild_run_recovery.cpp): it is Wiped once nobody is back
+    // alive inside within the window.
+    GuildRunPoll spent = Inside(3, 0);
+    spent.secondsRecovering = GUILD_RUN_RECOVERY_SECONDS;
+    Check("three inside, none alive, the window spent", GuildRunNext(spent) == GuildRunVerdict::Wiped);
+    Check("three inside, none alive, just now, is a corpse run",
+          GuildRunNext(Inside(3, 0)) == GuildRunVerdict::Running);
     Check("nobody inside is not a wipe",
           GuildRunNext(Inside(0, 0)) != GuildRunVerdict::Wiped);
 }
