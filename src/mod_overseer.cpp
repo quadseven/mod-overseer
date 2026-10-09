@@ -780,6 +780,11 @@ constexpr int64 GHOST_HEALER_WALK_SECONDS = 120;
 constexpr int64 SPIRIT_HEALER_SICKNESS_SECONDS = 600;
 // How far round the ghost to look for the spirit healer itself.
 constexpr float GHOST_HEALER_SWEEP_YARDS = 60.0f;
+// A guild ghost whose corpse is on another map (DriveStrandedGhost) has no
+// corpse run to fall back on, so a walk to the healer that ran out of
+// GHOST_HEALER_WALK_SECONDS is tried again this long after it began, rather
+// than left for good.
+constexpr int64 STRANDED_GHOST_RETRY_SECONDS = 2 * GHOST_HEALER_WALK_SECONDS;
 // Two deaths here, three levels above, ninety seconds of waiting.
 constexpr OverseerDecisions::GhostRecoveryLimits GHOST_RECOVERY_LIMITS{2, 3, 90};
 
@@ -28540,9 +28545,16 @@ private:
                 continue;
             }
 
+            // GetCorpse() is map-scoped: null both before the release and for
+            // a ghost whose corpse lies on another map. The first is the dead
+            // engine's; the second nothing else will ever recover
+            // (DriveStrandedGhost).
             Corpse* corpse = bot->GetCorpse();
             if (!corpse)
-                continue;  // not released yet: the dead engine releases it
+            {
+                DriveStrandedGhost(bot, botAI, name, now);
+                continue;
+            }
             std::vector<OverseerDecisions::GuildDeathMark>& marks = _guildDeathMarks[name];
             OverseerDecisions::PruneGuildDeathMarks(marks, now, GHOST_REPEAT_MINUTES);
             OverseerDecisions::NoteGuildDeath(
@@ -28556,6 +28568,81 @@ private:
             DriveGhostRecovery(bot, botAI, name, corpse, deathsHere, /*ladder*/ false,
                                hostileGround);
         }
+    }
+
+    // A GUILD GHOST WHOSE CORPSE LIES INSIDE A DUNGEON TAKES THE SPIRIT HEALER.
+    // See OverseerDecisions::StrandedGhostNext for the measurement: a guild run
+    // that ends with members dead inside disbands its group, the dead release
+    // to the graveyard outside, and their corpses stay on the instance map,
+    // where neither the dead engine's corpse search nor DriveGhostRecovery can
+    // see them. They stood there for hours. Out of the group the instance is no
+    // longer theirs to enter, so the game's own way back is the spirit healer
+    // at the graveyard they stand at, asked as a client asks it: resurrection
+    // sickness and durability loss apply, and nothing is granted.
+    //
+    // The ghost recovery state is keyed on the corpse's place, which the core
+    // keeps across maps (GetCorpseLocation), so a second death starts afresh.
+    void DriveStrandedGhost(Player* bot, PlayerbotAI* botAI, std::string const& name, int64 now)
+    {
+        WorldLocation const corpseAt = bot->GetCorpseLocation();
+        OverseerDecisions::StrandedGhostFacts facts;
+        facts.ghost = bot->HasPlayerFlag(PLAYER_FLAGS_GHOST);
+        facts.corpseKnown = bot->HasCorpse();
+        facts.corpseMapId = corpseAt.GetMapId();
+        facts.standingMapId = bot->GetMapId();
+        facts.standingInstanceable = bot->GetMap()->Instanceable();
+        facts.grouped = bot->GetGroup() != nullptr;
+        if (OverseerDecisions::StrandedGhostNext(facts) !=
+            OverseerDecisions::StrandedGhostStep::SpiritHealer)
+        {
+            EndGhostRecovery(botAI, name);
+            return;
+        }
+
+        GhostRecoveryState& st = _ghostRecovery[name];
+        bool const sameDeath = st.choseHealer && st.mapId == corpseAt.GetMapId() &&
+                               st.corpseX == corpseAt.GetPositionX() &&
+                               st.corpseY == corpseAt.GetPositionY();
+        bool const retry = sameDeath && st.healerWalkSpent &&
+                           now - st.healerSince >= STRANDED_GHOST_RETRY_SECONDS;
+        if (!sameDeath || retry)
+            StartStrandedAttempt(bot, botAI, name, st, corpseAt, now, retry);
+        if (!st.healerGrave)
+            return;
+        WalkGhostToSpiritHealer(bot, botAI, name, st, /*ladder*/ false, now);
+    }
+
+    // A fresh walk to the spirit healer for a stranded ghost: a new death, or a
+    // walk that ran out (`retry`). Said once each, and written to the death row
+    // the first time.
+    void StartStrandedAttempt(Player* bot, PlayerbotAI* botAI, std::string const& name,
+                              GhostRecoveryState& st, WorldLocation const& corpseAt, int64 now,
+                              bool retry)
+    {
+        ReturnCorpseRun(botAI, st);
+        st = GhostRecoveryState{};
+        st.mapId = corpseAt.GetMapId();
+        st.corpseX = corpseAt.GetPositionX();
+        st.corpseY = corpseAt.GetPositionY();
+        st.choseHealer = true;
+        st.healerSince = now;
+        st.saidAny = true;
+        st.said = OverseerDecisions::GhostRecovery::SpiritHealer;
+        st.healerGrave = sGraveyard->GetClosestGraveyard(bot, bot->GetTeamId());
+        if (st.healerGrave)
+            st.healerRefused = GraveyardRefusal(bot, *st.healerGrave);
+        if (!retry)
+            RecordGhostRecovery(name, OverseerDecisions::GhostRecovery::SpiritHealer);
+        // The deploy proof: "stranded ghost" is said nowhere else.
+        LOG_INFO("module.overseer",
+                 "overseer: stranded ghost '{}' (level {}) - its corpse lies on map {} "
+                 "({:.0f}, {:.0f}) and it stands on map {} out of any group, where neither "
+                 "the dead engine nor a run can take it back; {} the spirit healer at '{}'{}{}",
+                 name, bot->GetLevel(), st.mapId, st.corpseX, st.corpseY,
+                 static_cast<uint32>(bot->GetMapId()), retry ? "trying again for" : "it takes",
+                 st.healerGrave ? st.healerGrave->name : std::string("none found"),
+                 st.healerRefused.empty() ? "" : ", though that graveyard was judged: ",
+                 st.healerRefused);
     }
 
     // A LIVING MEMBER THAT HAS DIED TWICE WHERE IT STANDS HEARTHS OUT
@@ -29371,7 +29458,19 @@ private:
             case OverseerDecisions::GhostRecovery::SpiritHealer:
                 break;
         }
+        return WalkGhostToSpiritHealer(bot, botAI, name, st, ladder, now);
+    }
 
+    // THE SPIRIT HEALER, CARRIED OUT: walk the ghost to the nearest spirit
+    // healer and ask it the way a client asks it. Shared by DriveGhostRecovery
+    // and DriveStrandedGhost, so a ghost whose corpse is out of reach is raised
+    // by the same core handler, with the same sickness and durability loss, as
+    // one that chose the healer beside its corpse. `st.healerGrave` is set by
+    // the caller. True when this poll is spoken for and the stuck-revival
+    // ladder must not act on it.
+    bool WalkGhostToSpiritHealer(Player* bot, PlayerbotAI* botAI, std::string const& name,
+                                 GhostRecoveryState& st, bool ladder, int64 now)
+    {
         if (!st.choseHealer)
         {
             st.choseHealer = true;

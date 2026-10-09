@@ -16155,6 +16155,27 @@ bool GuildGhostDriven(bool onRoster, bool botSession, bool playerClient, bool ha
     return !onRoster && botSession && !playerClient && hasAI;
 }
 
+StrandedGhostStep StrandedGhostNext(StrandedGhostFacts const& facts)
+{
+    if (!facts.ghost || !facts.corpseKnown)
+        return StrandedGhostStep::Leave;
+    if (facts.corpseMapId == facts.standingMapId)
+        return StrandedGhostStep::Leave;
+    if (facts.standingInstanceable || facts.grouped)
+        return StrandedGhostStep::Leave;
+    return StrandedGhostStep::SpiritHealer;
+}
+
+char const* StrandedGhostStepWord(StrandedGhostStep step)
+{
+    switch (step)
+    {
+        case StrandedGhostStep::Leave:        return "leave";
+        case StrandedGhostStep::SpiritHealer: return "spirit_healer";
+    }
+    return "unknown";
+}
+
 int NearestTrainerSpot(std::vector<TrainerSpot> const& spots, uint32_t mapId, float x, float y,
                        float maxYards)
 {

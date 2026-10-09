@@ -18838,6 +18838,60 @@ bool GuildGhostDriven(bool onRoster, bool botSession, bool playerClient, bool ha
 // Stormwind City for the Horde.
 bool OnOtherFactionsGround(bool alliance, uint32_t zoneId);
 
+// ---------------------- a natural guild member's corpse left inside a dungeon --
+//
+// THE GUILD GHOST DRIVE NEVER SAW A CORPSE ON ANOTHER MAP. It reads the corpse
+// through Player::GetCorpse(), which resolves through the map the ghost stands
+// on, and skipped a null as "not released yet". A guild run that wipes or ends
+// with members dead inside leaves exactly that: the group is disbanded, the
+// dead release to the outdoor graveyard, and every corpse stays on the
+// instance map. The dead engine cannot see such a corpse either
+// (FindCorpseAction reads the same lookup), so nothing ever moved them. It is
+// the bug DriveStuckRevival already had and fixed for the family (#79).
+//
+// Measured on the dev realm (2026-10-09): 21 online guild members stood as
+// ghosts at the graveyards outside the Deadmines, Wailing Caverns and
+// Blackfathom Deeps, out of any group, with their corpses on maps 36, 43 and
+// 48, the oldest for nearly six hours. Six were the two guilds' own tanks.
+// 253 of 256 guild deaths on a dungeon map in two days had no ghost recovery
+// decision at all, against nearly every death in the open world.
+//
+// A player whose dungeon group is gone cannot reach a corpse inside, because
+// the instance belonged to the group. It takes the spirit healer at the
+// graveyard it stands at, with resurrection sickness and durability loss.
+enum class StrandedGhostStep : std::uint8_t
+{
+    Leave,         // not this decision's to make: see StrandedGhostNext
+    SpiritHealer,  // take the spirit healer's resurrection where it stands
+};
+
+struct StrandedGhostFacts
+{
+    // Released: the ghost flag is set.
+    bool ghost{false};
+    // The core keeps a corpse location for it (Player::HasCorpse).
+    bool corpseKnown{false};
+    // The map the corpse lies on (Player::GetCorpseLocation), and the map the
+    // ghost stands on.
+    uint32_t corpseMapId{0};
+    uint32_t standingMapId{0};
+    // The map it stands on is an instance, a battleground or an arena.
+    bool standingInstanceable{false};
+    // In a group: a run still under way may take it back to its corpse (the
+    // raid run-back walks grouped ghosts to the door), so it is left to it.
+    bool grouped{false};
+};
+
+// SpiritHealer only for a released ghost, out of any group, standing in the
+// open world, whose corpse the core knows is on another map. Leave for
+// everything else: alive or not yet released (the dead engine releases it), a
+// corpse on its own map (DecideGhostRecovery decides), a ghost inside an
+// instance, or one in a group.
+StrandedGhostStep StrandedGhostNext(StrandedGhostFacts const& facts);
+
+// "leave", "spirit_healer".
+char const* StrandedGhostStepWord(StrandedGhostStep step);
+
 // ------------------------------- a natural guild member goes to its trainer --
 //
 // A natural guild member is granted no spells (playerbots patch 0024), and
