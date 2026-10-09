@@ -51115,6 +51115,9 @@ private:
             ++executed;
 
             Player* player = ObjectAccessor::FindPlayerByName(targetName);
+            // The next row for a death knight settled on a deck lets it go
+            // first, whatever the row then does (2026-10-09).
+            LiftDeckSettleForRow(targetName, player, kind);
             if (kind == "naturalize")
                 // BEFORE the online test, and the only kind that is: its
                 // target may be offline, and when it is online it is logged
@@ -51340,6 +51343,10 @@ private:
             }
             else
                 detail = "target has no bot AI (selfbot not enabled?)";
+
+            // A take, a hand-in or a drop that went through leaves a death
+            // knight on a deck of Acherus where it stands (2026-10-09).
+            SettleAfterQuestRow(player, kind, status);
 
             // NO ROW GOES BACK ON THE QUEUE IN PLACE. NOT `sell` EITHER, NOW.
             //
@@ -61982,6 +61989,9 @@ private:
                              "after {}ms",
                              check.id, check.targetName, check.ev.from.mapId,
                              check.ev.now.mapId, check.ev.waitedMs);
+                    // Home on a deck of Acherus, a death knight settles at its
+                    // bind point for its next row (2026-10-09).
+                    SettleOnTheDeck(bot, "hearth");
                     break;
 
                 case HearthOutcome::Stayed:
@@ -66730,6 +66740,12 @@ private:
         uint32 combatMs{0};
         uint32 pauses{0};
         bool paused{false};
+        // A DESTINATION ON ANOTHER LEVEL OF THE MAP (2026-10-09): whether the
+        // last poll had the walker on its way to the teleport pad that joins
+        // the two, the pad's spawn, and how many times a pad has carried it.
+        bool onPadLeg{false};
+        uint32 padSpawn{0};
+        uint32 padCarries{0};
     };
 
     // FAR WALKS STARTED, per bot, for the budget (#633). World thread only,
@@ -66893,6 +66909,7 @@ private:
               << ",\"mount_tries\":" << ev.mountTries
               << ",\"route_points\":" << ev.travel.route.size();
         o << ",\"combat_ms\":" << ev.combatMs << ",\"pauses\":" << ev.pauses;
+        o << ",\"pad_carries\":" << ev.padCarries;
         o << ",\"hold_applied\":" << (ev.hold.applied ? "true" : "false")
           << ",\"hold_placed_by_this_row\":" << (ev.hold.placed ? "true" : "false")
           << ",\"hold_took_stay\":" << (ev.hold.tookStay ? "true" : "false")
@@ -67074,15 +67091,292 @@ private:
         return true;
     }
 
+    // ------------------------------------ teleport pads between two levels (2026-10-09) --
+    //
+    // THE PADS OF A MAP, READ FROM THE WORLD'S OWN TABLES. A pad is a creature
+    // spawn whose addon aura (creature_addon, else creature_template_addon,
+    // the order Creature::GetCreatureAddon reads them in) is a periodic trigger
+    // of a teleport that sends every unit in an area round its caster
+    // (TARGET_UNIT_SRC_AREA_ENTRY) to a spell_target_position on the same map.
+    // Across the whole Spell.dbc four auras are that (54700, 54724, 54742,
+    // 54745), all of them the decks of Acherus. See OverseerDecisions::
+    // TeleportPad for why a walk only has to stand on one.
+    struct PadSpawn
+    {
+        OverseerDecisions::TeleportPad pad;
+        uint32 phaseMask{0};
+        uint32 spawnId{0};
+        uint32 entry{0};
+        uint32 spell{0};  // the teleport the pad casts
+    };
+
+    // The teleport a pad's aura casts, when a walk can use it: an area
+    // teleport to a spot on this map, with no target conditions a walker
+    // might fail. Reads the radius and the exit into `out`.
+    static bool PadTeleportOf(uint32 triggerId, uint32 mapId, PadSpawn& out)
+    {
+        SpellInfo const* trigger = sSpellMgr->GetSpellInfo(triggerId);
+        if (!trigger)
+            return false;
+        for (SpellEffectInfo const& effect : trigger->GetEffects())
+        {
+            bool const areaTeleport = effect.Effect == SPELL_EFFECT_TELEPORT_UNITS &&
+                                      effect.TargetA.GetTarget() == TARGET_DEST_DB &&
+                                      effect.TargetB.GetTarget() == TARGET_UNIT_SRC_AREA_ENTRY;
+            bool const conditional =
+                effect.ImplicitTargetConditions && !effect.ImplicitTargetConditions->empty();
+            if (!areaTeleport || conditional)
+                continue;
+            SpellTargetPosition const* to = sSpellMgr->GetSpellTargetPosition(
+                triggerId, SpellEffIndex(effect.EffectIndex));   // SpellMgr.h:693
+            if (!to || to->target_mapId != mapId)
+                continue;
+            out.pad.radius = effect.CalcRadius();
+            out.pad.exit = OverseerDecisions::MailWalkPoint{to->target_X, to->target_Y,
+                                                           to->target_Z};
+            out.spell = triggerId;
+            return true;
+        }
+        return false;
+    }
+
+    // Is one of these auras a pad's periodic teleport?
+    static bool PadAuraAmong(std::vector<uint32> const& auras, uint32 mapId, PadSpawn& out)
+    {
+        for (uint32 auraId : auras)
+        {
+            SpellInfo const* aura = sSpellMgr->GetSpellInfo(auraId);
+            if (!aura)
+                continue;
+            for (SpellEffectInfo const& effect : aura->GetEffects())
+                if (effect.ApplyAuraName == SPELL_AURA_PERIODIC_TRIGGER_SPELL &&
+                    PadTeleportOf(effect.TriggerSpell, mapId, out))
+                    return true;
+        }
+        return false;
+    }
+
+    // Every pad on a map, read once per map and kept: the spawn tables do not
+    // change under a running world. World thread only, like the walk list.
+    static std::vector<PadSpawn> const& TeleportPadsOnMap(uint32 mapId)
+    {
+        static std::map<uint32, std::vector<PadSpawn>> byMap;
+        auto const known = byMap.find(mapId);
+        if (known != byMap.end())
+            return known->second;
+        std::vector<PadSpawn>& pads = byMap[mapId];
+        for (auto const& itr : sObjectMgr->GetAllCreatureData())
+        {
+            CreatureData const& data = itr.second;
+            if (data.mapid != mapId)
+                continue;
+            CreatureAddon const* addon = sObjectMgr->GetCreatureAddon(itr.first);
+            if (!addon)
+                addon = sObjectMgr->GetCreatureTemplateAddon(data.id);
+            PadSpawn pad;
+            if (!addon || !PadAuraAmong(addon->auras, mapId, pad))
+                continue;
+            pad.pad.at = OverseerDecisions::MailWalkPoint{data.posX, data.posY, data.posZ};
+            pad.phaseMask = data.phaseMask;
+            pad.spawnId = uint32(itr.first);
+            pad.entry = data.id;
+            pads.push_back(pad);
+            LOG_INFO("module.overseer",
+                     "overseer: teleport pad on map {}: creature {} (spawn {}) casts spell {} on "
+                     "whoever stands within {:.1f} yards of ({:.1f}, {:.1f}, {:.1f}) and sets them "
+                     "down at ({:.1f}, {:.1f}, {:.1f})",
+                     mapId, pad.entry, pad.spawnId, pad.spell, pad.pad.radius, pad.pad.at.x,
+                     pad.pad.at.y, pad.pad.at.z, pad.pad.exit.x, pad.pad.exit.y,
+                     pad.pad.exit.z);
+        }
+        return pads;
+    }
+
+    // The pads this character could step on: its map's, in its phase. `spawns`
+    // gets the spawn behind each pad, in the same order, when asked for.
+    static std::vector<OverseerDecisions::TeleportPad> TeleportPadsFor(
+        Player* who, std::vector<PadSpawn const*>* spawns = nullptr)
+    {
+        std::vector<OverseerDecisions::TeleportPad> pads;
+        for (PadSpawn const& spawn : TeleportPadsOnMap(who->GetMapId()))
+        {
+            if (!(spawn.phaseMask & who->GetPhaseMask()))
+                continue;
+            pads.push_back(spawn.pad);
+            if (spawns)
+                spawns->push_back(&spawn);
+        }
+        return pads;
+    }
+
+    static OverseerDecisions::MailWalkPoint StandingPoint(Player* who)
+    {
+        return OverseerDecisions::MailWalkPoint{who->GetPositionX(), who->GetPositionY(),
+                                                who->GetPositionZ()};
+    }
+
+    // The pad this walk steps on first, and the spawn behind it; none when the
+    // destination is on the walker's own level or no pad joins the two.
+    struct PadPick
+    {
+        OverseerDecisions::TeleportPadChoice choice;
+        PadSpawn const* spawn{nullptr};
+    };
+
+    static PadPick PadPickFor(Player* who, MailWalkEvidence const& ev)
+    {
+        PadPick pick;
+        std::vector<PadSpawn const*> spawns;
+        std::vector<OverseerDecisions::TeleportPad> const pads = TeleportPadsFor(who, &spawns);
+        pick.choice = OverseerDecisions::ChooseTeleportPad(
+            pads, StandingPoint(who), OverseerDecisions::MailWalkPoint{ev.boxX, ev.boxY, ev.boxZ});
+        if (pick.choice.index >= 0)
+            pick.spawn = spawns[static_cast<std::size_t>(pick.choice.index)];
+        return pick;
+    }
+
+    // WHERE THIS LEG GOES: the destination, or the pad that carries the walker
+    // to the destination's level. A walk aimed across two decks is aimed at a
+    // point no polygon of the walker's deck reaches.
+    static OverseerDecisions::MailWalkPoint WalkAimOf(Player* who, MailWalkEvidence const& ev,
+                                                      bool& viaPad)
+    {
+        PadPick const pick = PadPickFor(who, ev);
+        viaPad = pick.spawn != nullptr;
+        if (viaPad)
+            return pick.spawn->pad.at;
+        return OverseerDecisions::MailWalkPoint{ev.boxX, ev.boxY, ev.boxZ};
+    }
+
+    // HOW FAR THE WALKER STILL HAS TO GO, read each poll: by way of the pad
+    // when the destination is on another level, else the straight line. Says
+    // once when a walk turns to a pad and once when the pad has carried it.
+    static float WalkYardsLeft(Player* bot, MailWalkCheck& check)
+    {
+        MailWalkEvidence& ev = check.ev;
+        PadPick const pick = PadPickFor(bot, ev);
+        if (pick.spawn && !ev.onPadLeg)
+            LOG_INFO("module.overseer",
+                     "overseer: {} walk {} - '{}' stands {:.0f} yards {} '{}' on another level of "
+                     "map {}; it walks to the teleport pad that joins the two levels (creature "
+                     "{}, spawn {}, {:.0f} yards off) and steps on it, and the pad's spell {} "
+                     "carries it there like a player",
+                     OverseerDecisions::WalkGoalWord(ev.goal), check.id, check.targetName,
+                     std::fabs(ev.boxZ - bot->GetPositionZ()),
+                     ev.boxZ > bot->GetPositionZ() ? "below" : "above", ev.mailboxName, ev.mapId,
+                     pick.spawn->entry, pick.spawn->spawnId,
+                     bot->GetExactDist(pick.spawn->pad.at.x, pick.spawn->pad.at.y,
+                                       pick.spawn->pad.at.z),
+                     pick.spawn->spell);
+        else if (!pick.spawn && ev.onPadLeg)
+        {
+            ++ev.padCarries;
+            LOG_INFO("module.overseer",
+                     "overseer: {} walk {} - '{}' is on the level of '{}' now, at ({:.1f}, "
+                     "{:.1f}, {:.1f}): the teleport pad (spawn {}) carried it, and it walks on",
+                     OverseerDecisions::WalkGoalWord(ev.goal), check.id, check.targetName,
+                     ev.mailboxName, bot->GetPositionX(), bot->GetPositionY(),
+                     bot->GetPositionZ(), ev.padSpawn);
+        }
+        ev.onPadLeg = pick.spawn != nullptr;
+        if (pick.spawn)
+        {
+            ev.padSpawn = pick.spawn->spawnId;
+            return pick.choice.viaYards;
+        }
+        return bot->GetExactDist(ev.boxX, ev.boxY, ev.boxZ);
+    }
+
+    // The yards a walk starts with: by way of the pad, or the straight line
+    // the destination was chosen on.
+    static float WalkStartYards(Player* who, MailWalkEvidence const& ev, float straightYards)
+    {
+        PadPick const pick = PadPickFor(who, ev);
+        return pick.spawn ? pick.choice.viaYards : straightYards;
+    }
+
+    // ------------------------------------------- the settle on the deck (2026-10-09) --
+    //
+    // A DEATH KNIGHT A CLASS ROW LEAVES ON A DECK OF ACHERUS STAYS THERE. The
+    // measurement is at OverseerDecisions::DECK_SETTLE_HOLD_VERB. It is the
+    // module's one hold (HoldCharacterStill): `stay` on, `new rpg` and `follow`
+    // off, the motion slot taken and the per-tick sweep keeping it put; it is
+    // not stood up or taken off a mount, since nothing is cast. It ends at the
+    // character's next row (LiftDeckSettleForRow), at a walk that takes it over
+    // (LetAWalkTakeOverASettle), or at its ceiling (ReleaseExpiredHolds).
+    static void SettleOnTheDeck(Player* who, char const* after)
+    {
+        PlayerbotAI* botAI = who ? GET_PLAYERBOT_AI(who) : nullptr;
+        if (!botAI)
+            return;
+        std::string const name = who->GetName();
+        OverseerDecisions::DeckSettleFacts facts;
+        facts.mapId = who->GetMapId();
+        facts.deathKnight = who->getClass() == CLASS_DEATH_KNIGHT;
+        facts.onAPaddedLevel =
+            OverseerDecisions::OnAPaddedLevel(TeleportPadsFor(who), StandingPoint(who));
+        facts.alive = who->IsAlive();
+        facts.inCombat = who->IsInCombat();
+        facts.inFlight = who->IsInFlight();
+        facts.heldByAnother = HeldStill(name);
+        if (!OverseerDecisions::SettlesOnTheDeck(facts))
+            return;
+        if (!HoldCharacterStill(who, botAI, name, OverseerDecisions::DECK_SETTLE_HOLD_VERB,
+                                OverseerDecisions::DECK_SETTLE_SECONDS, false))
+            return;
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' settles on the deck where its {} left it, at ({:.1f}, {:.1f}, "
+                 "{:.1f}) on map {}, for up to {}s or until its next row: a death knight let go "
+                 "there wanders off the deck",
+                 name, after, who->GetPositionX(), who->GetPositionY(), who->GetPositionZ(),
+                 facts.mapId, OverseerDecisions::DECK_SETTLE_SECONDS);
+    }
+
+    // A take, a hand-in or a drop that went through (DoQuest's `delivered`).
+    // A use parks as `verifying` and settles when it reads back instead.
+    static void SettleAfterQuestRow(Player* who, std::string const& kind, char const* status)
+    {
+        if (who && kind == "quest" && status && std::string(status) == "delivered")
+            SettleOnTheDeck(who, "quest row");
+    }
+
+    // The next row for a settled character lets it go before it runs, unless
+    // the row only reads or speaks (RowLiftsDeckSettle).
+    static void LiftDeckSettleForRow(std::string const& name, Player* who,
+                                     std::string const& kind)
+    {
+        auto const hold = HoldsInForce().find(name);
+        if (hold == HoldsInForce().end() ||
+            hold->second.verb != OverseerDecisions::DECK_SETTLE_HOLD_VERB)
+            return;
+        if (OverseerDecisions::RowLiftsDeckSettle(kind))
+            ReleaseHold(name, who, "its next row arrived", OverseerDecisions::DECK_SETTLE_HOLD_VERB);
+    }
+
+    // A WALK TAKES OVER A SETTLE rather than being refused by it, the way it
+    // replaces its own linger (OverseerDecisions::HoldYieldsToWalk).
+    static void LetAWalkTakeOverASettle(std::string const& name, Player* who)
+    {
+        auto const hold = HoldsInForce().find(name);
+        if (hold != HoldsInForce().end() && OverseerDecisions::HoldYieldsToWalk(hold->second.verb))
+            ReleaseHold(name, who, "a walk takes it over", OverseerDecisions::DECK_SETTLE_HOLD_VERB);
+    }
+
     // Where the next leg of a walk goes, without moving anybody: a straight
     // leg toward the destination for a near walk, the travel survey's next leg
     // for a far one. False when the ground there gives no step.
+    //
+    // A DESTINATION ON ANOTHER LEVEL IS WALKED TO BY ITS PAD (2026-10-09): the
+    // leg aims at the pad that joins the walker's level to the destination's
+    // (WalkAimOf), and the survey is not asked, since it knows no pad.
     static bool MailWalkLegStep(Player* who, MailWalkEvidence& ev, WorldPosition& step)
     {
+        bool viaPad = false;
+        OverseerDecisions::MailWalkPoint const goal = WalkAimOf(who, ev, viaPad);
         bool final = false;
         OverseerDecisions::MailWalkPoint aim = OverseerDecisions::MailWalkLegAim(
-            who->GetPositionX(), who->GetPositionY(), who->GetPositionZ(), ev.boxX, ev.boxY,
-            ev.boxZ, OverseerDecisions::MAIL_WALK_LEG_YARDS, final);
+            who->GetPositionX(), who->GetPositionY(), who->GetPositionZ(), goal.x, goal.y,
+            goal.z, OverseerDecisions::MAIL_WALK_LEG_YARDS, final);
         float aimZ = aim.z;
 
         // A FAR WALK FOLLOWS THE TRAVEL SURVEY (#633), through the roster
@@ -67092,7 +67386,8 @@ private:
         // straight leg above is walked then, exactly as a near walk walks it.
         WorldPosition const destination(ev.mapId, ev.boxX, ev.boxY, ev.boxZ);
         bool onRoute = false;
-        if (ev.far)
+        bool const surveyed = ev.far && !viaPad;
+        if (surveyed)
         {
             WorldPosition const leg =
                 RouteLeg(who, destination, ev.travel, ev.character, ev.travel.target);
@@ -67120,7 +67415,7 @@ private:
         // THE GROUND GUARD, AND FOR A FAR WALK THE ROSTER'S RETREAT ALONG THE
         // ROUTE when the point it aimed at is refused (#592).
         if (GroundedStep(who, WorldPosition(ev.mapId, aim.x, aim.y, aimZ), step) ||
-            (ev.far && RetreatAlongRoute(who, destination, ev.travel, step)))
+            (surveyed && RetreatAlongRoute(who, destination, ev.travel, step)))
             return true;
 
         // AND THEN THE NAVMESH'S OWN WAY. A straight leg's aim is a point on
@@ -67156,8 +67451,12 @@ private:
         // The path's own first point is where the bot stands; its height is
         // the one the first segment is measured from.
         leg.botZ = who->GetPositionZ();
+        // Toward the destination, or toward the pad when it is on another
+        // level (2026-10-09): no path joins two decks a pad joins.
+        bool viaPad = false;
+        OverseerDecisions::MailWalkPoint const goal = WalkAimOf(who, ev, viaPad);
         PathGenerator path(who);   // PathGenerator.h:61
-        if (!path.CalculatePath(ev.boxX, ev.boxY, ev.boxZ))
+        if (!path.CalculatePath(goal.x, goal.y, goal.z))
             return leg;
         if (path.GetPathType() & PATHFIND_NOPATH)
             return leg;
@@ -67201,8 +67500,12 @@ private:
         MotionMaster* const motion = who->GetMotionMaster();
         if (!motion)
             return false;
-        if (!force && who->isMoving()
-            && motion->GetMotionSlotType(MOTION_SLOT_ACTIVE) == POINT_MOTION_TYPE)
+        // A WALKER A PAD IS CARRYING IS LEFT ALONE UNTIL IT LANDS (2026-10-09):
+        // the pad's teleport is a near teleport, and a leg handed out before it
+        // is acknowledged would be walked from the place the walker is leaving.
+        bool const walking = who->isMoving()
+            && motion->GetMotionSlotType(MOTION_SLOT_ACTIVE) == POINT_MOTION_TYPE;
+        if (who->IsBeingTeleported() || (!force && walking))
         {
             LetHeldCharacterWalk(ev.character, MAIL_WALK_SWEEP_QUIET_SECONDS);
             return true;
@@ -67484,10 +67787,12 @@ private:
             if (check.targetName == ev.character)
                 gate.alreadyWalking = true;
         {
+            // A settle on the deck is the walk's to take over (2026-10-09).
             auto const& holds = HoldsInForce();
             auto const hold = holds.find(ev.character);
             gate.heldByAnother = HeldStill(ev.character) && hold != holds.end()
-                && hold->second.verb != MAIL_WALK_HOLD_VERB;
+                && hold->second.verb != MAIL_WALK_HOLD_VERB
+                && !D::HoldYieldsToWalk(hold->second.verb);
         }
         if (char const* wall = D::MailWalkGate(gate); *wall)
             return refuse(wall);
@@ -67509,7 +67814,9 @@ private:
         }
 
         // A linger left by an earlier walk is this verb's own and is replaced
-        // rather than re-asserted, so the new walk gets its own ceiling.
+        // rather than re-asserted, so the new walk gets its own ceiling. A
+        // settle on the deck is taken over the same way.
+        LetAWalkTakeOverASettle(ev.character, who);
         ReleaseHold(ev.character, who, "a new walk replaces it", MAIL_WALK_HOLD_VERB);
 
         // ALREADY AT A BOX. Nothing to walk; held there for the linger so the
@@ -67664,9 +67971,11 @@ private:
         ev.boxX = chosen.x;
         ev.boxY = chosen.y;
         ev.boxZ = chosen.z;
-        ev.startYards = choice.yards;
-        ev.bestYards = choice.yards;
-        ev.nowYards = choice.yards;
+        // By way of the pad when the destination is on another level
+        // (2026-10-09), so the clock and the progress read the way it walks.
+        ev.startYards = WalkStartYards(who, ev, choice.yards);
+        ev.bestYards = ev.startYards;
+        ev.nowYards = ev.startYards;
 
         // ---- near or far (#633) ----------------------------------------------
         //
@@ -67877,6 +68186,9 @@ private:
     // the walk does not take a character off somebody else.
     static bool RetakeWalkHold(Player* bot, MailWalkEvidence& ev)
     {
+        // A settle on the deck placed in the gap is the walk's to take over
+        // (2026-10-09), as it is when the row starts.
+        LetAWalkTakeOverASettle(ev.character, bot);
         auto const& holds = HoldsInForce();
         auto const hold = holds.find(ev.character);
         if (HeldStill(ev.character) && hold != holds.end() &&
@@ -67940,7 +68252,9 @@ private:
                 ev.waitedMs += elapsedMs;
             if (facts.present && facts.sameMap)
             {
-                ev.nowYards = bot->GetExactDist(ev.boxX, ev.boxY, ev.boxZ);
+                // By way of a pad when the destination is on another level of
+                // the map (2026-10-09).
+                ev.nowYards = WalkYardsLeft(bot, check);
                 // A far walk that goes round reads its progress along the route
                 // and its clock from the route's length (2026-10-08).
                 bool walkedOnRoute = false;
@@ -68321,6 +68635,10 @@ private:
                          ev.spawnIsObject ? "gameobject" : "creature", ev.spawnId,
                          ev.reachedYards, ev.waitedMs, ev.legs,
                          party ? "held for its party" : "let go to play");
+                // ...except a death knight on a deck of Acherus, which settles
+                // there for its next row (2026-10-09).
+                if (!party)
+                    SettleOnTheDeck(bot, "spawn walk");
             }
             else if (state == D::MailWalkState::Arrived)
             {
@@ -69287,6 +69605,10 @@ private:
             }
             LOG_INFO("module.overseer", "overseer: quest use {} for '{}' read back as {} after {}ms",
                      check.id, check.targetName, outcome, check.ev.waitedMs);
+            // A use that went through leaves a death knight on a deck of
+            // Acherus where it stands, for its next row (2026-10-09).
+            if (*detail == '\0')
+                SettleOnTheDeck(bot, "quest use");
 
             CharacterDatabase.Execute(
                 "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "

@@ -19888,4 +19888,92 @@ char const* HuntStepWord(HuntStep step)
     return "unknown";
 }
 
+namespace
+{
+float PadFlatYards(MailWalkPoint const& a, MailWalkPoint const& b)
+{
+    return std::hypot(a.x - b.x, a.y - b.y);
+}
+
+float PadYards(MailWalkPoint const& a, MailWalkPoint const& b)
+{
+    float const dx = a.x - b.x;
+    float const dy = a.y - b.y;
+    float const dz = a.z - b.z;
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+bool OnOneLevel(float z, float otherZ)
+{
+    return std::fabs(z - otherZ) <= TELEPORT_PAD_LEVEL_YARDS;
+}
+
+// The pad stands on the walker's level within reach, sets it down on the
+// destination's level, and is not a pad that leaves it on the level it was on.
+bool PadServes(TeleportPad const& pad, MailWalkPoint const& from, MailWalkPoint const& to)
+{
+    return OnOneLevel(pad.at.z, from.z) && OnOneLevel(pad.exit.z, to.z) &&
+           !OnOneLevel(pad.exit.z, pad.at.z) &&
+           PadFlatYards(from, pad.at) <= TELEPORT_PAD_REACH_YARDS;
+}
+}  // namespace
+
+TeleportPadChoice ChooseTeleportPad(std::vector<TeleportPad> const& pads,
+                                    MailWalkPoint const& from, MailWalkPoint const& to)
+{
+    TeleportPadChoice best;
+    if (OnOneLevel(from.z, to.z))
+        return best;
+    for (std::size_t i = 0; i < pads.size(); ++i)
+    {
+        if (!PadServes(pads[i], from, to))
+            continue;
+        float const via = PadYards(from, pads[i].at) + PadYards(pads[i].exit, to);
+        if (best.index < 0 || via < best.viaYards)
+        {
+            best.index = static_cast<int>(i);
+            best.viaYards = via;
+        }
+    }
+    return best;
+}
+
+float WalkYardsToGo(std::vector<TeleportPad> const& pads, MailWalkPoint const& from,
+                    MailWalkPoint const& to)
+{
+    TeleportPadChoice const choice = ChooseTeleportPad(pads, from, to);
+    return choice.index >= 0 ? choice.viaYards : PadYards(from, to);
+}
+
+bool OnAPaddedLevel(std::vector<TeleportPad> const& pads, MailWalkPoint const& at)
+{
+    for (TeleportPad const& pad : pads)
+    {
+        bool const byThePad = OnOneLevel(at.z, pad.at.z) &&
+                              PadFlatYards(at, pad.at) <= TELEPORT_PAD_REACH_YARDS;
+        bool const byItsExit = OnOneLevel(at.z, pad.exit.z) &&
+                               PadFlatYards(at, pad.exit) <= TELEPORT_PAD_REACH_YARDS;
+        if (byThePad || byItsExit)
+            return true;
+    }
+    return false;
+}
+
+bool SettlesOnTheDeck(DeckSettleFacts const& facts)
+{
+    return facts.mapId == DEATH_KNIGHT_START_MAP_ID && facts.deathKnight &&
+           facts.onAPaddedLevel && facts.alive && !facts.inCombat && !facts.inFlight &&
+           !facts.heldByAnother;
+}
+
+bool RowLiftsDeckSettle(std::string const& kind)
+{
+    return kind != "probe" && kind != "chat";
+}
+
+bool HoldYieldsToWalk(std::string const& holdVerb)
+{
+    return holdVerb == DECK_SETTLE_HOLD_VERB;
+}
+
 }  // namespace OverseerDecisions
