@@ -237,6 +237,47 @@ void AGameObjectUseAsksNothingOfAnItemOrALife()
     ExpectText("no object of that entry", QuestUseGate(f), R::NoTarget);
 }
 
+// Perrine's Chest (37098) and the Burning Blade Stash (58595) carry lock 43: a
+// click at either did nothing on the dev realm (2026-10-09), because a chest
+// opens only to the spell its lock names.
+void AChestIsOpenedWithTheSpellItsLockNames()
+{
+    // Lock type 5 asks no skill; a key case (type 1) needs an item, not a spell.
+    std::vector<ChestLockCase> const lock = {{1, 6893, true}, {LOCK_CASE_SKILL, 5, true}};
+    std::vector<LockOpener> const known = {
+        {2575, 3},   // Mining opens a mining lock, not this one
+        {6477, 10},  // an opening of another lock type
+        {21651, 5},
+        {3365, 5},
+    };
+    Expect(ChestOpeningSpell(lock, known) == 3365,
+           "the lowest known spell of the skill case's lock type opens the chest");
+    Expect(ChestOpeningSpell(lock, {{2575, 3}, {6477, 10}}) == 0,
+           "no known spell of the lock's type: no opener");
+    Expect(ChestOpeningSpell({{1, 6893, true}}, known) == 0,
+           "a key lock is not opened by a spell");
+    Expect(ChestOpeningSpell({}, known) == 0, "no lock row: the open-lock cast is refused, no opener");
+    Expect(ChestOpeningSpell({{LOCK_CASE_SKILL, 5, false}}, known) == 0,
+           "a skill case the character does not meet is skipped");
+    Expect(ChestOpeningSpell({{LOCK_CASE_SKILL, 5, false}, {LOCK_CASE_SKILL, 10, true}}, known) ==
+               6477,
+           "the next skill case the character meets is tried");
+
+    QuestUseGateFacts f = Ready();
+    f.gameObject = true;
+    f.chest = true;
+    f.reachYards = 5.5f;
+    f.targetYards = 0.0f;
+    ExpectText("a chest no known spell opens is refused, not clicked", QuestUseGate(f),
+               R::NoOpener);
+    f.opener = 3365;
+    ExpectText("a chest with an opener may fire", QuestUseGate(f), "");
+    f.chest = false;
+    f.opener = 0;
+    ExpectText("an object that is no chest is still clicked", QuestUseGate(f), "");
+    Expect(QuestUseRefusalRetry(R::NoOpener) == TownRetry::Never, "no opener: never");
+}
+
 void TheRetryTable()
 {
     Expect(QuestUseRefusalRetry(R::MalformedItem) == TownRetry::Never, "malformed item: never");
@@ -281,6 +322,7 @@ int main()
     TheObjectGrammar();
     TheGateAnswersEachWallInOrder();
     AGameObjectUseAsksNothingOfAnItemOrALife();
+    AChestIsOpenedWithTheSpellItsLockNames();
     TheRetryTable();
     TheJudge();
     if (failures)

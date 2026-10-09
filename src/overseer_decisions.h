@@ -6127,7 +6127,8 @@ char const* TownRetryWord(TownRetry retry);
 // shaman's totem item used on a creature. The packet is CMSG_USE_ITEM with a
 // unit target block, the very packet a client sends. `use-gameobject` is a
 // player clicking the nearest gameobject of an entry (CMSG_GAMEOBJ_USE), which
-// is how a quest chest, an altar or a lever is operated.
+// is how an altar or a lever is operated; a quest chest is opened with the
+// spell its lock names instead (ChestOpeningSpell), as a client opens one.
 //
 // THE WALK IS THE BRIDGE'S. These verbs never move the character: they fire
 // when it already stands within reach of the target, and refuse with `the
@@ -6207,6 +6208,7 @@ constexpr char const* NoHereSpell = "that item has no spell that needs no target
 constexpr char const* ItemMissing = "the character does not carry that item";
 constexpr char const* ItemUnusable = "the core will not let this character use that item";
 constexpr char const* ItemOnCooldown = "the item's spell is on cooldown";
+constexpr char const* NoOpener = "no spell this character knows opens that chest's lock";
 // Endings.
 constexpr char const* LeftWorld = "left the world before the use could be read back";
 constexpr char const* NothingHappened = "the use changed nothing the character could be read for";
@@ -6233,6 +6235,10 @@ struct QuestUseGateFacts
     float targetYards{-1.0f};  // negative is unread
     float reachYards{QUEST_USE_CREATURE_YARDS};
     bool wrongTarget{false};   // the item's spell takes no creature target
+    // A chest (use-gameobject on GAMEOBJECT_TYPE_CHEST) and the spell that
+    // opens it (ChestOpeningSpell); 0 is none known.
+    bool chest{false};
+    std::uint32_t opener{0};
     // The item (use-item-on only).
     bool itemCarried{true};
     bool itemUsable{true};
@@ -6242,6 +6248,46 @@ struct QuestUseGateFacts
 // "" when the use may fire; otherwise the QuestUseRefusal literal for the
 // first wall: the character's walls, then the target's, then the item's.
 char const* QuestUseGate(QuestUseGateFacts const& facts);
+
+// A CHEST IS OPENED WITH A SPELL, NOT A CLICK (2026-10-09). The core's
+// GameObject::Use has no case for GAMEOBJECT_TYPE_CHEST, so CMSG_GAMEOBJ_USE at
+// a chest does nothing at all. A client opens a chest by casting the spell its
+// lock names: an OPEN_LOCK effect whose MiscValue is the lock type of a
+// LOCK_KEY_SKILL case of the chest's Lock.dbc row ("Opening", which every
+// character is created knowing). Spell::SendLoot then opens the loot window and
+// the bot's own loot strategy stores the quest item. Measured on the dev realm
+// on 2026-10-09: 50 of 52 `use-gameobject 37098` rows (Perrine's Chest, the
+// undead warlock's Creature of the Void) and every row at the Burning Blade
+// Stash (58595, the orc warlock's) read back `nothing`, and eleven warlocks
+// stood beside their chest with the quest in the log for a day.
+//
+// One case of a chest's lock: its key type (the core's LockKeyType), its index
+// (for a skill case, the lock type an opening spell's MiscValue must name), and
+// whether the character meets the skill that lock type asks for (true for a
+// lock type that asks none).
+constexpr std::uint32_t LOCK_CASE_SKILL = 2;  // the core's LOCK_KEY_SKILL
+
+struct ChestLockCase
+{
+    std::uint32_t type{0};
+    std::uint32_t index{0};
+    bool skillMet{true};
+};
+
+// A spell the character knows whose effect opens a lock of `lockType`.
+struct LockOpener
+{
+    std::uint32_t spellId{0};
+    std::uint32_t lockType{0};
+};
+
+// The spell the character opens the chest with: for the first skill case of
+// the lock whose skill the character meets, the lowest known spell that opens
+// that lock type. 0 when none does (a key lock, a lock type no known spell
+// opens, a skill too low, or no lock at all, which the core's open-lock cast
+// refuses), and the use is refused NoOpener: a click would open nothing.
+std::uint32_t ChestOpeningSpell(std::vector<ChestLockCase> const& lock,
+                                std::vector<LockOpener> const& known);
 
 // Worth asking again without changing the row. Moving, fighting, dying, a
 // target out of reach or dead (it respawns), a hold and a use under way are.

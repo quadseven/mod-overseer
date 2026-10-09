@@ -19498,7 +19498,7 @@ char const* QuestUseGate(QuestUseGateFacts const& facts)
     if (facts.targetYards < 0.0f || facts.targetYards > facts.reachYards)
         return R::TooFar;
     if (facts.gameObject)
-        return "";
+        return facts.chest && !facts.opener ? R::NoOpener : "";
     if (facts.wrongTarget)
         return R::WrongTarget;
     if (!facts.itemCarried)
@@ -19514,12 +19514,30 @@ TownRetry QuestUseRefusalRetry(std::string const& detail)
 {
     namespace R = QuestUseRefusal;
     if (detail == R::MalformedItem || detail == R::MalformedObject || detail == R::MalformedHere ||
-        detail == R::NoBotAI || detail == R::NoHereSpell ||
+        detail == R::NoBotAI || detail == R::NoHereSpell || detail == R::NoOpener ||
         detail == R::WrongTarget || detail == R::ItemMissing || detail == R::ItemUnusable)
         return TownRetry::Never;
     if (detail == R::InInstance)
         return TownRetry::Elsewhere;
     return TownRetry::Later;
+}
+
+std::uint32_t ChestOpeningSpell(std::vector<ChestLockCase> const& lock,
+                                std::vector<LockOpener> const& known)
+{
+    for (ChestLockCase const& keyed : lock)
+    {
+        if (keyed.type != LOCK_CASE_SKILL || !keyed.skillMet)
+            continue;
+        std::uint32_t best = 0;
+        for (LockOpener const& opener : known)
+            if (opener.spellId && opener.lockType == keyed.index &&
+                (!best || opener.spellId < best))
+                best = opener.spellId;
+        if (best)
+            return best;
+    }
+    return 0;
 }
 
 QuestUseOutcome JudgeQuestUse(QuestUseReadBack const& read)

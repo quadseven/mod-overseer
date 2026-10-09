@@ -68246,7 +68246,9 @@ private:
     // it, and uses the carried item at it (CMSG_USE_ITEM with a unit target
     // block, as the cast verb writes its named target); or clicks the nearest
     // gameobject of the entry (CMSG_GAMEOBJ_USE, whose handler re-checks the
-    // interaction distance itself). Nothing here grants quest credit, spawns a
+    // interaction distance itself), except a chest, which it opens with the
+    // spell the chest's lock names (CMSG_CAST_SPELL at the object, as a client
+    // does: GameObject::Use has no chest case). Nothing here grants quest credit, spawns a
     // creature or moves the character: the core's own spell or gameobject
     // script runs and the quest counters move when it says so.
     //
@@ -68338,6 +68340,61 @@ private:
         return o.str();
     }
 
+    // THE SPELL A CLIENT OPENS A CHEST WITH (OverseerDecisions::ChestOpeningSpell):
+    // the chest's lock cases from Lock.dbc (lock_dbc is empty in this world
+    // database, as DoorPrerequisitesFor notes) and every OPEN_LOCK spell the
+    // character knows. 0 when none opens it.
+    static uint32 ChestOpenerFor(Player* who, GameObject* chest)
+    {
+        namespace D = OverseerDecisions;
+
+        std::vector<D::ChestLockCase> lock;
+        if (LockEntry const* entry = sLockStore.LookupEntry(chest->GetGOInfo()->GetLockId()))
+        {
+            for (uint8 i = 0; i < MAX_LOCK_CASE; ++i)
+            {
+                D::ChestLockCase keyed;
+                keyed.type = entry->Type[i];
+                keyed.index = entry->Index[i];
+                if (keyed.type == LOCK_KEY_SKILL)
+                    if (uint32 skill = SkillByLockType(LockType(keyed.index)))
+                        keyed.skillMet = uint32(who->GetSkillValue(skill)) >= entry->Skill[i];
+                lock.push_back(keyed);
+            }
+        }
+
+        std::vector<D::LockOpener> known;
+        for (auto const& [spellId, spell] : who->GetSpellMap())
+        {
+            if (!spell || spell->State == PLAYERSPELL_REMOVED || !spell->Active)
+                continue;
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+            if (!info)
+                continue;
+            for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                if (info->Effects[i].Effect == SPELL_EFFECT_OPEN_LOCK)
+                    known.push_back({spellId, uint32(info->Effects[i].MiscValue)});
+        }
+        return D::ChestOpeningSpell(lock, known);
+    }
+
+    // CMSG_CAST_SPELL at a gameobject, as a client opens a chest: castCount,
+    // spellId, castFlags, then TARGET_FLAG_GAMEOBJECT and the object's packed
+    // guid, which SpellCastTargets::Read takes as the object target. The open
+    // lock effect re-checks the lock and the range itself, and Spell::SendLoot
+    // opens the loot window the bot's loot strategy then stores from.
+    static void DriveChestOpen(WorldSession* session, uint32 spellId, ObjectGuid chest)
+    {
+        WorldPacket raw(CMSG_CAST_SPELL, 1 + 4 + 1 + 4 + 9);
+        raw << uint8(1);  // castCount
+        raw << uint32(spellId);
+        raw << uint8(0);  // castFlags
+        raw << uint32(TARGET_FLAG_GAMEOBJECT);
+        raw << chest.WriteAsPacked();
+        raw.rpos(0);
+        session->HandleCastSpellOpcode(raw);
+    }
+
     static char const* DoQuestUse(Player* who, std::string const& command, char const*& status,
                                   std::string& out, std::vector<QuestUseCheck>& parked,
                                   uint32 id)
@@ -68411,6 +68468,11 @@ private:
                     targetGuid = object->GetGUID();
                     gate.targetYards = who->GetDistance(object);
                     gate.reachYards = object->GetInteractionDistance();
+                    // A chest opens only to the spell its lock names (no click).
+                    gate.chest = object->GetGoType() == GAMEOBJECT_TYPE_CHEST;
+                    if (gate.chest)
+                        gate.opener = ChestOpenerFor(who, object);
+                    ev.spellId = gate.opener;
                 }
             }
             else
@@ -68487,7 +68549,10 @@ private:
 
         if (request.gameObject)
         {
-            DriveGameObjectUse(session, targetGuid);
+            if (ev.spellId)
+                DriveChestOpen(session, ev.spellId, targetGuid);
+            else
+                DriveGameObjectUse(session, targetGuid);
         }
         else if (request.here)
         {
