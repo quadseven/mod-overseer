@@ -19652,8 +19652,66 @@ constexpr unsigned GUILD_RUN_CEILING_SECONDS = 120 * 60;
 // teleport, a logout) and the run is over.
 constexpr unsigned GUILD_RUN_EMPTY_SECONDS = 90;
 // A run without its assigned tank or healer cannot clear safely. Give those
-// members a short window to return before the living party is recalled.
+// members a short window to return before the living party is recalled. It is
+// also how long a body lying inside is left for the dungeon brain's own
+// resurrection before it is released to run back (GuildRunRecoveryNext).
 constexpr unsigned GUILD_RUN_ROLE_RECOVERY_SECONDS = 5 * 60;
+
+// A WIPE IS A CORPSE RUN, NOT THE END OF THE RUN. A guild run ended the moment
+// everybody inside was dead, and a dead tank or healer nobody raised ended it
+// five minutes later. Measured on the dev realm over 48 hours (2026-10-09): 42
+// of 105 guild runs ended "wiped" and 19 "abandoned" that way, and the
+// Deadmines cleared 0 of 46 runs in ten days, Wailing Caverns 1 of 63. Every
+// run started again from the door with fresh trash, and its dead stood as
+// ghosts at the graveyard outside for hours.
+//
+// A group of players releases, runs back from the graveyard, walks in and
+// carries on: the cleared trash and the bosses stay dead. So the dead inside
+// are released (the release button's own repop) when nobody alive is left to
+// raise them, or when one has lain dead past GUILD_RUN_ROLE_RECOVERY_SECONDS;
+// every ghost of the run is walked from the graveyard to the dungeon's door
+// and knocked through it, and the core raises a ghost that enters the instance
+// its corpse is in (HandleMoveWorldportAck). The dungeon brain is not re-armed
+// while ghosts are still coming back, so the group pulls again whole. A wipe
+// or a missing tank or healer that is coming back ends the run only when it is
+// not back within this window, counted from the wipe or the death.
+constexpr unsigned GUILD_RUN_RECOVERY_SECONDS = 15 * 60;
+
+struct GuildRunRecoveryFacts
+{
+    unsigned aliveInside{0};
+    // Members dead on the dungeon's map and not released.
+    unsigned deadInside{0};
+    // Members released as ghosts whose corpse is on the dungeon's map, standing
+    // outside it: the corpse run.
+    unsigned ghostsComingBack{0};
+    // Since a member first lay dead inside without being raised (0 when none).
+    unsigned secondsDeadInside{0};
+    unsigned rezBudgetSeconds{GUILD_RUN_ROLE_RECOVERY_SECONDS};
+    // Since the recovery began (GuildRunRecovering), 0 when none is under way.
+    unsigned secondsRecovering{0};
+    unsigned recoverySeconds{GUILD_RUN_RECOVERY_SECONDS};
+};
+
+struct GuildRunRecoveryStep
+{
+    // Release the dead lying inside.
+    bool release{false};
+    // Walk the run's ghosts to the door and knock each one through.
+    bool walkBack{false};
+    // Do not re-arm the dungeon brain yet: somebody is still coming back.
+    bool holdBrain{false};
+};
+
+// A recovery is under way: ghosts of the run are coming back, or nobody inside
+// is alive and somebody lies dead there.
+bool GuildRunRecovering(unsigned aliveInside, unsigned deadInside, unsigned ghostsComingBack);
+
+// What the run does about its dead this poll. Release: dead lie inside and
+// nobody alive is there, or the rez budget has passed. Walk back and hold the
+// brain: ghosts are out, inside the recovery window. Past the window the
+// ghosts are no longer walked and the brain is armed for whoever is back.
+GuildRunRecoveryStep GuildRunRecoveryNext(GuildRunRecoveryFacts const& facts);
 
 // A PICK-UP GROUP (wow-overseer issue 591). A guild group short a real tank
 // or healer recruits one from the server the way players do: its asker says
@@ -19771,20 +19829,33 @@ struct GuildRunPoll
     bool groupGone{false};
     unsigned ceilingSeconds{GUILD_RUN_CEILING_SECONDS};
     unsigned emptySeconds{GUILD_RUN_EMPTY_SECONDS};
+    // THE CORPSE RUN (GUILD_RUN_RECOVERY_SECONDS). Ghosts of the run whose
+    // corpse is on the dungeon's map, standing outside it.
+    unsigned ghostsComingBack{0};
+    // Every assigned tank or healer not alive inside is dead (lying inside or
+    // a ghost coming back), so the seat is recoverable rather than gone.
+    bool rolesComingBack{false};
+    // Since the recovery began (GuildRunRecovering); 0 when none is under way.
+    unsigned secondsRecovering{0};
+    unsigned recoverySeconds{GUILD_RUN_RECOVERY_SECONDS};
 };
 
 enum class GuildRunVerdict : std::uint8_t
 {
     Running,
     Cleared,    // the finder says the dungeon is finished, or every boss is down
-    Wiped,      // everybody inside is dead at once
+    Wiped,      // everybody inside died and nobody was back within the recovery window
     Abandoned,  // nobody inside, the group is gone, or a role stays unavailable
     TimedOut,   // inside past the ceiling
 };
 
 // ONE POLL of a group that has been inside. Cleared is asked first: a group
-// whose last boss died has cleared it whatever happens after. A wipe is every
-// member inside dead at the same poll with at least one member inside.
+// whose last boss died has cleared it whatever happens after; then a group that
+// is gone, then the ceiling. A wipe is nobody alive inside with somebody dead
+// there or a ghost of the run coming back, and it is Wiped only once
+// `secondsRecovering` reaches `recoverySeconds`; until then the corpse run is
+// Running. A missing tank or healer is Abandoned after `roleRecoverySeconds`,
+// or after `recoverySeconds` when the seat is coming back (`rolesComingBack`).
 GuildRunVerdict GuildRunNext(GuildRunPoll const& poll);
 
 // "running", "cleared", "wiped", "abandoned", "timed out".
@@ -19810,11 +19881,14 @@ struct GuildRunRearmFacts
     // Since the last `dc on` / `dc ensure` was issued for this run.
     unsigned secondsSinceIssued{0};
     unsigned cooldownSeconds{GUILD_RUN_REARM_SECONDS};
+    // Ghosts of the run are still coming back (GuildRunRecoveryStep::holdBrain):
+    // the group pulls again whole, so nothing is asked yet.
+    bool regrouping{false};
 };
 
 enum class GuildRunRearmStep : std::uint8_t
 {
-    Skip,   // not armed yet, or nobody alive to arm for
+    Skip,   // not armed yet, nobody alive to arm for, or ghosts still coming back
     Wait,   // asked a moment ago
     Issue,  // ask the dungeon brain to be on
 };
