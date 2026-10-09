@@ -21814,6 +21814,105 @@ HuntStep HuntNext(HuntPollFacts const& facts);
 // "looting", "nodrop".
 char const* HuntStepWord(HuntStep step);
 
+// ------------------------------- two levels joined by a teleport pad (2026-10-09) --
+//
+// ACHERUS FLOATS OVER THE DEATH KNIGHT'S STARTING ZONE IN TWO DECKS: the Hall of
+// Command below (z about 367 to 384) and the Heart of Acherus above (z about 415
+// to 444), where Instructor Razuvious, the runeforges and the Battle-worn Sword
+// chests stand. The navmesh holds them as two islands with no polygon between
+// them (map 609, tile 27,42: 584 polygons below, 655 above), so a walk aimed
+// across them ends under its destination. On wow-dev on 2026-10-09 a death
+// knight's walk to a sword chest ended "stopped getting nearer the spawn" 8
+// yards from it on the flat and 44 yards below it.
+//
+// A PAD JOINS THEM, AND THE SERVER WORKS IT. Each deck has a trigger creature
+// (29580 below, 29581 above) carrying a periodic aura (54700, 54724) that casts
+// a teleport (54699, 54725) every second on every unit within 3 yards of it on
+// the flat (TARGET_UNIT_SRC_AREA_ENTRY; the core reads an entry area target in
+// 2D), to the teleport's spell_target_position. It is not a client areatrigger:
+// AreaTrigger.dbc holds none there, and nothing waits for CMSG_AREATRIGGER. A
+// bot that stands on the pad is carried exactly as a player is, so a walk only
+// has to walk onto it. The adapter reads each pad from the world's own tables
+// (creature addon auras, the spells, spell_target_position); nothing here names
+// a coordinate.
+struct TeleportPad
+{
+    MailWalkPoint at;    // where the pad's trigger creature stands
+    float radius{0.f};   // the teleport's area radius, measured on the flat
+    MailWalkPoint exit;  // where the teleport sets a walker down
+};
+
+// ONE LEVEL. A pad serves a walk only between two levels: the pad within this
+// many yards of the walker's height, its exit within this many of the
+// destination's, and the destination more than this many from the walker's.
+// The decks of Acherus are 31 yards apart at their nearest (384 and 415), and
+// each spans under 30 (the upper one's balconies reach 444, 23 over the pad).
+constexpr float TELEPORT_PAD_LEVEL_YARDS = 25.0f;
+// A pad joins two floors of one building: only one this near on the flat is
+// stepped on. One walk leg.
+constexpr float TELEPORT_PAD_REACH_YARDS = MAIL_WALK_LEG_YARDS;
+
+struct TeleportPadChoice
+{
+    int index{-1};         // the pad to step on first; -1 for none
+    float viaYards{-1.f};  // walker to the pad, plus the pad's exit to the destination
+};
+
+// THE PAD A WALK STEPS ON FIRST: the destination is on another level than the
+// walker, and a pad on the walker's level within reach sets it down on the
+// destination's. The shortest way round by a pad wins; none when no pad serves.
+TeleportPadChoice ChooseTeleportPad(std::vector<TeleportPad> const& pads,
+                                    MailWalkPoint const& from, MailWalkPoint const& to);
+
+// The yards a walk still has to go, which its progress and its clock are read
+// against: by way of the pad ChooseTeleportPad picks, or the straight 3D line.
+float WalkYardsToGo(std::vector<TeleportPad> const& pads, MailWalkPoint const& from,
+                    MailWalkPoint const& to);
+
+// Does `at` stand on a level a pad joins to another one: within reach of a pad,
+// or of a pad's exit, at its own height?
+bool OnAPaddedLevel(std::vector<TeleportPad> const& pads, MailWalkPoint const& at);
+
+// ------------------------------------------ the settle on the deck (2026-10-09) --
+//
+// A DEATH KNIGHT LET GO ON A DECK WANDERS OFF IT. After a hearth home to Acherus
+// read back at its bind point on the upper deck, Brug stood on the lower one 3.5
+// minutes later, before the bridge's next pass wrote its next class row: a
+// wander across the Heart's pad drops a bot to the Hall of Command, and one off
+// the edge drops it to the ground, 266 yards down. So after a class quest row
+// goes through there (a take, a hand-in or a drop; a use that read back; a walk
+// to a spawn that arrived) or a hearth that came home, the bot is held where the
+// row left it, with the module's own hold, until its next row or the ceiling.
+// Only on a padded level of the start zone: the ground is where a hunt's own
+// grind does the work, and a hold there would stop it.
+constexpr char const* DECK_SETTLE_HOLD_VERB = "settle";
+// The ceiling. The next class row lifts it at once; on wow-dev a take or a hearth
+// was followed by the next class row 215 to 219 seconds later (a 90 second
+// follow-up and the pass's own compute), so five minutes outlasts one pass.
+constexpr uint32_t DECK_SETTLE_SECONDS = 300;
+
+struct DeckSettleFacts
+{
+    uint32_t mapId{0};
+    bool deathKnight{false};
+    bool onAPaddedLevel{false};  // OnAPaddedLevel, read where it stands
+    bool alive{false};
+    bool inCombat{false};
+    bool inFlight{false};
+    bool heldByAnother{false};  // another verb's hold is in force
+};
+
+// Is the character held to settle where its row left it?
+bool SettlesOnTheDeck(DeckSettleFacts const& facts);
+
+// Does the next row of this kind for the character lift its settle? Every kind
+// that acts does. A `probe` reads and a `chat` line speaks; neither moves it.
+bool RowLiftsDeckSettle(std::string const& kind);
+
+// May a walk row take this hold over rather than be refused by it, the way it
+// replaces its own linger? True for the settle on the deck.
+bool HoldYieldsToWalk(std::string const& holdVerb);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
