@@ -68096,6 +68096,29 @@ private:
                 player->FindNearestCreature(entry, OverseerDecisions::SPAWN_WALK_ARRIVE_YARDS);
             if (npc && npc->IsAlive())
                 return npc;
+            // SAY WHY NOTHING WAS IN REACH (2026-10-08): Brug stood 19 yards from
+            // Instructor Razuvious and was told there was no giver. The nearest
+            // creature of the entry within 120 yards, with its distances, its
+            // phase against the player's, and whether it is alive, tells which
+            // of range, phase or a moved creature it was.
+            if (Creature* far = player->FindNearestCreature(entry, 120.0f, false))
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: quest {} giver {} for '{}': nearest is {:.1f} yards "
+                         "({:.1f} flat), alive {}, creature phase {} player phase {}, "
+                         "in the player's view {}",
+                         questId, entry, player->GetName(), player->GetExactDist(far),
+                         player->GetExactDist2d(far), far->IsAlive() ? "yes" : "no",
+                         far->GetPhaseMask(), player->GetPhaseMask(),
+                         player->CanSeeOrDetect(far) ? "yes" : "no");
+            }
+            else
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: quest {} giver {} for '{}': no creature of that entry "
+                         "within 120 yards",
+                         questId, entry, player->GetName());
+            }
         }
         return nullptr;
     }
