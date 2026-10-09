@@ -278,6 +278,28 @@ void AChestIsOpenedWithTheSpellItsLockNames()
     Expect(QuestUseRefusalRetry(R::NoOpener) == TownRetry::Never, "no opener: never");
 }
 
+// After the open-by-spell fix the cast fired at Perrine's Chest and nothing
+// reached the bags: the bot's loot strategy skips a stack-of-one item when its
+// bags are over 80 percent full and closes the window. The opener takes the
+// loot itself, quest items first.
+void TheOpenerTakesItsChestLootQuestItemsFirst()
+{
+    std::uint64_t const chest = 0xF110000000009052ull;
+    std::vector<std::uint8_t> const grimoire = ChestLootSlots(chest, chest, 0, 1);
+    Expect(grimoire.size() == 1 && grimoire[0] == 0,
+           "a chest holding only Egalin's Grimoire: its one quest slot is taken");
+
+    std::vector<std::uint8_t> const mixed = ChestLootSlots(chest, chest, 2, 1);
+    Expect(mixed.size() == 3 && mixed[0] == 2 && mixed[1] == 0 && mixed[2] == 1,
+           "the quest slot (after the plain items) first, then the plain items");
+
+    Expect(ChestLootSlots(0, chest, 0, 1).empty(), "no chest opened by a use: nothing taken");
+    Expect(ChestLootSlots(chest, chest + 1, 0, 1).empty(),
+           "a window on another object: nothing taken");
+    Expect(ChestLootSlots(chest, chest, 0, 0).empty(), "an empty window: nothing to take");
+    Expect(ChestLootSlots(chest, chest, 300, 0).size() == 255, "a loot slot is one byte");
+}
+
 void TheRetryTable()
 {
     Expect(QuestUseRefusalRetry(R::MalformedItem) == TownRetry::Never, "malformed item: never");
@@ -323,6 +345,7 @@ int main()
     TheGateAnswersEachWallInOrder();
     AGameObjectUseAsksNothingOfAnItemOrALife();
     AChestIsOpenedWithTheSpellItsLockNames();
+    TheOpenerTakesItsChestLootQuestItemsFirst();
     TheRetryTable();
     TheJudge();
     if (failures)

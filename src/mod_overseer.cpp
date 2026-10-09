@@ -68907,11 +68907,91 @@ private:
         return D::ChestOpeningSpell(lock, known);
     }
 
+public:
+    // THE CHEST EACH MEMBER'S USE OPENED (OverseerDecisions::ChestLootSlots), by
+    // name, so the loot hook knows the window on that chest from any other. Set
+    // as the cast is driven and cleared when the row is judged. Written on the
+    // world thread and read from a map thread, so behind a lock; bounded by the
+    // characters with a quest use parked.
+    static void NoteChestOpen(std::string const& name, ObjectGuid chest)
+    {
+        std::lock_guard<std::mutex> guard(ChestOpensLock());
+        ChestOpens()[name] = chest.GetRawValue();
+    }
+
+    static void ForgetChestOpen(std::string const& name)
+    {
+        std::lock_guard<std::mutex> guard(ChestOpensLock());
+        ChestOpens().erase(name);
+    }
+
+    // THE OPENER TAKES ITS LOOT, called from Player::SendLoot (OverseerChestScript)
+    // in the breath the window opens, before the bot's own loot strategy reads
+    // it and closes it without a stack-of-one item when its bags are over 80
+    // percent full. Each slot is CMSG_AUTOSTORE_LOOT_ITEM, the packet a client's
+    // click sends, so the core's StoreLootItem moves the item out of the chest's
+    // loot and refuses what the bags cannot hold; the money is CMSG_LOOT_MONEY.
+    // What reached the bags is read off them, before and after.
+    static void TakeChestLoot(Player* who, ObjectGuid lootGuid, Loot& loot)
+    {
+        uint64 opened = 0;
+        {
+            std::lock_guard<std::mutex> guard(ChestOpensLock());
+            auto const it = ChestOpens().find(who->GetName());
+            if (it != ChestOpens().end())
+                opened = it->second;
+        }
+        std::vector<uint8> const slots = OverseerDecisions::ChestLootSlots(
+            opened, lootGuid.GetRawValue(), loot.items.size(), loot.quest_items.size());
+        WorldSession* const session = who->GetSession();
+        if (slots.empty() || !session)
+            return;
+
+        std::map<uint32, uint32> before;
+        for (LootItem const& item : loot.items)
+            before[item.itemid] = who->GetItemCount(item.itemid);
+        for (LootItem const& item : loot.quest_items)
+            before[item.itemid] = who->GetItemCount(item.itemid);
+        for (uint8 const slot : slots)
+        {
+            WorldPacket take(CMSG_AUTOSTORE_LOOT_ITEM, 1);
+            take << slot;
+            take.rpos(0);
+            session->HandleAutostoreLootItemOpcode(take);
+        }
+        if (loot.gold)
+        {
+            WorldPacket gold(CMSG_LOOT_MONEY, 0);
+            session->HandleLootMoneyOpcode(gold);
+        }
+        uint32 taken = 0;
+        for (auto const& [entry, held] : before)
+            if (who->GetItemCount(entry) > held)
+                ++taken;
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' takes the loot of chest {} it opened as the window opens: {} "
+                 "slot(s) asked, quest items first, {} item(s) reached the bags - "
+                 "chest loot taken by the opener",
+                 who->GetName(), lootGuid.GetEntry(), slots.size(), taken);
+    }
+
+private:
+    static std::mutex& ChestOpensLock()
+    {
+        static std::mutex lock;
+        return lock;
+    }
+    static std::map<std::string, uint64>& ChestOpens()
+    {
+        static std::map<std::string, uint64> opens;
+        return opens;
+    }
+
     // CMSG_CAST_SPELL at a gameobject, as a client opens a chest: castCount,
     // spellId, castFlags, then TARGET_FLAG_GAMEOBJECT and the object's packed
     // guid, which SpellCastTargets::Read takes as the object target. The open
     // lock effect re-checks the lock and the range itself, and Spell::SendLoot
-    // opens the loot window the bot's loot strategy then stores from.
+    // opens the loot window, which the opener empties (TakeChestLoot).
     static void DriveChestOpen(WorldSession* session, uint32 spellId, ObjectGuid chest)
     {
         WorldPacket raw(CMSG_CAST_SPELL, 1 + 4 + 1 + 4 + 9);
@@ -69079,7 +69159,10 @@ private:
         if (request.gameObject)
         {
             if (ev.spellId)
+            {
+                NoteChestOpen(ev.character, targetGuid);
                 DriveChestOpen(session, ev.spellId, targetGuid);
+            }
             else
                 DriveGameObjectUse(session, targetGuid);
         }
@@ -69158,6 +69241,7 @@ private:
                 check.ev.verdict = D::QuestUseOutcome::Unreadable;
                 ReleaseHold(check.targetName, bot, "the character left the world mid-use",
                             QUEST_USE_HOLD_VERB);
+                ForgetChestOpen(check.targetName);
                 CharacterDatabase.Execute(
                     "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
                     "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
@@ -69185,6 +69269,7 @@ private:
             read.lootOpened = !check.ev.lootOpenBefore && !bot->GetLootGUID().IsEmpty();
 
             ReleaseHold(check.targetName, bot, "the quest use row ended", QUEST_USE_HOLD_VERB);
+            ForgetChestOpen(check.targetName);
 
             check.ev.verdict = D::JudgeQuestUse(read);
             char const* const outcome = D::QuestUseOutcomeWord(check.ev.verdict);
@@ -70152,6 +70237,26 @@ private:
     }
 };
 
+// THE CHEST A MEMBER OPENED IS LOOTED BY IT (2026-10-09). Player::SendLoot calls
+// this after the window's loot is filled and before the window is sent, so the
+// member takes its loot (OverseerWorldScript::TakeChestLoot) before the bot's
+// own loot strategy can read the window and close it. Every other loot window
+// on the world leaves on the gameobject test or the registry lookup.
+class OverseerChestScript : public PlayerScript
+{
+public:
+    OverseerChestScript() : PlayerScript("OverseerChestScript", {
+        PLAYERHOOK_ON_BEFORE_SEND_LOOT,
+    }) {}
+
+    void OnPlayerBeforeSendLoot(Player* player, ObjectGuid lootGuid, Loot* loot) override
+    {
+        if (!player || !loot || !lootGuid.IsGameObject())
+            return;
+        OverseerWorldScript::TakeChestLoot(player, lootGuid, *loot);
+    }
+};
+
 class OverseerDoorScript : public PlayerScript
 {
 public:
@@ -70352,6 +70457,7 @@ void Addmod_overseerScripts()
     new OverseerChatScript();
     new OverseerEventScript();
     new OverseerDoorScript();
+    new OverseerChestScript();
     new OverseerFinderScript();
     new OverseerKeepScript();
     new OverseerMeterScript();

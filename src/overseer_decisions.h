@@ -6255,7 +6255,7 @@ char const* QuestUseGate(QuestUseGateFacts const& facts);
 // lock names: an OPEN_LOCK effect whose MiscValue is the lock type of a
 // LOCK_KEY_SKILL case of the chest's Lock.dbc row ("Opening", which every
 // character is created knowing). Spell::SendLoot then opens the loot window and
-// the bot's own loot strategy stores the quest item. Measured on the dev realm
+// the member takes what it holds (ChestLootSlots). Measured on the dev realm
 // on 2026-10-09: 50 of 52 `use-gameobject 37098` rows (Perrine's Chest, the
 // undead warlock's Creature of the Void) and every row at the Burning Blade
 // Stash (58595, the orc warlock's) read back `nothing`, and eleven warlocks
@@ -6288,6 +6288,31 @@ struct LockOpener
 // refuses), and the use is refused NoOpener: a click would open nothing.
 std::uint32_t ChestOpeningSpell(std::vector<ChestLockCase> const& lock,
                                 std::vector<LockOpener> const& known);
+
+// THE OPENER TAKES ITS LOOT, AS A PLAYER CLICKS IT (2026-10-09). After the
+// open-by-spell fix (#888) the cast fired at Perrine's Chest and the loot
+// window opened, and still nothing reached the bags: the row read back
+// `nothing`, so the window had already closed with the quest counter unmoved.
+// mod-playerbots' StoreLootAction answers every loot window and skips any item
+// that does not stack while the bags are over 80 percent full and the bot has
+// no real player for a master, then releases the window. Egalin's Grimoire and
+// the Tablet of Verga stack to one, and all eleven warlocks waiting at those
+// chests stood at 85 to 100 percent (one at 21 of 22 slots). The corpse loot of
+// a hunt was already measured losing a 100 percent quest drop the same way
+// (HuntLootCorpse). So the member takes the chest's loot itself, in the breath
+// the window opens (Player::SendLoot, before the bot's AI reads the window):
+// the core's own StoreLootItem moves each item from the chest's loot to the
+// bags, so nothing is made that the chest did not hold.
+//
+// The loot slots a member takes from a loot window that is opening, in the
+// order it takes them. None unless the window is on the chest the member's own
+// use opened (`opened` is that chest's guid, `looting` the window's; both
+// non-zero and equal). Otherwise the quest item slots first (in the window they
+// follow the `plain` items, one slot each), so a bag with one free slot spends
+// it on what the quest needs, then the plain items. At most 255 slots: a loot
+// slot is one byte.
+std::vector<std::uint8_t> ChestLootSlots(std::uint64_t opened, std::uint64_t looting,
+                                         std::size_t plain, std::size_t quest);
 
 // Worth asking again without changing the row. Moving, fighting, dying, a
 // target out of reach or dead (it respawns), a hold and a use under way are.
