@@ -17363,6 +17363,112 @@ GuildRunStrayStep GuildRunStrayNext(GuildRunStrayFacts const& facts)
 
 namespace
 {
+// The text after `"key":` in `json`, or npos. GuildRunJson writes every key
+// once per object and no key inside a string, so a plain find is the reader.
+std::size_t GuildRunJsonValueAt(std::string const& json, char const* key)
+{
+    std::string const needle = std::string("\"") + key + "\":";
+    std::size_t const at = json.find(needle);
+    return at == std::string::npos ? at : at + needle.size();
+}
+
+unsigned GuildRunJsonUnsigned(std::string const& json, char const* key)
+{
+    std::size_t at = GuildRunJsonValueAt(json, key);
+    if (at == std::string::npos)
+        return 0;
+    unsigned value = 0;
+    for (; at < json.size() && json[at] >= '0' && json[at] <= '9'; ++at)
+        value = value * 10 + static_cast<unsigned>(json[at] - '0');
+    return value;
+}
+
+std::string GuildRunJsonString(std::string const& json, char const* key)
+{
+    std::size_t at = GuildRunJsonValueAt(json, key);
+    if (at == std::string::npos || at >= json.size() || json[at] != '"')
+        return std::string();
+    std::string value;
+    for (++at; at < json.size() && json[at] != '"'; ++at)
+    {
+        if (json[at] == '\\' && at + 1 < json.size())
+            ++at;
+        value += json[at];
+    }
+    return value;
+}
+}  // namespace
+
+GuildRunResume ReadGuildRunResume(std::string const& result)
+{
+    GuildRunResume resume;
+    // The run's own fields come before "members", so they are read from the
+    // text before it and never from a member's object.
+    std::size_t const membersAt = result.find("\"members\":[");
+    std::string const head = result.substr(0, membersAt);
+    resume.inside = GuildRunJsonString(head, "phase") == "inside";
+    resume.mapId = GuildRunJsonUnsigned(head, "map");
+    resume.dungeonId = GuildRunJsonUnsigned(head, "dungeon_id");
+    resume.secondsQueued = GuildRunJsonUnsigned(head, "seconds_queued");
+    resume.secondsInside = GuildRunJsonUnsigned(head, "seconds_inside");
+    resume.deaths = GuildRunJsonUnsigned(head, "deaths");
+    resume.ilvlStart = GuildRunJsonUnsigned(head, "ilvl_start");
+    if (membersAt == std::string::npos)
+        return resume;
+    std::size_t at = membersAt;
+    while ((at = result.find('{', at)) != std::string::npos)
+    {
+        std::size_t const end = result.find('}', at);
+        if (end == std::string::npos)
+            break;
+        std::string const one = result.substr(at, end - at + 1);
+        GuildRunResumeMember member;
+        member.name = GuildRunJsonString(one, "name");
+        member.levelStart = GuildRunJsonUnsigned(one, "level_start");
+        member.deaths = GuildRunJsonUnsigned(one, "deaths");
+        if (!member.name.empty())
+            resume.members.push_back(member);
+        at = end + 1;
+    }
+    return resume;
+}
+
+GuildRunAdoptStep GuildRunAdoptNext(GuildRunAdoptFacts const& facts)
+{
+    // A run still queueing had its place in a queue the restart emptied.
+    if (!facts.wasInside)
+        return GuildRunAdoptStep::Release;
+    if (facts.tankInWorld)
+    {
+        // A character is in one group at a time: a tank in this process's own
+        // run, or in no finder group at all, has no saved group left to resume.
+        if (facts.liveRunGroup || !facts.tankInFinderGroup)
+            return GuildRunAdoptStep::Release;
+        bool const everybody = facts.membersInWorld >= facts.groupSize;
+        if (everybody || facts.expired)
+            return facts.membersBack ? GuildRunAdoptStep::Adopt : GuildRunAdoptStep::Release;
+        return GuildRunAdoptStep::Wait;
+    }
+    return facts.expired ? GuildRunAdoptStep::Release : GuildRunAdoptStep::Wait;
+}
+
+char const* GuildRunAdoptWhy(GuildRunAdoptFacts const& facts)
+{
+    if (!facts.wasInside)
+        return "it was still in the finder's queue, which a restart empties";
+    if (!facts.tankInWorld)
+        return "its tank was not back in the world within a quarter hour";
+    if (facts.liveRunGroup)
+        return "its tank is already in another guild run";
+    if (!facts.tankInFinderGroup)
+        return "its group was disbanded";
+    if (!facts.membersBack)
+        return "nobody of it was back inside the dungeon";
+    return "it is not over";
+}
+
+namespace
+{
 bool GuildRunCleared(GuildRunPoll const& poll)
 {
     return poll.finderFinished || (poll.bossesTotal && poll.bossesDone >= poll.bossesTotal) ||

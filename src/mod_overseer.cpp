@@ -38215,6 +38215,22 @@ private:
     std::vector<GuildRunStray> _guildRunStrays;
     bool _guildRunStraysRead{false};
 
+    // Runs a restarted worldserver found inside, their rows taken over by this
+    // one, waiting for their members to log back in (GuildRunAdoptNext).
+    struct GuildRunAdoption
+    {
+        uint32 id{0};
+        std::string tank;
+        OverseerDecisions::GuildFinderRequest request;
+        OverseerDecisions::GuildRunResume resume;
+        // When the row was read, and how long it had gone untouched by then:
+        // the run's clock went on while no worldserver was writing it.
+        std::time_t readAt{0};
+        std::time_t silentSeconds{0};
+        std::time_t until{0};
+    };
+    std::vector<GuildRunAdoption> _guildRunAdoptions;
+
     static uint32 EquippedItemLevel(Player* p)
     {
         uint32 sum = 0;
@@ -38536,6 +38552,7 @@ private:
     {
         std::time_t const now = std::time(nullptr);
         DriveGuildRunStrays(now);
+        DriveGuildRunAdoptions(now);
         std::vector<GuildRun> still;
         for (GuildRun& run : _guildRuns)
         {
@@ -39124,33 +39141,217 @@ private:
         return false;
     }
 
+    // A RESTARTED WORLDSERVER'S RUN, TAKEN BACK UP (OverseerDecisions::
+    // GuildRunAdoptNext). The row is already this process's (the restart read
+    // below claimed it), so ExpireAbandonedClaims leaves it alone while the
+    // members log back in. Adopted, the run is rebuilt from its row and driven
+    // from the next poll like a run this process formed: the same verdicts, the
+    // same corpse run, and the dungeon brain armed again by the drive's own
+    // `dc on`, since its flag did not survive the restart. Released, the row
+    // ends as an error and the group is left to the stray pass as before.
+    void DriveGuildRunAdoptions(std::time_t now)
+    {
+        if (_guildRunAdoptions.empty())
+            return;
+        std::vector<GuildRunAdoption> still;
+        for (GuildRunAdoption& adoption : _guildRunAdoptions)
+        {
+            std::vector<std::string> names{adoption.tank, adoption.request.healer};
+            names.insert(names.end(), adoption.request.damage.begin(),
+                         adoption.request.damage.end());
+            uint32 const mapId = adoption.resume.mapId;
+
+            Player* const tank = ObjectAccessor::FindPlayerByName(adoption.tank);
+            Group* const group = tank && tank->IsInWorld() ? tank->GetGroup() : nullptr;
+            OverseerDecisions::GuildRunAdoptFacts facts;
+            facts.wasInside = adoption.resume.inside && mapId != 0;
+            facts.tankInWorld = tank && tank->IsInWorld();
+            facts.tankInFinderGroup = group && group->isLFGGroup();
+            if (group)
+                for (GuildRun const& run : _guildRuns)
+                    if (run.groupGuid == group->GetGUID().GetRawValue())
+                        facts.liveRunGroup = true;
+            facts.groupSize = static_cast<unsigned>(names.size());
+            for (std::string const& name : names)
+            {
+                Player* const p = ObjectAccessor::FindPlayerByName(name);
+                if (!p || !p->IsInWorld())
+                    continue;
+                ++facts.membersInWorld;
+                if (p->GetMapId() == mapId || GuildRunGhostOf(p, mapId))
+                    ++facts.membersBack;
+            }
+            facts.expired = now >= adoption.until;
+
+            OverseerDecisions::GuildRunAdoptStep const step =
+                OverseerDecisions::GuildRunAdoptNext(facts);
+            if (step == OverseerDecisions::GuildRunAdoptStep::Wait)
+            {
+                still.push_back(adoption);
+                continue;
+            }
+
+            if (step == OverseerDecisions::GuildRunAdoptStep::Release)
+            {
+                std::string const why = OverseerDecisions::GuildRunAdoptWhy(facts);
+                LOG_WARN("module.overseer",
+                         "overseer: GUILD FINDER RUN {} ('{}', '{}') did not survive the "
+                         "restart - {}; {} of {} member(s) back in the world, {} inside",
+                         adoption.id, adoption.tank, adoption.request.keyword, why,
+                         facts.membersInWorld, facts.groupSize, facts.membersBack);
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_command SET status = 'error', detail = '{}', "
+                    "updated_at = NOW() WHERE id = {} AND status = 'verifying' "
+                    "AND claimed_by = '{}'",
+                    Esc(("lost at the restart: " + why).substr(0, 255)), adoption.id,
+                    g_runToken);
+                if (!facts.liveRunGroup)
+                {
+                    GuildRunStray stray;
+                    stray.tank = adoption.tank;
+                    stray.names = names;
+                    stray.until = now + OverseerDecisions::GUILD_RUN_ADOPT_SECONDS;
+                    _guildRunStrays.push_back(stray);
+                }
+                continue;
+            }
+
+            // ADOPTED. Everything the row kept comes back from it; what only
+            // the world knows (the group, the instance, who is alive) is read
+            // from the world, and the bosses on the drive's first poll.
+            GuildRun run;
+            run.id = adoption.id;
+            run.tank = adoption.tank;
+            run.names = names;
+            run.seats = {OverseerDecisions::GuildSeat::Tank, OverseerDecisions::GuildSeat::Healer};
+            for (std::size_t i = 2; i < names.size(); ++i)
+                run.seats.push_back(OverseerDecisions::GuildSeat::Damage);
+            for (std::string const& name : names)
+            {
+                Player* const p = ObjectAccessor::FindPlayerByName(name);
+                ObjectGuid const guid = p ? p->GetGUID() : sCharacterCache->GetCharacterGuidByName(name);
+                if (!guid.IsEmpty())
+                    run.guids.push_back(guid.GetRawValue());
+                // Only the members in the world are marked: a death the last
+                // worldserver already counted is not counted again on login.
+                if (p && p->IsInWorld())
+                    run.alive[name] = p->IsAlive();
+            }
+            for (OverseerDecisions::GuildRunResumeMember const& member : adoption.resume.members)
+            {
+                run.levelAt[member.name] = static_cast<uint8>(member.levelStart);
+                if (member.deaths)
+                    run.deathsOf[member.name] = member.deaths;
+            }
+            run.keyword = adoption.request.keyword;
+            run.dungeonId = adoption.resume.dungeonId;
+            run.mapId = mapId;
+            run.instanceId = RunInstance(names, adoption.tank, mapId);
+            run.groupGuid = group->GetGUID().GetRawValue();
+            run.phase = GuildRunPhase::Inside;
+            // The run's clock kept going while no worldserver wrote the row, so
+            // the ceiling still counts from when the group really went in.
+            run.enteredAt = adoption.readAt - adoption.silentSeconds -
+                            static_cast<std::time_t>(adoption.resume.secondsInside);
+            run.queuedAt = run.enteredAt - static_cast<std::time_t>(adoption.resume.secondsQueued);
+            run.heartbeatAt = now;
+            run.deaths = adoption.resume.deaths;
+            run.ilvlAtEntry = adoption.resume.ilvlStart;
+            run.said = "inside";
+
+            // THE TANK LEADS AND IS ITS OWN MASTER AGAIN, as DoGuildFinderRun
+            // made it: the master was memory, and the other four follow nobody
+            // until it is set.
+            if (PlayerbotAI* tankAI = GET_PLAYERBOT_AI(tank))
+                tankAI->SetMaster(tank);
+            TrackGuildRunLoot(run.guids);
+
+            LOG_WARN("module.overseer",
+                     "overseer: GUILD FINDER RUN {} is adopted after the restart - '{}' leads "
+                     "again in map {}, {} of {} member(s) back inside, {}s inside so far",
+                     run.id, run.tank, run.mapId, facts.membersBack, facts.groupSize,
+                     now - run.enteredAt);
+            WriteGuildRunRow(run.id, "verifying", "inside",
+                             GuildRunJson(run, "inside", nullptr, run.ilvlAtEntry, now));
+            _guildRuns.push_back(run);
+        }
+        _guildRunAdoptions.swap(still);
+    }
+
     // A RESTART LEAVES THE GROUP BEHIND. The finder group is saved with its
     // members and they log back in inside the dungeon, with the dungeon brain's
-    // flag and this module's memory gone. Rows this process did not claim are
-    // ended by ExpireAbandonedClaims; their groups are read once here and, for
-    // a quarter of an hour, the living are taken out and the group disbanded as
-    // soon as the tank is back in the world. A group a live guild run of this
-    // process formed is never the leftover (OverseerDecisions::GuildRunStrayNext):
-    // the tank seated in a new run inside the quarter hour used to have the new
-    // run's group disbanded under it.
+    // flag and this module's memory gone. A row whose run was inside is claimed
+    // here for this process and handed to DriveGuildRunAdoptions, which resumes
+    // the run when its members are back. Any other row this process did not
+    // claim is ended by ExpireAbandonedClaims; its group is read once here and,
+    // for a quarter of an hour, the living are taken out and the group
+    // disbanded as soon as the tank is back in the world. A group a live guild
+    // run of this process formed is never the leftover
+    // (OverseerDecisions::GuildRunStrayNext): the tank seated in a new run
+    // inside the quarter hour used to have the new run's group disbanded under
+    // it.
     void DriveGuildRunStrays(std::time_t now)
     {
         if (!_guildRunStraysRead)
         {
             _guildRunStraysRead = true;
             if (QueryResult rows = CharacterDatabase.Query(
-                    "SELECT target_name, command FROM overseer_command WHERE kind = 'guild' "
+                    "SELECT target_name, command, id, status, claimed_by, result, "
+                    "TIMESTAMPDIFF(SECOND, updated_at, NOW()) FROM overseer_command "
+                    "WHERE kind = 'guild' "
                     "AND command LIKE 'finder-run %' AND status IN ('claimed', 'verifying') "
                     "AND claimed_by <> '{}' AND created_at > NOW() - INTERVAL 3 HOUR",
                     g_runToken))
                 do
                 {
-                    std::string const tank = rows->Fetch()[0].Get<std::string>();
+                    Field* const fields = rows->Fetch();
+                    std::string const tank = fields[0].Get<std::string>();
                     OverseerDecisions::GuildFinderRequest const request =
                         OverseerDecisions::ParseGuildFinderRequest(
-                            rows->Fetch()[1].Get<std::string>(), tank);
+                            fields[1].Get<std::string>(), tank);
                     if (request.error != OverseerDecisions::GuildFinderRefusal::None)
                         continue;
+
+                    // THE RUN WAS INSIDE: take the row over, synchronously and
+                    // guarded on the holder read, and believe it only once the
+                    // read back names this process (the claim path's rule).
+                    uint32 const id = fields[2].Get<uint32>();
+                    std::string const status = fields[3].Get<std::string>();
+                    std::string const holder = fields[4].Get<std::string>();
+                    OverseerDecisions::GuildRunResume const resume =
+                        OverseerDecisions::ReadGuildRunResume(
+                            fields[5].IsNull() ? std::string() : fields[5].Get<std::string>());
+                    if (status == "verifying" && resume.inside && resume.mapId)
+                    {
+                        CharacterDatabase.DirectExecute(
+                            "UPDATE overseer_command SET claimed_by = '{}', updated_at = NOW() "
+                            "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                            g_runToken, id, Esc(holder));
+                        QueryResult const mine = CharacterDatabase.Query(
+                            "SELECT claimed_by FROM overseer_command WHERE id = {} "
+                            "AND status = 'verifying'",
+                            id);
+                        if (mine && mine->Fetch()[0].Get<std::string>() == g_runToken)
+                        {
+                            GuildRunAdoption adoption;
+                            adoption.id = id;
+                            adoption.tank = tank;
+                            adoption.request = request;
+                            adoption.resume = resume;
+                            adoption.readAt = now;
+                            adoption.silentSeconds =
+                                static_cast<std::time_t>(std::max<int64>(0, fields[6].Get<int64>()));
+                            adoption.until = now + OverseerDecisions::GUILD_RUN_ADOPT_SECONDS;
+                            _guildRunAdoptions.push_back(adoption);
+                            LOG_WARN("module.overseer",
+                                     "overseer: guild finder run {} under '{}' was inside map {} "
+                                     "when the last worldserver stopped ({}s in); its row is held "
+                                     "for this one while its members log back in",
+                                     id, tank, resume.mapId, resume.secondsInside);
+                            continue;
+                        }
+                    }
+
                     GuildRunStray stray;
                     stray.tank = tank;
                     stray.names = {tank, request.healer};
