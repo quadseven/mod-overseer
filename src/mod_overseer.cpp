@@ -33461,7 +33461,9 @@ private:
         return value ? value->Get() : 0;
     }
 
-    static uint32 ExpectedEncounterMask(uint32 mapId, Player* member)
+    // Every bit the map's DungeonEncounter.dbc rows credit at normal
+    // difficulty, 0 for a map that credits none.
+    static uint32 MapEncounterMask(uint32 mapId)
     {
         DungeonEncounterList const* encounters =
             sObjectMgr->GetDungeonEncounterList(mapId, DUNGEON_DIFFICULTY_NORMAL);
@@ -33473,6 +33475,14 @@ private:
             if (encounter && encounter->dbcEntry &&
                 encounter->dbcEntry->encounterIndex < 32)
                 mapMask |= 1u << encounter->dbcEntry->encounterIndex;
+        return mapMask;
+    }
+
+    static uint32 ExpectedEncounterMask(uint32 mapId, Player* member)
+    {
+        uint32 const mapMask = MapEncounterMask(mapId);
+        if (!mapMask)
+            return 0;
 
         uint32 const wingMask =
             OverseerDecisions::DungeonMapHasIndependentWings(mapId)
@@ -36291,7 +36301,9 @@ private:
     // ChooseFinderDungeon): every normal-difficulty dungeon row of
     // LFGDungeons.dbc on the door's inside map, matched by where
     // lfg_dungeon_template lands the group against where the door's own
-    // areatrigger does. The core's GetLFGDungeon(map, difficulty) returns
+    // areatrigger does, or for a Dire Maul door, the areatrigger of the door
+    // into the same wing that the finder starts at (OverseerDecisions::
+    // FinderWingDoorFor). The core's GetLFGDungeon(map, difficulty) returns
     // the first row for a map, which is the wrong wing of Scarlet Monastery,
     // Maraudon, Dire Maul, Blackrock Depths and Stratholme. Kept per door;
     // the tables are loaded once at start-up.
@@ -36328,10 +36340,16 @@ private:
             candidates.push_back(c);
             byId[row->ID] = row;
         }
+        // Measured from the door into the same wing that the finder starts
+        // at (OverseerDecisions::FinderWingDoorFor: Dire Maul's East and West
+        // wings each have a door that lands on their finder row's start).
+        DungeonPortal const* const wingDoor =
+            FindDungeonPortal(OverseerDecisions::FinderWingDoorFor(portal.keyword));
+        uint32 const landingTrigger = wingDoor ? wingDoor->entryTriggerId : portal.entryTriggerId;
         float landingX = 0.f;
         float landingY = 0.f;
         if (AreaTriggerTeleport const* landing =
-                sObjectMgr->GetAreaTriggerTeleport(portal.entryTriggerId))
+                sObjectMgr->GetAreaTriggerTeleport(landingTrigger))
         {
             landingX = landing->target_X;
             landingY = landing->target_Y;
@@ -36341,6 +36359,28 @@ private:
         LFGDungeonEntry const* const chosen = id ? byId[id] : nullptr;
         s_chosen[portal.entryTriggerId] = {chosen, why};
         return chosen;
+    }
+
+    // HOW MANY NORMAL FINDER ROWS SHARE THIS MAP (OverseerDecisions::
+    // FinderRowEndsDungeon): the same rows FinderDungeonForDoor chooses from,
+    // less the holiday ones. Blackrock Depths has two, Maraudon three.
+    static std::size_t FinderNormalRowsOnMap(uint32 mapId)
+    {
+        static std::map<uint32, std::size_t> s_rows;
+        auto const known = s_rows.find(mapId);
+        if (known != s_rows.end())
+            return known->second;
+        std::size_t rows = 0;
+        for (uint32 i = 0; i < sLFGDungeonStore.GetNumRows(); ++i)
+        {
+            LFGDungeonEntry const* row = sLFGDungeonStore.LookupEntry(i);
+            if (row && row->MapID == mapId && row->TypeID == lfg::LFG_TYPE_DUNGEON &&
+                Difficulty(row->Difficulty) == DUNGEON_DIFFICULTY_NORMAL &&
+                !(row->Flags & lfg::LFG_FLAG_SEASONAL))
+                ++rows;
+        }
+        s_rows[mapId] = rows;
+        return rows;
     }
 
     // WHAT THE DUNGEON FINDER WOULD SAY ABOUT THIS FAMILY NOW. The locks are
@@ -38506,6 +38546,11 @@ private:
         uint32 ilvlAtEntry{0};
         uint32 bossesDone{0};
         uint32 bossesTotal{0};
+        // The queued row's last boss is the dungeon's (OverseerDecisions::
+        // FinderRowEndsDungeon), and whether the finder's "finished" on a
+        // row that is not was said yet.
+        bool finderEndsDungeon{true};
+        bool finderSliceSaid{false};
         bool dcAccepted{false};
         std::time_t dcTriedAt{0};
         std::string outcome;
@@ -38890,6 +38935,8 @@ private:
         run.keyword = request.keyword;
         run.dungeonId = dungeon->ID;
         run.mapId = portal->insideMapId;
+        run.finderEndsDungeon = OverseerDecisions::FinderRowEndsDungeon(
+            run.mapId, FinderNormalRowsOnMap(run.mapId));
         run.groupGuid = group->GetGUID().GetRawValue();
         run.queuedAt = std::time(nullptr);
         run.heartbeatAt = run.queuedAt;
@@ -39734,7 +39781,20 @@ private:
             // campaign coordinator finishes on (CompletedEncounters,
             // ExpectedEncounterMask) answers it, filtered to the wing named by
             // this run's portal keyword.
-            poll.expectedMask = ExpectedEncounterMask(run.mapId, tank);
+            //
+            // A WING ROW OF A CONNECTED DUNGEON IS NOT THE DUNGEON
+            // (OverseerDecisions::FinderRowEndsDungeon). Blackrock Depths'
+            // Prison row finishes on Gerstahn, the first of 19 bosses, so the
+            // run expects every boss the dungeon brain is armed for instead.
+            // The brain's roster is read off the tank only while it stands in
+            // the run's copy: a ghost outside reads another map's.
+            uint32 const brainMask =
+                tank && tank->IsInWorld() && tank->GetMapId() == run.mapId
+                    ? DungeonBrainExpectedEncounterMask(tank)
+                    : 0;
+            poll.finderEndsDungeon = run.finderEndsDungeon;
+            poll.expectedMask = OverseerDecisions::GuildRunExpectedMask(
+                run.mapId, MapEncounterMask(run.mapId), brainMask, run.finderEndsDungeon);
             poll.creditedMask = poll.expectedMask ? CompletedEncounters(tank) : 0;
             if (!run.bossesTotal && poll.expectedMask)
             {
@@ -39744,8 +39804,20 @@ private:
             }
             poll.bossesDone = run.bossesDone;
             poll.bossesTotal = run.bossesTotal;
+            poll.ceilingSeconds =
+                OverseerDecisions::GuildRunCeilingSeconds(run.finderEndsDungeon, run.bossesTotal);
             poll.finderFinished =
                 ourGroup && sLFGMgr->GetState(group->GetGUID()) == lfg::LFG_STATE_FINISHED_DUNGEON;
+            if (poll.finderFinished && !run.finderEndsDungeon && !run.finderSliceSaid)
+            {
+                run.finderSliceSaid = true;
+                LOG_INFO("module.overseer",
+                         "overseer: guild finder run {} - the finder says finder dungeon {} is "
+                         "finished, but it is one of {} finder rows on map {}; the run goes on "
+                         "until every boss it expects is down ({} of {})",
+                         run.id, run.dungeonId, FinderNormalRowsOnMap(run.mapId), run.mapId,
+                         run.bossesDone, run.bossesTotal);
+            }
             poll.groupGone = !ourGroup;
             poll.secondsInside = static_cast<unsigned>(now - run.enteredAt);
             if (poll.inside)
@@ -39843,8 +39915,9 @@ private:
                 switch (verdict)
                 {
                     case OverseerDecisions::GuildRunVerdict::Cleared:
-                        why = poll.finderFinished ? "the finder says the dungeon is finished"
-                                                  : "every boss is down";
+                        why = poll.finderFinished && poll.finderEndsDungeon
+                                  ? "the finder says the dungeon is finished"
+                                  : "every boss is down";
                         break;
                     case OverseerDecisions::GuildRunVerdict::Wiped:
                         why = "everybody inside is dead, and nobody was back alive inside " +
@@ -40013,6 +40086,8 @@ private:
             run.keyword = adoption.request.keyword;
             run.dungeonId = adoption.resume.dungeonId;
             run.mapId = mapId;
+            run.finderEndsDungeon =
+                OverseerDecisions::FinderRowEndsDungeon(mapId, FinderNormalRowsOnMap(mapId));
             run.instanceId = RunInstance(names, adoption.tank, mapId);
             run.groupGuid = group->GetGUID().GetRawValue();
             run.phase = GuildRunPhase::Inside;

@@ -20133,6 +20133,31 @@ struct FinderDungeonCandidate
 std::uint32_t ChooseFinderDungeon(std::vector<FinderDungeonCandidate> const& candidates,
                                   float landingX, float landingY, std::string& why);
 
+// WHICH DOOR'S LANDING STANDS FOR THIS DOOR'S WING. Dire Maul's wings each have
+// more than one door, and the finder starts a wing's group at one of them:
+// the East row (34) at the East wing's west door (areatrigger 3183) and the
+// West row (36) at the West wing's south door (3186), to the yard. The other
+// doors land elsewhere in the same wing, `dire-maul-east-east` (3185) 683
+// yards from the East start and `dire-maul-west-north` (3187) 95 yards from
+// the West one, past FINDER_WING_MATCH_YARDS, so matched by their own landing
+// they had no finder dungeon. The world names each trigger by its wing
+// ("Dire Maul, East Wing [East] (Entrance)"), so this is that name, written
+// down. Every other door is its own.
+std::string FinderWingDoorFor(std::string const& keyword);
+
+// DOES THE FINDER'S "FINISHED" ON THIS ROW MEAN THE DUNGEON IS DONE? The core
+// finishes a finder group on the boss whose instance_encounters row names the
+// queued dungeon. On a map with one normal finder row, that is the dungeon's
+// last boss. On a map whose finder rows are wings of their own (Scarlet
+// Monastery, Dire Maul: DungeonMapHasIndependentWings), it is that wing's last
+// boss. But Blackrock Depths and Maraudon are each one connected dungeon the
+// finder slices into rows: the Prison (30) finishes on High Interrogator
+// Gerstahn, encounter 0 of 19, and Maraudon's orange (26) and purple (272)
+// rows on Razorlash and Lord Vyletongue, of 8 up to Princess Theradras. There
+// the finder's word ends only a slice, and the run goes on.
+// `normalRowsOnMap` counts the map's normal-difficulty, non-holiday rows.
+bool FinderRowEndsDungeon(std::uint32_t mapId, std::size_t normalRowsOnMap);
+
 // CAN THESE CLASSES MAKE THE GROUP THE FINDER INSISTS ON: one tank, one healer
 // and the rest damage (LFGMgr::CheckGroupRoles)? Asked of the role masks
 // FinderRoleMask gives, so a family with no healer class is told so before
@@ -20523,8 +20548,13 @@ struct GuildRunPoll
     unsigned secondsInside{0};
     // How long nobody has been inside (0 while somebody is).
     unsigned secondsEmpty{0};
-    // The core's LFG_STATE_FINISHED_DUNGEON for the group: the last boss died.
+    // The core's LFG_STATE_FINISHED_DUNGEON for the group: the queued row's
+    // last boss died.
     bool finderFinished{false};
+    // And that row's last boss is the dungeon's (FinderRowEndsDungeon). When
+    // it is not, the finder's word clears nothing: the run is cleared once
+    // every boss it expects (GuildRunExpectedMask) is down.
+    bool finderEndsDungeon{true};
     unsigned bossesDone{0};
     unsigned bossesTotal{0};
     // The core's own encounter credit for the map (DungeonEncounter.dbc bits the
@@ -20569,6 +20599,27 @@ GuildRunVerdict GuildRunNext(GuildRunPoll const& poll);
 
 // "running", "cleared", "wiped", "abandoned", "timed out".
 char const* GuildRunVerdictWord(GuildRunVerdict verdict);
+
+// THE ENCOUNTERS A GUILD RUN MUST CREDIT BEFORE IT IS CLEARED. `mapMask` is
+// every bit the map's DungeonEncounter.dbc rows credit; `brainMask` the bits
+// mod-dungeon-clear's roster is armed for in this copy, 0 when unread. As
+// DungeonRunExpectedMask for a row that ends its dungeon and for an
+// independent wing. For a wing row of a connected dungeon
+// (FinderRowEndsDungeon false) the brain's roster narrows it: the whole
+// dungeon, less what the brain never clears (Maraudon's Rotgrip, who lives in
+// open water, and the Ring of Law, an objective credited to its announcer).
+std::uint32_t GuildRunExpectedMask(std::uint32_t mapId, std::uint32_t mapMask,
+                                   std::uint32_t brainMask, bool finderEndsDungeon);
+
+// AND THE TIME A WHOLE DUNGEON GETS. Guild runs that cleared Wailing Caverns,
+// seven bosses, took 101 minutes on average and 116 at most (dev realm, to
+// 2026-10-10): about a quarter of an hour a boss for a group that rests
+// between pulls. A wing row that now goes on to the whole of Blackrock Depths
+// expects 15 bosses, so GUILD_RUN_CEILING_SECONDS would end it half done. Such
+// a run gets GUILD_RUN_SECONDS_PER_BOSS for each boss it expects, never less
+// than the ceiling; every other run keeps the ceiling.
+constexpr unsigned GUILD_RUN_SECONDS_PER_BOSS = 15 * 60;
+unsigned GuildRunCeilingSeconds(bool finderEndsDungeon, unsigned bossesExpected);
 
 // THE DUNGEON BRAIN IS ASKED AGAIN, NOT ONLY ONCE. A guild run is armed once
 // per stay (`dc on`), and the dungeon module can disable itself afterwards (a
