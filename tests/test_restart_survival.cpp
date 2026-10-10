@@ -140,6 +140,14 @@ void AnAdoptedRunKeepsItsLootTally()
     GuildRunResume const none = ReadGuildRunResume(
         "{\"phase\":\"inside\",\"map\":36,\"loot_items\":0,\"loot_notable\":[],\"members\":[]}");
     Check("an empty tally reads as nothing", none.lootItems == 0 && none.lootNotable.empty());
+    GuildRunResume const holes = ReadGuildRunResume(
+        "{\"phase\":\"inside\",\"map\":36,\"loot_items\":3,"
+        "\"loot_notable\":[1937,,5191],\"members\":[]}");
+    Check("a hole in the notable list reads as no list, never a shifted one",
+          holes.lootNotable.empty());
+    GuildRunResume const nested = ReadGuildRunResume(
+        "{\"phase\":\"inside\",\"map\":36,\"loot_notable\":[1937,[5191]],\"members\":[]}");
+    Check("a nested array reads as no list", nested.lootNotable.empty());
     GuildRunResume const old = ReadGuildRunResume(
         "{\"phase\":\"inside\",\"map\":36,\"deaths\":0,\"members\":[]}");
     Check("a row written before the tally rode the heartbeat reads as nothing",

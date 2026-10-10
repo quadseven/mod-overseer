@@ -17852,8 +17852,13 @@ GuildRunResume ReadGuildRunResume(std::string const& result)
         std::size_t at = GuildRunJsonValueAt(head, "loot_notable");
         if (at != std::string::npos && at < head.size() && head[at] == '[')
         {
+            // Strict: only digits and commas between the brackets. Anything
+            // else (a nested array, a quote, an empty slot) reads as no tally
+            // rather than as a plausible but shifted one.
+            std::vector<unsigned> parsed;
             unsigned value = 0;
             bool digits = false;
+            bool clean = true;
             for (++at; at < head.size() && head[at] != ']'; ++at)
             {
                 if (head[at] >= '0' && head[at] <= '9')
@@ -17861,15 +17866,22 @@ GuildRunResume ReadGuildRunResume(std::string const& result)
                     value = value * 10 + static_cast<unsigned>(head[at] - '0');
                     digits = true;
                 }
-                else if (digits)
+                else if (head[at] == ',' && digits)
                 {
-                    resume.lootNotable.push_back(value);
+                    parsed.push_back(value);
                     value = 0;
                     digits = false;
                 }
+                else
+                {
+                    clean = false;
+                    break;
+                }
             }
-            if (digits)
-                resume.lootNotable.push_back(value);
+            if (clean && digits)
+                parsed.push_back(value);
+            if (clean && at < head.size() && (digits || parsed.empty()))
+                resume.lootNotable = parsed;
         }
     }
     if (membersAt == std::string::npos)
