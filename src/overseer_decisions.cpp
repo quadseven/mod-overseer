@@ -17696,6 +17696,36 @@ std::uint8_t GuildSeatRoleMask(GuildSeat seat)
     return FINDER_ROLE_DAMAGE;
 }
 
+GuildFinderFamilySeat GuildFinderFamilySeatOf(GuildFinderFamilyFacts const& facts)
+{
+    if (!facts.onRoster)
+        return GuildFinderFamilySeat::NotFamily;
+    if (facts.familyCampaign)
+        return GuildFinderFamilySeat::Campaign;
+    if (facts.head)
+        return GuildFinderFamilySeat::Head;
+    if (facts.seat != GuildSeat::Tank && facts.seat != GuildSeat::Healer)
+        return GuildFinderFamilySeat::DamageSeat;
+    return GuildFinderFamilySeat::Lent;
+}
+
+char const* GuildFinderFamilySeatWord(GuildFinderFamilySeat seat)
+{
+    switch (seat)
+    {
+        case GuildFinderFamilySeat::NotFamily:
+        case GuildFinderFamilySeat::Lent:
+            return "";
+        case GuildFinderFamilySeat::Campaign:
+            return "is a family member whose family's campaign is armed or running";
+        case GuildFinderFamilySeat::Head:
+            return "heads its family's party, which follows it";
+        case GuildFinderFamilySeat::DamageSeat:
+            return "is a family member, lent to a tank or healer seat only";
+    }
+    return "is a family member";
+}
+
 GuildRunRearmStep GuildRunRearmNext(GuildRunRearmFacts const& facts)
 {
     if (!facts.armed || facts.aliveInside == 0 || facts.regrouping || !facts.tankAlive)
