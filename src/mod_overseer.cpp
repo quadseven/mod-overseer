@@ -7358,6 +7358,69 @@ using OverseerDecisions::DuesDiscardFor;
 using OverseerDecisions::DuesLetter;
 }  // namespace NaturalizeNames
 
+// A GUILD RUN'S FINDER GROUP GETS ITS DUNGEON BACK BEFORE ANYBODY LOGS IN
+// (OverseerDecisions::GuildRunRestoresFinderDungeon). GroupMgr::LoadGroups has
+// already deleted `lfg_data` for every finder group that is not type 12, and a
+// guild run's premade finder group is type 8. Left alone, the core refuses the
+// group its own dungeon at login (MapMgr::PlayerCannotEnter, "dont allow LFG
+// Group to enter other instance that is selected") and sends every member out
+// through the go-back trigger. Measured 2026-10-10 17:00 UTC: all four runs
+// inside ended "nobody of it was back inside", with groups, binds and instances
+// all intact. The dungeon given back is the one the run's own row names, by the
+// same LFGMgr::SetDungeon the core's load makes for a type 12 group. Nothing is
+// moved, granted or created: a member still logs into the instance it is bound
+// to, or is refused it by the core's other rules exactly as before.
+//
+// From OnStartup, which runs after the groups are loaded and before the world
+// loop, so before the first bot is logged in.
+void RestoreGuildRunFinderDungeons()
+{
+    QueryResult rows = CharacterDatabase.Query(
+        "SELECT id, target_name, result FROM overseer_command WHERE kind = 'guild' "
+        "AND command LIKE 'finder-run %' AND status = 'verifying' "
+        "AND created_at > NOW() - INTERVAL 3 HOUR");
+    if (!rows)
+        return;
+    do
+    {
+        Field* const fields = rows->Fetch();
+        uint32 const id = fields[0].Get<uint32>();
+        std::string const tank = fields[1].Get<std::string>();
+        OverseerDecisions::GuildRunResume const resume = OverseerDecisions::ReadGuildRunResume(
+            fields[2].IsNull() ? std::string() : fields[2].Get<std::string>());
+
+        ObjectGuid const tankGuid = sCharacterCache->GetCharacterGuidByName(tank);
+        ObjectGuid const groupGuid =
+            tankGuid.IsEmpty() ? ObjectGuid::Empty : sCharacterCache->GetCharacterGroupGuidByGuid(tankGuid);
+        Group* const group =
+            groupGuid.IsEmpty() ? nullptr : sGroupMgr->GetGroupByGUID(groupGuid.GetCounter());
+        LFGDungeonEntry const* const dungeon =
+            resume.dungeonId ? sLFGDungeonStore.LookupEntry(resume.dungeonId) : nullptr;
+
+        OverseerDecisions::GuildRunFinderRestoreFacts facts;
+        facts.wasInside = resume.inside;
+        facts.dungeonId = resume.dungeonId;
+        facts.runMap = resume.mapId;
+        facts.dungeonMap = dungeon ? dungeon->MapID : 0;
+        facts.finderGroup = group && group->isLFGGroup();
+        facts.knownDungeon = group ? sLFGMgr->GetDungeon(group->GetGUID()) : 0;
+        // The rule already refuses a missing DBC entry (its map reads 0, never
+        // the run's); the pointer is checked here too so that stays true
+        // whatever the rule becomes.
+        if (!dungeon || !group || !OverseerDecisions::GuildRunRestoresFinderDungeon(facts))
+            continue;
+
+        // The finder's own key for a dungeon: its ID with its type above it,
+        // as LFGMgr::MakeNewGroup sets it (LFGDungeonData::Entry).
+        sLFGMgr->SetDungeon(group->GetGUID(), dungeon->ID + (dungeon->TypeID << 24));
+        LOG_WARN("module.overseer",
+                 "overseer: guild finder run {} - the finder group under '{}' "
+                 "is given back its finder dungeon {} (map {}), which the core dropped with its "
+                 "lfg_data on load, so its members log back in inside",
+                 id, tank, resume.dungeonId, resume.mapId);
+    } while (rows->NextRow());
+}
+
 class OverseerWorldScript : public WorldScript
 {
     // The level-up and login hooks spend a guild raider's points with the same
@@ -7366,6 +7429,11 @@ class OverseerWorldScript : public WorldScript
 
 public:
     OverseerWorldScript() : WorldScript("OverseerWorldScript") {}
+
+    void OnStartup() override
+    {
+        RestoreGuildRunFinderDungeons();
+    }
 
     void OnUpdate(uint32 diff) override
     {

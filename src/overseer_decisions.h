@@ -20677,6 +20677,39 @@ GuildRunAdoptStep GuildRunAdoptNext(GuildRunAdoptFacts const& facts);
 // Why a released run ended, for the row's `detail`.
 char const* GuildRunAdoptWhy(GuildRunAdoptFacts const& facts);
 
+// THE FINDER GROUP'S DUNGEON, GIVEN BACK AT STARTUP.
+//
+// Measured on the dev realm at 2026-10-10 17:00 UTC. The groups and the binds
+// survived the restart, and so did the instances, with up to 3 bosses down. Yet
+// all four guild runs inside were still ended "nobody of it was back inside":
+// every member logged back in outside its dungeon's door. GroupMgr::LoadGroups
+// deletes `lfg_data` for any group whose type is not exactly 12. A guild run's
+// group is a premade party queued through the finder (ConvertToLFG(false),
+// type 8), so its finder dungeon is dropped on every load.
+// MapMgr::PlayerCannotEnter then refuses a finder group every map but its
+// finder dungeon, the login check fails, and the core sends the member out
+// through the map's go-back trigger.
+//
+// So, at startup and before any login, a run whose row was inside has its saved
+// finder group given back the dungeon its row names. That is the same
+// LFGMgr::SetDungeon the core's own load makes for a type 12 group.
+struct GuildRunFinderRestoreFacts
+{
+    // The row's last word was phase "inside".
+    bool wasInside{false};
+    // The finder dungeon the row names (LFGDungeons.dbc ID) and the run's map.
+    unsigned dungeonId{0};
+    unsigned runMap{0};
+    // That finder entry's own map, read from the DBC.
+    unsigned dungeonMap{0};
+    // The tank's saved group is a finder group.
+    bool finderGroup{false};
+    // The finder dungeon the core already holds for that group (0: none).
+    unsigned knownDungeon{0};
+};
+
+bool GuildRunRestoresFinderDungeon(GuildRunFinderRestoreFacts const& facts);
+
 // ------------------------- what a level-up hands the roster (the operator) --
 //
 // TrainRoster runs on every level change of a roster character. With factory
