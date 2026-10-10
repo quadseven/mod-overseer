@@ -4953,6 +4953,7 @@ static void LogGuildDeath(Player* killed, char const* kind, std::string const& k
              killed->GetGroup() ? ", grouped" : "");
     // Killed by something far above it: remembered for LeaveGuildDeathSpot,
     // which sends the member home after this first death (2026-10-10).
+    std::string const memberName = killed->GetName();
     if (OverseerDecisions::OutmatchedDeath(killed->GetLevel(), killerLevel))
     {
         OverseerDecisions::GuildOutmatchedMark mark;
@@ -4962,7 +4963,7 @@ static void LogGuildDeath(Player* killed, char const* kind, std::string const& k
         mark.memberLevel = killed->GetLevel();
         mark.killerLevel = killerLevel;
         std::lock_guard<std::mutex> lock(g_guildOutmatchedMutex);
-        g_guildOutmatched[killed->GetName()] = mark;
+        g_guildOutmatched[memberName] = mark;
     }
 }
 

@@ -15538,7 +15538,9 @@ RoadSamples RoadSamplesAlong(std::vector<RoutePoint> const& route, std::size_t f
 
 RouteLimits FarWalkRoadLimits()
 {
-    return RouteLimits{};
+    // Written out rather than taken from RouteLimits' defaults, so a change
+    // made there for another caller of JudgeRoute does not move this rule.
+    return RouteLimits{FAR_WALK_ROAD_LEVEL_GAP, FAR_WALK_ROAD_LETHAL_RUN_YARDS};
 }
 
 void NoteStoredItem(LootStoreNote& note, std::uint64_t looter, std::uint32_t itemGuid,

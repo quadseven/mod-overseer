@@ -17945,6 +17945,11 @@ bool FarWalkMayAskFlight(FarWalkFlightFacts const& facts);
 // leaves no gap between the circles read.
 constexpr std::size_t FAR_WALK_ROAD_MAX_SAMPLES = 400;
 
+// The far walk's own copy of the `??` rule (FarWalkRoadLimits): ten levels over,
+// two hundred yards unbroken.
+constexpr uint32_t FAR_WALK_ROAD_LEVEL_GAP = 10;
+constexpr float FAR_WALK_ROAD_LETHAL_RUN_YARDS = 200.f;
+
 struct RoadSamples
 {
     std::vector<RoutePoint> points;
@@ -17961,7 +17966,7 @@ RoadSamples RoadSamplesAlong(std::vector<RoutePoint> const& route, std::size_t f
                              float spacingYards, std::size_t maxSamples);
 
 // THE SAME `??` RULE THE FAMILY'S DESTINATIONS AND ROUTES ARE JUDGED BY
-// (RouteLimits' defaults): ground holding something ten levels above the walker,
+// (the values RouteLimits' defaults carry today): ground holding something ten levels above the walker,
 // unbroken for more than two hundred yards. A lone walker in starting gear is
 // weaker than a party, so this refuses only what a party would refuse too.
 RouteLimits FarWalkRoadLimits();
