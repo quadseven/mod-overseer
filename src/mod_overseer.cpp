@@ -70705,6 +70705,7 @@ private:
 
         D::QuestUseGateFacts gate;
         gate.gameObject = request.gameObject;
+        gate.here = request.here;
         gate.hasBotAI = GET_PLAYERBOT_AI(who) != nullptr;
         gate.inWorld = session && who->IsInWorld() && map;
         gate.loggingOut = !session || SessionIsLoggingOut(session);
@@ -70770,6 +70771,17 @@ private:
                     targetGuid = creature->GetGUID();
                     gate.targetYards = who->GetDistance(creature);
                     gate.reachYards = D::QUEST_USE_CREATURE_YARDS;
+                    // A fight with this creature alone is no wall
+                    // (QuestUseGateFacts::fightingOnlyTarget).
+                    if (gate.inCombat)
+                    {
+                        Unit* const victim = who->GetVictim();
+                        bool only = !victim || victim == creature;
+                        for (Unit* attacker : who->getAttackers())
+                            if (attacker != creature)
+                                only = false;
+                        gate.fightingOnlyTarget = only;
+                    }
                 }
             }
         }
@@ -70793,6 +70805,11 @@ private:
                     if (info && info->NeedsExplicitUnitTarget() != request.here)
                     {
                         ev.spellId = uint32(proto->Spells[i].SpellId);
+                        // The reach is the spell's own range at a creature
+                        // (QuestUseCreatureReach): a Taming Rod's 30 yards.
+                        if (creature)
+                            gate.reachYards =
+                                D::QuestUseCreatureReach(info->GetMaxRange(false, who));
                         break;
                     }
                 }
@@ -70818,11 +70835,20 @@ private:
         ev.counterBefore = QuestLogSum(who);
         ev.lootOpenBefore = !who->GetLootGUID().IsEmpty();
 
+        // The cast and, for a channeled spell, the channel (QuestUseSpellMs): a
+        // Taming Rod's tame lands when its 20 second channel ends, so the read
+        // back and the hold wait for it.
         uint32 castMs = 0;
+        uint32 channelMs = 0;
         if (ev.spellId)
             if (SpellInfo const* info = sSpellMgr->GetSpellInfo(ev.spellId))
+            {
                 castMs = info->CalcCastTime(who);
-        ev.windowMs = D::CastVerifyWindowMs(castMs, QUEST_USE_MARGIN_MS, QUEST_USE_FLOOR_MS,
+                if (info->IsChanneled() && info->GetDuration() > 0)
+                    channelMs = uint32(info->GetDuration());
+            }
+        ev.windowMs = D::CastVerifyWindowMs(D::QuestUseSpellMs(castMs, channelMs),
+                                            QUEST_USE_MARGIN_MS, QUEST_USE_FLOOR_MS,
                                             QUEST_USE_WINDOW_CEILING_MS);
 
         // Held for the cast, in the same breath as the packet.

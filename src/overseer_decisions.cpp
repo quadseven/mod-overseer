@@ -20153,7 +20153,7 @@ char const* QuestUseGate(QuestUseGateFacts const& facts)
         return R::Dead;
     if (facts.inFlight)
         return R::InFlight;
-    if (facts.inCombat)
+    if (facts.inCombat && !(facts.fightingOnlyTarget && !facts.gameObject && !facts.here))
         return R::InCombat;
     if (facts.inInstance)
         return R::InInstance;
@@ -20181,6 +20181,22 @@ char const* QuestUseGate(QuestUseGateFacts const& facts)
     if (facts.itemOnCooldown)
         return R::ItemOnCooldown;
     return "";
+}
+
+float QuestUseCreatureReach(float spellMaxRangeYards)
+{
+    if (!std::isfinite(spellMaxRangeYards))
+        return QUEST_USE_CREATURE_YARDS;
+    float const reach = spellMaxRangeYards - QUEST_USE_RANGE_SLACK_YARDS;
+    if (!(reach > QUEST_USE_CREATURE_YARDS))
+        return QUEST_USE_CREATURE_YARDS;
+    return reach < QUEST_USE_SEARCH_YARDS ? reach : QUEST_USE_SEARCH_YARDS;
+}
+
+uint32_t QuestUseSpellMs(uint32_t castMs, uint32_t channelMs)
+{
+    uint32_t const total = castMs + channelMs;
+    return total < castMs ? 0xFFFFFFFFu : total;
 }
 
 TownRetry QuestUseRefusalRetry(std::string const& detail)

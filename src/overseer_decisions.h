@@ -6246,6 +6246,26 @@ constexpr float QUEST_USE_CREATURE_YARDS = 8.0f;
 // How far the adapter looks for the target before saying `none in reach`.
 constexpr float QUEST_USE_SEARCH_YARDS = 40.0f;
 
+// THE REACH IS THE ITEM'S OWN SPELL RANGE (2026-10-10). A creature wanders
+// around its spawn, and the walk to a spawn ends up to 20 yards off it, so a
+// hunter sent to tame a beast stood 10 to 35 yards from it. Eight yards turned
+// 58 Taming Rod rows into `the target is too far` on the dev realm in four
+// days, while every rod's spell reaches 30 yards (SpellRange.dbc). The reach
+// for a creature is the spell's hostile maximum less QUEST_USE_RANGE_SLACK_YARDS
+// (the core measures from the bodies' edges, the gate from their centers), never
+// under QUEST_USE_CREATURE_YARDS and never past QUEST_USE_SEARCH_YARDS. An
+// unread or nonsense range keeps the near edge.
+constexpr float QUEST_USE_RANGE_SLACK_YARDS = 2.0f;
+float QuestUseCreatureReach(float spellMaxRangeYards);
+
+// HOW LONG THE ITEM'S SPELL RUNS: its cast time and, for a channeled spell, its
+// channel (saturating). A Taming Rod is instant and channeled for 20 seconds;
+// the tame and the quest's completion land when the channel ends. The read back
+// was 6 seconds in, so all 8 rods that fired read `nothing` and 7 of them had
+// tamed their beast by the end. The window (CastVerifyWindowMs) and the hold
+// that keeps the hunter still are taken from this, so both cover the channel.
+uint32_t QuestUseSpellMs(uint32_t castMs, uint32_t channelMs);
+
 // First word is one of the two verbs. A malformed row still reaches the
 // parser and is refused in its words.
 bool IsQuestUseRow(std::string const& command);
@@ -6302,12 +6322,21 @@ struct QuestUseGateFacts
     bool alive{false};
     bool inFlight{false};
     bool inCombat{false};
+    // THE ONLY FIGHT IS WITH THE CREATURE THE ITEM IS USED ON (2026-10-10): its
+    // victim is that creature or nothing, and nothing else attacks it. A hunter
+    // reaching its beast is often already fighting it (21 rod rows refused `in
+    // combat` on the dev realm, most at melee range, then 12 `the creature is
+    // dead`), and a player uses the rod mid-fight: the rod's own threat starts
+    // the fight anyway. Only for an item used on a creature; any other fight,
+    // and any fight during a gameobject or here use, is still the wall.
+    bool fightingOnlyTarget{false};
     bool inInstance{false};
     bool moving{false};
     bool alreadyRunning{false};
     bool heldByAnother{false};
     // The target.
     bool gameObject{false};
+    bool here{false};  // use-item-here: no target to fight
     bool targetSeen{false};    // one of that entry stands within the search radius
     bool targetAlive{true};    // a creature only
     float targetYards{-1.0f};  // negative is unread
