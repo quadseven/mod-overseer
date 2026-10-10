@@ -16641,6 +16641,40 @@ uint32_t WeaponSkillSpellFor(uint32_t weaponSubclass)
     return 0;
 }
 
+std::vector<std::size_t> WeaponsWorthTraining(std::vector<CarriedWeapon> const& carried,
+                                              uint32_t level, uint32_t wornMainLevel,
+                                              uint32_t wornRangedLevel, uint32_t minGain)
+{
+    // InventoryType: one-hand, two-hand and main hand; ranged, thrown and
+    // ranged right (guns, crossbows and wands).
+    auto wornFor = [&](uint32_t inventoryType, uint32_t& worn) {
+        if (inventoryType == 13 || inventoryType == 17 || inventoryType == 21)
+            worn = wornMainLevel;
+        else if (inventoryType == 15 || inventoryType == 25 || inventoryType == 26)
+            worn = wornRangedLevel;
+        else
+            return false;
+        return true;
+    };
+    std::vector<std::pair<uint32_t, std::size_t>> gains;
+    for (std::size_t i = 0; i < carried.size(); ++i)
+    {
+        CarriedWeapon const& weapon = carried[i];
+        uint32_t worn = 0;
+        if (weapon.skillKnown || !weapon.skillLearnable || weapon.requiredLevel > level ||
+            WeaponSkillSpellFor(weapon.subclass) == 0 || !wornFor(weapon.inventoryType, worn) ||
+            weapon.itemLevel < worn + minGain)
+            continue;
+        gains.emplace_back(weapon.itemLevel - worn, i);
+    }
+    std::stable_sort(gains.begin(), gains.end(),
+                     [](auto const& a, auto const& b) { return a.first > b.first; });
+    std::vector<std::size_t> out;
+    for (auto const& gain : gains)
+        out.push_back(gain.second);
+    return out;
+}
+
 void PruneGuildDeathMarks(std::vector<GuildDeathMark>& marks, int64_t now, uint32_t minutes)
 {
     int64_t const oldest = now - int64_t(minutes) * 60;
@@ -16720,11 +16754,16 @@ bool TrainingStopWants(TrainingStopMember const& member)
     return member.learnSkill != 0 || member.classSpells != 0;
 }
 
+float TrainingStopReach(TrainingStopFacts const& facts)
+{
+    return facts.campaignArmed ? TRAINING_STOP_YARDS : TRAINING_TRIP_YARDS;
+}
+
 TrainingStopLeg PickTrainingStopLeg(TrainingStopFacts const& facts,
                                     std::vector<TrainingStopMember> const& members)
 {
     TrainingStopLeg leg;
-    if (!facts.campaignArmed)
+    if (!facts.campaignArmed && !facts.questing)
     {
         leg.step = TrainingStopStep::NotACampaign;
         return leg;
@@ -16764,7 +16803,7 @@ TrainingStopLeg PickTrainingStopLeg(TrainingStopFacts const& facts,
         if (!TrainingStopWants(member) || member.walkedThisStop || !member.onHeadMap)
             continue;
         anyOnHeadMap = true;
-        if (member.trainerYards < 0.f || member.trainerYards > TRAINING_STOP_YARDS)
+        if (member.trainerYards < 0.f || member.trainerYards > TrainingStopReach(facts))
             continue;
         leg.member = i;
         found = true;
@@ -16788,10 +16827,11 @@ TrainingStopLeg PickTrainingStopLeg(TrainingStopFacts const& facts,
 char const* TrainingStopStepWord(TrainingStopStep step)
 {
     static_assert(TRAINING_STOP_YARDS == 1500.f, "the NoTrainerInTown sentence below says 1500 yards");
+    static_assert(TRAINING_TRIP_YARDS == 3000.f, "the NoTrainerInTown sentence below says 3000 yards");
     switch (step)
     {
         case TrainingStopStep::NotACampaign:
-            return "no campaign is armed, so the bridge's learn trips walk";
+            return "the head is neither on a campaign nor questing, so no training stop opens";
         case TrainingStopStep::NothingToLearn:
             return "nobody in the family has a learn left for this stop";
         case TrainingStopStep::RunOwnsTravel:
@@ -16803,7 +16843,8 @@ char const* TrainingStopStepWord(TrainingStopStep step)
         case TrainingStopStep::NobodyOnHeadMap:
             return "every member with a learn is on another map or unavailable";
         case TrainingStopStep::NoTrainerInTown:
-            return "no trainer for the learns left is within 1500 yards of the head";
+            return "no trainer for the learns left is within 1500 yards of the head in a "
+                   "campaign's town, or 3000 on a questing family's trip";
         case TrainingStopStep::ColumnTaken:
             return "an errand a training stop may not take holds the head's travel column";
         case TrainingStopStep::Walk:

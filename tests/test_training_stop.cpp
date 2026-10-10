@@ -312,10 +312,71 @@ void ItNeverTakesTheRunsTurn()
     Check("a recovering run with an instance straggler blocks training",
           PickTrainingStopLeg(recovering, Horde()).step == TrainingStopStep::RunOwnsTravel);
 
-    TrainingStopFacts questing = HeldInTown();
-    questing.campaignArmed = false;
-    Check("with no campaign armed the bridge's learn trips walk",
-          PickTrainingStopLeg(questing, Horde()).step == TrainingStopStep::NotACampaign);
+    TrainingStopFacts idle = HeldInTown();
+    idle.campaignArmed = false;
+    Check("a head neither campaigning nor questing opens no stop",
+          PickTrainingStopLeg(idle, Horde()).step == TrainingStopStep::NotACampaign);
+}
+
+// A QUESTING FAMILY GOES TO TOWN TO TRAIN (2026-10-10). The stop said "no
+// campaign is armed, so the bridge's learn trips walk", and those trips buy
+// professions only, so a questing family bought no class spell at all.
+// Measured on the dev realm: the Alliance family, questing, owed 5 spells its
+// Stormwind trainers teach, 1,950 to 2,500 yards from the head in Elwynn.
+std::vector<TrainingStopMember> Alliance(float yards)
+{
+    std::vector<TrainingStopMember> out;
+    for (char const* name : {"Grug", "Bork", "Grog", "Og"})
+    {
+        TrainingStopMember member = Member(name, 0, yards);
+        member.classSpells = 1;
+        out.push_back(member);
+    }
+    return out;
+}
+
+TrainingStopFacts Questing()
+{
+    TrainingStopFacts facts;
+    facts.questing = true;
+    facts.columnFree = true;
+    return facts;
+}
+
+void AQuestingFamilyGoesToTownToTrain()
+{
+    Check("a questing family's stop walks to its trainers",
+          PickTrainingStopLeg(Questing(), Alliance(2300.f)).step == TrainingStopStep::Walk);
+    Check("the trip reaches as far as the guild's own class-trainer walk",
+          OverseerDecisions::TRAINING_TRIP_YARDS == 3000.f &&
+              OverseerDecisions::TrainingStopReach(Questing()) == 3000.f);
+    Check("and no farther",
+          PickTrainingStopLeg(Questing(), Alliance(3001.f)).step ==
+              TrainingStopStep::NoTrainerInTown);
+    Check("a campaign's town keeps its 1500 yards",
+          OverseerDecisions::TrainingStopReach(HeldInTown()) == TRAINING_STOP_YARDS &&
+              PickTrainingStopLeg(HeldInTown(), Alliance(2300.f)).step ==
+                  TrainingStopStep::NoTrainerInTown);
+
+    TrainingStopFacts inside = Questing();
+    inside.head.familyMemberInsideInstance = true;
+    Check("never while a member is inside a dungeon",
+          PickTrainingStopLeg(inside, Alliance(300.f)).step == TrainingStopStep::RunOwnsTravel);
+    TrainingStopFacts rested = Questing();
+    rested.sinceLastStop = TRAINING_STOP_REST_SECONDS - 1;
+    Check("and it rests between stops like any other",
+          PickTrainingStopLeg(rested, Alliance(300.f)).step == TrainingStopStep::Resting);
+    TrainingStopFacts taken = Questing();
+    taken.columnFree = false;
+    Check("and waits for a column it may not take",
+          PickTrainingStopLeg(taken, Alliance(300.f)).step == TrainingStopStep::ColumnTaken);
+
+    Check("the sentence no longer sends the learn to the bridge",
+          std::string(TrainingStopStepWord(TrainingStopStep::NotACampaign)).find("bridge") ==
+              std::string::npos);
+    Check("and the reach sentence names both distances",
+          std::string(TrainingStopStepWord(TrainingStopStep::NoTrainerInTown)).find("3000") !=
+              std::string::npos);
 }
 
 void ItIsBounded()
@@ -589,6 +650,22 @@ void TheStockadesCampaignLivesInStormwind()
               std::string::npos);
 }
 
+// The adapter reads the head's job: "quest" opens the stop, and the member's
+// trainer search and the skip line both use the stop's reach.
+void AQuestingHeadOpensTheStop()
+{
+    std::string const src = ReadModule();
+    Check("the head's quest job is the questing fact",
+          src.find("facts.questing = !facts.campaignArmed && headJob == \"quest\";") !=
+              std::string::npos);
+    Check("a questing family's members are searched for a trainer",
+          src.find("if ((facts.campaignArmed || facts.questing) && stopMayOpen") !=
+              std::string::npos);
+    Check("the skip line measures the stop's own reach",
+          src.find("member.trainerYards > OverseerDecisions::TrainingStopReach(facts)") !=
+              std::string::npos);
+}
+
 int main()
 {
     TheTownIsTheCity();
@@ -599,7 +676,9 @@ int main()
     ItNeverTakesTheRunsTurn();
     ItIsBounded();
     ARestIsAsLongAsItsReason();
+    AQuestingFamilyGoesToTownToTrain();
     TheAdapterIsWired();
+    AQuestingHeadOpensTheStop();
     TheStormwindTrainersAreInReach();
     ARestEarnedInRatchetIsNotServedInStormwind();
     TheRepairLegWaitsForAnOpenStopAndNoLonger();
