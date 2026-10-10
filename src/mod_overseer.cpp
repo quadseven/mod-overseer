@@ -38517,6 +38517,11 @@ private:
     bool SendLentMemberOff(Player* p, std::string const& family, uint32 runId,
                            OverseerDecisions::GuildSeat seat)
     {
+        // The same guard SendSittingOutMemberOff keeps. DoGuildFinderRun
+        // checked this a moment ago on this same thread, so it is belt and
+        // braces, never a second answer.
+        if (!p || !p->IsInWorld())
+            return false;
         if (PlayerbotAI* const ai = GET_PLAYERBOT_AI(p))
             if (Player* const master = ai->GetMaster(); master && master != p &&
                 OnRoster(master->GetName()) && FamilyOfCharacter(master->GetName()) == family)
