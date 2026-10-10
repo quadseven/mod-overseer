@@ -3213,6 +3213,26 @@ constexpr uint32 DEATH_FLUSH_MS = 3000;
 // there is a cohort's worth of rows to look at.
 constexpr uint32 DEATH_RETENTION_DAYS = 90;
 
+// HOW LONG AN ANSWERED PROBE IS KEPT. A kind 'probe' row is a read-only
+// question (auras, meter, a tool's probe) whose asker reads the answer back by
+// id within seconds of asking and never reads it again: nothing selects a
+// probe by anything but its id, and the member's activity read already skips
+// them. On the dev realm on 2026-10-10 they were 562,489 of overseer_command's
+// 828,287 rows and 663 MB of its `result`, kept forever. A day is a hundred
+// times longer than any asker waits, and long enough to read one back by hand.
+//
+// ONLY PROBES. Every other kind is the realm's history and some reader treats
+// it as such: the naturalize audit reads delivered 'buy' and 'gm' rows to tell
+// earned items from granted ones, the guild bank reads its last tab purchase,
+// and the bridge reads a member's last job order. Pruning those needs each
+// reader given a bound first.
+constexpr uint32 PROBE_RETENTION_HOURS = 24;
+// At most this many rows a sweep, so the backlog of months drains over hours
+// (about ten at one sweep each five minutes) instead of in one statement that
+// holds the async writer while it deletes half a million rows. After that a
+// sweep finds the few hundred probes of one day.
+constexpr uint32 PROBE_SWEEP_BATCH = 5000;
+
 // The hour an event fell in, as the grouping half of the unique key. See
 // 2026_08_24_02_overseer_event.sql for why the timeline is coarsened to an
 // hour rather than collapsed entirely or kept per-occurrence.
@@ -7748,6 +7768,13 @@ public:
             CharacterDatabase.Execute(
                 "DELETE FROM overseer_level WHERE created_at < NOW() - INTERVAL {} DAY",
                 DEATH_RETENTION_DAYS);
+            // Answered probes past a day, a batch at a time (see
+            // PROBE_RETENTION_HOURS). On updated_at, which is when the answer
+            // was written; (kind, status, updated_at) serves it.
+            CharacterDatabase.Execute(
+                "DELETE FROM overseer_command WHERE kind = 'probe' "
+                "AND updated_at < NOW() - INTERVAL {} HOUR LIMIT {}",
+                PROBE_RETENTION_HOURS, PROBE_SWEEP_BATCH);
             // The run timeline: swept on created_at like the deaths, because a
             // row is never updated after it is written.
             if (RunTimelinePresent())
