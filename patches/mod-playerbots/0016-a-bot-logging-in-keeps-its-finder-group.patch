@@ -1,0 +1,48 @@
+Subject: [PATCH] a bot logging back in keeps its dungeon finder group
+
+WHY THIS PATCH EXISTS
+
+PlayerbotHolder::OnBotLogin (src/Bot/PlayerbotMgr.cpp, about line 515 at the
+pin below) makes a bot leave any group that holds neither its master nor a
+character from a non-random account. That is right for a party a player formed
+and walked away from. It is wrong for a dungeon finder group, which the finder
+formed for one dungeon and which its members leave by the finder's own exit.
+
+mod-overseer's guild runs are finder groups of five random bots. After a
+worldserver restart a random bot has no master, so each member that logged
+back in left its group, until the core disbanded it, and the group's instance
+bind went with it. Measured on the dev realm at 2026-10-10 14:02 UTC: the core
+loaded all four guild runs' finder groups at startup (6 groups, 29 members),
+and seconds later only the two family parties were left. Every member came back
+in a dungeon instance of its own (Bigmon in instance 10, Chillmon in 5, Deadpan
+in 7, Grumbles in 8, all map 36). mod-overseer read each run as disbanded and
+ended it, 15 to 49 minutes in.
+
+RandomPlayerbotMgr already makes the same exemption for its own rule ("leave
+group if leader is rndbot": `group && !group->isLFGGroup() && ...`). This gives
+the login check the same exemption and changes nothing else. A finder group
+that really is over is still disbanded by whoever runs it: mod-overseer's stray
+pass does that for a guild run that did not survive the restart.
+
+WHAT WOULD LET THIS PATCH BE DELETED
+
+Upstream exempting finder (LFG) groups in PlayerbotHolder::OnBotLogin.
+
+APPLIES TO
+
+mod-playerbots @ 7bae1b5c58c76a0aa20381155edc08096d1485b2, on top of local
+patches 0001-0015. Touches only the group check in PlayerbotHolder::OnBotLogin.
+
+diff --git a/src/Bot/PlayerbotMgr.cpp b/src/Bot/PlayerbotMgr.cpp
+index b49b848..b4a9868 100644
+--- a/src/Bot/PlayerbotMgr.cpp
++++ b/src/Bot/PlayerbotMgr.cpp
+@@ -512,7 +512,7 @@ void PlayerbotHolder::OnBotLogin(Player* const bot)
+             }
+         }
+ 
+-        if (!groupValid)
++        if (!groupValid && !group->isLFGGroup())
+         {
+             botAI->LeaveOrDisbandGroup();
+         }
