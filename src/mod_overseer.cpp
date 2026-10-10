@@ -21516,6 +21516,13 @@ private:
                 _partySplitSaid[name] = leader->GetMapId();
             return;
         }
+        // AND ONCE ON THE CONTINENT OF ITS LEADER'S DUNGEON DOOR, it walks to
+        // the door and in (2026-10-10): `follow` cannot cross a doorway.
+        if (split && WalkToLeadersDoor(p, leader, name))
+        {
+            _partySplitSaid[name] = leader->GetMapId();
+            return;
+        }
         // THE ORDINARY END OF A TOO-FAR HOLD: the leader came back within the
         // line. Asked before every return below so a follower back in
         // formation is let go on the first poll that sees it.
@@ -41701,6 +41708,141 @@ private:
         LOG_INFO("module.overseer", "overseer: '{}' ends its own crossing - {}", name, why);
     }
 
+    // WHERE A STRANDED MEMBER CROSSES TO (2026-10-10): its leader's map, or,
+    // while the leader is inside a dungeon this module has a door for, the
+    // continent that door stands on and the door's own position there. See
+    // OverseerDecisions::StrandedCrossingGoal for the measurement. The door is
+    // read the way every other caller reads it: the portal row by inside map,
+    // then the areatrigger it names, which must stand on the portal's outside
+    // map. Anything less keeps the old goal, the leader's own map.
+    OverseerDecisions::StrandedGoal StrandedGoalOf(Player* leader, float& goalX,
+                                                   float& goalY) const
+    {
+        goalX = leader->GetPositionX();
+        goalY = leader->GetPositionY();
+        uint32 const leaderMap = leader->GetMapId();
+        DungeonPortal const* const portal =
+            FindDungeonPortalByInsideMap(leaderMap, std::string());
+        // AreaTrigger  ObjectMgr.h:425-428  map/x/y/z
+        AreaTrigger const* const door =
+            portal ? sObjectMgr->GetAreaTrigger(portal->entryTriggerId) : nullptr;
+        bool const known = door && door->map == portal->outsideMapId;
+        OverseerDecisions::StrandedGoal const goal = OverseerDecisions::StrandedCrossingGoal(
+            leaderMap, known, known ? portal->outsideMapId : 0);
+        if (goal.viaDoor)
+        {
+            goalX = door->x;
+            goalY = door->y;
+        }
+        return goal;
+    }
+
+    // A MEMBER ON THE CONTINENT OF ITS LEADER'S DUNGEON DOOR WALKS TO THE DOOR
+    // AND IN (2026-10-10), rather than waiting in `follow` on a leader inside.
+    // See OverseerDecisions::DecideDoorRejoin for the rule and its measurement.
+    // The walk is the rejoin lease WalkStrandedBackIn already uses, so it
+    // outlives any run and ends when the member is on its leader's map; the
+    // knock is StepThroughAreaTrigger, which re-checks the trigger's own radius.
+    // Answers true when this took the member on this poll.
+    std::map<std::string, std::string> _doorRejoinSaid;
+    bool WalkToLeadersDoor(Player* p, Player* leader, std::string const& name)
+    {
+        float goalX = 0.f;
+        float goalY = 0.f;
+        OverseerDecisions::StrandedGoal const goal = StrandedGoalOf(leader, goalX, goalY);
+        DungeonPortal const* const portal =
+            goal.viaDoor ? FindDungeonPortalByInsideMap(goal.insideMap, std::string()) : nullptr;
+        AreaTrigger const* const door =
+            portal ? sObjectMgr->GetAreaTrigger(portal->entryTriggerId) : nullptr;
+        if (!door || p->GetMapId() != goal.map)
+        {
+            _doorRejoinSaid.erase(name);
+            return false;
+        }
+
+        OverseerDecisions::AreaTriggerShape const shape = TriggerShapeOf(*door);
+        float const arriveWithin =
+            OverseerDecisions::DoorArrivalYards(TRAVEL_ARRIVED_POSITION_YARDS, shape);
+
+        auto const escort = _dungeonEscorts.find(name);
+        auto const coord = _dungeonRunCoordinators.find(FamilyOfCharacter(name));
+        OverseerDecisions::DoorRejoinFacts facts;
+        facts.steerable = SteerableAI(p) != nullptr && p->IsInWorld();
+        facts.alive = p->IsAlive();
+        facts.inCombat = p->IsInCombat();
+        facts.leaderInsideKnownDoor = true;
+        facts.onDoorMap = true;
+        facts.runEscortHoldsIt = escort != _dungeonEscorts.end() && !escort->second.catchUp &&
+                                 !escort->second.rejoin && !escort->second.crossing;
+        facts.partyBelongsInside = coord == _dungeonRunCoordinators.end() ||
+                                   coord->second.phase == DungeonRunPhase::Idle ||
+                                   coord->second.phase == DungeonRunPhase::StagedInside ||
+                                   coord->second.phase == DungeonRunPhase::Clearing;
+        // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
+        facts.yardsFromDoor = p->GetDistance2d(door->x, door->y);
+        OverseerDecisions::DoorRejoinStep const step = OverseerDecisions::DecideDoorRejoin(
+            facts, std::max(DUNGEON_DOORSTEP_RADIUS_YARDS, arriveWithin));
+
+        std::string const word = OverseerDecisions::DoorRejoinStepName(step);
+        bool const fresh = _doorRejoinSaid[name] != word;
+        _doorRejoinSaid[name] = word;
+        if (fresh && step != OverseerDecisions::DoorRejoinStep::None)
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is on map {} and its leader '{}' is inside map {} - it "
+                     "goes to the dungeon's door, areatrigger {}, {:.0f} yards away: {} ({})",
+                     name, p->GetMapId(), leader->GetName(), goal.insideMap,
+                     portal->entryTriggerId, facts.yardsFromDoor, word,
+                     facts.partyBelongsInside ? "the party belongs inside"
+                                              : "its run is walking the party out, so it "
+                                                "meets them at the door");
+
+        switch (step)
+        {
+            case OverseerDecisions::DoorRejoinStep::None:
+                return false;
+            case OverseerDecisions::DoorRejoinStep::Wait:
+                return true;
+            case OverseerDecisions::DoorRejoinStep::Walk:
+            {
+                // A catch-up walk from before the split has nowhere on this map
+                // to go; the door walk takes its place.
+                if (escort != _dungeonEscorts.end() && escort->second.catchUp)
+                {
+                    EndOneEscort(name, escort->second.granted);
+                    _dungeonEscorts.erase(escort);
+                }
+                if (!OverseerDecisions::ArrivalReachesTrigger(arriveWithin, shape))
+                    return false;
+                OverseerDecisions::DungeonRunEntryState here;
+                here.name = name;
+                here.seen = true;
+                here.alive = true;
+                here.distanceFromDoor = facts.yardsFromDoor;
+                OverseerDecisions::DoorAimHeight const height = DoorAimHeightFor(
+                    door, std::vector<OverseerDecisions::DungeonRunEntryState>{here},
+                    arriveWithin);
+                std::string const aim =
+                    OverseerDecisions::TravelAimAtPosition(door->map, door->x, door->y, height.z);
+                if (aim.empty())
+                    return false;
+                RejoinToward(name, aim, arriveWithin);
+                return true;
+            }
+            case OverseerDecisions::DoorRejoinStep::Knock:
+            {
+                std::ostringstream target;
+                target << "trigger:" << portal->entryTriggerId;
+                if (StepThroughAreaTrigger(name, p, target.str()))
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' stepped through areatrigger {} into map {} to "
+                             "rejoin its leader '{}'",
+                             name, portal->entryTriggerId, goal.insideMap, leader->GetName());
+                return true;
+            }
+        }
+        return false;
+    }
+
     // ONE STRANDED MEMBER, ONE PARTY POLL. Answers true when this took the
     // member (a hearth, or a crossing of its own), so DriveCatchUp does nothing
     // else with it on this poll; false leaves the member to the drive as before,
@@ -41732,7 +41874,13 @@ private:
         facts.alive = p->IsAlive();
         facts.inCombat = p->IsInCombat();
         facts.memberMap = p->GetMapId();
-        facts.leaderMap = leader->GetMapId();
+        // THE DOOR'S CONTINENT, NOT THE INSTANCE, while the leader is inside a
+        // dungeon (StrandedGoalOf): no transport berths on an instance map.
+        float goalX = 0.f;
+        float goalY = 0.f;
+        OverseerDecisions::StrandedGoal const goal = StrandedGoalOf(leader, goalX, goalY);
+        facts.leaderMap = goal.map;
+        facts.leaderInsideMap = goal.viaDoor ? goal.insideMap : 0;
         facts.aboard = riding != nullptr;
         facts.crossingUnderWay = memo != _loneCrossings.end() && memo->second.crossingSince;
         facts.crossingLanded = memo != _loneCrossings.end() &&
@@ -41761,7 +41909,7 @@ private:
         facts.familyOwnsTheWay =
             FamilyCrossing(family) || runEscort || InDungeonRun(p) || familyComesHere;
 
-        facts.boundOnLeaderMap = p->m_homebindMapId == leader->GetMapId();
+        facts.boundOnLeaderMap = p->m_homebindMapId == facts.leaderMap;
         facts.boundOnMemberMap = p->m_homebindMapId == p->GetMapId();
         auto const gaveUp = _strandedGroundGiveUp.find(name);
         facts.berthWalkGaveUp = gaveUp != _strandedGroundGiveUp.end() &&
@@ -41786,8 +41934,7 @@ private:
             std::vector<CrossingTransportInfo const*> serving;
             std::vector<std::pair<int, int>> stops;
             facts.transportServes =
-                PriceCrossingTransports(p, facts.memberMap, facts.leaderMap,
-                                        leader->GetPositionX(), leader->GetPositionY(), 0,
+                PriceCrossingTransports(p, facts.memberMap, facts.leaderMap, goalX, goalY, 0,
                                         serving, stops, priced) >= 0;
         }
 
@@ -42284,13 +42431,18 @@ private:
                 if (mo->GetEntry())
                     memo.crossingRouteEntry = mo->GetEntry();
 
+        // THE LEADER, OR THE DOOR OF THE DUNGEON HE IS INSIDE (StrandedGoalOf),
+        // is what the far landing is chosen against.
         Player* const leader = ObjectAccessor::FindPlayerByName(memo.leaderName);
+        float goalX = 0.f;
+        float goalY = 0.f;
         bool const leaderThere = leader && leader->IsInWorld() &&
-                                 leader->GetMapId() == memo.crossingDestinationMap;
+                                 StrandedGoalOf(leader, goalX, goalY).map ==
+                                     memo.crossingDestinationMap;
         CrossingRoute route = ReadCrossingFromWorld(
             memo, std::vector<std::string>{name}, name, p, memo.crossingOriginMap,
-            memo.crossingDestinationMap, leaderThere ? leader->GetPositionX() : 0.f,
-            leaderThere ? leader->GetPositionY() : 0.f);
+            memo.crossingDestinationMap, leaderThere ? goalX : 0.f,
+            leaderThere ? goalY : 0.f);
         if (memo.crossingSince &&
             std::time(nullptr) - memo.crossingSince > time_t(CROSSING_BACKSTOP_SECONDS))
             route.world.overdue = true;

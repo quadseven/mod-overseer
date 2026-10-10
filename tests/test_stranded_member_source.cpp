@@ -62,7 +62,7 @@ int main()
     if (stranded.find("PriceCrossingTransports(") == std::string::npos)
         return Fail("a boat home must be priced the way the family's crossing is");
     if (stranded.find("DoHearth(") == std::string::npos ||
-        stranded.find("m_homebindMapId == leader->GetMapId()") == std::string::npos)
+        stranded.find("m_homebindMapId == facts.leaderMap") == std::string::npos)
         return Fail("a member bound on its leader's map must be able to hearth there");
 
     std::size_t const clock = text.find("if (_dungeonRunTimer >= DUNGEON_RUN_POLL_MS)");
