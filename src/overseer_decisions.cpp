@@ -14961,9 +14961,9 @@ SpawnWalkRequest ParseSpawnWalkRequest(std::string const& command)
     std::vector<std::string> const words = MailWalkWords(command);
     SpawnWalkRequest bad;
     bad.error = SpawnWalkRefusal::MalformedSpawn;
-    if (words.empty() || words[0] != SPAWN_WALK_VERB || words.size() > 3)
+    if (words.empty() || words[0] != SPAWN_WALK_VERB || words.size() > 4)
         return bad;
-    bool sawSpawn = false, sawMax = false;
+    bool sawSpawn = false, sawMax = false, sawNear = false;
     for (std::size_t i = 1; i < words.size(); ++i)
     {
         std::string key, value;
@@ -14982,6 +14982,15 @@ SpawnWalkRequest ParseSpawnWalkRequest(std::string const& command)
             if (!ErrandWalkCap(value, request.maxYards))
                 return bad;
         }
+        else if (key == "near" && !sawNear)
+        {
+            sawNear = true;
+            float near = 0.f;
+            if (!MailWalkYards(value, near) || near < SPAWN_WALK_NEAR_MIN_YARDS ||
+                near > SPAWN_WALK_ARRIVE_YARDS)
+                return bad;
+            request.arriveYards = near;
+        }
         else
             return bad;
     }
@@ -14990,9 +14999,9 @@ SpawnWalkRequest ParseSpawnWalkRequest(std::string const& command)
     return request;
 }
 
-bool SpawnWalkArrived(float yards)
+bool SpawnWalkArrived(float yards, float arrive)
 {
-    return yards >= 0.f && yards <= SPAWN_WALK_ARRIVE_YARDS;
+    return yards >= 0.f && yards <= arrive;
 }
 
 bool IsTrainerWalkRow(std::string const& command)
