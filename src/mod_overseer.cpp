@@ -60229,6 +60229,170 @@ private:
             return "";
         }
 
+        if (request.verb == GuildVerb::BankWithdrawItem)
+        {
+            // THE OTHER HALF OF deposit-item, AND THE SAME WALK. The bridge
+            // aims a member with withdraw rights at a vault and writes this
+            // row once it stands there; it is answered from where the member
+            // stands now, or refused by name.
+            uint8 const tabId = request.bankTab;
+            if (tabId >= GuildPurchasedTabs(guild))
+                return refuse("the guild has not bought that bank tab");
+
+            WorldSession* session = who->GetSession();
+            if (!session)
+                return refuse("that character has no session to bank through");
+
+            bool anyVaultInRange = false;
+            GameObject* vault = GuildBankInReach(who, anyVaultInRange);
+            if (!vault)
+                return refuse(anyVaultInRange
+                                  ? "a guild bank is nearby but this character cannot use it"
+                                  : "no guild bank in reach");
+
+            // THE TAB AS THE GUILD OBJECT HOLDS IT (GuildBankMemory, #684),
+            // read again after the move for the witness.
+            auto readTab = [&]() -> std::vector<OverseerDecisions::GuildBankSlotItem>
+            {
+                std::vector<OverseerDecisions::GuildBankSlotItem> slots;
+                auto const& tabs = guild->*GuildBankMemory::Tabs();
+                if (tabId >= tabs.size())
+                    return slots;
+                for (uint8 slot = 0; slot < GUILD_BANK_MAX_SLOTS; ++slot)
+                    if (Item const* there = tabs[tabId].GetItem(slot))
+                        slots.push_back({slot, there->GetGUID().GetCounter(), there->GetEntry(),
+                                         there->GetCount()});
+                return slots;
+            };
+            auto heldOf = [](std::vector<OverseerDecisions::GuildBankSlotItem> const& slots,
+                             uint32 entry) -> uint32
+            {
+                uint32 held = 0;
+                for (auto const& there : slots)
+                    if (there.entry == entry)
+                        held += there.count;
+                return held;
+            };
+
+            std::vector<OverseerDecisions::GuildBankSlotItem> const before = readTab();
+            int const found = OverseerDecisions::GuildBankSlotHolding(before, request.itemKey);
+            if (found < 0)
+                return refuse("no stack with that guid in that guild bank tab");
+            uint8 const bankSlot = static_cast<uint8>(found);
+            Item* banked = (guild->*GuildBankMemory::Tabs())[tabId].GetItem(bankSlot);
+            if (!banked)
+                return refuse("no stack with that guid in that guild bank tab");
+
+            ItemTemplate const* proto = banked->GetTemplate();
+            std::string const itemName = proto ? proto->Name1 : std::string();
+            uint32 const itemEntry = banked->GetEntry();
+            uint32 const itemCount = banked->GetCount();
+
+            // AN EMPTY SLOT OF THE MEMBER'S OWN BAGS, the backpack first and
+            // then each worn bag, asked of the core's own CanStoreItem the way
+            // the vault's move asks it. A named slot rather than the core's
+            // auto-store, because auto-store may merge the stack into one the
+            // member already carries, and then the guid the bridge lists by is
+            // gone. A member with no room takes nothing, and says so.
+            uint8 toBag = NULL_BAG;
+            uint8 toSlot = NULL_SLOT;
+            {
+                ItemPosCountVec dest;
+                for (uint8 s = INVENTORY_SLOT_ITEM_START; s < INVENTORY_SLOT_ITEM_END && toSlot == NULL_SLOT; ++s)
+                {
+                    dest.clear();
+                    if (!who->GetItemByPos(INVENTORY_SLOT_BAG_0, s)
+                        && who->CanStoreItem(INVENTORY_SLOT_BAG_0, s, dest, banked, false) == EQUIP_ERR_OK)
+                    {
+                        toBag = INVENTORY_SLOT_BAG_0;
+                        toSlot = s;
+                    }
+                }
+                for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END && toSlot == NULL_SLOT; ++b)
+                {
+                    Bag* worn = who->GetBagByPos(b);
+                    if (!worn)
+                        continue;
+                    for (uint32 i = 0; i < worn->GetBagSize() && toSlot == NULL_SLOT; ++i)
+                    {
+                        dest.clear();
+                        if (!worn->GetItemByPos(i)
+                            && who->CanStoreItem(b, static_cast<uint8>(i), dest, banked, false) == EQUIP_ERR_OK)
+                        {
+                            toBag = b;
+                            toSlot = static_cast<uint8>(i);
+                        }
+                    }
+                }
+            }
+            if (toSlot == NULL_SLOT)
+                return refuse("no free bag slot to take the stack into");
+
+            // THE CORE'S OWN MOVE, THE ONE A DRAG OUT OF THE VAULT REACHES
+            // (WorldSession::HandleGuildBankSwapItems). Its withdraw-right and
+            // daily-allowance checks are inside; it is void and refuses in
+            // silence, so the tab and the bags are read back below.
+            guild->SwapItemsWithInventory(who, /*toChar=*/true, tabId, bankSlot,
+                                           toBag, toSlot, /*splitedAmount=*/0);
+
+            std::vector<OverseerDecisions::GuildBankSlotItem> const after = readTab();
+            OverseerDecisions::GuildItemWithdrawFacts facts;
+            facts.stackCount = itemCount;
+            facts.tabHeldBefore = heldOf(before, itemEntry);
+            facts.tabHeldAfter = heldOf(after, itemEntry);
+            facts.stillInTab = OverseerDecisions::GuildBankSlotHolding(after, request.itemKey) >= 0;
+            facts.carriedAfter = FindCarriedItem(who, /*byGuid=*/true, request.itemKey) != nullptr;
+            OverseerDecisions::GuildItemWithdraw const verdict =
+                OverseerDecisions::GuildItemWithdrawVerdict(facts);
+
+            std::ostringstream o;
+            o << "\"guild\":" << J(guild->GetName())
+              << ",\"guild_id\":" << guild->GetId()
+              << ",\"item_guid\":" << request.itemKey
+              << ",\"entry\":" << itemEntry
+              << ",\"name\":" << J(itemName)
+              << ",\"count\":" << itemCount
+              << ",\"tab\":" << uint32(tabId)
+              << ",\"slot\":" << uint32(bankSlot)
+              << ",\"tab_held_before\":" << facts.tabHeldBefore
+              << ",\"tab_held_after\":" << facts.tabHeldAfter;
+            note = o.str();
+
+            if (verdict == OverseerDecisions::GuildItemWithdraw::Refused)
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: guild '{}' ({}) did not let {} withdraw {} x{} (guid {}) "
+                         "from bank tab {} - this rank has no withdraw right on that tab, "
+                         "or no withdrawals left today",
+                         guild->GetName(), guild->GetId(), who->GetName(), itemName, itemCount,
+                         request.itemKey, uint32(tabId));
+                return refuse("the core refused the withdrawal - this rank cannot withdraw "
+                              "from that tab, or has no withdrawals left today");
+            }
+            if (verdict == OverseerDecisions::GuildItemWithdraw::Unexplained)
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: guild '{}' ({}) - {} asked for {} x{} (guid {}) from bank "
+                         "tab {}: the tab holds {} of that entry where it held {}, the guid is "
+                         "{} the tab and {} the bags",
+                         guild->GetName(), guild->GetId(), who->GetName(), itemName, itemCount,
+                         request.itemKey, uint32(tabId), facts.tabHeldAfter, facts.tabHeldBefore,
+                         facts.stillInTab ? "still in" : "out of",
+                         facts.carriedAfter ? "in" : "not in");
+                return refuse("the tab and the bags do not agree on what the withdrawal "
+                              "moved - read the vault before asking again");
+            }
+
+            LOG_INFO("module.overseer",
+                     "overseer: {} withdrew {} x{} (guid {}) from guild '{}' ({}) bank tab {}",
+                     who->GetName(), itemName, itemCount, request.itemKey,
+                     guild->GetName(), guild->GetId(), uint32(tabId));
+
+            describe("withdrawn", "");
+            status = "applied";
+            return "";
+        }
+
         std::vector<GuildMemberFacts> const members = GuildRosterFacts(guild->GetId());
 
         // A SHORT ROSTER READ IS NOT AN EMPTY GUILD, AND THE DIFFERENCE IS THE

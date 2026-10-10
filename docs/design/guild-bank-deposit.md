@@ -170,3 +170,14 @@ another thread: `buy-tab` from the tab count and the buyer's purse
 `tab:N`, `buy-tab` takes `tab:N` and refuses any tab but the next one, and
 `name-tab tab:N icon:<icon> <name>` names a tab. Which item goes to which
 tab is the caller's policy, not the executor's.
+
+**Update 2026-10-10: item withdraw.** `bank withdraw-item guid:<n> [tab:<t>]`
+takes one named stack out of a tab, at a vault, through the same
+`Guild::SwapItemsWithInventory` with `toChar=true`: the call the client's drag
+out of a vault reaches. The rank's withdraw right on the tab and its daily
+allowance are the core's (`BankMoveItemData::HasWithdrawRights`, spent by
+`_UpdateMemberWithdrawSlots`), and the move writes the vault's own withdraw log
+line. The stack goes into an empty bag slot the core's `CanStoreItem` accepts,
+never auto-stored, so it keeps its guid for whoever lists it next. The answer is
+read back from the tab and the bags (`GuildItemWithdrawVerdict`). Which stacks
+to take, and who takes them, is the caller's policy.

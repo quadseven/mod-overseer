@@ -14127,8 +14127,16 @@ GuildRequest ParseGuildRequest(std::string const& command)
             request.bankRankId = static_cast<std::uint8_t>(rank);
             return request;
         }
-        if (sub == "deposit-item")
+        if (sub == "deposit-item" || sub == "withdraw-item")
         {
+            // ONE GRAMMAR FOR BOTH DIRECTIONS, ONE DIFFERENCE. A withdraw
+            // names the stack in the tab by guid and only by guid: the same
+            // entry can fill a dozen slots of one tab and the caller chose
+            // one, so `entry:` is refused rather than answered with whichever
+            // slot comes first.
+            bool const taking = sub == "withdraw-item";
+            char const* const specInvalid = taking ? GuildRefusal::BankWithdrawItemSpecInvalid
+                                                   : GuildRefusal::BankItemSpecInvalid;
             // `guid:<n>` or `entry:<n>`, the exact same shape DoGive's own
             // item spec already parses (mod_overseer.cpp's ParseGiveSpec) -
             // restated here rather than shared because this file has to keep
@@ -14149,7 +14157,7 @@ GuildRequest ParseGuildRequest(std::string const& command)
             std::string const trailing = nextWord(i);
             if (!trailing.empty() || (!tabWord.empty() && tabWord.compare(0, 4, "tab:") != 0))
             {
-                request.error = GuildRefusal::BankItemSpecInvalid;
+                request.error = specInvalid;
                 return request;
             }
             if (!tabWord.empty())
@@ -14166,16 +14174,16 @@ GuildRequest ParseGuildRequest(std::string const& command)
             std::string::size_type const colon = specWord.find(':');
             if (colon == std::string::npos)
             {
-                request.error = GuildRefusal::BankItemSpecInvalid;
+                request.error = specInvalid;
                 return request;
             }
             std::string const what = specWord.substr(0, colon);
             std::string const value = specWord.substr(colon + 1);
             bool const byGuid = (what == "guid");
-            if ((!byGuid && what != "entry") || value.empty()
+            if ((!byGuid && (taking || what != "entry")) || value.empty()
                 || value.find_first_not_of("0123456789") != std::string::npos)
             {
-                request.error = GuildRefusal::BankItemSpecInvalid;
+                request.error = specInvalid;
                 return request;
             }
             // Overflow refused on the digit that would cause it, same
@@ -14185,17 +14193,17 @@ GuildRequest ParseGuildRequest(std::string const& command)
             {
                 if (key > 0xFFFFFFFFull)
                 {
-                    request.error = GuildRefusal::BankItemSpecInvalid;
+                    request.error = specInvalid;
                     return request;
                 }
                 key = key * 10 + static_cast<std::uint64_t>(ch - '0');
             }
             if (key == 0 || key > 0xFFFFFFFFull)
             {
-                request.error = GuildRefusal::BankItemSpecInvalid;
+                request.error = specInvalid;
                 return request;
             }
-            request.verb = GuildVerb::BankDepositItem;
+            request.verb = taking ? GuildVerb::BankWithdrawItem : GuildVerb::BankDepositItem;
             request.itemByGuid = byGuid;
             request.itemKey = static_cast<std::uint32_t>(key);
             return request;
@@ -14255,6 +14263,27 @@ GuildRequest ParseGuildRequest(std::string const& command)
 
     request.error = GuildRefusal::NoVerb;
     return request;
+}
+
+int GuildBankSlotHolding(std::vector<GuildBankSlotItem> const& tab, std::uint32_t guid)
+{
+    if (guid == 0)
+        return -1;
+    for (GuildBankSlotItem const& item : tab)
+        if (item.guid == guid)
+            return item.slot;
+    return -1;
+}
+
+GuildItemWithdraw GuildItemWithdrawVerdict(GuildItemWithdrawFacts const& facts)
+{
+    bool const tabLostTheStack = facts.tabHeldBefore >= facts.tabHeldAfter
+                                 && facts.tabHeldBefore - facts.tabHeldAfter == facts.stackCount;
+    if (facts.stackCount > 0 && !facts.stillInTab && facts.carriedAfter && tabLostTheStack)
+        return GuildItemWithdraw::Withdrawn;
+    if (facts.stillInTab && !facts.carriedAfter && facts.tabHeldAfter == facts.tabHeldBefore)
+        return GuildItemWithdraw::Refused;
+    return GuildItemWithdraw::Unexplained;
 }
 
 GuildTabPurchase GuildTabPurchaseVerdict(GuildTabPurchaseFacts const& facts)

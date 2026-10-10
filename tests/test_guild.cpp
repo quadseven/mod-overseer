@@ -1248,6 +1248,51 @@ void BankDepositItemParses()
                 BankItemSpecInvalid);
 }
 
+void BankWithdrawItemParses()
+{
+    using namespace OverseerDecisions::GuildRefusal;
+
+    // A STACK IN A TAB IS NAMED BY ITS GUID, THE STACK THE BRIDGE CHOSE TO
+    // LIST. Nothing else in the tab is an acceptable substitute, so `entry:`
+    // is refused the way the personal bank's withdraw refuses it.
+    GuildRequest const take = ParseGuildRequest("bank withdraw-item guid:494263 tab:0");
+    Check("withdraw-item by guid parses", take.verb == GuildVerb::BankWithdrawItem);
+    Check("and is marked as a guid", take.itemByGuid);
+    CheckUnsigned("carrying the guid", take.itemKey, 494263);
+    CheckUnsigned("from the tab it named", take.bankTab, 0);
+    Check("which it said it named", take.bankTabNamed);
+    CheckString("refused by nothing", take.error, "");
+
+    GuildRequest const later = ParseGuildRequest("bank withdraw-item guid:77 tab:3");
+    CheckUnsigned("a later tab is that tab", later.bankTab, 3);
+    Check("no tab is tab 0, as for a deposit",
+          ParseGuildRequest("bank withdraw-item guid:77").bankTab == 0
+              && !ParseGuildRequest("bank withdraw-item guid:77").bankTabNamed);
+    Check("the verb is case insensitive like the others",
+          ParseGuildRequest("BANK withdraw-item guid:1").verb == GuildVerb::BankWithdrawItem);
+
+    CheckString("an entry is refused: a withdraw takes one named stack",
+                ParseGuildRequest("bank withdraw-item entry:2589").error,
+                BankWithdrawItemSpecInvalid);
+    CheckString("no spec at all is refused",
+                ParseGuildRequest("bank withdraw-item").error, BankWithdrawItemSpecInvalid);
+    CheckString("a guid of 0 is refused",
+                ParseGuildRequest("bank withdraw-item guid:0").error,
+                BankWithdrawItemSpecInvalid);
+    CheckString("a guid past uint32 is refused, not wrapped",
+                ParseGuildRequest("bank withdraw-item guid:99999999999").error,
+                BankWithdrawItemSpecInvalid);
+    CheckString("a tab past the core's six is refused",
+                ParseGuildRequest("bank withdraw-item guid:5 tab:6").error, BankTabInvalid);
+    CheckString("a word after the tab is refused",
+                ParseGuildRequest("bank withdraw-item guid:5 tab:0 now").error,
+                BankWithdrawItemSpecInvalid);
+    Check("and the gold withdraw is still the gold withdraw",
+          ParseGuildRequest("bank withdraw 500").verb == GuildVerb::BankWithdraw);
+    Check("and a deposit-item is still a deposit",
+          ParseGuildRequest("bank deposit-item guid:5").verb == GuildVerb::BankDepositItem);
+}
+
 void ATabCanBeNamedOnEveryBankVerbThatTouchesOne()
 {
     using namespace OverseerDecisions::GuildRefusal;
@@ -1400,6 +1445,7 @@ void ABadRowIsRefusedByNameAndNeverSilently()
                                     BankAmountIsZero,
                                     BankAmountTooBig,
                                     BankItemSpecInvalid,
+                                    BankWithdrawItemSpecInvalid,
                                     BankBuyTabTrailing,
                                     BankTabInvalid,
                                     BankNameTabInvalid,
@@ -1444,6 +1490,7 @@ int main()
     ATabardIsFiveBytesOrItIsRefused();
     BankDepositParses();
     BankDepositItemParses();
+    BankWithdrawItemParses();
     ATabCanBeNamedOnEveryBankVerbThatTouchesOne();
     ATabPurchaseIsJudgedFromTheGuildAndThePurseNotFromTheRow();
     ABadRowIsRefusedByNameAndNeverSilently();

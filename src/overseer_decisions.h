@@ -16533,6 +16533,17 @@ enum class GuildVerb : std::uint8_t
     // materials, its gear for later and its raid supplies apart the way a
     // raid guild's officers do. No `tab:` is tab 0, the v1 behaviour.
     BankDepositItem,
+    // `bank withdraw-item guid:<item_instance.guid> [tab:<t>]` - the other
+    // half of deposit-item: a member stood at a guild vault takes one named
+    // stack out of tab `t` (tab 0 when none is named) into an empty slot of
+    // its own bags. GUID ONLY: the same entry can fill a dozen slots of one
+    // tab, and the caller chose one of them. The move is the core's own
+    // `Guild::SwapItemsWithInventory(toChar=true)`, the call the client's
+    // drag out of a vault reaches, so the rank's withdraw right on that tab
+    // and its daily allowance (`BankMoveItemData::HasWithdrawRights`) are the
+    // core's to enforce and to count. The executor reads the tab and the
+    // bags back afterwards (GuildItemWithdrawVerdict); it never writes a row.
+    BankWithdrawItem,
     // `bank name-tab tab:<n> icon:<icon> <name>` - the guild master names a
     // purchased tab at a vault, through the core's own
     // Guild::HandleSetBankTabInfo, which is what the client's tab editor
@@ -16573,7 +16584,9 @@ struct GuildRequest
     std::uint32_t depositCopper{0};
     // BankGrantDeposit only: the rank receiving deposit rights.
     std::uint8_t bankRankId{0};
-    // BankDepositItem only: which carried item, in the same `guid:`/`entry:`
+    // BankDepositItem and BankWithdrawItem: which item. For a withdraw it is
+    // always a guid (`itemByGuid` true), the stack in the tab. For a deposit,
+    // which carried item, in the same `guid:`/`entry:`
     // convention DoGive's own item spec already uses (guid names exactly one
     // item_instance row; entry names a type and picks whichever the
     // character happens to be carrying). itemKey is never zero when verb is
@@ -16581,7 +16594,8 @@ struct GuildRequest
     // it the same way a missing spec is refused.
     bool itemByGuid{false};
     std::uint32_t itemKey{0};
-    // BankDepositItem, BankNameTab and a BankBuyTab that named its tab: the
+    // BankDepositItem, BankWithdrawItem, BankNameTab and a BankBuyTab that
+    // named its tab: the
     // guild bank tab, 0 to GUILD_BANK_TABS - 1. `bankTabNamed` says whether
     // the row gave one, because 0 is both the default and a legal tab.
     std::uint8_t bankTab{0};
@@ -16651,7 +16665,7 @@ namespace GuildRefusal
 {
 constexpr char const* NoVerb = "a guild row must begin with form, view, shortlist, invite, remove, tabard, bank or raid";
 constexpr char const* RaidTakesFormOrNothing = "raid takes nothing, or the single word form";
-constexpr char const* BankNeedsDeposit = "bank takes `deposit <copper>`, `withdraw <copper>`, `deposit-item <guid:N|entry:N> [tab:N]`, `buy-tab [tab:N]`, `name-tab tab:N icon:<icon> <name>` or `grant-deposit rank:N`";
+constexpr char const* BankNeedsDeposit = "bank takes `deposit <copper>`, `withdraw <copper>`, `deposit-item <guid:N|entry:N> [tab:N]`, `withdraw-item guid:N [tab:N]`, `buy-tab [tab:N]`, `name-tab tab:N icon:<icon> <name>` or `grant-deposit rank:N`";
 constexpr char const* BankBuyTabTrailing = "bank buy-tab takes tab:N or nothing";
 constexpr char const* BankTabInvalid = "a guild bank tab is tab:0 to tab:5";
 constexpr char const* BankNameTabInvalid = "bank name-tab takes tab:N icon:<icon> and a name of at most 16 characters";
@@ -16660,6 +16674,7 @@ constexpr char const* BankAmountNotANumber = "bank deposit takes a copper amount
 constexpr char const* BankAmountIsZero = "a deposit of nothing is not a request";
 constexpr char const* BankAmountTooBig = "that deposit is larger than a character can ever carry";
 constexpr char const* BankItemSpecInvalid = "bank deposit-item takes guid:<item_instance.guid> or entry:<item id>, then tab:N or nothing";
+constexpr char const* BankWithdrawItemSpecInvalid = "bank withdraw-item takes guid:<item_instance.guid>, then tab:N or nothing";
 constexpr char const* TabardNeedsFive = "tabard takes five numbers: style, colour, border style, border colour, background";
 constexpr char const* TabardNotANumber = "tabard takes five numbers and nothing else";
 constexpr char const* TabardValueTooBig = "a tabard value is stored as one byte; 255 is the most any of the five can be";
@@ -16671,6 +16686,60 @@ constexpr char const* CountIsZero = "a shortlist of nothing is not a question";
 }  // namespace GuildRefusal
 
 GuildRequest ParseGuildRequest(std::string const& command);
+
+// -- taking a stack out of a guild bank tab ---------------------------------
+//
+// WHAT A PLAYER DOES AT A VAULT, AND WHAT THE CORE CHECKS WHEN IT DOES. A
+// member opens the vault, finds the stack in the tab and drags it into an
+// empty bag slot. The client sends CMSG_GUILD_BANK_SWAP_ITEMS, and the core
+// answers it with Guild::SwapItemsWithInventory(player, toChar=true, tab,
+// slot, bag, bagSlot, 0). Inside, `_MoveItems` asks
+// `BankMoveItemData::HasWithdrawRights`: a guild master always may, any
+// other rank only with GUILD_BANK_RIGHT_VIEW_TAB on that tab and withdrawals
+// left today (`guild_bank_right.SlotPerDay` less what the member has taken).
+// A move spends one of them (`_UpdateMemberWithdrawSlots`) and writes a
+// GUILD_BANK_LOG_WITHDRAW_ITEM line to the vault's log. The call is void and
+// a refusal changes nothing, so the executor reads both sides back.
+//
+// One slot of a tab, as the executor reads it from the Guild object's own
+// memory (GuildBankMemory in the adapter).
+struct GuildBankSlotItem
+{
+    std::uint8_t slot{0};
+    std::uint32_t guid{0};
+    std::uint32_t entry{0};
+    std::uint32_t count{0};
+};
+
+// The tab slot holding the stack whose item_instance guid is `guid`, or -1.
+// Never a neighbour of the same entry: the caller chose this stack.
+int GuildBankSlotHolding(std::vector<GuildBankSlotItem> const& tab, std::uint32_t guid);
+
+struct GuildItemWithdrawFacts
+{
+    // The stack's count when it was found in the tab.
+    std::uint32_t stackCount{0};
+    // Units of the stack's entry in the tab, before and after the call.
+    std::uint32_t tabHeldBefore{0};
+    std::uint32_t tabHeldAfter{0};
+    // Whether the guid is still in the tab, and whether the character now
+    // carries it, after the call.
+    bool stillInTab{false};
+    bool carriedAfter{false};
+};
+
+enum class GuildItemWithdraw : std::uint8_t
+{
+    // Out of the tab, into the bags, and the tab exactly the stack lighter.
+    Withdrawn,
+    // Nothing moved: no withdraw right on that tab, or none left today.
+    Refused,
+    // Something moved that a withdraw does not explain. Never reported as a
+    // withdraw, and never as a refusal a caller could simply retry.
+    Unexplained,
+};
+
+GuildItemWithdraw GuildItemWithdrawVerdict(GuildItemWithdrawFacts const& facts);
 
 // -- buying a guild bank tab (#496) -------------------------------------------
 //
