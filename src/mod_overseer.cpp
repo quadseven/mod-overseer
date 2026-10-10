@@ -14548,6 +14548,14 @@ private:
     // the trainer's real price. Passes, because a recipe opens the next one.
     // Each purchase is read back with HasSpell: TeachSpell reports only to a
     // client. Returns how many the character now holds that it did not.
+    //
+    // EACH RECIPE IS SAID BY NAME AND RECORDED ON ITS OWN (wow-overseer#769).
+    // The bridge now sends a family crafter to its trainer for the rung its
+    // ladder names (guildjobs.recipes_due), and whether that rung was bought is
+    // the one fact the errand exists for. The trade-level event below the
+    // purchase says "some recipes"; this one names the spell, so
+    // `overseer_event` (kind 'learn', subject_id the recipe) keeps the proof
+    // after the worldserver's log has rolled.
     static uint32 BuyRecipes(Trainer::Trainer* trainer, Creature* npc, Player* bot, uint32 skill)
     {
         uint32 bought = 0;
@@ -14556,15 +14564,25 @@ private:
             uint32 boughtThisPass = 0;
             for (uint32 spellId : RecipesToBuy(trainer, npc, bot, skill))
             {
+                uint64 const purseBefore = bot->GetMoney();
                 trainer->TeachSpell(npc, bot, spellId);
                 if (bot->HasSpell(spellId))
                 {
                     ++bought;
                     ++boughtThisPass;
+                    uint64 const purseAfter = bot->GetMoney();
+                    uint64 const paid = purseBefore > purseAfter ? purseBefore - purseAfter : 0;
+                    SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+                    std::string const recipe =
+                        info ? std::string(info->SpellName[LOCALE_enUS]) : std::string();
                     LOG_INFO("module.overseer",
-                             "overseer: '{}' bought recipe {} of {} ({}) from creature {} at the "
-                             "trainer's price, not a grant",
-                             bot->GetName(), spellId, SkillName(skill), skill, npc->GetEntry());
+                             "overseer: '{}' bought recipe '{}' ({}) of {} ({}) from creature {} "
+                             "for {} copper of its own, at the trainer's price, not a grant",
+                             bot->GetName(), recipe, spellId, SkillName(skill), skill,
+                             npc->GetEntry(), paid);
+                    RecordEvent(bot, "learn", spellId, recipe,
+                                "bought this recipe from its trade's trainer, at the trainer's "
+                                "price");
                 }
             }
             if (!boughtThisPass)

@@ -173,6 +173,18 @@ int main()
         Check("training stop admits a recipes-only learner",
               src.find("RecipesToBuy(trainer, nullptr, bot, plan->second.learnSkill)") !=
                   std::string::npos);
+        // Each bought recipe is said by name and recorded as its own 'learn'
+        // event, keyed on the recipe's spell (wow-overseer#769): the proof a
+        // family crafter bought its rung outlives the worldserver's log.
+        std::size_t const buy = src.find("static uint32 BuyRecipes(");
+        std::size_t const end = src.find("std::map<std::string, ProfessionPlan> LoadProfessionPlans()");
+        std::string const body =
+            buy == std::string::npos || end == std::string::npos ? std::string()
+                                                                  : src.substr(buy, end - buy);
+        Check("each recipe is named in the log line",
+              body.find("bought recipe '{}' ({}) of {} ({})") != std::string::npos);
+        Check("each recipe is its own learn event",
+              body.find("RecordEvent(bot, \"learn\", spellId, recipe,") != std::string::npos);
     }
 
     if (failures)
