@@ -17847,6 +17847,43 @@ GuildRunResume ReadGuildRunResume(std::string const& result)
     resume.secondsInside = GuildRunJsonUnsigned(head, "seconds_inside");
     resume.deaths = GuildRunJsonUnsigned(head, "deaths");
     resume.ilvlStart = GuildRunJsonUnsigned(head, "ilvl_start");
+    resume.lootItems = GuildRunJsonUnsigned(head, "loot_items");
+    {
+        std::size_t at = GuildRunJsonValueAt(head, "loot_notable");
+        if (at != std::string::npos && at < head.size() && head[at] == '[')
+        {
+            // Strict: only digits and commas between the brackets. Anything
+            // else (a nested array, a quote, an empty slot) reads as no tally
+            // rather than as a plausible but shifted one.
+            std::vector<unsigned> parsed;
+            unsigned value = 0;
+            bool digits = false;
+            bool clean = true;
+            for (++at; at < head.size() && head[at] != ']'; ++at)
+            {
+                if (head[at] >= '0' && head[at] <= '9')
+                {
+                    value = value * 10 + static_cast<unsigned>(head[at] - '0');
+                    digits = true;
+                }
+                else if (head[at] == ',' && digits)
+                {
+                    parsed.push_back(value);
+                    value = 0;
+                    digits = false;
+                }
+                else
+                {
+                    clean = false;
+                    break;
+                }
+            }
+            if (clean && digits)
+                parsed.push_back(value);
+            if (clean && at < head.size() && (digits || parsed.empty()))
+                resume.lootNotable = parsed;
+        }
+    }
     if (membersAt == std::string::npos)
         return resume;
     std::size_t at = membersAt;
@@ -17908,6 +17945,40 @@ bool GuildRunRestoresFinderDungeon(GuildRunFinderRestoreFacts const& facts)
     // over a dungeon the core still holds.
     return facts.wasInside && facts.dungeonId != 0 && facts.runMap != 0 &&
            facts.dungeonMap == facts.runMap && facts.finderGroup && facts.knownDungeon == 0;
+}
+
+bool FamilyRunRestoresFinderDungeon(FamilyRunFinderRestoreFacts const& facts)
+{
+    GuildRunFinderRestoreFacts asGuild;
+    asGuild.wasInside = facts.runActive;
+    asGuild.dungeonId = facts.dungeonId;
+    asGuild.runMap = facts.runMap;
+    asGuild.dungeonMap = facts.dungeonMap;
+    asGuild.finderGroup = facts.finderGroup;
+    asGuild.knownDungeon = facts.knownDungeon;
+    return GuildRunRestoresFinderDungeon(asGuild);
+}
+
+bool GuildRunAdoptionTouchDue(std::int64_t secondsSinceTouch)
+{
+    return secondsSinceTouch >= static_cast<std::int64_t>(GUILD_RUN_ADOPT_TOUCH_SECONDS);
+}
+
+std::int64_t GuildRunStrayExpiry(bool tankInWorld, std::int64_t startedAt, std::int64_t now)
+{
+    if (startedAt != 0)
+        return startedAt;
+    return tankInWorld ? now + static_cast<std::int64_t>(GUILD_RUN_STRAY_SECONDS) : 0;
+}
+
+bool GuildRunStrayExpired(std::int64_t expiry, std::int64_t now)
+{
+    return expiry != 0 && now >= expiry;
+}
+
+bool RunCloseHeldAfterStartup(std::int64_t secondsSinceStart)
+{
+    return secondsSinceStart < static_cast<std::int64_t>(RUN_CLOSE_STARTUP_HOLD_SECONDS);
 }
 
 namespace

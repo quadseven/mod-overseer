@@ -3274,6 +3274,9 @@ std::string MakeRunToken()
     return ss.str();
 }
 std::string const g_runToken = MakeRunToken();
+// When this process started, for the hold on closing dungeon runs
+// (OverseerDecisions::RunCloseHeldAfterStartup).
+std::int64_t const g_startedAt = static_cast<std::int64_t>(std::time(nullptr));
 
 std::mutex g_watchMutex;
 std::vector<WatchEntry> g_watch;
@@ -4169,6 +4172,34 @@ void TrackGuildRunLoot(std::vector<uint64> const& guids)
     for (uint64 guid : guids)
         g_guildRunLoot[guid] = GuildRunLootTally();
     g_guildRunLootAny.store(!g_guildRunLoot.empty(), std::memory_order_relaxed);
+}
+
+// What these characters have looted so far, left counting: written into every
+// heartbeat so a restart can hand it to the adopted run.
+GuildRunLootTally PeekGuildRunLoot(std::vector<uint64> const& guids)
+{
+    GuildRunLootTally total;
+    std::lock_guard<std::mutex> guard(g_guildRunLootMutex);
+    for (uint64 guid : guids)
+    {
+        auto const it = g_guildRunLoot.find(guid);
+        if (it == g_guildRunLoot.end())
+            continue;
+        total.items += it->second.items;
+        for (uint32 entry : it->second.notable)
+            if (total.notable.size() < 16)
+                total.notable.push_back(entry);
+    }
+    return total;
+}
+
+// Start counting from what an earlier worldserver's heartbeat said.
+void SeedGuildRunLoot(uint64 firstGuid, GuildRunLootTally const& tally)
+{
+    std::lock_guard<std::mutex> guard(g_guildRunLootMutex);
+    auto const it = g_guildRunLoot.find(firstGuid);
+    if (it != g_guildRunLoot.end())
+        it->second = tally;
 }
 
 GuildRunLootTally TakeGuildRunLoot(std::vector<uint64> const& guids)
@@ -7447,6 +7478,22 @@ public:
     void OnStartup() override
     {
         RestoreGuildRunFinderDungeons();
+        RestoreFamilyRunFinderDungeons();
+    }
+
+    // THE QUEUES ARE WRITTEN ONCE MORE AT SHUTDOWN. Chat, events, deaths and
+    // level changes wait for their timers (one to several seconds), so
+    // everything that happened since the last flush was dropped with the
+    // process on every roll. The database workers drain their queue when the
+    // pool closes, so these writes land.
+    void OnShutdown() override
+    {
+        FlushChat();
+        FlushEvents();
+        FlushDeaths();
+        FlushLevels();
+        LOG_INFO("module.overseer",
+                 "overseer: the chat, event, death and level queues are flushed at shutdown");
     }
 
     void OnUpdate(uint32 diff) override
@@ -11977,6 +12024,25 @@ private:
     // the whole reason this table exists.
     void CloseAbandonedRuns()
     {
+        // A ROLL IS NOT A RUN GONE COLD. Every heartbeat is older than
+        // RUN_COLD_SECONDS when a worldserver starts, so for a while the close
+        // waits for the adoption and the arming drive to touch them; closed at
+        // once, the real run read 'emptied' and the campaign's next run
+        // reopened renumbered.
+        if (OverseerDecisions::RunCloseHeldAfterStartup(
+                static_cast<std::int64_t>(std::time(nullptr)) - g_startedAt))
+        {
+            static bool said = false;
+            if (!said)
+            {
+                said = true;
+                LOG_INFO("module.overseer",
+                         "overseer: cold dungeon runs are not closed for {}s after the start, so "
+                         "a restart does not end a run that is still inside",
+                         OverseerDecisions::RUN_CLOSE_STARTUP_HOLD_SECONDS);
+            }
+            return;
+        }
         // CLOSED ON A COLD HEARTBEAT, NOT ON AN EMPTY ROOM.
         //
         // The first draft asked FindPlayerByName for each roster member and
@@ -38642,6 +38708,8 @@ private:
     {
         std::string tank;
         std::vector<std::string> names;
+        // The instant the stray expires; 0 until its tank has been seen in the
+        // world (OverseerDecisions::GuildRunStrayExpiry).
         std::time_t until{0};
         bool teleported{false};
     };
@@ -38661,6 +38729,8 @@ private:
         std::time_t readAt{0};
         std::time_t silentSeconds{0};
         std::time_t until{0};
+        // When the row was last written while the adoption waited.
+        std::time_t touchedAt{0};
     };
     std::vector<GuildRunAdoption> _guildRunAdoptions;
 
@@ -39016,6 +39086,58 @@ private:
             return false;
         sLFGMgr->LeaveLfg(group->GetGUID());
         return true;
+    }
+
+    // A FAMILY'S FINDER GROUP GETS ITS DUNGEON BACK TOO
+    // (OverseerDecisions::FamilyRunRestoresFinderDungeon). The guild restore at
+    // startup reads only kind = 'guild' rows; a family campaign that entered by
+    // the finder rung has only its active `overseer_dungeon_run` row, and its
+    // premade group is the same type 8 finder group the core strips of its
+    // dungeon on load. Run once from OnStartup, before any login. The finder
+    // entry is the one the run's map door chooses (FinderDungeonForDoor); on a
+    // map with several doors it is the first door's, which is the entry of the
+    // table's first wing.
+    static void RestoreFamilyRunFinderDungeons()
+    {
+        QueryResult rows = CharacterDatabase.Query(
+            "SELECT id, leader_name, map_id FROM overseer_dungeon_run WHERE state = 'active'");
+        if (!rows)
+            return;
+        do
+        {
+            Field* const fields = rows->Fetch();
+            uint32 const id = fields[0].Get<uint32>();
+            std::string const leader = fields[1].Get<std::string>();
+            uint32 const mapId = fields[2].Get<uint32>();
+
+            ObjectGuid const leaderGuid = sCharacterCache->GetCharacterGuidByName(leader);
+            ObjectGuid const groupGuid =
+                leaderGuid.IsEmpty() ? ObjectGuid::Empty
+                                     : sCharacterCache->GetCharacterGroupGuidByGuid(leaderGuid);
+            Group* const group =
+                groupGuid.IsEmpty() ? nullptr : sGroupMgr->GetGroupByGUID(groupGuid.GetCounter());
+            DungeonPortal const* const portal = FindDungeonPortalByInsideMap(mapId, std::string());
+            std::string why;
+            LFGDungeonEntry const* const dungeon =
+                portal ? FinderDungeonForDoor(*portal, why) : nullptr;
+
+            OverseerDecisions::FamilyRunFinderRestoreFacts facts;
+            facts.runActive = true;
+            facts.runMap = mapId;
+            facts.dungeonId = dungeon ? dungeon->ID : 0;
+            facts.dungeonMap = dungeon ? dungeon->MapID : 0;
+            facts.finderGroup = group && group->isLFGGroup();
+            facts.knownDungeon = group ? sLFGMgr->GetDungeon(group->GetGUID()) : 0;
+            if (!dungeon || !group || !OverseerDecisions::FamilyRunRestoresFinderDungeon(facts))
+                continue;
+
+            sLFGMgr->SetDungeon(group->GetGUID(), dungeon->ID + (dungeon->TypeID << 24));
+            LOG_WARN("module.overseer",
+                     "overseer: dungeon run {} - the finder group under '{}' is given back its "
+                     "finder dungeon {} (map {}), which the core dropped with its lfg_data on "
+                     "load, so the family logs back in inside",
+                     id, leader, dungeon->ID, mapId);
+        } while (rows->NextRow());
     }
 
     // ONE POLL OF EVERY GUILD RUN, from DeliverPendingCommands.
@@ -39945,8 +40067,11 @@ private:
             if (now - run.heartbeatAt >= 60)
             {
                 run.heartbeatAt = now;
+                // THE LOOT TALLY RIDES THE HEARTBEAT, so an adopted run reads
+                // back what its members had looted before the restart.
+                GuildRunLootTally const loot = PeekGuildRunLoot(run.guids);
                 WriteGuildRunRow(run.id, "verifying", "inside",
-                                 GuildRunJson(run, "inside", nullptr, 0, now));
+                                 GuildRunJson(run, "inside", &loot, 0, now));
             }
             return true;
         }
@@ -40027,6 +40152,23 @@ private:
                 OverseerDecisions::GuildRunAdoptNext(facts);
             if (step == OverseerDecisions::GuildRunAdoptStep::Wait)
             {
+                // THE ROW IS KEPT FRESH WHILE THE MEMBERS LOG BACK IN. The
+                // bridge ends a 'verifying' row it has not seen written for
+                // GUILD_RUN_ROW_STALE_SECONDS, and an adoption waits up to a
+                // quarter hour without writing it.
+                if (OverseerDecisions::GuildRunAdoptionTouchDue(now - adoption.touchedAt))
+                {
+                    adoption.touchedAt = now;
+                    CharacterDatabase.Execute(
+                        "UPDATE overseer_command SET updated_at = NOW() WHERE id = {} "
+                        "AND status = 'verifying' AND claimed_by = '{}'",
+                        adoption.id, g_runToken);
+                    LOG_INFO("module.overseer",
+                             "overseer: guild finder run {} under '{}' is still waiting for its "
+                             "members after the restart ({} of {} in the world); its row is "
+                             "touched so the bridge does not end it as stale",
+                             adoption.id, adoption.tank, facts.membersInWorld, facts.groupSize);
+                }
                 still.push_back(adoption);
                 continue;
             }
@@ -40050,7 +40192,8 @@ private:
                     GuildRunStray stray;
                     stray.tank = adoption.tank;
                     stray.names = names;
-                    stray.until = now + OverseerDecisions::GUILD_RUN_ADOPT_SECONDS;
+                    // until stays 0: the quarter hour starts when the tank is
+                    // seen in the world (GuildRunStrayExpiry).
                     _guildRunStrays.push_back(stray);
                 }
                 continue;
@@ -40107,6 +40250,12 @@ private:
             if (PlayerbotAI* tankAI = GET_PLAYERBOT_AI(tank))
                 tankAI->SetMaster(tank);
             TrackGuildRunLoot(run.guids);
+            GuildRunLootTally carried;
+            carried.items = adoption.resume.lootItems;
+            carried.notable.assign(adoption.resume.lootNotable.begin(),
+                                   adoption.resume.lootNotable.end());
+            if (!run.guids.empty())
+                SeedGuildRunLoot(run.guids.front(), carried);
 
             LOG_WARN("module.overseer",
                      "overseer: GUILD FINDER RUN {} is adopted after the restart - '{}' leads "
@@ -40114,7 +40263,7 @@ private:
                      run.id, run.tank, run.mapId, facts.membersBack, facts.groupSize,
                      now - run.enteredAt);
             WriteGuildRunRow(run.id, "verifying", "inside",
-                             GuildRunJson(run, "inside", nullptr, run.ilvlAtEntry, now));
+                             GuildRunJson(run, "inside", &carried, run.ilvlAtEntry, now));
             _guildRuns.push_back(run);
         }
         _guildRunAdoptions.swap(still);
@@ -40184,6 +40333,7 @@ private:
                             adoption.silentSeconds =
                                 static_cast<std::time_t>(std::max<int64>(0, fields[6].Get<int64>()));
                             adoption.until = now + OverseerDecisions::GUILD_RUN_ADOPT_SECONDS;
+                            adoption.touchedAt = now;
                             _guildRunAdoptions.push_back(adoption);
                             LOG_WARN("module.overseer",
                                      "overseer: guild finder run {} under '{}' was inside map {} "
@@ -40199,7 +40349,8 @@ private:
                     stray.names = {tank, request.healer};
                     stray.names.insert(stray.names.end(), request.damage.begin(),
                                        request.damage.end());
-                    stray.until = now + 15 * 60;
+                    // until stays 0: the quarter hour starts when the tank is
+                    // seen in the world (GuildRunStrayExpiry).
                     _guildRunStrays.push_back(stray);
                     LOG_WARN("module.overseer",
                              "overseer: '{}' led a guild finder run the last worldserver did not "
@@ -40225,7 +40376,13 @@ private:
                         facts.liveRunGroup = true;
             }
             facts.takenOut = stray.teleported;
-            facts.expired = now >= stray.until;
+            // THE QUARTER HOUR STARTS WHEN THE TANK IS FIRST SEEN IN THE WORLD,
+            // not when the row was read: a tank back after a long login queue
+            // used to find its stray dropped, the finder group never disbanded
+            // and its bots counted as already grouped.
+            stray.until = OverseerDecisions::GuildRunStrayExpiry(
+                tank && tank->IsInWorld(), stray.until, now);
+            facts.expired = OverseerDecisions::GuildRunStrayExpired(stray.until, now);
             OverseerDecisions::GuildRunStrayStep const step =
                 OverseerDecisions::GuildRunStrayNext(facts);
             if (step == OverseerDecisions::GuildRunStrayStep::Wait)
