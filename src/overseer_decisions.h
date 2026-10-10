@@ -20890,6 +20890,11 @@ struct GuildRunResume
     unsigned secondsInside{0};
     unsigned deaths{0};
     unsigned ilvlStart{0};
+    // What the run's members had looted when the row was last written
+    // (GuildRunJson's loot_items and loot_notable); 0 and none for a row
+    // written before the tally rode the heartbeat.
+    unsigned lootItems{0};
+    std::vector<unsigned> lootNotable;
     std::vector<GuildRunResumeMember> members;
 };
 
@@ -20964,6 +20969,63 @@ struct GuildRunFinderRestoreFacts
 };
 
 bool GuildRunRestoresFinderDungeon(GuildRunFinderRestoreFacts const& facts);
+
+// A FAMILY'S RUN THAT WENT IN BY THE FINDER KEEPS ITS DUNGEON TOO.
+//
+// The startup restore above reads only kind = 'guild' rows. A family campaign
+// that took the dungeon finder rung (RunRecovery::DungeonFinder) is in the same
+// case: its premade group is a finder group of type 8, the core dropped its
+// lfg_data on load, and its members log back in outside the door. Its record is
+// the run's `overseer_dungeon_run` row, still 'active', and the signal that it
+// went in by the finder is the saved group itself: a family that walked in is
+// a plain party. The dungeon is the finder entry of the run's map.
+struct FamilyRunFinderRestoreFacts
+{
+    // An `overseer_dungeon_run` row is still active on `runMap`.
+    bool runActive{false};
+    unsigned runMap{0};
+    // The finder entry chosen for that map's door (LFGDungeons.dbc ID), and
+    // its own map.
+    unsigned dungeonId{0};
+    unsigned dungeonMap{0};
+    // The run leader's saved group is a finder group.
+    bool finderGroup{false};
+    // The finder dungeon the core already holds for that group (0: none).
+    unsigned knownDungeon{0};
+};
+
+bool FamilyRunRestoresFinderDungeon(FamilyRunFinderRestoreFacts const& facts);
+
+// A WAITING ADOPTION KEEPS ITS ROW FRESH.
+//
+// The bridge ends any 'verifying' row it has not seen written for 300 s. An
+// adoption waits up to GUILD_RUN_ADOPT_SECONDS (15 minutes) for its members
+// and wrote nothing meanwhile, so a roll with a slow login left a row the
+// bridge sweep could end under the module. The wait touches the row's
+// updated_at this often, well inside that bound.
+constexpr unsigned GUILD_RUN_ADOPT_TOUCH_SECONDS = 60;
+constexpr unsigned GUILD_RUN_ROW_STALE_SECONDS = 300;
+
+bool GuildRunAdoptionTouchDue(std::int64_t secondsSinceTouch);
+
+// THE STRAY'S QUARTER HOUR STARTS WHEN ITS TANK IS SEEN. A stray's clock used
+// to start when the restart read the row, so a tank back after a quarter hour
+// found its stray already dropped: the finder group was never disbanded and its
+// members counted as already grouped. `startedAt` is 0 until the tank has been
+// seen in the world; the return is the instant the stray expires, or 0 while
+// the clock has not started.
+constexpr unsigned GUILD_RUN_STRAY_SECONDS = 15 * 60;
+std::int64_t GuildRunStrayExpiry(bool tankInWorld, std::int64_t startedAt, std::int64_t now);
+bool GuildRunStrayExpired(std::int64_t expiry, std::int64_t now);
+
+// A ROLL IS NOT A RUN GONE COLD. CloseAbandonedRuns ends an active
+// overseer_dungeon_run row whose heartbeat is 120 s old. A worldserver start
+// finds every run's heartbeat that old by definition, so the close ended the
+// real run as 'emptied' and the arming drive then opened a new row, which the
+// campaign counted as another run. For this long after start the close waits
+// for the adoption and the arming drive to touch the heartbeat.
+constexpr unsigned RUN_CLOSE_STARTUP_HOLD_SECONDS = 10 * 60;
+bool RunCloseHeldAfterStartup(std::int64_t secondsSinceStart);
 
 // ------------------------- what a level-up hands the roster (the operator) --
 //
