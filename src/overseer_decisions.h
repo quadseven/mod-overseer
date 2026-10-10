@@ -8560,7 +8560,13 @@ struct StrandedFacts
     bool alive{false};
     bool inCombat{false};
     std::uint32_t memberMap{0};
+    // The map the member crosses to: its leader's own, or, while the leader
+    // is inside a dungeon, the continent that dungeon's door stands on
+    // (StrandedCrossingGoal).
     std::uint32_t leaderMap{0};
+    // The dungeon map the leader is inside when `leaderMap` is its door's
+    // continent, zero otherwise (no continent is an instance map).
+    std::uint32_t leaderInsideMap{0};
     // Standing on a transport, read from the character.
     bool aboard{false};
     // Its own crossing has taken a step and not ended.
@@ -8606,6 +8612,74 @@ bool ShouldLeaveDeck(bool stillAboard, bool transportDocked, float yardsToGround
 
 // The verdict as one sentence, for the log line that says it.
 std::string StrandedWayExplanation(StrandedFacts const& facts, StrandedWay way);
+
+// A LEADER INSIDE A DUNGEON IS CROSSED TO AT ITS DOOR (2026-10-10). The
+// stranded member's crossing compared its map with the leader's own map, and
+// a leader inside a dungeon stands on the instance map. No boat or zeppelin
+// berths on an instance map, so every pricing came back empty. On the dev realm
+// on 2026-10-10 from 00:40 ET, four of the Horde family stood inside Shadowfang
+// Keep (map 33) while Oz stood in Kalimdor (map 1), and the worldserver said
+// "no transport its faction may ride ... joins map 1 and map 33" every minute
+// for over an hour. Meanwhile the zeppelin from Orgrimmar to Undercity joins
+// map 1 to map 0, where the keep's door stands. The run closed 'split_failed'
+// and went into recovery.
+//
+// A PLAYER IN THAT MEMBER'S SHOES rides to the continent the dungeon's door is
+// on and walks in. So the goal of the crossing is the door's continent and
+// the door's position there. The walk from the landing to the door, and the
+// knock, belong to the run that already walks stragglers back in
+// (WalkStrandedBackIn) or gathers its party at the door. A leader on an
+// instance map with no door this module knows keeps the old goal: its own map.
+struct StrandedGoal
+{
+    std::uint32_t map{0};
+    // The goal is the door of the dungeon the leader is inside, not the
+    // leader; `insideMap` is that dungeon.
+    bool viaDoor{false};
+    std::uint32_t insideMap{0};
+};
+
+StrandedGoal StrandedCrossingGoal(std::uint32_t leaderMap, bool leaderInsideKnownDoor,
+                                  std::uint32_t doorOutsideMap);
+
+// A MEMBER ON THE DOOR'S CONTINENT WALKS TO THE DOOR AND IN (2026-10-10). Once
+// across, the member stood on map 0 in Silverpine Forest with its leader inside
+// Shadowfang Keep, and `follow` cannot cross a doorway, so it waited on a leader
+// that never came out while the four inside waited on it. A player walks to the
+// door and steps through; a grouped character stepping through lands in its
+// group leader's copy (InstanceSaveMgr::PlayerGetDestinationInstanceId).
+//
+// THE KNOCK ONLY WHILE THE PARTY BELONGS INSIDE: no run, or a run that is
+// IDLE, STAGED_INSIDE or CLEARING. A run that is walking the party out
+// (EXIT, REPAIRING, RESETTING, RECOVERING) is met at the door instead, so the
+// member is never put into a copy its family is leaving. A run's own escort
+// owns its member, a ghost belongs to the revival drive, and a fight comes
+// first.
+enum class DoorRejoinStep : std::uint8_t
+{
+    None,       // not this case, or another drive owns the member
+    Wait,       // this case, but nothing moves it this poll
+    Walk,       // walk to the door
+    Knock,      // at the door: step through
+};
+
+struct DoorRejoinFacts
+{
+    bool steerable{false};
+    bool alive{false};
+    bool inCombat{false};
+    // The leader is inside a dungeon whose door this module knows, and the
+    // member stands on the continent that door is on.
+    bool leaderInsideKnownDoor{false};
+    bool onDoorMap{false};
+    // A dungeon run's escort (not a catch-up, a rejoin or a crossing) holds it.
+    bool runEscortHoldsIt{false};
+    bool partyBelongsInside{false};
+    float yardsFromDoor{-1.f};
+};
+
+DoorRejoinStep DecideDoorRejoin(DoorRejoinFacts const& facts, float knockYards);
+char const* DoorRejoinStepName(DoorRejoinStep step);
 
 // ----------------------------- who a character can actually be sent to (#234) --
 //

@@ -422,7 +422,8 @@ void AnUnformattableDoorAimIsRefusedByEveryAdapter()
                   stragglerRefusal - stragglerGuard < 500,
               true);
 
-    std::size_t const raidCall = source.find("TravelAimAtPosition(", stragglerCall + 1);
+    std::size_t const raidCall =
+        source.find("TravelAimAtPosition(", source.find("void DriveRaidRun()"));
     std::size_t const raidGuard = source.find("if (aim.empty())", raidCall);
     std::size_t const raidRefusal = source.find("continue;", raidGuard);
     std::size_t const raidTimeline = source.find("WriteRaidTimeline(", raidGuard);

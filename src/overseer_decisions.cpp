@@ -7158,13 +7158,69 @@ StrandedWay DecideStrandedWay(StrandedFacts const& f)
     return StrandedWay::Refuse;
 }
 
+StrandedGoal StrandedCrossingGoal(std::uint32_t leaderMap, bool leaderInsideKnownDoor,
+                                  std::uint32_t doorOutsideMap)
+{
+    StrandedGoal goal;
+    goal.map = leaderMap;
+    if (!leaderInsideKnownDoor || doorOutsideMap == leaderMap)
+        return goal;
+    goal.map = doorOutsideMap;
+    goal.viaDoor = true;
+    goal.insideMap = leaderMap;
+    return goal;
+}
+
+DoorRejoinStep DecideDoorRejoin(DoorRejoinFacts const& f, float knockYards)
+{
+    if (!f.leaderInsideKnownDoor || !f.onDoorMap)
+        return DoorRejoinStep::None;
+    if (!f.steerable || !f.alive || f.runEscortHoldsIt)
+        return DoorRejoinStep::None;
+    if (f.inCombat || f.yardsFromDoor < 0.f)
+        return DoorRejoinStep::Wait;
+    if (f.yardsFromDoor > knockYards)
+        return DoorRejoinStep::Walk;
+    return f.partyBelongsInside ? DoorRejoinStep::Knock : DoorRejoinStep::Wait;
+}
+
+char const* DoorRejoinStepName(DoorRejoinStep step)
+{
+    switch (step)
+    {
+        case DoorRejoinStep::None: return "none";
+        case DoorRejoinStep::Wait: return "wait";
+        case DoorRejoinStep::Walk: return "walk";
+        case DoorRejoinStep::Knock: return "knock";
+    }
+    return "unknown";
+}
+
+namespace
+{
+// Said after the way when the goal is a dungeon's door, so the line names the
+// map the leader is really on as well as the map the member crosses to.
+std::string DoorClause(StrandedFacts const& f)
+{
+    if (!f.leaderInsideMap)
+        return std::string();
+    return " (map " + std::to_string(f.leaderMap) + " holds the door of the dungeon its " +
+           "leader is inside, map " + std::to_string(f.leaderInsideMap) + ")";
+}
+}  // namespace
+
 std::string StrandedWayExplanation(StrandedFacts const& f, StrandedWay way)
 {
     std::string const here = std::to_string(f.memberMap);
     std::string const there = std::to_string(f.leaderMap);
+    std::string const door = DoorClause(f);
     switch (way)
     {
         case StrandedWay::NotStranded:
+            if (f.leaderInsideMap)
+                return "it is on map " + there + ", where the door of the dungeon its leader is " +
+                       "inside (map " + std::to_string(f.leaderInsideMap) + ") stands, and no " +
+                       "crossing of its own is under way";
             return "it is on its leader's map and no crossing of its own is under way";
         case StrandedWay::StandDown:
             return "a dungeon run, the family's own crossing, or a dungeon door on this "
@@ -7184,7 +7240,7 @@ std::string StrandedWayExplanation(StrandedFacts const& f, StrandedWay way)
                        "bound on map " + here + ", its own, and is ready, so it hearths to its "
                        "inn and sails from there";
             return "its hearthstone is bound on map " + there +
-                   ", its leader's, and is ready, so it hearths there";
+                   ", its leader's, and is ready, so it hearths there" + door;
         case StrandedWay::Sail:
             if (f.aboard)
                 return "it is a passenger, so its crossing is supervised to the far landing";
@@ -7193,16 +7249,17 @@ std::string StrandedWayExplanation(StrandedFacts const& f, StrandedWay way)
                        "off the deck left";
             return "a transport its faction may ride joins map " + here + " and map " + there +
                    ", so it walks to the berth, boards when the transport docks, rides, and "
-                   "walks off";
+                   "walks off" + door;
         case StrandedWay::WaitForStone:
             return "no transport its faction may ride joins map " + here + " and map " + there +
-                   ", and its hearthstone, bound on map " + there + ", is cooling down";
+                   ", and its hearthstone, bound on map " + there + ", is cooling down" + door;
         case StrandedWay::Refuse:
             return "no transport its faction may ride, with a surveyed berth level with its "
                    "deck at both ends, joins map " + here + " and map " + there +
                    ", and its hearthstone is " +
                    (f.carriesStone ? std::string("not bound on map ") + there
-                                   : std::string("not carried"));
+                                   : std::string("not carried")) +
+                   door;
     }
     return "unknown";
 }
