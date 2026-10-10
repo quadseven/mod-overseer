@@ -127,6 +127,78 @@ constexpr std::size_t DEATH_DAMAGE_HISTORY_SIZE = 3;
 // Keep only the most recent damage observations, in chronological order.
 void RememberDamage(DamageHistory& history, DamageTaken sample);
 
+// WHAT KILLED A MEMBER IN A DUNGEON, SEEN HIT BY HIT. The death row's context
+// (damage_1..3, health_at_death, in_combat) came only from caches the 5 s
+// snapshot fills for roster characters, so every natural guild member's death
+// was written with health 0, in_combat -1 and NULL damage: on 2026-10-09, 0 of
+// 254 dungeon deaths and 0 of 8,087 deaths in all had a sample. A death hook
+// cannot read any of it back either: the core has zeroed the health, stopped
+// the combat and emptied the attacker list before any death hook runs.
+//
+// So the damage hook keeps the last hits a player in a dungeon took, each
+// with the state just before it landed (the hook fires before the core
+// subtracts the damage), and the death row reads them back.
+struct DeathHit
+{
+    std::int64_t atMs{0};
+    std::uint32_t amount{0};
+    // The attacker's name; empty when there was none or it was the member
+    // itself (a fall, drowning), so the row's killer fills it in instead.
+    std::string source;
+    std::uint32_t healthBefore{0};
+    std::uint32_t maxHealth{0};
+    std::uint32_t manaBefore{0};
+    // 0 when the member has no mana bar (a warrior, a rogue).
+    std::uint32_t maxMana{0};
+    bool inCombat{false};
+    // Hostile units in combat with the member when the hit landed.
+    std::uint32_t enemiesEngaged{0};
+    // Who had the member as its target, read on the killing blow only
+    // (NameTheAttackers). Empty on every other hit.
+    std::string targetedBy;
+};
+
+using DeathHitRing = std::vector<DeathHit>;
+
+// The newest hits kept per member, and how old a hit may be and still belong
+// to the death that follows it.
+constexpr std::size_t DEATH_HIT_RING_SIZE = 6;
+constexpr std::int64_t DEATH_HIT_WINDOW_MS = 30000;
+
+// Keep only the newest DEATH_HIT_RING_SIZE hits, oldest first.
+void RememberDeathHit(DeathHitRing& ring, DeathHit hit);
+
+// "Goblin Woodcarver x2, Defias Miner": the attackers by how many of each,
+// most first, then by name. Empty for none, and never longer than
+// DEATH_TARGETED_BY_MAX characters.
+constexpr std::size_t DEATH_TARGETED_BY_MAX = 250;
+std::string NameTheAttackers(std::vector<std::string> const& names);
+
+// The death's account, read from the hits inside DEATH_HIT_WINDOW_MS before
+// it. `seen` is false when there were none, and every field is then unsampled.
+struct DeathHitAccount
+{
+    bool seen{false};
+    // The state just before the newest hit, the killing blow when the hook saw it.
+    std::uint32_t healthBefore{0};
+    std::uint32_t maxHealth{0};
+    std::uint32_t manaBefore{0};
+    std::uint32_t maxMana{0};
+    bool inCombat{false};
+    std::uint32_t enemiesEngaged{0};
+    std::string targetedBy;
+    // The newest DEATH_DAMAGE_HISTORY_SIZE hits, oldest first, with their sources.
+    DamageHistory damage;
+};
+
+DeathHitAccount AccountForDeathHits(DeathHitRing const& ring, std::int64_t deathMs);
+
+// The deploy proof for a sampled dungeon death, one line:
+//   death sample - 'Durg' in map 36 had 41 of 673 health and no mana bar before
+//   the killing blow, in combat, 3 enemies engaged, targeted by Goblin
+//   Woodcarver x2, Defias Miner; last hits: Defias Miner 12 (3s before), ...
+std::string DeathSampleLine(std::string const& name, unsigned mapId, DeathHitAccount const& account);
+
 // A failed aim read is not the same thing as a successful read of an empty
 // column. Keep the last known council decision through a transient database
 // failure; otherwise one failed poll turns a steady aim into 0 and the next
@@ -20248,11 +20320,17 @@ struct GuildRunRearmFacts
     // Ghosts of the run are still coming back (GuildRunRecoveryStep::holdBrain):
     // the group pulls again whole, so nothing is asked yet.
     bool regrouping{false};
+    // The run's tank is alive inside. The dungeon module elects its leader
+    // among LIVING tank bots only, so while the tank lies dead every living
+    // member refuses the verb ("No tank bot found in your group"): run 507
+    // was refused once a minute for five minutes after its tank died on
+    // 2026-10-10. Nothing is asked until the tank is back.
+    bool tankAlive{true};
 };
 
 enum class GuildRunRearmStep : std::uint8_t
 {
-    Skip,   // not armed yet, nobody alive to arm for, or ghosts still coming back
+    Skip,   // not armed yet, nobody alive to arm for, the tank is dead, or ghosts still coming back
     Wait,   // asked a moment ago
     Issue,  // ask the dungeon brain to be on
 };
@@ -20343,7 +20421,9 @@ struct GuildRunHoldFacts
     bool held{false};
     unsigned aliveInside{0};
     // Bodies lying inside, not released: the dungeon module's own rez walks to
-    // them, which a pause would stop.
+    // them, which a pause would stop. A group that is low rests first anyway
+    // (GuildRunHoldNext): the rezzer needs the mana, and an unpaused brain
+    // walks the tank on while it waits for it.
     unsigned deadInside{0};
     bool anyFighting{false};
     // Ghosts of the run are being walked back (GuildRunRecoveryStep::walkBack),
@@ -20384,11 +20464,31 @@ struct GuildRunHold
 
 // ONE POLL of the hold. Nothing while the brain is not armed, while nobody is
 // alive inside (a hold outlives a wipe, so the first member raised does not
-// walk on alone), or while anybody fights. A body inside releases a hold. Else
-// hold while the living wait for ghosts (bounded), or when a member is under a
-// trigger outside a timed-out rest's cooldown; release when rested, or when the
-// rest has run its bound.
+// walk on alone), or while anybody fights. Hold while the living wait for
+// ghosts (bounded), or when a member is under a trigger outside a timed-out
+// rest's cooldown; release when rested, or when the rest has run its bound.
+//
+// REST BEFORE THE REZ. A body inside used to release any hold at once, so the
+// dungeon module's rez could walk to it. In run 507 (2026-10-10, 11:10 New
+// York) two members died to Defias Evokers; the hold let go, the healer sat at
+// 0 to 5% mana "waiting on mana" for the rez, and the unpaused brain walked
+// the tank to the next door and into Goblin Woodcarvers with two down: the
+// tank, the healer and the last damage dealer died within 25 s. A group of
+// players drinks first, then raises its dead, then pulls. So with a body
+// inside, a group under a trigger rests (bounded as any rest), and the hold is
+// let go for the rez once the living are over their triggers.
 GuildRunHold GuildRunHoldNext(GuildRunHoldFacts const& facts);
+
+// FOCUS FIRE ON A SKULL. In 39 of 45 Deadmines first wipes (2026-10-08 to
+// 2026-10-10) the group went down in one fight, and the tank died first in 32.
+// Unmarked, each damage dealer picks its own target (a caster prefers the mob
+// it expects to kill in 5 to 30 s), so the damage spreads over the pack and
+// every mob lives longer on the tank. A group of players marks a skull and
+// kills it first. mod-playerbots' own `mark rti` combat strategy does that:
+// in combat, the tank puts the skull on the attacker with the least health,
+// and every damage dealer's target value takes the skull before anything
+// else. The run turns it on for the seat and takes it off at the end.
+std::vector<std::string> GuildRunSeatTactics(GuildSeat seat);
 
 // "none", "regroup", "rest", "rested", "rest timed out", "a body inside".
 char const* GuildRunHoldWhyWord(GuildRunHoldWhy why);

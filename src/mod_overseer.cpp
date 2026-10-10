@@ -4868,6 +4868,15 @@ struct PendingDeath
     // left 223 kill-plane deaths unexplained.
     int32 fallGuardStandDown = -1;
     int32 fallGuardSeconds = -1;
+
+    // THE HITS BEFORE A DUNGEON DEATH (OverseerDecisions::DeathHit). False when
+    // the damage hook saw no hit inside DEATH_HIT_WINDOW_MS, and the four
+    // columns below are then written NULL, never 0.
+    bool hitSampled = false;
+    uint32 manaAtDeath = 0;
+    uint32 maxManaAtDeath = 0;     // 0 = no mana bar
+    uint32 enemiesEngaged = 0;
+    std::string targetedBy;
 };
 std::mutex g_deathMutex;
 // THE NEWEST OUTMATCHED DEATH OF EACH NATURAL GUILD MEMBER (2026-10-10): killed
@@ -4882,6 +4891,80 @@ uint64 g_droppedDeaths = 0;
 // When each managed-guild member's last death row was queued, by lowercased
 // name, under g_deathMutex. One entry per guild member at most.
 std::map<std::string, std::int64_t> g_guildDeathAt;
+
+// THE LAST HITS EACH PLAYER IN A DUNGEON TOOK (OverseerDecisions::DeathHit),
+// by guid. Written by the damage hook on whatever map thread owns the victim,
+// read and erased by RecordDeath, and swept of anybody whose newest hit is old
+// by SweepDeathHits on the world thread. It holds only players who were hit
+// inside a dungeon in the last minute, so it stays the size of the fights
+// going on.
+std::mutex g_deathHitMutex;
+std::map<uint32, OverseerDecisions::DeathHitRing> g_deathHits;
+
+// Called from OverseerMeterScript::OnDamage, on the map thread that owns the
+// victim, BEFORE the core subtracts the damage (Unit::DealDamage calls the
+// hook ahead of reading the victim's health), so every field is the state the
+// hit found. Everything read here is gone by the time any death hook runs:
+// setDeathState zeroes the health and stops the combat, and the attacker
+// list empties with it.
+static void NoteDungeonHit(Unit* attacker, Player* hurt, uint32 damage)
+{
+    if (!hurt || !damage || !hurt->IsInWorld())
+        return;
+    Map* const map = hurt->GetMap();
+    if (!map || !map->IsDungeon())
+        return;
+    OverseerDecisions::DeathHit hit;
+    hit.atMs = static_cast<std::int64_t>(GameTime::GetGameTimeMS().count());
+    hit.amount = damage;
+    if (attacker && attacker != hurt)
+        hit.source = attacker->GetName();
+    hit.healthBefore = hurt->GetHealth();
+    hit.maxHealth = hurt->GetMaxHealth();
+    hit.maxMana = hurt->GetMaxPower(POWER_MANA);
+    hit.manaBefore = hit.maxMana ? hurt->GetPower(POWER_MANA) : 0;
+    hit.inCombat = hurt->IsInCombat();
+    hit.enemiesEngaged = static_cast<uint32>(hurt->GetCombatManager().GetPvECombatRefs().size());
+    // The killing blow: who had this member as its target, while the list
+    // still exists.
+    if (damage >= hit.healthBefore)
+    {
+        std::vector<std::string> names;
+        for (Unit* who : hurt->getAttackers())
+            if (who && who->GetVictim() == hurt)
+                names.push_back(who->GetName());
+        hit.targetedBy = OverseerDecisions::NameTheAttackers(names);
+    }
+    std::lock_guard<std::mutex> guard(g_deathHitMutex);
+    OverseerDecisions::RememberDeathHit(g_deathHits[hurt->GetGUID().GetCounter()], std::move(hit));
+}
+
+// World thread, on the death flush's timer: forget anybody whose newest hit
+// can no longer belong to a death.
+static void SweepDeathHits()
+{
+    std::int64_t const now = static_cast<std::int64_t>(GameTime::GetGameTimeMS().count());
+    std::lock_guard<std::mutex> guard(g_deathHitMutex);
+    for (auto it = g_deathHits.begin(); it != g_deathHits.end();)
+        it = it->second.empty() ||
+                     now - it->second.back().atMs > 2 * OverseerDecisions::DEATH_HIT_WINDOW_MS
+                 ? g_deathHits.erase(it)
+                 : std::next(it);
+}
+
+// The account of `guid`'s last hits, taken: a ring belongs to one death.
+static OverseerDecisions::DeathHitAccount TakeDeathHits(uint32 guid)
+{
+    std::int64_t const now = static_cast<std::int64_t>(GameTime::GetGameTimeMS().count());
+    std::lock_guard<std::mutex> guard(g_deathHitMutex);
+    auto const it = g_deathHits.find(guid);
+    if (it == g_deathHits.end())
+        return {};
+    OverseerDecisions::DeathHitAccount account =
+        OverseerDecisions::AccountForDeathHits(it->second, now);
+    g_deathHits.erase(it);
+    return account;
+}
 
 // A death is never coalesced, unlike g_eventQueue. Every keyed queue in this
 // file exists because the SAME fact repeating is not new information; a
@@ -5019,6 +5102,10 @@ void RecordDeath(Player* player)
         if (record)
             last = static_cast<std::int64_t>(now);
     }
+    // The hits before this death, taken whether or not a row is written: a
+    // ring belongs to one death.
+    OverseerDecisions::DeathHitAccount const hits = TakeDeathHits(player->GetGUID().GetCounter());
+    bool const inDungeon = player->GetMap() && player->GetMap()->IsDungeon();
     if (!record)
     {
         // The killer left for this death is spent with it.
@@ -5066,6 +5153,22 @@ void RecordDeath(Player* player)
                     ? static_cast<uint32>(now - sample.sampledAt)
                     : 0;
         }
+    }
+
+    // A DUNGEON DEATH IS READ HIT BY HIT. The damage hook saw each hit with the
+    // state it found, so its account outranks the five-second sample above:
+    // the health and mana before the killing blow, whether it was fighting,
+    // how many were on it and who, and the last hits with their sources.
+    if (hits.seen)
+    {
+        d.hitSampled = true;
+        d.healthAtDeath = hits.healthBefore;
+        d.maxHealthAtDeath = hits.maxHealth;
+        d.manaAtDeath = hits.manaBefore;
+        d.maxManaAtDeath = hits.maxMana;
+        d.enemiesEngaged = hits.enemiesEngaged;
+        d.targetedBy = hits.targetedBy;
+        d.damage = hits.damage;
     }
 
     {
@@ -5167,6 +5270,8 @@ void RecordDeath(Player* player)
     }
     d.driver = OverseerDecisions::DeathDriverName(
         OverseerDecisions::NameTheDriver(attribution));
+    if (hits.seen)
+        d.inCombat = hits.inCombat ? 1 : 0;
 
     // The killer, if this death arrived through one of the two kill hooks
     // below - CONSUMED, not copied: a stale entry left behind by a PREVIOUS
@@ -5205,6 +5310,15 @@ void RecordDeath(Player* player)
     for (OverseerDecisions::DamageTaken& sample : d.damage)
         if (sample.source.empty())
             sample.source = d.killerName.empty() ? d.killerType : d.killerName;
+
+    // The deploy proof of the hit sample: "death sample" is said nowhere else.
+    if (inDungeon)
+    {
+        OverseerDecisions::DeathHitAccount said = hits;
+        said.damage = d.damage;
+        LOG_INFO("module.overseer", "overseer: {}",
+                 OverseerDecisions::DeathSampleLine(d.characterName, d.mapId, said));
+    }
 
     std::lock_guard<std::mutex> guard(g_deathMutex);
     if (g_deathQueue.size() >= MAX_DEATH_QUEUE)
@@ -7541,6 +7655,7 @@ public:
             _deathTimer = 0;
             FlushDeaths();
             FlushLevels();
+            SweepDeathHits();
         }
         if (_sweepTimer >= CHAT_SWEEP_MS)
         {
@@ -38277,6 +38392,11 @@ private:
         std::time_t recoverySince{0};
         unsigned walkingSaid{0};
         std::map<std::string, std::vector<std::string>> leased;
+        // FOCUS FIRE (OverseerDecisions::GuildRunSeatTactics): the combat
+        // strategies this run turned on, by member, so the end of the run
+        // takes off exactly those; and the members that refused one, said once.
+        std::map<std::string, std::vector<std::string>> tactics;
+        std::set<std::string> tacticsRefused;
         // THE DOOR AND THE REST (OverseerDecisions::GuildRunEnterTogether and
         // GuildRunHoldNext): how many ghosts were last said to wait at the
         // door, how many were walked or waiting this poll, whether this run
@@ -38599,8 +38719,9 @@ private:
                      std::time_t now)
     {
         // Whatever the corpse run leased goes back: past here the ghosts are
-        // the ordinary recoveries' again.
+        // the ordinary recoveries' again. So do the run's combat tactics.
         ReturnGuildRunLeases(run, {});
+        ReturnGuildRunTactics(run);
         run.outcome = outcome;
         run.why = why;
         run.phase = GuildRunPhase::Leaving;
@@ -38902,6 +39023,63 @@ private:
             walked.insert(ghost->GetName());
             WalkGuildRunGhost(run, ghost, portal->entryTriggerId, *trigger, enter);
         }
+    }
+
+    // FOCUS FIRE (OverseerDecisions::GuildRunSeatTactics). A member inside
+    // that lacks its seat's combat strategy gets it, and the run remembers it
+    // turned it on. A strategy the member already had is left alone, so the
+    // end of the run never takes off what it did not add. A refusal is said once.
+    void ApplyGuildRunTactics(GuildRun& run)
+    {
+        for (std::size_t i = 0; i < run.names.size() && i < run.seats.size(); ++i)
+        {
+            std::vector<std::string> const wanted =
+                OverseerDecisions::GuildRunSeatTactics(run.seats[i]);
+            if (wanted.empty())
+                continue;
+            Player* const p = ObjectAccessor::FindPlayerByName(run.names[i]);
+            PlayerbotAI* const ai = p && p->IsInWorld() ? GET_PLAYERBOT_AI(p) : nullptr;
+            if (!ai || p->GetMapId() != run.mapId)
+                continue;
+            for (std::string const& strategy : wanted)
+            {
+                if (ai->HasStrategy(strategy, BOT_STATE_COMBAT))
+                    continue;
+                ai->ChangeStrategy("+" + strategy, BOT_STATE_COMBAT);
+                if (!ai->HasStrategy(strategy, BOT_STATE_COMBAT))
+                {
+                    if (run.tacticsRefused.insert(run.names[i] + "/" + strategy).second)
+                        LOG_INFO("module.overseer",
+                                 "overseer: guild run tactics {} - '{}' did not take '{}' in "
+                                 "combat; the run goes on without it",
+                                 run.id, run.names[i], strategy);
+                    continue;
+                }
+                run.tactics[run.names[i]].push_back(strategy);
+                // The deploy proof: "guild run tactics" is said nowhere else.
+                LOG_INFO("module.overseer",
+                         "overseer: guild run tactics {} - '{}' ({}) fights with '{}': in combat "
+                         "it marks a skull on the attacker with the least health, and the "
+                         "group kills it first",
+                         run.id, run.names[i], GuildSeatWord(run.seats[i]), strategy);
+            }
+        }
+    }
+
+    // ...and takes off, at the end of the run, exactly what it turned on.
+    void ReturnGuildRunTactics(GuildRun& run)
+    {
+        for (auto const& [name, strategies] : run.tactics)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            PlayerbotAI* const ai = p ? GET_PLAYERBOT_AI(p) : nullptr;
+            if (!ai)
+                continue;
+            for (std::string const& strategy : strategies)
+                if (ai->HasStrategy(strategy, BOT_STATE_COMBAT))
+                    ai->ChangeStrategy("-" + strategy, BOT_STATE_COMBAT);
+        }
+        run.tactics.clear();
     }
 
     // Hand back what GUILD_RUN_GHOST_LEASES took, and only that, to every
@@ -39408,6 +39586,7 @@ private:
                 rearm.regrouping = regrouping;
                 rearm.secondsSinceIssued =
                     now >= run.dcTriedAt ? static_cast<unsigned>(now - run.dcTriedAt) : 0;
+                rearm.tankAlive = GuildRunAliveInside(run, tank);
                 if (OverseerDecisions::GuildRunRearmNext(rearm) ==
                         OverseerDecisions::GuildRunRearmStep::Issue &&
                     tank && tank->IsInWorld())
@@ -39437,6 +39616,11 @@ private:
                                  OverseerDecisions::GUILD_RUN_REARM_SECONDS);
                 }
             }
+
+            // FOCUS FIRE: each seat's combat tactics for the run, once the
+            // dungeon brain is armed (GuildRunSeatTactics).
+            if (run.dcAccepted)
+                ApplyGuildRunTactics(run);
 
             // THE GROUP REGROUPS AND RESTS BEFORE IT PULLS: the dungeon brain is
             // held while the living wait for ghosts running back, and while a
@@ -50892,6 +51076,27 @@ private:
         return true;
     }
 
+    // Does overseer_death have the hit columns (2026_10_10_01_overseer_death_hits.sql)?
+    // Asked once per process, as ItemStoryColumnsPresent asks, and said once
+    // when the answer is no.
+    SchemaColumns _deathHitColumns{SchemaColumns::Unknown};
+
+    bool DeathHitColumnsPresent()
+    {
+        if (_deathHitColumns != SchemaColumns::Unknown)
+            return _deathHitColumns == SchemaColumns::Present;
+        bool const present = SchemaHasColumns(
+            "overseer_death",
+            "'mana_at_death','max_mana_at_death','enemies_engaged','targeted_by'", 4);
+        _deathHitColumns = present ? SchemaColumns::Present : SchemaColumns::Absent;
+        if (!present)
+            LOG_WARN("module.overseer",
+                     "overseer: overseer_death has no mana_at_death / max_mana_at_death / "
+                     "enemies_engaged / targeted_by (2026_10_10_01_overseer_death_hits.sql has "
+                     "not been applied), so death rows are written without them");
+        return present;
+    }
+
     // Write the queued deaths (infra#2912). Same shape as FlushEvents - one
     // multi-row INSERT per tick, built on the world thread only, because
     // EscapeString borrows the shared synchronous connection with no lock of
@@ -50995,6 +51200,9 @@ private:
                          LONE_LEG_LIMITS.deaths);
             }
 
+        // The four hit columns ship in a migration that may land in a later
+        // image than this writer; without them the row is written as before.
+        bool const hitColumns = DeathHitColumnsPresent();
         std::ostringstream ss;
         ss << "INSERT INTO overseer_death (character_name, character_guid, level, "
               "map, zone, pos_x, pos_y, pos_z, killer_type, killer_name, killer_entry, "
@@ -51009,7 +51217,9 @@ private:
               "fall_start_movement_generator, "
               "leader_seen, leader_map, leader_pos_x, leader_pos_y, leader_pos_z, "
               "recovery_rung, recovery_prev_rung, recovery_seconds, "
-              "fall_guard_standdown, fall_guard_seconds) VALUES ";
+              "fall_guard_standdown, fall_guard_seconds"
+           << (hitColumns ? ", mana_at_death, max_mana_at_death, enemies_engaged, targeted_by" : "")
+           << ") VALUES ";
         bool first = true;
         for (PendingDeath const& d : batch)
         {
@@ -51067,8 +51277,16 @@ private:
                << ',' << static_cast<int32>(d.recoveryPrevRung)
                << ',' << d.recoverySeconds
                << ',' << d.fallGuardStandDown
-               << ',' << d.fallGuardSeconds
-               << ')';
+               << ',' << d.fallGuardSeconds;
+            if (hitColumns)
+            {
+                if (d.hitSampled)
+                    ss << ',' << d.manaAtDeath << ',' << d.maxManaAtDeath << ','
+                       << d.enemiesEngaged << ",'" << Esc(d.targetedBy) << "'";
+                else
+                    ss << ",NULL,NULL,NULL,NULL";
+            }
+            ss << ')';
         }
         CharacterDatabase.Execute(ss.str().c_str());
 
@@ -71475,6 +71693,8 @@ public:
             return;
         Note(source, OverseerDecisions::MeterKind::Damage, damage);
         Note(hurt, OverseerDecisions::MeterKind::Taken, damage);
+        // The hits a dungeon death is read from (RecordDeath).
+        NoteDungeonHit(attacker, hurt, damage);
     }
 
     void OnHeal(Unit* healer, Unit* /*reciever*/, uint32& gain) override

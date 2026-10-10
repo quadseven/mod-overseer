@@ -58,6 +58,97 @@ void RememberDamage(DamageHistory& history, DamageTaken sample)
     history.push_back(std::move(sample));
 }
 
+void RememberDeathHit(DeathHitRing& ring, DeathHit hit)
+{
+    if (ring.size() >= DEATH_HIT_RING_SIZE)
+        ring.erase(ring.begin(), ring.begin() + (ring.size() - DEATH_HIT_RING_SIZE + 1));
+    ring.push_back(std::move(hit));
+}
+
+std::string NameTheAttackers(std::vector<std::string> const& names)
+{
+    std::map<std::string, unsigned> counts;
+    for (std::string const& name : names)
+        if (!name.empty())
+            ++counts[name];
+    std::vector<std::pair<std::string, unsigned>> order(counts.begin(), counts.end());
+    std::stable_sort(order.begin(), order.end(),
+                     [](auto const& a, auto const& b) { return a.second > b.second; });
+    std::string out;
+    for (auto const& [name, count] : order)
+    {
+        if (!out.empty())
+            out += ", ";
+        out += name;
+        if (count > 1)
+            out += " x" + std::to_string(count);
+    }
+    // targeted_by is a VARCHAR(255), and one overlong value would fail the
+    // whole batch the row is written in.
+    if (out.size() > DEATH_TARGETED_BY_MAX)
+        out = out.substr(0, DEATH_TARGETED_BY_MAX - 3) + "...";
+    return out;
+}
+
+DeathHitAccount AccountForDeathHits(DeathHitRing const& ring, std::int64_t deathMs)
+{
+    DeathHitAccount account;
+    std::vector<DeathHit const*> inWindow;
+    for (DeathHit const& hit : ring)
+        if (hit.atMs <= deathMs && deathMs - hit.atMs <= DEATH_HIT_WINDOW_MS)
+            inWindow.push_back(&hit);
+    if (inWindow.empty())
+        return account;
+    DeathHit const& last = *inWindow.back();
+    account.seen = true;
+    account.healthBefore = last.healthBefore;
+    account.maxHealth = last.maxHealth;
+    account.manaBefore = last.manaBefore;
+    account.maxMana = last.maxMana;
+    account.inCombat = last.inCombat;
+    account.enemiesEngaged = last.enemiesEngaged;
+    for (auto it = inWindow.rbegin(); it != inWindow.rend() && account.targetedBy.empty(); ++it)
+        account.targetedBy = (*it)->targetedBy;
+    std::size_t const first =
+        inWindow.size() > DEATH_DAMAGE_HISTORY_SIZE ? inWindow.size() - DEATH_DAMAGE_HISTORY_SIZE : 0;
+    for (std::size_t i = first; i < inWindow.size(); ++i)
+    {
+        DamageTaken taken;
+        taken.amount = inWindow[i]->amount;
+        taken.secondsBeforeDeath = static_cast<std::uint32_t>((deathMs - inWindow[i]->atMs) / 1000);
+        taken.source = inWindow[i]->source;
+        account.damage.push_back(std::move(taken));
+    }
+    return account;
+}
+
+std::string DeathSampleLine(std::string const& name, unsigned mapId, DeathHitAccount const& account)
+{
+    std::ostringstream line;
+    line << "death sample - '" << name << "' in map " << mapId;
+    if (!account.seen)
+    {
+        line << " took no hit the damage hook saw in the last " << DEATH_HIT_WINDOW_MS / 1000
+             << "s, so its health, mana and attackers are unsampled";
+        return line.str();
+    }
+    line << " had " << account.healthBefore << " of " << account.maxHealth << " health and ";
+    if (account.maxMana)
+        line << account.manaBefore << " of " << account.maxMana << " mana";
+    else
+        line << "no mana bar";
+    line << " before the killing blow, " << (account.inCombat ? "in combat" : "out of combat")
+         << ", " << account.enemiesEngaged << " enem" << (account.enemiesEngaged == 1 ? "y" : "ies")
+         << " engaged, targeted by "
+         << (account.targetedBy.empty() ? std::string("nobody") : account.targetedBy)
+         << "; last hits:";
+    for (std::size_t i = account.damage.size(); i-- > 0;)
+        line << ' ' << (account.damage[i].source.empty() ? std::string("unknown") : account.damage[i].source)
+             << ' ' << account.damage[i].amount << " (" << account.damage[i].secondsBeforeDeath
+             << "s before)" << (i ? "," : "");
+    return line.str();
+}
+
 std::map<std::string, uint32_t> QuestAimsAfterRead(
     std::map<std::string, uint32_t> const& previous,
     std::map<std::string, uint32_t> const& loaded, bool readSucceeded)
@@ -17506,7 +17597,7 @@ std::uint8_t GuildSeatRoleMask(GuildSeat seat)
 
 GuildRunRearmStep GuildRunRearmNext(GuildRunRearmFacts const& facts)
 {
-    if (!facts.armed || facts.aliveInside == 0 || facts.regrouping)
+    if (!facts.armed || facts.aliveInside == 0 || facts.regrouping || !facts.tankAlive)
         return GuildRunRearmStep::Skip;
     return facts.secondsSinceIssued >= facts.cooldownSeconds ? GuildRunRearmStep::Issue
                                                              : GuildRunRearmStep::Wait;
@@ -17725,11 +17816,20 @@ GuildRunHold GuildRunHoldNext(GuildRunHoldFacts const& facts)
         return hold;
     if (facts.deadInside > 0)
     {
-        if (facts.held)
+        // Rest before the rez: a low group holds (or stays held) as any rest,
+        // and the body is the reason the hold is let go once it is not low.
+        bool const low = facts.need == GuildRunRestNeed::Low;
+        if (!facts.held)
         {
-            hold.step = GuildRunHoldStep::Release;
-            hold.why = GuildRunHoldWhy::Dead;
+            if (low && facts.restRearmed)
+                hold = {GuildRunHoldStep::Hold, GuildRunHoldWhy::Rest};
+            return hold;
         }
+        if (low && facts.secondsResting < facts.restMaxSeconds)
+            hold.why = GuildRunHoldWhy::Rest;
+        else
+            hold = {GuildRunHoldStep::Release,
+                    low ? GuildRunHoldWhy::RestTimedOut : GuildRunHoldWhy::Dead};
         return hold;
     }
     bool const regroup = facts.ghostsComingBack && facts.secondsRegrouping < facts.regroupWaitSeconds;
@@ -17750,6 +17850,13 @@ GuildRunHold GuildRunHoldNext(GuildRunHoldFacts const& facts)
     else
         hold.why = GuildRunHoldWhy::Rest;
     return hold;
+}
+
+std::vector<std::string> GuildRunSeatTactics(GuildSeat seat)
+{
+    if (seat == GuildSeat::Tank)
+        return {"mark rti"};
+    return {};
 }
 
 char const* GuildRunHoldWhyWord(GuildRunHoldWhy why)
