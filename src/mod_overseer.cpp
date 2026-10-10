@@ -70874,6 +70874,14 @@ private:
 
         if (request.spell)
         {
+            // The gate refused a target it did not see; said again here, so the
+            // cast never names a creature that is not there.
+            if (!creature)
+            {
+                ReleaseHold(ev.character, who, "the quest use found no target",
+                            QUEST_USE_HOLD_VERB);
+                return refuse(D::QuestUseRefusal::NoTarget);
+            }
             DriveSelection(session, targetGuid);
             who->SetFacingToObject(creature);
             // CMSG_CAST_SPELL: castCount, spell, castFlags, then a target block -

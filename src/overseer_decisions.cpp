@@ -20157,7 +20157,8 @@ char const* QuestUseGate(QuestUseGateFacts const& facts)
         return R::Dead;
     if (facts.inFlight)
         return R::InFlight;
-    if (facts.inCombat && !(facts.fightingOnlyTarget && !facts.gameObject && !facts.here))
+    if (facts.inCombat &&
+        !(facts.fightingOnlyTarget && facts.targetSeen && !facts.gameObject && !facts.here))
         return R::InCombat;
     if (facts.inInstance)
         return R::InInstance;

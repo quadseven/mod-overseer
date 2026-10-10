@@ -105,6 +105,9 @@ void AFightWithTheBeastItselfIsNoWall()
     ExpectText("a fight with something else", QuestUseGate(f), R::InCombat);
     f.fightingOnlyTarget = true;
     ExpectText("a fight only with the beast to tame", QuestUseGate(f), "");
+    f.targetSeen = false;
+    ExpectText("a fight with no beast seen stays a wall", QuestUseGate(f), R::InCombat);
+    f.targetSeen = true;
 
     // A dead beast is still dead, fight or not.
     f.targetAlive = false;
