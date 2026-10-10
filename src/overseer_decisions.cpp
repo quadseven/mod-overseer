@@ -20070,7 +20070,7 @@ bool IsQuestUseRow(std::string const& command)
 {
     std::vector<std::string> const words = QuestUseWords(command);
     return !words.empty() && (words[0] == USE_ITEM_ON_VERB || words[0] == USE_GAMEOBJECT_VERB ||
-                              words[0] == USE_ITEM_HERE_VERB);
+                              words[0] == USE_ITEM_HERE_VERB || words[0] == USE_SPELL_ON_VERB);
 }
 
 QuestUseRequest ParseQuestUseRequest(std::string const& command)
@@ -20109,11 +20109,15 @@ QuestUseRequest ParseQuestUseRequest(std::string const& command)
         return request;
     }
 
+    // use-item-on creature:<entry> item:<entry>, or use-spell-on
+    // creature:<entry> spell:<id>: the same shape, keyed by what is used.
+    bool const bySpell = words[0] == USE_SPELL_ON_VERB;
+    char const* const usedKey = bySpell ? "spell" : "item";
     std::uint32_t creature = 0;
-    std::uint32_t item = 0;
+    std::uint32_t used = 0;
     bool haveCreature = false;
-    bool haveItem = false;
-    bool ok = words[0] == USE_ITEM_ON_VERB && words.size() == 3;
+    bool haveUsed = false;
+    bool ok = (bySpell || words[0] == USE_ITEM_ON_VERB) && words.size() == 3;
     for (std::size_t i = 1; ok && i < words.size(); ++i)
     {
         std::uint32_t value = 0;
@@ -20122,21 +20126,21 @@ QuestUseRequest ParseQuestUseRequest(std::string const& command)
             creature = value;
             haveCreature = true;
         }
-        else if (QuestUseKeyed(words[i], "item", value) && !haveItem)
+        else if (QuestUseKeyed(words[i], usedKey, value) && !haveUsed)
         {
-            item = value;
-            haveItem = true;
+            used = value;
+            haveUsed = true;
         }
         else
             ok = false;
     }
-    if (!ok || !haveCreature || !haveItem)
+    if (!ok || !haveCreature || !haveUsed)
     {
-        request.error = QuestUseRefusal::MalformedItem;
+        request.error = bySpell ? QuestUseRefusal::MalformedSpell : QuestUseRefusal::MalformedItem;
         return request;
     }
     request.target = creature;
-    request.item = item;
+    (bySpell ? request.spell : request.item) = used;
     return request;
 }
 
@@ -20172,6 +20176,14 @@ char const* QuestUseGate(QuestUseGateFacts const& facts)
         return R::TooFar;
     if (facts.gameObject)
         return facts.chest && !facts.opener ? R::NoOpener : "";
+    if (facts.castsSpell)
+    {
+        if (facts.wrongTarget)
+            return R::NoCreatureSpell;
+        if (!facts.spellKnown)
+            return R::SpellUnknown;
+        return facts.itemOnCooldown ? R::SpellOnCooldown : "";
+    }
     if (facts.wrongTarget)
         return R::WrongTarget;
     if (!facts.itemCarried)
@@ -20193,6 +20205,11 @@ float QuestUseCreatureReach(float spellMaxRangeYards)
     return reach < QUEST_USE_SEARCH_YARDS ? reach : QUEST_USE_SEARCH_YARDS;
 }
 
+bool QuestUsePetGained(std::uint64_t before, std::uint64_t after)
+{
+    return after != 0 && after != before;
+}
+
 uint32_t QuestUseSpellMs(uint32_t castMs, uint32_t channelMs)
 {
     uint32_t const total = castMs + channelMs;
@@ -20203,8 +20220,9 @@ TownRetry QuestUseRefusalRetry(std::string const& detail)
 {
     namespace R = QuestUseRefusal;
     if (detail == R::MalformedItem || detail == R::MalformedObject || detail == R::MalformedHere ||
-        detail == R::NoBotAI || detail == R::NoHereSpell || detail == R::NoOpener ||
-        detail == R::WrongTarget || detail == R::ItemMissing || detail == R::ItemUnusable)
+        detail == R::MalformedSpell || detail == R::NoBotAI || detail == R::NoHereSpell ||
+        detail == R::NoOpener || detail == R::WrongTarget || detail == R::ItemMissing ||
+        detail == R::ItemUnusable || detail == R::SpellUnknown || detail == R::NoCreatureSpell)
         return TownRetry::Never;
     if (detail == R::InInstance)
         return TownRetry::Elsewhere;
@@ -20247,7 +20265,7 @@ QuestUseOutcome JudgeQuestUse(QuestUseReadBack const& read)
 {
     if (!read.readable)
         return QuestUseOutcome::Unreadable;
-    if (read.counterMoved)
+    if (read.counterMoved || read.petGained)
         return QuestUseOutcome::Progressed;
     if (read.itemConsumed || read.lootOpened || read.onCooldown)
         return QuestUseOutcome::Spent;

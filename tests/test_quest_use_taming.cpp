@@ -124,6 +124,69 @@ void AFightWithTheBeastItselfIsNoWall()
     ExpectText("a here use in a fight", QuestUseGate(h), R::InCombat);
 }
 
+// AFTER THE CHAIN, THE HUNTER TAMES ITS OWN PET. The last Taming the Beast
+// teaches Tame Beast (1515: instant, channeled 20 seconds, 30 yards, then 13481
+// tames the creature for good). The rods' tames only charm a beast for 15
+// minutes, so a hunter with the whole chain done still has no pet until it
+// casts Tame Beast on one, as a player does. `use-spell-on` is that cast.
+void TheSpellGrammar()
+{
+    QuestUseRequest r = ParseQuestUseRequest("use-spell-on creature:3126 spell:1515");
+    Expect(*r.error == '\0' && r.target == 3126 && r.spell == 1515 && r.item == 0 &&
+               !r.gameObject && !r.here,
+           "use-spell-on creature:N spell:M parses");
+    r = ParseQuestUseRequest("use-spell-on spell:1515 creature:3126");
+    Expect(*r.error == '\0' && r.target == 3126 && r.spell == 1515, "in any order");
+    Expect(IsQuestUseRow("use-spell-on creature:3126 spell:1515"), "a quest use row");
+    ExpectText("no spell", ParseQuestUseRequest("use-spell-on creature:3126").error,
+               R::MalformedSpell);
+    ExpectText("an item is no spell",
+               ParseQuestUseRequest("use-spell-on creature:3126 item:15917").error,
+               R::MalformedSpell);
+    ExpectText("a zero spell", ParseQuestUseRequest("use-spell-on creature:3126 spell:0").error,
+               R::MalformedSpell);
+    ExpectText("a spell twice",
+               ParseQuestUseRequest("use-spell-on creature:1 spell:1515 spell:1515").error,
+               R::MalformedSpell);
+    // The item verb is unchanged.
+    r = ParseQuestUseRequest("use-item-on creature:3099 item:15917");
+    Expect(*r.error == '\0' && r.item == 15917 && r.spell == 0, "the item verb keeps its item");
+}
+
+void TheSpellGate()
+{
+    QuestUseGateFacts f = Rod(12.0f);
+    f.castsSpell = true;
+    ExpectText("a known spell at a beast in reach", QuestUseGate(f), "");
+    f.spellKnown = false;
+    ExpectText("an unknown spell", QuestUseGate(f), R::SpellUnknown);
+    f = Rod(12.0f);
+    f.castsSpell = true;
+    f.wrongTarget = true;
+    ExpectText("a spell that takes no creature", QuestUseGate(f), R::NoCreatureSpell);
+    f = Rod(12.0f);
+    f.castsSpell = true;
+    f.itemOnCooldown = true;
+    ExpectText("a spell on cooldown", QuestUseGate(f), R::SpellOnCooldown);
+    Expect(QuestUseRefusalRetry(R::SpellUnknown) == TownRetry::Never, "unknown spell: never");
+    Expect(QuestUseRefusalRetry(R::NoCreatureSpell) == TownRetry::Never, "no creature spell: never");
+    Expect(QuestUseRefusalRetry(R::MalformedSpell) == TownRetry::Never, "malformed: never");
+    Expect(QuestUseRefusalRetry(R::SpellOnCooldown) == TownRetry::Later, "cooldown: later");
+}
+
+void ANewPetIsTheTameDone()
+{
+    QuestUseReadBack read;
+    read.petGained = true;
+    Expect(JudgeQuestUse(read) == QuestUseOutcome::Progressed, "a pet gained is the use done");
+    read.readable = false;
+    Expect(JudgeQuestUse(read) == QuestUseOutcome::Unreadable, "unreadable still outranks it");
+    Expect(QuestUsePetGained(0, 0x1234) && QuestUsePetGained(0x1, 0x2),
+           "a pet where none was, or another pet, is gained");
+    Expect(!QuestUsePetGained(0x1234, 0x1234) && !QuestUsePetGained(0x1234, 0),
+           "the same pet, or none, is not");
+}
+
 }  // namespace
 
 int main()
@@ -131,6 +194,9 @@ int main()
     TheReachIsTheItemsOwnSpellRange();
     TheReadBackWaitsOutTheChannel();
     AFightWithTheBeastItselfIsNoWall();
+    TheSpellGrammar();
+    TheSpellGate();
+    ANewPetIsTheTameDone();
     if (failures)
     {
         std::fprintf(stderr, "%d failure(s)\n", failures);

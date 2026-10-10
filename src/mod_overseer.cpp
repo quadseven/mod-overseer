@@ -70478,6 +70478,10 @@ private:
         uint64 counterBefore{0};
         uint64 counterAfter{0};
         bool lootOpenBefore{false};
+        // The character's pet guid before the use, and whether one it did not
+        // have is there after (QuestUsePetGained): a Tame Beast that took.
+        uint64 petBefore{0};
+        bool petGained{false};
         uint32 windowMs{0};
         uint32 waitedMs{0};
         CastHoldReport hold;
@@ -70534,6 +70538,7 @@ private:
           << ",\"item_after\":" << ev.itemAfter
           << ",\"counter_before\":" << ev.counterBefore
           << ",\"counter_after\":" << ev.counterAfter
+          << ",\"pet_gained\":" << (ev.petGained ? "true" : "false")
           << ",\"window_ms\":" << ev.windowMs
           << ",\"waited_ms\":" << ev.waitedMs
           << ",\"hold_applied\":" << (ev.hold.applied ? "true" : "false")
@@ -70789,7 +70794,19 @@ private:
         ev.yards = gate.targetYards;
 
         Item* item = nullptr;
-        if (!request.gameObject)
+        if (request.spell)
+        {
+            // use-spell-on: a known spell cast at the creature (Tame Beast).
+            gate.castsSpell = true;
+            ev.spellId = request.spell;
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(request.spell);
+            gate.wrongTarget = !info || !info->NeedsExplicitUnitTarget();
+            gate.spellKnown = who->HasSpell(request.spell);
+            gate.itemOnCooldown = who->HasSpellCooldown(request.spell);
+            if (info && creature)
+                gate.reachYards = D::QuestUseCreatureReach(info->GetMaxRange(false, who));
+        }
+        else if (!request.gameObject)
         {
             item = FindCarriedItem(who, false, request.item);
             gate.itemCarried = item != nullptr;
@@ -70853,8 +70870,24 @@ private:
 
         // Held for the cast, in the same breath as the packet.
         HoldStillAndReport(who, ev.character, QUEST_USE_HOLD_VERB, ev.hold);
+        ev.petBefore = who->GetPetGUID().GetRawValue();
 
-        if (request.gameObject)
+        if (request.spell)
+        {
+            DriveSelection(session, targetGuid);
+            who->SetFacingToObject(creature);
+            // CMSG_CAST_SPELL: castCount, spell, castFlags, then a target block -
+            // TARGET_FLAG_UNIT and one packed guid, as a client casts at its target.
+            WorldPacket raw(CMSG_CAST_SPELL, 1 + 4 + 1 + 4 + 9);
+            raw << uint8(1);  // castCount
+            raw << uint32(request.spell);
+            raw << uint8(0);  // castFlags
+            raw << uint32(TARGET_FLAG_UNIT);
+            raw << targetGuid.WriteAsPacked();
+            raw.rpos(0);
+            session->HandleCastSpellOpcode(raw);
+        }
+        else if (request.gameObject)
         {
             if (ev.spellId)
             {
@@ -70908,6 +70941,11 @@ private:
                  "overseer: '{}' is using {} {} (item {}, spell {}) at {} yards; judging in {}ms",
                  ev.character, request.gameObject ? "gameobject" : request.here ? "here" : "creature", ev.targetEntry,
                  ev.itemEntry, ev.spellId, ev.yards, ev.windowMs);
+        if (gate.fightingOnlyTarget)
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' uses it mid-fight with creature {} itself, the only one "
+                     "fighting it",
+                     ev.character, ev.targetEntry);
 
         QuestUseCheck check;
         check.id = id;
@@ -70960,10 +70998,16 @@ private:
             read.counterMoved = check.ev.counterAfter != check.ev.counterBefore;
             if (!check.ev.gameObject)
             {
-                check.ev.itemAfter = int32(bot->GetItemCount(check.ev.itemEntry, false));
-                read.itemConsumed = check.ev.itemAfter < check.ev.itemBefore;
+                if (check.ev.itemEntry)
+                {
+                    check.ev.itemAfter = int32(bot->GetItemCount(check.ev.itemEntry, false));
+                    read.itemConsumed = check.ev.itemAfter < check.ev.itemBefore;
+                }
                 read.onCooldown = check.ev.spellId && bot->HasSpellCooldown(check.ev.spellId);
             }
+            check.ev.petGained =
+                D::QuestUsePetGained(check.ev.petBefore, bot->GetPetGUID().GetRawValue());
+            read.petGained = check.ev.petGained;
             read.lootOpened = !check.ev.lootOpenBefore && !bot->GetLootGUID().IsEmpty();
 
             ReleaseHold(check.targetName, bot, "the quest use row ended", QUEST_USE_HOLD_VERB);

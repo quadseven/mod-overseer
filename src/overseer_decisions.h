@@ -6239,6 +6239,16 @@ constexpr char const* USE_GAMEOBJECT_VERB = "use-gameobject";
 // `unchanged`.
 constexpr char const* USE_ITEM_HERE_VERB = "use-item-here";
 
+// `use-spell-on creature:<entry> spell:<id>` (2026-10-10): a spell the
+// character knows cast at a creature, as a player targets a beast and casts
+// Tame Beast. The hunter's Taming the Beast chain teaches Tame Beast (1515) and
+// nothing else gives a pet: the rods' tames only charm a beast for 15 minutes.
+// The packet is CMSG_CAST_SPELL with a unit target block. The gate and the read
+// back are the item use's; a pet the character did not have before is the use
+// done (QuestUseReadBack::petGained). Nothing here makes a pet: the core's
+// own TAME_CREATURE effect does, when the channel ends with the beast alive.
+constexpr char const* USE_SPELL_ON_VERB = "use-spell-on";
+
 // Reach for a creature target. The item's own spell range is checked again by
 // the core, so this is the near edge of what any quest item allows.
 constexpr float QUEST_USE_CREATURE_YARDS = 8.0f;
@@ -6275,7 +6285,8 @@ struct QuestUseRequest
     bool gameObject{false};   // true: use-gameobject; false: use-item-on
     bool here{false};         // true: use-item-here (no target, `item` only)
     std::uint32_t target{0};  // creature entry, or gameobject entry
-    std::uint32_t item{0};    // item entry; 0 for a gameobject use
+    std::uint32_t item{0};    // item entry; 0 for a gameobject or spell use
+    std::uint32_t spell{0};   // use-spell-on: the spell cast at the creature
     char const* error{""};    // a QuestUseRefusal literal; empty when it parsed
 };
 
@@ -6288,6 +6299,10 @@ namespace QuestUseRefusal
 constexpr char const* MalformedItem = "malformed use-item-on command";
 constexpr char const* MalformedObject = "malformed use-gameobject command";
 constexpr char const* MalformedHere = "malformed use-item-here command";
+constexpr char const* MalformedSpell = "malformed use-spell-on command";
+constexpr char const* SpellUnknown = "the character does not know that spell";
+constexpr char const* NoCreatureSpell = "that spell takes no creature target";
+constexpr char const* SpellOnCooldown = "the spell is on cooldown";
 constexpr char const* NoBotAI = "character has no bot AI";
 constexpr char const* NotInWorld = "character is not in the world";
 constexpr char const* LoggingOut = "character is logging out";
@@ -6349,7 +6364,11 @@ struct QuestUseGateFacts
     // The item (use-item-on only).
     bool itemCarried{true};
     bool itemUsable{true};
-    bool itemOnCooldown{false};
+    bool itemOnCooldown{false};  // the item's spell, or a use-spell-on's spell
+    // A use-spell-on: no item, a spell the character must know. `wrongTarget`
+    // then says the spell takes no creature target.
+    bool castsSpell{false};
+    bool spellKnown{true};
 };
 
 // "" when the use may fire; otherwise the QuestUseRefusal literal for the
@@ -6442,12 +6461,17 @@ struct QuestUseReadBack
     bool itemConsumed{false};   // fewer of the item than before (use-item-on)
     bool lootOpened{false};     // a loot window is open on the character
     bool onCooldown{false};     // the item's spell cooldown started (use-item-on)
+    bool petGained{false};      // a pet the character did not have (QuestUsePetGained)
 };
+
+// A pet now that was not there before the use, or another one: the tame took.
+// The raw guids of the character's pet before and after; 0 is none.
+bool QuestUsePetGained(std::uint64_t before, std::uint64_t after);
 
 enum class QuestUseOutcome
 {
     Unreadable,
-    Progressed,  // a quest counter or status moved: 'applied'
+    Progressed,  // a quest counter or status moved, or a pet was gained: 'applied'
     Spent,       // something visibly happened, no counter moved: 'applied'
     Nothing,     // none of it: 'unchanged'
 };
