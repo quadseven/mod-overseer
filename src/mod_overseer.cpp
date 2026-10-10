@@ -38253,12 +38253,25 @@ private:
         std::string said;
         // THE CORPSE RUN (OverseerDecisions::GUILD_RUN_RECOVERY_SECONDS): when a
         // member first lay dead inside unraised, when the recovery began, what
-        // was last said of it, and the ghosts whose dead engine had `stay`
-        // taken off for the walk back (StepGuildRunRecovery).
+        // was last said of it, and the ghosts whose dead engine had strategies
+        // taken off for the walk back, by name (GUILD_RUN_GHOST_LEASES).
         std::time_t deadInsideSince{0};
         std::time_t recoverySince{0};
         unsigned walkingSaid{0};
-        std::set<std::string> stayLeased;
+        std::map<std::string, std::vector<std::string>> leased;
+        // THE DOOR AND THE REST (OverseerDecisions::GuildRunEnterTogether and
+        // GuildRunHoldNext): how many ghosts were last said to wait at the
+        // door, how many were walked or waiting this poll, whether this run
+        // has the dungeon brain paused, and the clocks of the hold.
+        unsigned atDoorSaid{0};
+        unsigned ghostsWalked{0};
+        bool brainHeld{false};
+        std::time_t holdRefusedAt{0};
+        std::time_t holdAssertedAt{0};
+        std::time_t heldSince{0};
+        std::time_t regroupSince{0};
+        std::time_t restSince{0};
+        std::time_t restRearmAt{0};
     };
     std::vector<GuildRun> _guildRuns;
 
@@ -38563,7 +38576,7 @@ private:
     {
         // Whatever the corpse run leased goes back: past here the ghosts are
         // the ordinary recoveries' again.
-        ReturnGuildRunStayLeases(run, {});
+        ReturnGuildRunLeases(run, {});
         run.outcome = outcome;
         run.why = why;
         run.phase = GuildRunPhase::Leaving;
@@ -38730,28 +38743,61 @@ private:
 
     static constexpr uint32 GUILD_RUN_RUNBACK_POINT_ID = 0;
 
-    // One ghost of the run. Standing in the door it is knocked through; else it
-    // is walked there with a path and without forcing the destination, as the
-    // raid run-back walks: a leg the navmesh cannot find is not walked through
-    // the hill, and the next poll walks on from wherever it stopped. The dead
-    // engine's `stay` is leased off while it walks, because its default action
-    // stops any movement it finds.
+    // WHAT A GHOST OF THE RUN IS LEASED OFF, while it walks back or waits at
+    // the door. `stay`, because its default action stops any movement it
+    // finds. `follow`, because a grouped bot's dead engine carries it
+    // (AiFactory::AddDefaultDeadStrategies) and walks a groupmate's ghost after
+    // the tank's instead of to the door. Measured on the dev realm (guild run
+    // 464, 2026-10-10): the tank's ghost walked the Deadmines mine tunnel and
+    // stepped through, while three groupmates trailed it over the hill above
+    // and stopped 17 to 20 yards over the door's trigger, where no knock can
+    // reach. `dead`, so nothing else in that engine moves a ghost that waits at
+    // the door. The natural guilds' own ghost recovery takes the same three
+    // (LeaseCorpseRun).
+    static constexpr char const* GUILD_RUN_GHOST_LEASES[] = {"dead", "follow", "stay"};
+
+    // Take a ghost of the run off the dead engine. Whatever that engine had it
+    // walking toward stops here, once, so the walk to the door takes over.
+    static void LeaseGuildRunGhost(GuildRun& run, Player* ghost)
+    {
+        PlayerbotAI* const ai = GET_PLAYERBOT_AI(ghost);
+        if (!ai)
+            return;
+        std::vector<std::string>& taken = run.leased[ghost->GetName()];
+        bool tookAny = false;
+        for (char const* strategy : GUILD_RUN_GHOST_LEASES)
+        {
+            if (!ai->HasStrategy(strategy, BOT_STATE_DEAD))
+                continue;
+            ai->ChangeStrategy(std::string("-") + strategy, BOT_STATE_DEAD);
+            taken.emplace_back(strategy);
+            tookAny = true;
+        }
+        if (tookAny)
+        {
+            ghost->GetMotionMaster()->Clear();
+            ghost->StopMoving();
+        }
+    }
+
+    // One ghost of the run, leased off the dead engine. Standing in the door it
+    // steps through when the group goes in together (`enter`) and otherwise
+    // waits there; else it is walked to the door with a path and without
+    // forcing the destination, as the raid run-back walks: a leg the navmesh
+    // cannot find is not walked through the hill, and the next poll walks on
+    // from wherever it stopped.
     void WalkGuildRunGhost(GuildRun& run, Player* ghost, uint32 triggerId,
-                           AreaTrigger const& trigger)
+                           AreaTrigger const& trigger, bool enter)
     {
         std::string const name = ghost->GetName();
         if (ghost->IsBeingTeleported())
             return;
+        LeaseGuildRunGhost(run, ghost);
         if (ghost->IsInAreaTriggerRadius(&trigger))
         {
-            StepThroughAreaTrigger(name, ghost, "trigger:" + std::to_string(triggerId));
+            if (enter)
+                StepThroughAreaTrigger(name, ghost, "trigger:" + std::to_string(triggerId));
             return;
-        }
-        PlayerbotAI* const ai = GET_PLAYERBOT_AI(ghost);
-        if (ai && ai->HasStrategy("stay", BOT_STATE_DEAD))
-        {
-            ai->ChangeStrategy("-stay", BOT_STATE_DEAD);
-            run.stayLeased.insert(name);
         }
         MotionMaster* motion = ghost->GetMotionMaster();
         if (ghost->isMoving() &&
@@ -38762,8 +38808,38 @@ private:
                           0.f, /*generatePath*/ true, /*forceDestination*/ false);
     }
 
-    // Every ghost of the run standing on the door's map, walked or knocked.
-    // `walked` takes their names.
+    // Alive in the run's own copy of its dungeon.
+    static bool GuildRunAliveInside(GuildRun const& run, Player* p)
+    {
+        return p && p->IsInWorld() && p->IsAlive() && p->GetMapId() == run.mapId &&
+               (!run.instanceId || p->GetInstanceId() == run.instanceId);
+    }
+
+    // The deploy proof of the door: said when the count waiting changes, and
+    // when the group steps through.
+    static void SayGuildRunDoor(GuildRun& run, OverseerDecisions::GuildRunDoorFacts const& door,
+                                bool enter)
+    {
+        if (enter)
+            LOG_INFO("module.overseer",
+                     "overseer: guild run corpse run {} - {} ghost(s) "
+                     "step through the '{}' door together, with {} alive inside and the healer {}",
+                     run.id, door.ghostsAtDoor, run.keyword, door.aliveInside,
+                     door.healerHere ? "among them" : "not back");
+        else if (door.ghostsAtDoor && door.ghostsAtDoor != run.atDoorSaid)
+            LOG_INFO("module.overseer",
+                     "overseer: guild run corpse run {} - {} ghost(s) wait at the '{}' door for "
+                     "the group, {} still walking, {} alive inside, the healer {}; nobody goes "
+                     "in alone",
+                     run.id, door.ghostsAtDoor, run.keyword,
+                     door.ghostsComingBack - door.ghostsAtDoor, door.aliveInside,
+                     door.healerHere ? "here" : "not here");
+        run.atDoorSaid = enter ? 0 : door.ghostsAtDoor;
+    }
+
+    // Every ghost of the run standing on the door's map, walked to the door or
+    // waiting at it, and stepped through together once the group is there
+    // (OverseerDecisions::GuildRunEnterTogether). `walked` takes their names.
     void WalkGuildRunGhostsBack(GuildRun& run, std::set<std::string>& walked)
     {
         DungeonPortal const* portal = FindDungeonPortal(run.keyword);
@@ -38771,32 +38847,56 @@ private:
             portal ? sObjectMgr->GetAreaTrigger(portal->entryTriggerId) : nullptr;
         if (!trigger)
             return;
-        for (std::string const& name : run.names)
+        std::vector<Player*> ghosts;
+        OverseerDecisions::GuildRunDoorFacts door;
+        door.groupSize = static_cast<unsigned>(run.names.size());
+        for (std::size_t i = 0; i < run.names.size(); ++i)
         {
-            Player* const ghost = ObjectAccessor::FindPlayerByName(name);
-            if (!GuildRunGhostOf(ghost, run.mapId) || ghost->GetMapId() != portal->outsideMapId)
+            Player* const p = ObjectAccessor::FindPlayerByName(run.names[i]);
+            bool const healer =
+                i < run.seats.size() && run.seats[i] == OverseerDecisions::GuildSeat::Healer;
+            if (GuildRunAliveInside(run, p))
+            {
+                ++door.aliveInside;
+                door.healerHere = door.healerHere || healer;
                 continue;
-            walked.insert(name);
-            WalkGuildRunGhost(run, ghost, portal->entryTriggerId, *trigger);
+            }
+            if (!GuildRunGhostOf(p, run.mapId) || p->GetMapId() != portal->outsideMapId)
+                continue;
+            ghosts.push_back(p);
+            ++door.ghostsComingBack;
+            if (!p->IsBeingTeleported() && p->IsInAreaTriggerRadius(trigger))
+            {
+                ++door.ghostsAtDoor;
+                door.healerHere = door.healerHere || healer;
+            }
+        }
+        bool const enter = OverseerDecisions::GuildRunEnterTogether(door);
+        SayGuildRunDoor(run, door, enter);
+        for (Player* ghost : ghosts)
+        {
+            walked.insert(ghost->GetName());
+            WalkGuildRunGhost(run, ghost, portal->entryTriggerId, *trigger, enter);
         }
     }
 
-    // Hand `stay` back to every member it was taken from that is alive again,
-    // gone, or not walked this poll (`walked`).
-    static void ReturnGuildRunStayLeases(GuildRun& run, std::set<std::string> const& walked)
+    // Hand back what GUILD_RUN_GHOST_LEASES took, and only that, to every
+    // member that is alive again, gone, or not walked this poll (`walked`).
+    static void ReturnGuildRunLeases(GuildRun& run, std::set<std::string> const& walked)
     {
-        for (auto it = run.stayLeased.begin(); it != run.stayLeased.end();)
+        for (auto it = run.leased.begin(); it != run.leased.end();)
         {
-            Player* const who = ObjectAccessor::FindPlayerByName(*it);
-            if (who && !who->IsAlive() && walked.count(*it))
+            Player* const who = ObjectAccessor::FindPlayerByName(it->first);
+            if (who && !who->IsAlive() && walked.count(it->first))
             {
                 ++it;
                 continue;
             }
             PlayerbotAI* const ai = who ? GET_PLAYERBOT_AI(who) : nullptr;
-            if (ai && !ai->HasStrategy("stay", BOT_STATE_DEAD))
-                ai->ChangeStrategy("+stay", BOT_STATE_DEAD);
-            it = run.stayLeased.erase(it);
+            for (std::string const& strategy : it->second)
+                if (ai && !ai->HasStrategy(strategy, BOT_STATE_DEAD))
+                    ai->ChangeStrategy("+" + strategy, BOT_STATE_DEAD);
+            it = run.leased.erase(it);
         }
     }
 
@@ -38859,9 +38959,195 @@ private:
         std::set<std::string> walked;
         if (step.walkBack && !poll.groupGone)
             WalkGuildRunGhostsBack(run, walked);
-        ReturnGuildRunStayLeases(run, walked);
+        ReturnGuildRunLeases(run, walked);
         SayGuildRunWalk(run, walked.size(), poll.secondsRecovering);
+        run.ghostsWalked = static_cast<unsigned>(walked.size());
         return step.holdBrain;
+    }
+
+    // ---------------------------------------- a guild run rests between pulls --
+    //
+    // THE DUNGEON BRAIN IS HELD WHILE THE GROUP REGROUPS AND RESTS, as players
+    // stop to drink: see OverseerDecisions::GuildRunHoldNext for the
+    // measurement and the bounds. The hold is the dungeon module's own pause
+    // (`dc pause pause` / `dc pause resume`, the intents its addon button
+    // sends): the run keeps its bosses, its driving ladder stands down, the
+    // followers gather on the tank, and eating and drinking go on as the bots'
+    // own engines choose. Nothing is restored or granted; the rest is the
+    // members' own regeneration and their own food and drink.
+
+    // One living member inside, read for the rest. The member's mana counts
+    // when it has a mana bar at all (a warrior's and a rogue's are empty).
+    static OverseerDecisions::GuildRunMemberShape GuildRunShapeOf(Player* p, bool healer)
+    {
+        OverseerDecisions::GuildRunMemberShape shape;
+        shape.healthPct = p->GetHealthPct();
+        shape.usesMana = p->GetMaxPower(POWER_MANA) > 0;
+        shape.manaPct = shape.usesMana ? p->GetPowerPct(POWER_MANA) : 100.f;
+        shape.healer = healer;
+        return shape;
+    }
+
+    // Who the rest waits on first, for the log: the member furthest under a
+    // trigger, else the furthest under a bar.
+    static std::string GuildRunRestWaitsOn(GuildRun const& run)
+    {
+        std::string who;
+        float worst = 1000.f;
+        for (std::size_t i = 0; i < run.names.size(); ++i)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(run.names[i]);
+            if (!GuildRunAliveInside(run, p))
+                continue;
+            bool const healer =
+                i < run.seats.size() && run.seats[i] == OverseerDecisions::GuildSeat::Healer;
+            OverseerDecisions::GuildRunMemberShape const m = GuildRunShapeOf(p, healer);
+            float const manaBar = m.healer ? OverseerDecisions::GUILD_RUN_REST_HEALER_MANA_PCT
+                                           : OverseerDecisions::GUILD_RUN_REST_MANA_PCT;
+            float const health = m.healthPct - OverseerDecisions::GUILD_RUN_REST_HEALTH_PCT;
+            float const mana = m.usesMana ? m.manaPct - manaBar : 1000.f;
+            float const score = std::min(health, mana);
+            if (score >= worst)
+                continue;
+            worst = score;
+            who = "'" + run.names[i] + "' at " +
+                  (health <= mana ? std::to_string(static_cast<int>(m.healthPct)) + "% health"
+                                  : std::to_string(static_cast<int>(m.manaPct)) + "% mana");
+        }
+        return who.empty() ? std::string("nobody") : who;
+    }
+
+    // Pause (`hold`) or resume the dungeon brain, from the tank, on every
+    // living member inside: the elected leader takes it and a follower answers
+    // true at once (DcPauseAction), as with `dc on`. True when nobody refused.
+    // A refusal is said and asked again after GUILD_RUN_HOLD_RETRY_SECONDS.
+    bool IssueGuildRunHold(GuildRun& run, bool hold, std::time_t now)
+    {
+        Player* const tank = ObjectAccessor::FindPlayerByName(run.tank);
+        if (!tank || !tank->IsInWorld() ||
+            now - run.holdRefusedAt < OverseerDecisions::GUILD_RUN_HOLD_RETRY_SECONDS)
+            return false;
+        bool any = false;
+        bool all = true;
+        for (std::string const& name : run.names)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            PlayerbotAI* const ai = GuildRunAliveInside(run, p) ? GET_PLAYERBOT_AI(p) : nullptr;
+            if (!ai)
+                continue;
+            any = true;
+            if (!ai->DoSpecificAction("dc pause", Event("dc", hold ? "pause" : "resume", tank), true))
+                all = false;
+        }
+        if (any && all)
+        {
+            run.holdAssertedAt = now;
+            return true;
+        }
+        run.holdRefusedAt = now;
+        if (any)
+            LOG_INFO("module.overseer",
+                     "overseer: guild run rest {} - 'dc pause {}' from '{}' refused (see "
+                     "playerbots.dungeonclear); asked again in {}s",
+                     run.id, hold ? "pause" : "resume", run.tank,
+                     OverseerDecisions::GUILD_RUN_HOLD_RETRY_SECONDS);
+        return false;
+    }
+
+    // ONE POLL OF THE HOLD, after the corpse run and before the verdict.
+    // `ghostsWalking`: ghosts of the run were walked to the door or waited at
+    // it this poll.
+    void StepGuildRunHold(GuildRun& run, OverseerDecisions::GuildRunPoll const& poll,
+                          bool ghostsWalking, std::time_t now)
+    {
+        using OverseerDecisions::GuildRunHoldStep;
+        using OverseerDecisions::GuildRunHoldWhy;
+        OverseerDecisions::GuildRunHoldFacts facts;
+        facts.armed = run.dcAccepted;
+        facts.held = run.brainHeld;
+        facts.aliveInside = poll.aliveInside;
+        facts.deadInside = poll.inside - poll.aliveInside;
+        facts.ghostsComingBack = ghostsWalking;
+        std::vector<OverseerDecisions::GuildRunMemberShape> living;
+        for (std::size_t i = 0; i < run.names.size(); ++i)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(run.names[i]);
+            if (!GuildRunAliveInside(run, p))
+                continue;
+            if (p->IsInCombat())
+                facts.anyFighting = true;
+            living.push_back(GuildRunShapeOf(
+                p, i < run.seats.size() && run.seats[i] == OverseerDecisions::GuildSeat::Healer));
+        }
+        facts.need = OverseerDecisions::GuildRunRestNeedOf(living);
+        run.regroupSince =
+            poll.aliveInside && ghostsWalking ? (run.regroupSince ? run.regroupSince : now) : 0;
+        facts.secondsRegrouping =
+            run.regroupSince ? static_cast<unsigned>(now - run.regroupSince) : 0;
+        facts.secondsResting = run.restSince ? static_cast<unsigned>(now - run.restSince) : 0;
+        facts.restRearmed = now >= run.restRearmAt;
+        OverseerDecisions::GuildRunHold const hold = OverseerDecisions::GuildRunHoldNext(facts);
+
+        if (hold.step == GuildRunHoldStep::Hold)
+        {
+            if (!IssueGuildRunHold(run, true, now))
+                return;
+            run.brainHeld = true;
+            run.heldSince = now;
+            run.restSince = hold.why == GuildRunHoldWhy::Rest ? now : 0;
+            // The deploy proof: "guild run rest" is said nowhere else.
+            if (hold.why == GuildRunHoldWhy::Regroup)
+                LOG_INFO("module.overseer",
+                         "overseer: guild run rest {} - the dungeon brain holds: {} alive inside "
+                         "wait for {} ghost(s) running back, at most {}s",
+                         run.id, poll.aliveInside, run.ghostsWalked,
+                         OverseerDecisions::GUILD_RUN_REGROUP_WAIT_SECONDS);
+            else
+                LOG_INFO("module.overseer",
+                         "overseer: guild run rest {} - the dungeon brain holds: the group rests "
+                         "before the next pull, waiting on {}; it pulls again at {}% health and "
+                         "{}% mana, or after {}s",
+                         run.id, GuildRunRestWaitsOn(run),
+                         static_cast<int>(OverseerDecisions::GUILD_RUN_RESTED_HEALTH_PCT),
+                         static_cast<int>(OverseerDecisions::GUILD_RUN_RESTED_MANA_PCT),
+                         OverseerDecisions::GUILD_RUN_REST_MAX_SECONDS);
+            return;
+        }
+        if (hold.step == GuildRunHoldStep::Release)
+        {
+            if (!IssueGuildRunHold(run, false, now))
+                return;
+            if (hold.why == GuildRunHoldWhy::RestTimedOut)
+                run.restRearmAt = now + OverseerDecisions::GUILD_RUN_REST_REARM_SECONDS;
+            LOG_INFO("module.overseer",
+                     "overseer: guild run rest {} - the dungeon brain goes on after {}s ({}){}",
+                     run.id, static_cast<unsigned>(now - run.heldSince),
+                     OverseerDecisions::GuildRunHoldWhyWord(hold.why),
+                     hold.why == GuildRunHoldWhy::RestTimedOut
+                         ? "; still waiting on " + GuildRunRestWaitsOn(run)
+                         : std::string());
+            run.brainHeld = false;
+            run.heldSince = 0;
+            run.restSince = 0;
+            return;
+        }
+        if (!run.brainHeld)
+        {
+            run.restSince = 0;
+            return;
+        }
+        // HELD AND STAYING HELD. A regroup that turned into a rest starts the
+        // rest's clock. And the pause is asked again now and then: the dungeon
+        // module can lose it (a fresh `dc on` after it disabled itself, a door
+        // it resumed on), and asking again with the explicit intent changes
+        // nothing on a run that is still paused.
+        if (hold.why == GuildRunHoldWhy::Regroup)
+            run.restSince = 0;
+        else if (hold.why == GuildRunHoldWhy::Rest && !run.restSince)
+            run.restSince = now;
+        if (poll.aliveInside && !facts.anyFighting &&
+            now - run.holdAssertedAt >= OverseerDecisions::GUILD_RUN_HOLD_RETRY_SECONDS)
+            IssueGuildRunHold(run, true, now);
     }
 
     bool DriveGuildRun(GuildRun& run, std::time_t now)
@@ -39127,6 +39413,13 @@ private:
                                  OverseerDecisions::GUILD_RUN_REARM_SECONDS);
                 }
             }
+
+            // THE GROUP REGROUPS AND RESTS BEFORE IT PULLS: the dungeon brain is
+            // held while the living wait for ghosts running back, and while a
+            // member is low (GuildRunHoldNext). After the corpse run, so a
+            // ghost raised this poll is counted inside.
+            bool const ghostsWalking = run.ghostsWalked > 0;
+            StepGuildRunHold(run, poll, ghostsWalking, now);
 
             OverseerDecisions::GuildRunVerdict const verdict = OverseerDecisions::GuildRunNext(poll);
             if (verdict != OverseerDecisions::GuildRunVerdict::Running)

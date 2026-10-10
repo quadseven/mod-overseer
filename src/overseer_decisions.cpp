@@ -17597,6 +17597,83 @@ GuildRunRecoveryStep GuildRunRecoveryNext(GuildRunRecoveryFacts const& facts)
     return step;
 }
 
+bool GuildRunEnterTogether(GuildRunDoorFacts const& facts)
+{
+    if (!facts.ghostsAtDoor)
+        return false;
+    unsigned const here = facts.ghostsAtDoor + facts.aliveInside;
+    unsigned const quorum = std::min(
+        facts.healerHere ? GUILD_RUN_REGROUP_HEALER_QUORUM : GUILD_RUN_REGROUP_QUORUM,
+        facts.groupSize);
+    // Never one alone, whatever the group's size says.
+    return here >= std::max(quorum, 2u);
+}
+
+GuildRunRestNeed GuildRunRestNeedOf(std::vector<GuildRunMemberShape> const& living)
+{
+    bool rested = true;
+    for (GuildRunMemberShape const& m : living)
+    {
+        float const manaTrigger = m.healer ? GUILD_RUN_REST_HEALER_MANA_PCT : GUILD_RUN_REST_MANA_PCT;
+        if (m.healthPct < GUILD_RUN_REST_HEALTH_PCT || (m.usesMana && m.manaPct < manaTrigger))
+            return GuildRunRestNeed::Low;
+        if (m.healthPct < GUILD_RUN_RESTED_HEALTH_PCT ||
+            (m.usesMana && m.manaPct < GUILD_RUN_RESTED_MANA_PCT))
+            rested = false;
+    }
+    return rested ? GuildRunRestNeed::Rested : GuildRunRestNeed::Partial;
+}
+
+GuildRunHold GuildRunHoldNext(GuildRunHoldFacts const& facts)
+{
+    GuildRunHold hold;
+    // Nobody for the brain to drive, not armed yet, or a fight it owns. A held
+    // brain stays held through a wipe: the first member raised waits.
+    if (!facts.armed || facts.aliveInside == 0 || facts.anyFighting)
+        return hold;
+    if (facts.deadInside > 0)
+    {
+        if (facts.held)
+        {
+            hold.step = GuildRunHoldStep::Release;
+            hold.why = GuildRunHoldWhy::Dead;
+        }
+        return hold;
+    }
+    bool const regroup = facts.ghostsComingBack && facts.secondsRegrouping < facts.regroupWaitSeconds;
+    if (!facts.held)
+    {
+        if (regroup)
+            hold = {GuildRunHoldStep::Hold, GuildRunHoldWhy::Regroup};
+        else if (facts.need == GuildRunRestNeed::Low && facts.restRearmed)
+            hold = {GuildRunHoldStep::Hold, GuildRunHoldWhy::Rest};
+        return hold;
+    }
+    if (regroup)
+        hold.why = GuildRunHoldWhy::Regroup;
+    else if (facts.need == GuildRunRestNeed::Rested)
+        hold = {GuildRunHoldStep::Release, GuildRunHoldWhy::Rested};
+    else if (facts.secondsResting >= facts.restMaxSeconds)
+        hold = {GuildRunHoldStep::Release, GuildRunHoldWhy::RestTimedOut};
+    else
+        hold.why = GuildRunHoldWhy::Rest;
+    return hold;
+}
+
+char const* GuildRunHoldWhyWord(GuildRunHoldWhy why)
+{
+    switch (why)
+    {
+        case GuildRunHoldWhy::None:         return "none";
+        case GuildRunHoldWhy::Regroup:      return "regroup";
+        case GuildRunHoldWhy::Rest:         return "rest";
+        case GuildRunHoldWhy::Rested:       return "rested";
+        case GuildRunHoldWhy::RestTimedOut: return "rest timed out";
+        case GuildRunHoldWhy::Dead:         return "a body inside";
+    }
+    return "unknown";
+}
+
 char const* GuildRunVerdictWord(GuildRunVerdict verdict)
 {
     switch (verdict)

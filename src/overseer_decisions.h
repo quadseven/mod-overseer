@@ -19913,9 +19913,10 @@ constexpr unsigned GUILD_RUN_ROLE_RECOVERY_SECONDS = 5 * 60;
 // are released (the release button's own repop) when nobody alive is left to
 // raise them, or when one has lain dead past GUILD_RUN_ROLE_RECOVERY_SECONDS;
 // every ghost of the run is walked from the graveyard to the dungeon's door
-// and knocked through it, and the core raises a ghost that enters the instance
-// its corpse is in (HandleMoveWorldportAck). The dungeon brain is not re-armed
-// while ghosts are still coming back, so the group pulls again whole. A wipe
+// and knocked through it once the group is there (GuildRunEnterTogether), and
+// the core raises a ghost that enters the instance its corpse is in
+// (HandleMoveWorldportAck). The dungeon brain is not re-armed while ghosts are
+// still coming back, so the group pulls again whole. A wipe
 // or a missing tank or healer that is coming back ends the run only when it is
 // not back within this window, counted from the wipe or the death.
 constexpr unsigned GUILD_RUN_RECOVERY_SECONDS = 15 * 60;
@@ -20137,6 +20138,140 @@ enum class GuildRunRearmStep : std::uint8_t
 };
 
 GuildRunRearmStep GuildRunRearmNext(GuildRunRearmFacts const& facts);
+
+// THE GROUP GOES BACK IN TOGETHER, AND RESTS BEFORE IT PULLS. Measured on the
+// dev realm from the corpse run's deploy to 2026-10-10 00:00 (New York): 17
+// Deadmines guild runs cleared 0 and took 157 deaths. 13 wiped to the last
+// member, and 58 deaths came after that wipe, 52 of them the tank's. Each ghost
+// was knocked through the door the moment it reached it, so the tank, first
+// back, was raised at the entrance alone, and the dungeon brain it still
+// carried walked it into the next pack: run 462's tank died three more times
+// while its four groupmates never reached the door. And the pulls themselves
+// went in tired: run 462 pulled Sneed with its lowest caster at 3% mana.
+//
+// So a ghost waits at the door until the group is there (GuildRunEnterTogether),
+// and the dungeon brain is held with the dungeon module's own pause while the
+// group regroups and while it drinks and eats back up (GuildRunHoldNext), as a
+// group of players does. Both are bounded, so neither can stall a run.
+
+// The healer and two more, or four of the five without the healer, step
+// through the door together. Capped by the group's size.
+constexpr unsigned GUILD_RUN_REGROUP_HEALER_QUORUM = 3;
+constexpr unsigned GUILD_RUN_REGROUP_QUORUM = 4;
+
+struct GuildRunDoorFacts
+{
+    // Ghosts of the run outside whose corpse is in the dungeon, and of those
+    // the ones standing in the door's trigger.
+    unsigned ghostsComingBack{0};
+    unsigned ghostsAtDoor{0};
+    unsigned aliveInside{0};
+    // The healer's seat is a ghost at the door or alive inside.
+    bool healerHere{false};
+    unsigned groupSize{GUILD_FINDER_GROUP_SIZE};
+};
+
+// Do the ghosts at the door step through now? Only as a group: the ghosts at
+// the door and the living inside make the healer's quorum with the healer
+// among them, or the full quorum without it. A ghost that would be raised
+// alone waits; a ghost joining a living group inside goes straight in.
+bool GuildRunEnterTogether(GuildRunDoorFacts const& facts);
+
+// When a group stops to rest, and when it is rested. A member under a trigger
+// stops the group; the rest goes on until every member is over its bar. The
+// healer's mana is the group's margin, so it stops the group earliest.
+constexpr float GUILD_RUN_REST_HEALTH_PCT = 70.f;
+constexpr float GUILD_RUN_REST_HEALER_MANA_PCT = 60.f;
+constexpr float GUILD_RUN_REST_MANA_PCT = 40.f;
+constexpr float GUILD_RUN_RESTED_HEALTH_PCT = 90.f;
+constexpr float GUILD_RUN_RESTED_MANA_PCT = 80.f;
+// A rest that cannot finish (a member with nothing to drink and a slow
+// spirit) lets the group go after this long, and the group is not stopped
+// again for GUILD_RUN_REST_REARM_SECONDS, so a rest can slow a run but never
+// stall it. A living group waits for its ghosts at most
+// GUILD_RUN_REGROUP_WAIT_SECONDS: a run back from the graveyard measured 81 s.
+constexpr unsigned GUILD_RUN_REST_MAX_SECONDS = 120;
+constexpr unsigned GUILD_RUN_REST_REARM_SECONDS = 45;
+constexpr unsigned GUILD_RUN_REGROUP_WAIT_SECONDS = 180;
+// A pause or resume the dungeon module refused is asked again after this long.
+constexpr unsigned GUILD_RUN_HOLD_RETRY_SECONDS = 15;
+
+// One living member inside, read for the rest.
+struct GuildRunMemberShape
+{
+    float healthPct{100.f};
+    float manaPct{100.f};
+    // A mana bar to wait on (a warrior's or a rogue's is never waited on).
+    bool usesMana{false};
+    bool healer{false};
+};
+
+enum class GuildRunRestNeed : std::uint8_t
+{
+    Rested,   // every member over its bar
+    Partial,  // over every trigger, under a bar: rest on if resting, else pull
+    Low,      // a member under a trigger: stop and rest
+};
+
+GuildRunRestNeed GuildRunRestNeedOf(std::vector<GuildRunMemberShape> const& living);
+
+struct GuildRunHoldFacts
+{
+    // The run's first `dc on` was accepted.
+    bool armed{false};
+    // This run paused the dungeon brain and has not resumed it.
+    bool held{false};
+    unsigned aliveInside{0};
+    // Bodies lying inside, not released: the dungeon module's own rez walks to
+    // them, which a pause would stop.
+    unsigned deadInside{0};
+    bool anyFighting{false};
+    // Ghosts of the run are being walked back (GuildRunRecoveryStep::walkBack),
+    // and how long the living inside have waited for them.
+    bool ghostsComingBack{false};
+    unsigned secondsRegrouping{0};
+    unsigned regroupWaitSeconds{GUILD_RUN_REGROUP_WAIT_SECONDS};
+    GuildRunRestNeed need{GuildRunRestNeed::Rested};
+    // Since this hold became a rest (0 while it is a regroup or not held).
+    unsigned secondsResting{0};
+    unsigned restMaxSeconds{GUILD_RUN_REST_MAX_SECONDS};
+    // False inside GUILD_RUN_REST_REARM_SECONDS of a rest that timed out.
+    bool restRearmed{true};
+};
+
+enum class GuildRunHoldStep : std::uint8_t
+{
+    Nothing,  // leave the brain as it is
+    Hold,     // pause it
+    Release,  // resume it
+};
+
+enum class GuildRunHoldWhy : std::uint8_t
+{
+    None,
+    Regroup,       // the living inside wait for ghosts running back
+    Rest,          // a member is low; the group rests to its bars
+    Rested,        // every member is over its bar (or nothing is left to wait for)
+    RestTimedOut,  // a rest ran GUILD_RUN_REST_MAX_SECONDS
+    Dead,          // a body lies inside: the dungeon module's rez needs the brain
+};
+
+struct GuildRunHold
+{
+    GuildRunHoldStep step{GuildRunHoldStep::Nothing};
+    GuildRunHoldWhy why{GuildRunHoldWhy::None};
+};
+
+// ONE POLL of the hold. Nothing while the brain is not armed, while nobody is
+// alive inside (a hold outlives a wipe, so the first member raised does not
+// walk on alone), or while anybody fights. A body inside releases a hold. Else
+// hold while the living wait for ghosts (bounded), or when a member is under a
+// trigger outside a timed-out rest's cooldown; release when rested, or when the
+// rest has run its bound.
+GuildRunHold GuildRunHoldNext(GuildRunHoldFacts const& facts);
+
+// "none", "regroup", "rest", "rested", "rest timed out", "a body inside".
+char const* GuildRunHoldWhyWord(GuildRunHoldWhy why);
 
 // A RESTART'S LEFTOVER GROUP, NEVER THE NEXT RUN'S. A worldserver that dies
 // mid-run leaves a stray: the tank of a run it did not finish, whose finder

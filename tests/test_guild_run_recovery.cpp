@@ -278,7 +278,7 @@ void TheAdapterIsWired()
     Check("and nobody is raised by hand", recovery.find("ResurrectPlayer") == std::string::npos);
     Check("the end of a run hands every lease back",
           Between(source, "    void EndGuildRun(", "    static bool LeaveGuildRunQueue(")
-                  .find("ReturnGuildRunStayLeases(run, {});") != std::string::npos);
+                  .find("ReturnGuildRunLeases(run, {});") != std::string::npos);
 }
 
 }  // namespace
