@@ -14811,6 +14811,8 @@ MailWalkState JudgeMailWalk(MailWalkFacts const& facts)
                                                  : MailWalkState::Flying;
     if (facts.mailboxInReach)
         return MailWalkState::Arrived;
+    if (facts.roadLethal)
+        return MailWalkState::LethalRoad;
     if (facts.waitedMs >= facts.timeoutMs)
         return MailWalkState::TimedOut;
     if (facts.sinceProgressMs >= facts.stallMs)
@@ -14836,6 +14838,7 @@ char const* MailWalkStateWord(MailWalkState state)
         case MailWalkState::GroundRefused: return "ground_refused";
         case MailWalkState::Paused:        return "paused";
         case MailWalkState::Flying:        return "flying";
+        case MailWalkState::LethalRoad:    return "lethal_road";
     }
     return "walking";
 }
@@ -14857,6 +14860,7 @@ char const* MailWalkEndReason(MailWalkState state)
         case MailWalkState::GroundRefused: return R::GroundRefused;
         case MailWalkState::Paused:        return "";
         case MailWalkState::Flying:        return "";
+        case MailWalkState::LethalRoad:    return R::LethalRoad;
     }
     return "";
 }
@@ -15149,6 +15153,7 @@ char const* WalkEndReasonFor(WalkGoal goal, MailWalkState state)
         case MailWalkState::GroundRefused: return pick(E::TrainerGround, E::VendorGround, S::SpawnGround);
         case MailWalkState::Paused:        return "";
         case MailWalkState::Flying:        return "";
+        case MailWalkState::LethalRoad:    return pick(E::TrainerLethalRoad, E::VendorLethalRoad, S::SpawnLethalRoad);
     }
     return "";
 }
@@ -15268,11 +15273,26 @@ GhostRecovery GuildGhostFallback(unsigned deathsHere, bool healerGraveKnown,
 }
 
 GuildDeathSpotStep GuildLeavesDeathSpot(unsigned deathsHere, unsigned repeatDeaths,
-                                        bool hearthReady, bool inCombat)
+                                        bool hearthReady, bool inCombat, bool outmatchedHere)
 {
-    if (repeatDeaths && deathsHere >= repeatDeaths && hearthReady && !inCombat)
+    if (!hearthReady || inCombat)
+        return GuildDeathSpotStep::Stay;
+    if (outmatchedHere || (repeatDeaths && deathsHere >= repeatDeaths))
         return GuildDeathSpotStep::Hearth;
     return GuildDeathSpotStep::Stay;
+}
+
+bool OutmatchedDeath(uint32_t memberLevel, uint32_t killerLevel)
+{
+    return killerLevel > 0 && killerLevel >= memberLevel + GUILD_OUTMATCHED_LEVEL_GAP;
+}
+
+bool OutmatchedHere(GuildOutmatchedMark const& mark, int64_t now, uint32_t mapId,
+                    uint32_t zoneId, uint32_t windowMinutes)
+{
+    if (mark.at <= 0 || mark.mapId != mapId || mark.zoneId != zoneId)
+        return false;
+    return now - mark.at <= int64_t(windowMinutes) * 60;
 }
 
 HeadTradeAnswer AnswerTradeAtHead(bool traderIsKin, uint32_t theyOffer, uint32_t theirCopper,
@@ -15471,6 +15491,54 @@ bool FarWalkMayAskFlight(FarWalkFlightFacts const& facts)
     if (facts.flights >= FAR_WALK_FLIGHTS_MAX)
         return false;
     return facts.yardsToGo >= FAR_WALK_FLIGHT_MIN_YARDS;
+}
+
+RoadSamples RoadSamplesAlong(std::vector<RoutePoint> const& route, std::size_t from,
+                             float spacingYards, std::size_t maxSamples)
+{
+    RoadSamples out;
+    if (spacingYards <= 0.f || maxSamples == 0 || from >= route.size() ||
+        route.size() - from < 2)
+        return out;
+    float length = 0.f;
+    for (std::size_t i = from + 1; i < route.size(); ++i)
+        length += std::hypot(route[i].x - route[i - 1].x, route[i].y - route[i - 1].y);
+    if (length <= 0.f)
+        return out;
+    std::size_t count = static_cast<std::size_t>(std::ceil(length / spacingYards - 1e-4f));
+    if (count == 0)
+        count = 1;
+    if (count > maxSamples)
+        count = maxSamples;
+    out.spacingYards = length / float(count);
+    out.points.reserve(count);
+
+    // Walk the legs once, placing each sample where its distance falls.
+    std::size_t leg = from + 1;
+    float legStart = 0.f;
+    float legLength = std::hypot(route[leg].x - route[leg - 1].x, route[leg].y - route[leg - 1].y);
+    for (std::size_t n = 0; n < count; ++n)
+    {
+        float const at = (float(n) + 0.5f) * out.spacingYards;
+        while (at > legStart + legLength && leg + 1 < route.size())
+        {
+            legStart += legLength;
+            ++leg;
+            legLength = std::hypot(route[leg].x - route[leg - 1].x,
+                                   route[leg].y - route[leg - 1].y);
+        }
+        RoutePoint const& a = route[leg - 1];
+        RoutePoint const& b = route[leg];
+        float const t = legLength > 0.f ? std::min(1.f, (at - legStart) / legLength) : 0.f;
+        out.points.push_back(RoutePoint{a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t,
+                                        a.z + (b.z - a.z) * t});
+    }
+    return out;
+}
+
+RouteLimits FarWalkRoadLimits()
+{
+    return RouteLimits{};
 }
 
 void NoteStoredItem(LootStoreNote& note, std::uint64_t looter, std::uint32_t itemGuid,
