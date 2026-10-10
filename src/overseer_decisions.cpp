@@ -17720,6 +17720,15 @@ char const* GuildRunAdoptWhy(GuildRunAdoptFacts const& facts)
     return "it is not over";
 }
 
+bool GuildRunRestoresFinderDungeon(GuildRunFinderRestoreFacts const& facts)
+{
+    // Only a run that was inside, only into the dungeon its own row names and
+    // only when that names the run's map, only for a finder group, and never
+    // over a dungeon the core still holds.
+    return facts.wasInside && facts.dungeonId != 0 && facts.runMap != 0 &&
+           facts.dungeonMap == facts.runMap && facts.finderGroup && facts.knownDungeon == 0;
+}
+
 namespace
 {
 bool GuildRunCleared(GuildRunPoll const& poll)
