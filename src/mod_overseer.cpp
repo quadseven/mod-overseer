@@ -29286,22 +29286,42 @@ private:
             LoadWeaponSpots();
         Item* const worn = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
         uint32 const wornLevel = worn ? worn->GetTemplate()->ItemLevel : 0;
+        Item* const wornRanged = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
+        uint32 const wornRangedLevel = wornRanged ? wornRanged->GetTemplate()->ItemLevel : 0;
 
-        // 1. A BETTER WEAPON IN THE BAGS IT HAS NO SKILL FOR: the weapon master.
-        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        // 1. A BETTER WEAPON IN ANY BAG IT HAS NO SKILL FOR: the weapon master.
+        // The backpack and every bag, main-hand and ranged weapons alike
+        // (OverseerDecisions::WeaponsWorthTraining says why).
+        std::vector<ItemTemplate const*> protos;
+        std::vector<OverseerDecisions::CarriedWeapon> bagWeapons;
+        auto readCarried = [&](Item* item)
         {
-            Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
             ItemTemplate const* proto = item ? item->GetTemplate() : nullptr;
-            if (!proto || proto->Class != ITEM_CLASS_WEAPON ||
-                !IsMainHandType(proto->InventoryType) ||
-                proto->ItemLevel < wornLevel + GUILD_WEAPON_MIN_GAIN ||
-                proto->RequiredLevel > bot->GetLevel())
-                continue;
+            if (!proto || proto->Class != ITEM_CLASS_WEAPON)
+                return;
             uint32 const skill = proto->GetSkill();
+            OverseerDecisions::CarriedWeapon weapon;
+            weapon.inventoryType = proto->InventoryType;
+            weapon.subclass = proto->SubClass;
+            weapon.itemLevel = proto->ItemLevel;
+            weapon.requiredLevel = proto->RequiredLevel;
+            weapon.skillKnown = skill == 0 || bot->GetSkillValue(skill) != 0;
+            weapon.skillLearnable =
+                skill != 0 && GetSkillRaceClassInfo(skill, bot->getRace(), bot->getClass()) != nullptr;
+            bagWeapons.push_back(weapon);
+            protos.push_back(proto);
+        };
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            readCarried(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+            if (Bag* bag = bot->GetBagByPos(b))
+                for (uint32 slot = 0; slot < bag->GetBagSize(); ++slot)
+                    readCarried(bag->GetItemByPos(static_cast<uint8>(slot)));
+        for (std::size_t const index : OverseerDecisions::WeaponsWorthTraining(
+                 bagWeapons, bot->GetLevel(), wornLevel, wornRangedLevel, GUILD_WEAPON_MIN_GAIN))
+        {
+            ItemTemplate const* proto = protos[index];
             uint32 const skillSpell = OverseerDecisions::WeaponSkillSpellFor(proto->SubClass);
-            if (!skill || !skillSpell || bot->GetSkillValue(skill) ||
-                !GetSkillRaceClassInfo(skill, bot->getRace(), bot->getClass()))
-                continue;
             NpcSpot const* best = nullptr;
             for (NpcSpot const& spot : _weaponMasterSpots)
             {
@@ -50238,6 +50258,9 @@ private:
 
             OverseerDecisions::TrainingStopFacts facts;
             facts.campaignArmed = IsDungeonJob(headJob) || OverseerDecisions::HoldsInTown(headJob);
+            // A QUESTING FAMILY TRAINS TOO (2026-10-10): nothing else buys it a
+            // class spell, and no run waits on it (TRAINING_TRIP_YARDS).
+            facts.questing = !facts.campaignArmed && headJob == "quest";
             facts.head = HeadTravelFactsFor(headName);
             facts.columnFree = column.empty();
             // A TOWN ERRAND'S AIM IS THE STOP'S TO TAKE (2026-09-29). Not one
@@ -50290,7 +50313,8 @@ private:
                                    bot->GetMapId() == head->GetMapId();
                 uint32 trainer = 0;
                 // The spawn search only for a member the pick could walk for.
-                if (facts.campaignArmed && stopMayOpen && member.onHeadMap && !member.walkedThisStop)
+                if ((facts.campaignArmed || facts.questing) && stopMayOpen && member.onHeadMap &&
+                    !member.walkedThisStop)
                 {
                     WorldPosition where;
                     if (row.learnSkill)
@@ -50324,7 +50348,7 @@ private:
                     // and where so a priest with no trainer on this map is
                     // not a silent gap.
                     if (!row.learnSkill && bot->GetMoney() > 0 &&
-                        (trainer == 0 || member.trainerYards > OverseerDecisions::TRAINING_STOP_YARDS) &&
+                        (trainer == 0 || member.trainerYards > OverseerDecisions::TrainingStopReach(facts)) &&
                         (trainer == 0 || member.classSpells > 0) &&
                         stop.noTrainerSaid
                             .insert(row.name + "@" + std::to_string(head->GetMapId()))
@@ -50335,7 +50359,7 @@ private:
                                  "({}), so the others are walked for and this one waits for a "
                                  "town that has one",
                                  family, row.name, static_cast<uint32>(bot->getClass()),
-                                 static_cast<uint32>(OverseerDecisions::TRAINING_STOP_YARDS),
+                                 static_cast<uint32>(OverseerDecisions::TrainingStopReach(facts)),
                                  static_cast<uint32>(head->GetMapId()),
                                  trainer ? std::to_string(static_cast<uint32>(member.trainerYards)) +
                                                " yards to the nearest"
@@ -50404,11 +50428,13 @@ private:
                              ? std::string(SkillName(member.learnSkill)) + " (" +
                                    std::to_string(member.learnSkill) + ")"
                              : std::to_string(member.classSpells) + " class spell(s)",
-                         facts.head.bagBlocked
-                             ? "The campaign holds the family in town for bag room"
-                             : facts.head.campaignBetweenAttempts
-                                   ? "The campaign is between attempts"
-                                   : "The campaign is armed and not staging",
+                         facts.questing
+                             ? "The family is questing between runs"
+                             : facts.head.bagBlocked
+                                   ? "The campaign holds the family in town for bag room"
+                                   : facts.head.campaignBetweenAttempts
+                                         ? "The campaign is between attempts"
+                                         : "The campaign is armed and not staging",
                          headName);
                 continue;
             }

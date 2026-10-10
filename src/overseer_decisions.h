@@ -18635,6 +18635,19 @@ constexpr uint32_t TOWN_STOP_MAX_SECONDS = 300;
 // under fourteen minutes, inside the travel backstop's twenty.
 constexpr float TRAINING_STOP_YARDS = 1500.f;
 
+// A QUESTING FAMILY GOES TO TOWN TO TRAIN (2026-10-10). The stop opened only
+// for an armed campaign, on the word that "the bridge's learn trips walk"
+// otherwise; those trips buy professions and nothing else, so a family out
+// questing bought no class spell at all. Measured on the dev realm: the
+// Alliance family had quested since its last campaign, its head's job read
+// "quest" on every roster row, and its warrior, rogue and paladin owed 5
+// spells their Stormwind trainers teach, from 1,950 to 2,500 yards from the
+// head in Elwynn. No run waits on a questing family, so its stop reaches as
+// far as the guild's own class-trainer walk (GUILD_TRAINER_WALK_YARDS in
+// mod_overseer.cpp, 3000). The travel backstop restarts on every ten yards of
+// progress, so a long walk that is moving is not cut.
+constexpr float TRAINING_TRIP_YARDS = 3000.f;
+
 // May `who` put its aim on the head right now?
 //
 // A TRAINER TRIP WAITS FOR AN ARMED CAMPAIGN BETWEEN ATTEMPTS TOO
@@ -19429,6 +19442,33 @@ int ChooseWeaponOffer(std::vector<WeaponOffer> const& offers, uint32_t wornItemL
 // (ItemSubclassWeapon), or 0 for a subclass no weapon master sells.
 uint32_t WeaponSkillSpellFor(uint32_t weaponSubclass);
 
+// A WEAPON IN ANY BAG, AND A RANGED ONE, SENDS A GUILD MEMBER TO THE WEAPON
+// MASTER (2026-10-10). The drive read only the backpack's main-hand weapons.
+// Measured on the dev realm: 32 guild members carried 33 weapons that beat
+// what they wore by their own spec's gear score and waited only on a weapon
+// skill their class can learn; the drive read 8 of them. 19 sat in a bag
+// past the backpack, and 4 were bows, guns or a thrown weapon, judged here
+// against the worn ranged piece. Read this way it reads 27; the other 6 beat
+// the worn piece by less than `minGain` item levels.
+struct CarriedWeapon
+{
+    uint32_t inventoryType{0};   // InventoryType
+    uint32_t subclass{0};        // ItemSubclassWeapon
+    uint32_t itemLevel{0};
+    uint32_t requiredLevel{0};
+    bool skillKnown{false};      // the member holds the weapon's skill line
+    bool skillLearnable{false};  // its race and class may learn that line
+};
+
+// The carried weapons worth a weapon master's lesson, biggest gain first: one
+// the member may wield at its level once the skill is learned, that a weapon
+// master teaches (WeaponSkillSpellFor), and whose item level beats the worn
+// piece of its own slot by `minGain`: a main-hand weapon the worn main hand,
+// a bow, gun, crossbow or thrown weapon the worn ranged piece.
+std::vector<std::size_t> WeaponsWorthTraining(std::vector<CarriedWeapon> const& carried,
+                                              uint32_t level, uint32_t wornMainLevel,
+                                              uint32_t wornRangedLevel, uint32_t minGain);
+
 // Drop marks older than `minutes` before `now`.
 void PruneGuildDeathMarks(std::vector<GuildDeathMark>& marks, int64_t now, uint32_t minutes);
 
@@ -19546,9 +19586,11 @@ bool TrainingStopWants(TrainingStopMember const& member);
 struct TrainingStopFacts
 {
     // The head's job is a dungeon campaign, or the town hold the bridge puts
-    // a campaign's family on while it waits in town (TOWN_HOLD_JOB). Anything
-    // else is the bridge's own learn trip to walk.
+    // a campaign's family on while it waits in town (TOWN_HOLD_JOB).
     bool campaignArmed{false};
+    // The head's job is "quest": the family is between runs, out in the
+    // world. The stop opens for it too, and reaches TRAINING_TRIP_YARDS.
+    bool questing{false};
     // Where the family's run stands and whether it is held for bag room; the
     // `trainerYards` in it is ignored, since each member has its own.
     HeadTravelFacts head;
@@ -19573,13 +19615,13 @@ struct TrainingStopFacts
 
 enum class TrainingStopStep : uint8_t
 {
-    NotACampaign,     // no armed campaign: the bridge's learn trips walk
+    NotACampaign,     // the head neither campaigns nor quests: no stop opens
     NothingToLearn,   // nobody in the family carries a learn
     RunOwnsTravel,    // the run is staging or inside
     Resting,          // the last stop ended less than TRAINING_STOP_REST_SECONDS ago
     SpentItsTime,     // this stop has run TRAINING_STOP_MAX_SECONDS
     NobodyOnHeadMap,    // every member with a learn is on another map or unavailable
-    NoTrainerInTown,  // every learn's trainer is past TRAINING_STOP_YARDS, or on no spawn
+    NoTrainerInTown,  // every learn's trainer is past TrainingStopReach, or on no spawn
     ColumnTaken,      // an errand the stop may not take holds the head's travel column
     Walk,             // walk the head to `member`'s trainer
     LearnsOwed,       // a visit taught nothing and its tries are spent: not "nothing left"
@@ -19592,6 +19634,11 @@ struct TrainingStopLeg
     // are walked in, head first when the head has a learn of its own.
     std::size_t member{0};
 };
+
+// How far from the head a learn's trainer may stand for this stop to walk to
+// it: TRAINING_STOP_YARDS in a campaign's town, TRAINING_TRIP_YARDS for a
+// questing family.
+float TrainingStopReach(TrainingStopFacts const& facts);
 
 // The first reason in the enum's order wins. A member already walked for this
 // stop is not walked again in it, so one trainer the world will not let a
