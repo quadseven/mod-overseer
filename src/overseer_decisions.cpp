@@ -2084,6 +2084,10 @@ char const* ClearingClockHoldReason(ClearingClock clock)
             return "the leader is not on the dungeon map";
         case ClearingClock::HeldNoIssuer:
             return "no groupmate may issue a dungeon-clear command";
+        case ClearingClock::HeldLeaderClientLost:
+            return "the leader's client is not connected or no groupmate may issue a "
+                   "dungeon-clear command, so the leader-client hold keeps everybody inside "
+                   "still";
         case ClearingClock::Runs:
             break;
     }
@@ -16031,6 +16035,14 @@ ExitHearthStep ExitFailureHearthStep(ExitHearthFacts const& facts, unsigned maxA
 bool GroundGaveUpDuringWalk(std::int64_t walkSince, std::int64_t groundGaveUpAt)
 {
     return walkSince > 0 && groundGaveUpAt >= walkSince;
+}
+
+bool EvacuationWalkFailed(std::int64_t walkSince, std::int64_t groundGaveUpAt,
+                          std::int64_t now, std::int64_t boundSeconds)
+{
+    if (GroundGaveUpDuringWalk(walkSince, groundGaveUpAt))
+        return true;
+    return walkSince > 0 && now >= walkSince && now - walkSince >= boundSeconds;
 }
 
 EvacuationWay DecideEvacuationWay(bool groundGaveUp, ExitHearthStep hearth)
