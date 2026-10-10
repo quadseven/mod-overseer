@@ -19810,10 +19810,17 @@ struct FinderDungeonCandidate
     bool hasEntrance{false};
     float x{0.f};
     float y{0.f};
+    // LFG_FLAG_SEASONAL: a holiday boss (the Headless Horseman, Ahune, Coren
+    // Direbrew, the Crown Chemical Co.) on a dungeon's own map. The core locks
+    // every member out of it out of season (LFG_LOCKSTATUS_NOT_IN_SEASON).
+    bool seasonal{false};
 };
 
 // The finder dungeon for a door whose areatrigger lands at (landingX,
-// landingY), or 0 with `why` saying which of the two reasons it is.
+// landingY), or 0 with `why` saying which of the three reasons it is. A
+// seasonal row is never the door's dungeon. Two rows the same distance from
+// the landing (Blackrock Depths' Prison and Upper City share a start) go to
+// the lower id, the wing the door opens on.
 std::uint32_t ChooseFinderDungeon(std::vector<FinderDungeonCandidate> const& candidates,
                                   float landingX, float landingY, std::string& why);
 

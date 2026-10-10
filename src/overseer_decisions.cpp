@@ -17088,25 +17088,39 @@ std::uint32_t ChooseFinderDungeon(std::vector<FinderDungeonCandidate> const& can
         why = "the campaign's dungeon has no dungeon finder entry";
         return 0;
     }
-    if (candidates.size() == 1)
-        return candidates.front().id;
+    // A HOLIDAY BOSS IS NEVER THE DOOR'S DUNGEON. Shadowfang Keep's own row
+    // has no start in lfg_dungeon_template and the Crown Chemical Co.'s lands
+    // 58 yards from the door's, so the match below chose the holiday boss and
+    // every guild run there was locked out "not in season" (dev realm,
+    // 2026-10-08 to 10-10, 14 of 14 runs).
+    std::vector<FinderDungeonCandidate> normal;
+    for (FinderDungeonCandidate const& c : candidates)
+        if (!c.seasonal)
+            normal.push_back(c);
+    if (normal.empty())
+    {
+        why = "the campaign's dungeon has only a holiday dungeon finder entry";
+        return 0;
+    }
+    if (normal.size() == 1)
+        return normal.front().id;
     std::uint32_t best = 0;
     float bestYards = FINDER_WING_MATCH_YARDS;
-    for (FinderDungeonCandidate const& c : candidates)
+    for (FinderDungeonCandidate const& c : normal)
     {
         if (!c.hasEntrance)
             continue;
         float const dx = c.x - landingX;
         float const dy = c.y - landingY;
         float const yards = std::sqrt(dx * dx + dy * dy);
-        if (yards <= bestYards)
+        if (yards < bestYards || (yards == bestYards && (!best || c.id < best)))
         {
             best = c.id;
             bestYards = yards;
         }
     }
     if (!best)
-        why = std::to_string(candidates.size()) +
+        why = std::to_string(normal.size()) +
               " dungeon finder wings share this map and none starts where this door lands, "
               "so the finder could send the family to the wrong one";
     return best;

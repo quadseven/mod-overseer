@@ -36074,6 +36074,7 @@ private:
                 continue;
             OverseerDecisions::FinderDungeonCandidate c;
             c.id = row->ID;
+            c.seasonal = (row->Flags & lfg::LFG_FLAG_SEASONAL) != 0;
             if (QueryResult at = WorldDatabase.Query(
                     "SELECT position_x, position_y FROM lfg_dungeon_template WHERE dungeonId = {}",
                     row->ID))
@@ -38487,6 +38488,12 @@ private:
                 return refuse("'" + name + "' is already in a group");
             if (sLFGMgr->GetState(p->GetGUID()) != lfg::LFG_STATE_NONE)
                 return refuse("'" + name + "' is already in the dungeon finder");
+            // A MEMBER WAITING FOR A BATTLEGROUND IS NAMED (LFGMgr::JoinLfg
+            // refuses the whole group, LFG_JOIN_USING_BG_SYSTEM, and names
+            // nobody). Named, the bridge benches it and forms the run without
+            // it; the member keeps its place in the queue it chose.
+            if (p->InBattlegroundQueue() && !sWorld->getBoolConfig(CONFIG_ALLOW_JOIN_BG_AND_LFG))
+                return refuse("'" + name + "' is waiting in a battleground queue");
             sLFGMgr->InitializeLockedDungeons(p, nullptr);
             lfg::LfgLockMap const& locks = sLFGMgr->GetLockedDungeons(p->GetGUID());
             auto const lock = locks.find(dungeon->ID + (dungeon->TypeID << 24));
