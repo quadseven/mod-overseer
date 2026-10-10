@@ -7404,7 +7404,10 @@ void RestoreGuildRunFinderDungeons()
         facts.dungeonMap = dungeon ? dungeon->MapID : 0;
         facts.finderGroup = group && group->isLFGGroup();
         facts.knownDungeon = group ? sLFGMgr->GetDungeon(group->GetGUID()) : 0;
-        if (!OverseerDecisions::GuildRunRestoresFinderDungeon(facts))
+        // The rule already refuses a missing DBC entry (its map reads 0, never
+        // the run's); the pointer is checked here too so that stays true
+        // whatever the rule becomes.
+        if (!dungeon || !group || !OverseerDecisions::GuildRunRestoresFinderDungeon(facts))
             continue;
 
         // The finder's own key for a dungeon: its ID with its type above it,
