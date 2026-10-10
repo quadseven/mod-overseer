@@ -17277,6 +17277,24 @@ std::uint32_t ChooseFinderDungeon(std::vector<FinderDungeonCandidate> const& can
     return best;
 }
 
+std::string FinderWingDoorFor(std::string const& keyword)
+{
+    // areatrigger_teleport, map 429: 3185 "East Wing [East]", 3184 "East Wing
+    // [South]" and 3183 "East Wing [West]" all enter the East wing, and 3183
+    // lands on row 34's start; 3187 "West Wing [North]" and 3186 "West Wing
+    // [South]" enter the West wing, and 3186 lands on row 36's start.
+    if (keyword == "dire-maul-east-east" || keyword == "dire-maul-east-south")
+        return "dire-maul-east-west";
+    if (keyword == "dire-maul-west-north")
+        return "dire-maul-west-south";
+    return keyword;
+}
+
+bool FinderRowEndsDungeon(std::uint32_t mapId, std::size_t normalRowsOnMap)
+{
+    return DungeonMapHasIndependentWings(mapId) || normalRowsOnMap <= 1;
+}
+
 bool FinderRolesFit(std::vector<std::uint8_t> const& masks)
 {
     std::size_t const n = masks.size();
@@ -17793,7 +17811,8 @@ namespace
 {
 bool GuildRunCleared(GuildRunPoll const& poll)
 {
-    return poll.finderFinished || (poll.bossesTotal && poll.bossesDone >= poll.bossesTotal) ||
+    return (poll.finderFinished && poll.finderEndsDungeon) ||
+           (poll.bossesTotal && poll.bossesDone >= poll.bossesTotal) ||
            DungeonRunCompletion(poll.expectedMask, poll.creditedMask) == DungeonCompletion::Complete;
 }
 
@@ -17953,6 +17972,26 @@ char const* GuildRunVerdictWord(GuildRunVerdict verdict)
         case GuildRunVerdict::TimedOut:  return "timed out";
     }
     return "unknown";
+}
+
+std::uint32_t GuildRunExpectedMask(std::uint32_t mapId, std::uint32_t mapMask,
+                                   std::uint32_t brainMask, bool finderEndsDungeon)
+{
+    if (finderEndsDungeon || DungeonMapHasIndependentWings(mapId) || !brainMask)
+        return DungeonRunExpectedMask(mapId, mapMask, brainMask);
+    // A wing row of a connected dungeon: the whole map, less what the brain's
+    // roster never clears. A roster that shares no bit with the map (read off
+    // another map) says nothing, and the map stands.
+    std::uint32_t const required = DungeonRunExpectedMask(mapId, mapMask, 0);
+    std::uint32_t const armed = required & brainMask;
+    return armed ? armed : required;
+}
+
+unsigned GuildRunCeilingSeconds(bool finderEndsDungeon, unsigned bossesExpected)
+{
+    if (finderEndsDungeon)
+        return GUILD_RUN_CEILING_SECONDS;
+    return std::max(GUILD_RUN_CEILING_SECONDS, bossesExpected * GUILD_RUN_SECONDS_PER_BOSS);
 }
 
 RosterTraining RosterTrainingFor(bool factoryGrants)
