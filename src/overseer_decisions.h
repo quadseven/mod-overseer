@@ -20076,6 +20076,85 @@ enum class GuildRunStrayStep : std::uint8_t
 
 GuildRunStrayStep GuildRunStrayNext(GuildRunStrayFacts const& facts);
 
+// A RESTART IS NOT THE END OF A GUILD RUN THAT IS STILL INSIDE.
+//
+// Measured on the dev realm over the three days to 2026-10-10: 27 guild runs
+// ended "lost: claim expired: the run holding it is gone", 49 minutes in on
+// average with 1.6 bosses down, 110.8 member-hours inside between them. Every
+// one ended 28 to 136 seconds after a worldserver start, none after a bridge
+// restart. The row is claimed under the worldserver's run token and the run
+// lives only in that process's memory, so the next worldserver's lease ended
+// the row (ExpireAbandonedClaims) and its stray pass took the group out of
+// the dungeon and disbanded it.
+//
+// Nothing else about the run was gone. The finder group, every member's
+// instance bind and the instance's boss states are saved by the core and come
+// back with it, and the members log back in inside the dungeon. So a row whose
+// last word was "inside" is taken over by the new worldserver and its run is
+// rebuilt from the row while the members log back in. It is ended only when it
+// is really over: the group disbanded, everybody back and nobody inside, or the
+// tank not back within the window.
+
+// What a run's own row last said about it (GuildRunJson's shape).
+struct GuildRunResumeMember
+{
+    std::string name;
+    unsigned levelStart{0};
+    unsigned deaths{0};
+};
+
+struct GuildRunResume
+{
+    // The row's phase was "inside": the group had been taken in.
+    bool inside{false};
+    unsigned mapId{0};
+    unsigned dungeonId{0};
+    unsigned secondsQueued{0};
+    unsigned secondsInside{0};
+    unsigned deaths{0};
+    unsigned ilvlStart{0};
+    std::vector<GuildRunResumeMember> members;
+};
+
+// Read a guild run row's `result`. Anything unreadable reads as not inside,
+// which is the old behaviour: the run is ended.
+GuildRunResume ReadGuildRunResume(std::string const& result);
+
+// How long the next worldserver waits for a run's members to log back in.
+// The same quarter hour the stray pass has always given a leftover group.
+constexpr unsigned GUILD_RUN_ADOPT_SECONDS = 15 * 60;
+
+struct GuildRunAdoptFacts
+{
+    // The row's last word was phase "inside" (GuildRunResume::inside).
+    bool wasInside{false};
+    // The tank is in the world...
+    bool tankInWorld{false};
+    // ...in a finder group (the core's LFG flag), which is the saved group.
+    bool tankInFinderGroup{false};
+    // ...and that group is already a guild run's of this process.
+    bool liveRunGroup{false};
+    // Members of the run in the world, the tank included.
+    unsigned membersInWorld{0};
+    // Of those, the ones on the run's map, or released ghosts whose corpse is.
+    unsigned membersBack{0};
+    unsigned groupSize{GUILD_FINDER_GROUP_SIZE};
+    // GUILD_RUN_ADOPT_SECONDS have passed since the restart read the row.
+    bool expired{false};
+};
+
+enum class GuildRunAdoptStep : std::uint8_t
+{
+    Wait,     // members are still logging back in
+    Adopt,    // the run goes on under this worldserver
+    Release,  // the run is really over: end the row
+};
+
+GuildRunAdoptStep GuildRunAdoptNext(GuildRunAdoptFacts const& facts);
+
+// Why a released run ended, for the row's `detail`.
+char const* GuildRunAdoptWhy(GuildRunAdoptFacts const& facts);
+
 // ------------------------- what a level-up hands the roster (the operator) --
 //
 // TrainRoster runs on every level change of a roster character. With factory
