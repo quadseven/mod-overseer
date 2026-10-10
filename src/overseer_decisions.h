@@ -17565,6 +17565,7 @@ bool MailWalkMadeProgress(float bestYards, float nowYards);
 //
 //   kind='cast'  walk-to-trainer skill:<id> [learn:<spell>[,<spell>...]] [max:<yards>]
 //   kind='cast'  walk-to-trainer talents:<tree> [max:<yards>]   (a talent reset, #692)
+//   kind='cast'  walk-to-trainer class [max:<yards>]            (class spells, see below)
 //   kind='buy'   walk-to-vendor item:<entry> [max:<yards>]
 //   kind='buy'   walk-to-vendor any [max:<yards>]
 //
@@ -17580,6 +17581,16 @@ bool MailWalkMadeProgress(float bestYards, float nowYards);
 // Trainer::TeachSpell, and reads each back. A vendor walk ends with the bot
 // held at the counter for MAIL_WALK_LINGER_SECONDS, so the `buy` row written
 // next finds a vendor in reach; a successful buy lifts the hold.
+//
+// A CLASS WALK (`walk-to-trainer class`) is a guild bot's own trip to its class
+// trainer. The random guild bots run mod-playerbots' new rpg strategy, which
+// never visits a trainer, so on the dev realm on 2026-10-10 the 142 members of
+// the two family guilds had 1,569 class spells waiting, a median of ten each.
+// The walk ends at the nearest trainer of the walker's class on its map that
+// would teach it at least one spell now (Trainer::CanTeachSpell), and on
+// arrival buys what its purse covers, in ClassSpellsToBuy's order, one spell
+// at a time through Trainer::TeachSpell: the core takes the money with the
+// reputation discount and checks every requirement, as at the trainer window.
 
 constexpr char const* TRAINER_WALK_VERB = "walk-to-trainer";
 constexpr char const* VENDOR_WALK_VERB = "walk-to-vendor";
@@ -17622,17 +17633,37 @@ struct TrainerWalkRequest
     // A TALENT RESET INSTEAD OF A TRADE (#692): the talent tree, 0 to 2, the
     // walk buys a reset for and spends the points in. -1 on a trade walk.
     int32_t talentTab{-1};
+    // A CLASS WALK: the bare word `class`, the walker's class spells.
+    bool classSpells{false};
     char const* error{""};        // empty when it parsed
 };
 
 // A TALENTS WALK (#692) names `talents:<0..2>` in place of `skill:` and carries
-// no `learn:`; exactly one of `skill:` and `talents:` is present.
+// no `learn:`. A CLASS WALK names the bare word `class` in place of both and
+// carries no `learn:`. Exactly one of `skill:`, `talents:` and `class` is
+// present.
 //
-// `skill:` is required and must be a non-zero id. `learn:` is optional, a comma
+// `skill:` must be a non-zero id. `learn:` is optional, a comma
 // list of non-zero ids with no repeats and at most TRAINER_WALK_MAX_LEARN of
 // them. `max:` is optional and no larger than FAR_WALK_MAX_YARDS (#633). Each key at
 // most once, in any order; anything else is Malformed.
 TrainerWalkRequest ParseTrainerWalkRequest(std::string const& command);
+
+// One class spell a trainer would teach the walker now, at the walker's price.
+struct ClassSpellOffer
+{
+    uint32_t spell{0};
+    uint32_t reqLevel{0};
+    uint32_t cost{0};  // copper, after the reputation discount
+};
+
+// The class spells a class walk buys from a purse of `money` copper, in the
+// order bought: lowest level first, then cheapest, then by spell id. Each is
+// taken while it fits what the purse still holds; one that does not fit is
+// skipped and the cheaper ones after it are still bought, so one dear spell
+// (a warlock's 10 gold Felsteed) never stands in front of the 20 silver ones
+// at its level. Spell 0 is never bought.
+std::vector<uint32_t> ClassSpellsToBuy(std::vector<ClassSpellOffer> offers, uint64_t money);
 
 struct VendorWalkRequest
 {
@@ -17696,6 +17727,10 @@ constexpr char const* TalentsTooLow       = "the character is below the level a 
 constexpr char const* TalentsInTree       = "the character's talents are already in that tree";
 constexpr char const* TalentsCannotAfford = "the character cannot afford the talent reset";
 constexpr char const* NoClassTrainerOnMap = "no trainer of this character's class on this map resets talents";
+// A class walk's own: no trainer of the walker's class on its map would teach
+// it a spell now.
+constexpr char const* NoClassSpellTrainerOnMap =
+    "no trainer of this character's class on this map has a class spell to teach it now";
 }  // namespace ErrandWalkRefusal
 
 // The refusal a walk to `goal` gives where the mailbox walk gives `mailboxWall`.

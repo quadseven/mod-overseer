@@ -67661,6 +67661,12 @@ private:
         uint32 specIndex{0};
         uint32 pointsBefore[3]{0, 0, 0};
         uint32 pointsAfter[3]{0, 0, 0};
+        // A class walk: the walker's class spells. `offered` is how many the
+        // trainer would teach it now, `tooDear` how many of those the purse
+        // could not cover; `taught` above lists the ones bought.
+        bool classSpells{false};
+        uint32 offered{0};
+        uint32 tooDear{0};
 
         // A vendor walk's request: an item, or any vendor that buys.
         uint32 item{0};
@@ -67840,6 +67846,9 @@ private:
             WalkIdList(o, ev.notTaught);
             o << ",\"money_before\":" << ev.moneyBefore
               << ",\"money_after\":" << ev.moneyAfter;
+            if (ev.classSpells)
+                o << ",\"class\":true,\"offered\":" << ev.offered
+                  << ",\"too_dear\":" << ev.tooDear;
             if (ev.talentTab >= 0)
                 o << ",\"talents\":" << ev.talentTab << ",\"spec_index\":" << ev.specIndex
                   << ",\"points_before\":[" << ev.pointsBefore[0] << "," << ev.pointsBefore[1]
@@ -67918,6 +67927,17 @@ private:
                     spells.push_back(spellId);
     }
 
+    // Would this trainer teach `who` any spell now? Trainer::CanTeachSpell is
+    // the core's own question at the trainer window: level, earlier ranks,
+    // race and class, and not already known.
+    static bool ClassTrainerTeaches(Trainer::Trainer* trainer, Player* who)
+    {
+        for (Trainer::Spell const& spell : trainer->GetSpells())
+            if (trainer->CanTeachSpell(who, &spell))
+                return true;
+        return false;
+    }
+
     // May a walk of this row end at a spawn of this creature entry? Its faction
     // must be one the core would let this character deal with (the same
     // reaction GetNPCIfCanInteractWith tests, read from the template because
@@ -67956,6 +67976,10 @@ private:
         // which is Creature::CanResetTalents' own question.
         if (ev.talentTab >= 0)
             return TrainerServesClassOf(entry, who);
+        // A CLASS WALK ends at a trainer of the walker's class that would teach
+        // it at least one spell now, so it never walks to one with nothing.
+        if (ev.classSpells)
+            return TrainerServesClassOf(entry, who) && ClassTrainerTeaches(trainer, who);
         uint32 rankSpell = 0;
         std::vector<uint32> spells;
         TrainerOffers(trainer, who, ev, rankSpell, spells);
@@ -68600,6 +68624,77 @@ private:
         return "unchanged";
     }
 
+    // A GUILD BOT'S CLASS SPELLS, AT THE CLASS TRAINER THE WALK REACHED. Every
+    // spell the trainer would teach now (Trainer::CanTeachSpell) is offered at
+    // the walker's own price, with its reputation discount; ClassSpellsToBuy
+    // picks what the purse covers, and each is bought through
+    // Trainer::TeachSpell, which takes the money and checks every requirement
+    // again, exactly as the trainer window does. Each purchase is read back
+    // with HasSpell. Judged by the trade visit's own rule: the offered spells
+    // are the asked ones and the bought ones the learned ones.
+    static char const* ClassSpellsAtTheTrainer(Player* bot, MailWalkEvidence& ev, char const*& reason)
+    {
+        namespace D = OverseerDecisions;
+        namespace E = OverseerDecisions::ErrandWalkRefusal;
+        ev.moneyBefore = int64(bot->GetMoney());
+        D::TrainerVisitFacts facts;
+
+        Creature* npc = WalkCreatureInReach(bot, ev);
+        Trainer::Trainer* trainer = npc ? sObjectMgr->GetTrainer(ev.mailboxEntry) : nullptr;
+        if (trainer && TrainerServesClassOf(ev.mailboxEntry, bot))
+        {
+            float const discount = bot->GetReputationPriceDiscount(npc);
+            std::vector<D::ClassSpellOffer> offers;
+            for (Trainer::Spell const& spell : trainer->GetSpells())
+            {
+                if (!trainer->CanTeachSpell(bot, &spell))
+                    continue;
+                D::ClassSpellOffer offer;
+                offer.spell = spell.SpellId;
+                offer.reqLevel = spell.ReqLevel;
+                offer.cost = static_cast<uint32>(std::floor(spell.MoneyCost * discount));
+                offers.push_back(offer);
+            }
+            ev.offered = static_cast<uint32>(offers.size());
+            std::vector<uint32_t> const buy = D::ClassSpellsToBuy(offers, uint64(bot->GetMoney()));
+            ev.tooDear = ev.offered - static_cast<uint32>(buy.size());
+            // READ BACK TWO WAYS. A trainer line whose spell is a LEARN spell
+            // is cast rather than learned (Trainer::TeachSpell, IsCastable), so
+            // the walker may never hold that id itself; the core takes the
+            // money only on the path that teaches, so a purse that dropped is
+            // the other witness.
+            for (uint32 spellId : buy)
+            {
+                uint32 const purseBefore = bot->GetMoney();
+                trainer->TeachSpell(npc, bot, spellId);  // Trainer.h:73
+                if (bot->HasSpell(spellId) || bot->GetMoney() < purseBefore)
+                    ev.taught.push_back(spellId);
+                else
+                    ev.notTaught.push_back(spellId);
+            }
+        }
+        facts.asked = ev.offered;
+        facts.learned = static_cast<uint32_t>(ev.taught.size());
+        ev.moneyAfter = int64(bot->GetMoney());
+
+        D::TrainerVisitOutcome const outcome = D::JudgeTrainerVisit(facts);
+        ev.visit = D::TrainerVisitWord(outcome);
+        switch (outcome)
+        {
+            case D::TrainerVisitOutcome::Learned:
+                reason = "";
+                return "applied";
+            case D::TrainerVisitOutcome::NothingToLearn:
+                reason = E::NothingToLearn;
+                return "unchanged";
+            case D::TrainerVisitOutcome::TaughtNothing:
+                reason = E::TaughtNothing;
+                return "unchanged";
+        }
+        reason = E::TaughtNothing;
+        return "unchanged";
+    }
+
     // BUY WHAT THE ROW ASKED FOR, AT THE TRAINER THE WALK REACHED, the way a
     // player does at the trainer window: Trainer::TeachSpell, which takes the
     // money (with the reputation discount) and enforces every requirement, one
@@ -68612,6 +68707,8 @@ private:
         namespace E = OverseerDecisions::ErrandWalkRefusal;
         if (ev.talentTab >= 0)
             return RespecAtTheTrainer(bot, ev, reason);
+        if (ev.classSpells)
+            return ClassSpellsAtTheTrainer(bot, ev, reason);
         D::TrainerVisitFacts facts;
         facts.asked = static_cast<uint32_t>(ev.learnAsked.size());
         ev.moneyBefore = int64(bot->GetMoney());
@@ -68701,6 +68798,10 @@ private:
             if (ev.talentTab >= 0 &&
                 std::string(reason) == D::ErrandWalkRefusal::NoTrainerOnMap)
                 reason = D::ErrandWalkRefusal::NoClassTrainerOnMap;
+            // A class walk wants a trainer of its class with a spell to teach.
+            if (ev.classSpells &&
+                std::string(reason) == D::ErrandWalkRefusal::NoTrainerOnMap)
+                reason = D::ErrandWalkRefusal::NoClassSpellTrainerOnMap;
             out = MailWalkJson(ev, "refused", reason);
             if (goal == D::WalkGoal::Mailbox)
                 LOG_INFO("module.overseer",
@@ -68729,6 +68830,7 @@ private:
             ev.skill = req.skill;
             ev.learnAsked.assign(req.learn.begin(), req.learn.end());
             ev.talentTab = req.talentTab;
+            ev.classSpells = req.classSpells;
         }
         else if (goal == D::WalkGoal::Spawn)
         {
@@ -69600,7 +69702,15 @@ private:
                 word = ev.visit;
                 ReleaseHold(check.targetName, bot, "the trainer visit is over",
                             MAIL_WALK_HOLD_VERB);
-                if (ev.talentTab >= 0)
+                if (ev.classSpells)
+                    LOG_INFO("module.overseer",
+                             "overseer: class trainer walk {} - '{}' reached '{}' after {}ms and {} "
+                             "leg(s): {} - {} class spell(s) learned of {} offered, {} too "
+                             "dear, money {} -> {}",
+                             check.id, check.targetName, ev.reachedName, ev.waitedMs, ev.legs,
+                             ev.visit, ev.taught.size(), ev.offered, ev.tooDear,
+                             ev.moneyBefore, ev.moneyAfter);
+                else if (ev.talentTab >= 0)
                     LOG_INFO("module.overseer",
                              "overseer: talent walk {} - '{}' reached '{}' after {}ms and {} "
                              "leg(s): {} - tree {} with premade spec {}, points {}/{}/{} -> "

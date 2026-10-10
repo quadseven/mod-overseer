@@ -15182,9 +15182,17 @@ TrainerWalkRequest ParseTrainerWalkRequest(std::string const& command)
     };
     if (words.empty() || words[0] != TRAINER_WALK_VERB || words.size() > 4)
         return malformed();
-    bool sawSkill = false, sawLearn = false, sawMax = false, sawTalents = false;
+    bool sawSkill = false, sawLearn = false, sawMax = false, sawTalents = false,
+         sawClass = false;
     for (std::size_t i = 1; i < words.size(); ++i)
     {
+        // A CLASS WALK is the one bare word in the grammar.
+        if (words[i] == "class" && !sawClass)
+        {
+            sawClass = true;
+            request.classSpells = true;
+            continue;
+        }
         std::string key, value;
         if (!ErrandWalkPair(words[i], key, value))
             return malformed();
@@ -15216,10 +15224,33 @@ TrainerWalkRequest ParseTrainerWalkRequest(std::string const& command)
         else
             return malformed();
     }
-    // EXACTLY ONE OF A TRADE AND A TREE (#692), and a reset buys no recipes.
-    if (sawSkill == sawTalents || (sawTalents && sawLearn))
+    // EXACTLY ONE OF A TRADE, A TREE (#692) AND THE CLASS, and only a trade
+    // walk names recipes.
+    if (int(sawSkill) + int(sawTalents) + int(sawClass) != 1 || (sawLearn && !sawSkill))
         return malformed();
     return request;
+}
+
+std::vector<uint32_t> ClassSpellsToBuy(std::vector<ClassSpellOffer> offers, uint64_t money)
+{
+    std::sort(offers.begin(), offers.end(),
+              [](ClassSpellOffer const& a, ClassSpellOffer const& b)
+              {
+                  if (a.reqLevel != b.reqLevel)
+                      return a.reqLevel < b.reqLevel;
+                  if (a.cost != b.cost)
+                      return a.cost < b.cost;
+                  return a.spell < b.spell;
+              });
+    std::vector<uint32_t> bought;
+    for (ClassSpellOffer const& offer : offers)
+    {
+        if (!offer.spell || offer.cost > money)
+            continue;
+        money -= offer.cost;
+        bought.push_back(offer.spell);
+    }
+    return bought;
 }
 
 VendorWalkRequest ParseVendorWalkRequest(std::string const& command)
