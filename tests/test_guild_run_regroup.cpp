@@ -247,7 +247,9 @@ void TheGroupWaitsForItsGhostsBeforeItPulls()
     ExpectHold("a hold outlives a wipe, so the first raised cannot walk on alone", wiped,
                GuildRunHoldStep::Nothing, GuildRunHoldWhy::None);
 
-    GuildRunHoldFacts body = FiveAliveAt(GuildRunRestNeed::Low);
+    // A body inside, the living over their triggers: the dungeon brain's own
+    // rez walks to it. (A low group rests first: test_guild_run_tactics.cpp.)
+    GuildRunHoldFacts body = FiveAliveAt(GuildRunRestNeed::Partial);
     body.held = true;
     body.aliveInside = 4;
     body.deadInside = 1;
