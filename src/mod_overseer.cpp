@@ -4870,6 +4870,13 @@ struct PendingDeath
     int32 fallGuardSeconds = -1;
 };
 std::mutex g_deathMutex;
+// THE NEWEST OUTMATCHED DEATH OF EACH NATURAL GUILD MEMBER (2026-10-10): killed
+// by something OverseerDecisions::GUILD_OUTMATCHED_LEVEL_GAP or more levels
+// above it. Written by the death hook on a map thread (LogGuildDeath), read and
+// cleared by LeaveGuildDeathSpot on the world thread, so it has its own lock.
+// One entry per member at most.
+std::mutex g_guildOutmatchedMutex;
+std::map<std::string, OverseerDecisions::GuildOutmatchedMark> g_guildOutmatched;
 std::vector<PendingDeath> g_deathQueue;
 uint64 g_droppedDeaths = 0;
 // When each managed-guild member's last death row was queued, by lowercased
@@ -4944,6 +4951,20 @@ static void LogGuildDeath(Player* killed, char const* kind, std::string const& k
              items, items ? ilvl / items : 0, kind, killerName, killerEntry, killerLevel,
              killerRank, killed->getAttackers().size(), killed->GetMapId(), killed->GetZoneId(),
              killed->GetGroup() ? ", grouped" : "");
+    // Killed by something far above it: remembered for LeaveGuildDeathSpot,
+    // which sends the member home after this first death (2026-10-10).
+    std::string const memberName = killed->GetName();
+    if (OverseerDecisions::OutmatchedDeath(killed->GetLevel(), killerLevel))
+    {
+        OverseerDecisions::GuildOutmatchedMark mark;
+        mark.at = static_cast<int64_t>(time(nullptr));
+        mark.mapId = killed->GetMapId();
+        mark.zoneId = killed->GetZoneId();
+        mark.memberLevel = killed->GetLevel();
+        mark.killerLevel = killerLevel;
+        std::lock_guard<std::mutex> lock(g_guildOutmatchedMutex);
+        g_guildOutmatched[memberName] = mark;
+    }
 }
 
 // The level-up record (#533): the family and the managed guilds, decided by
@@ -28651,19 +28672,39 @@ private:
     // stands now, so it fires on revival at the corpse, at a graveyard beside
     // the killer, or on walking back into the same spot. True when a hearth was
     // started this poll.
+    //
+    // AND ONCE, NOT TWICE, WHERE IT WAS OUTMATCHED (2026-10-10): a member killed
+    // by something far above its level (g_guildOutmatched) hearths out as soon
+    // as it stands alive in that zone with its stone ready, wherever in the zone
+    // it revived. See OverseerDecisions::GuildLeavesDeathSpot.
     bool LeaveGuildDeathSpot(Player* bot, std::string const& name, int64 now)
     {
+        OverseerDecisions::GuildOutmatchedMark outmatched;
+        {
+            std::lock_guard<std::mutex> lock(g_guildOutmatchedMutex);
+            auto const mark = g_guildOutmatched.find(name);
+            if (mark != g_guildOutmatched.end())
+                outmatched = mark->second;
+        }
+        bool const outmatchedHere = OverseerDecisions::OutmatchedHere(
+            outmatched, now, bot->GetMapId(), bot->GetZoneId(),
+            OverseerDecisions::GUILD_OUTMATCHED_WINDOW_MINUTES);
+        unsigned deathsHere = 0;
         auto const it = _guildDeathMarks.find(name);
-        if (it == _guildDeathMarks.end() || it->second.empty())
+        if (it != _guildDeathMarks.end() && !it->second.empty())
+        {
+            OverseerDecisions::PruneGuildDeathMarks(it->second, now, GHOST_REPEAT_MINUTES);
+            deathsHere = OverseerDecisions::CountGuildDeathsNear(
+                it->second, now, bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(),
+                GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES);
+        }
+        if (!outmatchedHere && !deathsHere)
             return false;
-        OverseerDecisions::PruneGuildDeathMarks(it->second, now, GHOST_REPEAT_MINUTES);
-        unsigned const deathsHere = OverseerDecisions::CountGuildDeathsNear(
-            it->second, now, bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(),
-            GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES);
         uint32 const stone = HearthstoneSpellOf(bot);
         bool const hearthReady = stone && !bot->HasSpellCooldown(stone) && !HearthPendingFor(name);
         if (OverseerDecisions::GuildLeavesDeathSpot(deathsHere, GHOST_RECOVERY_LIMITS.repeatDeaths,
-                                                    hearthReady, bot->IsInCombat()) !=
+                                                    hearthReady, bot->IsInCombat(),
+                                                    outmatchedHere) !=
             OverseerDecisions::GuildDeathSpotStep::Hearth)
             return false;
         char const* status = "error";
@@ -28675,11 +28716,29 @@ private:
         if (!refusal.empty() && said == refusal)
             return false;
         said = refusal;
-        LOG_INFO("module.overseer",
-                 "overseer: '{}' (level {}) has died {} time(s) within {:.0f} yards of where it "
-                 "stands in {}min and hearths out instead of fighting on there{}",
-                 name, bot->GetLevel(), deathsHere, GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES,
-                 refusal.empty() ? std::string() : " - refused: " + refusal);
+        if (outmatchedHere)
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' (level {}) was killed in zone {} by a level {} creature, "
+                     "far above its own level, {}min ago and hearths out after that first death "
+                     "instead of trying again{}",
+                     name, bot->GetLevel(), outmatched.zoneId, outmatched.killerLevel,
+                     (now - outmatched.at) / 60,
+                     refusal.empty() ? std::string() : " - refused: " + refusal);
+        else
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' (level {}) has died {} time(s) within {:.0f} yards of where "
+                     "it stands in {}min and hearths out instead of fighting on there{}",
+                     name, bot->GetLevel(), deathsHere, GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES,
+                     refusal.empty() ? std::string() : " - refused: " + refusal);
+        if (refusal.empty() && outmatchedHere)
+        {
+            // Only the death this hearth answered: one the hook wrote since is
+            // a new death and keeps its own mark.
+            std::lock_guard<std::mutex> lock(g_guildOutmatchedMutex);
+            auto const mark = g_guildOutmatched.find(name);
+            if (mark != g_guildOutmatched.end() && mark->second.at == outmatched.at)
+                g_guildOutmatched.erase(mark);
+        }
         return refusal.empty();
     }
 
@@ -66888,6 +66947,12 @@ private:
         // progress whatever the straight line says; its length sizes the clock.
         OverseerDecisions::RouteMark routeMark{};
         bool routeClockSet{false};
+        // THE ROAD THAT ROUTE TAKES, read once per route (2026-10-10): the
+        // serial of the route last read, and whether it crosses ground far
+        // above the walker. See FarWalkRoadLethal.
+        std::uint64_t roadReadSerial{0};
+        bool roadLethal{false};
+        OverseerDecisions::RouteVerdict road{};
         uint32 legs{0};
         // The last ten second mark a quest party leader's position was logged at.
         uint32 partyPosMark{0};
@@ -67561,6 +67626,48 @@ private:
         auto const hold = HoldsInForce().find(name);
         if (hold != HoldsInForce().end() && OverseerDecisions::HoldYieldsToWalk(hold->second.verb))
             ReleaseHold(name, who, "a walk takes it over", OverseerDecisions::DECK_SETTLE_HOLD_VERB);
+    }
+
+    // THE ROAD A FAR WALK WAS GIVEN, READ ONCE PER ROUTE (2026-10-10). The
+    // survey's route from the walker's place on it, sampled along its own
+    // waypoints (OverseerDecisions::RoadSamplesAlong), the worst creature within
+    // the threat radius of each sample read off spawn data the way the roster
+    // reads a destination's ground, and judged by FarWalkRoadLimits. True when
+    // the road crosses ground far above the walker; the verdict is kept on the
+    // walk for the log and the poll. A walk with no route has nothing to read.
+    //
+    // Measured on the dev realm 2026-10-07 to 10: 51 of 72 times a natural guild
+    // member of 11 to 24 came into Searing Gorge (creatures 43 to 50), it was on
+    // a far walk from Dun Morogh or Loch Modan following the survey's road south.
+    static bool FarWalkRoadLethal(Player* bot, MailWalkEvidence& ev)
+    {
+        if (ev.travel.route.empty() || ev.travel.routeSerial == ev.roadReadSerial)
+            return ev.roadLethal;
+        ev.roadReadSerial = ev.travel.routeSerial;
+        ev.road = OverseerDecisions::RouteVerdict{};
+        ev.roadLethal = false;
+        OverseerDecisions::RoadSamples const road = OverseerDecisions::RoadSamplesAlong(
+            ev.travel.route, ev.travel.routeCursor.at, TRAVEL_WALK_SAMPLE_YARDS,
+            OverseerDecisions::FAR_WALK_ROAD_MAX_SAMPLES);
+        if (road.points.empty())
+            return false;
+        std::vector<std::pair<float, float>> points;
+        points.reserve(road.points.size());
+        for (OverseerDecisions::RoutePoint const& p : road.points)
+            points.emplace_back(p.x, p.y);
+        OverseerDecisions::RouteLimits const limits = OverseerDecisions::FarWalkRoadLimits();
+        std::vector<NearbyThreat> ground;
+        HostileSpawnsNearEach(bot, ev.mapId, points, TRAVEL_THREAT_RADIUS,
+                              bot->GetLevel() + limits.unknownLevelDiff - 1, false, ground);
+        OverseerDecisions::RouteReading reading;
+        reading.characterLevel = bot->GetLevel();
+        reading.sampleSpacingYards = road.spacingYards;
+        reading.worstLevelAtSample.reserve(ground.size());
+        for (NearbyThreat const& threat : ground)
+            reading.worstLevelAtSample.push_back(threat.level);
+        ev.road = OverseerDecisions::JudgeRoute(reading, limits);
+        ev.roadLethal = !ev.road.survivable;
+        return ev.roadLethal;
     }
 
     // Where the next leg of a walk goes, without moving anybody: a straight
@@ -68528,6 +68635,7 @@ private:
             facts.sinceProgressMs = ev.sinceProgressMs;
             facts.groundRefusals = ev.groundRefusals;
             facts.combatMs = ev.combatMs;
+            facts.roadLethal = ev.roadLethal;
 
             D::MailWalkState state = D::JudgeMailWalk(facts);
 
@@ -68724,6 +68832,25 @@ private:
                                  "overseer: guild far walk {} - '{}' has no flight that beats "
                                  "the road to '{}', {:.0f} yards off; it goes on by road (#633)",
                                  check.id, check.targetName, ev.mailboxName, ev.nowYards);
+                    }
+
+                    // THE ROAD ITSELF, after the flight logic's turn (2026-10-10).
+                    // A road through ground far above the walker is not walked:
+                    // the walk stops here and ends on the next poll with
+                    // LethalRoad. See OverseerDecisions::FarWalkRoadLimits.
+                    if (!ev.roadLethal && FarWalkRoadLethal(bot, ev))
+                    {
+                        bot->StopMoving();
+                        LOG_WARN("module.overseer",
+                                 "overseer: guild far walk {} - '{}' (level {}) will not walk "
+                                 "the road to '{}': it crosses ground far above its level, "
+                                 "{:.0f} yards of it unbroken and {:.0f} in all, creatures up "
+                                 "to level {}; with no flight it could take, the walk ends",
+                                 check.id, check.targetName, bot->GetLevel(), ev.mailboxName,
+                                 ev.road.longestLethalRunYards, ev.road.lethalYards,
+                                 ev.road.worstLevel);
+                        still.push_back(check);
+                        continue;
                     }
 
                     // THE MOUNT, by upstream's own `check mount state` action:

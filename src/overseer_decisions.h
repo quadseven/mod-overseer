@@ -17230,6 +17230,8 @@ constexpr char const* LeftMap          = "left the map on the way to the mailbox
 constexpr char const* TookFlight       = "took a flight on the way to the mailbox";
 constexpr char const* TimedOut         = "did not reach the mailbox in time";
 constexpr char const* Stalled          = "stopped getting nearer the mailbox";
+// A far walk's road crosses ground far above the walker's level (FarWalkRoadLimits).
+constexpr char const* LethalRoad       = "the road to the mailbox crosses ground far above its level";
 }  // namespace MailWalkRefusal
 
 // Worth asking again later without changing the row: true for walls that move
@@ -17337,6 +17339,9 @@ enum class MailWalkState
     // arrival and the ground clocks wait for the landing.
     Paused,
     Flying,
+    // A FAR WALK'S ROAD CROSSES GROUND FAR ABOVE THE WALKER (FarWalkRoadLimits):
+    // the walk ends rather than walk it. Not retryable: the ground does not move.
+    LethalRoad,
 };
 
 // What one poll of a walk read. `mailboxInReach` is the core's own gate: a
@@ -17364,6 +17369,10 @@ struct MailWalkFacts
     // How long without progress is a stall. A far walk follows the survey round
     // hills and rivers and is given longer (FAR_WALK_STALL_SECONDS).
     uint32_t stallMs{MAIL_WALK_STALL_SECONDS * 1000u};
+    // The road the far walk was given was read and crosses ground far above the
+    // walker (FarWalkRoadLimits). Set by the adapter after the flight logic's
+    // turn, so a walker that can fly round it flies.
+    bool roadLethal{false};
 };
 
 // THE VERDICT FOR ONE POLL. Leaving the world, dying, a taxi the walk did not
@@ -17513,6 +17522,7 @@ constexpr char const* TrainerLeftMap   = "left the map on the way to the trainer
 constexpr char const* TrainerFlight    = "took a flight on the way to the trainer";
 constexpr char const* TrainerTimedOut  = "did not reach the trainer in time";
 constexpr char const* TrainerStalled   = "stopped getting nearer the trainer";
+constexpr char const* TrainerLethalRoad = "the road to the trainer crosses ground far above its level";
 
 // Endings of a vendor walk that started.
 constexpr char const* VendorCombat     = "entered combat on the way to the vendor";
@@ -17522,6 +17532,7 @@ constexpr char const* VendorLeftMap    = "left the map on the way to the vendor"
 constexpr char const* VendorFlight     = "took a flight on the way to the vendor";
 constexpr char const* VendorTimedOut   = "did not reach the vendor in time";
 constexpr char const* VendorStalled    = "stopped getting nearer the vendor";
+constexpr char const* VendorLethalRoad = "the road to the vendor crosses ground far above its level";
 
 // What a trainer visit that arrived can end with.
 constexpr char const* NothingToLearn   = "the trainer had nothing left to teach that was asked for";
@@ -17654,6 +17665,7 @@ constexpr char const* SpawnLeftMap   = "left the map on the way to the spawn";
 constexpr char const* SpawnFlight    = "took a flight on the way to the spawn";
 constexpr char const* SpawnTimedOut  = "did not reach the spawn in time";
 constexpr char const* SpawnStalled   = "stopped getting nearer the spawn";
+constexpr char const* SpawnLethalRoad = "the road to the spawn crosses ground far above its level";
 }  // namespace SpawnWalkRefusal
 
 // ------------------------------------------ far walks for guild bots (#633) --
@@ -17909,6 +17921,55 @@ struct FarWalkFlightFacts
     uint32_t flights{0};
 };
 bool FarWalkMayAskFlight(FarWalkFlightFacts const& facts);
+
+// ------------------------------------- a far walk reads its road (2026-10-10) --
+//
+// MEASURED ON THE DEV REALM, 2026-10-07 TO 2026-10-10. Natural guild members at
+// levels 11 to 24 died in Searing Gorge (creatures 43 to 50) about 400 times a
+// day. Of 72 times a member came into the gorge from somewhere else, 51 were
+// far walks ending "died on the way to the spawn": a level walk to the Sentinel
+// Hill flight master or a class quest walk to a Stormwind trainer, set off from
+// Dun Morogh or Loch Modan with no flight it knew to take. The travel survey's
+// road between the two halves of the Eastern Kingdoms runs through Searing
+// Gorge and Burning Steppes, and the walk followed it on foot.
+//
+// A player of that level takes the tram or a flight, or does not go. So the
+// walk reads the road it was given before it walks it: the worst creature
+// within the threat radius of points along the route's own waypoints (not the
+// straight line, which is not where a far walk goes), judged by JudgeRoute
+// under FarWalkRoadLimits. A road that fails is not walked. The flight logic
+// has its turn first.
+
+// At most this many samples per road. A longer road is still read end to end,
+// at a wider spacing; at the threat radius of 60 a spacing up to 120 still
+// leaves no gap between the circles read.
+constexpr std::size_t FAR_WALK_ROAD_MAX_SAMPLES = 400;
+
+// The far walk's own copy of the `??` rule (FarWalkRoadLimits): ten levels over,
+// two hundred yards unbroken.
+constexpr uint32_t FAR_WALK_ROAD_LEVEL_GAP = 10;
+constexpr float FAR_WALK_ROAD_LETHAL_RUN_YARDS = 200.f;
+
+struct RoadSamples
+{
+    std::vector<RoutePoint> points;
+    // How much road each sample speaks for: the road's length over the count,
+    // so `points.size() * spacingYards` is exactly the road read.
+    float spacingYards{0.f};
+};
+
+// Points at the middle of equal spacings laid end to end along `route` from
+// waypoint `from` to its end, flat distance, no wider apart than
+// `spacingYards` unless `maxSamples` forces it. Nothing for a route of fewer
+// than two points from `from`, or one of no length.
+RoadSamples RoadSamplesAlong(std::vector<RoutePoint> const& route, std::size_t from,
+                             float spacingYards, std::size_t maxSamples);
+
+// THE SAME `??` RULE THE FAMILY'S DESTINATIONS AND ROUTES ARE JUDGED BY
+// (the values RouteLimits' defaults carry today): ground holding something ten levels above the walker,
+// unbroken for more than two hundred yards. A lone walker in starting gear is
+// weaker than a party, so this refuses only what a party would refuse too.
+RouteLimits FarWalkRoadLimits();
 
 // ---------------------------------------------------------------------------
 // THE DUNGEON RUN TIMELINE (overseer_dungeon_run_event).
@@ -18891,8 +18952,45 @@ enum class GuildDeathSpotStep
     Stay,
     Hearth,
 };
+//
+// OUTMATCHED, ONE DEATH IS ENOUGH (2026-10-10). Whakk, level 20, died in
+// Searing Gorge at 23:20 ET to a level 45 spider and hearthed out at 23:43
+// after seven deaths there; Mok, level 22, died there 152 times in 22 hours.
+// In such ground the member revives at a graveyard hundreds of yards from its
+// corpse, so two deaths within 60 yards of where it stands come late. A member
+// killed by something GUILD_OUTMATCHED_LEVEL_GAP or more levels above it, and
+// standing alive in that zone (`outmatchedHere`, OutmatchedHere), hearths once
+// the stone is ready and it is out of combat, whatever `deathsHere` says.
 GuildDeathSpotStep GuildLeavesDeathSpot(unsigned deathsHere, unsigned repeatDeaths,
-                                        bool hearthReady, bool inCombat);
+                                        bool hearthReady, bool inCombat,
+                                        bool outmatchedHere = false);
+
+// THE `??` CON: ten levels over is a creature the game will not even give a
+// level to, and a fight a member in its own earned gear does not survive.
+constexpr uint32_t GUILD_OUTMATCHED_LEVEL_GAP = 10;
+// How long an outmatched death keeps sending its member home. Longer than the
+// hearthstone's thirty minute cooldown plus a corpse run, so a member whose
+// stone was spent just before still leaves the moment it is ready.
+constexpr uint32_t GUILD_OUTMATCHED_WINDOW_MINUTES = 60;
+
+// Whether a member of `memberLevel` killed by a creature of `killerLevel` was
+// outmatched. An unknown (zero) killer level is not.
+bool OutmatchedDeath(uint32_t memberLevel, uint32_t killerLevel);
+
+// The newest outmatched death of one member, as the death hook saw it.
+struct GuildOutmatchedMark
+{
+    int64_t at{0};          // epoch seconds; 0 is no mark
+    uint32_t mapId{0};
+    uint32_t zoneId{0};
+    uint32_t memberLevel{0};
+    uint32_t killerLevel{0};
+};
+
+// Whether the member still stands where it was outmatched: the same map and
+// zone, inside `windowMinutes` of the death.
+bool OutmatchedHere(GuildOutmatchedMark const& mark, int64_t now, uint32_t mapId,
+                    uint32_t zoneId, uint32_t windowMinutes);
 
 // "corpse_run", "spirit_healer", "wait", "ladder": the words written to
 // overseer_death.ghost_recovery and to the log.
