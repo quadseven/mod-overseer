@@ -20339,6 +20339,42 @@ enum class GuildSeat : std::uint8_t
 // role assignment must not undo that. The tank leads.
 std::uint8_t GuildSeatRoleMask(GuildSeat seat);
 
+// A FAMILY'S TANK OR HEALER IN A GUILD RUN (wow-overseer issue 784). The
+// operator, 2026-10-10: a family's tank and healer may take guild-run seats
+// while their own family has no campaign run going. They are never pulled
+// from a family campaign or a run in progress, and a family campaign about to
+// start takes them back (the bridge's queue waits for them between runs).
+// Before this every family member named in a finder-run row refused the run.
+//
+// A roster member the row names is lent when its family has no campaign armed
+// or running (InAFamilyCampaign: a dungeon job, the town hold, a coordinator
+// past idle, a stand-in guest), it sits in the tank or healer seat, and it is
+// not its family's head: the head's followers keep it as their master, so it
+// stays with them. A lent member leaves its family's party for the run (as a
+// member sitting out does) and the one-group rule takes it back once the run
+// is over.
+enum class GuildFinderFamilySeat : std::uint8_t
+{
+    NotFamily,  // not on the roster: seated as any guildmate
+    Lent,       // on the roster and free to take this seat
+    Campaign,   // its family's campaign is armed or running
+    Head,       // it heads its family's party
+    DamageSeat, // a family member is lent to a tank or healer seat only
+};
+
+struct GuildFinderFamilyFacts
+{
+    bool onRoster{false};
+    bool head{false};
+    bool familyCampaign{false};
+    GuildSeat seat{GuildSeat::Damage};
+};
+
+GuildFinderFamilySeat GuildFinderFamilySeatOf(GuildFinderFamilyFacts const& facts);
+
+// Why the run is refused over this member, or "" for NotFamily and Lent.
+char const* GuildFinderFamilySeatWord(GuildFinderFamilySeat seat);
+
 // Once the group is inside, read every poll until the run is over.
 struct GuildRunPoll
 {

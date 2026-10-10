@@ -8279,6 +8279,11 @@ private:
             {
                 if (standin && member.name == standin->outName)
                     continue;
+                // A MEMBER LENT TO A GUILD RUN (wow-overseer issue 784) is not
+                // grouped, followed or pulled back either: the run is never
+                // left mid-way, and this takes it back the poll after it ends.
+                if (InAGuildRun(member.name))
+                    continue;
                 // Present means playing: on camera (#131), or headless because
                 // Overseer.HeadlessRoster says this one is played unwatched. A
                 // roster character in the world with NEITHER is on its way out
@@ -38481,6 +38486,52 @@ private:
     };
     std::vector<GuildRun> _guildRuns;
 
+    // Is `name` one of a guild run's five right now (queued, inside or on its
+    // way out)? A family member lent to one (wow-overseer issue 784) is the
+    // run's until it ends, so the one-group rule leaves it out meanwhile.
+    bool InAGuildRun(std::string const& name) const
+    {
+        for (GuildRun const& run : _guildRuns)
+            if (std::find(run.names.begin(), run.names.end(), name) != run.names.end())
+                return true;
+        return false;
+    }
+
+    // Does `p` stand in its own family's party: a group the core does not own
+    // (no battleground, battlefield or finder group), led by a member of the
+    // same family? A lent member leaves only that one for a guild run.
+    static bool InItsFamilyParty(Player* p, std::string const& family)
+    {
+        Group* const group = p ? p->GetGroup() : nullptr;
+        if (!group || group->isBGGroup() || group->isBFGroup() || group->isLFGGroup())
+            return false;
+        std::string const leader = group->GetLeaderName();
+        return OnRoster(leader) && FamilyOfCharacter(leader) == family;
+    }
+
+    // THE LENT MEMBER LEAVES ITS FAMILY'S PARTY, the way a player types
+    // /leave, and stops following its family (as SendSittingOutMemberOff does
+    // for a member sitting out). The one-group rule takes it back once its
+    // guild run is over (KeepRosterGrouped skips it until then). False when
+    // the core kept it in the party.
+    bool SendLentMemberOff(Player* p, std::string const& family, uint32 runId,
+                           OverseerDecisions::GuildSeat seat)
+    {
+        if (PlayerbotAI* const ai = GET_PLAYERBOT_AI(p))
+            if (Player* const master = ai->GetMaster(); master && master != p &&
+                OnRoster(master->GetName()) && FamilyOfCharacter(master->GetName()) == family)
+                ai->SetMaster(nullptr);
+        if (InItsFamilyParty(p, family))
+            p->RemoveFromGroup(GROUP_REMOVEMETHOD_LEAVE);
+        if (p->GetGroup())
+            return false;
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' of the family of '{}' leaves its family's party for guild "
+                 "run {} as its {}; its family has no campaign going",
+                 p->GetName(), family, runId, GuildSeatWord(seat));
+        return true;
+    }
+
     // Groups a restarted worldserver left behind: the finder group persists in
     // the database, its dungeon-clear flag and this module's memory do not.
     struct GuildRunStray
@@ -38637,13 +38688,33 @@ private:
         if (!anchor)
             return refuse("every member of the row is a pug");
         std::vector<Player*> players;
-        for (std::string const& name : names)
+        // A FAMILY'S TANK OR HEALER WHILE ITS FAMILY IS IDLE (wow-overseer
+        // issue 784): each one the row seats, with its family, leaves its
+        // family's party once every member has passed every check below.
+        std::vector<std::pair<Player*, std::string>> lent;
+        for (std::size_t i = 0; i < names.size(); ++i)
         {
+            std::string const& name = names[i];
             Player* const p = ObjectAccessor::FindPlayerByName(name);
             if (!p || !p->IsInWorld() || !p->GetSession())
                 return refuse("'" + name + "' is not in the world");
-            if (OnRoster(name))
-                return refuse("'" + name + "' is a family member, which its own campaign directs");
+            OverseerDecisions::GuildFinderFamilyFacts family;
+            std::string familyHead;
+            family.onRoster = OnRoster(name);
+            if (family.onRoster)
+            {
+                familyHead = FamilyOfCharacter(name);
+                // A roster with no family column cannot name its head, so
+                // nobody of it is lent.
+                family.head = familyHead.empty() || familyHead == name;
+                family.familyCampaign = InAFamilyCampaign(name);
+                family.seat = seats[i];
+            }
+            OverseerDecisions::GuildFinderFamilySeat const familySeat =
+                OverseerDecisions::GuildFinderFamilySeatOf(family);
+            if (char const* wall = OverseerDecisions::GuildFinderFamilySeatWord(familySeat); *wall)
+                return refuse("'" + name + "' " + wall);
+            bool const isLent = familySeat == OverseerDecisions::GuildFinderFamilySeat::Lent;
             if (IsStandinGuest(name))
                 return refuse("'" + name + "' stands in for a family member, and that family's "
                               "campaign directs it");
@@ -38672,7 +38743,9 @@ private:
                 return refuse("'" + name + "' is in combat");
             if (p->GetMap() && p->GetMap()->Instanceable())
                 return refuse("'" + name + "' is inside an instance or a battleground");
-            if (p->GetGroup())
+            // A lent member stands in its family's party, which it leaves for
+            // the run below; any other group refuses it as before.
+            if (p->GetGroup() && !(isLent && InItsFamilyParty(p, familyHead)))
                 return refuse("'" + name + "' is already in a group");
             if (sLFGMgr->GetState(p->GetGUID()) != lfg::LFG_STATE_NONE)
                 return refuse("'" + name + "' is already in the dungeon finder");
@@ -38689,7 +38762,14 @@ private:
                 return refuse("'" + name + "' is locked out of it (" +
                               OverseerDecisions::FinderLockWord(lock->second) + ")");
             players.push_back(p);
+            if (isLent)
+                lent.emplace_back(p, familyHead);
         }
+
+        for (std::size_t i = 0; i < players.size(); ++i)
+            for (auto const& loan : lent)
+                if (loan.first == players[i] && !SendLentMemberOff(loan.first, loan.second, id, seats[i]))
+                    return refuse("'" + names[i] + "' could not leave its family's party");
 
         // THE PARTY, AS AN ACCEPTED INVITE MAKES IT (GroupHandler.cpp,
         // HandleGroupAcceptOpcode: Create the leader's group, then AddMember).
