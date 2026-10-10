@@ -8300,6 +8300,10 @@ struct CrossingMember
     // deck its master stands on from sixty yards, and a follower further away
     // than that is left on the pier. Zero for the leader himself.
     float leaderDistance{0.f};
+    // SAME-MAP RIDES ONLY (CrossingWorld::sameMap): not aboard and standing at
+    // the landing berth of the stop it rode to. On one map `mapId` cannot say
+    // which end a walker is at, so the adapter says it.
+    bool atLanding{false};
 };
 
 // What the adapter could establish about the crossing itself. Every field is a
@@ -8341,6 +8345,12 @@ struct CrossingWorld
     // deck that is moving.
     bool dockedAtOrigin{false};
     bool dockedAtDestination{false};
+    // THE RIDE NEVER LEAVES THE MAP (the Undercity to Grom'gol zeppelin): origin
+    // and destination are one map and the two ends are two stops of one
+    // transport. A walker is then at the far end when it stands at the landing
+    // berth (CrossingMember::atLanding), and a passenger is at the far end when
+    // the transport is docked at the destination stop.
+    bool sameMap{false};
     // How much of that stop is left, in milliseconds. Meaningless unless one of
     // the two above is true.
     std::uint32_t dwellLeftMs{0};
@@ -8740,6 +8750,29 @@ StrandedWay DecideStrandedWay(StrandedFacts const& facts);
 // passenger already beside ground off the deck of a docked transport.
 bool ShouldLeaveDeck(bool stillAboard, bool transportDocked, float yardsToGround,
                      float landedYards);
+
+// WHERE A PASSENGER STEPS OFF A DOCKED DECK, AND WHY THE FIRST DRY POINT IS NOT
+// ENOUGH. A surveyed landing the map does not put on the transport can still sit
+// on the hull's edge: on the dev realm on 2026-10-10 a member was walked 26
+// yards off the Theramore boat to a landing 0.4 yards away, the transport let go
+// of it (ShouldLeaveDeck) on five polls running, and it was still a passenger
+// when the boat cast off and carried it back to Menethil. Twenty-five crossings
+// of 427 ended in that ping-pong. So a landing is judged on its neighbours too,
+// and a landing that did not hold is not tried twice.
+struct LandingProbe
+{
+    // The map puts the landing itself on the transport.
+    bool onDeck{false};
+    // The map puts any point of a ring round the landing on the transport: the
+    // landing is at the hull's edge, not clear of it.
+    bool hullBeside{false};
+};
+
+// The index of the landing to walk to: the nearest one off the deck with the
+// hull clear of it, after skipping `failedHolds` of those (each a landing a
+// passenger stood at and was still carried away from); failing every such
+// landing, the nearest one merely off the deck. -1 when the deck covers them all.
+int PickLanding(std::vector<LandingProbe> const& landings, unsigned failedHolds);
 
 // The verdict as one sentence, for the log line that says it.
 std::string StrandedWayExplanation(StrandedFacts const& facts, StrandedWay way);
@@ -22393,6 +22426,22 @@ char const* PartyEndsWord(PartyEnds ends);
 // "retry":true|false,"map":<destination map>,"steps":<drive polls spent>}.
 constexpr char CROSS_VERB[] = "cross-to-map";
 
+// THE SAME-MAP RIDE (the Undercity to Grom'gol zeppelin, which never leaves
+// map 0, so `cross-to-map` has nothing to name):
+//
+//   kind='job'  ride-to-stop map:<map id> x:<x> y:<y>
+//
+// The map is the one the member stands on; x and y are any point of the stop it
+// wants to reach (the dock's tower, say). The module picks the stop of the
+// member's transport nearest that point, walks the member to the berth of the
+// stop nearest ITSELF, boards, rides, and walks off at the landing, exactly as
+// the crossing does. Same result JSON, same refusals, same cap.
+constexpr char RIDE_VERB[] = "ride-to-stop";
+// A member this near the destination point is there: the ride is not taken.
+constexpr float RIDE_ALREADY_THERE_YARDS = 150.0f;
+// A walker this near the landing berth, off every transport, has arrived.
+constexpr float RIDE_ASHORE_YARDS = 25.0f;
+
 // Crossings under way on the realm at once (Overseer.Cross.AtOnce).
 constexpr unsigned CROSS_AT_ONCE = 2;
 // Walks to the berth a crossing may start before it gives up on the ground.
@@ -22406,15 +22455,20 @@ struct CrossRequest
 {
     char const* error{""};
     std::uint32_t map{0};
+    // `ride-to-stop`: the stop to reach, as a point of it, on `map` itself.
+    bool ride{false};
+    float x{0.f};
+    float y{0.f};
 };
 
-// Exactly `cross-to-map map:<digits>`, at most five digits. Map 0 is a map.
+// Exactly `cross-to-map map:<digits>`, at most five digits (map 0 is a map), or
+// exactly `ride-to-stop map:<digits> x:<number> y:<number>`.
 CrossRequest ParseCrossRequest(std::string const& command);
 
 namespace CrossRefusal
 {
 constexpr char const* Malformed =
-    "a cross-to-map row is: cross-to-map map:<map id>";
+    "a cross-to-map row is: cross-to-map map:<map id>, or ride-to-stop map:<map id> x:<x> y:<y>";
 constexpr char const* Disabled        = "crossing is off (Overseer.Cross.Enable)";
 constexpr char const* NotABot         = "the character is not a bot";
 constexpr char const* NotInWorld      = "the character is not in the world";
@@ -22423,6 +22477,7 @@ constexpr char const* InCombat        = "the character is in combat";
 constexpr char const* InInstance      = "the character is in an instance";
 constexpr char const* InFlight        = "the character is in flight";
 constexpr char const* AlreadyThere    = "the character is already on that map";
+constexpr char const* AlreadyAtStop   = "the character is already at that stop";
 constexpr char const* AlreadyCrossing = "the character is already crossing";
 constexpr char const* Busy =
     "the character is on a walk or held by another job";
@@ -22450,6 +22505,9 @@ struct CrossFacts
     bool inInstance{false};
     bool inFlight{false};
     bool onTargetMap{false};
+    // The row is a same-map ride, and `onTargetMap` then means the member
+    // already stands at the stop it asked for.
+    bool rideRequest{false};
     bool alreadyCrossing{false};
     // A walk of another verb is under way, or another verb's hold stands.
     bool busy{false};

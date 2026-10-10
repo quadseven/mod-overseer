@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
 
 #include <iterator>
@@ -6602,12 +6603,23 @@ CrossingStep ReadCrossing(CrossingWorld const& world,
         }
         ++step.readable;
 
+        // WHICH END A WALKER IS AT. Two maps say it by the map; a ride on one
+        // map says it by the landing (CrossingMember::atLanding), and a
+        // passenger on one map is at the far end while the transport is docked
+        // there.
+        bool const here = !world.sameMap || m.mapId == world.originMap;
+        bool const onDestination =
+            world.sameMap ? (here && (m.aboard ? world.dockedAtDestination : m.atLanding))
+                          : m.mapId == world.destinationMap;
+        bool const onOrigin = !m.aboard && m.mapId == world.originMap &&
+                              !(world.sameMap && m.atLanding);
+
         if (m.isLeader)
         {
             step.leaderReadable = true;
             step.leaderAboard = m.aboard;
-            step.leaderOnOrigin = !m.aboard && m.mapId == world.originMap;
-            step.leaderOnDestination = m.mapId == world.destinationMap;
+            step.leaderOnOrigin = onOrigin;
+            step.leaderOnDestination = onDestination;
             step.leaderAtBerth = step.leaderOnOrigin &&
                                  m.berthDistance <= limits.berthArrivedYards;
         }
@@ -6626,12 +6638,12 @@ CrossingStep ReadCrossing(CrossingWorld const& world,
         if (m.aboard)
         {
             ++step.aboard;
-            if (m.mapId == world.destinationMap)
+            if (onDestination)
                 ++step.stillAboard;
             continue;
         }
 
-        if (m.mapId == world.destinationMap)
+        if (onDestination)
             ++step.ashore;
         else if (m.mapId == world.originMap)
             ++step.waiting;
@@ -6651,7 +6663,7 @@ CrossingStep ReadCrossing(CrossingWorld const& world,
     // 2. THE CROSSING ITSELF, BEFORE ANY STEP ALONG IT. A crossing between one
     //    map and itself is a caller bug rather than a finished crossing, and
     //    answering Done would hide it.
-    if (world.originMap == world.destinationMap)
+    if (world.originMap == world.destinationMap && !world.sameMap)
     {
         step.leg = CrossingLeg::Unknown;
         step.action = CrossingAction::Refuse;
@@ -7227,6 +7239,26 @@ bool ShouldLeaveDeck(bool stillAboard, bool transportDocked, float yardsToGround
 {
     return stillAboard && transportDocked && yardsToGround >= 0.f &&
            yardsToGround <= landedYards;
+}
+
+int PickLanding(std::vector<LandingProbe> const& landings, unsigned failedHolds)
+{
+    unsigned skip = failedHolds;
+    for (std::size_t i = 0; i < landings.size(); ++i)
+    {
+        if (landings[i].onDeck || landings[i].hullBeside)
+            continue;
+        if (skip)
+        {
+            --skip;
+            continue;
+        }
+        return static_cast<int>(i);
+    }
+    for (std::size_t i = 0; i < landings.size(); ++i)
+        if (!landings[i].onDeck)
+            return static_cast<int>(i);
+    return -1;
 }
 
 StrandedWay DecideStrandedWay(StrandedFacts const& f)
@@ -19991,29 +20023,70 @@ char const* PartyEndsWord(PartyEnds ends)
 bool IsCrossRow(std::string const& command)
 {
     std::vector<std::string> const words = GuildFinderWords(command);
-    return !words.empty() && words[0] == CROSS_VERB;
+    return !words.empty() && (words[0] == CROSS_VERB || words[0] == RIDE_VERB);
 }
+
+namespace
+{
+
+// "key:" then at most five digits.
+bool CrossMapWord(std::string const& word, std::uint32_t& map)
+{
+    if (word.compare(0, 4, "map:") != 0)
+        return false;
+    std::string const digits = word.substr(4);
+    if (digits.empty() || digits.size() > 5 ||
+        digits.find_first_not_of("0123456789") != std::string::npos)
+        return false;
+    map = 0;
+    // At most five digits, so this cannot overflow, and it cannot throw.
+    for (char c : digits)
+        map = map * 10 + static_cast<std::uint32_t>(c - '0');
+    return true;
+}
+
+// "x:" or "y:" then an optionally negative decimal of at most nine characters.
+bool CrossCoordWord(std::string const& word, char key, float& value)
+{
+    if (word.size() < 3 || word[0] != key || word[1] != ':')
+        return false;
+    std::string const text = word.substr(2);
+    if (text.size() > 9)
+        return false;
+    std::size_t at = text[0] == '-' ? 1 : 0;
+    std::size_t digits = 0;
+    bool dot = false;
+    for (; at < text.size(); ++at)
+    {
+        if (text[at] == '.' && !dot && digits)
+            dot = true;
+        else if (text[at] >= '0' && text[at] <= '9')
+            ++digits;
+        else
+            return false;
+    }
+    if (!digits || text.back() == '.')
+        return false;
+    value = std::strtof(text.c_str(), nullptr);
+    return true;
+}
+
+}  // namespace
 
 CrossRequest ParseCrossRequest(std::string const& command)
 {
     CrossRequest out;
     std::vector<std::string> const words = GuildFinderWords(command);
-    char const prefix[] = "map:";
-    if (words.size() != 2 || words[0] != CROSS_VERB || words[1].compare(0, 4, prefix) != 0)
+    if (words.size() == 2 && words[0] == CROSS_VERB && CrossMapWord(words[1], out.map))
+        return out;
+    if (words.size() == 4 && words[0] == RIDE_VERB && CrossMapWord(words[1], out.map) &&
+        CrossCoordWord(words[2], 'x', out.x) && CrossCoordWord(words[3], 'y', out.y))
     {
-        out.error = CrossRefusal::Malformed;
+        out.ride = true;
         return out;
     }
-    std::string const digits = words[1].substr(4);
-    if (digits.empty() || digits.size() > 5 ||
-        digits.find_first_not_of("0123456789") != std::string::npos)
-    {
-        out.error = CrossRefusal::Malformed;
-        return out;
-    }
-    // At most five digits, so this cannot overflow, and it cannot throw.
-    for (char c : digits)
-        out.map = out.map * 10 + static_cast<std::uint32_t>(c - '0');
+    out = CrossRequest{};
+    out.error = CrossRefusal::Malformed;
     return out;
 }
 
@@ -20035,7 +20108,7 @@ char const* CrossGate(CrossFacts const& f)
     if (f.inFlight)
         return R::InFlight;
     if (f.onTargetMap)
-        return R::AlreadyThere;
+        return f.rideRequest ? R::AlreadyAtStop : R::AlreadyThere;
     if (f.alreadyCrossing)
         return R::AlreadyCrossing;
     if (f.busy)

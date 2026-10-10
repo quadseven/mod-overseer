@@ -1469,6 +1469,20 @@ constexpr float CROSSING_WALK_OFF_REACH_YARDS = 80.0f;
 // How long the hold lets a step on or off the deck run before the sweep may
 // re-take the slot. Eighty yards at run speed is under twelve seconds.
 constexpr uint32 CROSSING_STEP_WALK_SECONDS = 15;
+// THE STEP ABOARD IS TAKEN FROM THE BERTH ITSELF. A crossing reads "at the
+// berth" from twelve yards out (CROSSING_BERTH_ARRIVED_YARDS), and on the dev
+// realm on 2026-10-10 a member stepped aboard the Menethil boat from 11.6 and
+// 12.5 yards and was found 28 yards from the berth and not aboard twenty
+// seconds later, both times; the one stepped from 7.8 yards sailed. A walker
+// waiting for the boat, or about to board, closes to this first.
+constexpr float CROSSING_BOARD_FROM_BERTH_YARDS = 4.0f;
+// Polls a job spends closing on the berth before it boards from where it stands.
+constexpr uint32 CROSSING_BOARD_APPROACH_TRIES = 6;
+// A landing is clear of the hull when none of the ring of points this far round
+// it is on the transport (OverseerDecisions::PickLanding).
+constexpr float CROSSING_HULL_CLEAR_YARDS = 3.0f;
+// The landings looked at when stepping off, nearest the mooring first.
+constexpr std::size_t CROSSING_LANDINGS_PROBED = 24;
 // Within this of the ground he was stepped to, he has stepped. Two yards, the
 // slack a spline stop leaves (HOLD_PIN_SLACK_YARDS is one) and well inside a
 // pier's width.
@@ -15678,15 +15692,17 @@ private:
     // sense infra#68 asks for, and it costs nothing extra: a creature that is
     // not a flight master simply fails the HasNpcFlag check below and this is
     // a no-op.
-    void DiscoverFlightPointOnArrival(std::string const& name, Player* bot, uint32 entry)
+    void DiscoverFlightPointOnArrival(std::string const& name, Player* bot, uint32 entry,
+                                      float range = TRAVEL_ARRIVED_YARDS)
     {
         if (!entry)
             return;   // an `at:`/`trigger:` aim names no creature to check
 
-        // Same radius DriveTravel already measured "arrived" against, and the
-        // same call TrainOnArrival uses above to turn a spawn point back into
-        // the live creature standing near it.
-        Creature* npc = bot->FindNearestCreature(entry, TRAVEL_ARRIVED_YARDS);
+        // Same radius DriveTravel already measured "arrived" against (or the
+        // caller's, for a walk that arrives by its own radius), and the same
+        // call TrainOnArrival uses above to turn a spawn point back into the
+        // live creature standing near it.
+        Creature* npc = bot->FindNearestCreature(entry, range);
         if (!npc || !npc->IsAlive())
             return;
 
@@ -40881,18 +40897,47 @@ private:
     // transport to ask, nothing says any point is on it, and the first wins.
     static bool GroundOffTheDeck(Player* who, Transport* transport,
                                  std::vector<OverseerDecisions::BerthCandidate> const& points,
-                                 float& outX, float& outY, float& outZ)
+                                 unsigned failedHolds, float& outX, float& outY, float& outZ)
     {
-        for (OverseerDecisions::BerthCandidate const& p : points)
+        if (points.empty())
+            return false;
+        int pick = 0;
+        if (transport)
         {
-            if (transport && MapSaysOnTransport(who, transport, p.x, p.y, p.z))
-                continue;
-            outX = p.x;
-            outY = p.y;
-            outZ = p.z;
-            return true;
+            // JUDGED ON ITS NEIGHBOURS TOO (OverseerDecisions::PickLanding): a
+            // landing the map calls dry can sit on the hull's edge, and a
+            // passenger stood there is a passenger still when the boat sails.
+            std::vector<OverseerDecisions::LandingProbe> probes;
+            std::size_t const looked = std::min(points.size(), CROSSING_LANDINGS_PROBED);
+            for (std::size_t i = 0; i < looked; ++i)
+            {
+                OverseerDecisions::BerthCandidate const& c = points[i];
+                OverseerDecisions::LandingProbe probe;
+                probe.onDeck = MapSaysOnTransport(who, transport, c.x, c.y, c.z);
+                if (!probe.onDeck)
+                {
+                    // Eight points round the landing, as literals (M_PI is a
+                    // POSIX extension this file does not lean on).
+                    static constexpr float RING[8][2] = {
+                        {1.f, 0.f},         {0.7071f, 0.7071f},   {0.f, 1.f},
+                        {-0.7071f, 0.7071f}, {-1.f, 0.f},          {-0.7071f, -0.7071f},
+                        {0.f, -1.f},        {0.7071f, -0.7071f}};
+                    for (auto const& dir : RING)
+                        if (!probe.hullBeside)
+                            probe.hullBeside = MapSaysOnTransport(
+                                who, transport, c.x + dir[0] * CROSSING_HULL_CLEAR_YARDS,
+                                c.y + dir[1] * CROSSING_HULL_CLEAR_YARDS, c.z);
+                }
+                probes.push_back(probe);
+            }
+            pick = OverseerDecisions::PickLanding(probes, failedHolds);
+            if (pick < 0)
+                return false;
         }
-        return false;
+        outX = points[static_cast<std::size_t>(pick)].x;
+        outY = points[static_cast<std::size_t>(pick)].y;
+        outZ = points[static_cast<std::size_t>(pick)].z;
+        return true;
     }
 
     // THE STEP OFF A DECK, OR BACK OFF IT AT THE ORIGIN. Upstream's straight
@@ -40907,7 +40952,15 @@ private:
                          std::vector<OverseerDecisions::BerthCandidate> const& points)
     {
         float x = 0.f, y = 0.f, z = 0.f;
-        if (!GroundOffTheDeck(who, transport, points, x, y, z))
+        // A LANDING THE TRANSPORT LET GO OF AND TOOK BACK IS NOT TRIED A THIRD
+        // TIME: the first release is the ordinary step off, a second means the
+        // map still put the walker on the deck there, and every one after it
+        // moves the walker on to the next landing clear of the hull.
+        unsigned& releases = _stepOffReleases[who->GetName()];
+        if (!who->GetTransport())
+            releases = 0;
+        unsigned const failedHolds = releases > 1 ? releases - 1 : 0;
+        if (!GroundOffTheDeck(who, transport, points, failedHolds, x, y, z))
             return -1.f;
         float const yards = who->GetExactDist2d(x, y);
         if (yards > CROSSING_WALK_OFF_REACH_YARDS)
@@ -40922,11 +40975,13 @@ private:
                                  who->GetTransport() == transport, true, yards,
                                  CROSSING_LANDED_YARDS))
             {
+                ++releases;
                 transport->RemovePassenger(who);
                 LOG_INFO("module.overseer",
                          "overseer: '{}' steps off '{}' onto the dock, {:.1f} yards from "
-                         "surveyed ground - the transport lets go of it here (#274)",
-                         who->GetName(), transport->GetName(), yards);
+                         "surveyed ground - the transport lets go of it here (release {}; a "
+                         "second one moves it to the next landing clear of the hull) (#274)",
+                         who->GetName(), transport->GetName(), yards, releases);
             }
             return yards;
         }
@@ -40975,7 +41030,8 @@ private:
     int PriceCrossingTransports(Player* leader, uint32 originMap, uint32 destinationMap,
                                 float goalX, float goalY, uint32 incumbent,
                                 std::vector<CrossingTransportInfo const*>& serving,
-                                std::vector<std::pair<int, int>>& stops, std::string& said)
+                                std::vector<std::pair<int, int>>& stops, std::string& said,
+                                bool sameMap = false, float fromX = 0.f, float fromY = 0.f)
     {
         serving.clear();
         stops.clear();
@@ -40986,10 +41042,12 @@ private:
         {
             if (!info.mapsUsed.count(originMap) || !info.mapsUsed.count(destinationMap))
                 continue;
-            int const from = StopOnMap(info, originMap, leader->GetPositionX(),
-                                       leader->GetPositionY());
+            // A RIDE ON ONE MAP BOARDS AT THE STOP NEAREST WHERE IT STARTED, not
+            // where the passenger is now: aboard, it is carried past the others.
+            int const from = StopOnMap(info, originMap, sameMap ? fromX : leader->GetPositionX(),
+                                       sameMap ? fromY : leader->GetPositionY());
             int const to = StopOnMap(info, destinationMap, goalX, goalY);
-            if (from < 0 || to < 0)
+            if (from < 0 || to < 0 || (sameMap && from == to))
                 continue;
             CrossingStopInfo const& a = info.stops[from];
             CrossingStopInfo const& b = info.stops[to];
@@ -41096,11 +41154,13 @@ private:
                                         std::vector<std::string> const& members,
                                         std::string const& leaderName, Player* leader,
                                         uint32 originMap, uint32 destinationMap,
-                                        float goalX, float goalY)
+                                        float goalX, float goalY, bool sameMap = false,
+                                        float fromX = 0.f, float fromY = 0.f)
     {
         CrossingRoute route;
         route.world.originMap = originMap;
         route.world.destinationMap = destinationMap;
+        route.world.sameMap = sameMap;
 
         // A CROSSING IS THE SAME CROSSING WHILE BOTH ITS ENDS ARE, and only
         // then does it keep the transport it chose.
@@ -41109,11 +41169,12 @@ private:
                                   coord.crossingDestinationMap == destinationMap;
         std::vector<CrossingTransportInfo const*> serving;
         std::vector<std::pair<int, int>> stops;
-        int const pick = leader && originMap != destinationMap
+        int const pick = leader && (originMap != destinationMap || sameMap)
                              ? PriceCrossingTransports(leader, originMap, destinationMap, goalX,
                                                        goalY,
                                                        sameCrossing ? coord.crossingRouteEntry : 0,
-                                                       serving, stops, route.priced)
+                                                       serving, stops, route.priced, sameMap,
+                                                       fromX, fromY)
                              : -1;
 
         coord.crossingOriginMap = originMap;
@@ -41209,6 +41270,21 @@ private:
                 riding = onBoard->ToMotionTransport();
             member.aboard = riding && route.transportEntry &&
                             riding->GetEntry() == route.transportEntry;
+
+            // A RIDE ON ONE MAP: AT THE LANDING is within the ashore radius of
+            // its berth, or standing on one of the landings the walk off picks
+            // from, and off every transport.
+            if (sameMap && !member.aboard && route.world.landingKnown &&
+                member.mapId == originMap &&
+                std::fabs(p->GetPositionZ() - route.landingZ) <= TRAVEL_ARRIVED_VERTICAL_YARDS)
+            {
+                member.atLanding =
+                    p->GetDistance2d(route.landingX, route.landingY) <=
+                    OverseerDecisions::RIDE_ASHORE_YARDS;
+                for (OverseerDecisions::BerthCandidate const& c : route.landings)
+                    if (!member.atLanding && std::fabs(p->GetPositionZ() - c.z) <= CROSSING_DECK_STEP_YARDS)
+                        member.atLanding = p->GetDistance2d(c.x, c.y) <= CROSSING_LANDED_YARDS + 1.f;
+            }
 
             // MEANINGLESS UNLESS THERE IS A BERTH AND THIS MEMBER IS ON ITS
             // MAP, and zero rather than a stale number in every other case,
@@ -42049,8 +42125,21 @@ private:
         uint32 jobWalks{0};
         uint32 jobFineSteps{0};
         bool jobSaidForeignWalk{false};
+        // A `ride-to-stop` ROW: a crossing between two stops of one map. The
+        // point of the stop it rides to, and where the member stood when the
+        // row started, which fixes the stop it boards at while the transport
+        // carries it past the others.
+        uint32 boardApproaches{0};
+        bool rideSameMap{false};
+        float rideX{0.f};
+        float rideY{0.f};
+        float rideFromX{0.f};
+        float rideFromY{0.f};
     };
     std::map<std::string, LoneCrossing> _loneCrossings;
+    // How many times the transport has let go of a walker at a landing, per
+    // character, for the crossing under way (see StepOntoGround).
+    std::map<std::string, unsigned> _stepOffReleases;
 
     // A job's crossing reads its member through the bot AI; every other
     // memo (a family's coordinator, a stranded member) through Steerable.
@@ -42087,6 +42176,7 @@ private:
         if (memo == _loneCrossings.end())
             return;
         _loneCrossings.erase(memo);
+        _stepOffReleases.erase(name);
         Player* const p = ObjectAccessor::FindPlayerByName(name);
         auto const escort = _dungeonEscorts.find(name);
         if (escort != _dungeonEscorts.end() && escort->second.crossing)
@@ -42730,7 +42820,12 @@ private:
         facts.inCombat = who->IsInCombat();
         facts.inInstance = map && map->Instanceable();
         facts.inFlight = who->IsInFlight();
-        facts.onTargetMap = who->GetMapId() == request.map;
+        facts.rideRequest = request.ride;
+        facts.onTargetMap =
+            request.ride ? (who->GetMapId() == request.map &&
+                            who->GetExactDist2d(request.x, request.y) <=
+                                D::RIDE_ALREADY_THERE_YARDS)
+                         : who->GetMapId() == request.map;
         facts.alreadyCrossing = CrossingAlone(name) || IsCrossingAlone(name);
         {
             auto const& holds = HoldsInForce();
@@ -42746,9 +42841,15 @@ private:
             std::vector<CrossingTransportInfo const*> serving;
             std::vector<std::pair<int, int>> stops;
             std::string priced;
+            // A ride is on the member's own map, so a row naming another map has
+            // no ride to price.
             facts.routeKnown =
-                PriceCrossingTransports(who, who->GetMapId(), request.map, 0.f, 0.f, 0, serving,
-                                        stops, priced) >= 0;
+                (!request.ride || who->GetMapId() == request.map) &&
+                PriceCrossingTransports(who, who->GetMapId(), request.map,
+                                        request.ride ? request.x : 0.f,
+                                        request.ride ? request.y : 0.f, 0, serving, stops, priced,
+                                        request.ride, who->GetPositionX(),
+                                        who->GetPositionY()) >= 0;
             if (!facts.routeKnown)
                 LOG_INFO("module.overseer",
                          "overseer: cross-to-map {} for '{}' from map {} to map {} - priced: {}",
@@ -42763,10 +42864,19 @@ private:
         started.jobRow = id;
         started.jobStart = std::time(nullptr);
         started.jobTouched = started.jobStart;
+        started.rideSameMap = request.ride;
+        started.rideX = request.x;
+        started.rideY = request.y;
+        started.rideFromX = who->GetPositionX();
+        started.rideFromY = who->GetPositionY();
         _loneCrossings[name] = started;
         LOG_INFO("module.overseer",
-                 "overseer: cross-to-map {} - '{}' sets out from map {} for map {}; up to {}s",
-                 id, name, who->GetMapId(), request.map, CROSSING_BACKSTOP_SECONDS);
+                 "overseer: cross-to-map {} - '{}' sets out from map {} for {}{}; up to {}s",
+                 id, name, who->GetMapId(),
+                 request.ride ? std::string("the stop at (") + std::to_string(int(request.x)) +
+                                    ", " + std::to_string(int(request.y)) + ") on map "
+                              : std::string("map "),
+                 request.map, CROSSING_BACKSTOP_SECONDS);
         status = "verifying";
         return "";
     }
@@ -42833,8 +42943,10 @@ private:
                                      memo.crossingDestinationMap;
         CrossingRoute route = ReadCrossingFromWorld(
             memo, std::vector<std::string>{name}, name, p, memo.crossingOriginMap,
-            memo.crossingDestinationMap, leaderThere ? goalX : 0.f,
-            leaderThere ? goalY : 0.f);
+            memo.crossingDestinationMap,
+            memo.rideSameMap ? memo.rideX : (leaderThere ? goalX : 0.f),
+            memo.rideSameMap ? memo.rideY : (leaderThere ? goalY : 0.f), memo.rideSameMap,
+            memo.rideFromX, memo.rideFromY);
         if (memo.crossingSince &&
             std::time(nullptr) - memo.crossingSince > time_t(CROSSING_BACKSTOP_SECONDS))
             route.world.overdue = true;
@@ -42921,7 +43033,10 @@ private:
 
             case OverseerDecisions::CrossingAction::Hold:
                 holdIt();
-                if (!LevelWithBerth(p, route))
+                // WAITING FOR THE BOAT IS WAITING ON ITS BERTH: close the last
+                // yards now, so the step aboard is a short one when it docks.
+                if (!LevelWithBerth(p, route) ||
+                    p->GetExactDist2d(route.berthX, route.berthY) > CROSSING_BOARD_FROM_BERTH_YARDS)
                     StepTowardBerth(p, origin, route.berthX, route.berthY, route.berthZ);
                 if (fresh || std::time(nullptr) - memo.holdSaidAt >= 60)
                 {
@@ -42939,8 +43054,14 @@ private:
                 if (fresh)
                     _travelAims.Release(name, "its boat home");
                 holdIt();
-                if (!LevelWithBerth(p, route))
+                // BOUNDED, so a berth nobody can stand within a few yards of
+                // never keeps the boat from being boarded at all.
+                if (!LevelWithBerth(p, route) ||
+                    (p->GetExactDist2d(route.berthX, route.berthY) >
+                         CROSSING_BOARD_FROM_BERTH_YARDS &&
+                     memo.boardApproaches < CROSSING_BOARD_APPROACH_TRIES))
                 {
+                    ++memo.boardApproaches;
                     StepTowardBerth(p, origin, route.berthX, route.berthY, route.berthZ);
                     break;
                 }
@@ -70098,6 +70219,14 @@ private:
                 // the work, and a hold would keep it from them.
                 bot->StopMoving();
                 status = "applied";
+                // A GUILD WALK THAT ENDS AT A FLIGHT MASTER LEARNS ITS NODE, as a
+                // player standing there would on opening the taxi window. Of 37
+                // recent arrivals 32 knew it and 5 did not (#805): the walk let
+                // the member go without ever asking. A no-op for any creature
+                // that is not a flight master, and for a gameobject spawn.
+                if (!ev.spawnIsObject)
+                    DiscoverFlightPointOnArrival(check.targetName, bot, ev.mailboxEntry,
+                                                 D::SPAWN_WALK_ARRIVE_YARDS + 2.f);
                 // A QUEST PARTY'S LEADER IS HELD AT THE OBJECTIVE instead, until
                 // the party ends; the ceiling is the party's own clock.
                 QuestParty const* const party = QuestPartyOf(check.targetName);
