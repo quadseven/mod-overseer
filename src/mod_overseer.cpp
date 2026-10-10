@@ -33369,7 +33369,7 @@ private:
             return;
         coord.clearClock = clock;
         LOG_INFO("module.overseer",
-                 "overseer: dungeon run {} of campaign {} CLEARING on map {} holds its stall "
+                 "overseer: dungeon run {} of campaign {} on map {} holds its CLEARING stall "
                  "clock - {}. No 'dc skip' and no exit while it is held",
                  coord.runNumber, coord.campaignId, insideMapId,
                  OverseerDecisions::ClearingClockHoldReason(clock));
@@ -34599,8 +34599,14 @@ private:
         {
             time_t const walkSince = coord.evacWalkSince.emplace(name, now).first->second;
             auto const gaveUp = _strandedGroundGiveUp.find(name);
-            if (OverseerDecisions::GroundGaveUpDuringWalk(
-                    walkSince, gaveUp == _strandedGroundGiveUp.end() ? 0 : gaveUp->second))
+            // AND A WALK THAT HAS RUN EVACUATION_WALK_BOUND_SECONDS WITHOUT
+            // GETTING THIS MEMBER OUT HAS FAILED TOO, whichever release ended it
+            // (2026-10-10). The ground give-up alone missed Shadowfang Keep: the
+            // leader's walk was released by the twenty-minute travel backstop,
+            // not by the ground, and the door was aimed at again for eight hours.
+            if (OverseerDecisions::EvacuationWalkFailed(
+                    walkSince, gaveUp == _strandedGroundGiveUp.end() ? 0 : gaveUp->second,
+                    now, OverseerDecisions::EVACUATION_WALK_BOUND_SECONDS))
                 coord.evacGaveUp.insert(name);
             bool const groundGaveUp = coord.evacGaveUp.count(name) != 0;
 
@@ -34642,10 +34648,12 @@ private:
                     LOG_ERROR("module.overseer",
                               "overseer: dungeon run {} cannot hearth '{}' out of map {} "
                               "either - its walk to areatrigger {} was released as "
-                              "unreachable and its hearthstone is missing, cooling down or "
-                              "out of attempts, so it keeps walking at the door until one "
-                              "of those changes",
-                              coord.runNumber, name, portal.insideMapId, portal.exitTriggerId);
+                              "unreachable or has not got it out in {} minutes, and its "
+                              "hearthstone is missing, cooling down or out of attempts, so "
+                              "it keeps walking at the door until one of those changes",
+                              coord.runNumber, name, portal.insideMapId, portal.exitTriggerId,
+                              static_cast<uint32>(
+                                  OverseerDecisions::EVACUATION_WALK_BOUND_SECONDS / 60));
                 EscortToward(name, exitAim, splitCopy ? "SPLIT" : "RESET",
                              EscortPurpose::LeaveInstance);
             }
@@ -34660,11 +34668,13 @@ private:
                 coord.loggedHearthOut = true;
                 LOG_WARN("module.overseer",
                          "overseer: dungeon run {} cannot walk {} out of map {} - the walk to "
-                         "areatrigger {} was released as unreachable on the ground, so they "
-                         "USE THEIR HEARTHSTONES instead, as a player would. No teleport is "
-                         "written and no map is changed",
+                         "areatrigger {} was released as unreachable on the ground or has not "
+                         "got them out in {} minutes, so they USE THEIR HEARTHSTONES instead, "
+                         "as a player would. No teleport is written and no map is changed",
                          coord.runNumber, JoinNames(hearthers), portal.insideMapId,
-                         portal.exitTriggerId);
+                         portal.exitTriggerId,
+                         static_cast<uint32>(
+                             OverseerDecisions::EVACUATION_WALK_BOUND_SECONDS / 60));
             }
             if (!episode.runId)
                 episode.runId = coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId);
@@ -46117,7 +46127,7 @@ private:
                         StandDownDungeonBrain(member, held, heldAI);
                     }
                     Player* const insideMember = FirstMemberInsideARun(members);
-                    HoldClearingClock(coord, OverseerDecisions::ClearingClock::HeldLeaderAway,
+                    HoldClearingClock(coord, OverseerDecisions::ClearingClock::HeldLeaderClientLost,
                                       insideMember ? insideMember->GetMapId() : 0u);
                     return;
                 }

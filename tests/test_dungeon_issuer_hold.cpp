@@ -108,7 +108,21 @@ void TheStallClockRunsOnlyWhileTheBrainCanBeDriven()
     Check("every hold has a reason",
           std::strlen(ClearingClockHoldReason(ClearingClock::HeldNotArmed)) > 0 &&
               std::strlen(ClearingClockHoldReason(ClearingClock::HeldLeaderAway)) > 0 &&
-              std::strlen(ClearingClockHoldReason(ClearingClock::HeldNoIssuer)) > 0);
+              std::strlen(ClearingClockHoldReason(ClearingClock::HeldNoIssuer)) > 0 &&
+              std::strlen(ClearingClockHoldReason(ClearingClock::HeldLeaderClientLost)) > 0);
+
+    // THE LEADER-CLIENT HOLD IS NOT A LEADER OFF THE MAP (2026-10-10). After a
+    // restart the head came back headless on map 33 and the hold logged "the
+    // leader is not on the dungeon map" with the leader standing on it. The
+    // client hold says what it is holding for.
+    Check("the client hold does not claim the leader is off the map",
+          std::strcmp(ClearingClockHoldReason(ClearingClock::HeldLeaderClientLost),
+                      ClearingClockHoldReason(ClearingClock::HeldLeaderAway)) != 0 &&
+              std::strstr(ClearingClockHoldReason(ClearingClock::HeldLeaderClientLost),
+                          "not on the dungeon map") == nullptr);
+    Check("the client hold names the client",
+          std::strstr(ClearingClockHoldReason(ClearingClock::HeldLeaderClientLost),
+                      "client") != nullptr);
 }
 
 // (headNamed, headPresent, headInThisGroup, headLeads)

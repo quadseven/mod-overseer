@@ -2917,6 +2917,12 @@ enum class ClearingClock
     HeldNotArmed,
     HeldLeaderAway,
     HeldNoIssuer,
+    // The leader-client hold (DungeonLeaderClientLoss), which holds the clock
+    // while the head's client or an authorized issuer is missing. It used to
+    // borrow HeldLeaderAway and so logged "the leader is not on the dungeon
+    // map" about a leader standing on it (2026-10-10, map 33, after a restart
+    // brought the head back headless).
+    HeldLeaderClientLost,
 };
 
 ClearingClock ClearingClockState(bool acceptedOnEveryoneInside, bool leaderVisible,
@@ -18720,6 +18726,23 @@ enum class EvacuationWay
 // of its as unreachable on the ground. Both are seconds since the epoch, zero
 // for "never". True when the give-up came after the walk began.
 bool GroundGaveUpDuringWalk(std::int64_t walkSince, std::int64_t groundGaveUpAt);
+
+// AND A WALK OUT THAT HAS GONE ON TOO LONG HAS FAILED, HOWEVER IT WAS RELEASED
+// (2026-10-10). Four members stood about 34 yards from Shadowfang Keep's exit,
+// areatrigger 194, from 01:46 to 10:04 America/New_York with the run in
+// REPAIRING. The leader's walk was released every twenty minutes by the travel
+// BACKSTOP ("no nearer for minutes"), never by the ground give-up, so the
+// hearth above never came and the door was aimed at again for eight hours.
+// After a restart the same 34 yards took 25 seconds: the ground was fine and
+// the walk had never started. Which release fires is not the question a person
+// asks; "I have been trying to leave for ten minutes" is.
+//
+// True when GroundGaveUpDuringWalk, or when the member was first aimed at the
+// door `boundSeconds` or more before `now`. A walk that never began
+// (`walkSince` zero) or a clock stepped backwards never fails one.
+constexpr std::int64_t EVACUATION_WALK_BOUND_SECONDS = 10 * 60;
+bool EvacuationWalkFailed(std::int64_t walkSince, std::int64_t groundGaveUpAt,
+                          std::int64_t now, std::int64_t boundSeconds);
 
 // `hearth` is ExitFailureHearthStep for the member. Impossible, and
 // NotInside, leave the walk as it was: there is nothing else to try.
