@@ -67282,6 +67282,8 @@ private:
         // A spawn walk's request: which table and which spawn id.
         bool spawnIsObject{false};
         uint32 spawnId{0};
+        // A spawn walk's arrival radius: the row's `near:`, else the place radius.
+        float spawnArriveYards{OverseerDecisions::SPAWN_WALK_ARRIVE_YARDS};
 
         // A FAR WALK (#633): the destination lies past the goal's near cap, so
         // the walk mounts, may fly and follows the travel survey. `travel` is
@@ -67630,13 +67632,14 @@ private:
             return MailboxInReach(who, name, yards);
         // A SPAWN IS A PLACE: there once within SPAWN_WALK_ARRIVE_YARDS of the
         // spawn row's own position, whatever stands on it now (a node already
-        // picked, a mob already killed).
+        // picked, a mob already killed), or within the row's `near:` when it
+        // walks to a creature it must talk to (an innkeeper, 2026-10-10).
         if (ev.goal == OverseerDecisions::WalkGoal::Spawn)
         {
             if (who->GetMapId() != ev.mapId)
                 return false;
             float const there = who->GetExactDist(ev.boxX, ev.boxY, ev.boxZ);
-            if (!OverseerDecisions::SpawnWalkArrived(there))
+            if (!OverseerDecisions::SpawnWalkArrived(there, ev.spawnArriveYards))
                 return false;
             name = ev.mailboxName;
             yards = there;
@@ -68348,6 +68351,7 @@ private:
             ev.capYards = req.maxYards;
             ev.spawnIsObject = req.gameObject;
             ev.spawnId = req.spawn;
+            ev.spawnArriveYards = req.arriveYards;
         }
         else
         {

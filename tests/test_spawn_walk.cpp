@@ -266,6 +266,59 @@ void TheAdapterWiresIt()
           true);
 }
 
+// A WALK TO AN INNKEEPER ENDS WHERE THE INNKEEPER WILL TALK (2026-10-10). The
+// guild's level walk brings a member to the zone it levels in, and the bridge
+// then walks it to that zone's innkeeper to set its hearth there, the way a
+// player rebinds. `bind here` binds only from inside the core's interaction
+// distance, so the walk to the innkeeper asks for `near:`.
+void NearNarrowsTheArrival()
+{
+    SpawnWalkRequest const inn =
+        ParseSpawnWalkRequest("walk-to-spawn creature:2810 near:3 max:20000");
+    CheckText("a near walk parses", inn.error, "");
+    CheckNumber("its spawn", inn.spawn, 2810);
+    CheckNear("its cap", inn.maxYards, 20000.f);
+    CheckNear("its arrival radius", inn.arriveYards, 3.f);
+    CheckNear("without near: the place radius",
+              ParseSpawnWalkRequest("walk-to-spawn creature:2810").arriveYards,
+              SPAWN_WALK_ARRIVE_YARDS);
+    CheckText("keys in any order",
+              ParseSpawnWalkRequest("walk-to-spawn near:2.5 creature:9").error, "");
+    CheckNear("the floor itself", ParseSpawnWalkRequest(
+                  "walk-to-spawn creature:9 near:1").arriveYards, SPAWN_WALK_NEAR_MIN_YARDS);
+    CheckNear("the place radius itself", ParseSpawnWalkRequest(
+                  "walk-to-spawn creature:9 near:20").arriveYards, SPAWN_WALK_ARRIVE_YARDS);
+    for (char const* row : {
+             "walk-to-spawn creature:9 near:0",
+             "walk-to-spawn creature:9 near:0.5",
+             "walk-to-spawn creature:9 near:21",
+             "walk-to-spawn creature:9 near:-3",
+             "walk-to-spawn creature:9 near:",
+             "walk-to-spawn creature:9 near:3 near:4",
+             "walk-to-spawn creature:9 near:3 max:500 now",
+             "walk-to-spawn near:3",
+         })
+    {
+        SpawnWalkRequest const r = ParseSpawnWalkRequest(row);
+        if (std::string(r.error) != S::MalformedSpawn)
+        {
+            std::printf("FAIL '%s' should be malformed, got '%s'\n", row, r.error);
+            ++failures;
+        }
+    }
+
+    Check("inside near", SpawnWalkArrived(2.9f, 3.f), true);
+    Check("at near", SpawnWalkArrived(3.f, 3.f), true);
+    Check("past near though inside the place radius", SpawnWalkArrived(4.f, 3.f), false);
+    Check("an unread distance never arrives near", SpawnWalkArrived(-1.f, 3.f), false);
+
+    std::string const text = Source();
+    Check("the walk keeps the row's radius",
+          text.find("ev.spawnArriveYards = req.arriveYards;") != std::string::npos, true);
+    Check("and the arrival reads it",
+          text.find("SpawnWalkArrived(there, ev.spawnArriveYards)") != std::string::npos, true);
+}
+
 }  // namespace
 
 int main()
@@ -277,6 +330,7 @@ int main()
     WhichSpawnRefusalsMove();
     ThereIsNearTheSpawn();
     TheAdapterWiresIt();
+    NearNarrowsTheArrival();
 
     if (failures)
     {

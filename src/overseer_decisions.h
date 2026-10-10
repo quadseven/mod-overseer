@@ -17606,11 +17606,13 @@ char const* TrainerVisitWord(TrainerVisitOutcome outcome);
 // SHAPE, on kind='job' and routed on the first word the way `walk-to-trainer`
 // rides kind='cast':
 //
-//   kind='job'  walk-to-spawn gameobject:<spawn id> [max:<yards>]
-//   kind='job'  walk-to-spawn creature:<spawn id> [max:<yards>]
+//   kind='job'  walk-to-spawn gameobject:<spawn id> [max:<yards>] [near:<yards>]
+//   kind='job'  walk-to-spawn creature:<spawn id> [max:<yards>] [near:<yards>]
 //
 // Exactly one of `gameobject:` and `creature:`. `max:` as for the other walks,
 // up to FAR_WALK_MAX_YARDS; past ERRAND_WALK_MAX_YARDS the walk is a far walk.
+// `near:` narrows the arrival radius (below), from SPAWN_WALK_NEAR_MIN_YARDS up
+// to SPAWN_WALK_ARRIVE_YARDS.
 //
 // ARRIVING ENDS THE WALK AND LETS THE BOT GO. A walk to a spawn ends within
 // SPAWN_WALK_ARRIVE_YARDS of it with the hold lifted at once, like a trainer
@@ -17624,6 +17626,17 @@ constexpr char const* SPAWN_WALK_VERB = "walk-to-spawn";
 // the bot's own gather strategy reaches a node from further than that.
 constexpr float SPAWN_WALK_ARRIVE_YARDS = 20.0f;
 
+// A WALK TO A CREATURE A CHARACTER MUST TALK TO (2026-10-10). Twenty yards is a
+// place, and an innkeeper is a counter: the core binds a hearthstone only from
+// inside INTERACTION_DISTANCE (HandleBinderActivateOpcode asks
+// GetNPCIfCanInteractWith), so a guild member walked to the innkeeper of the
+// zone it now levels in stood twenty yards off and `bind here` answered
+// "innkeeper not in range". `near:` asks the walk to end that close instead, as
+// a vendor or trainer walk ends inside the counter's reach. Never wider than
+// the place radius, and never so tight that a creature's own body keeps the
+// walker out.
+constexpr float SPAWN_WALK_NEAR_MIN_YARDS = 1.0f;
+
 bool IsSpawnWalkRow(std::string const& command);
 
 struct SpawnWalkRequest
@@ -17631,16 +17644,19 @@ struct SpawnWalkRequest
     bool gameObject{false};   // true: a gameobject spawn; false: a creature spawn
     uint32_t spawn{0};        // the spawn id (`gameobject.guid` or `creature.guid`)
     float maxYards{ERRAND_WALK_MAX_YARDS};
+    float arriveYards{SPAWN_WALK_ARRIVE_YARDS};  // `near:`, else the place radius
     char const* error{""};
 };
 
-// `gameobject:` or `creature:` (exactly one, a non-zero id) and an optional
-// `max:`, each at most once, in any order. Anything else is MalformedSpawn.
+// `gameobject:` or `creature:` (exactly one, a non-zero id), an optional `max:`
+// and an optional `near:`, each at most once, in any order. Anything else is
+// MalformedSpawn.
 SpawnWalkRequest ParseSpawnWalkRequest(std::string const& command);
 
-// Is the walker there? True within SPAWN_WALK_ARRIVE_YARDS of the spawn. A
-// negative distance is an unread one and never counts.
-bool SpawnWalkArrived(float yards);
+// Is the walker there? True within `arrive` yards of the spawn
+// (SPAWN_WALK_ARRIVE_YARDS unless the row said `near:`). A negative distance is
+// an unread one and never counts.
+bool SpawnWalkArrived(float yards, float arrive = SPAWN_WALK_ARRIVE_YARDS);
 
 namespace SpawnWalkRefusal
 {
