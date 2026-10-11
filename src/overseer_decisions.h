@@ -19351,6 +19351,23 @@ GuildHealerGraveyard PickGuildHealerGraveyard(bool nearestSafe, bool alternative
 // chosen graveyard count.
 bool HealerServesGraveyard(float healerToGraveyardYards, float sweepYards);
 
+// WHERE THE CORE PUTS A GHOST THAT TAKES A SPIRIT HEALER. The core's handler
+// raises the ghost, then teleports it to the graveyard nearest its CORPSE when
+// that differs from the one nearest the ghost. A ghost rerouted to a safe
+// graveyard 1200 yards from the corpse is therefore sent straight back to the
+// graveyard it avoided (wow-dev 2026-10-11: one member walked to the safe
+// healer, took it, and was killed by the same footmen 8 seconds later at the
+// unsafe graveyard, four times in 20 minutes). A rerouted ghost is raised where
+// it stands, beside the healer it walked to; everyone else takes the core's
+// handler unchanged. `rerouted` is the reroute flag; `healerServesChosenGrave`
+// says the healer used stands at the graveyard the ghost chose.
+enum class SpiritReviveSite
+{
+    CoreHandler,
+    WhereItStands,
+};
+SpiritReviveSite SpiritReviveSiteFor(bool rerouted, bool healerServesChosenGrave);
+
 // Seconds a ghost is given to reach the spirit healer at a graveyard
 // `yards` away: the base allowance, or the walk at ghost pace with half again
 // for the road, whichever is longer. The base alone was sized for a ghost

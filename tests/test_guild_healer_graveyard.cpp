@@ -18,6 +18,8 @@ using OverseerDecisions::GhostHealerWalkSeconds;
 using OverseerDecisions::GuildHealerGraveyard;
 using OverseerDecisions::HealerServesGraveyard;
 using OverseerDecisions::PickGuildHealerGraveyard;
+using OverseerDecisions::SpiritReviveSite;
+using OverseerDecisions::SpiritReviveSiteFor;
 
 namespace
 {
@@ -56,6 +58,15 @@ int main()
     Check(GhostHealerWalkSeconds(300.f, 120) == 120, "a short walk keeps the base allowance");
     Check(GhostHealerWalkSeconds(1400.f, 120) > 120, "a long walk gets longer than the base");
     Check(GhostHealerWalkSeconds(1400.f, 120) >= 1400 / 7, "and at least the walk itself");
+
+    Check(SpiritReviveSiteFor(true, true) == SpiritReviveSite::WhereItStands,
+          "a ghost rerouted to a safe healer is raised beside it, not sent back to the corpse graveyard");
+    Check(SpiritReviveSiteFor(true, false) == SpiritReviveSite::CoreHandler,
+          "a healer that does not serve the chosen graveyard leaves the core handler in charge");
+    Check(SpiritReviveSiteFor(false, true) == SpiritReviveSite::CoreHandler,
+          "a ghost that was not rerouted keeps the core handler");
+    Check(SpiritReviveSiteFor(false, false) == SpiritReviveSite::CoreHandler,
+          "no reroute and no chosen healer keeps the core handler");
 
     if (failures)
     {

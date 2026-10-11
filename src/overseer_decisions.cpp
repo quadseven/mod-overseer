@@ -15536,6 +15536,12 @@ bool HealerServesGraveyard(float healerToGraveyardYards, float sweepYards)
     return healerToGraveyardYards >= 0.f && healerToGraveyardYards <= sweepYards;
 }
 
+SpiritReviveSite SpiritReviveSiteFor(bool rerouted, bool healerServesChosenGrave)
+{
+    return rerouted && healerServesChosenGrave ? SpiritReviveSite::WhereItStands
+                                               : SpiritReviveSite::CoreHandler;
+}
+
 int64_t GhostHealerWalkSeconds(float yards, int64_t baseSeconds)
 {
     constexpr float GHOST_YARDS_PER_SECOND = 7.0f;
