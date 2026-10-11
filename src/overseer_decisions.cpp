@@ -15525,6 +15525,27 @@ GhostRecovery GuildGhostFallback(unsigned deathsHere, bool healerGraveKnown,
     return GhostRecovery::CorpseRun;
 }
 
+GuildHealerGraveyard PickGuildHealerGraveyard(bool nearestSafe, bool alternativeFound)
+{
+    return !nearestSafe && alternativeFound ? GuildHealerGraveyard::Alternative
+                                            : GuildHealerGraveyard::Nearest;
+}
+
+bool HealerServesGraveyard(float healerToGraveyardYards, float sweepYards)
+{
+    return healerToGraveyardYards >= 0.f && healerToGraveyardYards <= sweepYards;
+}
+
+int64_t GhostHealerWalkSeconds(float yards, int64_t baseSeconds)
+{
+    constexpr float GHOST_YARDS_PER_SECOND = 7.0f;
+    constexpr float ROAD_FACTOR = 1.5f;
+    if (!(yards > 0.f))
+        return baseSeconds;
+    int64_t const walk = static_cast<int64_t>(yards / GHOST_YARDS_PER_SECOND * ROAD_FACTOR) + 1;
+    return walk > baseSeconds ? walk : baseSeconds;
+}
+
 GuildDeathSpotStep GuildLeavesDeathSpot(unsigned deathsHere, unsigned repeatDeaths,
                                         bool hearthReady, bool inCombat, bool outmatchedHere)
 {

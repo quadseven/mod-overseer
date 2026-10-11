@@ -28720,6 +28720,10 @@ private:
         int64 healerSince{0};
         bool healerWalkSpent{false};
         bool healerWalkIssued{false};
+        // The graveyard was swapped for a safe one because the nearest failed
+        // the safety test; only healers standing at it count.
+        bool healerRerouted{false};
+        int64 healerWalkSeconds{GHOST_HEALER_WALK_SECONDS};
         bool saidAny{false};
         OverseerDecisions::GhostRecovery said{OverseerDecisions::GhostRecovery::CorpseRun};
         std::vector<std::string> leased;  // dead-engine strategies taken off
@@ -29735,6 +29739,12 @@ private:
             st.healerGrave = sGraveyard->GetClosestGraveyard(bot, bot->GetTeamId());
             if (st.healerGrave)
                 st.healerRefused = GraveyardRefusal(bot, *st.healerGrave);
+            // A caller without the ladder (the natural guilds) takes the
+            // spirit healer after repeat deaths, and the nearest healer is
+            // the one standing among the guards that failed the test. Run the
+            // ghost to a graveyard that passes it instead.
+            if (!ladder && st.healerGrave && !st.healerRefused.empty())
+                RerouteHealerGraveyard(bot, name, st, corpse);
         }
 
         // Live: what is standing near the corpse NOW at or above its level, or
@@ -29835,6 +29845,36 @@ private:
         return WalkGhostToSpiritHealer(bot, botAI, name, st, ladder, now);
     }
 
+    // THE NEAREST GRAVEYARD FAILED THE SAFETY TEST: LOOK FOR ANOTHER ON THIS
+    // MAP, the way the stuck-revival ladder does (SafeGraveyardNear). On
+    // wow-dev 2026-10-10 seven Horde members died 318 times in six hours at one
+    // Hillsbrad graveyard to Alliance footmen, each revived into them by the
+    // healer this guild path took anyway. The ghost walks to the other
+    // graveyard's healer; nothing is granted. With none that passes, the
+    // nearest stands as before.
+    void RerouteHealerGraveyard(Player* bot, std::string const& name, GhostRecoveryState& st,
+                                Corpse* corpse)
+    {
+        std::string refused;
+        GraveyardStruct const* const nearest = st.healerGrave;
+        GraveyardStruct const* const safe =
+            SafeGraveyardNear(bot, nearest, st.mapId, st.corpseX, st.corpseY,
+                              corpse->GetPositionZ(), refused);
+        if (OverseerDecisions::PickGuildHealerGraveyard(false, safe != nullptr) !=
+            OverseerDecisions::GuildHealerGraveyard::Alternative)
+            return;
+        st.healerGrave = safe;
+        st.healerRefused.clear();
+        st.healerRerouted = true;
+        st.healerWalkSeconds = OverseerDecisions::GhostHealerWalkSeconds(
+            bot->GetExactDist2d(safe->x, safe->y), GHOST_HEALER_WALK_SECONDS);
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' (level {}) avoids the spirit healer at '{}' and walks to '{}' "
+                 "instead, {:.0f} yards, {}s allowed: {}",
+                 name, bot->GetLevel(), nearest->name, safe->name,
+                 bot->GetExactDist2d(safe->x, safe->y), st.healerWalkSeconds, refused);
+    }
+
     // THE SPIRIT HEALER, CARRIED OUT: walk the ghost to the nearest spirit
     // healer and ask it the way a client asks it. Shared by DriveGhostRecovery
     // and DriveStrandedGhost, so a ghost whose corpse is out of reach is raised
@@ -29852,7 +29892,7 @@ private:
         }
         if (st.healerWalkSpent)
             return false;
-        if (now - st.healerSince > GHOST_HEALER_WALK_SECONDS)
+        if (now - st.healerSince > st.healerWalkSeconds)
         {
             st.healerWalkSpent = true;
             if (!ladder)
@@ -29882,8 +29922,16 @@ private:
         Cell::VisitObjects(bot, healerSearcher, GHOST_HEALER_SWEEP_YARDS);
         Creature* nearest = nullptr;
         for (Creature* creature : healers)
+        {
+            // Past a reroute, the healer beside the ghost is the unsafe one.
+            if (st.healerRerouted &&
+                !OverseerDecisions::HealerServesGraveyard(
+                    creature->GetExactDist2d(st.healerGrave->x, st.healerGrave->y),
+                    GHOST_HEALER_SWEEP_YARDS))
+                continue;
             if (!nearest || bot->GetExactDist2d(creature) < bot->GetExactDist2d(nearest))
                 nearest = creature;
+        }
 
         if (nearest && bot->GetNPCIfCanInteractWith(nearest->GetGUID(), UNIT_NPC_FLAG_SPIRITHEALER))
         {
