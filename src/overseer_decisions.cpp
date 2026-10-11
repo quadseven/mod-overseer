@@ -18047,7 +18047,12 @@ GuildRunVerdict GuildRunNext(GuildRunPoll const& poll)
     if (poll.groupGone)
         return GuildRunVerdict::Abandoned;
     if (poll.secondsInside >= poll.ceilingSeconds)
-        return GuildRunVerdict::TimedOut;
+    {
+        bool const fighting = poll.bossInCombat && poll.aliveInside > 0 &&
+                              poll.secondsInside < poll.ceilingSeconds + GUILD_RUN_BOSS_EXTENSION_SECONDS;
+        if (!fighting)
+            return GuildRunVerdict::TimedOut;
+    }
     if (poll.aliveInside == 0)
         return GuildRunNobodyAlive(poll);
     return GuildRunSeats(poll);
@@ -18193,6 +18198,22 @@ unsigned GuildRunCeilingSeconds(bool finderEndsDungeon, unsigned bossesExpected)
     if (finderEndsDungeon)
         return GUILD_RUN_CEILING_SECONDS;
     return std::max(GUILD_RUN_CEILING_SECONDS, bossesExpected * GUILD_RUN_SECONDS_PER_BOSS);
+}
+
+unsigned GuildRunSecondsPerBoss(std::uint32_t mapId)
+{
+    // Blackfathom Deeps: about 30 minutes a boss (wow-overseer#835).
+    return mapId == 48 ? 30 * 60 : 0;
+}
+
+unsigned GuildRunCeilingForMap(std::uint32_t mapId, bool finderEndsDungeon,
+                               unsigned bossesExpected)
+{
+    unsigned const base = GuildRunCeilingSeconds(finderEndsDungeon, bossesExpected);
+    unsigned const perBoss = GuildRunSecondsPerBoss(mapId);
+    if (!perBoss)
+        return base;
+    return std::max(base, bossesExpected * perBoss + GUILD_RUN_CEILING_MARGIN_SECONDS);
 }
 
 RosterTraining RosterTrainingFor(bool factoryGrants)

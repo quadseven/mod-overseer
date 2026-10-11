@@ -20616,6 +20616,10 @@ struct GuildRunPoll
     // The group is gone, or the tank is no longer in it.
     bool groupGone{false};
     unsigned ceilingSeconds{GUILD_RUN_CEILING_SECONDS};
+    // A boss encounter is under way in the run's copy (the instance script's
+    // IsEncounterInProgress). Past the ceiling it buys the run
+    // GUILD_RUN_BOSS_EXTENSION_SECONDS, once.
+    bool bossInCombat{false};
     unsigned emptySeconds{GUILD_RUN_EMPTY_SECONDS};
     // THE CORPSE RUN (GUILD_RUN_RECOVERY_SECONDS). Ghosts of the run whose
     // corpse is on the dungeon's map, standing outside it.
@@ -20669,6 +20673,24 @@ std::uint32_t GuildRunExpectedMask(std::uint32_t mapId, std::uint32_t mapMask,
 // than the ceiling; every other run keeps the ceiling.
 constexpr unsigned GUILD_RUN_SECONDS_PER_BOSS = 15 * 60;
 unsigned GuildRunCeilingSeconds(bool finderEndsDungeon, unsigned bossesExpected);
+
+// A LONG DUNGEON SCALES THE CEILING WITH ITS BOSSES. Blackfathom Deeps, seven
+// bosses at about half an hour each, ended `timed out` six times with no clear
+// (wow-overseer#835): the last at 7230 s with four of seven down. A map in
+// GuildRunSecondsPerBoss gets that many seconds a boss for the bosses it
+// expects, plus GUILD_RUN_CEILING_MARGIN_SECONDS, never less than the base
+// ceiling. A seven-boss Blackfathom gets 7 * 1800 + 1800 = 14400 s. Every map not in
+// the table, and every map whose boss count gives less, keeps GuildRunCeilingSeconds.
+constexpr unsigned GUILD_RUN_CEILING_MARGIN_SECONDS = 30 * 60;
+// Seconds a boss for a map with a measured slow clear; 0 for every other map.
+unsigned GuildRunSecondsPerBoss(std::uint32_t mapId);
+unsigned GuildRunCeilingForMap(std::uint32_t mapId, bool finderEndsDungeon,
+                               unsigned bossesExpected);
+
+// A BOSS STILL BEING FOUGHT WHEN THE CEILING HITS GETS THIS MUCH MORE, ONCE:
+// the extension is measured from the ceiling, so a run past ceiling plus
+// extension is timed out whatever is in combat.
+constexpr unsigned GUILD_RUN_BOSS_EXTENSION_SECONDS = 10 * 60;
 
 // THE DUNGEON BRAIN IS ASKED AGAIN, NOT ONLY ONCE. A guild run is armed once
 // per stay (`dc on`), and the dungeon module can disable itself afterwards (a
