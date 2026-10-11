@@ -19325,6 +19325,38 @@ uint32_t KillerAtCorpse(CreatureKillMark const& mark, uint32_t mapId, float corp
 GhostRecovery GuildGhostFallback(unsigned deathsHere, bool healerGraveKnown,
                                  unsigned repeatDeaths);
 
+// A GUILD GHOST DOES NOT TAKE THE SPIRIT HEALER AT A GRAVEYARD THAT IS ITSELF
+// THE KILLER. GuildGhostFallback sends a repeat-death ghost to the nearest
+// spirit healer "even at a graveyard that is not perfectly safe", and when that
+// graveyard stands among the other faction's guards the member is revived into
+// them and killed again within seconds. On wow-dev 2026-10-10 seven Horde
+// members, levels 23 to 25, died 318 times in six hours at one Hillsbrad
+// graveyard to Alliance footmen (level 26), one of them once a minute for three
+// and a half hours; the log said "refused: 5 hostile spawn(s) above level 25"
+// and then took that healer anyway. A player runs the ghost to another graveyard.
+// `nearestSafe` is the graveyard safety test on the nearest graveyard;
+// `alternativeFound` says the module's graveyard search found one that passes.
+// The alternative is taken only when the nearest fails and one exists; with
+// none, the nearest stands, as before.
+enum class GuildHealerGraveyard
+{
+    Nearest,
+    Alternative,
+};
+GuildHealerGraveyard PickGuildHealerGraveyard(bool nearestSafe, bool alternativeFound);
+
+// Whether a spirit healer `healerToGraveyardYards` from a graveyard serves it.
+// A ghost sent to a different graveyard must not activate the healer it is
+// standing beside at the unsafe one, so only healers within `sweepYards` of the
+// chosen graveyard count.
+bool HealerServesGraveyard(float healerToGraveyardYards, float sweepYards);
+
+// Seconds a ghost is given to reach the spirit healer at a graveyard
+// `yards` away: the base allowance, or the walk at ghost pace with half again
+// for the road, whichever is longer. The base alone was sized for a ghost
+// released beside its healer; a rerouted one walks across the zone.
+int64_t GhostHealerWalkSeconds(float yards, int64_t baseSeconds);
+
 // A GUILD MEMBER THAT HAS DIED TWICE AT ONE SPOT LEAVES IT ONCE ALIVE. Every
 // recovery path brought guild members back to the same mobs: the corpse run,
 // the spirit healer at a graveyard beside the killer, the walk back from the
