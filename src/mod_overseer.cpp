@@ -29938,7 +29938,26 @@ private:
             std::string const healerName = nearest->GetName();
             WorldPacket packet(CMSG_SPIRIT_HEALER_ACTIVATE, 8);
             packet << nearest->GetGUID();
-            bot->GetSession()->HandleSpiritHealerActivateOpcode(packet);
+            // The core's handler raises the ghost and then teleports it to the
+            // graveyard nearest its CORPSE, which for a rerouted ghost is the
+            // unsafe one it walked away from. Raise it where it stands, with
+            // the handler's own sickness and durability loss and no teleport.
+            if (OverseerDecisions::SpiritReviveSiteFor(
+                    st.healerRerouted,
+                    OverseerDecisions::HealerServesGraveyard(
+                        nearest->GetExactDist2d(st.healerGrave->x, st.healerGrave->y),
+                        GHOST_HEALER_SWEEP_YARDS)) ==
+                OverseerDecisions::SpiritReviveSite::WhereItStands)
+            {
+                bot->ResurrectPlayer(0.5f, true);
+                float const durabilityLoss =
+                    sWorld->getRate(RATE_DURABILITY_LOSS_ON_SPIRIT_RESURRECT) / 100.0f;
+                if (durabilityLoss)
+                    bot->DurabilityLossAll(durabilityLoss, true);
+                bot->SpawnCorpseBones();
+            }
+            else
+                bot->GetSession()->HandleSpiritHealerActivateOpcode(packet);
             if (!bot->IsAlive())
             {
                 LOG_WARN("module.overseer",
