@@ -13525,6 +13525,19 @@ bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct)
     return lowestDurabilityPct < floorPct;
 }
 
+RaidPullRepairAction RaidPullRepairDecision(unsigned bossesDone, bool anySeatBelowFloor,
+                                           long heldSeconds, long maximumHoldSeconds)
+{
+    // Molten Core orders Majordomo Executus after the first eight bosses and
+    // Ragnaros after Majordomo.
+    if (bossesDone != 8 && bossesDone != 9)
+        return RaidPullRepairAction::Ignore;
+    if (!anySeatBelowFloor)
+        return RaidPullRepairAction::Resume;
+    return heldSeconds >= maximumHoldSeconds ? RaidPullRepairAction::TimedOut
+                                              : RaidPullRepairAction::Hold;
+}
+
 bool RaidGhostMayBeWalked(long ghostSeconds)
 {
     return ghostSeconds < RAID_RUNBACK_WAIT_SECONDS;

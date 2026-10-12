@@ -35,6 +35,8 @@ using OverseerDecisions::RaidKeywordForJob;
 using OverseerDecisions::RaidKnockOrder;
 using OverseerDecisions::RaidRunFacts;
 using OverseerDecisions::RaidSeatNeedsRepair;
+using OverseerDecisions::RaidPullRepairAction;
+using OverseerDecisions::RaidPullRepairDecision;
 using OverseerDecisions::RaidRunPhase;
 using OverseerDecisions::RaidRunPhaseName;
 using OverseerDecisions::RaidRunStep;
@@ -59,6 +61,22 @@ void TheRepairFloorIsStrictAndConfigurable()
     Check("at the floor does not need repair", !RaidSeatNeedsRepair(70, 70));
     Check("above the floor does not need repair", !RaidSeatNeedsRepair(100, 70));
     Check("zero floor disables this gate", !RaidSeatNeedsRepair(0, 0));
+}
+
+void OnlyMajordomoAndRagnarosPullsWaitForRepair()
+{
+    Check("Majordomo pull holds below-floor seats",
+          RaidPullRepairDecision(8, true, 10, 300) == RaidPullRepairAction::Hold);
+    Check("Ragnaros pull holds below-floor seats",
+          RaidPullRepairDecision(9, true, 10, 300) == RaidPullRepairAction::Hold);
+    Check("Majordomo resumes when all seats meet floor",
+          RaidPullRepairDecision(8, false, 10, 300) == RaidPullRepairAction::Resume);
+    Check("Ragnaros resumes at the time limit",
+          RaidPullRepairDecision(9, true, 300, 300) == RaidPullRepairAction::TimedOut);
+    Check("other boss pulls do not hold",
+          RaidPullRepairDecision(7, true, 10, 300) == RaidPullRepairAction::Ignore);
+    Check("first boss pull does not hold",
+          RaidPullRepairDecision(0, true, 10, 300) == RaidPullRepairAction::Ignore);
 }
 
 void CheckString(char const* what, std::string const& got, std::string const& want)
@@ -295,6 +313,7 @@ void ARaidMapIsNotArmedUntilClearingIsOrdered()
 int main()
 {
     TheRepairFloorIsStrictAndConfigurable();
+    OnlyMajordomoAndRagnarosPullsWaitForRepair();
     TheMoltenCoreDoorIsTheWorldsOwnNumbers();
     OnlyAnExactRaidJobNamesADoor();
     NoOrderIsIdleAndAnEndedOrderReleases();

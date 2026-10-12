@@ -45124,6 +45124,12 @@ private:
         // Seats already given their pre-FORM repair attempt for this order.
         std::set<std::string> repairAttempted;
         std::set<std::string> repairWalkSaid;
+        unsigned durabilityBossesDone{std::numeric_limits<unsigned>::max()};
+        unsigned repairHoldBossesDone{std::numeric_limits<unsigned>::max()};
+        time_t repairHoldSince{0};
+        bool repairHoldDecisionSaid{false};
+        bool repairBrainPaused{false};
+        time_t repairHoldRefusedAt{0};
     };
     std::map<std::string, RaidRunState> _raidRuns;
     // What the raid timeline last wrote for each family (#640).
@@ -45957,6 +45963,168 @@ private:
             if (facts.raidFormed && door)
                 RaidEncounters(group, door, bossesDone, bossesTotal);
             facts.cleared = bossesTotal > 0 && bossesDone >= bossesTotal;
+
+            // Read the seats before every next encounter. A boss count advances
+            // only after the previous encounter is DONE, so this is the pre-pull
+            // snapshot for the next boss.
+            if (run.phase == RaidRunPhase::Clear && facts.ordered && bossesDone < bossesTotal &&
+                run.durabilityBossesDone != bossesDone)
+            {
+                std::string lowestSeat;
+                uint32 lowestPct = 100;
+                unsigned belowFloor = 0;
+                for (auto const& [name, subgroup] : seats)
+                {
+                    (void)subgroup;
+                    Player* member = ObjectAccessor::FindPlayerByName(name);
+                    if (!member || !member->IsInWorld())
+                        continue;
+                    uint32 const pct = LowestDurabilityPct(member);
+                    if (pct < lowestPct || lowestSeat.empty())
+                    {
+                        lowestPct = pct;
+                        lowestSeat = name;
+                    }
+                    if (OverseerDecisions::RaidSeatNeedsRepair(pct, repairFloor))
+                        ++belowFloor;
+                }
+                if (!lowestSeat.empty())
+                    LOG_INFO("module.overseer",
+                             "overseer: raid run for family '{}': lowest durability {} {}%; "
+                             "{} seat(s) under the {}% floor (before encounter {})",
+                             roster.family, lowestSeat, lowestPct, belowFloor,
+                             repairFloor, bossesDone + 1);
+                else
+                    LOG_WARN("module.overseer",
+                             "overseer: raid run for family '{}': cannot log pre-pull "
+                             "durability for encounter {} - no readable seats",
+                             roster.family, bossesDone + 1);
+                run.durabilityBossesDone = bossesDone;
+            }
+
+            // Hold the dungeon brain only before Majordomo and Ragnaros. Seats
+            // use the ordinary repair verb at a repairer; the hold expires after
+            // five minutes even if one cannot afford the repair.
+            bool repairHold = false;
+            bool repairHoldTimedOut = false;
+            if (run.phase == RaidRunPhase::Clear && facts.ordered &&
+                OverseerDecisions::RaidPullRepairDecision(bossesDone, false, 0, 300) !=
+                    OverseerDecisions::RaidPullRepairAction::Ignore)
+            {
+                if (run.repairHoldBossesDone != bossesDone)
+                {
+                    run.repairHoldBossesDone = bossesDone;
+                    run.repairHoldSince = std::time(nullptr);
+                    run.repairAttempted.clear();
+                    run.repairWalkSaid.clear();
+                    run.repairHoldDecisionSaid = false;
+                    run.repairBrainPaused = false;
+                    run.repairHoldRefusedAt = 0;
+                }
+                repairHoldTimedOut = OverseerDecisions::RaidPullRepairDecision(
+                                         bossesDone, true,
+                                         long(std::time(nullptr) - run.repairHoldSince), 300) ==
+                                     OverseerDecisions::RaidPullRepairAction::TimedOut;
+                for (auto const& [name, subgroup] : seats)
+                {
+                    (void)subgroup;
+                    Player* member = ObjectAccessor::FindPlayerByName(name);
+                    if (!member || !member->IsInWorld())
+                        continue;
+                    uint32 const pct = LowestDurabilityPct(member);
+                    if (!OverseerDecisions::RaidSeatNeedsRepair(pct, repairFloor))
+                        continue;
+                    if (repairHoldTimedOut)
+                        continue;
+                    repairHold = true;
+                    if (run.repairAttempted.count(name))
+                        continue;
+                    bool oneIsNearby = false;
+                    float nearestYards = -1.f;
+                    if (!CounterInReach(member, OverseerDecisions::CounterRole::Repairer,
+                                        oneIsNearby, nearestYards))
+                    {
+                        _travelAims.Claim(name, "repair", OverseerDecisions::TravelOwner::Run);
+                        if (run.repairWalkSaid.insert(name).second)
+                            LOG_INFO("module.overseer",
+                                     "overseer: raid run for family '{}' pre-pull repair walk "
+                                     "for '{}' - lowest durability {}%, floor {}%",
+                                     roster.family, name, pct, repairFloor);
+                        continue;
+                    }
+                    HoldAtTheCounter(member, name);
+                    char const* status = "error";
+                    std::string evidence;
+                    char const* answer = DoRepair(member, "all", status, evidence);
+                    uint32 const afterPct = LowestDurabilityPct(member);
+                    run.repairAttempted.insert(name);
+                    _travelAims.Release(name, "raid pre-pull repair completed");
+                    ReleaseCounterHold(name, "raid pre-pull repair completed");
+                    if (OverseerDecisions::RaidSeatNeedsRepair(afterPct, repairFloor))
+                        LOG_WARN("module.overseer",
+                                 "overseer: raid run for family '{}' could not repair '{}' "
+                                 "before encounter {} ({}% remains): {}",
+                                 roster.family, name, bossesDone + 1, afterPct,
+                                 answer ? answer : "repair was partial or unaffordable");
+                }
+                auto const action = OverseerDecisions::RaidPullRepairDecision(
+                    bossesDone, repairHold,
+                    long(std::time(nullptr) - run.repairHoldSince), 300);
+                if (!run.repairHoldDecisionSaid &&
+                    action != OverseerDecisions::RaidPullRepairAction::Hold)
+                {
+                    if (action == OverseerDecisions::RaidPullRepairAction::TimedOut)
+                        LOG_WARN("module.overseer",
+                                 "overseer: raid run for family '{}' repair hold before "
+                                 "encounter {} timed out after 300 seconds",
+                                 roster.family, bossesDone + 1);
+                    else
+                        LOG_INFO("module.overseer",
+                                 "overseer: raid run for family '{}' repair hold before "
+                                 "encounter {} complete - every seat is at or above {}%",
+                                 roster.family, bossesDone + 1, repairFloor);
+                    run.repairHoldDecisionSaid = true;
+                }
+                repairHold = action == OverseerDecisions::RaidPullRepairAction::Hold;
+            }
+            if (run.phase == RaidRunPhase::Clear && head)
+            {
+                bool const shouldPause = repairHold && !repairHoldTimedOut;
+                if (shouldPause != run.repairBrainPaused &&
+                    std::time(nullptr) - run.repairHoldRefusedAt >= 30)
+                {
+                    bool any = false;
+                    bool allAccepted = true;
+                    if (group)
+                    {
+                        for (GroupReference* ref = group->GetFirstMember(); ref;
+                             ref = ref->next())
+                        {
+                            Player* member = ref->GetSource();
+                            PlayerbotAI* ai = member && member->IsInWorld() && member->IsAlive()
+                                                  ? GET_PLAYERBOT_AI(member)
+                                                  : nullptr;
+                            if (!ai)
+                                continue;
+                            any = true;
+                            if (!ai->DoSpecificAction(
+                                    "dc pause",
+                                    Event("dc", shouldPause ? "pause" : "resume", head), true))
+                                allAccepted = false;
+                        }
+                    }
+                    if (any && allAccepted)
+                        run.repairBrainPaused = shouldPause;
+                    else
+                    {
+                        run.repairHoldRefusedAt = std::time(nullptr);
+                        LOG_WARN("module.overseer",
+                                 "overseer: raid run for family '{}' could not {} the "
+                                 "dungeon brain for its repair hold; retrying",
+                                 roster.family, shouldPause ? "pause" : "resume");
+                    }
+                }
+            }
             if (run.phase == RaidRunPhase::Clear && door && facts.ordered)
             {
                 OverseerDecisions::RaidClearStallAction const stall =

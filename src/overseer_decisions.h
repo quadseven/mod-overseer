@@ -16511,6 +16511,12 @@ bool RaidWiped(RaidRunFacts const& facts);
 // measurement; callers pass the already-computed lowest percentage.
 bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct);
 
+enum class RaidPullRepairAction { Ignore, Hold, Resume, TimedOut };
+
+// The Molten Core repair gate is only before Majordomo Executus and Ragnaros.
+RaidPullRepairAction RaidPullRepairDecision(unsigned bossesDone, bool anySeatBelowFloor,
+                                            long heldSeconds, long maximumHoldSeconds);
+
 // One poll of the raid run.
 //
 // THE ORDER OF THE CHECKS IS THE ORDER OF THE THINGS THAT OVERRIDE EACH OTHER.
