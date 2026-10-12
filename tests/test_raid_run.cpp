@@ -397,6 +397,17 @@ void TheStonesMinimumIsKeptForBothEnds()
     Check("and the reason says it keeps walking",
           below.why.find("minimum") != std::string::npos);
 
+    // The minimum itself is enough, at either stone.
+    std::vector<RaidStoneSeat> atFloor{Seat("Selie", 55), AtStone("Bork", 60, 0),
+                                       AtStone("Og", 60, 0)};
+    RaidStoneSummon const exact = ChooseRaidStoneSummon(atFloor, Stones());
+    Check("a level 55 seat is summoned at the 55 stone", exact.summon && exact.stone == 0);
+    std::vector<RaidStoneSeat> atLowFloor{Seat("Selie", 48), AtStone("Bork", 60, 1),
+                                          AtStone("Og", 60, 1)};
+    RaidStoneSummon const lowExact = ChooseRaidStoneSummon(atLowFloor, Stones());
+    Check("a level 48 seat is summoned at the 48 stone",
+          lowExact.summon && lowExact.stone == 1);
+
     std::vector<RaidStoneSeat> low{Seat("Selie", 50), AtStone("Bork", 60, 1),
                                    AtStone("Og", 60, 1)};
     RaidStoneSummon const lowStone = ChooseRaidStoneSummon(low, Stones());
