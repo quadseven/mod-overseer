@@ -11428,6 +11428,10 @@ struct RoutePlan
     // one where it was not enough, and the difference between this and the extra
     // yards the way round would have cost is exactly how short it fell.
     float detourBudgetYards{0.f};
+    // How far the entry node stands above or below the character (#925), so
+    // the route line can name it. Negative when the character's height was
+    // not given or nothing was planned.
+    float entryHeightGapYards{-1.f};
 };
 
 struct RoutePlanLimits
@@ -11480,6 +11484,30 @@ struct RoutePlanLimits
     // node here. A refused node is only refused as the ENTRY: a route may still
     // pass through it, since a recorded path leaves it from where it stands.
     std::vector<std::uint32_t> refusedEntries;
+    // THE WAY IN IS ON THE CHARACTER'S OWN FLOOR (#925). Plane distance cannot
+    // tell a floor from the roof above it: a leader in the Stormwind Wizard's
+    // Sanctum at z 29.6 was given node 1689, the Mage Tower roof 37 yards
+    // across and 119 yards up, reachable only through an areatrigger, while
+    // node 1690 stood on his own floor 47 yards off with a walk link to the
+    // street. He never moved. When `fromZKnown` is set, a node within
+    // `entryNodeYards` whose height differs from `fromZ` by more than
+    // `maxEntryRiseYards` is passed over as the way in, but only while some
+    // node inside that gap is also within `entryNodeYards`. When none is, the
+    // nearest node is taken as before, so a character on a hillside with
+    // nothing level near it still gets a route.
+    //
+    // LEFT UNKNOWN, NOTHING CHANGES. `fromZKnown` defaults to false, and every
+    // caller that does not set it gets the plan this planner has always made.
+    //
+    // WHY FORTY. Over the shipped survey, 2720 walk links join two nodes less
+    // than 100 yards apart on the plane; 122 of them climb more than 40 yards
+    // and 312 climb more than 20. Forty leaves nearly every real slope alone
+    // and is a third of the gap that stranded the Sanctum leader. A smaller
+    // step, like the 9 yards of the Orgrimmar barracks exit, is still the
+    // navmesh entry check's question and not this one.
+    bool fromZKnown{false};
+    float fromZ{0.f};
+    float maxEntryRiseYards{40.f};
 };
 
 // THE NODE SEQUENCE, AND THE ONE CHOICE THAT MAKES IT WORK.
