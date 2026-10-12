@@ -38723,6 +38723,14 @@ private:
         std::time_t regroupSince{0};
         std::time_t restSince{0};
         std::time_t restRearmAt{0};
+        // WHERE IT STALLED (issue 936): who the queue waits on, as last said;
+        // the members that stood in its copy; the dungeon brain's next boss,
+        // read while the tank stands in the copy; and the last boss kill.
+        std::string saidAbsent;
+        std::set<std::string> cameInside;
+        std::string nextBoss;
+        uint32 killsSeen{0};
+        std::time_t lastKillAt{0};
     };
     std::vector<GuildRun> _guildRuns;
 
@@ -38773,7 +38781,7 @@ private:
         LOG_INFO("module.overseer",
                  "overseer: '{}' of the family of '{}' leaves its family's party for guild "
                  "run {} as its {}; its family has no campaign going",
-                 p->GetName(), family, runId, GuildSeatWord(seat));
+                 p->GetName(), family, runId, OverseerDecisions::GuildSeatWord(seat));
         return true;
     }
 
@@ -38821,15 +38829,50 @@ private:
         return sum;
     }
 
-    static char const* GuildSeatWord(OverseerDecisions::GuildSeat seat)
+    // Each of the run's members with where it stands, for OverseerDecisions::
+    // GuildRunAbsentWhy. `instanceId` 0 counts any copy of the run's map.
+    // `seatsOnly` keeps only a tank or healer that is not alive in the copy:
+    // the members a missing-role verdict is about.
+    std::vector<OverseerDecisions::GuildRunAbsentMember> GuildRunAbsentees(
+        GuildRun const& run, uint32 instanceId, bool seatsOnly) const
     {
-        switch (seat)
+        std::vector<OverseerDecisions::GuildRunAbsentMember> out;
+        for (std::size_t i = 0; i < run.names.size(); ++i)
         {
-            case OverseerDecisions::GuildSeat::Tank:   return "tank";
-            case OverseerDecisions::GuildSeat::Healer: return "healer";
-            case OverseerDecisions::GuildSeat::Damage: return "dps";
+            OverseerDecisions::GuildRunAbsentMember m;
+            m.name = run.names[i];
+            m.seat = i < run.seats.size() ? run.seats[i] : OverseerDecisions::GuildSeat::Damage;
+            Player* const p = ObjectAccessor::FindPlayerByName(m.name);
+            bool const inWorld = p && p->IsInWorld();
+            bool const alive = inWorld && p->IsAlive();
+            m.inside = inWorld && p->GetMapId() == run.mapId &&
+                       (!instanceId || p->GetInstanceId() == instanceId);
+            m.cameInside = run.cameInside.count(m.name) > 0;
+            m.absence = OverseerDecisions::GuildRunAbsenceOf(
+                inWorld, alive, inWorld && p->IsInCombat(), m.inside);
+            if (seatsOnly && (m.seat == OverseerDecisions::GuildSeat::Damage ||
+                              (alive && m.inside)))
+                continue;
+            out.push_back(m);
         }
-        return "dps";
+        return out;
+    }
+
+    // The encounter at `index` of the map's DungeonEncounter.dbc rows, "" when
+    // none answers.
+    static std::string EncounterName(uint32 mapId, int index)
+    {
+        DungeonEncounterList const* encounters =
+            index < 0 ? nullptr
+                      : sObjectMgr->GetDungeonEncounterList(mapId, DUNGEON_DIFFICULTY_NORMAL);
+        if (!encounters)
+            return std::string();
+        for (DungeonEncounter const* encounter : *encounters)
+            if (encounter && encounter->dbcEntry &&
+                encounter->dbcEntry->encounterIndex == static_cast<uint32>(index) &&
+                encounter->dbcEntry->encounterName[LOCALE_enUS])
+                return encounter->dbcEntry->encounterName[LOCALE_enUS];
+        return std::string();
     }
 
     // The row's `result`, from what the run has seen so far.
@@ -38848,6 +38891,16 @@ private:
           << ",\"bosses_total\":" << run.bossesTotal
           << ",\"dc_on\":" << (run.dcAccepted ? "true" : "false")
           << ",\"ilvl_start\":" << run.ilvlAtEntry << ",\"ilvl_end\":" << ilvlNow;
+        // WHERE IT STALLED (issue 936), on every write once the group is in:
+        // the dungeon brain's next boss and the seconds since the last kill,
+        // the latter only once a boss has died.
+        if (run.enteredAt)
+        {
+            o << ",\"next_boss\":" << J(run.nextBoss);
+            if (run.lastKillAt)
+                o << ",\"seconds_since_kill\":"
+                  << (now > run.lastKillAt ? now - run.lastKillAt : 0);
+        }
         if (loot)
         {
             o << ",\"loot_items\":" << loot->items << ",\"loot_notable\":[";
@@ -38863,7 +38916,7 @@ private:
             auto const lv = run.levelAt.find(name);
             auto const dd = run.deathsOf.find(name);
             o << (i ? "," : "") << "{\"name\":" << J(name)
-              << ",\"seat\":" << J(GuildSeatWord(run.seats[i]))
+              << ",\"seat\":" << J(OverseerDecisions::GuildSeatWord(run.seats[i]))
               << ",\"level_start\":" << (lv == run.levelAt.end() ? 0 : unsigned(lv->second))
               << ",\"level_end\":" << (p ? unsigned(p->GetLevel()) : 0)
               << ",\"deaths\":" << (dd == run.deathsOf.end() ? 0 : dd->second) << '}';
@@ -39512,7 +39565,8 @@ private:
                          "overseer: guild run tactics {} - '{}' ({}) fights with '{}': in combat "
                          "it marks a skull on the attacker with the least health, and the "
                          "group kills it first",
-                         run.id, run.names[i], GuildSeatWord(run.seats[i]), strategy);
+                         run.id, run.names[i], OverseerDecisions::GuildSeatWord(run.seats[i]),
+                         strategy);
             }
         }
     }
@@ -39833,12 +39887,18 @@ private:
             poll.waitedSeconds = static_cast<unsigned>(now - run.queuedAt);
             OverseerDecisions::FinderStep const step = OverseerDecisions::FinderNext(poll);
             std::string const said = OverseerDecisions::FinderStepWord(step);
-            if (said != run.said)
+            // WHO IT WAITS ON (issue 936): each member not inside or not
+            // ready, with its state, said again whenever that changes.
+            std::string const absent =
+                OverseerDecisions::GuildRunAbsentWhy(GuildRunAbsentees(run, headInstance, false));
+            if (said != run.said || absent != run.saidAbsent)
                 LOG_INFO("module.overseer",
-                         "overseer: guild finder run {} - {} (state {}, {} of {} inside, {}s)",
+                         "overseer: guild finder run {} - {} (state {}, {} of {} inside, {}s){}{}",
                          run.id, said, static_cast<unsigned>(poll.state), poll.inside,
-                         poll.familySize, poll.waitedSeconds);
+                         poll.familySize, poll.waitedSeconds, absent.empty() ? "" : "; ",
+                         absent);
             run.said = said;
+            run.saidAbsent = absent;
             switch (step)
             {
                 case OverseerDecisions::FinderStep::Inside:
@@ -39869,7 +39929,10 @@ private:
                                        ? OverseerDecisions::FinderJoinResultWord(told.joinResult)
                                        : "a failed role check or a proposal that did not hold") +
                                   ")";
-                    EndGuildRun(run, "not entered", why, now);
+                    std::string const absent = OverseerDecisions::GuildRunAbsentWhy(
+                        GuildRunAbsentees(run, headInstance, false));
+                    EndGuildRun(run, "not entered", absent.empty() ? why : why + "; " + absent,
+                                now);
                     return true;
                 }
                 case OverseerDecisions::FinderStep::Accept:
@@ -39937,6 +40000,7 @@ private:
                     (run.instanceId && p->GetInstanceId() != run.instanceId))
                     continue;
                 ++poll.inside;
+                run.cameInside.insert(name);
                 if (isAlive)
                 {
                     ++poll.aliveInside;
@@ -40001,6 +40065,18 @@ private:
             }
             poll.bossesDone = run.bossesDone;
             poll.bossesTotal = run.bossesTotal;
+            // WHERE IT STALLED (issue 936): the last kill is when the count of
+            // bosses down last rose, and the next boss is read only while the
+            // tank stands in the copy, since its credit is read off its bind.
+            if (run.bossesDone > run.killsSeen)
+            {
+                run.killsSeen = run.bossesDone;
+                run.lastKillAt = now;
+            }
+            if (tank && tank->IsInWorld() && tank->GetMapId() == run.mapId)
+                run.nextBoss = EncounterName(
+                    run.mapId,
+                    OverseerDecisions::GuildRunNextBossIndex(poll.expectedMask, poll.creditedMask));
             poll.ceilingSeconds =
                 OverseerDecisions::GuildRunCeilingSeconds(run.finderEndsDungeon, run.bossesTotal);
             poll.finderFinished =
@@ -40129,9 +40205,18 @@ private:
                         else
                             why = "the assigned tank and healer roles were not both alive inside "
                                   "for " + std::to_string(poll.secondsWithoutRoles) + "s";
+                        if (!poll.groupGone)
+                        {
+                            std::string const absent = OverseerDecisions::GuildRunAbsentWhy(
+                                GuildRunAbsentees(run, run.instanceId, poll.inside > 0));
+                            if (!absent.empty())
+                                why += "; " + absent;
+                        }
                         break;
                     case OverseerDecisions::GuildRunVerdict::TimedOut:
-                        why = "inside for " + std::to_string(poll.secondsInside) + "s";
+                        why = OverseerDecisions::GuildRunTimedOutWhy(
+                            poll.secondsInside, run.nextBoss, run.lastKillAt != 0,
+                            run.lastKillAt ? static_cast<unsigned>(now - run.lastKillAt) : 0);
                         break;
                     default:
                         break;
@@ -40317,6 +40402,12 @@ private:
             run.heartbeatAt = now;
             run.deaths = adoption.resume.deaths;
             run.ilvlAtEntry = adoption.resume.ilvlStart;
+            // The last kill as the row last said it, so a boss already down
+            // when the run is adopted is not read as a kill just now.
+            run.killsSeen = adoption.resume.bossesDone;
+            if (adoption.resume.killSeen)
+                run.lastKillAt = adoption.readAt - adoption.silentSeconds -
+                                 static_cast<std::time_t>(adoption.resume.secondsSinceKill);
             run.said = "inside";
 
             // THE TANK LEADS AND IS ITS OWN MASTER AGAIN, as DoGuildFinderRun

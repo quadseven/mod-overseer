@@ -20682,6 +20682,61 @@ GuildRunVerdict GuildRunNext(GuildRunPoll const& poll);
 // "running", "cleared", "wiped", "abandoned", "timed out".
 char const* GuildRunVerdictWord(GuildRunVerdict verdict);
 
+// WHO A STALLED RUN WAITS ON, AND WHERE IT STALLED (issue 936). 73 guild runs
+// timed out at 7200 s in one day on the dev realm, about 720 member-hours, and
+// 21 more were abandoned for a missing role, with nothing in the row but
+// "inside for 7200s" or "not both alive inside for 300s". The worldserver log
+// holds about five minutes, so an older run's stall point was lost, and the
+// finder's wait (FinderNext waits while anyone is not ready) never named the
+// member it waited on. The run's end now says both.
+
+// "tank", "healer", "dps".
+char const* GuildSeatWord(GuildSeat seat);
+
+enum class GuildRunAbsence : std::uint8_t
+{
+    Present,    // alive, out of combat, in the run's copy
+    NotInWorld, // logged out, or between maps
+    Dead,
+    InCombat,
+    OtherMap,   // alive and free, but not in the run's copy
+};
+
+// The first of these that holds, in this order: not in the world, dead, in
+// combat, not in the run's copy.
+GuildRunAbsence GuildRunAbsenceOf(bool inWorld, bool alive, bool inCombat, bool inRunCopy);
+
+// "here", "not in world", "dead", "in combat", "other map".
+char const* GuildRunAbsenceWord(GuildRunAbsence absence);
+
+struct GuildRunAbsentMember
+{
+    std::string name;
+    GuildSeat seat{GuildSeat::Damage};
+    GuildRunAbsence absence{GuildRunAbsence::Present};
+    // It stands in the run's copy now (dead or fighting there), or stood in it
+    // at some point of this run.
+    bool inside{false};
+    bool cameInside{false};
+};
+
+// Each member that is not Present, "; " apart: "'X' (healer) never came
+// inside: in combat", "'X' (healer) is inside: dead" for one in the copy now,
+// and "'X' (healer) left the copy: not in world" for one that had been in.
+// None absent is "".
+std::string GuildRunAbsentWhy(std::vector<GuildRunAbsentMember> const& members);
+
+// The timed-out why: "inside for 7200s; next Gelihast, last kill 95 min ago".
+// `nextBoss` is the first boss the dungeon brain expects that the core has not
+// credited ("next boss unknown" when ""), and the minutes are whole minutes
+// since the run's last boss kill ("no kill yet" when `killed` is false).
+std::string GuildRunTimedOutWhy(unsigned secondsInside, std::string const& nextBoss,
+                                bool killed, unsigned secondsSinceKill);
+
+// The dungeon brain's next boss: the lowest encounter bit it expects that the
+// core has not credited, or -1 when it expects none or all are credited.
+int GuildRunNextBossIndex(std::uint32_t expectedMask, std::uint32_t creditedMask);
+
 // THE ENCOUNTERS A GUILD RUN MUST CREDIT BEFORE IT IS CLEARED. `mapMask` is
 // every bit the map's DungeonEncounter.dbc rows credit; `brainMask` the bits
 // mod-dungeon-clear's roster is armed for in this copy, 0 when unread. As
@@ -20977,6 +21032,12 @@ struct GuildRunResume
     // written before the tally rode the heartbeat.
     unsigned lootItems{0};
     std::vector<unsigned> lootNotable;
+    // Bosses down and the seconds since the last kill when the row was last
+    // written (`killSeen` false for a row with no kill, or written before the
+    // heartbeat carried it), so the adopted run's "last kill" stays true.
+    unsigned bossesDone{0};
+    bool killSeen{false};
+    unsigned secondsSinceKill{0};
     std::vector<GuildRunResumeMember> members;
 };
 

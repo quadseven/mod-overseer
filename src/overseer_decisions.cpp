@@ -17906,6 +17906,9 @@ GuildRunResume ReadGuildRunResume(std::string const& result)
     resume.deaths = GuildRunJsonUnsigned(head, "deaths");
     resume.ilvlStart = GuildRunJsonUnsigned(head, "ilvl_start");
     resume.lootItems = GuildRunJsonUnsigned(head, "loot_items");
+    resume.bossesDone = GuildRunJsonUnsigned(head, "bosses_done");
+    resume.killSeen = GuildRunJsonValueAt(head, "seconds_since_kill") != std::string::npos;
+    resume.secondsSinceKill = GuildRunJsonUnsigned(head, "seconds_since_kill");
     {
         std::size_t at = GuildRunJsonValueAt(head, "loot_notable");
         if (at != std::string::npos && at < head.size() && head[at] == '[')
@@ -18204,6 +18207,80 @@ char const* GuildRunVerdictWord(GuildRunVerdict verdict)
         case GuildRunVerdict::TimedOut:  return "timed out";
     }
     return "unknown";
+}
+
+char const* GuildSeatWord(GuildSeat seat)
+{
+    switch (seat)
+    {
+        case GuildSeat::Tank:   return "tank";
+        case GuildSeat::Healer: return "healer";
+        case GuildSeat::Damage: return "dps";
+    }
+    return "dps";
+}
+
+GuildRunAbsence GuildRunAbsenceOf(bool inWorld, bool alive, bool inCombat, bool inRunCopy)
+{
+    if (!inWorld)
+        return GuildRunAbsence::NotInWorld;
+    if (!alive)
+        return GuildRunAbsence::Dead;
+    if (inCombat)
+        return GuildRunAbsence::InCombat;
+    if (!inRunCopy)
+        return GuildRunAbsence::OtherMap;
+    return GuildRunAbsence::Present;
+}
+
+char const* GuildRunAbsenceWord(GuildRunAbsence absence)
+{
+    switch (absence)
+    {
+        case GuildRunAbsence::Present:    return "here";
+        case GuildRunAbsence::NotInWorld: return "not in world";
+        case GuildRunAbsence::Dead:       return "dead";
+        case GuildRunAbsence::InCombat:   return "in combat";
+        case GuildRunAbsence::OtherMap:   return "other map";
+    }
+    return "unknown";
+}
+
+std::string GuildRunAbsentWhy(std::vector<GuildRunAbsentMember> const& members)
+{
+    std::string why;
+    for (GuildRunAbsentMember const& m : members)
+    {
+        if (m.absence == GuildRunAbsence::Present)
+            continue;
+        if (!why.empty())
+            why += "; ";
+        why += "'" + m.name + "' (" + GuildSeatWord(m.seat) + ") " +
+               (m.inside       ? "is inside: "
+                : m.cameInside ? "left the copy: "
+                               : "never came inside: ") +
+               GuildRunAbsenceWord(m.absence);
+    }
+    return why;
+}
+
+int GuildRunNextBossIndex(std::uint32_t expectedMask, std::uint32_t creditedMask)
+{
+    std::uint32_t const left = expectedMask & ~creditedMask;
+    for (int i = 0; i < 32; ++i)
+        if (left & (1u << i))
+            return i;
+    return -1;
+}
+
+std::string GuildRunTimedOutWhy(unsigned secondsInside, std::string const& nextBoss,
+                                bool killed, unsigned secondsSinceKill)
+{
+    std::string why = "inside for " + std::to_string(secondsInside) + "s; ";
+    why += nextBoss.empty() ? "next boss unknown" : "next " + nextBoss;
+    why += killed ? ", last kill " + std::to_string(secondsSinceKill / 60) + " min ago"
+                  : ", no kill yet";
+    return why;
 }
 
 std::uint32_t GuildRunExpectedMask(std::uint32_t mapId, std::uint32_t mapMask,
