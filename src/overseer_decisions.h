@@ -8490,6 +8490,126 @@ std::string GatheringCrossingBlocker(std::string const& leader, std::uint32_t le
                                      std::uint32_t doorMap, CrossingAction action,
                                      std::uint32_t crossingSeconds);
 
+// ------------------------- a crossing that makes no progress gives up (#926) --
+//
+// Refs wow-overseer#870. One leader's walk to the Menethil berth was restarted
+// 424 times over 4.7 hours, and the family's queue head had 0 runs of 9. Two
+// backstops existed and neither held against an aim the crossing owns. The
+// travel drive's no-progress backoff refused the aim for fifteen minutes, but
+// the IDLE crossing claimed it again on every poll and the refusal only
+// released it again: 131 times in 12 minutes. And the crossing's own backstop,
+// after half an hour, refused and zeroed its clock, so the next poll walked
+// again with a fresh half hour: released at 15:44:59, walking at 15:45:04.
+//
+// So the crossing keeps a record per leader that a Refuse does not reset:
+// attempts, the nearest the leader has got to the berth, and when the record
+// started. An attempt opens when the crossing claims the berth aim and closes
+// when one of the things below ends it. Two closed attempts in a row that got
+// no 100 yards nearer hand the dungeon back for two hours.
+
+// What ended an attempt at the berth.
+enum class CrossingAttemptEnd : std::uint8_t
+{
+    // The crossing's own half-hour backstop read it overdue.
+    Overdue,
+    // The travel drive refused every bearing toward the berth, or got no
+    // nearer to it for its whole backstop, and released the aim as unreachable.
+    GroundGiveUp,
+    // The travel drive's no-progress backoff refused the berth aim.
+    NoProgressBackoff,
+    // The travel drive refused the berth aim for another reason (deaths).
+    Refused,
+};
+
+// The clause a log line names the end with.
+char const* CrossingAttemptEndWord(CrossingAttemptEnd end);
+
+struct CrossingAttemptLimits
+{
+    // Failed attempts in a row, none of them gaining `gainYards`, before the
+    // crossing gives up.
+    std::uint32_t attempts{2};
+    float gainYards{100.f};
+    // How long a dungeon given up on stays refused to the family. Long enough
+    // that the family's own drives get a real evening's share, short enough
+    // that a guard who moved or a route fixed by a deploy is tried again.
+    std::int64_t cooloffSeconds{2 * 60 * 60};
+};
+
+// One leader's record. World thread only, lost on a restart, which costs one
+// more attempt.
+struct CrossingAttempts
+{
+    // What the record is about: the dungeon and the berth aim. A different
+    // either one starts a fresh record (the cool-off stays with the dungeon).
+    std::string dungeon;
+    std::string berth;
+    // Closed attempts in a row that gained less than `gainYards`.
+    std::uint32_t failed{0};
+    // The nearest the leader has been to the berth, and the reading the next
+    // gain is measured from. Below zero when nothing has been read.
+    float best{-1.f};
+    float reference{-1.f};
+    std::int64_t firstSeen{0};
+    // An attempt is under way: the crossing claimed the berth aim and nothing
+    // has ended it yet. A second end of the same attempt (the backoff, then
+    // the backstop) is one failure, not two.
+    bool open{false};
+    // The dungeon is refused until this moment; zero when it is not.
+    std::int64_t refusedUntil{0};
+};
+
+// The crossing is about to claim `berth` for `dungeon`, with the leader
+// `yards` from it. Starts a fresh record for a different dungeon or berth,
+// opens an attempt, and keeps the nearest reading.
+void OpenCrossingAttempt(CrossingAttempts& record, std::string const& dungeon,
+                         std::string const& berth, float yards, std::int64_t now);
+
+enum class CrossingAttemptVerdict : std::uint8_t
+{
+    // Nothing to do: no attempt was under way, or one ended having gained
+    // enough, or not enough of them have failed yet.
+    Continue,
+    // Hand the dungeon back for the cool-off.
+    GiveUp,
+};
+
+struct CrossingAttemptReading
+{
+    CrossingAttemptVerdict verdict{CrossingAttemptVerdict::Continue};
+    // Whether this end closed an attempt (false when none was open).
+    bool counted{false};
+    // Failed attempts in a row, including this one.
+    std::uint32_t attempts{0};
+    // How much nearer the berth the attempts since the count last started got.
+    float gained{0.f};
+    std::int64_t cooloffSeconds{0};
+    // Seconds since the record started, for the line that says it gave up.
+    std::int64_t seconds{0};
+};
+
+// The attempt under way ended (for one of the CrossingAttemptEnd reasons). On
+// GiveUp the record is refused until now + cooloffSeconds and its count starts
+// again, so the attempt after the cool-off is the first of a new two.
+CrossingAttemptReading EndCrossingAttempt(CrossingAttempts& record, std::int64_t now,
+                                          CrossingAttemptLimits const& limits);
+
+// Is `dungeon` handed back at `now`? Seconds of cool-off left, or 0.
+std::int64_t CrossingHandedBack(CrossingAttempts const& record, std::string const& dungeon,
+                                std::int64_t now);
+
+// May the crossing claim its berth aim on this poll? Not while the travel
+// drive refuses that aim: a claim would only be released again by the
+// refusal, every poll, for the whole of it. `sinceRefused` is seconds since
+// the aim was refused, below zero when it never was.
+enum class CrossingBerthClaim : std::uint8_t
+{
+    Claim,
+    StandBack,
+};
+CrossingBerthClaim ReadCrossingBerthClaim(std::int64_t sinceRefused,
+                                          std::int64_t refusalSeconds);
+
 // ------------------------------------------- is the transport docked (#303) --
 //
 // A MotionTransport stands still at a stop frame for exactly the interval
