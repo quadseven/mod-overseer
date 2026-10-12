@@ -52976,7 +52976,7 @@ private:
                 {
                     OverseerDecisions::EquipRefusal const refusal =
                         OverseerDecisions::EquipRefused(detail);
-                    status = refusal.status;
+                    status = "error";
                     detail = refusal.detail;
                 }
 

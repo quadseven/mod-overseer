@@ -36,7 +36,7 @@ bool ParseEquipCommand(std::string const& command, EquipCommand& out)
         if (command[i] < '0' || command[i] > '9')
             return false;
     // An item template entry is never zero; reject it before conversion.
-    if (command.find_first_not_of('0', 8) >= end)
+    if (command.find_first_not_of('0', 8) == std::string::npos)
         return false;
     if (end < command.size())
     {
