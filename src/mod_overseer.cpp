@@ -1400,9 +1400,10 @@ constexpr uint32 CON_COLOR_UNKNOWN_LEVEL_DIFF = 10;
 // eight level 65 elites, and died there eighteen times in sixteen minutes.
 //
 // THE RADIUS IS THE GRAVEYARD'S OWN NUMBER AND IS NAMED AS SUCH. The module
-// already refuses to RESURRECT a character where hostile spawns above its level
-// sit within GRAVEYARD_THREAT_RADIUS, and it was the same module walking it to
-// such a place on an errand. One number, so the two answers cannot drift.
+// already refuses to RESURRECT a character where hostile spawns at or above
+// its level, or of its killer's kind, sit within GRAVEYARD_THREAT_RADIUS,
+// and it was the same module walking it to such a place on an errand.
+// One number, so the two answers cannot drift.
 //
 // THE LEVEL GAP IS DELIBERATELY NOT THE GRAVEYARD'S, and the difference is the
 // only interesting judgement here. The graveyard test counts anything above the
