@@ -16506,6 +16506,11 @@ struct RaidRunStep
 // Is the raid wiped, by RAID_WIPE_PCT? See that constant.
 bool RaidWiped(RaidRunFacts const& facts);
 
+// A raid seat is due for repair when its lowest wearable item is below the
+// configured floor. An item with no maximum durability is not part of the
+// measurement; callers pass the already-computed lowest percentage.
+bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct);
+
 // One poll of the raid run.
 //
 // THE ORDER OF THE CHECKS IS THE ORDER OF THE THINGS THAT OVERRIDE EACH OTHER.

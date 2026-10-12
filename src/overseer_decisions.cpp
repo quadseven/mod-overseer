@@ -13520,6 +13520,11 @@ bool RaidWiped(RaidRunFacts const& facts)
     return !facts.insideCombat && facts.insideDead * 100 >= total * RAID_WIPE_PCT;
 }
 
+bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct)
+{
+    return lowestDurabilityPct < floorPct;
+}
+
 bool RaidGhostMayBeWalked(long ghostSeconds)
 {
     return ghostSeconds < RAID_RUNBACK_WAIT_SECONDS;
