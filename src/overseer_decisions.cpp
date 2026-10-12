@@ -23,6 +23,51 @@
 namespace OverseerDecisions
 {
 
+bool ParseEquipCommand(std::string const& command, EquipCommand& out)
+{
+    if (command.compare(0, 8, "e Hitem:") != 0)
+        return false;
+    std::string::size_type end = command.find(':', 8);
+    if (end == std::string::npos)
+        end = command.size();
+    if (end == 8)
+        return false;
+    for (std::string::size_type i = 8; i < end; ++i)
+        if (command[i] < '0' || command[i] > '9')
+            return false;
+    if (end < command.size())
+    {
+        // Hyperlink suffixes are numeric item fields only; reject a second
+        // link, whitespace, or arbitrary trailing command text.
+        for (std::string::size_type i = end; i < command.size(); ++i)
+            if ((command[i] < '0' || command[i] > '9') && command[i] != ':')
+                return false;
+    }
+    try
+    {
+        unsigned long const value = std::stoul(command.substr(8, end - 8));
+        if (!value || value > UINT32_MAX)
+            return false;
+        out.entry = static_cast<uint32_t>(value);
+        return true;
+    }
+    catch (std::exception const&)
+    {
+        return false;
+    }
+}
+
+EquipRefusal EquipRefused(std::string const& reason)
+{
+    return {"error", reason};
+}
+
+EquipRefusal EquipReadBack(bool worn)
+{
+    return {worn ? "applied" : "unchanged",
+            worn ? "" : "the bot did not put the item on"};
+}
+
 LeaderClientGate DungeonLeaderClientGate(bool socketOpen, std::time_t openSince,
                                          std::time_t now, std::time_t settleSeconds)
 {
