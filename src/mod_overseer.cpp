@@ -7466,6 +7466,12 @@ void RestoreGuildRunFinderDungeons()
     } while (rows->NextRow());
 }
 
+// Logouts on a shared account that cleared only their own character's online
+// flag (wow-overseer#874). OverseerDatabaseScript counts them; the world
+// update says the count every PRESENCE_SUMMARY_MS and starts it again.
+static std::atomic<uint32> g_characterOnlyLogouts{0};
+static constexpr uint32 PRESENCE_SUMMARY_MS = 10 * 60 * 1000;
+
 class OverseerWorldScript : public WorldScript
 {
     // The level-up and login hooks spend a guild raider's points with the same
@@ -7578,6 +7584,17 @@ public:
         {
             _raidSpecTimer = 0;
             ReloadRaidSpecTargets();
+        }
+        // Said even at zero, so a quiet ten minutes reads as quiet rather
+        // than as a hook that never ran.
+        _presenceSummaryTimer += diff;
+        if (_presenceSummaryTimer >= PRESENCE_SUMMARY_MS)
+        {
+            _presenceSummaryTimer = 0;
+            LOG_INFO("module.overseer",
+                     "overseer: presence flag: {} logout(s) on shared accounts marked only their "
+                     "own character offline in the last 10 minutes",
+                     g_characterOnlyLogouts.exchange(0));
         }
         if (_rosterTimer >= ROSTER_POLL_MS)
         {
@@ -72143,6 +72160,7 @@ private:
     // more (#131) - only a client can.
     uint32 _rosterTimer = 0;
     uint32 _raidSpecTimer = 0;
+    uint32 _presenceSummaryTimer = 0;
     uint32 _partyTimer = 0;
     uint32 _trainTimer = 0;
     uint32 _questTimer = 0;
@@ -72758,6 +72776,62 @@ private:
     }
 };
 
+// A LOGOUT CLEARS ONLY ITS OWN CHARACTER WHILE ACCOUNT-MATES PLAY ON
+// (wow-overseer#874). WorldSession::LogoutPlayer runs CHAR_UPD_ACCOUNT_ONLINE,
+// which sets online = 0 for the whole account. Under playerbots many
+// characters on one account are in the world at once, so one bot's logout
+// marked always-online guild members offline until their next save, 15
+// minutes later: on the dev realm 42 characters in the world read online 0,
+// and 2 to 7 of the guild members at any moment. The hook runs before the
+// leaving player is removed from the world, so the count skips it
+// rather than counting it. A lone session keeps the core's statement unchanged.
+class OverseerDatabaseScript : public DatabaseScript
+{
+public:
+    OverseerDatabaseScript() : DatabaseScript("OverseerDatabaseScript", {
+        DATABASEHOOK_ON_DATABASE_SELECT_INDEX_LOGOUT,
+    }) {}
+
+    void OnDatabaseSelectIndexLogout(Player* player, uint32& statementIndex,
+                                     uint32& statementParam) override
+    {
+        if (!player || !player->GetSession())
+            return;
+        WorldSession const* leaving = player->GetSession();
+        uint32 const accountId = leaving->GetAccountId();
+        uint32 others = 0;
+        for (auto const& itr : ObjectAccessor::GetPlayers())
+        {
+            Player* other = itr.second;
+            if (!other || other == player || !other->IsInWorld() || !other->GetSession())
+                continue;
+            if (other->GetSession()->GetAccountId() == accountId)
+                ++others;
+        }
+
+        if (OverseerDecisions::LogoutOfflineScope(others) ==
+            OverseerDecisions::LogoutScope::CharacterOnly)
+        {
+            statementIndex = CHAR_UPD_CHAR_OFFLINE;
+            statementParam = player->GetGUID().GetCounter();
+            ++g_characterOnlyLogouts;
+        }
+
+        // The module had no logout hook, so a guild member's real departure
+        // left no line at all.
+        if (!InNaturalGuild(player))
+            return;
+        Guild const* guild = sGuildMgr->GetGuildById(player->GetGuildId());
+        char const* cause = sWorld->IsShuttingDown() ? "server shutdown"
+                            : leaving->IsBot()       ? "bot session"
+                                                     : "player client";
+        LOG_INFO("module.overseer",
+                 "overseer: guild member '{}' ({}) left the world: {}; {} other character(s) "
+                 "on its account stay in the world",
+                 player->GetName(), guild ? guild->GetName() : std::string(), cause, others);
+    }
+};
+
 void Addmod_overseerScripts()
 {
     // Install the crash trace before constructing scripts or starting module work.
@@ -72775,4 +72849,5 @@ void Addmod_overseerScripts()
     new OverseerKeepScript();
     new OverseerMeterScript();
     new OverseerAuctionScript();
+    new OverseerDatabaseScript();
 }

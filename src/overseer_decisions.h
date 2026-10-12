@@ -22963,6 +22963,22 @@ bool RowLiftsDeckSettle(std::string const& kind);
 // replaces its own linger? True for the settle on the deck.
 bool HoldYieldsToWalk(std::string const& holdVerb);
 
+// WHICH ROWS A LOGOUT MARKS OFFLINE. The core's logout clears the online flag
+// for every character on the leaving character's ACCOUNT. Under playerbots
+// many characters on one account are in the world at once, so one bot's logout
+// marked always-online guild members offline until their next save, 15 minutes
+// later (wow-overseer#874: 42 characters in the world read online 0 on the dev
+// realm). A logout with account-mates still in the world clears only its own
+// character; a lone session keeps the core's account-wide statement.
+// `otherInWorldOnAccount` counts the in-world players on the same account,
+// the leaving one excluded.
+enum class LogoutScope
+{
+    Account,
+    CharacterOnly,
+};
+LogoutScope LogoutOfflineScope(uint32_t otherInWorldOnAccount);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

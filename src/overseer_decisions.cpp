@@ -20813,4 +20813,10 @@ bool HoldYieldsToWalk(std::string const& holdVerb)
     return holdVerb == DECK_SETTLE_HOLD_VERB;
 }
 
+LogoutScope LogoutOfflineScope(uint32_t otherInWorldOnAccount)
+{
+    return otherInWorldOnAccount == 0 ? LogoutScope::Account
+                                      : LogoutScope::CharacterOnly;
+}
+
 }  // namespace OverseerDecisions
