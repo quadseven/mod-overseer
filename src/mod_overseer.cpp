@@ -45113,6 +45113,9 @@ private:
         // How many ghosts the run-back walked on the last poll, so the line is
         // said when the number changes rather than every five seconds.
         unsigned runBackWalking{0};
+        // Seats already given their pre-FORM repair attempt for this order.
+        std::set<std::string> repairAttempted;
+        std::set<std::string> repairWalkSaid;
     };
     std::map<std::string, RaidRunState> _raidRuns;
     // What the raid timeline last wrote for each family (#640).
@@ -45799,6 +45802,74 @@ private:
             std::map<std::string, unsigned> seats;
             if (facts.ordered)
                 seats = LoadRaidSeats(roster.family, keyword);
+
+            // REPAIR BEFORE FORM. A raid order first walks every seat whose
+            // lowest wearable item is below the configured floor to a repairer.
+            // The existing repair executor uses the character's own purse and
+            // reads durability back after the core handler returns.
+            uint32 const repairFloor = std::min<uint32>(
+                100, sConfigMgr->GetOption<uint32>("Overseer.Raid.RepairFloorPct", 70));
+            bool repairPending = false;
+            if (facts.ordered && run.phase == RaidRunPhase::Idle && repairFloor <= 100)
+            {
+                for (auto const& [name, subgroup] : seats)
+                {
+                    (void)subgroup;
+                    if (run.repairAttempted.count(name))
+                        continue;
+                    Player* member = ObjectAccessor::FindPlayerByName(name);
+                    if (!member || !member->IsInWorld())
+                    {
+                        run.repairAttempted.insert(name);
+                        LOG_WARN("module.overseer",
+                                 "overseer: raid run for family '{}' cannot check '{}' for "
+                                 "pre-FORM repair because the seat is not in the world",
+                                 roster.family, name);
+                        continue;
+                    }
+                    uint32 const lowestPct = LowestDurabilityPct(member);
+                    if (!OverseerDecisions::RaidSeatNeedsRepair(lowestPct, repairFloor))
+                        continue;
+
+                    bool oneIsNearby = false;
+                    float nearestYards = -1.f;
+                    if (!CounterInReach(member, OverseerDecisions::CounterRole::Repairer,
+                                        oneIsNearby, nearestYards))
+                    {
+                        repairPending = true;
+                        _travelAims.Claim(name, "repair", OverseerDecisions::TravelOwner::Run);
+                        if (run.repairWalkSaid.insert(name).second)
+                            LOG_INFO("module.overseer",
+                                     "overseer: raid run for family '{}' repair walk for '{}' - "
+                                     "lowest durability {}%, floor {}%",
+                                     roster.family, name, lowestPct, repairFloor);
+                        continue;
+                    }
+
+                    HoldAtTheCounter(member, name);
+                    char const* status = "error";
+                    std::string evidence;
+                    char const* answer = DoRepair(member, "all", status, evidence);
+                    uint32 const afterPct = LowestDurabilityPct(member);
+                    run.repairAttempted.insert(name);
+                    _travelAims.Release(name, "raid pre-FORM repair completed");
+                    ReleaseCounterHold(name, "raid pre-FORM repair completed");
+                    if (OverseerDecisions::RaidSeatNeedsRepair(afterPct, repairFloor))
+                        LOG_WARN("module.overseer",
+                                 "overseer: raid run for family '{}' could not bring '{}' "
+                                 "to the {}% repair floor (lowest {}% after repair): {}",
+                                 roster.family, name, repairFloor, afterPct,
+                                 answer ? answer : "repair was partial or unaffordable");
+                    else
+                        LOG_INFO("module.overseer",
+                                 "overseer: raid run for family '{}' repaired '{}' from {}% "
+                                 "to {}% before FORM",
+                                 roster.family, name, lowestPct, afterPct);
+                    repairPending = true;
+                }
+            }
+            if (repairPending)
+                continue;
 
             // BUSY, FOR CLEAR'S STALL LADDER: somebody inside fighting, dead
             // and waiting on a healer, or the head eating or drinking.
@@ -55991,6 +56062,19 @@ private:
                 take(bag->GetItemByPos(uint8(i)));
         }
         return readings;
+    }
+
+    static uint32 LowestDurabilityPct(Player* who)
+    {
+        uint32 lowest = 100;
+        for (DurabilityReading const& reading : ReadCarriedDurability(who))
+        {
+            uint32 const percent = reading.maximum
+                                      ? reading.current * 100 / reading.maximum
+                                      : 100;
+            lowest = std::min(lowest, percent);
+        }
+        return lowest;
     }
 
     // The core's own repair arithmetic (Player::DurabilityRepair), run without
