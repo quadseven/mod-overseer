@@ -34,6 +34,8 @@ int main()
     Check("entry is extracted", parsed.entry == 15211, true);
     Check("other verbs are ignored", ParseEquipCommand("nc +grind", parsed), false);
     Check("missing entry is rejected", ParseEquipCommand("e Hitem:", parsed), false);
+    Check("zero entry is rejected", ParseEquipCommand("e Hitem:0", parsed), false);
+    Check("overflowing entry is rejected", ParseEquipCommand("e Hitem:999999999999999999999999", parsed), false);
     Check("trailing command text is rejected", ParseEquipCommand("e Hitem:15211 junk", parsed), false);
 
     EquipRefusal refusal = EquipRefused("EQUIP_ERR_CANT_EQUIP 29");

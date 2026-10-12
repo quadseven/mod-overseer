@@ -35,6 +35,9 @@ bool ParseEquipCommand(std::string const& command, EquipCommand& out)
     for (std::string::size_type i = 8; i < end; ++i)
         if (command[i] < '0' || command[i] > '9')
             return false;
+    // An item template entry is never zero; reject it before conversion.
+    if (command.find_first_not_of('0', 8) >= end)
+        return false;
     if (end < command.size())
     {
         // Hyperlink suffixes are numeric item fields only; reject a second
@@ -46,12 +49,16 @@ bool ParseEquipCommand(std::string const& command, EquipCommand& out)
     try
     {
         unsigned long const value = std::stoul(command.substr(8, end - 8));
-        if (!value || value > UINT32_MAX)
+        if (value > UINT32_MAX)
             return false;
         out.entry = static_cast<uint32_t>(value);
         return true;
     }
-    catch (std::exception const&)
+    catch (std::invalid_argument const&)
+    {
+        return false;
+    }
+    catch (std::out_of_range const&)
     {
         return false;
     }

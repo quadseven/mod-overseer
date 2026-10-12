@@ -52620,7 +52620,7 @@ private:
             }
 
             char const* status = "error";
-            char const* detail = "";
+            std::string detail;
 
             // Bot orders only. 'chat', 'gm', 'probe', 'give', 'trade',
             // 'share', 'job', 'sell', 'bank', 'auction', 'bind', 'hearth',
