@@ -23,6 +23,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -39,6 +41,11 @@ using OverseerDecisions::RaidKeywordForJob;
 using OverseerDecisions::RaidKnockOrder;
 using OverseerDecisions::RaidRunFacts;
 using OverseerDecisions::RaidSeatNeedsRepair;
+using OverseerDecisions::RaidPullRepairAction;
+using OverseerDecisions::RaidPullRepairDecision;
+using OverseerDecisions::RaidPullRepairForSeats;
+using OverseerDecisions::RaidPullSeatRepairStep;
+using OverseerDecisions::RaidPullSeatStep;
 using OverseerDecisions::RaidRunPhase;
 using OverseerDecisions::RaidRunPhaseName;
 using OverseerDecisions::RaidRunStep;
@@ -66,6 +73,108 @@ void TheRepairFloorIsStrictAndConfigurable()
     Check("at the floor does not need repair", !RaidSeatNeedsRepair(70, 70));
     Check("above the floor does not need repair", !RaidSeatNeedsRepair(100, 70));
     Check("zero floor disables this gate", !RaidSeatNeedsRepair(0, 0));
+}
+
+void OnlyMajordomoAndRagnarosPullsWaitForRepair()
+{
+    Check("Majordomo pull holds below-floor seats",
+          RaidPullRepairDecision(8, true, 10, 300) == RaidPullRepairAction::Hold);
+    Check("Ragnaros pull holds below-floor seats",
+          RaidPullRepairDecision(9, true, 10, 300) == RaidPullRepairAction::Hold);
+    Check("Majordomo resumes when all seats meet floor",
+          RaidPullRepairDecision(8, false, 10, 300) == RaidPullRepairAction::Resume);
+    Check("Ragnaros resumes at the time limit",
+          RaidPullRepairDecision(9, true, 300, 300) == RaidPullRepairAction::TimedOut);
+    Check("other boss pulls do not hold",
+          RaidPullRepairDecision(7, true, 10, 300) == RaidPullRepairAction::Ignore);
+    Check("first boss pull does not hold",
+          RaidPullRepairDecision(0, true, 10, 300) == RaidPullRepairAction::Ignore);
+}
+
+// The run feeds each readable seat's lowest durability to the gate; this is
+// the decision the pull acts on, including the timeout that must be logged as
+// a timeout and not as every seat having repaired.
+void ThePullHoldReadsEverySeat()
+{
+    std::vector<unsigned> const mixed = {100, 69, 90};
+    std::vector<unsigned> const healthy = {100, 70, 90};
+    Check("one seat under the floor holds Majordomo",
+          RaidPullRepairForSeats(8, mixed, 70, 10, 300) == RaidPullRepairAction::Hold);
+    Check("one seat under the floor holds Ragnaros",
+          RaidPullRepairForSeats(9, mixed, 70, 10, 300) == RaidPullRepairAction::Hold);
+    Check("seats at the floor resume the pull",
+          RaidPullRepairForSeats(9, healthy, 70, 10, 300) == RaidPullRepairAction::Resume);
+    Check("the time limit ends the hold as TimedOut",
+          RaidPullRepairForSeats(9, mixed, 70, 300, 300) == RaidPullRepairAction::TimedOut);
+    Check("a mid-raid boss never holds",
+          RaidPullRepairForSeats(4, mixed, 70, 10, 300) == RaidPullRepairAction::Ignore);
+    Check("no readable seats resume",
+          RaidPullRepairForSeats(8, {}, 70, 10, 300) == RaidPullRepairAction::Resume);
+}
+
+// Each seat's step inside the hold, as the run's seat loop acts on it: a seat
+// under the floor walks or repairs and holds the pull, is charged once, and is
+// let go (not walked) once the hold has timed out.
+void EachSeatInThePullHoldWalksRepairsOrWaits()
+{
+    Check("a seat at the floor is ready",
+          RaidPullSeatRepairStep(70, 70, false, false, false) == RaidPullSeatStep::Ready);
+    Check("a seat under the floor with no repairer walks",
+          RaidPullSeatRepairStep(69, 70, false, false, false) == RaidPullSeatStep::Walk);
+    Check("a seat under the floor at a repairer repairs",
+          RaidPullSeatRepairStep(69, 70, false, false, true) == RaidPullSeatStep::Repair);
+    Check("a seat already sent through repair is not charged again",
+          RaidPullSeatRepairStep(69, 70, false, true, true) == RaidPullSeatStep::Attempted);
+    Check("a timed-out hold stops walking the seat",
+          RaidPullSeatRepairStep(69, 70, true, false, false) == RaidPullSeatStep::TimedOut);
+    Check("a timed-out hold leaves a ready seat ready",
+          RaidPullSeatRepairStep(90, 70, true, false, false) == RaidPullSeatStep::Ready);
+}
+
+bool Has(std::string const& text, char const* needle)
+{
+    return text.find(needle) != std::string::npos;
+}
+
+// The decisions above only matter if the raid run acts on them. This reads the
+// run's pre-pull block in src/mod_overseer.cpp (run from the repo root) and
+// checks it logs every pull, gates the hold on the decision, repairs through
+// the ordinary verb, logs an unpaid seat, and pauses the brain only while held.
+void ThePrePullHoldIsWiredIntoTheRun()
+{
+    std::ifstream in("src/mod_overseer.cpp");
+    std::stringstream text;
+    text << in.rdbuf();
+    std::string const source = text.str();
+    if (source.empty())
+    {
+        std::printf("FAIL could not read src/mod_overseer.cpp (run from the repo root)\n");
+        ++failures;
+        return;
+    }
+    std::size_t const at = source.find("// Read the seats before every next encounter.");
+    Check("the pre-pull block exists", at != std::string::npos);
+    std::size_t const end = at == std::string::npos ? at : source.find("RaidClearStall(", at);
+    std::string const body = end == std::string::npos ? "" : source.substr(at, end - at);
+    Check("every pull logs the lowest durability line",
+          Has(body, "overseer: raid run for family '{}': lowest durability {} {}%"));
+    Check("a pull with no readable seat is logged, not skipped",
+          Has(body, "cannot log pre-pull"));
+    Check("the hold is gated on the boss decision",
+          Has(body, "RaidPullRepairDecision(bossesDone, false, 0, 300) !=\n"
+                    "                    OverseerDecisions::RaidPullRepairAction::Ignore"));
+    Check("the hold reads every seat", Has(body, "RaidPullRepairForSeats("));
+    Check("each seat steps through the seat decision", Has(body, "RaidPullSeatRepairStep("));
+    Check("the wall clock is read once per poll",
+          Has(body, "long const heldNow = long(std::time(nullptr) - run.repairHoldSince);"));
+    Check("a seat at a repairer pays through the ordinary verb",
+          Has(body, "DoRepair(member, \"all\", status, evidence)"));
+    Check("a seat that cannot pay is logged", Has(body, "could not repair '{}'"));
+    Check("the end of the hold is logged as a timeout or as complete",
+          Has(body, "timed out after 300 seconds") &&
+              Has(body, "complete - every seat is at or above"));
+    Check("the brain pauses only while held and not timed out",
+          Has(body, "bool const shouldPause = repairHold && !repairHoldTimedOut;"));
 }
 
 void CheckString(char const* what, std::string const& got, std::string const& want)
@@ -452,6 +561,10 @@ void ARaidMapIsNotArmedUntilClearingIsOrdered()
 int main()
 {
     TheRepairFloorIsStrictAndConfigurable();
+    OnlyMajordomoAndRagnarosPullsWaitForRepair();
+    ThePullHoldReadsEverySeat();
+    EachSeatInThePullHoldWalksRepairsOrWaits();
+    ThePrePullHoldIsWiredIntoTheRun();
     TheMoltenCoreDoorIsTheWorldsOwnNumbers();
     OnlyAnExactRaidJobNamesADoor();
     NoOrderIsIdleAndAnEndedOrderReleases();

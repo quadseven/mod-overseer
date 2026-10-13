@@ -3,8 +3,9 @@
  *
  * The decisions are proved in test_hidden_plane.cpp. What only the adapter can
  * get wrong is whether it ASKS: measures the raw terrain, passes the plane into
- * the errand release and the stand-down set, and returns the character on the
- * same map. A rung nothing feeds is the failure this repository has shipped
+ * the errand release and the stand-down set, and sends the character off the
+ * plane by its own hearthstone, never a teleport (natural only, 2026-10-12).
+ * A rung nothing feeds is the failure this repository has shipped
  * before, so the wiring is pinned as text.
  */
 
@@ -50,18 +51,20 @@ int main()
         "verdict.remedy ==\n                OverseerDecisions::TerrainRemedy::ReturnToLastGround");
     if (back == std::string::npos)
         return Fail("the drive must act on ReturnToLastGround");
-    if (!Has(text, "verdict.groundMapId != bot->GetMapId()", back))
-        return Fail("a return must be refused unless it is on the character's own map");
+    // NATURAL ONLY (2026-10-12): the return is the character's own
+    // hearthstone, never a teleport written here.
+    std::size_t const end = text.find("            // IN THE AIR BESIDE A TRANSPORT", back);
     std::size_t const refuse = text.find("_travelAims.Refuse(name, travelTarget", back);
-    std::size_t const tele = text.find("bot->TeleportTo(bot->GetMapId(), verdict.groundX", back);
-    if (refuse == std::string::npos || tele == std::string::npos || !(refuse < tele))
-        return Fail("the errand that walked it there is refused before the return");
-    if (!Has(text, "WAS UNDER THE WORLD at map", back))
-        return Fail("a return must be logged loudly, by name");
+    std::size_t const hearth = text.find("HearthOffThePlane(bot, name, groundOnRecord)", back);
+    if (end == std::string::npos || refuse == std::string::npos || hearth == std::string::npos ||
+        !(refuse < hearth && hearth < end))
+        return Fail("the errand that walked it there is refused before the hearthstone");
+    if (text.substr(back, end - back).find("TeleportTo") != std::string::npos)
+        return Fail("nothing on the plane rung teleports the character");
+    if (!Has(text, "IS UNDER THE WORLD at map", back))
+        return Fail("a plane it does not hearth off must be logged loudly, by name");
     if (!Has(text, "IS STILL UNDER THE WORLD at map"))
         return Fail("the plane's give-up must be its own loud line, not 'the detector is wrong'");
-    if (!Has(text, "(nearThePlane || onThePlane)"))
-        return Fail("a plane lift is not held to the 30-yard cap of an ordinary lift");
-    std::cout << "hidden plane is measured, returned, refused and logged\n";
+    std::cout << "hidden plane is measured, hearthed off, refused and logged\n";
     return EXIT_SUCCESS;
 }

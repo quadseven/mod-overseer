@@ -8,13 +8,13 @@
  *       kind='bot'  - delivered to the named bot as if whispered, via
  *                     PlayerbotAI::HandleCommand(CHAT_MSG_WHISPER, ...) with
  *                     the bot itself as the speaker - the same self-command
- *                     pattern mod-playerbots uses internally.
+ *                     pattern mod-playerbots uses internally. A verb that
+ *                     grants (maintenance, autogear, cheat, summon, init,
+ *                     levelup) is refused; see GrantingBotCommandRefusal.
  *       kind='chat' - the character actually SPEAKS in the world, on the
  *                     named channel, exactly as a seated player would.
- *       kind='gm'   - a dot-command run through the character's own session,
- *                     with that account's own security level. No escalation:
- *                     a non-GM account gets the same refusal it would get by
- *                     typing the command itself.
+ *       kind='gm'   - retired (natural only): answered with a refusal, and no
+ *                     dot-command is run on any character.
  *       kind='probe' - read-only. Answers from the live Player*, never from
  *                     the up-to-fifteen-minutes-stale characters table.
  *       kind='give' - move one item from target_name's bags into target_arg's,
@@ -695,28 +695,14 @@ constexpr int64 STUCK_REVIVAL_DEAD_SECONDS = 45;
 // this one is wall time from the death.
 constexpr int64 STUCK_REVIVAL_HEALER_SECONDS = 90 + 30;
 
-// WHEN THE NEAREST GRAVEYARD IS ITSELF THE THING KILLING THEM.
-// Resurrecting at the closest graveyard is right almost everywhere, and it is
-// what this drive did first. Measured on wow-dev 2026-08-28 it doubled the
-// death rate: 4.94 deaths/character/10min before, 10.03 after, over a 34-minute
-// window (173 deaths). The family were dying at Burning Steppes graveyard 1469
-// (-7923.56, -1353.23), which has four level 57-58 Flamescale Wyrmkin spawned
-// 31 yards away - inside the aggro radius of a level 15-19 character. Every
-// resurrection handed them straight back to the same mob, so a FASTER revive
-// meant a FASTER death. The run carried its own control group: Grug, the only
-// one this drive skipped at the time, died 22 times while the four it revived
-// died 35-39 each.
-//
-// So a graveyard that a character keeps dying at is not a rescue, and the
-// module already has the evidence to know which is which - it writes every
-// death to overseer_death with a position and a timestamp. Repeated deaths in
-// one small area mean the local graveyard is not working; go home instead.
-// Deliberately measured in the module's OWN telemetry rather than by zone or
-// creature id: nothing here is specific to Burning Steppes or to one mob, and
-// a trap built somewhere else reads identically.
-constexpr uint64 STUCK_REVIVAL_TRAP_DEATHS = 3;
-constexpr uint32 STUCK_REVIVAL_TRAP_MINUTES = 15;
-constexpr float STUCK_REVIVAL_TRAP_RADIUS = 100.0f;
+// WHEN THE NEAREST GRAVEYARD IS ITSELF THE THING KILLING THEM. Measured on
+// wow-dev 2026-08-28: resurrecting at the closest graveyard doubled the death
+// rate, because Burning Steppes graveyard 1469 has four level 57-58 Flamescale
+// Wyrmkin 31 yards away and every resurrection handed a level 15-19 character
+// straight back to them. This drive used to send a character home to a bind
+// point after three deaths in 100 yards in fifteen minutes; that was a
+// teleport, and it is gone (natural only, 2026-10-12). The safety check below
+// is what keeps the ghost off such a graveyard now.
 
 // WHEN THE NEAREST GRAVEYARD IS SOMEBODY ELSE'S CAMP.
 // GetClosestGraveyard answers a geometry question. The character needs a
@@ -743,16 +729,9 @@ constexpr float STUCK_REVIVAL_TRAP_RADIUS = 100.0f;
 // The alternatives are the core's own candidate set for that corpse (the
 // graveyards graveyard_zone links to its zone, filtered by team, which is
 // what GetClosestGraveyard itself walks at GameGraveyard.cpp:145-160), nearest
-// first; when none qualifies the bind point is the destination, because it
-// is the one place that always exists and is always the character's own.
+// first; when none qualifies the nearest stands.
 constexpr float GRAVEYARD_THREAT_RADIUS = 60.0f;
 constexpr std::size_t GRAVEYARD_CANDIDATES = 6;
-
-// Two revivals of the same character at the same graveyard inside this
-// window, and the second goes to the bind point instead, unconditionally:
-// whatever the scoring above thought of that graveyard, the character has
-// now demonstrated it cannot live there.
-constexpr int64 GRAVEYARD_REPEAT_SECONDS = 5 * 60;
 
 // THE GRACE AFTER A REVIVAL. A character revived at half health that is
 // immediately walked off by `follow` or `new rpg` arrives at its next fight
@@ -7530,6 +7509,15 @@ void RestoreGuildRunFinderDungeons()
     } while (rows->NextRow());
 }
 
+// Logouts on a shared account that cleared only their own character's online
+// flag (wow-overseer#874). OverseerDatabaseScript counts them; the world
+// update says the count every PRESENCE_SUMMARY_MS and starts it again.
+// It needs no cap: logouts run from session updates inside the same world
+// update that drains it, so it cannot climb while the timer stalls, and at
+// 64 bits it cannot wrap in any realm's lifetime even if it did.
+static std::atomic<uint64> g_characterOnlyLogouts{0};
+static constexpr uint32 PRESENCE_SUMMARY_MS = 10 * 60 * 1000;
+
 class OverseerWorldScript : public WorldScript
 {
     // The level-up and login hooks spend a guild raider's points with the same
@@ -7642,6 +7630,17 @@ public:
         {
             _raidSpecTimer = 0;
             ReloadRaidSpecTargets();
+        }
+        // Said even at zero, so a quiet ten minutes reads as quiet rather
+        // than as a hook that never ran.
+        _presenceSummaryTimer += diff;
+        if (_presenceSummaryTimer >= PRESENCE_SUMMARY_MS)
+        {
+            _presenceSummaryTimer = 0;
+            LOG_INFO("module.overseer",
+                     "overseer: presence flag: {} logout(s) on shared accounts marked only their "
+                     "own character offline in the last 10 minutes",
+                     g_characterOnlyLogouts.exchange(0));
         }
         if (_rosterTimer >= ROSTER_POLL_MS)
         {
@@ -14714,6 +14713,7 @@ private:
             for (uint32 spellId : RecipesToBuy(trainer, npc, bot, skill))
             {
                 uint64 const purseBefore = bot->GetMoney();
+                // natural-only: bought at a trainer in reach, which takes its price (TeachSpell).
                 trainer->TeachSpell(npc, bot, spellId);
                 if (bot->HasSpell(spellId))
                 {
@@ -15054,6 +15054,8 @@ private:
                  static_cast<uint32>(bot->GetPureMaxSkillValue(skill)),
                  static_cast<uint32>(value));
 
+        // natural-only: a profession unlearned, as the spellbook's own unlearn does; it takes
+        // away.
         bot->SetSkill(static_cast<uint16>(skill), 0, 0, 0);  // Player.h:2111
 
         // READ BACK, NOT ASSUMED. "delivered is not worked" is the rule this
@@ -15222,6 +15224,7 @@ private:
         // to compare against - see the comment on `succeeded`.
         uint32 const maxBefore = static_cast<uint32>(bot->GetPureMaxSkillValue(skill));
 
+        // natural-only: bought at a trainer in reach, which takes its price (TeachSpell).
         trainer->TeachSpell(npc, bot, spellId);  // Trainer.h:73
 
         // THE READ-BACK, and it is the whole point of the exercise. TeachSpell
@@ -15481,6 +15484,8 @@ private:
                 }
             }
 
+            // natural-only: a recipe the character knows (HasSpell above), cast untriggered with
+            // its own reagents.
             SpellCastResult const result = bot->CastSpell(bot, spellId, false);
             if (result == SPELL_CAST_OK)
             {
@@ -15771,6 +15776,7 @@ private:
                  "overseer: '{}' is buying Fishing from '{}' (creature {}, spell {})",
                  name, npc->GetName(), entry, spellId);
 
+        // natural-only: bought at a trainer in reach, which takes its price (TeachSpell).
         trainer->TeachSpell(npc, bot, spellId);  // Trainer.h:73
 
         // THE READ-BACK. TeachSpell returns void and reports failure only to
@@ -18323,6 +18329,8 @@ private:
             return false;
         }
         AllowedLooterSet looters = drop.GetAllowedLooters();
+        // natural-only: master loot of a real drop off the corpse, which is marked looted below,
+        // as HandleLootMasterGiveOpcode does.
         Item* newitem = target->StoreNewItem(dest, drop.itemid, true, drop.randomPropertyId, looters);
         if (!newitem)
         {
@@ -18330,6 +18338,7 @@ private:
             return false;
         }
         uint32 const itemGuid = newitem->GetGUID().GetCounter();
+        // natural-only: the notice for the looted drop above.
         target->SendNewItem(newitem, uint32(drop.count), false, false, true);
         target->UpdateLootAchievements(&drop, &loot);
         drop.count = 0;
@@ -27341,209 +27350,107 @@ private:
             }
             // Recovery is terminal for the unsafe travel aim. Capture the
             // snapshot first so the recovery log preserves the cause, then
-            // clear it before any rescue teleport so the next travel poll
-            // cannot re-issue the same coordinate onto the bad plane. Once, and
+            // clear it before any remedy so the next travel poll cannot
+            // re-issue the same coordinate onto the bad plane. Once, and
             // only where the verdict can have been caused by the aim.
             if (endsTheErrand)
                 _travelAims.Release(name, "the terrain drive (a lift, or a give-up "
                                           "under the world)");
 
-            // A LIFT IS NOT A DISPLACEMENT, so it takes nothing away. Same map,
-            // same x and y, on top of the surface the probe just read - and the
-            // ONLY remedy in this drive that moves anything at all, since #188
-            // removed the bind-point escalation that followed it. The map id
-            // passed here is the character's own by construction, so a recovery
-            // cannot change continents even if the surface reading is nonsense.
-            // quest aim and the party the character had a moment ago are still
-            // exactly right for where it now stands. The old bind-point
-            // teleport cleared both aims every time; over
-            // the 204 recoveries measured on 2026-09-05 that was 204 silent
-            // undos of errands the character was in the middle of, one of them
-            // ten seconds after it had been sent to a vendor 39 yards away.
-            // BACK TO THE LAST GROUND, ON THE SAME MAP (the hidden plane). A
-            // character on the placeholder under the city is not standing on
-            // anything a walk can lead off, so it is put where it last stood
-            // on ground, by the same TeleportTo the lift below uses. The map
-            // is the character's own by construction and is checked again here
-            // because this is the one remedy that changes x and y. The errand
-            // that walked it there is released above and REFUSED here, so the
-            // next poll cannot write the same walk back.
+            // OFF THE HIDDEN PLANE BY ITS OWN HEARTHSTONE, NOT BY A TELEPORT
+            // (natural only, 2026-10-12). A character on the placeholder under
+            // the city is not standing on anything a walk can lead off. This
+            // used to put it back where it last stood on ground with a
+            // TeleportTo, which no player can do; a player under the world
+            // uses the hearthstone, and so does this, through the same
+            // HearthOffThePlane the give-up below uses (its own stone, bound on
+            // this map only, once per forget window). The errand that walked
+            // it there is released above and, when it had a travel aim,
+            // REFUSED here, so the next poll cannot write the same walk back.
+            // With no travel aim there is nothing to refuse, and the log
+            // below says so.
             if (verdict.remedy ==
                 OverseerDecisions::TerrainRemedy::ReturnToLastGround)
             {
-                if (verdict.groundMapId != bot->GetMapId())
-                {
-                    LOG_ERROR("module.overseer",
-                              "overseer: '{}' is on the hidden plane under the world at "
-                              "map {} ({:.1f}, {:.1f}, {:.1f}) and the ground it was to "
-                              "be returned to is on map {}; NOT MOVED - no remedy here "
-                              "changes a map (#188)",
-                              name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
-                              verdict.groundMapId);
-                    continue;
-                }
                 if (!travelTarget.empty())
                     _travelAims.Refuse(name, travelTarget,
                                        "it walked the character onto the plane under "
                                        "the world");
-                bot->TeleportTo(bot->GetMapId(), verdict.groundX, verdict.groundY,
-                                verdict.groundZ, bot->GetOrientation());
-                OverseerDecisions::FallBaselineHandedOver(
-                    _fallBaseline[LowerName(name)], verdict.groundZ,
-                    std::time(nullptr));
+                OverseerDecisions::PlaneHearthVerdict const hearth =
+                    HearthOffThePlane(bot, name, groundOnRecord);
+                if (hearth.action == OverseerDecisions::PlaneHearthAction::Hearth ||
+                    HearthPendingFor(bot->GetName()))
+                    continue;
                 LOG_ERROR("module.overseer",
-                          "overseer: '{}' WAS UNDER THE WORLD at map {} position "
+                          "overseer: '{}' IS UNDER THE WORLD at map {} position "
                           "({:.1f}, {:.1f}, {:.1f}): its feet are on the raw terrain "
                           "(terrain z {:.3f}) and the terrain for {:.0f} yards round it "
                           "is featureless, which is the placeholder plane under the "
-                          "city and not ground anybody walks on, whatever the navmesh "
-                          "there says (surface over it: {}). RETURNED to the last ground "
-                          "it stood on, map {} ({:.1f}, {:.1f}, {:.1f}), {}s ago. Its "
-                          "errand is released and refused: quest aim job='{}' quest={} "
-                          "travel='{}'. If this repeats the module gives up loudly "
-                          "instead of moving it again",
+                          "city (surface over it: {}). It does not hearth off: {}. "
+                          "NOT MOVED: nothing here teleports a member (natural only), "
+                          "and its last ground, map {} ({:.1f}, {:.1f}, {:.1f}), is "
+                          "where a walk would have to take it. Its errand is released "
+                          "and its travel aim {}: quest aim job='{}' quest={} "
+                          "travel='{}'",
                           name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
                           reading.terrainZ, TERRAIN_PLANE_RING_YARDS,
                           reading.surfaceValid ? std::to_string(reading.surfaceAboveZ)
                                                : std::string("none"),
-                          verdict.groundMapId, verdict.groundX, verdict.groundY,
-                          verdict.groundZ,
-                          static_cast<uint32>(std::time(nullptr) - memory.plane.ground.when),
+                          hearth.reason, verdict.groundMapId, verdict.groundX,
+                          verdict.groundY, verdict.groundZ,
+                          travelTarget.empty() ? "was empty, so nothing is refused"
+                                               : "is refused",
                           job, questAim, travelTarget);
                 continue;
             }
 
-            // DOWN ONTO THE FLOOR, BESIDE A TRANSPORT THAT STOPPED CARRYING IT.
-            // Same map, same x and y, onto the floor the probe just measured
-            // under the feet - which is where the fall was about to put it,
-            // without the fall. Its errand and its party are kept: the aim
-            // did not put it in the air.
+            // IN THE AIR BESIDE A TRANSPORT THAT STOPPED CARRYING IT. This used
+            // to set the character down onto the floor under it with a
+            // TeleportTo, which no player can do (natural only, 2026-10-12).
+            // It is said, loudly, and left: what happens next is what happens
+            // to a player, and a death is recovered by a release and a corpse
+            // run or the spirit healer.
             if (verdict.remedy == OverseerDecisions::TerrainRemedy::SetDown)
             {
-                float const downZ = verdict.liftZ + TERRAIN_RECOVERY_LIFT_CLEARANCE_YARDS;
-                bot->TeleportTo(bot->GetMapId(), fromX, fromY, downZ,
-                                bot->GetOrientation());
-                OverseerDecisions::FallBaselineHandedOver(
-                    _fallBaseline[LowerName(name)], downZ, std::time(nullptr));
                 LOG_ERROR("module.overseer",
-                          "overseer: '{}' WAS IN THE AIR beside '{}' at map {} position "
+                          "overseer: '{}' IS IN THE AIR beside '{}' at map {} position "
                           "({:.1f}, {:.1f}, {:.1f}): not on it, no local navmesh, not "
-                          "falling yet, and the floor {:.1f} yards down at z {:.1f}, "
-                          "which kills from full health. SET DOWN onto that floor at the "
-                          "same x/y instead of letting it fall there. It keeps quest aim "
-                          "job='{}' quest={} travel='{}' and its party. Somebody still "
-                          "needs to look at why the transport stopped carrying it",
+                          "falling yet, and the floor {:.1f} yards down at z {:.1f}. "
+                          "NOT MOVED: nothing here teleports a member (natural only). "
+                          "It keeps quest aim job='{}' quest={} travel='{}' and its "
+                          "party. Somebody needs to look at why the transport stopped "
+                          "carrying it",
                           name, besideName, static_cast<uint32>(fromMap), fromX, fromY,
                           fromZ, fromZ - verdict.liftZ, verdict.liftZ, job, questAim,
                           travelTarget);
                 continue;
             }
 
+            // FALLING THROUGH THE WORLD. This used to lift the character
+            // straight up onto the nearest surface with a teleport, which no
+            // player can do (natural only, 2026-10-12). It is said, loudly, and
+            // left: a fall the world did not catch ends as it would for a
+            // player, and the death is recovered by a release and a corpse run
+            // or the spirit healer.
             if (verdict.remedy == OverseerDecisions::TerrainRemedy::LiftToSurface)
             {
-                // THE NEAREST LAYER OVER THE FEET, NOT THE TOP OF THE STACK
-                // (#592). The verdict's height is the first surface the probe
-                // met searching DOWN from sixty yards up, which is the highest
-                // one in reach; in a layered city that is a roof or the canyon
-                // rim, and on 2026-09-23 it put the Horde leader 58 yards above
-                // Orgrimmar and farther from the Cleft he was walking to. So the
-                // same probe is asked again rising in footing strides, and the
-                // first layer it meets is the landing. Not for the void catch,
-                // whose deep probe is answering a different question and where
-                // any surface at all is better than the plane.
-                float liftZ = verdict.liftZ;
-                float nearestLayerZ = reading.surfaceAboveZ;
-                if (!nearThePlane)
-                {
-                    std::vector<OverseerDecisions::LayerProbe> rising;
-                    for (float reach : OverseerDecisions::LiftProbeReaches(
-                             TERRAIN_RECOVERY_FOOTING_REACH_YARDS,
-                             TERRAIN_RECOVERY_PROBE_YARDS))
-                    {
-                        OverseerDecisions::LayerProbe probe;
-                        probe.valid = SurfaceAbove(bot, probe.surfaceZ, reach);
-                        rising.push_back(probe);
-                    }
-                    nearestLayerZ = OverseerDecisions::LiftLandingSurface(
-                        fromZ, rising, reading.surfaceAboveZ,
-                        TERRAIN_RECOVERY_FOOTING_REACH_YARDS);
-                    liftZ = nearestLayerZ + TERRAIN_RECOVERY_LIFT_CLEARANCE_YARDS;
-                }
-                if (!OverseerDecisions::LiftDestinationIsValid(
-                        fromZ, liftZ, std::isfinite(nearestLayerZ),
-                        (nearThePlane || onThePlane)
-                            ? 0.f
-                            : TERRAIN_RECOVERY_LIMITS.maxLiftYards))
-                {
-                    LOG_ERROR("module.overseer",
-                              "overseer: '{}' refused a terrain lift from z {:.1f} to "
-                              "invalid or over-cap destination z {:.1f}; giving up loudly",
-                              name, fromZ, liftZ);
-                    continue;
-                }
-                bot->TeleportTo(bot->GetMapId(), fromX, fromY, liftZ,
-                                bot->GetOrientation());
-                // AND THE CORE NOW BELIEVES THIS CHARACTER'S FALL BEGAN UP
-                // HERE. Written down rather than acted on: the poll above
-                // guards every character whether or not it was lifted, so this
-                // is the module recording the one height it is certain it is
-                // answerable for, and not a gate on anything. Measured on
-                // 2026-09-06: 'Bork' lifted from z 142.2 to z 157.3 at
-                // 19:11:53 and killed at z 65.7 at 19:15:22 by the 91.6-yard
-                // difference, at full health, out of combat, having moved 0.6
-                // yards downward in the last second of its life (#265).
-                OverseerDecisions::FallBaselineHandedOver(
-                    _fallBaseline[LowerName(name)], liftZ,
-                    std::time(nullptr));
-                // A CATCH ABOVE THE KILL PLANE IS NOT THE SAME EVENT AS A
-                // LIFT AND MUST NOT READ AS ONE. An ordinary lift is a
-                // character that has slipped a few tens of yards under
-                // something; this is a character that was seconds from a
-                // max-health kill, and a reader counting "recoveries per hour"
-                // needs to be able to separate them or the metric #188 asked
-                // for measures two different things at once. ERROR rather than
-                // WARN for the same reason: an ordinary lift is routine and
-                // this is not.
-                if (nearThePlane)
-                {
-                    LOG_ERROR("module.overseer",
-                              "overseer: '{}' was falling out of the world at map {} "
-                              "position ({:.1f}, {:.1f}, {:.1f}), which is inside the "
-                              "{:.0f} yards above the kill plane at z {:.0f} where the "
-                              "core deals max health outright and no immunity applies. "
-                              "CAUGHT: lifted straight up to z {:.1f} at the same x/y, "
-                              "onto the surface at its own coordinates found by the deep "
-                              "probe. Same map, same x, same y - nothing here can split "
-                              "the family, and crossing the plane demonstrably does "
-                              "(#188). It keeps quest aim job='{}' quest={} travel='{}'. This "
-                              "is a rescue and not a fix: somebody still needs to look at "
-                              "what drops a character through the world at these "
-                              "coordinates",
-                              name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
-                              TERRAIN_RECOVERY_VOID_CATCH_YARDS,
-                              OverseerDecisions::VOID_PLANE_Z, liftZ, job,
-                              questAim, travelTarget);
-                    continue;
-                }
-                LOG_WARN("module.overseer",
-                         "overseer: '{}' read as below the world at map {} position "
-                         "({:.1f}, {:.1f}, {:.1f}), surface z {:.1f} ({:.1f} yards up), "
-                         "{}, FALLING for {}s with {} and without rising (#725); "
-                         "LIFTED straight up to z {:.1f} at the same "
-                         "x/y, onto the nearest layer over its feet at z {:.1f} rather "
-                         "than the highest one in reach (#592) - it keeps quest aim "
-                         "job='{}' quest={} travel='{}' and its party. "
-                         "If this is a real recovery the next poll is clean; if the same "
-                         "condition comes back it escalates rather than repeating",
-                         name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
-                         surface, surface - fromZ, footing,
-                         memory.fallingSince
-                             ? static_cast<uint32>(std::time(nullptr) - memory.fallingSince)
-                             : 0u,
-                         reading.floorBelowValid
-                             ? "the nearest floor under it more than a stride away"
-                             : "no floor found under its feet",
-                         liftZ, nearestLayerZ, job, questAim, travelTarget);
+                LOG_ERROR("module.overseer",
+                          "overseer: '{}' reads as below the world at map {} position "
+                          "({:.1f}, {:.1f}, {:.1f}), surface z {:.1f} ({:.1f} yards up), "
+                          "{}, FALLING for {}s with {}{}. NOT LIFTED: nothing here "
+                          "teleports a member (natural only). It keeps quest aim "
+                          "job='{}' quest={} travel='{}' and its party. Somebody needs to "
+                          "look at what drops a character through the world here",
+                          name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
+                          surface, surface - fromZ, footing,
+                          memory.fallingSince
+                              ? static_cast<uint32>(std::time(nullptr) - memory.fallingSince)
+                              : 0u,
+                          reading.floorBelowValid
+                              ? "the nearest floor under it more than a stride away"
+                              : "no floor found under its feet",
+                          nearThePlane ? ", inside the catch height above the kill plane" : "",
+                          job, questAim, travelTarget);
                 continue;
             }
 
@@ -27778,6 +27685,8 @@ private:
 
                 _healerExpected.erase(name);
                 EndGhostRecovery(botAI, name);
+                LadderEnd(botAI, name);
+                _ladderNoGraveSaid.erase(name);
                 ReleaseRevivalHold(botAI, name);
                 DriveRevivedSickness(bot, botAI, name);
                 continue;
@@ -28044,372 +27953,109 @@ private:
             if (healerExpected(deadFor))
                 continue;
 
-            // Has this character been dying over and over in one small area?
-            // If so the local graveyard is feeding it back to whatever killed
-            // it, and reviving there again is the harm, not the fix - see
-            // STUCK_REVIVAL_TRAP_* above for the measurement that established
-            // this.
-            uint64 recentDeathsHere = 0;
-            if (QueryResult trap = CharacterDatabase.Query(
-                    "SELECT COUNT(*) FROM overseer_death WHERE character_name = '{}' "
-                    "AND created_at >= NOW() - INTERVAL {} MINUTE AND map = {} "
-                    "AND POW(pos_x - {}, 2) + POW(pos_y - {}, 2) <= {}",
-                    Esc(name), STUCK_REVIVAL_TRAP_MINUTES, corpseMap,
-                    corpseX, corpseY,
-                    STUCK_REVIVAL_TRAP_RADIUS * STUCK_REVIVAL_TRAP_RADIUS))
-                recentDeathsHere = trap->Fetch()[0].Get<uint64>();
-
-            if (recentDeathsHere >= STUCK_REVIVAL_TRAP_DEATHS)
-            {
-                // Home, not the graveyard. m_homebind* is the character's own
-                // bind point - the destination its own Hearthstone would use -
-                // so this is the existing in-game escape, reached without the
-                // 10-second cast that combat here interrupts every time.
-                //
-                // The LEADER's bind point when there is one, so the family
-                // lands together and mod-overseer's follow logic just works.
-                // Sending each to its own bind would scatter this roster
-                // across two starting zones (measured: Elwynn and Dun Morogh,
-                // ~2000 yards apart) and leave the party split on arrival.
-                Player* const home = RevivalHome(bot);
-
-                // ...AND NOT WHEN THAT BIND IS OFF THE PARTY'S MAP (#241). The
-                // escape from a death trap is worth taking; a continent is not
-                // an escape, it is a party split, and no drive in this module
-                // can rejoin one. Nothing here has looked for a graveyard yet,
-                // so the question asked is whether one exists on this map at
-                // all - and when it does, this branch DECLINES TO ESCALATE and
-                // falls through to the ordinary graveyard path below, which
-                // revives on this map. That is the whole remedy.
-                OverseerDecisions::RevivalMoveVerdict const crossing =
-                    RevivalCrossMapCheck(
-                        bot, home,
-                        sGraveyard->GetClosestGraveyard(bot, bot->GetTeamId()) != nullptr);
-                if (crossing.mayMove)
-                {
-                    bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
-                                    home->m_homebindY, home->m_homebindZ, 0.f);
-                    bot->ResurrectPlayer(1.0f);
-                    bot->SpawnCorpseBones();
-
-                    LOG_WARN("module.overseer",
-                             "overseer: '{}' has died {} times within {}yd in the last "
-                             "{}min - the nearest graveyard is inside whatever is killing "
-                             "it, so reviving there again would only speed the loop up "
-                             "(measured: doing exactly that doubled this roster's death "
-                             "rate). Sent home to '{}'s bind point instead",
-                             name, recentDeathsHere, uint32(STUCK_REVIVAL_TRAP_RADIUS),
-                             STUCK_REVIVAL_TRAP_MINUTES, home->GetName());
-                    _lastRevival.erase(name);
-                    HoldAfterRevival(bot, botAI, name, home->m_homebindMapId,
-                                     home->m_homebindX, home->m_homebindY);
-                    continue;
-                }
-
-                LOG_WARN("module.overseer",
-                         "overseer: '{}' has died {} times within {}yd in the last {}min, "
-                         "which normally sends it to '{}'s bind point - REFUSED, because "
-                         "that bind is on map {} and the rest of this party is on map {}. "
-                         "A revival that changes continents is not an escape from a death "
-                         "trap, it is a party split, and nothing in this module can rejoin "
-                         "one: `follow` cannot cross a map and the catch-up walk refuses a "
-                         "cross-map gap (#241). Reviving on this map instead. Whatever "
-                         "keeps killing it here is a routing problem (#234), and no "
-                         "revival answers that one",
-                         name, recentDeathsHere, uint32(STUCK_REVIVAL_TRAP_RADIUS),
-                         STUCK_REVIVAL_TRAP_MINUTES, home->GetName(),
-                         static_cast<uint32>(home->m_homebindMapId), crossing.partyMapId);
-            }
-
-            // NO GRAVEYARD ON THIS MAP IS NOT A REASON TO WALK AWAY.
+            // THE LADDER ENDS AT A SPIRIT HEALER, NOT IN A RESURRECTION BY HAND
+            // (natural only, 2026-10-12). Every exit here used to teleport the
+            // ghost - to a graveyard, or to the leader's bind point - and
+            // raise it with ResurrectPlayer, with no sickness and no
+            // durability loss: a resurrection no player can have. What a
+            // player who cannot reach its corpse has is the spirit healer, so
+            // the ghost walks to one and asks it the way a client asks it
+            // (WalkGhostToSpiritHealer), sickness and durability loss
+            // included.
             //
-            // This used to be `if (!grave) continue;`, and that stranded every
-            // character who died INSIDE AN INSTANCE. Measured: `game_graveyard`
-            // holds ZERO rows on map 36, because the Deadmines graveyards are
-            // outdoor ones, so the lookup comes back empty for a character
-            // standing in the instance. A body lay there for 29 minutes while
-            // this drive ran the whole time and never once considered it - over
-            // the same window the drive logged exactly two revivals, both for a
-            // character who had died outside.
-            //
-            // THE SAME SHAPE AS THE CORPSE BUG THIS DRIVE ALREADY HAD (#79):
-            // an early return whose comment reads as a transient case and whose
-            // reality is permanent. A map does not grow a graveyard while you
-            // wait. Every `continue` on this path has to answer "can this
-            // condition change on its own?" - and when it cannot, skipping is
-            // stranding.
-            //
-            // It matters more here than it looks. Upstream's own rescue is
-            // gated behind IsRandomBot, which is false for this roster, so
-            // without this fallback a death inside an instance has NO recovery
-            // path at all: not upstream's, not this one. It also silently
-            // freezes dungeon runs, because the party holds position waiting
-            // for a member who is never coming back.
-            //
-            // The bind point is the fallback because it is the one destination
-            // that always exists, it is the character's OWN in-game escape, and
-            // the trap branch directly above already relies on it working.
+            // THE GRAVEYARD IS STILL CHOSEN FOR SAFETY. The nearest one is a
+            // geometry answer; SafeGraveyardNear asks whether a character of
+            // this level can stand there (see GRAVEYARD_THREAT_RADIUS), so a
+            // ghost dying over and over in one place walks to a graveyard that
+            // is not feeding it back to what killed it. With none that passes,
+            // the nearest stands: a character put down next to a threat can
+            // walk away and be helped by the party beside it.
             GraveyardStruct const* grave = sGraveyard->GetClosestGraveyard(bot, bot->GetTeamId());
-            if (!grave)
+            if (!grave || grave->Map != bot->GetMapId())
             {
-                // THE ONE EXIT THAT STILL CROSSES MAPS UNCONDITIONALLY, and it
-                // has to (#241). There is no graveyard on this map, so there is
-                // no alternative to weigh: refusing here would restore the
-                // regression this branch was written for, a body lying in the
-                // Deadmines for 29 minutes while this drive ran the whole time.
-                // "Never change maps" would be a worse rule honestly applied,
-                // which is why the rule is about the PARTY'S map and not about
-                // moving. Two things do change: the destination is the LEADER'S
-                // bind, so a party that all takes this exit lands together, and
-                // leaving the rest of the party behind is now SAID rather than
-                // done quietly.
-                Player* const home = RevivalHome(bot);
-                OverseerDecisions::RevivalMoveVerdict const crossing =
-                    RevivalCrossMapCheck(bot, home, false);
-
-                bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
-                                home->m_homebindY, home->m_homebindZ, 0.f);
-                bot->ResurrectPlayer(0.5f);
-                bot->SpawnCorpseBones();
-
-                LOG_WARN("module.overseer",
-                         "overseer: '{}' has been dead for {}s on map {}, which has no "
-                         "graveyard of its own - dying inside an instance leaves nothing "
-                         "for GetClosestGraveyard to return, so it was sent to '{}'s "
-                         "bind point instead of being left where it fell",
-                         name, deadFor, static_cast<uint32>(bot->GetMapId()),
-                         home->GetName());
-                if (crossing.splitsParty)
+                // NO GRAVEYARD ON THIS MAP, so no spirit healer either. A ghost
+                // here has its corpse run and nothing else, as a player would;
+                // the dead engine keeps it. Said once per death.
+                LadderEnd(botAI, name);
+                if (_ladderNoGraveSaid[name] != ghostTime)
+                {
+                    _ladderNoGraveSaid[name] = ghostTime;
                     LOG_ERROR("module.overseer",
-                              "overseer: '{}' was revived onto map {} and the rest of its "
-                              "party is on map {} - THE FAMILY IS NOW SPLIT ACROSS TWO MAPS "
-                              "and nothing in this module can rejoin it: `follow` cannot "
-                              "cross a map, the catch-up walk refuses a cross-map gap, and "
-                              "an `at:` aim cannot name a coordinate on another map. There "
-                              "was no graveyard on map {} to revive it at instead, so the "
-                              "only alternative was leaving a corpse where it fell. "
-                              "Somebody has to move them (#241)",
-                              name, static_cast<uint32>(home->m_homebindMapId),
-                              crossing.partyMapId, static_cast<uint32>(bot->GetMapId()));
-                _lastRevival.erase(name);
-                HoldAfterRevival(bot, botAI, name, home->m_homebindMapId,
-                                 home->m_homebindX, home->m_homebindY);
+                              "overseer: '{}' has been dead for {}s on map {}, which has no "
+                              "graveyard and so no spirit healer - left to its own corpse "
+                              "run, because nothing here raises or teleports a member "
+                              "(natural only). Somebody needs to look at why it is a ghost "
+                              "here at all",
+                              name, deadFor, static_cast<uint32>(bot->GetMapId()));
+                }
                 continue;
             }
 
-            // NEAREST IS A GEOMETRY ANSWER; THE CHARACTER ASKED A SAFETY
-            // QUESTION. See GRAVEYARD_THREAT_RADIUS for the measurement and
-            // the two tests. When the nearest graveyard passes, everything
-            // below is exactly what it was before.
             std::string refused;
             GraveyardStruct const* safe = SafeGraveyardNear(
                 bot, grave, corpseMap, corpseX, corpseY, corpseZ,
                 GraveyardEvidenceFor(name, corpseMap, corpseX, corpseY,
                                      KillerEntryAt(name, corpseMap, corpseX, corpseY)),
                 refused);
-            if (!safe)
-            {
-                // `grave` exists, so this map HAS somewhere to revive at; it is
-                // only that every candidate was judged dangerous. That is a
-                // real alternative, and #241 is the argument for preferring it
-                // to an ocean. A character put down next to a threat can walk
-                // away - the hold below is written to release exactly that
-                // case, "not held there; it is left free to move away" - can be
-                // helped by four groupmates standing near it, and can be
-                // revived again if it does die. A character put down on another
-                // continent can do none of those and no drive here can reach
-                // it.
-                Player* const home = RevivalHome(bot);
-                OverseerDecisions::RevivalMoveVerdict const crossing =
-                    RevivalCrossMapCheck(bot, home, true);
-                if (crossing.mayMove)
-                {
-                    bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
-                                    home->m_homebindY, home->m_homebindZ, 0.f);
-                    bot->ResurrectPlayer(0.5f);
-                    bot->SpawnCorpseBones();
-
-                    LOG_WARN("module.overseer",
-                             "overseer: '{}' (level {}) has been dead for {}s and no "
-                             "graveyard for its corpse is safe to stand at [{}] - sent to "
-                             "'{}'s bind point instead of the nearest graveyard",
-                             name, static_cast<uint32>(bot->GetLevel()), deadFor, refused,
-                             home->GetName());
-                    _lastRevival.erase(name);
-                    HoldAfterRevival(bot, botAI, name, home->m_homebindMapId,
-                                     home->m_homebindX, home->m_homebindY);
-                    continue;
-                }
-
-                LOG_WARN("module.overseer",
-                         "overseer: '{}' (level {}) has been dead for {}s and no graveyard "
-                         "for its corpse is safe to stand at [{}], which normally sends it "
-                         "to '{}'s bind point - REFUSED, because that bind is on map {} "
-                         "and the rest of this party is on map {}. Reviving at the nearest "
-                         "graveyard anyway: a character put down next to something "
-                         "dangerous can walk away and can be helped by the four standing "
-                         "beside it, and one put down on another continent can do neither "
-                         "(#241)",
-                         name, static_cast<uint32>(bot->GetLevel()), deadFor, refused,
-                         home->GetName(), static_cast<uint32>(home->m_homebindMapId),
-                         crossing.partyMapId);
+            // No safe graveyard on this map: the nearest stands. The bind point
+            // is not an alternative, because reaching it would be a teleport
+            // and a resurrection no player has (natural only), and a character
+            // put down next to a threat can walk away and be helped by the
+            // party beside it (#241).
+            if (!safe || safe->Map != bot->GetMapId())
                 safe = grave;
-            }
-
-            // THE SAME GRAVEYARD TWICE IN FIVE MINUTES IS A VERDICT, NOT A
-            // COINCIDENCE. Whatever the scoring above thinks of the place it
-            // picked, a character this drive already revived there and that
-            // is dead again has shown it cannot live there. Home,
-            // unconditionally - see GRAVEYARD_REPEAT_SECONDS.
-            int64 const now = time(nullptr);
-            auto const last = _lastRevival.find(name);
-            if (last != _lastRevival.end() && last->second.first == safe->ID &&
-                now - last->second.second < GRAVEYARD_REPEAT_SECONDS)
-            {
-                // THIS IS THE EXIT THAT SPLIT THE FAMILY (#241). The leader
-                // took it at 17:35:43 and was in Duskwood while the other four
-                // stayed in the Barrens, and eleven silent minutes followed
-                // because nothing here can walk a follower across an ocean.
-                //
-                // AND THE VERDICT ABOVE IT IS WEAKER THAN IT SOUNDS. "Twice at
-                // one graveyard inside 300s means it cannot live there" reads
-                // as a rare finding; in hostile territory it is the ordinary
-                // one. Measured on overseer_death 18:18:24 to 18:22:30: SIX
-                // deaths in four minutes, every one to a Horde Guard, worn down
-                // to between 4 and 35 percent health. Two of them were walking
-                // to (1, 172.9, -1704.1), and the only creature within 45 yards
-                // of that point is entry 6491, a Spirit Healer, 13.3 yards
-                // away - so the aim was a graveyard. The Barrens is Horde
-                // ground and its graveyards stand beside Horde guards, so an
-                // Alliance party revives into the thing that killed it. That is
-                // a statement about the ZONE, and a bind teleport does not
-                // answer it any better than reviving again does; it answers it
-                // on another continent. Being walked into hostile ground at all
-                // is #234, and no revival is going to fix that one.
-                Player* const home = RevivalHome(bot);
-                OverseerDecisions::RevivalMoveVerdict const crossing =
-                    RevivalCrossMapCheck(bot, home, true);
-                if (crossing.mayMove)
-                {
-                    bot->TeleportTo(home->m_homebindMapId, home->m_homebindX,
-                                    home->m_homebindY, home->m_homebindZ, 0.f);
-                    bot->ResurrectPlayer(0.5f);
-                    bot->SpawnCorpseBones();
-
-                    LOG_WARN("module.overseer",
-                             "overseer: '{}' has been dead for {}s and this drive already "
-                             "revived it at '{}' {}s ago - twice at one graveyard inside "
-                             "{}s means it cannot live there, so it was sent to '{}'s bind "
-                             "point instead",
-                             name, deadFor, safe->name, now - last->second.second,
-                             GRAVEYARD_REPEAT_SECONDS, home->GetName());
-                    _lastRevival.erase(last);
-                    HoldAfterRevival(bot, botAI, name, home->m_homebindMapId,
-                                     home->m_homebindX, home->m_homebindY);
-                    continue;
-                }
-
-                LOG_WARN("module.overseer",
-                         "overseer: '{}' has been dead for {}s and this drive already "
-                         "revived it at '{}' {}s ago, which normally sends it to '{}'s "
-                         "bind point - REFUSED, because that bind is on map {} and the "
-                         "rest of this party is on map {}. It is in a revive-and-die loop "
-                         "at '{}' and this drive is putting it back there deliberately, "
-                         "because its only alternative is a continent the other four "
-                         "cannot follow it to (#241). The loop is a routing problem "
-                         "(#234): something keeps sending this family somewhere it cannot "
-                         "survive, and no revival fixes that",
-                         name, deadFor, safe->name, now - last->second.second,
-                         home->GetName(), static_cast<uint32>(home->m_homebindMapId),
-                         crossing.partyMapId, safe->name);
-            }
-
-            // Mirrors exactly what SpiritHealerAction::Execute already does
-            // on a successful revive (ResurrectPlayer + SpawnCorpseBones) -
-            // this is not a new resurrection mechanism, it is the same one,
-            // reached without depending on a path that never runs for this
-            // roster at all.
-            bot->TeleportTo(safe->Map, safe->x, safe->y, safe->z, 0.f);
-            bot->ResurrectPlayer(0.5f);
-            bot->SpawnCorpseBones();
-
-            if (safe == grave)
-                LOG_WARN("module.overseer",
-                         "overseer: '{}' has been dead for {}s - mod-playerbots' own "
-                         "auto-relocate-after-repeated-deaths (RandomTeleport, "
-                         "RandomPlayerbotMgr.cpp) is gated behind IsRandomBot, which is false "
-                         "for this roster's named accounts, so it would never reach a graveyard "
-                         "on its own; resurrected at the nearest graveyard instead",
-                         name, deadFor);
-            else
-                LOG_WARN("module.overseer",
-                         "overseer: '{}' (level {}) has been dead for {}s - the nearest "
-                         "graveyard was refused [{}], so it was resurrected at '{}' instead",
-                         name, static_cast<uint32>(bot->GetLevel()), deadFor, refused,
-                         safe->name);
-            _lastRevival[name] = std::make_pair(safe->ID, now);
-            HoldAfterRevival(bot, botAI, name, safe->Map, safe->x, safe->y);
+            LadderToSpiritHealer(bot, botAI, name, safe, safe != grave, deadFor, refused);
         } while (result->NextRow());
     }
 
-    // THE BIND POINT A REVIVAL SHOULD USE, which is the LEADER'S whenever
-    // there is one (#241). The repeated-deaths branch has always done this and
-    // said why - "sending each to its own bind would scatter this roster
-    // across two starting zones (measured: Elwynn and Dun Morogh, ~2000 yards
-    // apart) and leave the party split on arrival" - and the other three
-    // bind-point exits on the same ladder ignored it. Four exits, one
-    // discipline: three of them were contradicting a sibling branch a hundred
-    // lines above that has a comment explaining the hazard.
-    //
-    // For the leader itself this resolves to its own bind, which is correct
-    // and is also exactly the case RevivalMayCrossMaps exists to catch: a
-    // leader taking a bind point off the party's map does not reunite anybody,
-    // it takes the party's reference point away.
-    static Player* RevivalHome(Player* bot)
+    // THE STUCK-REVIVAL LADDER'S ONE EXIT: walk the ghost to the spirit healer
+    // at `grave` and take its resurrection, through WalkGhostToSpiritHealer.
+    // Its own walk state (_ladderHealer), apart from DriveGhostRecovery's,
+    // because that drive hands a ghost to the ladder exactly when ITS walk has
+    // run out. A walk that runs out here is started again after
+    // STRANDED_GHOST_RETRY_SECONDS, the stranded ghost's retry, and said each
+    // time.
+    void LadderToSpiritHealer(Player* bot, PlayerbotAI* botAI, std::string const& name,
+                              GraveyardStruct const* grave, bool rerouted, int64 deadFor,
+                              std::string const& refused)
     {
-        Player* home = bot;
-        if (Group* group = bot->GetGroup())
-            if (Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID()))
-                home = leader;
-        return home;
-    }
-
-    // The map each OTHER member of this character's group is on. World thread
-    // only, which is where this whole drive runs (OnUpdate): reading GetMapId
-    // off a groupmate owned by another map thread is what KeepRosterFollowing
-    // and DriveCatchUp already do on this same thread, and nothing here
-    // dereferences anything a map thread could be freeing.
-    //
-    // An empty answer means "not grouped, or nobody else was in the world",
-    // and the pure rule treats that as UNKNOWN rather than as agreement. A
-    // party map nobody could establish may not be used to refuse a revival.
-    static std::vector<uint32_t> PartyMapsAround(Player* bot)
-    {
-        std::vector<uint32_t> maps;
-        Group* group = bot->GetGroup();
-        if (!group)
-            return maps;
-        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        int64 const now = time(nullptr);
+        GhostRecoveryState& st = _ladderHealer[name];
+        bool const retry = st.healerWalkSpent && now - st.healerSince >= STRANDED_GHOST_RETRY_SECONDS;
+        if (st.healerGrave != grave || retry)
         {
-            Player* member = ref->GetSource();
-            if (!member || member == bot || !member->IsInWorld())
-                continue;
-            maps.push_back(static_cast<uint32_t>(member->GetMapId()));
+            ReturnCorpseRun(botAI, st);
+            st = GhostRecoveryState{};
+            WorldLocation const corpseAt = bot->GetCorpseLocation();
+            st.mapId = corpseAt.GetMapId();
+            st.corpseX = corpseAt.GetPositionX();
+            st.corpseY = corpseAt.GetPositionY();
+            st.healerGrave = grave;
+            st.healerRerouted = rerouted;
+            st.healerWalkSeconds = OverseerDecisions::GhostHealerWalkSeconds(
+                bot->GetExactDist2d(grave->x, grave->y), GHOST_HEALER_WALK_SECONDS);
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' (level {}) has been dead for {}s and nothing else has "
+                     "raised it - {}it walks to the spirit healer at '{}', {:.0f} yards, {}s "
+                     "allowed, and takes the resurrection a player would, sickness and "
+                     "durability loss included{}",
+                     name, static_cast<uint32>(bot->GetLevel()), deadFor,
+                     retry ? "its last walk ran out, so " : "", grave->name,
+                     bot->GetExactDist2d(grave->x, grave->y), st.healerWalkSeconds,
+                     rerouted ? " (the nearest graveyard was refused: " + refused + ")"
+                              : std::string());
         }
-        return maps;
+        WalkGhostToSpiritHealer(bot, botAI, name, st, /*ladder*/ true, now);
     }
 
-    // One question, asked at all four bind-point exits: may this revival put
-    // the character on `home`'s bind map? See RevivalMayCrossMaps for the rule
-    // and for the incident it came from.
-    static OverseerDecisions::RevivalMoveVerdict RevivalCrossMapCheck(
-        Player* bot, Player const* home, bool graveyardOnThisMap)
+    // The death is over, or the ladder has nothing to walk to.
+    void LadderEnd(PlayerbotAI* botAI, std::string const& name)
     {
-        OverseerDecisions::RevivalMove move;
-        move.bindMapId = static_cast<uint32_t>(home->m_homebindMapId);
-        move.partyMapIds = PartyMapsAround(bot);
-        move.graveyardOnThisMap = graveyardOnThisMap;
-        return OverseerDecisions::RevivalMayCrossMaps(move);
+        auto const it = _ladderHealer.find(name);
+        if (it == _ladderHealer.end())
+            return;
+        ReturnCorpseRun(botAI, it->second);
+        _ladderHealer.erase(it);
     }
 
     // THE GRACE AFTER A REVIVAL - see REVIVAL_HOLD_SECONDS. `+stay` is
@@ -29228,6 +28874,7 @@ private:
                              bot->GetName(), spellId, npc->GetEntry(), refusal);
                     continue;
                 }
+                // natural-only: bought at a trainer in reach, which takes its price (TeachSpell).
                 trainer->TeachSpell(npc, bot, spellId);
                 if (bot->HasSpell(spellId) || bot->GetMoney() < before)
                 {
@@ -29527,6 +29174,7 @@ private:
             if (npc && trainer && bot->GetNPCIfCanInteractWith(npc->GetGUID(), UNIT_NPC_FLAG_TRAINER))
             {
                 uint64 const before = bot->GetMoney();
+                // natural-only: bought at a trainer in reach, which takes its price (TeachSpell).
                 trainer->TeachSpell(npc, bot, skillSpell);
                 LOG_INFO("module.overseer",
                          "overseer: '{}' {} spell {} at weapon master {} for {} copper of its own",
@@ -30071,6 +29719,10 @@ private:
                         GHOST_HEALER_SWEEP_YARDS)) ==
                 OverseerDecisions::SpiritReviveSite::WhereItStands)
             {
+                // natural-only: the spirit healer's own resurrection, for a ghost standing at one
+                // (GetNPCIfCanInteractWith above); only the handler's teleport is left out. The
+                // `true` is ResurrectPlayer's applySickness, so the sickness stands, and the
+                // durability loss is the DurabilityLossAll just below, as in the handler.
                 bot->ResurrectPlayer(0.5f, true);
                 float const durabilityLoss =
                     sWorld->getRate(RATE_DURABILITY_LOSS_ON_SPIRIT_RESURRECT) / 100.0f;
@@ -30107,8 +29759,12 @@ private:
                 _sicknessEndsAt[name] = sickEnds;
             else
                 _sicknessEndsAt.erase(name);
+            // Both walk states give back what they leased: this one, and
+            // DriveGhostRecovery's when the ladder walked it (st is then the
+            // ladder's own). st is not used past these lines.
             ReturnCorpseRun(botAI, st);
-            _ghostRecovery.erase(name);
+            EndGhostRecovery(botAI, name);
+            LadderEnd(botAI, name);
             HoldAfterRevival(bot, botAI, name, bot->GetMapId(), bot->GetPositionX(),
                              bot->GetPositionY());
             return true;
@@ -31375,21 +31031,9 @@ private:
     // corridor - and for `wailing` it is the corridor's own first waypoint,
     // which is also the one home on this roster that was already right.
     //
-    // WHAT THIS IS WORTH WITH NO HEARTHSTONE INVOLVED AT ALL, which matters
-    // because the hearth verb is not casting today (#337: six consecutive
-    // attempts on the party leader reported a cast that never started). A
-    // homebind is not only where a hearthstone goes. FOUR revival escalations in
-    // this file teleport a character to m_homebind* - the repeat-at-one-
-    // graveyard exit, the no-graveyard-on-this-map exit, the every-graveyard-is-
-    // dangerous exit and the hostile-zone one - and every one of them fires on
-    // its own, with no item, no cast and no cooldown. They are how a leader
-    // ended up in Duskwood while four followers stood in the Barrens (#241), and
-    // RevivalMayCrossMaps now REFUSES three of the four whenever the bind is off
-    // the party's map, which leaves a character reviving beside whatever killed
-    // it because the alternative is worse. All four read RevivalHome, which is
-    // the LEADER's bind for a grouped character, so one corrected home turns
-    // them back into the recovery they were written to be for the whole family.
-    // The hearthstone is the second dividend here, not the first.
+    // The revival escalations that once teleported a character to a bind
+    // point are gone (natural only, 2026-10-12), so the homebind is now only
+    // where the hearthstone goes.
     //
     // AND IT DOES NOT RESCUE ANYBODY WHO IS ALREADY STRANDED. This makes the
     // NEXT hearth, and the next revival, land somewhere useful; it cannot walk a
@@ -45252,6 +44896,12 @@ private:
         // Seats already given their pre-FORM repair attempt for this order.
         std::set<std::string> repairAttempted;
         std::set<std::string> repairWalkSaid;
+        unsigned durabilityBossesDone{std::numeric_limits<unsigned>::max()};
+        unsigned repairHoldBossesDone{std::numeric_limits<unsigned>::max()};
+        time_t repairHoldSince{0};
+        bool repairHoldDecisionSaid{false};
+        bool repairBrainPaused{false};
+        time_t repairHoldRefusedAt{0};
     };
     std::map<std::string, RaidRunState> _raidRuns;
     // What the raid timeline last wrote for each family (#640).
@@ -46299,6 +45949,181 @@ private:
             if (facts.raidFormed && door)
                 RaidEncounters(group, door, bossesDone, bossesTotal);
             facts.cleared = bossesTotal > 0 && bossesDone >= bossesTotal;
+
+            // Read the seats before every next encounter. A boss count advances
+            // only after the previous encounter is DONE, so this is the pre-pull
+            // snapshot for the next boss.
+            if (run.phase == RaidRunPhase::Clear && facts.ordered && bossesDone < bossesTotal &&
+                run.durabilityBossesDone != bossesDone)
+            {
+                std::string lowestSeat;
+                uint32 lowestPct = 100;
+                unsigned belowFloor = 0;
+                for (auto const& [name, subgroup] : seats)
+                {
+                    (void)subgroup;
+                    Player* member = ObjectAccessor::FindPlayerByName(name);
+                    if (!member || !member->IsInWorld())
+                        continue;
+                    uint32 const pct = LowestDurabilityPct(member);
+                    if (pct < lowestPct || lowestSeat.empty())
+                    {
+                        lowestPct = pct;
+                        lowestSeat = name;
+                    }
+                    if (OverseerDecisions::RaidSeatNeedsRepair(pct, repairFloor))
+                        ++belowFloor;
+                }
+                if (!lowestSeat.empty())
+                    LOG_INFO("module.overseer",
+                             "overseer: raid run for family '{}': lowest durability {} {}%; "
+                             "{} seat(s) under the {}% floor (before encounter {})",
+                             roster.family, lowestSeat, lowestPct, belowFloor,
+                             repairFloor, bossesDone + 1);
+                else
+                    LOG_WARN("module.overseer",
+                             "overseer: raid run for family '{}': cannot log pre-pull "
+                             "durability for encounter {} - no readable seats",
+                             roster.family, bossesDone + 1);
+                run.durabilityBossesDone = bossesDone;
+            }
+
+            // Hold the dungeon brain only before Majordomo and Ragnaros. Seats
+            // use the ordinary repair verb at a repairer; the hold expires after
+            // five minutes even if one cannot afford the repair.
+            bool repairHold = false;
+            bool repairHoldTimedOut = false;
+            if (run.phase == RaidRunPhase::Clear && facts.ordered &&
+                OverseerDecisions::RaidPullRepairDecision(bossesDone, false, 0, 300) !=
+                    OverseerDecisions::RaidPullRepairAction::Ignore)
+            {
+                if (run.repairHoldBossesDone != bossesDone)
+                {
+                    run.repairHoldBossesDone = bossesDone;
+                    run.repairHoldSince = std::time(nullptr);
+                    run.repairAttempted.clear();
+                    run.repairWalkSaid.clear();
+                    run.repairHoldDecisionSaid = false;
+                    run.repairBrainPaused = false;
+                    run.repairHoldRefusedAt = 0;
+                }
+                // One clock read per poll, so the per-seat timeout below and the
+                // hold decision after the loop can never disagree across a
+                // second boundary.
+                long const heldNow = long(std::time(nullptr) - run.repairHoldSince);
+                repairHoldTimedOut = OverseerDecisions::RaidPullRepairDecision(
+                                         bossesDone, true, heldNow, 300) ==
+                                     OverseerDecisions::RaidPullRepairAction::TimedOut;
+                std::vector<unsigned> seatPcts;
+                for (auto const& [name, subgroup] : seats)
+                {
+                    (void)subgroup;
+                    Player* member = ObjectAccessor::FindPlayerByName(name);
+                    if (!member || !member->IsInWorld())
+                        continue;
+                    uint32 const pct = LowestDurabilityPct(member);
+                    seatPcts.push_back(pct);
+                    bool const attempted = run.repairAttempted.count(name) > 0;
+                    auto step = OverseerDecisions::RaidPullSeatRepairStep(
+                        pct, repairFloor, repairHoldTimedOut, attempted, false);
+                    if (step == OverseerDecisions::RaidPullSeatStep::Ready ||
+                        step == OverseerDecisions::RaidPullSeatStep::TimedOut)
+                        continue;
+                    repairHold = true;
+                    if (step == OverseerDecisions::RaidPullSeatStep::Attempted)
+                        continue;
+                    // The repairer sweep runs only for a seat still owed the repair verb.
+                    bool oneIsNearby = false;
+                    float nearestYards = -1.f;
+                    // True means a repairer is in reach: the step is then Repair
+                    // and the seat repairs below; false means Walk to one first.
+                    bool const repairerInReach = CounterInReach(
+                        member, OverseerDecisions::CounterRole::Repairer, oneIsNearby,
+                        nearestYards);
+                    step = OverseerDecisions::RaidPullSeatRepairStep(
+                        pct, repairFloor, repairHoldTimedOut, attempted, repairerInReach);
+                    if (step == OverseerDecisions::RaidPullSeatStep::Walk)
+                    {
+                        _travelAims.Claim(name, "repair", OverseerDecisions::TravelOwner::Run);
+                        if (run.repairWalkSaid.insert(name).second)
+                            LOG_INFO("module.overseer",
+                                     "overseer: raid run for family '{}' pre-pull repair walk "
+                                     "for '{}' - lowest durability {}%, floor {}%",
+                                     roster.family, name, pct, repairFloor);
+                        continue;
+                    }
+                    HoldAtTheCounter(member, name);
+                    char const* status = "error";
+                    std::string evidence;
+                    char const* answer = DoRepair(member, "all", status, evidence);
+                    uint32 const afterPct = LowestDurabilityPct(member);
+                    run.repairAttempted.insert(name);
+                    _travelAims.Release(name, "raid pre-pull repair completed");
+                    ReleaseCounterHold(name, "raid pre-pull repair completed");
+                    if (OverseerDecisions::RaidSeatNeedsRepair(afterPct, repairFloor))
+                        LOG_WARN("module.overseer",
+                                 "overseer: raid run for family '{}' could not repair '{}' "
+                                 "before encounter {} ({}% remains): {}",
+                                 roster.family, name, bossesDone + 1, afterPct,
+                                 answer ? answer : "repair was partial or unaffordable");
+                }
+                auto const action = OverseerDecisions::RaidPullRepairForSeats(
+                    bossesDone, seatPcts, repairFloor, heldNow, 300);
+                if (!run.repairHoldDecisionSaid &&
+                    action != OverseerDecisions::RaidPullRepairAction::Hold)
+                {
+                    if (action == OverseerDecisions::RaidPullRepairAction::TimedOut)
+                        LOG_WARN("module.overseer",
+                                 "overseer: raid run for family '{}' repair hold before "
+                                 "encounter {} timed out after 300 seconds",
+                                 roster.family, bossesDone + 1);
+                    else
+                        LOG_INFO("module.overseer",
+                                 "overseer: raid run for family '{}' repair hold before "
+                                 "encounter {} complete - every seat is at or above {}%",
+                                 roster.family, bossesDone + 1, repairFloor);
+                    run.repairHoldDecisionSaid = true;
+                }
+                repairHold = action == OverseerDecisions::RaidPullRepairAction::Hold;
+            }
+            if (run.phase == RaidRunPhase::Clear && head)
+            {
+                bool const shouldPause = repairHold && !repairHoldTimedOut;
+                if (shouldPause != run.repairBrainPaused &&
+                    std::time(nullptr) - run.repairHoldRefusedAt >= 30)
+                {
+                    bool any = false;
+                    bool allAccepted = true;
+                    if (group)
+                    {
+                        for (GroupReference* ref = group->GetFirstMember(); ref;
+                             ref = ref->next())
+                        {
+                            Player* member = ref->GetSource();
+                            PlayerbotAI* ai = member && member->IsInWorld() && member->IsAlive()
+                                                  ? GET_PLAYERBOT_AI(member)
+                                                  : nullptr;
+                            if (!ai)
+                                continue;
+                            any = true;
+                            if (!ai->DoSpecificAction(
+                                    "dc pause",
+                                    Event("dc", shouldPause ? "pause" : "resume", head), true))
+                                allAccepted = false;
+                        }
+                    }
+                    if (any && allAccepted)
+                        run.repairBrainPaused = shouldPause;
+                    else
+                    {
+                        run.repairHoldRefusedAt = std::time(nullptr);
+                        LOG_WARN("module.overseer",
+                                 "overseer: raid run for family '{}' could not {} the "
+                                 "dungeon brain for its repair hold; retrying",
+                                 roster.family, shouldPause ? "pause" : "resume");
+                    }
+                }
+            }
             if (run.phase == RaidRunPhase::Clear && door && facts.ordered)
             {
                 OverseerDecisions::RaidClearStallAction const stall =
@@ -50602,35 +50427,22 @@ private:
         }
     }
 
-    // Teach the roster what a character of its level would already know.
+    // Spend the roster's earned talent points, on every level change.
     //
-    // WHY THIS EXISTS AT ALL. mod-playerbots does this job properly on levelup -
-    // AutoMaintenanceOnLevelupAction picks talents, learns every trainer spell,
-    // and re-runs the skill init - and every branch of it is behind
-    // IsRandomBot(bot). That needs the account to be in the "<prefix>0..N"
-    // random-bot list AND the character to be in the currentBots pool AND the
-    // bot not to be a selfbot. This family fails all three, permanently and by
-    // design: named accounts cannot enter the list, they are kept out of the
-    // pool so RandomPlayerbotMgr never re-rolls them, and SelfBotLevel is 3.
+    // NATURAL ONLY (the operator, 2026-10-12). This drive used to run
+    // PlayerbotFactory::InitSkills, InitClassSpells and InitAvailableSpells on
+    // every level change, behind Overseer.Train.Factory (default on): every
+    // weapon skill of the class at level x 5, the riding ranks at 20, 40 and
+    // 60, the class spells, and every rank a trainer in the world would teach,
+    // with no trainer and no gold. That was a grant, and the key that allowed
+    // it is gone. The family learns its spells and trades at a real trainer
+    // and pays (the training stop walks it there), and gains weapon skill by
+    // using the weapon.
     //
-    // The result was invisible because the config said otherwise.
-    // AutoLearnTrainerSpells and AutoPickTalents were both 1, both parsed, and
-    // both dead on arrival for these five. What it looked like from the outside
-    // was a family that fought badly: a level 11 warrior with 13 spells and one
-    // talent, and a level 9 paladin with no spells whatsoever - no seal, no
-    // judgement, auto-attack and nothing else.
-    //
-    // WHY THE FACTORY AND NOT A SPELL LIST. PlayerbotFactory::InitAvailableSpells
-    // walks the real trainer tables, so a character learns exactly what a trainer
-    // in the world would teach it and nothing more. Writing our own list would be
-    // a second, worse copy of data the server already has, and would drift the
-    // first time a class changed.
-    //
-    // WHAT IS DELIBERATELY NOT CALLED. AutoTeleportForLevel, which yanks a bot to
-    // a level-appropriate zone: the family is questing somewhere on purpose and
-    // being teleported out of it mid-quest is not training, it is abduction.
-    // Randomize() and ClearEverything() likewise - they re-roll gear and level,
-    // which is the exact fate the roster exists to protect these characters from.
+    // WHAT IS LEFT is the talent spend. A character earns its points by
+    // levelling, and mod-playerbots' own level-up maintenance, which would
+    // spend them, runs only for a random bot (IsRandomBot), which no roster
+    // character is.
     void TrainRoster()
     {
         QueryResult result = CharacterDatabase.Query(
@@ -50645,9 +50457,7 @@ private:
             uint8 const specTab = fields[1].Get<uint8>();
             uint8 const trainedLevel = fields[2].Get<uint8>();
 
-            // Same guard as the other two drives: this one goes on to send
-            // the character to a trainer, so a half-built Player is just as
-            // unsafe here. See SteerableAI above.
+            // Same guard as the other two drives. See SteerableAI above.
             Player* bot = ObjectAccessor::FindPlayerByName(name);
             if (!SteerableAI(bot))
                 continue;
@@ -50657,79 +50467,18 @@ private:
             // Two reasons to do the work, and the talent one has to be gated on
             // specTab as well: with no tree chosen the points are never spent,
             // so "has free points" would be true forever and this would re-run
-            // the whole trainer walk every single poll.
+            // every single poll.
             bool const hasTree = specTab <= MAX_TALENT_TAB;
             bool const wantsTalents = hasTree && bot->GetFreeTalentPoints() > 0;
             if (level == trainedLevel && !wantsTalents)
                 continue;
 
-            OverseerDecisions::RosterTraining const training =
-                OverseerDecisions::RosterTrainingFor(RosterFactoryGrants());
-            if (training.skills)
-                LOG_INFO("module.overseer", "overseer: training '{}' at level {} (spec_tab {})",
-                         name, static_cast<uint32>(level), static_cast<uint32>(specTab));
-            else
-                LOG_INFO("module.overseer",
-                         "overseer: training '{}' at level {} (spec_tab {}) - factory grants are "
-                         "off, so no skills, riding or spells are granted; it learns at a "
-                         "trainer and pays", name, static_cast<uint32>(level),
-                         static_cast<uint32>(specTab));
+            LOG_INFO("module.overseer",
+                     "overseer: training '{}' at level {} (spec_tab {}) - talents only; it "
+                     "learns spells and trades at a trainer and pays", name,
+                     static_cast<uint32>(level), static_cast<uint32>(specTab));
 
-            PlayerbotFactory factory(bot, level);
-            if (training.skills)
-                factory.InitSkills();
-            if (training.classSpells)
-                factory.InitClassSpells();
-
-            // THE FOURTH BLOCKER, AND THE ONE NOBODY HAD NAMED (infra#2757,
-            // infra#2782). This is also where the alchemy all five hold came
-            // from, and until it was closed the other three fixes were
-            // pointless: freeing a slot for tailoring would simply have handed
-            // the slot to whatever the sweep below reached first, within sixty
-            // seconds, forever.
-            //
-            // WHAT InitAvailableSpells ACTUALLY DOES. It walks EVERY Tradeskill
-            // and Class trainer template in the world and learns every spell
-            // CanTeachSpell says yes to, with no NPC, no money and no journey
-            // (PlayerbotFactory.cpp:3210-3253). CanTeachSpell refuses a primary
-            // profession's first rank on exactly one condition - that the
-            // character has no free primary profession point
-            // (Trainer.cpp:145-148). So while a slot is open, the first
-            // profession in trainer-template order is taken out of thin air.
-            // That is why all five hold the SAME profession at 1/75 rather than
-            // five different ones: it was never a roll, it was an iteration
-            // order. AiPlayerbot.ClassMatchingProfessionChance could not have
-            // helped, because InitTradeSkills - the function that reads it -
-            // returns at its first line for anyone who is not a random bot
-            // (PlayerbotFactory.cpp:2755-2758).
-            //
-            // WHAT THE GUARD DOES, AND WHAT IT DELIBERATELY DOES NOT. Zeroing
-            // the free-slot counter for the duration of the sweep makes
-            // CanTeachSpell refuse primary FIRST RANKS and nothing else.
-            // Journeyman and higher ranks are not first ranks, recipes are not
-            // first ranks, and no class spell is - so every reason this module
-            // calls InitAvailableSpells at all still works, and a character
-            // that already holds a trade still gets its rank-ups. The only
-            // thing that becomes impossible is acquiring a profession without a
-            // trainer, which is the thing that was never meant to happen.
-            //
-            // Restored unconditionally, because a character left holding zero
-            // free slots could never learn the trade it is being sent to learn -
-            // which would swap one silent blocker for another.
-            if (training.trainerSpells)
-            {
-                uint32 const freeProfessionSlots = bot->GetFreePrimaryProfessionPoints();
-                if (freeProfessionSlots)
-                    LOG_INFO("module.overseer",
-                             "overseer: '{}' has {} free primary profession slot(s); holding "
-                             "them shut for the trainer-table sweep so it cannot take one "
-                             "without a trainer", name, freeProfessionSlots);
-                bot->SetFreePrimaryProfessions(0);  // Player.h:1796
-                factory.InitAvailableSpells();
-                bot->SetFreePrimaryProfessions(static_cast<uint16>(freeProfessionSlots));
-            }
-
-            if (hasTree && training.talents)
+            if (hasTree)
                 SpendTalents(bot, static_cast<uint32>(specTab));
 
             bot->SendTalentsInfoData(false);
@@ -51280,7 +51029,7 @@ private:
                     {
                         // NO PROFESSION TO LEARN, SO A CLASS SPELL IS THE
                         // LEARN (2026-09-29): the family is granted none
-                        // (Overseer.Train.Factory = 0) and no other path sends
+                        // (TrainRoster grants nothing) and no other path sends
                         // it to a trainer, so a level 35 priest held no
                         // Fortitude and nobody had a buff.
                         Trainer::Trainer* classTrainer = sObjectMgr->GetTrainer(trainer);
@@ -53196,7 +52945,7 @@ private:
             else if (kind == "chat")
                 detail = DoChat(player, channel, command, targetArg, status);
             else if (kind == "gm")
-                detail = DoGmCommand(player, command, status);
+                detail = DoGmCommand();
             else if (kind == "probe")
                 detail = DoProbe(player, command, status, rowResult);
             else if (kind == "give")
@@ -53322,6 +53071,15 @@ private:
                 detail = DoGuild(player, command, targetArg, status, rowResult);
             else if (kind == "bot" && command == "open items")
                 detail = DoOpenLockboxes(player, status, rowResult);
+            // NATURAL ONLY (2026-10-12): a playerbots verb that grants - gear,
+            // consumables, spells, cheats, a summon - is refused for every
+            // character and every source. See GrantingBotCommandRefusal.
+            else if (!(leaderRefusal = OverseerDecisions::GrantingBotCommandRefusal(command)).empty())
+            {
+                LOG_INFO("module.overseer", "overseer: command {} ('{}') for '{}' refused - {}", id,
+                         command, targetName, leaderRefusal);
+                detail = leaderRefusal.c_str();
+            }
             // A FAMILY LEADER'S MOVEMENT IS HIS INTENT BOOK'S (wow-overseer#335
             // follow-up). `follow`, `stay`, `reset ai` and the `nc` toggles of
             // `new rpg`, `follow` and `stay` from any of the bridge's own rules
@@ -54206,54 +53964,21 @@ private:
         return "";
     }
 
-    // Run a dot-command through the character's OWN session, so it carries
-    // that account's real security level. A non-GM account is refused by the
-    // core exactly as if the player had typed it.
-    //
-    // AND FOR A BOT THAT SECURITY LEVEL IS ALWAYS SEC_PLAYER, WHATEVER THE
-    // ACCOUNT SAYS. mod-playerbots builds bot sessions with the level as a
-    // hardcoded constructor argument and never reads `account_access`:
-    //
-    //     new WorldSession(botAccountId, "", 0x0, nullptr, SEC_PLAYER, ...)
-    //         -- PlayerbotMgr.cpp:203, and identically at
-    //            RandomPlayerbotFactory.cpp:701 and TravelMgr.cpp:3393,
-    //            so it is the module's uniform posture, not one path's slip.
-    //
-    // So GRANTING gmlevel 3 TO A BOT'S ACCOUNT DOES NOTHING - not after a
-    // relog, not after a worldserver restart. Two sessions independently
-    // assumed otherwise on 2026-08-25, granted it, saw `.additem` refused,
-    // and re-granted before reading this constructor. The rows were later
-    // deleted precisely because an inert gmlevel 3 sitting in the table is
-    // worse than none: the next reader concludes those characters have it.
-    //
-    // kind='gm' is therefore usable ONLY on a character whose session came
-    // from a REAL CLIENT LOGIN. If a dot-command has to run against the
-    // family, a human logs in and types it; there is no server-side road.
-    static char const* DoGmCommand(Player* player, std::string const& command, char const*& status)
+    // kind='gm' RUNS NOTHING (natural only, 2026-10-12). It ran a dot-command
+    // through the character's own session. For a bot that session is always
+    // SEC_PLAYER - mod-playerbots builds it with the level hardcoded
+    // (PlayerbotMgr.cpp:203, RandomPlayerbotFactory.cpp:701, TravelMgr.cpp:3393)
+    // and never reads `account_access` - so the core refused every GM command.
+    // Under a real client login on a GM account it would run any of them,
+    // `.additem` and `.levelup` included, which is a grant to a member by
+    // remote. A human at a client who needs a dot-command types it; this
+    // module does not carry one. So it takes no character and no command, and
+    // the row is answered with the caller's default status, `error`, and this
+    // reason: nothing was delivered, so nothing reports `delivered`.
+    static char const* DoGmCommand()
     {
-        WorldSession* session = player->GetSession();
-        if (!session)
-            return "character has no session";
-        if (command.empty() || command[0] != '.')
-            return "gm command must start with a dot";
-
-        ChatHandler handler(session);
-        // ParseCommands takes the command WITH its leading dot: it rejects
-        // anything that does not start with '.' or '!'.
-        if (!handler.ParseCommands(command))
-            return "command not found";
-
-        // ParseCommands returning true means only that the input was HANDLED
-        // as a command - a handler that refused, or that was given a bad
-        // target or bad arguments, reports the error to the session and still
-        // returns true. Reporting that as "done" would tell Discord a state
-        // change happened when it did not. HasSentErrorMessage is the real
-        // outcome.
-        if (handler.HasSentErrorMessage())
-            return "command failed or was refused (detail went to the game chat log)";
-
-        status = "delivered";
-        return "";
+        return "kind='gm' is retired: this module runs no dot-command on any character, "
+               "because a member gains nothing it did not earn";
     }
 
     // ---------------------------------------------------------------- give --
@@ -54574,6 +54299,8 @@ private:
             destSlot = int32(stored->GetSlot());
             Bag* container = stored->GetContainer();
             trans->Append(
+                // natural-only: an existing item moved between two members under a trade's
+                // rules (tradeable, not soulbound, in trade range); nothing is created.
                 "REPLACE INTO character_inventory (guid, bag, slot, item) VALUES ({}, {}, {}, {})",
                 receiver->GetGUID().GetRawValue(),
                 container ? container->GetGUID().GetCounter() : 0,
@@ -58515,16 +58242,6 @@ private:
     // watchable. Anything that reasons about a POV being observable - the
     // stream feature above all - is reasoning about a promise this key can
     // withdraw. Leave it on wherever there are clients to spare.
-    // Does a level-up hand the roster skills, riding and spells with no
-    // trainer and no gold? ON by default, which is how the module has always
-    // behaved. See RosterTrainingFor in overseer_decisions.h for what each
-    // switch covers. Read per poll, like the keys around it, so a
-    // `.reload config` takes effect.
-    static bool RosterFactoryGrants()
-    {
-        return sConfigMgr->GetOption<bool>("Overseer.Train.Factory", true);
-    }
-
     static bool RosterRequiresAClient()
     {
         // QUIET WHEN THE KEY IS ABSENT (wow-overseer#335 follow-up). This is
@@ -58820,9 +58537,9 @@ private:
         std::string const guild = GuildNameOf(guid, live);
         facts.guildListed = NameListHas(NaturalGuilds(), guild);
         facts.playerbotsGateCovers = NameListHas(PlayerbotsNaturalGuilds(), guild);
-        // TrainRoster's factory grants (Overseer.Train.Factory): a strip refuses
-        // while they are on, because the next level would teach it all back.
-        facts.trainFactoryOn = RosterFactoryGrants();
+        // TrainRoster's factory grants are gone (natural only, 2026-10-12), so
+        // nothing teaches a stripped family its grants back on the next level.
+        facts.trainFactoryOn = false;
         facts.deathKnight = cache->Class == CLASS_DEATH_KNIGHT;
         facts.level = live ? live->GetLevel() : cache->Level;
         facts.clientAttached = live && ClientAttached(live);
@@ -59022,6 +58739,9 @@ private:
                 // Ebon Hold), and logged out once there. The bot's AI
                 // answers the teleport the way it answers any other.
                 PlayerInfo const* info = sObjectMgr->GetPlayerInfo(player->getRace(), player->getClass());
+                // natural-only: the operator's reset (kind='naturalize', Overseer.Natural.Enabled
+                // off by default, never a family character) remakes a guild bot as a new
+                // character; this is that new character's start, never more than it held.
                 if (info && player->TeleportTo(info->mapId, info->positionX, info->positionY, info->positionZ,
                                                info->orientation))
                 {
@@ -59610,6 +59330,9 @@ private:
         // ---- the reset ----
         if (player->isDead())
         {
+            // natural-only: the operator's reset (kind='naturalize', Overseer.Natural.Enabled off
+            // by default, never a family character) remakes a guild bot as a new character; this
+            // is that new character's start, never more than it held.
             player->ResurrectPlayer(1.0f);
             player->SpawnCorpseBones();
         }
@@ -59722,6 +59445,9 @@ private:
             player->SetUInt32Value(PLAYER_FIELD_WATCHED_FACTION_INDEX, uint32(-1));
         }
         player->_ApplyAllLevelScaleItemMods(false);
+        // natural-only: the operator's reset (kind='naturalize', Overseer.Natural.Enabled off by
+        // default, never a family character) remakes a guild bot as a new character; this is that
+        // new character's start, never more than it held.
         player->SetLevel(static_cast<uint8>(startLevel));
         player->InitRunes();
         player->InitStatsForLevel(true);
@@ -59731,6 +59457,9 @@ private:
         // InitTalentForLevel counted them outside the Ebon Hold with the old
         // quest total. At level 1 this is the 0 it already has.
         player->SetFreeTalentPoints(start.freeTalentPoints);
+        // natural-only: the operator's reset (kind='naturalize', Overseer.Natural.Enabled off by
+        // default, never a family character) remakes a guild bot as a new character; this is that
+        // new character's start, never more than it held.
         player->SetUInt32Value(PLAYER_XP, 0);
         player->_ApplyAllLevelScaleItemMods(true);
 
@@ -59741,6 +59470,9 @@ private:
             if (status.uState != SKILL_DELETED)
                 skills.push_back(skill);
         for (uint16 skill : skills)
+            // natural-only: the operator's reset (kind='naturalize', Overseer.Natural.Enabled off
+            // by default, never a family character) remakes a guild bot as a new character; this
+            // is that new character's start, never more than it held.
             player->SetSkill(skill, 0, 0, 0);
         player->resetSpells();
         player->InitPrimaryProfessions();
@@ -59756,6 +59488,9 @@ private:
         }
         for (uint32 factionId : factions)
             if (FactionEntry const* faction = sFactionStore.LookupEntry(factionId))
+                // natural-only: the operator's reset (kind='naturalize', Overseer.Natural.Enabled
+                // off by default, never a family character) remakes a guild bot as a new
+                // character; this is that new character's start, never more than it held.
                 player->GetReputationMgr().SetOneFactionReputation(
                     faction, float(player->GetReputationMgr().GetBaseReputation(faction)), false);
 
@@ -59769,7 +59504,13 @@ private:
             player->InitTaxiNodesForLevel();
         }
 
-        player->SetMoney(startMoney);
+        // The lower of a new character's purse and what this one held: a
+        // reset takes back, it does not pay out, so a purse below the start
+        // stays where it is.
+        // natural-only: the operator's reset (kind='naturalize', Overseer.Natural.Enabled off by
+        // default, never a family character) remakes a guild bot as a new character; this is that
+        // new character's start, never more than it held.
+        player->SetMoney(std::min(player->GetMoney(), startMoney));
         player->ResetAchievements();
 
         // The starting outfit, as Player::Create hands it out.
@@ -59799,11 +59540,17 @@ private:
                     if (proto->GetMaxStackSize() < count)
                         count = proto->GetMaxStackSize();
                 }
+                // natural-only: the operator's reset (kind='naturalize', Overseer.Natural.Enabled
+                // off by default, never a family character) remakes a guild bot as a new
+                // character; this is that new character's start, never more than it held.
                 player->StoreNewItemInBestSlots(itemId, count);
             }
         }
         if (info)
             for (PlayerCreateInfoItem const& item : info->item)
+                // natural-only: the operator's reset (kind='naturalize', Overseer.Natural.Enabled
+                // off by default, never a family character) remakes a guild bot as a new
+                // character; this is that new character's start, never more than it held.
                 player->StoreNewItemInBestSlots(item.item_id, item.item_amount);
         for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
         {
@@ -60012,6 +59759,8 @@ private:
         // THE LEVEL FIRST, AND NOTHING ELSE UNTIL IT HAS READ BACK. If the
         // level does not move, the run stops having changed nothing, so a retry
         // starts from the same character.
+        // natural-only: the operator's lowering (kind='naturalize', off by default) is refused
+        // unless the target is below the level held.
         player->GiveLevel(static_cast<uint8>(targetLevel));
         if (player->GetLevel() != targetLevel)
         {
@@ -60020,6 +59769,8 @@ private:
             return false;
         }
         player->InitTalentForLevel();
+        // natural-only: the operator's strip or lowering (kind='naturalize', off by default) only
+        // takes away.
         player->SetUInt32Value(PLAYER_XP, 0);
         player->resetTalents(true);
 
@@ -60033,11 +59784,15 @@ private:
             uint16 const max = player->GetPureMaxSkillValue(skill);
             uint16 const value = static_cast<uint16>(std::min<uint32>(before, max));
             if (player->GetPureSkillValue(skill) != value)
+                // natural-only: the operator's strip or lowering (kind='naturalize', off by
+                // default) only takes away. The value is the one it held, under the new cap.
                 player->SetSkill(skill, player->GetSkillStep(skill), value, max);
         }
 
         for (auto const& [skill, value] : clamp)
             if (player->HasSkill(skill))
+                // natural-only: the operator's strip or lowering (kind='naturalize', off by
+                // default) only takes away. A weapon skill is clamped down to 5 x level.
                 player->SetSkill(skill, player->GetSkillStep(skill), static_cast<uint16>(value),
                                  player->GetPureMaxSkillValue(skill));
 
@@ -60125,6 +59880,8 @@ private:
             }
         player->m_mailsUpdated = true;
         if (d.fromPurse)
+            // natural-only: the operator's strip or lowering (kind='naturalize', off by default)
+            // only takes away.
             player->ModifyMoney(-static_cast<int32>(d.fromPurse));
         return true;
     }
@@ -60213,6 +59970,8 @@ private:
             return bankBefore != bankAfterWithdraw || purseBefore != purseAfterWithdraw;
         }
 
+        // natural-only: the operator's strip or lowering (kind='naturalize', off by default) only
+        // takes away. The withdrawal above put this in the purse.
         player->ModifyMoney(-static_cast<int32>(amount));
         uint32 const purseAfter = player->GetMoney();
         uint64 const bankAfter = guild->GetTotalBankMoney();
@@ -60350,6 +60109,8 @@ private:
                         {
                             moved[k]->DeleteFromInventoryDB(trans);
                             moved[k]->SaveToDB(trans);
+                            // natural-only: the strip mails a destroyed bag's contents, the
+                            // character's own items, to itself, as the core does.
                             draft.AddItem(moved[k]);
                         }
                         draft.SendMailTo(trans, MailReceiver(player), MailSender(player), MAIL_CHECK_MASK_COPIED);
@@ -60394,6 +60155,8 @@ private:
                 for (uint32 spellId : ridingSpells)
                     player->removeSpell(spellId, SPEC_MASK_ALL, false);
                 if (player->HasSkill(SKILL_RIDING))
+                    // natural-only: the operator's strip or lowering (kind='naturalize', off by
+                    // default) only takes away.
                     player->SetSkill(SKILL_RIDING, 0, 0, 0);
                 changed = true;
             }
@@ -60462,11 +60225,15 @@ private:
                     continue;
                 if (d.verdict == StripVerdict::Remove)
                 {
+                    // natural-only: the operator's strip or lowering (kind='naturalize', off by
+                    // default) only takes away.
                     player->SetSkill(skill, 0, 0, 0);
                     changed = true;
                 }
                 else if (d.verdict == StripVerdict::SetValue)
                 {
+                    // natural-only: the operator's strip or lowering (kind='naturalize', off by
+                    // default) only takes away. SetValue only ever lowers.
                     player->SetSkill(skill, player->GetSkillStep(skill), static_cast<uint16>(d.value),
                                      player->GetPureMaxSkillValue(skill));
                     changed = true;
@@ -63374,6 +63141,8 @@ private:
                     // the idle budget so a cast refused for ever ends the row,
                     // and now NAMED, so the next row of this shape arrives with
                     // its own diagnosis instead of a bare number.
+                    // natural-only: a conjure the character knows, read off its own spellbook
+                    // (FindConjureSource), cast by its own AI.
                     if (botAI->CastSpell(check.ev.spellId, bot))
                     {
                         ++check.ev.castsSpent;
@@ -63667,8 +63436,6 @@ private:
     // whatever the item's own template carries and reading it back off the item
     // is the only way to be casting the same thing the core is.
     static constexpr uint32 HEARTHSTONE_ITEM_ENTRY = 6948;
-    // The spell the stone casts (Hearthstone, 8690): cast on its own by a `recall`.
-    static constexpr uint32 HEARTHSTONE_SPELL_ID = 8690;
 
     // How close to the home a character has to read back before it has
     // arrived. Wide, and not because the spell is imprecise:
@@ -63946,23 +63713,27 @@ private:
         if (who->GetTransport())
             return refuse("character is on a transport");
 
+        // A RECALL IS REFUSED (natural only, 2026-10-12). It cast the stone's
+        // spell for a character that had lost the stone, which no player can
+        // do: a player without one gets a new one from an innkeeper.
         Item* stone = who->GetItemByEntry(HEARTHSTONE_ITEM_ENTRY);
-        bool const recall = request.verb == HearthVerb::Recall;
-        if (recall && stone)
-            return refuse("character carries a hearthstone; use it");
-        if (!recall && !stone)
+        if (request.verb == HearthVerb::Recall)
+            return refuse(stone ? "character carries a hearthstone; use it"
+                                : "a recall casts the hearthstone without the stone, which no "
+                                  "player can do; it gets a new stone from an innkeeper");
+        if (!stone)
             return refuse("character carries no hearthstone");
-        ev.itemEntry = stone ? stone->GetEntry() : 0;
+        ev.itemEntry = stone->GetEntry();
 
-        ItemTemplate const* proto = stone ? stone->GetTemplate() : nullptr;
-        if (!recall && !proto)
+        ItemTemplate const* proto = stone->GetTemplate();
+        if (!proto)
             return refuse("the hearthstone has no template");
 
         // THE SPELL COMES OFF THE ITEM. Player::CastItemUseSpell casts whatever
         // proto->Spells[] carries with ITEM_SPELLTRIGGER_ON_USE, so reading the
         // same field is the only way this module is asking for the same spell
         // the core is going to run.
-        for (uint8 i = 0; proto && i < MAX_ITEM_PROTO_SPELLS; ++i)
+        for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
         {
             if (proto->Spells[i].SpellId > 0
                 && proto->Spells[i].SpellTrigger == ITEM_SPELLTRIGGER_ON_USE)
@@ -63971,9 +63742,6 @@ private:
                 break;
             }
         }
-        // A character that lost its stone casts the stone's own spell.
-        if (recall)
-            ev.spellId = HEARTHSTONE_SPELL_ID;
         if (!ev.spellId)
             return refuse("the hearthstone has no on-use spell");
 
@@ -64048,30 +63816,17 @@ private:
         // because the mount is checked once, at Spell::prepare.
         HoldStillAndReport(who, ev.character, "hearth", ev.hold);
 
-        if (recall)
-        {
-            // Not triggered: the cast time, the interrupts and the cooldown are the
-            // ones a player's own cast would get.
-            LOG_WARN("module.overseer",
-                     "overseer: '{}' lost its hearthstone and casts the hearthstone spell "
-                     "to its own bind point (hearth recall)",
-                     ev.character);
-            who->CastSpell(who, ev.spellId, false);
-        }
-        else
-        {
-            WorldPacket raw(CMSG_USE_ITEM, 1 + 1 + 1 + 4 + 8 + 4 + 1 + 4);
-            raw << uint8(stone->GetBagSlot());
-            raw << uint8(stone->GetSlot());
-            raw << uint8(1);  // castCount
-            raw << uint32(ev.spellId);
-            raw << stone->GetGUID();
-            raw << uint32(0);  // glyphIndex
-            raw << uint8(0);   // castFlags; 0 keeps HandleClientCastFlags a no-op
-            raw << uint32(TARGET_FLAG_NONE);
-            raw.rpos(0);
-            session->HandleUseItemOpcode(raw);
-        }
+        WorldPacket raw(CMSG_USE_ITEM, 1 + 1 + 1 + 4 + 8 + 4 + 1 + 4);
+        raw << uint8(stone->GetBagSlot());
+        raw << uint8(stone->GetSlot());
+        raw << uint8(1);  // castCount
+        raw << uint32(ev.spellId);
+        raw << stone->GetGUID();
+        raw << uint32(0);  // glyphIndex
+        raw << uint8(0);   // castFlags; 0 keeps HandleClientCastFlags a no-op
+        raw << uint32(TARGET_FLAG_NONE);
+        raw.rpos(0);
+        session->HandleUseItemOpcode(raw);
 
         // ---- believe nothing, and do not judge yet ---------------------------
         //
@@ -65525,6 +65280,7 @@ private:
                 if (!trainer->CanTeachSpell(who, &spell))
                     continue;
                 uint32 const moneyBefore = who->GetMoney();
+                // natural-only: bought at a trainer in reach, which takes its price (TeachSpell).
                 trainer->TeachSpell(npc, who, spell.SpellId);
                 std::ostringstream o;
                 bool const learned = who->HasSkill(request.skill);
@@ -69961,6 +69717,8 @@ private:
         if (took)
         {
             ev.specIndex = sPlayerbotAIConfig.randomClassSpecIndex[bot->getClass()][tree];
+            // natural-only: spends the free points it has after a talent wipe paid for at a
+            // trainer; no point is granted.
             PlayerbotFactory::InitTalentsBySpecNo(bot, static_cast<int>(ev.specIndex), false);
             if (bot->GetFreeTalentPoints())
                 SpendTalents(bot, tree);
@@ -70024,6 +69782,7 @@ private:
             for (uint32 spellId : buy)
             {
                 uint32 const purseBefore = bot->GetMoney();
+                // natural-only: bought at a trainer in reach, which takes its price (TeachSpell).
                 trainer->TeachSpell(npc, bot, spellId);  // Trainer.h:73
                 if (bot->HasSpell(spellId) || bot->GetMoney() < purseBefore)
                     ev.taught.push_back(spellId);
@@ -70090,6 +69849,7 @@ private:
             {
                 facts.rankOffered = true;
                 ev.rankSpell = rankSpell;
+                // natural-only: bought at a trainer in reach, which takes its price (TeachSpell).
                 trainer->TeachSpell(npc, bot, rankSpell);  // Trainer.h:73
                 facts.rankLearned = heldSkill
                     ? int32(bot->GetPureMaxSkillValue(ev.skill)) > ev.maxBefore
@@ -70097,6 +69857,7 @@ private:
             }
             for (uint32 spellId : spells)
             {
+                // natural-only: bought at a trainer in reach, which takes its price (TeachSpell).
                 trainer->TeachSpell(npc, bot, spellId);
                 if (bot->HasSpell(spellId))
                 {
@@ -72720,6 +72481,7 @@ private:
     // more (#131) - only a client can.
     uint32 _rosterTimer = 0;
     uint32 _raidSpecTimer = 0;
+    uint32 _presenceSummaryTimer = 0;
     uint32 _partyTimer = 0;
     uint32 _trainTimer = 0;
     uint32 _questTimer = 0;
@@ -72739,12 +72501,6 @@ private:
     // the world thread only, cleared when the character is alive again, lost
     // on restart at the cost of one repeated line.
     std::set<std::string> _healerExpected;
-
-    // WHERE THIS DRIVE LAST REVIVED EACH CHARACTER (graveyard id, when), so a
-    // second revival at the same graveyard inside GRAVEYARD_REPEAT_SECONDS
-    // goes home instead. Cleared by a revival anywhere that is not a
-    // graveyard. Same ownership and lifetime as _awaitingRelease.
-    std::map<std::string, std::pair<uint32, int64>> _lastRevival;
 
     // UNTIL WHEN EACH REVIVED CHARACTER IS HELD, and whether it led (carried
     // `new rpg`) when the hold began, so the right mover is restored. Read
@@ -72766,6 +72522,11 @@ private:
     // saved strategy list is only ever added on top of those, so nothing this
     // module leased off is left missing.
     std::map<std::string, GhostRecoveryState> _ghostRecovery;
+    // The stuck-revival ladder's own spirit-healer walks (LadderToSpiritHealer),
+    // and the death each no-graveyard ghost was last named for. World thread
+    // only, cleared when the character is alive again.
+    std::map<std::string, GhostRecoveryState> _ladderHealer;
+    std::map<std::string, int64> _ladderNoGraveSaid;
     // A natural guild member's recent deaths (DriveGuildGhostRecovery), by name.
     std::map<std::string, std::vector<OverseerDecisions::GuildDeathMark>> _guildDeathMarks;
     // The last hearth refusal LeaveGuildDeathSpot logged for a member, by name.
@@ -73335,6 +73096,62 @@ private:
     }
 };
 
+// A LOGOUT CLEARS ONLY ITS OWN CHARACTER WHILE ACCOUNT-MATES PLAY ON
+// (wow-overseer#874). WorldSession::LogoutPlayer runs CHAR_UPD_ACCOUNT_ONLINE,
+// which sets online = 0 for the whole account. Under playerbots many
+// characters on one account are in the world at once, so one bot's logout
+// marked always-online guild members offline until their next save, 15
+// minutes later: on the dev realm 42 characters in the world read online 0,
+// and 2 to 7 of the guild members at any moment. The hook runs before the
+// leaving player is removed from the world, so the count skips it
+// rather than counting it. A lone session keeps the core's statement unchanged.
+class OverseerDatabaseScript : public DatabaseScript
+{
+public:
+    OverseerDatabaseScript() : DatabaseScript("OverseerDatabaseScript", {
+        DATABASEHOOK_ON_DATABASE_SELECT_INDEX_LOGOUT,
+    }) {}
+
+    void OnDatabaseSelectIndexLogout(Player* player, uint32& statementIndex,
+                                     uint32& statementParam) override
+    {
+        if (!player || !player->GetSession())
+            return;
+        WorldSession const* leaving = player->GetSession();
+        uint32 const accountId = leaving->GetAccountId();
+        uint32 others = 0;
+        for (auto const& itr : ObjectAccessor::GetPlayers())
+        {
+            Player* other = itr.second;
+            if (!other || other == player || !other->IsInWorld() || !other->GetSession())
+                continue;
+            if (other->GetSession()->GetAccountId() == accountId)
+                ++others;
+        }
+
+        if (OverseerDecisions::LogoutOfflineScope(others) ==
+            OverseerDecisions::LogoutScope::CharacterOnly)
+        {
+            statementIndex = CHAR_UPD_CHAR_OFFLINE;
+            statementParam = player->GetGUID().GetCounter();
+            ++g_characterOnlyLogouts;
+        }
+
+        // The module had no logout hook, so a guild member's real departure
+        // left no line at all.
+        if (!InNaturalGuild(player))
+            return;
+        Guild const* guild = sGuildMgr->GetGuildById(player->GetGuildId());
+        char const* cause = sWorld->IsShuttingDown() ? "server shutdown"
+                            : leaving->IsBot()       ? "bot session"
+                                                     : "player client";
+        LOG_INFO("module.overseer",
+                 "overseer: guild member '{}' ({}) left the world: {}; {} other character(s) "
+                 "on its account stay in the world",
+                 player->GetName(), guild ? guild->GetName() : std::string(), cause, others);
+    }
+};
+
 void Addmod_overseerScripts()
 {
     // Install the crash trace before constructing scripts or starting module work.
@@ -73352,4 +73169,5 @@ void Addmod_overseerScripts()
     new OverseerKeepScript();
     new OverseerMeterScript();
     new OverseerAuctionScript();
+    new OverseerDatabaseScript();
 }

@@ -411,12 +411,12 @@ void TheOutcomeWordsAreTheOnesARowCarries()
 
 }  // namespace
 
-// THE EXECUTOR'S TWO RECALL GATES, pinned in the source, because DoHearth reads
-// a live character and cannot be called from here (the adapter compiles only in
-// CI). A recall is for a character that has LOST its stone: one that carries it
-// is told to use it, and a stone-less one is let through with no item and the
-// stone's own spell. The core is asked for that spell before either cast, so a
-// DBC that lacks it is a named refusal and not a blank cast.
+// THE EXECUTOR REFUSES EVERY RECALL, pinned in the source, because DoHearth
+// reads a live character and cannot be called from here (the adapter compiles
+// only in CI). A recall cast the stone's spell for a character that had lost
+// the stone, which no player can do (natural only, 2026-10-12). The verb still
+// parses, so a row that asks for it is answered by name rather than as
+// malformed, and nothing in the executor casts a spell by hand any more.
 void TheRecallGatesAreInTheExecutor()
 {
     std::ifstream in("src/mod_overseer.cpp");
@@ -427,18 +427,19 @@ void TheRecallGatesAreInTheExecutor()
 
     std::size_t const fn = at("static char const* DoHearth(");
     Check("the executor is found", fn != std::string::npos, true);
-    std::size_t const carries = at("character carries a hearthstone; use it", fn);
+    std::size_t const end = at("\n    }\n", fn);
+    std::size_t const recall = at("if (request.verb == HearthVerb::Recall)", fn);
+    std::size_t const refused = at("a recall casts the hearthstone without the stone", fn);
     std::size_t const none = at("character carries no hearthstone", fn);
-    std::size_t const spell = at("ev.spellId = HEARTHSTONE_SPELL_ID", fn);
-    std::size_t const known = at("the core does not know that spell", fn);
-    std::size_t const cast = at("who->CastSpell(who, ev.spellId, false)", fn);
-    Check("a recall with a stone is refused", carries != std::string::npos, true);
+    std::size_t const packet = at("session->HandleUseItemOpcode(raw);", fn);
+    Check("a recall is refused", recall != std::string::npos && refused != std::string::npos, true);
     Check("a normal use without a stone is still refused", none != std::string::npos, true);
-    Check("a recall casts the stone's own spell", spell != std::string::npos, true);
-    Check("the core is asked about that spell before the cast",
-          known != std::string::npos && cast != std::string::npos && spell < known && known < cast,
+    Check("the refusal comes before the item is used",
+          recall < packet && refused < packet && packet < end, true);
+    Check("nothing casts the stone's spell without the stone",
+          src.find("who->CastSpell(who, ev.spellId, false)") == std::string::npos &&
+              src.find("HEARTHSTONE_SPELL_ID") == std::string::npos,
           true);
-    Check("the gates come before the spell is chosen", carries < spell && none < spell, true);
 }
 
 int main()

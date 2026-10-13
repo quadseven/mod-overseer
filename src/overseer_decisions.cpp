@@ -13588,6 +13588,44 @@ bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct)
     return lowestDurabilityPct < floorPct;
 }
 
+RaidPullRepairAction RaidPullRepairDecision(unsigned bossesDone, bool anySeatBelowFloor,
+                                           long heldSeconds, long maximumHoldSeconds)
+{
+    // Molten Core orders Majordomo Executus after the first eight bosses and
+    // Ragnaros after Majordomo.
+    if (bossesDone != 8 && bossesDone != 9)
+        return RaidPullRepairAction::Ignore;
+    if (!anySeatBelowFloor)
+        return RaidPullRepairAction::Resume;
+    return heldSeconds >= maximumHoldSeconds ? RaidPullRepairAction::TimedOut
+                                              : RaidPullRepairAction::Hold;
+}
+
+RaidPullRepairAction RaidPullRepairForSeats(unsigned bossesDone,
+                                            std::vector<unsigned> const& seatLowestPcts,
+                                            unsigned floorPct, long heldSeconds,
+                                            long maximumHoldSeconds)
+{
+    bool anyBelow = false;
+    for (unsigned const pct : seatLowestPcts)
+        if (RaidSeatNeedsRepair(pct, floorPct))
+            anyBelow = true;
+    return RaidPullRepairDecision(bossesDone, anyBelow, heldSeconds, maximumHoldSeconds);
+}
+
+RaidPullSeatStep RaidPullSeatRepairStep(unsigned lowestDurabilityPct, unsigned floorPct,
+                                        bool holdTimedOut, bool alreadyAttempted,
+                                        bool repairerInReach)
+{
+    if (!RaidSeatNeedsRepair(lowestDurabilityPct, floorPct))
+        return RaidPullSeatStep::Ready;
+    if (holdTimedOut)
+        return RaidPullSeatStep::TimedOut;
+    if (alreadyAttempted)
+        return RaidPullSeatStep::Attempted;
+    return repairerInReach ? RaidPullSeatStep::Repair : RaidPullSeatStep::Walk;
+}
+
 bool RaidGhostMayBeWalked(long ghostSeconds)
 {
     return ghostSeconds < RAID_RUNBACK_WAIT_SECONDS;
@@ -18409,16 +18447,6 @@ unsigned GuildRunCeilingSeconds(bool finderEndsDungeon, unsigned bossesExpected)
     return std::max(GUILD_RUN_CEILING_SECONDS, bossesExpected * GUILD_RUN_SECONDS_PER_BOSS);
 }
 
-RosterTraining RosterTrainingFor(bool factoryGrants)
-{
-    RosterTraining training;
-    training.skills = factoryGrants;
-    training.classSpells = factoryGrants;
-    training.trainerSpells = factoryGrants;
-    training.talents = true;
-    return training;
-}
-
 // ------------------------------------------------------------------ keep --
 
 bool KeepReservationCovers(KeepReservation const& r, std::string const& character, unsigned itemEntry,
@@ -19557,6 +19585,19 @@ std::string LeaderCommandRefusal(bool isFamilyLeader, std::string const& source,
             start = comma + 1;
         }
     }
+    return std::string();
+}
+
+std::string GrantingBotCommandRefusal(std::string const& command)
+{
+    std::string const verb = LowerTrimmed(command);
+    std::string const first = verb.substr(0, verb.find_first_of(" =\t"));
+    static char const* const granting[] = {"maintenance", "autogear", "cheat", "summon", "init",
+                                           "levelup"};
+    for (char const* word : granting)
+        if (first == word)
+            return "`" + first + "` hands a bot what a player would have to earn, and a member "
+                   "gains nothing it did not earn";
     return std::string();
 }
 
@@ -21025,6 +21066,12 @@ bool RowLiftsDeckSettle(std::string const& kind)
 bool HoldYieldsToWalk(std::string const& holdVerb)
 {
     return holdVerb == DECK_SETTLE_HOLD_VERB;
+}
+
+LogoutScope LogoutOfflineScope(uint32_t otherInWorldOnAccount)
+{
+    return otherInWorldOnAccount == 0 ? LogoutScope::Account
+                                      : LogoutScope::CharacterOnly;
 }
 
 }  // namespace OverseerDecisions
