@@ -35,11 +35,18 @@ int main()
         std::cerr << "the terrain release must be gated on TerrainRemedyEndsTheErrand\n";
         return EXIT_FAILURE;
     }
-    std::size_t const teleport = text.find("bot->TeleportTo(bot->GetMapId()", release);
+    // NATURAL ONLY (2026-10-12): the remedy after the release is the
+    // character's own hearthstone, never a teleport.
+    std::size_t const remedy = text.find("HearthOffThePlane(bot, name, groundOnRecord)", release);
     if (snapshot == std::string::npos || release == std::string::npos ||
-        teleport == std::string::npos || !(snapshot < release && release < teleport))
+        remedy == std::string::npos || !(snapshot < release && release < remedy))
     {
-        std::cerr << "recovery must snapshot the aim, release it, then teleport\n";
+        std::cerr << "recovery must snapshot the aim, release it, then hearth\n";
+        return EXIT_FAILURE;
+    }
+    if (text.find("bot->TeleportTo(bot->GetMapId()") != std::string::npos)
+    {
+        std::cerr << "nothing in the terrain drive teleports a member\n";
         return EXIT_FAILURE;
     }
 

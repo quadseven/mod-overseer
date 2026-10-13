@@ -58,6 +58,26 @@
 namespace OverseerDecisions
 {
 
+struct EquipCommand
+{
+    uint32_t entry{0};
+};
+
+// Accept the bridge's one-item equip form only: `e Hitem:<entry>` with an
+// optional numeric hyperlink suffix. Extra links or trailing text are invalid.
+bool ParseEquipCommand(std::string const& command, EquipCommand& out);
+
+struct EquipRefusal
+{
+    // A string literal ("error", "applied", "unchanged"), so the command loop
+    // can assign it straight to its own `char const* status` for the row.
+    char const* status;
+    std::string detail;
+};
+
+EquipRefusal EquipRefused(std::string const& reason);
+EquipRefusal EquipReadBack(bool worn);
+
 // A DUNGEON RUN'S LEADER MUST HOLD A CLIENT (#735). Only a client-attached
 // leader can issue the dungeon-clear, so ENTER and CLEARING wait until the
 // leader's socket has stayed open for the settle window (a measured flap ran
@@ -11117,7 +11137,9 @@ enum class HearthVerb
     // home, had no stone and no way to buy one, and no walk can climb 266 yards.
     // Same spell, cast time, cooldown, interrupts and destination as the item
     // (the character's own bind point); refused for a character that carries a
-    // stone, which must use it.
+    // stone, which must use it. PARSED BUT REFUSED by the executor since
+    // 2026-10-12 (natural only): a stone's spell without the stone is not
+    // something a player can cast.
     Recall,
 };
 
@@ -16346,6 +16368,12 @@ struct RaidDoor
     // "moltencore" for map 409). HOLD checks every raid member carries it
     // (#640).
     char const* fightStrategy;
+    // The meeting stones a straggler is summoned at during ASSEMBLE (#922), by
+    // gameobject entry, and the place they stand in for the log. Entries only:
+    // where each stands and its minimum level are read off the core's own
+    // spawn and template tables at run time. 0 is no stone.
+    unsigned meetingStones[2];
+    char const* stonesName;
 };
 
 // The door for `keyword`, or nullptr. Exact, lower case: the queue writes the
@@ -16500,6 +16528,8 @@ struct RaidRunStep
     bool standDown{false};    // leaving CLEAR: tell the brain to let go, once
     bool releaseDead{false};  // RECOVER: release every raid member lying dead inside
     bool runBack{false};      // RECOVER: walk every ghost of the raid to the door
+    // ASSEMBLE, after the walk: summon one straggler at a meeting stone (#922)
+    bool summonStragglers{false};
     char const* why{""};
 };
 
@@ -16510,6 +16540,30 @@ bool RaidWiped(RaidRunFacts const& facts);
 // configured floor. An item with no maximum durability is not part of the
 // measurement; callers pass the already-computed lowest percentage.
 bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct);
+
+enum class RaidPullRepairAction { Ignore, Hold, Resume, TimedOut };
+
+// The Molten Core repair gate is only before Majordomo Executus and Ragnaros.
+RaidPullRepairAction RaidPullRepairDecision(unsigned bossesDone, bool anySeatBelowFloor,
+                                            long heldSeconds, long maximumHoldSeconds);
+
+// The same gate fed with each readable seat's lowest durability percentage, as
+// the run sees them: any seat under the floor holds, and the time limit ends
+// the hold with TimedOut (not Resume) so the run can log which one it was.
+RaidPullRepairAction RaidPullRepairForSeats(unsigned bossesDone,
+                                            std::vector<unsigned> const& seatLowestPcts,
+                                            unsigned floorPct, long heldSeconds,
+                                            long maximumHoldSeconds);
+
+// What the run does for one seat during the repair hold before Majordomo or
+// Ragnaros: a seat at or above the floor is Ready; once the hold has timed out
+// a seat under it is left as TimedOut; a seat already sent through the repair
+// verb is not charged twice (Attempted); otherwise it Walks to a repairer, or
+// Repairs when one is in reach. Every step but Ready and TimedOut holds the pull.
+enum class RaidPullSeatStep { Ready, TimedOut, Attempted, Walk, Repair };
+RaidPullSeatStep RaidPullSeatRepairStep(unsigned lowestDurabilityPct, unsigned floorPct,
+                                        bool holdTimedOut, bool alreadyAttempted,
+                                        bool repairerInReach);
 
 // One poll of the raid run.
 //
@@ -16546,6 +16600,92 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts);
 // coordinator's measured lesson, kept here.
 std::vector<std::string> RaidKnockOrder(std::vector<std::string> const& inDoor,
                                         std::string const& head, bool headMayCross);
+
+// -- stragglers summoned at the mountain's meeting stones (#922) -------------
+//
+// A FULL RAID HAS NO SLOT FOR A WARLOCK, and Ritual of Summoning only moves a
+// member of the caster's own raid. The Blackrock Mountain meeting stones need
+// neither: GameObject::Use's MEETINGSTONE case lets any raid member standing at
+// the stone summon any other raid member, and refuses only when either of the
+// two is below the stone's minimum level (179587 reads 55 and 179586 reads 48
+// on the dev realm; the adapter reads the template, not these numbers). The
+// seats are already one raid (FormRaidFromSeats) and kind='summon' already
+// drives the whole chain: the walk of both clickers onto the stone, the
+// portal, the settle, the accept and the read-back.
+//
+// AFTER THE WALK. A seat is summoned only once ASSEMBLE has held this long
+// with the head at the door: the raid following him has had its chance to
+// walk in, and what is still away is a seat on a boat or on another continent.
+constexpr long RAID_STONE_SUMMON_AFTER_SECONDS = 5 * 60;
+// A straggler is summoned at most this many times in one order, for the reason
+// the dungeon rung keeps the same number: a summon that failed twice for one
+// character will not work because it was asked a third time.
+constexpr unsigned RAID_STONE_SUMMON_TRIES = 2;
+// How long one summon row may stay unfinished before the run stops waiting for
+// it. The verb's own ceilings add up to under a minute; the rest is the queue.
+constexpr long RAID_STONE_SUMMON_ROW_CEILING_SECONDS = 150;
+// A seat within this many yards of a stone, on its map and outside any
+// instance, can click it: inside the forty yards kind='summon' walks a clicker
+// the last of (#355). The dungeon rung's own reach.
+constexpr float RAID_STONE_REACH_YARDS = 35.f;
+
+// One stone as the world has it: its entry and the minimum level its template
+// carries, which the core checks of both the clicker and the one summoned.
+struct RaidStone
+{
+    unsigned entry{0};
+    unsigned minLevel{0};
+};
+
+// One raid member as the summon reads it.
+struct RaidStoneSeat
+{
+    std::string name;
+    // The head is never chosen: he is the operator's streaming character and
+    // the run owns his walk, so neither the verb's hold nor its walk may take
+    // him.
+    bool head{false};
+    bool inWorld{false};
+    bool alive{false};
+    bool inCombat{false};
+    // In any instance. A seat inside a dungeon or the raid is not pulled out.
+    bool inInstance{false};
+    // Something kind='summon' can move: a character with the bot AI that
+    // answers the far teleport.
+    bool summonable{false};
+    // Within RAID_ASSEMBLE_YARDS of the staging point on the door's map.
+    bool assembled{false};
+    // The index into the stones of the stone this seat stands within
+    // RAID_STONE_REACH_YARDS of, or -1.
+    int atStone{-1};
+    unsigned level{0};
+    // Summons already tried for this seat in this order.
+    unsigned tries{0};
+};
+
+struct RaidStoneSummon
+{
+    bool summon{false};
+    std::string straggler;
+    // Clicks the stone with the straggler selected; the core checks his level.
+    std::string clicker;
+    // Clicks the portal, the ritual's second participant.
+    std::string helper;
+    // Index into the stones, or -1.
+    int stone{-1};
+    std::string why;
+};
+
+// Who is summoned, by whom, at which stone. Stragglers in the order given,
+// stones in the order given, and the first straggler with a stone whose
+// minimum he meets and two seats standing at it - one who meets the minimum
+// to click it, and another to click the portal - is the answer.
+//
+// A SEAT BELOW EVERY STONE'S MINIMUM IS NOT SUMMONED. The core would refuse
+// the click, so the seat keeps walking with the raid.
+RaidStoneSummon ChooseRaidStoneSummon(std::vector<RaidStoneSeat> const& seats,
+                                      std::vector<RaidStone> const& stones,
+                                      unsigned triesPerSeat = RAID_STONE_SUMMON_TRIES);
 
 // May the dungeon brain be armed for a character on this map?
 //
@@ -21216,33 +21356,6 @@ bool GuildRunStrayExpired(std::int64_t expiry, std::int64_t now);
 constexpr unsigned RUN_CLOSE_STARTUP_HOLD_SECONDS = 10 * 60;
 bool RunCloseHeldAfterStartup(std::int64_t secondsSinceStart);
 
-// ------------------------- what a level-up hands the roster (the operator) --
-//
-// TrainRoster runs on every level change of a roster character. With factory
-// grants ON (the default, and the module's behaviour before this switch) it
-// hands out, with no trainer and no gold:
-//
-//   - skills: every weapon skill of the class at level x 5, and the riding
-//     ranks at 20, 40 and 60 (PlayerbotFactory::InitSkills);
-//   - class spells: the class's spells (InitClassSpells);
-//   - trainer spells: every rank any trainer in the world would teach
-//     (InitAvailableSpells), with the first rank of a primary profession held
-//     shut.
-//
-// Overseer.Train.Factory = 0 turns all three off. The family then
-// learns only at a real trainer and pays for it (the training stop walks it
-// there), and gains weapon skill by using the weapon. Talent points are still
-// spent, because a character earns them by levelling.
-struct RosterTraining
-{
-    bool skills{false};
-    bool classSpells{false};
-    bool trainerSpells{false};
-    bool talents{false};
-};
-
-RosterTraining RosterTrainingFor(bool factoryGrants);
-
 // ------------------------------------------------------------------ keep --
 //
 // AN ITEM A CHARACTER MUST KEEP, whatever else wants it (overseer_keep). The
@@ -21419,7 +21532,7 @@ struct NaturalizeFacts
     unsigned openBids{0};            // auctions it holds the high bid on
     unsigned codMail{0};             // COD mail waiting in its inbox
     bool playerbotsGateCovers{false};// AiPlayerbot.NaturalGuild names its guild
-    bool trainFactoryOn{true};       // Overseer.Train.Factory
+    bool trainFactoryOn{true};       // retired Overseer.Train.Factory; the adapter says false
     unsigned partsAlreadyDone{0};    // ledger bits already recorded for it
     unsigned level{0};               // its level now
 };
@@ -21986,6 +22099,17 @@ bool CommandSourceIsOperator(std::string const& source);
 // command may run.
 std::string LeaderCommandRefusal(bool isFamilyLeader, std::string const& source,
                                  std::string const& command);
+
+// NATURAL ONLY (the operator, 2026-10-12): a member gains nothing it could not
+// earn. A bridge row with no kind of its own is handed to mod-playerbots as a
+// whisper, verbatim, and several of its verbs hand a bot things out of thin
+// air: `maintenance` (bags, ammo, food, reagents, potions, spells, mounts,
+// glyphs, enchants), `autogear` (gear created for its level), `cheat` (gold,
+// taxi, health, mana and cooldown cheats), `summon` (a teleport to whoever
+// asked), and the factory's `init` and `levelup`. Refused for every source,
+// the operator's own included, because no member may have them at all.
+// Returns the refusal reason, empty when the command may run.
+std::string GrantingBotCommandRefusal(std::string const& command);
 
 // ------------------------------------------------------------------------
 // AN ERRAND IS STUCK ONLY WHEN IT HAS STOPPED GETTING ANYWHERE FOR A WINDOW.
@@ -23102,6 +23226,22 @@ bool RowLiftsDeckSettle(std::string const& kind);
 // May a walk row take this hold over rather than be refused by it, the way it
 // replaces its own linger? True for the settle on the deck.
 bool HoldYieldsToWalk(std::string const& holdVerb);
+
+// WHICH ROWS A LOGOUT MARKS OFFLINE. The core's logout clears the online flag
+// for every character on the leaving character's ACCOUNT. Under playerbots
+// many characters on one account are in the world at once, so one bot's logout
+// marked always-online guild members offline until their next save, 15 minutes
+// later (wow-overseer#874: 42 characters in the world read online 0 on the dev
+// realm). A logout with account-mates still in the world clears only its own
+// character; a lone session keeps the core's account-wide statement.
+// `otherInWorldOnAccount` counts the in-world players on the same account,
+// the leaving one excluded.
+enum class LogoutScope
+{
+    Account,
+    CharacterOnly,
+};
+LogoutScope LogoutOfflineScope(uint32_t otherInWorldOnAccount);
 
 }  // namespace OverseerDecisions
 
