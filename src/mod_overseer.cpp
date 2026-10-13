@@ -27281,8 +27281,10 @@ private:
             // uses the hearthstone, and so does this, through the same
             // HearthOffThePlane the give-up below uses (its own stone, bound on
             // this map only, once per forget window). The errand that walked
-            // it there is released above and REFUSED here, so the next poll
-            // cannot write the same walk back.
+            // it there is released above and, when it had a travel aim,
+            // REFUSED here, so the next poll cannot write the same walk back.
+            // With no travel aim there is nothing to refuse, and the log
+            // below says so.
             if (verdict.remedy ==
                 OverseerDecisions::TerrainRemedy::ReturnToLastGround)
             {
@@ -27304,13 +27306,17 @@ private:
                           "NOT MOVED: nothing here teleports a member (natural only), "
                           "and its last ground, map {} ({:.1f}, {:.1f}, {:.1f}), is "
                           "where a walk would have to take it. Its errand is released "
-                          "and refused: quest aim job='{}' quest={} travel='{}'",
+                          "and its travel aim {}: quest aim job='{}' quest={} "
+                          "travel='{}'",
                           name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
                           reading.terrainZ, TERRAIN_PLANE_RING_YARDS,
                           reading.surfaceValid ? std::to_string(reading.surfaceAboveZ)
                                                : std::string("none"),
                           hearth.reason, verdict.groundMapId, verdict.groundX,
-                          verdict.groundY, verdict.groundZ, job, questAim, travelTarget);
+                          verdict.groundY, verdict.groundZ,
+                          travelTarget.empty() ? "was empty, so nothing is refused"
+                                               : "is refused",
+                          job, questAim, travelTarget);
                 continue;
             }
 
@@ -29575,8 +29581,9 @@ private:
                 OverseerDecisions::SpiritReviveSite::WhereItStands)
             {
                 // natural-only: the spirit healer's own resurrection, for a ghost standing at one
-                // (GetNPCIfCanInteractWith above), with its sickness and durability loss; only the
-                // handler's teleport is left out.
+                // (GetNPCIfCanInteractWith above); only the handler's teleport is left out. The
+                // `true` is ResurrectPlayer's applySickness, so the sickness stands, and the
+                // durability loss is the DurabilityLossAll just below, as in the handler.
                 bot->ResurrectPlayer(0.5f, true);
                 float const durabilityLoss =
                     sWorld->getRate(RATE_DURABILITY_LOSS_ON_SPIRIT_RESURRECT) / 100.0f;
