@@ -45307,6 +45307,11 @@ private:
     {
         if (!run.head.empty())
             _travelAims.Release(run.head);
+        run.stoneRowSource.clear();
+        run.stoneRowTarget.clear();
+        run.stoneRowClicker.clear();
+        run.stoneRowEntry = 0;
+        run.stoneRowSince = 0;
         Player* head = run.head.empty() ? nullptr : ObjectAccessor::FindPlayerByName(run.head);
         Group* group = head ? head->GetGroup() : nullptr;
         if (group && run.groupId && group->GetGUID().GetRawValue() == run.groupId &&
@@ -45461,7 +45466,7 @@ private:
             run.stoneRowEntry = 0;
             run.stoneRowSince = 0;
         }
-        if (!mayAsk)
+        if (!mayAsk || !group || !group->isRaidGroup())
             return;
 
         std::vector<OverseerDecisions::RaidStone> facts;
@@ -46570,11 +46575,12 @@ private:
                 }
             }
 
-            // A row already in flight still has its verdict read after the run
-            // has left ASSEMBLE; only a new summon waits on the step.
-            if ((step.summonStragglers || !run.stoneRowSource.empty()) && group &&
-                group->isRaidGroup())
-                DriveRaidStoneSummon(roster.family, run, group, door, step.summonStragglers);
+            // A row already in flight still has its verdict read even if the
+            // group dissolved or is no longer a raid; only a new summon needs
+            // the raid group.
+            bool const maySummon = step.summonStragglers && group && group->isRaidGroup();
+            if (maySummon || !run.stoneRowSource.empty())
+                DriveRaidStoneSummon(roster.family, run, group, door, maySummon);
 
             WriteRaidTimeline(roster, run, door);
         }
