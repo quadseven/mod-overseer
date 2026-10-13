@@ -7121,6 +7121,114 @@ std::string GatheringCrossingBlocker(std::string const& leader, std::uint32_t le
            " minutes; the crossing last read '" + CrossingActionName(action) + "')";
 }
 
+// ------------------------- a crossing that makes no progress gives up (#926) --
+
+char const* CrossingAttemptEndWord(CrossingAttemptEnd end)
+{
+    switch (end)
+    {
+        case CrossingAttemptEnd::Overdue:
+            return "the crossing's own backstop ran out";
+        case CrossingAttemptEnd::GroundGiveUp:
+            return "the travel drive gave the berth walk up as unreachable";
+        case CrossingAttemptEnd::NoProgressBackoff:
+            return "the travel drive's no-progress backoff refused the berth aim";
+        case CrossingAttemptEnd::Refused:
+            return "the travel drive refused the berth aim";
+    }
+    return "the attempt ended";
+}
+
+void OpenCrossingAttempt(CrossingAttempts& record, std::string const& dungeon,
+                         std::string const& berth, float yards, std::int64_t now)
+{
+    if (record.dungeon != dungeon || record.berth != berth)
+    {
+        // A NEW QUESTION, NOT THE OLD ONE AGAIN. The cool-off belongs to the
+        // dungeon, so it survives only a change of berth.
+        std::int64_t const refusedUntil = record.dungeon == dungeon ? record.refusedUntil : 0;
+        record = CrossingAttempts{};
+        record.dungeon = dungeon;
+        record.berth = berth;
+        record.refusedUntil = refusedUntil;
+    }
+    if (!record.firstSeen)
+        record.firstSeen = now;
+    record.open = true;
+    if (yards < 0.f)
+        return;
+    if (record.reference < 0.f)
+        record.reference = yards;
+    if (record.best < 0.f || yards < record.best)
+        record.best = yards;
+}
+
+CrossingAttemptReading EndCrossingAttempt(CrossingAttempts& record, std::int64_t now,
+                                          CrossingAttemptLimits const& limits)
+{
+    CrossingAttemptReading reading;
+    reading.seconds = record.firstSeen ? now - record.firstSeen : 0;
+    reading.attempts = record.failed;
+    if (!record.open)
+        return reading;
+    record.open = false;
+    reading.counted = true;
+    reading.gained = record.reference >= 0.f && record.best >= 0.f
+                         ? record.reference - record.best
+                         : 0.f;
+
+    // AN ATTEMPT THAT GOT SOMEWHERE IS NOT A FAILURE TO GET ANYWHERE. A long
+    // walk can need more than one backstop, and each that ends nearer is
+    // worth another. The count starts again from where it got to.
+    if (reading.gained >= limits.gainYards)
+    {
+        record.failed = 0;
+        record.reference = record.best;
+        reading.attempts = 0;
+        return reading;
+    }
+
+    ++record.failed;
+    reading.attempts = record.failed;
+    if (record.failed < limits.attempts)
+        return reading;
+
+    reading.verdict = CrossingAttemptVerdict::GiveUp;
+    reading.cooloffSeconds = limits.cooloffSeconds;
+    record.refusedUntil = now + limits.cooloffSeconds;
+    record.failed = 0;
+    record.reference = -1.f;
+    record.best = -1.f;
+    record.firstSeen = 0;
+    return reading;
+}
+
+std::int64_t CrossingHandedBack(CrossingAttempts const& record, std::string const& dungeon,
+                                std::int64_t now)
+{
+    if (record.dungeon != dungeon || record.refusedUntil <= now)
+        return 0;
+    return record.refusedUntil - now;
+}
+
+CrossingBerthClaim ReadCrossingBerthClaim(std::int64_t sinceRefused,
+                                          std::int64_t refusalSeconds)
+{
+    return sinceRefused >= 0 && sinceRefused < refusalSeconds ? CrossingBerthClaim::StandBack
+                                                              : CrossingBerthClaim::Claim;
+}
+
+CrossingAttemptEnd CrossingRefusalEnd(std::string const& reason)
+{
+    return reason == NoProgressBackoffReason ? CrossingAttemptEnd::NoProgressBackoff
+                                             : CrossingAttemptEnd::Refused;
+}
+
+bool IsTravelGiveUpRelease(std::string const& why)
+{
+    return why == TravelBackstopReleaseReason || why == TravelGroundGiveUpReleaseReason;
+}
+
 DockReading ReadDock(std::uint32_t pathProgressMs, std::uint32_t periodMs,
                      std::vector<TransportStop> const& stops)
 {

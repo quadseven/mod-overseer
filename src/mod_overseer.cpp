@@ -1552,6 +1552,11 @@ constexpr uint32 CROSSING_STEP_POINT_ID = 0;
 // missing backstop. Half an hour is many boat periods and is short enough that
 // a family walking somewhere lethal is stopped the same evening.
 constexpr uint32 CROSSING_BACKSTOP_SECONDS = 1800;
+// HOW MANY OF THOSE, AND OF THE TRAVEL DRIVE'S OWN GIVE-UPS, A CROSSING TAKES
+// BEFORE IT HANDS THE DUNGEON BACK (#926). Two attempts in a row that got no
+// 100 yards nearer the berth, then two hours with the dungeon refused. See
+// OverseerDecisions::CrossingAttemptLimits.
+constexpr OverseerDecisions::CrossingAttemptLimits CROSSING_ATTEMPT_LIMITS{};
 // HOW LONG A LEADER WAITS AT A BERTH BEFORE HE GOES BACK FOR A HELD FOLLOWER
 // (#739). Five minutes, the run's own crossing backstop
 // (DUNGEON_CROSSING_BACKSTOP_SECONDS, declared further down): long enough for a
@@ -6265,9 +6270,13 @@ public:
         // reports how often; without this it could not say who took it, and a
         // run that re-arms seven times in ten minutes needs the second fact
         // more than the first. See LastEnd.
+        // AND WHICH AIM, UNDER A NUMBER OF ITS OWN (#926), so the crossing can
+        // tell its berth walk being given up from any other end, once each.
         _lastEnd[name] = ErrandEnd{why.empty() ? std::string("a release that did not name itself")
                                                : why,
-                                   false};
+                                   false,
+                                   claimedAim != _claimed.end() ? claimedAim->second : standing,
+                                   ++_endSerial};
         // A leader's column intent ends with its errand, completed or failed
         // by what the release says; nothing is ended for anybody else.
         EndLeaderColumnIntent(name, why.empty() ? std::string("a release") : why);
@@ -6454,6 +6463,10 @@ public:
     {
         std::string why;
         bool outside{false};
+        // The aim that ended and which end this was; empty and zero for an
+        // end not recorded by a release.
+        std::string target;
+        std::uint64_t serial{0};
     };
     ErrandEnd LastEnd(std::string const& name) const
     {
@@ -6743,6 +6756,7 @@ private:
     // What ended each character's last errand; see LastEnd. Never erased: one
     // short string per roster character, overwritten by the next ending.
     std::map<std::string, ErrandEnd> _lastEnd;
+    std::uint64_t _endSerial{0};
     // An aim this book was driving, let go of, and left standing in the column
     // because it was not this book's to erase (#558). Written by Release and
     // MarkCounterLanding, erased by Claim, Release, PruneVanished and
@@ -25545,7 +25559,7 @@ private:
                                  name, TRAVEL_STUCK_BACKOFF_RELEASES, target,
                                  static_cast<uint32>(TRAVEL_STUCK_BACKOFF_SECONDS / 60));
                         _travelAims.Refuse(name, target,
-                                           "repeated no-progress releases; bounded backoff is active");
+                                           OverseerDecisions::NoProgressBackoffReason);
                     }
                     LOG_WARN("module.overseer",
                              "overseer: '{}' was sent to '{}' and in {}s got no {} yards nearer, no further along its route and covered under {} yards of ground - releasing the errand, on the ground where it stands",
@@ -25583,7 +25597,7 @@ private:
                          "{} yards for {} minutes - releasing the errand as unreachable",
                          name, target, static_cast<uint32>(state.progress.best),
                          static_cast<uint32>(backstop / 60));
-                _travelAims.Release(name, "the travel drive (travel backstop: no nearer for minutes)");
+                _travelAims.Release(name, OverseerDecisions::TravelBackstopReleaseReason);
                 continue;
             }
 
@@ -25712,7 +25726,7 @@ private:
                              "overseer: '{}' was sent to '{}' and has been refused every "
                              "bearing for {} polls running without getting any nearer - releasing the errand as unreachable",
                              name, target, refusal.consecutive);
-                    _travelAims.Release(name, "the travel drive (every bearing refused, ground give-up)");
+                    _travelAims.Release(name, OverseerDecisions::TravelGroundGiveUpReleaseReason);
                     // A stranded member whose walk to its berth gives up here
                     // may hearth out of it instead (DecideStrandedWay, rule 6b).
                     _strandedGroundGiveUp[name] = std::time(nullptr);
@@ -32334,6 +32348,19 @@ private:
     // row, staging point, members, clocks and evacuation here, and nothing in
     // one entry is read or written on behalf of another family.
     std::map<std::string, DungeonRunCoordinatorState> _dungeonRunCoordinators;
+    // EACH LEADER'S CROSSING ATTEMPTS (#926), kept apart from the coordinator
+    // because a coordinator's crossing memo is dropped on a refusal and the
+    // whole state is replaced when a run opens, and the count has to outlive
+    // both. `endSeen` is the last errand end read off the travel book, so each
+    // is read once; `saidHandedBack` rations the cool-off's line.
+    struct CrossingAttemptBook
+    {
+        OverseerDecisions::CrossingAttempts record;
+        std::uint64_t endSeen{0};
+        bool saidHandedBack{false};
+        bool saidStandBack{false};
+    };
+    std::map<std::string, CrossingAttemptBook> _crossingAttempts;
 
     // WHERE EACH ROSTER MEMBER'S FAMILY RUN STANDS, for the drives that must
     // yield to it (#631). Rebuilt on every DriveDungeonRun from the
@@ -41596,6 +41623,62 @@ private:
                     break;
                 }
 
+                // THE TRAVEL DRIVE GAVE THE LAST WALK UP (#926). Read once per
+                // end, and only an end of this berth aim counts.
+                CrossingAttemptBook& attempts = _crossingAttempts[leaderName];
+                {
+                    TravelAimBook::ErrandEnd const ended = _travelAims.LastEnd(leaderName);
+                    if (ended.serial != attempts.endSeen)
+                    {
+                        attempts.endSeen = ended.serial;
+                        if (ended.target == aimText &&
+                            OverseerDecisions::IsTravelGiveUpRelease(ended.why) &&
+                            CrossingAttemptEnded(coord, leaderName, leader, portal,
+                                               OverseerDecisions::CrossingAttemptEnd::GroundGiveUp))
+                            break;
+                    }
+                }
+
+                // NOTHING IS CLAIMED WHILE THE TRAVEL DRIVE REFUSES THE AIM
+                // (#926). A claim would be released again by the refusal on
+                // the travel drive's next poll, every poll, for the whole of
+                // it: measured, 131 times in 12 minutes. The refusal is the
+                // end of this attempt, and the crossing's clock stops with it:
+                // the column is not the crossing's while it stands back, and a
+                // backstop firing then would release whatever the family's own
+                // drives put there. The next claim opens the next attempt.
+                {
+                    int64 const refusalSeconds = OverseerDecisions::ErrandCooloffSeconds(
+                        _travelAims.LethalStrikes(leaderName, aimText), ERRAND_DEATH_LIMITS);
+                    int64 const sinceRefused = _travelAims.SecondsSinceRefused(leaderName, aimText);
+                    if (OverseerDecisions::ReadCrossingBerthClaim(sinceRefused, refusalSeconds) ==
+                        OverseerDecisions::CrossingBerthClaim::StandBack)
+                    {
+                        // Read once: the reason both picks how the attempt
+                        // ended and is named in the stand-back line below.
+                        std::string const refused = _travelAims.RefusedReason(leaderName);
+                        if (CrossingAttemptEnded(coord, leaderName, leader, portal,
+                                                 OverseerDecisions::CrossingRefusalEnd(refused)))
+                            break;
+                        coord.crossingSince = 0;
+                        if (!attempts.saidStandBack)
+                        {
+                            attempts.saidStandBack = true;
+                            LOG_INFO("module.overseer",
+                                     "overseer: the crossing for '{}' claims nothing for '{}' "
+                                     "for another {}s - the travel drive refuses the berth aim "
+                                     "for '{}' ({}). {} of {} attempt(s) have failed without "
+                                     "getting {:.0f} yards nearer",
+                                     portal.keyword, leaderName, refusalSeconds - sinceRefused,
+                                     boat, refused, attempts.record.failed,
+                                     CROSSING_ATTEMPT_LIMITS.attempts,
+                                     CROSSING_ATTEMPT_LIMITS.gainYards);
+                        }
+                        break;
+                    }
+                    attempts.saidStandBack = false;
+                }
+
                 // THE CLOCK STARTS WITH THE FIRST STEP TAKEN, not with the first
                 // poll that noticed the family was split. A crossing that is
                 // only ever refused never starts a backstop, because there is
@@ -41603,7 +41686,15 @@ private:
                 if (!coord.crossingSince)
                     coord.crossingSince = std::time(nullptr);
 
-                _travelAims.Claim(leaderName, aimText, OverseerDecisions::TravelOwner::Run);
+                // AN ATTEMPT IS WHAT A CLAIM OPENS, with the nearest the leader
+                // has been to the berth kept against it (#926).
+                if (_travelAims.Claim(leaderName, aimText, OverseerDecisions::TravelOwner::Run))
+                    OverseerDecisions::OpenCrossingAttempt(
+                        attempts.record, portal.keyword, aimText,
+                        leader && leader->GetMapId() == route.world.originMap
+                            ? leader->GetExactDist2d(route.berthX, route.berthY)
+                            : -1.f,
+                        std::time(nullptr));
                 if (fresh)
                     LOG_INFO("module.overseer",
                              "overseer: '{}' is sent to the berth for '{}' at ({:.1f}, "
@@ -41717,6 +41808,7 @@ private:
                 if (fresh)
                 {
                     _travelAims.Release(leaderName, "the dungeon run coordinator");
+                    ForgetCrossingAttempts(leaderName, portal);
                     LOG_INFO("module.overseer",
                              "overseer: the leader '{}' is aboard '{}' between maps {} "
                              "and {} - {}",
@@ -41765,6 +41857,7 @@ private:
                 coord.crossingRouteEntry = 0;
                 coord.crossingMooringKnown = false;
                 coord.crossingTransportName.clear();
+                ForgetCrossingAttempts(leaderName, portal);
                 break;
 
             case OverseerDecisions::CrossingAction::Wait:
@@ -41890,6 +41983,13 @@ private:
                     coord.crossingSince = 0;
                 }
                 releaseTheLeader("the crossing is refused");
+                // THE BACKSTOP ENDS AN ATTEMPT AND DOES NOT END THE COUNT
+                // (#926). Zeroing the clock above used to be all of it, and the
+                // next poll walked again with a fresh half hour.
+                if (route.world.overdue &&
+                    CrossingAttemptEnded(coord, leaderName, leader, portal,
+                                       OverseerDecisions::CrossingAttemptEnd::Overdue))
+                    break;
                 if (!coord.loggedApproachRefused)
                 {
                     coord.loggedApproachRefused = true;
@@ -41923,6 +42023,76 @@ private:
         }
     }
 
+    // AN ATTEMPT AT THE BERTH ENDED (#926): counted, and when it is the last
+    // of the ones allowed, the dungeon is handed back. True when it was, in
+    // which case the berth aim and the crossing's hold are let go and its
+    // clock is stopped, and the caller does nothing further this poll.
+    bool CrossingAttemptEnded(DungeonRunCoordinatorState& coord, std::string const& leaderName,
+                              Player* leader, DungeonPortal const& portal,
+                              OverseerDecisions::CrossingAttemptEnd end)
+    {
+        CrossingAttemptBook& attempts = _crossingAttempts[leaderName];
+        std::string const berth = attempts.record.berth;
+        OverseerDecisions::CrossingAttemptReading const reading =
+            OverseerDecisions::EndCrossingAttempt(attempts.record, std::time(nullptr),
+                                                  CROSSING_ATTEMPT_LIMITS);
+        if (!reading.counted)
+            return false;
+        if (reading.verdict != OverseerDecisions::CrossingAttemptVerdict::GiveUp)
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: the crossing for '{}' counts a failed attempt for '{}' at "
+                     "'{}' - {}; {:.0f} yards gained, {} of {} attempt(s) failed without "
+                     "getting {:.0f} yards nearer",
+                     portal.keyword, leaderName, berth,
+                     OverseerDecisions::CrossingAttemptEndWord(end), reading.gained,
+                     reading.attempts, CROSSING_ATTEMPT_LIMITS.attempts,
+                     CROSSING_ATTEMPT_LIMITS.gainYards);
+            return false;
+        }
+
+        // HANDED BACK. The aim is given back only while it is still the
+        // crossing's own, so an errand somebody else wrote is left alone.
+        if (_travelAims.RunOwns(leaderName, berth))
+            _travelAims.Release(leaderName, "the campaign crossing (gave up on the berth)");
+        auto const hold = HoldsInForce().find(leaderName);
+        if (hold != HoldsInForce().end() && hold->second.verb == CROSSING_HOLD_VERB)
+            ReleaseHold(leaderName, leader, "the crossing gave up", CROSSING_HOLD_VERB);
+        coord.crossingSince = 0;
+        coord.crossingSaid = 255;
+        attempts.saidHandedBack = false;
+        attempts.saidStandBack = false;
+
+        std::string const detail =
+            std::to_string(reading.attempts) + " attempts at " + berth + " over " +
+            std::to_string(reading.seconds / 60) + " minutes, " +
+            std::to_string(static_cast<int32>(reading.gained)) + " yards gained; last: " +
+            OverseerDecisions::CrossingAttemptEndWord(end);
+        LOG_WARN("module.overseer",
+                 "overseer: the crossing for '{}' gave up after {} attempts - '{}' was sent "
+                 "to the berth '{}' and got {:.0f} yards nearer in {} minutes, under the "
+                 "{:.0f} yards each attempt needs; the last ended because {}. '{}' is "
+                 "handed back for {} minutes and the family returns to its own drives. The "
+                 "campaign stays on",
+                 portal.keyword, reading.attempts, leaderName, berth, reading.gained,
+                 static_cast<uint32>(reading.seconds / 60), CROSSING_ATTEMPT_LIMITS.gainYards,
+                 OverseerDecisions::CrossingAttemptEndWord(end), portal.keyword,
+                 static_cast<uint32>(reading.cooloffSeconds / 60));
+        RecordEvent(leader, "crossing_gave_up", portal.insideMapId, portal.keyword, detail);
+        return true;
+    }
+
+    // A crossing that got the leader aboard has made its progress, so its
+    // failed attempts are forgotten. A cool-off still running is not.
+    void ForgetCrossingAttempts(std::string const& leaderName, DungeonPortal const& portal)
+    {
+        auto const it = _crossingAttempts.find(leaderName);
+        if (it != _crossingAttempts.end() &&
+            !OverseerDecisions::CrossingHandedBack(it->second.record, portal.keyword,
+                                                   std::time(nullptr)))
+            _crossingAttempts.erase(it);
+    }
+
     // THE CAMPAIGN'S CROSSING FOR ONE POLL, READ OFF THE WORLD AND DRIVEN
     // (#241): for IDLE before a run opens, and for GATHERING when a run under
     // way finds its family on the wrong continent (2026-10-09). The goal on the
@@ -41936,6 +42106,32 @@ private:
                                std::string const& leaderJob, DungeonPortal const& portal,
                                uint32 crossingOrigin, OverseerDecisions::CrossingStep& step)
     {
+        // A DUNGEON THE CROSSING HANDED BACK IS NOT CROSSED TOWARD (#926). The
+        // answer is a refusal nobody drives: nothing is aimed, held, hearthed
+        // or released, so the family is on its own drives and the leader's
+        // intent book hears nothing from this until the cool-off ends.
+        auto const attempts = _crossingAttempts.find(leaderName);
+        if (attempts != _crossingAttempts.end())
+        {
+            int64 const left = OverseerDecisions::CrossingHandedBack(
+                attempts->second.record, portal.keyword, std::time(nullptr));
+            if (left > 0)
+            {
+                if (!attempts->second.saidHandedBack)
+                {
+                    attempts->second.saidHandedBack = true;
+                    LOG_INFO("module.overseer",
+                             "overseer: the next dungeon run for '{}' waits - the crossing for "
+                             "'{}' gave up and it is handed back for another {} minutes. "
+                             "Nothing crosses toward it until then",
+                             leaderName, portal.keyword, static_cast<uint32>(left / 60));
+                }
+                step = OverseerDecisions::CrossingStep{};
+                step.action = OverseerDecisions::CrossingAction::Refuse;
+                return true;
+            }
+        }
+
         AreaTrigger const* door = sObjectMgr->GetAreaTrigger(portal.entryTriggerId);
         CrossingRoute route = ReadCrossingFromWorld(
             coord, members, leaderName, leader, crossingOrigin, portal.outsideMapId,
