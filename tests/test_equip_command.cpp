@@ -42,6 +42,10 @@ int main()
     Check("largest uint32 entry parses", ParseEquipCommand("e Hitem:4294967295:0", parsed) && parsed.entry == 4294967295u, true);
     Check("entry past uint32 is rejected", ParseEquipCommand("e Hitem:4294967296:0", parsed), false);
     Check("trailing command text is rejected", ParseEquipCommand("e Hitem:15211 junk", parsed), false);
+    Check("bare link without entry is rejected", ParseEquipCommand("e Hitem", parsed), false);
+    Check("trailing bare colon is rejected", ParseEquipCommand("e Hitem:15211:", parsed), false);
+    Check("empty middle suffix field is rejected", ParseEquipCommand("e Hitem:15211::0", parsed), false);
+    Check("multi-field link suffix parses", ParseEquipCommand("e Hitem:15211:0:0:0", parsed) && parsed.entry == 15211, true);
 
     EquipRefusal refusal = EquipRefused("EQUIP_ERR_CANT_EQUIP 29");
     CheckText("core refusal is terminal error", refusal.status, "error");

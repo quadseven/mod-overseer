@@ -38,10 +38,19 @@ bool ParseEquipCommand(std::string const& command, EquipCommand& out)
     if (end < command.size())
     {
         // Hyperlink suffixes are numeric item fields only; reject a second
-        // link, whitespace, or arbitrary trailing command text.
+        // link, whitespace, or arbitrary trailing command text. Every field
+        // holds at least one digit, so a bare trailing or doubled colon
+        // (`e Hitem:15211:`) is a malformed link too.
         for (std::string::size_type i = end; i < command.size(); ++i)
-            if ((command[i] < '0' || command[i] > '9') && command[i] != ':')
+        {
+            if (command[i] == ':')
+            {
+                if (i + 1 == command.size() || command[i + 1] == ':')
+                    return false;
+            }
+            else if (command[i] < '0' || command[i] > '9')
                 return false;
+        }
     }
     try
     {
