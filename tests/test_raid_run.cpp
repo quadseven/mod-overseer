@@ -556,6 +556,53 @@ void ARaidMapIsNotArmedUntilClearingIsOrdered()
     Check("a raid map with a clearing order does", DungeonClearMayArmHere(true, true));
 }
 
+void TheInFlightSummonVerdictIsReadIndependentOfGroup()
+{
+    std::ifstream in("src/mod_overseer.cpp");
+    std::stringstream text;
+    text << in.rdbuf();
+    std::string const source = text.str();
+    if (source.empty())
+    {
+        std::printf("FAIL could not read src/mod_overseer.cpp (run from the repo root)\n");
+        ++failures;
+        return;
+    }
+
+    std::size_t const relAt = source.find("bool ReleaseRaidRun(");
+    Check("ReleaseRaidRun exists", relAt != std::string::npos);
+    std::size_t const relEnd =
+        relAt == std::string::npos ? relAt : source.find("return true;", relAt);
+    std::string const relBody =
+        relEnd == std::string::npos ? "" : source.substr(relAt, relEnd - relAt);
+    Check("ReleaseRaidRun clears in-flight stone summon state",
+          Has(relBody, "run.stoneRowSource.clear();") &&
+              Has(relBody, "run.stoneRowTarget.clear();"));
+
+    std::size_t const driveAt =
+        source.find("// A row already in flight still has its verdict read");
+    Check("DriveRaidStoneSummon dispatch block exists", driveAt != std::string::npos);
+    std::size_t const driveEnd =
+        driveAt == std::string::npos ? driveAt : source.find("WriteRaidTimeline(", driveAt);
+    std::string const driveBody =
+        driveEnd == std::string::npos ? "" : source.substr(driveAt, driveEnd - driveAt);
+    Check("in-flight summon row reading is not gated on group being a valid raid",
+          !Has(driveBody, "!run.stoneRowSource.empty()) && group && group->isRaidGroup()"));
+    Check("in-flight summon row is read even if group is not a raid group",
+          Has(driveBody, "maySummon || !run.stoneRowSource.empty()"));
+
+    std::size_t const summonAt = source.find("void DriveRaidStoneSummon(");
+    Check("DriveRaidStoneSummon exists", summonAt != std::string::npos);
+    std::size_t const summonEnd =
+        summonAt == std::string::npos
+            ? summonAt
+            : source.find("std::vector<OverseerDecisions::RaidStone> facts;", summonAt);
+    std::string const summonBody =
+        summonEnd == std::string::npos ? "" : source.substr(summonAt, summonEnd - summonAt);
+    Check("DriveRaidStoneSummon guards group before querying seats",
+          Has(summonBody, "if (!mayAsk || !group || !group->isRaidGroup())"));
+}
+
 }  // namespace
 
 int main()
@@ -578,6 +625,7 @@ int main()
     StragglersAreSummonedOnlyAfterTheWalk();
     AStragglerIsSummonedByASeatAtTheStone();
     TheStonesMinimumIsKeptForBothEnds();
+    TheInFlightSummonVerdictIsReadIndependentOfGroup();
 
     if (failures)
     {
