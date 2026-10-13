@@ -16525,6 +16525,16 @@ RaidPullRepairAction RaidPullRepairForSeats(unsigned bossesDone,
                                             unsigned floorPct, long heldSeconds,
                                             long maximumHoldSeconds);
 
+// What the run does for one seat during the repair hold before Majordomo or
+// Ragnaros: a seat at or above the floor is Ready; once the hold has timed out
+// a seat under it is left as TimedOut; a seat already sent through the repair
+// verb is not charged twice (Attempted); otherwise it Walks to a repairer, or
+// Repairs when one is in reach. Every step but Ready and TimedOut holds the pull.
+enum class RaidPullSeatStep { Ready, TimedOut, Attempted, Walk, Repair };
+RaidPullSeatStep RaidPullSeatRepairStep(unsigned lowestDurabilityPct, unsigned floorPct,
+                                        bool holdTimedOut, bool alreadyAttempted,
+                                        bool repairerInReach);
+
 // One poll of the raid run.
 //
 // THE ORDER OF THE CHECKS IS THE ORDER OF THE THINGS THAT OVERRIDE EACH OTHER.

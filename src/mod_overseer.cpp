@@ -46135,9 +46135,12 @@ private:
                     run.repairBrainPaused = false;
                     run.repairHoldRefusedAt = 0;
                 }
+                // One clock read per poll, so the per-seat timeout below and the
+                // hold decision after the loop can never disagree across a
+                // second boundary.
+                long const heldNow = long(std::time(nullptr) - run.repairHoldSince);
                 repairHoldTimedOut = OverseerDecisions::RaidPullRepairDecision(
-                                         bossesDone, true,
-                                         long(std::time(nullptr) - run.repairHoldSince), 300) ==
+                                         bossesDone, true, heldNow, 300) ==
                                      OverseerDecisions::RaidPullRepairAction::TimedOut;
                 std::vector<unsigned> seatPcts;
                 for (auto const& [name, subgroup] : seats)
@@ -46148,17 +46151,23 @@ private:
                         continue;
                     uint32 const pct = LowestDurabilityPct(member);
                     seatPcts.push_back(pct);
-                    if (!OverseerDecisions::RaidSeatNeedsRepair(pct, repairFloor))
-                        continue;
-                    if (repairHoldTimedOut)
+                    bool const attempted = run.repairAttempted.count(name) > 0;
+                    auto step = OverseerDecisions::RaidPullSeatRepairStep(
+                        pct, repairFloor, repairHoldTimedOut, attempted, false);
+                    if (step == OverseerDecisions::RaidPullSeatStep::Ready ||
+                        step == OverseerDecisions::RaidPullSeatStep::TimedOut)
                         continue;
                     repairHold = true;
-                    if (run.repairAttempted.count(name))
+                    if (step == OverseerDecisions::RaidPullSeatStep::Attempted)
                         continue;
+                    // The repairer sweep runs only for a seat still owed the repair verb.
                     bool oneIsNearby = false;
                     float nearestYards = -1.f;
-                    if (!CounterInReach(member, OverseerDecisions::CounterRole::Repairer,
-                                        oneIsNearby, nearestYards))
+                    step = OverseerDecisions::RaidPullSeatRepairStep(
+                        pct, repairFloor, repairHoldTimedOut, attempted,
+                        CounterInReach(member, OverseerDecisions::CounterRole::Repairer,
+                                       oneIsNearby, nearestYards));
+                    if (step == OverseerDecisions::RaidPullSeatStep::Walk)
                     {
                         _travelAims.Claim(name, "repair", OverseerDecisions::TravelOwner::Run);
                         if (run.repairWalkSaid.insert(name).second)
@@ -46184,8 +46193,7 @@ private:
                                  answer ? answer : "repair was partial or unaffordable");
                 }
                 auto const action = OverseerDecisions::RaidPullRepairForSeats(
-                    bossesDone, seatPcts, repairFloor,
-                    long(std::time(nullptr) - run.repairHoldSince), 300);
+                    bossesDone, seatPcts, repairFloor, heldNow, 300);
                 if (!run.repairHoldDecisionSaid &&
                     action != OverseerDecisions::RaidPullRepairAction::Hold)
                 {

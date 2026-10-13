@@ -13550,6 +13550,19 @@ RaidPullRepairAction RaidPullRepairForSeats(unsigned bossesDone,
     return RaidPullRepairDecision(bossesDone, anyBelow, heldSeconds, maximumHoldSeconds);
 }
 
+RaidPullSeatStep RaidPullSeatRepairStep(unsigned lowestDurabilityPct, unsigned floorPct,
+                                        bool holdTimedOut, bool alreadyAttempted,
+                                        bool repairerInReach)
+{
+    if (!RaidSeatNeedsRepair(lowestDurabilityPct, floorPct))
+        return RaidPullSeatStep::Ready;
+    if (holdTimedOut)
+        return RaidPullSeatStep::TimedOut;
+    if (alreadyAttempted)
+        return RaidPullSeatStep::Attempted;
+    return repairerInReach ? RaidPullSeatStep::Repair : RaidPullSeatStep::Walk;
+}
+
 bool RaidGhostMayBeWalked(long ghostSeconds)
 {
     return ghostSeconds < RAID_RUNBACK_WAIT_SECONDS;
