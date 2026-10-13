@@ -16619,6 +16619,27 @@ uint32_t KillerAtCorpse(CreatureKillMark const& mark, uint32_t mapId, float corp
     return dx * dx + dy * dy <= radius * radius ? mark.entry : 0;
 }
 
+PlaceDanger JudgePlaceDanger(PlaceDangerFacts const& facts)
+{
+    PlaceDanger danger;
+    for (std::size_t i = 0; i < facts.hostiles.size(); ++i)
+    {
+        PlaceHostile const& h = facts.hostiles[i];
+        if (!CorpseThreat(h.level, facts.memberLevel, h.entry, facts.killerEntry))
+            continue;
+        if (!danger.threats++ || h.level > danger.strongest)
+        {
+            danger.strongest = h.level;
+            danger.strongestAt = i;
+        }
+    }
+    if (danger.threats)
+        danger.reason = PlaceDangerReason::Hostiles;
+    else if (facts.repeatDeaths && facts.deathsNear >= facts.repeatDeaths)
+        danger.reason = PlaceDangerReason::RepeatDeaths;
+    return danger;
+}
+
 char const* GhostRecoveryWord(GhostRecovery choice)
 {
     switch (choice)

@@ -19352,6 +19352,52 @@ struct CreatureKillMark
 uint32_t KillerAtCorpse(CreatureKillMark const& mark, uint32_t mapId, float corpseX,
                         float corpseY, float radius, int64_t now, int64_t maxAgeSeconds);
 
+// ONE DANGER TEST FOR A CORPSE AND A GRAVEYARD (mod-overseer#933). The
+// graveyard safety test counted hostile spawns ABOVE the member's level, while
+// the repeat-death line near a corpse counted hostiles AT or above it, or of its
+// killer's kind, and its own repeat deaths. On wow-dev 2026-10-12, 15 Horde
+// guild members at levels 26 and 27 died 355 times in 24 hours to Hillsbrad
+// Footmen (level 26) within 25 yards of the Hillsbrad Fields graveyard: for a
+// level 26 ghost no footman is above it, so the graveyard passed as safe and the
+// repeat-death rung sent the ghost to the healer there. Both now ask this one
+// function, so the two tests cannot drift apart again.
+//
+// `hostiles` are the creatures hostile to the member and able to fight it near
+// the place (live grid or spawn table, the caller's choice). One counts when
+// CorpseThreat counts it. `deathsNear` is the member's own deaths within the
+// repeat radius of the place inside the repeat window.
+struct PlaceHostile
+{
+    uint32_t level{0};
+    uint32_t entry{0};
+};
+
+struct PlaceDangerFacts
+{
+    uint32_t memberLevel{0};
+    uint32_t killerEntry{0};  // the kind that killed it, 0 when none is known
+    std::vector<PlaceHostile> hostiles;
+    unsigned deathsNear{0};
+    unsigned repeatDeaths{2};  // the ghost recovery's own death loop count
+};
+
+enum class PlaceDangerReason : uint8_t
+{
+    Safe,
+    Hostiles,      // a hostile at or above its level, or of its killer's kind
+    RepeatDeaths,  // it has died here `repeatDeaths` times inside the window
+};
+
+struct PlaceDanger
+{
+    PlaceDangerReason reason{PlaceDangerReason::Safe};
+    unsigned threats{0};        // hostiles CorpseThreat counts
+    uint32_t strongest{0};      // the highest level among them, 0 for none
+    std::size_t strongestAt{0}; // its index in `hostiles`, meaningful when threats
+};
+
+PlaceDanger JudgePlaceDanger(PlaceDangerFacts const& facts);
+
 // A GUILD MEMBER THAT MAY NOT USE THE LADDER STILL LEAVES A DEATH LOOP. When the
 // ghost decision answers Ladder (the spirit healer's graveyard failed its safety
 // test) for a caller that does not run the stuck-revival ladder, the old
