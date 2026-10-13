@@ -11264,7 +11264,9 @@ enum class HearthVerb
     // home, had no stone and no way to buy one, and no walk can climb 266 yards.
     // Same spell, cast time, cooldown, interrupts and destination as the item
     // (the character's own bind point); refused for a character that carries a
-    // stone, which must use it.
+    // stone, which must use it. PARSED BUT REFUSED by the executor since
+    // 2026-10-12 (natural only): a stone's spell without the stone is not
+    // something a player can cast.
     Recall,
 };
 
@@ -21302,33 +21304,6 @@ bool GuildRunStrayExpired(std::int64_t expiry, std::int64_t now);
 constexpr unsigned RUN_CLOSE_STARTUP_HOLD_SECONDS = 10 * 60;
 bool RunCloseHeldAfterStartup(std::int64_t secondsSinceStart);
 
-// ------------------------- what a level-up hands the roster (the operator) --
-//
-// TrainRoster runs on every level change of a roster character. With factory
-// grants ON (the default, and the module's behaviour before this switch) it
-// hands out, with no trainer and no gold:
-//
-//   - skills: every weapon skill of the class at level x 5, and the riding
-//     ranks at 20, 40 and 60 (PlayerbotFactory::InitSkills);
-//   - class spells: the class's spells (InitClassSpells);
-//   - trainer spells: every rank any trainer in the world would teach
-//     (InitAvailableSpells), with the first rank of a primary profession held
-//     shut.
-//
-// Overseer.Train.Factory = 0 turns all three off. The family then
-// learns only at a real trainer and pays for it (the training stop walks it
-// there), and gains weapon skill by using the weapon. Talent points are still
-// spent, because a character earns them by levelling.
-struct RosterTraining
-{
-    bool skills{false};
-    bool classSpells{false};
-    bool trainerSpells{false};
-    bool talents{false};
-};
-
-RosterTraining RosterTrainingFor(bool factoryGrants);
-
 // ------------------------------------------------------------------ keep --
 //
 // AN ITEM A CHARACTER MUST KEEP, whatever else wants it (overseer_keep). The
@@ -21505,7 +21480,7 @@ struct NaturalizeFacts
     unsigned openBids{0};            // auctions it holds the high bid on
     unsigned codMail{0};             // COD mail waiting in its inbox
     bool playerbotsGateCovers{false};// AiPlayerbot.NaturalGuild names its guild
-    bool trainFactoryOn{true};       // Overseer.Train.Factory
+    bool trainFactoryOn{true};       // retired Overseer.Train.Factory; the adapter says false
     unsigned partsAlreadyDone{0};    // ledger bits already recorded for it
     unsigned level{0};               // its level now
 };
@@ -22072,6 +22047,17 @@ bool CommandSourceIsOperator(std::string const& source);
 // command may run.
 std::string LeaderCommandRefusal(bool isFamilyLeader, std::string const& source,
                                  std::string const& command);
+
+// NATURAL ONLY (the operator, 2026-10-12): a member gains nothing it could not
+// earn. A bridge row with no kind of its own is handed to mod-playerbots as a
+// whisper, verbatim, and several of its verbs hand a bot things out of thin
+// air: `maintenance` (bags, ammo, food, reagents, potions, spells, mounts,
+// glyphs, enchants), `autogear` (gear created for its level), `cheat` (gold,
+// taxi, health, mana and cooldown cheats), `summon` (a teleport to whoever
+// asked), and the factory's `init` and `levelup`. Refused for every source,
+// the operator's own included, because no member may have them at all.
+// Returns the refusal reason, empty when the command may run.
+std::string GrantingBotCommandRefusal(std::string const& command);
 
 // ------------------------------------------------------------------------
 // AN ERRAND IS STUCK ONLY WHEN IT HAS STOPPED GETTING ANYWHERE FOR A WINDOW.
@@ -23188,6 +23174,22 @@ bool RowLiftsDeckSettle(std::string const& kind);
 // May a walk row take this hold over rather than be refused by it, the way it
 // replaces its own linger? True for the settle on the deck.
 bool HoldYieldsToWalk(std::string const& holdVerb);
+
+// WHICH ROWS A LOGOUT MARKS OFFLINE. The core's logout clears the online flag
+// for every character on the leaving character's ACCOUNT. Under playerbots
+// many characters on one account are in the world at once, so one bot's logout
+// marked always-online guild members offline until their next save, 15 minutes
+// later (wow-overseer#874: 42 characters in the world read online 0 on the dev
+// realm). A logout with account-mates still in the world clears only its own
+// character; a lone session keeps the core's account-wide statement.
+// `otherInWorldOnAccount` counts the in-world players on the same account,
+// the leaving one excluded.
+enum class LogoutScope
+{
+    Account,
+    CharacterOnly,
+};
+LogoutScope LogoutOfflineScope(uint32_t otherInWorldOnAccount);
 
 }  // namespace OverseerDecisions
 

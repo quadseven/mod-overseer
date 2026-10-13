@@ -18412,16 +18412,6 @@ unsigned GuildRunCeilingSeconds(bool finderEndsDungeon, unsigned bossesExpected)
     return std::max(GUILD_RUN_CEILING_SECONDS, bossesExpected * GUILD_RUN_SECONDS_PER_BOSS);
 }
 
-RosterTraining RosterTrainingFor(bool factoryGrants)
-{
-    RosterTraining training;
-    training.skills = factoryGrants;
-    training.classSpells = factoryGrants;
-    training.trainerSpells = factoryGrants;
-    training.talents = true;
-    return training;
-}
-
 // ------------------------------------------------------------------ keep --
 
 bool KeepReservationCovers(KeepReservation const& r, std::string const& character, unsigned itemEntry,
@@ -19560,6 +19550,19 @@ std::string LeaderCommandRefusal(bool isFamilyLeader, std::string const& source,
             start = comma + 1;
         }
     }
+    return std::string();
+}
+
+std::string GrantingBotCommandRefusal(std::string const& command)
+{
+    std::string const verb = LowerTrimmed(command);
+    std::string const first = verb.substr(0, verb.find_first_of(" =\t"));
+    static char const* const granting[] = {"maintenance", "autogear", "cheat", "summon", "init",
+                                           "levelup"};
+    for (char const* word : granting)
+        if (first == word)
+            return "`" + first + "` hands a bot what a player would have to earn, and a member "
+                   "gains nothing it did not earn";
     return std::string();
 }
 
@@ -21028,6 +21031,12 @@ bool RowLiftsDeckSettle(std::string const& kind)
 bool HoldYieldsToWalk(std::string const& holdVerb)
 {
     return holdVerb == DECK_SETTLE_HOLD_VERB;
+}
+
+LogoutScope LogoutOfflineScope(uint32_t otherInWorldOnAccount)
+{
+    return otherInWorldOnAccount == 0 ? LogoutScope::Account
+                                      : LogoutScope::CharacterOnly;
 }
 
 }  // namespace OverseerDecisions
