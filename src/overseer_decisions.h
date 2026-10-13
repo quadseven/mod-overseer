@@ -16533,6 +16533,30 @@ bool RaidWiped(RaidRunFacts const& facts);
 // measurement; callers pass the already-computed lowest percentage.
 bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct);
 
+enum class RaidPullRepairAction { Ignore, Hold, Resume, TimedOut };
+
+// The Molten Core repair gate is only before Majordomo Executus and Ragnaros.
+RaidPullRepairAction RaidPullRepairDecision(unsigned bossesDone, bool anySeatBelowFloor,
+                                            long heldSeconds, long maximumHoldSeconds);
+
+// The same gate fed with each readable seat's lowest durability percentage, as
+// the run sees them: any seat under the floor holds, and the time limit ends
+// the hold with TimedOut (not Resume) so the run can log which one it was.
+RaidPullRepairAction RaidPullRepairForSeats(unsigned bossesDone,
+                                            std::vector<unsigned> const& seatLowestPcts,
+                                            unsigned floorPct, long heldSeconds,
+                                            long maximumHoldSeconds);
+
+// What the run does for one seat during the repair hold before Majordomo or
+// Ragnaros: a seat at or above the floor is Ready; once the hold has timed out
+// a seat under it is left as TimedOut; a seat already sent through the repair
+// verb is not charged twice (Attempted); otherwise it Walks to a repairer, or
+// Repairs when one is in reach. Every step but Ready and TimedOut holds the pull.
+enum class RaidPullSeatStep { Ready, TimedOut, Attempted, Walk, Repair };
+RaidPullSeatStep RaidPullSeatRepairStep(unsigned lowestDurabilityPct, unsigned floorPct,
+                                        bool holdTimedOut, bool alreadyAttempted,
+                                        bool repairerInReach);
+
 // One poll of the raid run.
 //
 // THE ORDER OF THE CHECKS IS THE ORDER OF THE THINGS THAT OVERRIDE EACH OTHER.

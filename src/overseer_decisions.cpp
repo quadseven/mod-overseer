@@ -13587,6 +13587,44 @@ bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct)
     return lowestDurabilityPct < floorPct;
 }
 
+RaidPullRepairAction RaidPullRepairDecision(unsigned bossesDone, bool anySeatBelowFloor,
+                                           long heldSeconds, long maximumHoldSeconds)
+{
+    // Molten Core orders Majordomo Executus after the first eight bosses and
+    // Ragnaros after Majordomo.
+    if (bossesDone != 8 && bossesDone != 9)
+        return RaidPullRepairAction::Ignore;
+    if (!anySeatBelowFloor)
+        return RaidPullRepairAction::Resume;
+    return heldSeconds >= maximumHoldSeconds ? RaidPullRepairAction::TimedOut
+                                              : RaidPullRepairAction::Hold;
+}
+
+RaidPullRepairAction RaidPullRepairForSeats(unsigned bossesDone,
+                                            std::vector<unsigned> const& seatLowestPcts,
+                                            unsigned floorPct, long heldSeconds,
+                                            long maximumHoldSeconds)
+{
+    bool anyBelow = false;
+    for (unsigned const pct : seatLowestPcts)
+        if (RaidSeatNeedsRepair(pct, floorPct))
+            anyBelow = true;
+    return RaidPullRepairDecision(bossesDone, anyBelow, heldSeconds, maximumHoldSeconds);
+}
+
+RaidPullSeatStep RaidPullSeatRepairStep(unsigned lowestDurabilityPct, unsigned floorPct,
+                                        bool holdTimedOut, bool alreadyAttempted,
+                                        bool repairerInReach)
+{
+    if (!RaidSeatNeedsRepair(lowestDurabilityPct, floorPct))
+        return RaidPullSeatStep::Ready;
+    if (holdTimedOut)
+        return RaidPullSeatStep::TimedOut;
+    if (alreadyAttempted)
+        return RaidPullSeatStep::Attempted;
+    return repairerInReach ? RaidPullSeatStep::Repair : RaidPullSeatStep::Walk;
+}
+
 bool RaidGhostMayBeWalked(long ghostSeconds)
 {
     return ghostSeconds < RAID_RUNBACK_WAIT_SECONDS;
