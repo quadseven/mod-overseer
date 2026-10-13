@@ -52253,6 +52253,16 @@ private:
     // resolved within VERIFY_GRACE_MS.
     std::vector<StrategyCheck> _pendingChecks;
 
+    struct EquipCheck
+    {
+        uint32 id{0};
+        std::string targetName;
+        std::string command;
+        uint32 entry{0};
+        uint32 waitedMs{0};
+    };
+    std::vector<EquipCheck> _pendingEquipChecks;
+
     // What the drain has already said about its own health (mod-overseer#230).
     // World thread only, like _pendingChecks beside it and for the same reason.
     OverseerDecisions::CommandQueueVoiceState _queueVoice;
@@ -52557,6 +52567,53 @@ private:
         _pendingChecks.swap(stillWaiting);
     }
 
+    void ResolveEquipChecks(uint32 elapsedMs)
+    {
+        std::vector<EquipCheck> waiting;
+        for (EquipCheck& check : _pendingEquipChecks)
+        {
+            check.waitedMs += elapsedMs;
+            Player* bot = ObjectAccessor::FindPlayerByName(check.targetName);
+            if (!bot)
+            {
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_command SET status = 'error', detail = '{}' "
+                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                    Esc("not in world"), check.id, g_runToken);
+                continue;
+            }
+            bool worn = false;
+            for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+                if (Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                    worn = worn || item->GetEntry() == check.entry;
+            if (!worn && check.waitedMs < VERIFY_GRACE_MS)
+            {
+                waiting.push_back(check);
+                continue;
+            }
+            OverseerDecisions::EquipRefusal const verdict =
+                OverseerDecisions::EquipReadBack(worn);
+            std::string detail = verdict.detail;
+            if (!worn)
+            {
+                PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+                if (!botAI)
+                    detail += "; no AI";
+                else if (!bot->IsAlive())
+                    detail += "; dead";
+                else if (bot->IsInCombat())
+                    detail += "; in combat";
+                else if (bot->IsNonMeleeSpellCast(false))
+                    detail += "; casting";
+            }
+            CharacterDatabase.Execute(
+                "UPDATE overseer_command SET status = '{}', detail = '{}' "
+                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                verdict.status, Esc(detail), check.id, g_runToken);
+        }
+        _pendingEquipChecks.swap(waiting);
+    }
+
     // ONE COMMAND PER VERB PER CHARACTER PER POLL.
     //
     // WHAT WAS WRONG. The goal supervisor hands the party leader three orders
@@ -52612,6 +52669,7 @@ private:
         // can now be ended. First, so a `verifying` row never outlives its
         // answer by a whole poll.
         ResolveStrategyChecks(sincePollMs);
+        ResolveEquipChecks(sincePollMs);
 
         // ...and the hearths, which wait longer because a hearthstone has a
         // cast time and a strategy command does not.
@@ -52755,7 +52813,7 @@ private:
             }
 
             char const* status = "error";
-            char const* detail = "";
+            std::string detail;
 
             // Bot orders only. 'chat', 'gm', 'probe', 'give', 'trade',
             // 'share', 'job', 'sell', 'bank', 'auction', 'bind', 'hearth',
@@ -52885,6 +52943,20 @@ private:
                 // BEFORE the online test like a naturalize row, because its
                 // target is normally offline (see DoRetire).
                 detail = DoRetire(targetName, command, id, status, rowResult);
+            else if (!player && kind == "bot")
+            {
+                OverseerDecisions::EquipCommand equipCommand;
+                if (OverseerDecisions::ParseEquipCommand(command, equipCommand))
+                {
+                    status = "error";
+                    detail = "not in world";
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' equip item {} refused - not in world",
+                             targetName, equipCommand.entry);
+                }
+                else
+                    detail = "target not online";
+            }
             else if (!player)
                 detail = "target not online";
             else if (kind == "chat")
@@ -53058,25 +53130,90 @@ private:
                 // command did nothing" from "there was nothing to do".
                 StrategyCheck check;
                 bool const checkable = ParseStrategyChange(command, check.items);
+                OverseerDecisions::EquipCommand equipCommand;
+                bool const equip = kind == "bot" &&
+                    OverseerDecisions::ParseEquipCommand(command, equipCommand);
+                bool equipRefused = false;
+                if (equip)
+                {
+                    Item* item = player->GetItemByEntry(equipCommand.entry);
+                    if (!item)
+                    {
+                        detail = "not carried";
+                        status = "error";
+                        equipRefused = true;
+                    }
+                    else
+                    {
+                        uint16 destination = NULL_SLOT;
+                        InventoryResult const result = player->CanEquipItem(
+                            NULL_SLOT, destination, item, true);
+                        if (result != EQUIP_ERR_OK)
+                        {
+                            std::string reason = InventoryResultName(result);
+                            if (reason.empty())
+                                reason = "InventoryResult";
+                            detail = reason + " " + std::to_string(uint32(result));
+                            status = "error";
+                            equipRefused = true;
+                        }
+                    }
+                }
                 if (checkable)
                 {
                     for (StrategyItem& item : check.items)
                         item.before = StrategyPresent(botAI, item);
                 }
 
-                botAI->HandleCommand(CHAT_MSG_WHISPER, command, player);
+                if (equipRefused)
+                {
+                    OverseerDecisions::EquipRefusal const refusal =
+                        OverseerDecisions::EquipRefused(detail);
+                    status = refusal.status;
+                    detail = refusal.detail;
+                }
+
+                if (!equipRefused)
+                    botAI->HandleCommand(CHAT_MSG_WHISPER, command, player);
+
+                if (equipRefused)
+                {
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' equip item {} refused - {}",
+                             targetName, equipCommand.entry, detail);
+                }
+                else if (equip)
+                {
+                    EquipCheck equipCheck;
+                    equipCheck.id = id;
+                    equipCheck.targetName = targetName;
+                    equipCheck.command = command;
+                    equipCheck.entry = equipCommand.entry;
+                    _pendingEquipChecks.push_back(equipCheck);
+                    status = "verifying";
+                }
 
                 // THE HAND-OFF IS LOGGED. Until this line the module logged
                 // only the command it HELD, so the log for the Ugga window
                 // contained `holding` lines and no trace whatsoever of the
                 // two commands that actually went out (infra#2819).
-                LOG_INFO("module.overseer",
-                         "overseer: handed command {} ('{}') to '{}'; {}",
-                         id, command, targetName,
-                         checkable ? "reading the live strategy list back before it counts"
-                                   : "no post-condition to read back");
+                if (!equipRefused)
+                    LOG_INFO("module.overseer",
+                             "overseer: handed command {} ('{}') to '{}'; {}",
+                             id, command, targetName,
+                             equip ? "reading equipment back before it counts"
+                             : checkable ? "reading the live strategy list back before it counts"
+                                       : "no post-condition to read back");
 
-                if (checkable)
+                if (equipRefused)
+                {
+                    // Preflight refusal is final; the bot never received it.
+                }
+                else if (equip)
+                {
+                    // The equip check was queued above.
+                }
+                else if (checkable)
                 {
                     check.id = id;
                     check.targetName = targetName;

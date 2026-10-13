@@ -58,6 +58,26 @@
 namespace OverseerDecisions
 {
 
+struct EquipCommand
+{
+    uint32_t entry{0};
+};
+
+// Accept the bridge's one-item equip form only: `e Hitem:<entry>` with an
+// optional numeric hyperlink suffix. Extra links or trailing text are invalid.
+bool ParseEquipCommand(std::string const& command, EquipCommand& out);
+
+struct EquipRefusal
+{
+    // A string literal ("error", "applied", "unchanged"), so the command loop
+    // can assign it straight to its own `char const* status` for the row.
+    char const* status;
+    std::string detail;
+};
+
+EquipRefusal EquipRefused(std::string const& reason);
+EquipRefusal EquipReadBack(bool worn);
+
 // A DUNGEON RUN'S LEADER MUST HOLD A CLIENT (#735). Only a client-attached
 // leader can issue the dungeon-clear, so ENTER and CLEARING wait until the
 // leader's socket has stayed open for the settle window (a measured flap ran
