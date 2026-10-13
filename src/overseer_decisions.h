@@ -11448,6 +11448,10 @@ struct RoutePlan
     // one where it was not enough, and the difference between this and the extra
     // yards the way round would have cost is exactly how short it fell.
     float detourBudgetYards{0.f};
+    // How far the entry node stands above or below the character (#925), so
+    // the route line can name it. Negative when the character's height was
+    // not given or nothing was planned.
+    float entryHeightGapYards{-1.f};
 };
 
 struct RoutePlanLimits
@@ -11500,6 +11504,30 @@ struct RoutePlanLimits
     // node here. A refused node is only refused as the ENTRY: a route may still
     // pass through it, since a recorded path leaves it from where it stands.
     std::vector<std::uint32_t> refusedEntries;
+    // THE WAY IN IS ON THE CHARACTER'S OWN FLOOR (#925). Plane distance cannot
+    // tell a floor from the roof above it: a leader in the Stormwind Wizard's
+    // Sanctum at z 29.6 was given node 1689, the Mage Tower roof 37 yards
+    // across and 119 yards up, reachable only through an areatrigger, while
+    // node 1690 stood on his own floor 47 yards off with a walk link to the
+    // street. He never moved. When `fromZKnown` is set, a node within
+    // `entryNodeYards` whose height differs from `fromZ` by more than
+    // `maxEntryRiseYards` is passed over as the way in, but only while some
+    // node inside that gap is also within `entryNodeYards`. When none is, the
+    // nearest node is taken as before, so a character on a hillside with
+    // nothing level near it still gets a route.
+    //
+    // LEFT UNKNOWN, NOTHING CHANGES. `fromZKnown` defaults to false, and every
+    // caller that does not set it gets the plan this planner has always made.
+    //
+    // WHY FORTY. Over the shipped survey, 2720 walk links join two nodes less
+    // than 100 yards apart on the plane; 122 of them climb more than 40 yards
+    // and 312 climb more than 20. Forty leaves nearly every real slope alone
+    // and is a third of the gap that stranded the Sanctum leader. A smaller
+    // step, like the 9 yards of the Orgrimmar barracks exit, is still the
+    // navmesh entry check's question and not this one.
+    bool fromZKnown{false};
+    float fromZ{0.f};
+    float maxEntryRiseYards{40.f};
 };
 
 // THE NODE SEQUENCE, AND THE ONE CHOICE THAT MAKES IT WORK.
@@ -16498,6 +16526,11 @@ struct RaidRunStep
 // Is the raid wiped, by RAID_WIPE_PCT? See that constant.
 bool RaidWiped(RaidRunFacts const& facts);
 
+// A raid seat is due for repair when its lowest wearable item is below the
+// configured floor. An item with no maximum durability is not part of the
+// measurement; callers pass the already-computed lowest percentage.
+bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct);
+
 // One poll of the raid run.
 //
 // THE ORDER OF THE CHECKS IS THE ORDER OF THE THINGS THAT OVERRIDE EACH OTHER.
@@ -19332,6 +19365,52 @@ struct CreatureKillMark
 // place or an old death is never read as this one's.
 uint32_t KillerAtCorpse(CreatureKillMark const& mark, uint32_t mapId, float corpseX,
                         float corpseY, float radius, int64_t now, int64_t maxAgeSeconds);
+
+// ONE DANGER TEST FOR A CORPSE AND A GRAVEYARD (mod-overseer#933). The
+// graveyard safety test counted hostile spawns ABOVE the member's level, while
+// the repeat-death line near a corpse counted hostiles AT or above it, or of its
+// killer's kind, and its own repeat deaths. On wow-dev 2026-10-12, 15 Horde
+// guild members at levels 26 and 27 died 355 times in 24 hours to Hillsbrad
+// Footmen (level 26) within 25 yards of the Hillsbrad Fields graveyard: for a
+// level 26 ghost no footman is above it, so the graveyard passed as safe and the
+// repeat-death rung sent the ghost to the healer there. Both now ask this one
+// function, so the two tests cannot drift apart again.
+//
+// `hostiles` are the creatures hostile to the member and able to fight it near
+// the place (live grid or spawn table, the caller's choice). One counts when
+// CorpseThreat counts it. `deathsNear` is the member's own deaths within the
+// repeat radius of the place inside the repeat window.
+struct PlaceHostile
+{
+    uint32_t level{0};
+    uint32_t entry{0};
+};
+
+struct PlaceDangerFacts
+{
+    uint32_t memberLevel{0};
+    uint32_t killerEntry{0};  // the kind that killed it, 0 when none is known
+    std::vector<PlaceHostile> hostiles;
+    unsigned deathsNear{0};
+    unsigned repeatDeaths{2};  // the ghost recovery's own death loop count
+};
+
+enum class PlaceDangerReason : uint8_t
+{
+    Safe,
+    Hostiles,      // a hostile at or above its level, or of its killer's kind
+    RepeatDeaths,  // it has died here `repeatDeaths` times inside the window
+};
+
+struct PlaceDanger
+{
+    PlaceDangerReason reason{PlaceDangerReason::Safe};
+    unsigned threats{0};        // hostiles CorpseThreat counts
+    uint32_t strongest{0};      // the highest level among them, 0 for none
+    std::size_t strongestAt{0}; // its index in `hostiles`, meaningful when threats
+};
+
+PlaceDanger JudgePlaceDanger(PlaceDangerFacts const& facts);
 
 // A GUILD MEMBER THAT MAY NOT USE THE LADDER STILL LEAVES A DEATH LOOP. When the
 // ghost decision answers Ladder (the spirit healer's graveyard failed its safety
