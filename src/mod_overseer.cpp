@@ -39860,6 +39860,9 @@ private:
                 run.killsSeen = run.bossesDone;
                 run.lastKillAt = now;
             }
+            // The bit index is the encounterIndex itself (MapEncounterMask and
+            // the save's completed mask both set 1u << encounterIndex), which is
+            // what EncounterName matches.
             if (tank && tank->IsInWorld() && tank->GetMapId() == run.mapId)
                 run.nextBoss = EncounterName(
                     run.mapId,

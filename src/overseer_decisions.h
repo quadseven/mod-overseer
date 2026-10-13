@@ -21057,7 +21057,9 @@ std::string GuildRunTimedOutWhy(unsigned secondsInside, std::string const& nextB
                                 bool killed, unsigned secondsSinceKill);
 
 // The dungeon brain's next boss: the lowest encounter bit it expects that the
-// core has not credited, or -1 when it expects none or all are credited.
+// core has not credited, or -1 when it expects none or all are credited. The
+// bit position IS DungeonEncounter.dbc's encounterIndex (both masks are built
+// as 1u << encounterIndex), so callers look the boss up by it with no offset.
 int GuildRunNextBossIndex(std::uint32_t expectedMask, std::uint32_t creditedMask);
 
 // THE ENCOUNTERS A GUILD RUN MUST CREDIT BEFORE IT IS CLEARED. `mapMask` is
