@@ -10072,7 +10072,9 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
 {
     RoutePlan plan;
     if (!(limits.entryNodeYards > 0.f) || !(limits.minGainYards >= 0.f) ||
-        !(limits.roundHandoverYards >= 0.f))
+        !(limits.roundHandoverYards >= 0.f) ||
+        (limits.fromZKnown &&
+         (!std::isfinite(limits.fromZ) || !(limits.maxEntryRiseYards >= 0.f))))
     {
         plan.verdict = RoutePlanVerdict::BadLimits;
         return plan;
@@ -10103,12 +10105,34 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
 
     // The way in: the nearest node, and it must be near. A route from a node
     // the character cannot get to is not a route.
+    //
+    // AND ON THE CHARACTER'S OWN FLOOR WHEN ONE IS NEAR (#925). If any node
+    // within reach is inside the height limit, every node outside it is passed
+    // over as the way in; if none is, the nearest is taken as it always was.
+    bool floorOnly = false;
+    if (limits.fromZKnown)
+    {
+        for (RouteNode const& node : here)
+        {
+            if (std::find(limits.refusedEntries.begin(), limits.refusedEntries.end(),
+                          node.id) != limits.refusedEntries.end())
+                continue;
+            if (PlaneDistance(node.x, node.y, fromX, fromY) <= limits.entryNodeYards &&
+                std::fabs(node.z - limits.fromZ) <= limits.maxEntryRiseYards)
+            {
+                floorOnly = true;
+                break;
+            }
+        }
+    }
     std::uint32_t entry = 0;
     float entryDistance = -1.f;
     for (std::uint32_t i = 0; i < here.size(); ++i)
     {
         if (std::find(limits.refusedEntries.begin(), limits.refusedEntries.end(),
                       here[i].id) != limits.refusedEntries.end())
+            continue;
+        if (floorOnly && !(std::fabs(here[i].z - limits.fromZ) <= limits.maxEntryRiseYards))
             continue;
         float const d = PlaneDistance(here[i].x, here[i].y, fromX, fromY);
         if (entryDistance < 0.f || d < entryDistance)
@@ -10286,6 +10310,8 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
     plan.yards = chosen->best[goal];
     plan.endsFromAimYards = goalDistance;
     plan.guardedLegs = guardedOnPlan;
+    if (limits.fromZKnown)
+        plan.entryHeightGapYards = std::fabs(here[entry].z - limits.fromZ);
     return plan;
 }
 
@@ -13495,6 +13521,11 @@ bool RaidWiped(RaidRunFacts const& facts)
     return !facts.insideCombat && facts.insideDead * 100 >= total * RAID_WIPE_PCT;
 }
 
+bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct)
+{
+    return lowestDurabilityPct < floorPct;
+}
+
 bool RaidGhostMayBeWalked(long ghostSeconds)
 {
     return ghostSeconds < RAID_RUNBACK_WAIT_SECONDS;
@@ -16673,6 +16704,27 @@ uint32_t KillerAtCorpse(CreatureKillMark const& mark, uint32_t mapId, float corp
     float const dx = mark.x - corpseX;
     float const dy = mark.y - corpseY;
     return dx * dx + dy * dy <= radius * radius ? mark.entry : 0;
+}
+
+PlaceDanger JudgePlaceDanger(PlaceDangerFacts const& facts)
+{
+    PlaceDanger danger;
+    for (std::size_t i = 0; i < facts.hostiles.size(); ++i)
+    {
+        PlaceHostile const& h = facts.hostiles[i];
+        if (!CorpseThreat(h.level, facts.memberLevel, h.entry, facts.killerEntry))
+            continue;
+        if (!danger.threats++ || h.level > danger.strongest)
+        {
+            danger.strongest = h.level;
+            danger.strongestAt = i;
+        }
+    }
+    if (danger.threats)
+        danger.reason = PlaceDangerReason::Hostiles;
+    else if (facts.repeatDeaths && facts.deathsNear >= facts.repeatDeaths)
+        danger.reason = PlaceDangerReason::RepeatDeaths;
+    return danger;
 }
 
 char const* GhostRecoveryWord(GhostRecovery choice)

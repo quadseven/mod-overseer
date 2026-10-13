@@ -732,8 +732,12 @@ constexpr float STUCK_REVIVAL_TRAP_RADIUS = 100.0f;
 //
 // A graveyard is refused when the ground it stands on is levelled above the
 // character (AreaTable's area_level, the same number the client's zone text
-// reads), or when hostile spawns above the character's level sit within
-// GRAVEYARD_THREAT_RADIUS of it. Spawn data, not the live grid: a graveyard
+// reads), or when it fails the danger test the ghost's repeat-death line
+// applies to its corpse (OverseerDecisions::JudgePlaceDanger, mod-overseer#933):
+// hostile spawns at or above the character's level, or of its killer's kind,
+// within GRAVEYARD_THREAT_RADIUS of it, or its own repeat deaths beside it.
+// Above its level was the old test, and a level 26 ghost read the Hillsbrad
+// Fields graveyard, among level 26 footmen, as safe. Spawn data, not the live grid: a graveyard
 // two grids away is not loaded, and an unloaded grid reads as "no creatures",
 // which is exactly the wrong answer for the question being asked.
 // The alternatives are the core's own candidate set for that corpse (the
@@ -909,13 +913,17 @@ static bool CanBeFought(CreatureData const& data, CreatureTemplate const* tmpl)
     return (flags & CANNOT_FIGHT) == 0;
 }
 
-static NearbyThreat HostileSpawnsNear(Player* bot, uint32 mapId, float x, float y,
-                                      float radius, uint32 aboveLevel)
+// Every hostile spawn a character could fight within `radius` yards of (x, y)
+// on `mapId`, at any level: what OverseerDecisions::JudgePlaceDanger is handed
+// for a graveyard. `templates` gets each one's template, in the same order.
+static std::vector<OverseerDecisions::PlaceHostile> HostileSpawnListNear(
+    Player* bot, uint32 mapId, float x, float y, float radius,
+    std::vector<CreatureTemplate const*>* templates = nullptr)
 {
-    NearbyThreat threat;
+    std::vector<OverseerDecisions::PlaceHostile> out;
     FactionTemplateEntry const* mine = bot ? bot->GetFactionTemplateEntry() : nullptr;
     if (!mine)
-        return threat;
+        return out;
 
     float const r2 = radius * radius;
     for (auto const& spawn : sObjectMgr->GetAllCreatureData())
@@ -931,18 +939,34 @@ static NearbyThreat HostileSpawnsNear(Player* bot, uint32 mapId, float x, float 
         if (dx * dx + dy * dy > r2)
             continue;
         CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(data.id);
-        if (!tmpl || tmpl->maxlevel <= aboveLevel)
-            continue;
-        if (!CanBeFought(data, tmpl))
+        if (!tmpl || !CanBeFought(data, tmpl))
             continue;
         FactionTemplateEntry const* theirs = sFactionTemplateStore.LookupEntry(tmpl->faction);
         if (!theirs || !theirs->IsHostileTo(*mine))
             continue;
+        out.push_back({tmpl->maxlevel, data.id});
+        if (templates)
+            templates->push_back(tmpl);
+    }
+    return out;
+}
+
+static NearbyThreat HostileSpawnsNear(Player* bot, uint32 mapId, float x, float y,
+                                      float radius, uint32 aboveLevel)
+{
+    NearbyThreat threat;
+    std::vector<CreatureTemplate const*> templates;
+    std::vector<OverseerDecisions::PlaceHostile> const hostiles =
+        HostileSpawnListNear(bot, mapId, x, y, radius, &templates);
+    for (std::size_t i = 0; i < hostiles.size(); ++i)
+    {
+        if (hostiles[i].level <= aboveLevel)
+            continue;
         ++threat.count;
-        if (tmpl->maxlevel > threat.level)
+        if (hostiles[i].level > threat.level)
         {
-            threat.level = tmpl->maxlevel;
-            threat.name = tmpl->Name;
+            threat.level = hostiles[i].level;
+            threat.name = templates[i]->Name;
         }
     }
     return threat;
@@ -1167,12 +1191,27 @@ static int32 AreaLevelAt(Map* map, uint32 phaseMask, float x, float y, float z)
     return area ? area->area_level : 0;
 }
 
+// What the character's own recent past says about a graveyard: the kind that
+// killed it, and where it died inside GHOST_REPEAT_MINUTES (each mark's time is
+// already inside that window).
+struct GraveyardEvidence
+{
+    uint32 killerEntry{0};
+    std::vector<OverseerDecisions::GuildDeathMark> deaths;
+};
+
 // Why this character should not be revived at this graveyard, or empty
-// when there is no reason. See GRAVEYARD_THREAT_RADIUS for the two tests.
+// when there is no reason. The ground's level is the first test (see
+// GRAVEYARD_THREAT_RADIUS); the second is the same danger test the ghost's
+// repeat-death line applies to its corpse (OverseerDecisions::JudgePlaceDanger,
+// mod-overseer#933): a hostile spawn within GRAVEYARD_THREAT_RADIUS at or above
+// its level or of its killer's kind, or its own repeat deaths within
+// GHOST_REPEAT_RADIUS inside GHOST_REPEAT_MINUTES.
 //
 //   FindBaseMap   MapMgr.h:44   Map* FindBaseMap(uint32 mapId) const
 //   GetPhaseMask  Object.h:517  uint32 GetPhaseMask() const
-static std::string GraveyardRefusal(Player* bot, GraveyardStruct const& g)
+static std::string GraveyardRefusal(Player* bot, GraveyardStruct const& g,
+                                    GraveyardEvidence const& evidence)
 {
     uint32 const level = bot->GetLevel();
     Map* map = g.Map == bot->GetMapId() ? bot->GetMap() : sMapMgr->FindBaseMap(g.Map);
@@ -1181,18 +1220,41 @@ static std::string GraveyardRefusal(Player* bot, GraveyardStruct const& g)
         return "it stands on level " + std::to_string(areaLevel) + " ground and the character is level " +
                std::to_string(level);
 
-    NearbyThreat const threat = HostileSpawnsNear(bot, g.Map, g.x, g.y, GRAVEYARD_THREAT_RADIUS, level);
-    if (threat.count)
-        return std::to_string(threat.count) + " hostile spawn(s) above level " + std::to_string(level) +
-               " within " + std::to_string(uint32(GRAVEYARD_THREAT_RADIUS)) + " yards, up to '" +
-               threat.name + "' (level " + std::to_string(threat.level) + ")";
-    return {};
+    std::vector<CreatureTemplate const*> templates;
+    OverseerDecisions::PlaceDangerFacts facts;
+    facts.memberLevel = level;
+    facts.killerEntry = evidence.killerEntry;
+    facts.hostiles = HostileSpawnListNear(bot, g.Map, g.x, g.y, GRAVEYARD_THREAT_RADIUS, &templates);
+    facts.deathsNear = OverseerDecisions::CountGuildDeathsNear(
+        evidence.deaths, time(nullptr), g.Map, g.x, g.y, GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES);
+    facts.repeatDeaths = GHOST_RECOVERY_LIMITS.repeatDeaths;
+    OverseerDecisions::PlaceDanger const danger = OverseerDecisions::JudgePlaceDanger(facts);
+
+    std::string const deaths = std::to_string(facts.deathsNear) + " death(s) within " +
+                               std::to_string(uint32(GHOST_REPEAT_RADIUS)) + " yards in " +
+                               std::to_string(GHOST_REPEAT_MINUTES) + "min";
+    switch (danger.reason)
+    {
+        case OverseerDecisions::PlaceDangerReason::Safe:
+            return {};
+        case OverseerDecisions::PlaceDangerReason::RepeatDeaths:
+            return deaths;
+        case OverseerDecisions::PlaceDangerReason::Hostiles:
+            break;
+    }
+    return std::to_string(danger.threats) + " hostile spawn(s) at or above level " +
+           std::to_string(level) + " or of its killer's kind (entry " +
+           std::to_string(evidence.killerEntry) + ") within " +
+           std::to_string(uint32(GRAVEYARD_THREAT_RADIUS)) + " yards, up to '" +
+           templates[danger.strongestAt]->Name + "' (level " + std::to_string(danger.strongest) +
+           "); " + deaths;
 }
 
 // The nearest graveyard this character can stand at: `nearest` itself when
 // it passes, else the nearest of the core's own alternatives for this corpse
-// that does, else null (the caller goes to the bind point). `refused`
-// collects every refusal, so the log line can say why.
+// that does, else null (the caller goes to the bind point). `evidence` is
+// the character's own (GraveyardEvidenceFor). `refused` collects every
+// refusal, so the log line can say why.
 //
 // Members read at the pinned core:
 //   GetGraveyardData          GameGraveyard.h:62  GraveyardContainer const&
@@ -1202,9 +1264,10 @@ static std::string GraveyardRefusal(Player* bot, GraveyardStruct const& g)
 //   Map::GetZoneAndAreaId     Map.h:255
 static GraveyardStruct const* SafeGraveyardNear(Player* bot, GraveyardStruct const* nearest,
                                                 uint32 corpseMap, float cx, float cy, float cz,
+                                                GraveyardEvidence const& evidence,
                                                 std::string& refused)
 {
-    refused = GraveyardRefusal(bot, *nearest);
+    refused = GraveyardRefusal(bot, *nearest, evidence);
     if (refused.empty())
         return nearest;
     refused = "'" + nearest->name + "': " + refused;
@@ -1245,7 +1308,7 @@ static GraveyardStruct const* SafeGraveyardNear(Player* bot, GraveyardStruct con
         if (tried++ >= GRAVEYARD_CANDIDATES)
             break;
         GraveyardStruct const* g = candidate.second;
-        std::string const why = GraveyardRefusal(bot, *g);
+        std::string const why = GraveyardRefusal(bot, *g, evidence);
         if (why.empty())
             return g;
         refused += "; '" + g->name + "': " + why;
@@ -1337,9 +1400,10 @@ constexpr uint32 CON_COLOR_UNKNOWN_LEVEL_DIFF = 10;
 // eight level 65 elites, and died there eighteen times in sixteen minutes.
 //
 // THE RADIUS IS THE GRAVEYARD'S OWN NUMBER AND IS NAMED AS SUCH. The module
-// already refuses to RESURRECT a character where hostile spawns above its level
-// sit within GRAVEYARD_THREAT_RADIUS, and it was the same module walking it to
-// such a place on an errand. One number, so the two answers cannot drift.
+// already refuses to RESURRECT a character where hostile spawns at or above
+// its level, or of its killer's kind, sit within GRAVEYARD_THREAT_RADIUS,
+// and it was the same module walking it to such a place on an errand.
+// One number, so the two answers cannot drift.
 //
 // THE LEVEL GAP IS DELIBERATELY NOT THE GRAVEYARD'S, and the difference is the
 // only interesting judgement here. The graveyard test counts anything above the
@@ -20072,6 +20136,11 @@ private:
         OverseerDecisions::RoutePlanLimits limits;
         limits.entryNodeYards = TRAVEL_ROUTE_ENTRY_YARDS;
         limits.minGainYards = TRAVEL_ROUTE_GAIN_YARDS;
+        // AND THE WAY IN IS ON ITS OWN FLOOR (#925): see
+        // RoutePlanLimits::fromZKnown. The Sanctum leader was given the Mage
+        // Tower roof 119 yards above him because only x and y were asked.
+        limits.fromZKnown = true;
+        limits.fromZ = bot->GetPositionZ();
         OverseerDecisions::RoutePlan plan;
         unsigned refusedEntries = 0;
         uint32 walkableEntry = 0;
@@ -20121,6 +20190,7 @@ private:
                     // character stands says nothing about the far node.
                     planFromX = farEnd->second->x;
                     planFromY = farEnd->second->y;
+                    limits.fromZ = farEnd->second->z;
                     walkableEntry = road.to;
                     limits.refusedEntries.clear();
                     continue;
@@ -20234,9 +20304,11 @@ private:
                  "overseer: '{}' is sent to '{}' and is routed round it - {} surveyed nodes, "
                  "{:.0f} yards of walking legs and {} waypoints, finishing {:.0f} yards from "
                  "the aim where the ordinary step takes over. No leg of it is a flight, a "
-                 "boat or a portal, because the party walks together (#316)",
+                 "boat or a portal, because the party walks together (#316). It enters at "
+                 "node {}, {:.0f} yards above or below where the plan starts (#925)",
                  name, target, static_cast<uint32>(plan.nodes.size()), plan.yards,
-                 static_cast<uint32>(route.size()), plan.endsFromAimYards);
+                 static_cast<uint32>(route.size()), plan.endsFromAimYards,
+                 plan.nodes.front(), plan.entryHeightGapYards);
         // AND SAID SEPARATELY WHEN THAT ROUTE IS ONLY THE FIRST HALF (#356), for
         // the same reason the guarded note below is separate: the line above has
         // meant one thing since #316 and an operator reading it for a death must
@@ -28130,8 +28202,11 @@ private:
             // the two tests. When the nearest graveyard passes, everything
             // below is exactly what it was before.
             std::string refused;
-            GraveyardStruct const* safe = SafeGraveyardNear(bot, grave, corpseMap,
-                                                            corpseX, corpseY, corpseZ, refused);
+            GraveyardStruct const* safe = SafeGraveyardNear(
+                bot, grave, corpseMap, corpseX, corpseY, corpseZ,
+                GraveyardEvidenceFor(name, corpseMap, corpseX, corpseY,
+                                     KillerEntryAt(name, corpseMap, corpseX, corpseY)),
+                refused);
             if (!safe)
             {
                 // `grave` exists, so this map HAS somewhere to revive at; it is
@@ -28729,25 +28804,22 @@ private:
         std::vector<std::string> leased;  // dead-engine strategies taken off
     };
 
-    // Living creatures near the corpse that could fight a character of this
-    // level again: alive, hostile to it, attackable, not a critter, and at or
-    // above `minLevel` or of the `killerEntry` kind that killed it here
-    // (OverseerDecisions::CorpseThreat, wow-overseer#599).
+    // Living creatures near the corpse that could fight this character:
+    // alive, hostile to it, attackable, not a critter. Which of them count, at
+    // or above its level or of the kind that killed it here, is
+    // OverseerDecisions::JudgePlaceDanger's to say (wow-overseer#599,
+    // mod-overseer#933), the same test its graveyard is judged by.
     struct GhostThreatCheck
     {
         Player const* ghost;
         float x;
         float y;
         float range;
-        uint32 minLevel;
-        uint32 killerEntry;
         bool operator()(Creature* creature) const
         {
             static constexpr uint32 CANNOT_FIGHT =
                 UNIT_FLAG_NON_ATTACKABLE | UNIT_FLAG_IMMUNE_TO_PC | UNIT_FLAG_NOT_SELECTABLE;
             return creature->IsAlive() && !creature->IsCritter() &&
-                   OverseerDecisions::CorpseThreat(creature->GetLevel(), minLevel,
-                                                   creature->GetEntry(), killerEntry) &&
                    creature->GetExactDist2d(x, y) <= range &&
                    !creature->HasUnitFlag(UnitFlags(CANNOT_FIGHT)) &&
                    creature->IsHostileTo(ghost);
@@ -28950,7 +29022,10 @@ private:
         st.said = OverseerDecisions::GhostRecovery::SpiritHealer;
         st.healerGrave = sGraveyard->GetClosestGraveyard(bot, bot->GetTeamId());
         if (st.healerGrave)
-            st.healerRefused = GraveyardRefusal(bot, *st.healerGrave);
+            st.healerRefused = GraveyardRefusal(
+                bot, *st.healerGrave,
+                GraveyardEvidenceFor(name, st.mapId, st.corpseX, st.corpseY,
+                                     KillerEntryAt(name, st.mapId, st.corpseX, st.corpseY)));
         if (!retry)
             RecordGhostRecovery(name, OverseerDecisions::GhostRecovery::SpiritHealer);
         // The deploy proof: "stranded ghost" is said nowhere else.
@@ -29654,6 +29729,48 @@ private:
         _guildWeaponSentTo.erase(name);
     }
 
+    // The kind that killed this character at its corpse on `mapId` at (x, y),
+    // or 0 (OverseerDecisions::KillerAtCorpse).
+    static uint32 KillerEntryAt(std::string const& name, uint32 mapId, float x, float y)
+    {
+        std::lock_guard<std::mutex> guard(g_killMutex);
+        auto const kill = g_creatureKill.find(LowerName(name));
+        if (kill == g_creatureKill.end())
+            return 0;
+        return OverseerDecisions::KillerAtCorpse(
+            kill->second, mapId, x, y, GHOST_REPEAT_RADIUS, static_cast<int64_t>(time(nullptr)),
+            int64_t(GHOST_REPEAT_MINUTES) * 60);
+    }
+
+    // What GraveyardRefusal is told about this character's own recent past
+    // (mod-overseer#933): its killer at the corpse, and its deaths inside
+    // GHOST_REPEAT_MINUTES, from overseer_death (the family) and the guild
+    // drive's own marks (a natural guild member, which has no rows there).
+    // Rows are windowed by the database's own clock and stamped `now`, so a
+    // clock gap between the two hosts cannot drop or keep one.
+    GraveyardEvidence GraveyardEvidenceFor(std::string const& name, uint32 mapId, float x,
+                                           float y, uint32 killerEntry)
+    {
+        GraveyardEvidence evidence;
+        evidence.killerEntry = killerEntry;
+        int64 const now = time(nullptr);
+        if (QueryResult rows = CharacterDatabase.Query(
+                "SELECT map, pos_x, pos_y FROM overseer_death WHERE character_name = '{}' "
+                "AND created_at >= NOW() - INTERVAL {} MINUTE",
+                Esc(name), GHOST_REPEAT_MINUTES))
+            do
+            {
+                Field* f = rows->Fetch();
+                evidence.deaths.push_back(
+                    {now, f[0].Get<uint16>(), f[1].Get<float>(), f[2].Get<float>()});
+            } while (rows->NextRow());
+        auto const marks = _guildDeathMarks.find(name);
+        if (marks != _guildDeathMarks.end())
+            evidence.deaths.insert(evidence.deaths.end(), marks->second.begin(),
+                                   marks->second.end());
+        return evidence;
+    }
+
     // The death is over: the character is alive again.
     void EndGhostRecovery(PlayerbotAI* botAI, std::string const& name)
     {
@@ -29728,49 +29845,54 @@ private:
 
             st.spawnThreat = HostileSpawnsNear(bot, st.mapId, st.corpseX, st.corpseY,
                                                GHOST_CORPSE_THREAT_RADIUS, bot->GetLevel());
-            {
-                std::lock_guard<std::mutex> guard(g_killMutex);
-                auto const kill = g_creatureKill.find(LowerName(name));
-                if (kill != g_creatureKill.end())
-                    st.killerEntry = OverseerDecisions::KillerAtCorpse(
-                        kill->second, st.mapId, st.corpseX, st.corpseY, GHOST_REPEAT_RADIUS,
-                        static_cast<int64_t>(time(nullptr)), int64_t(GHOST_REPEAT_MINUTES) * 60);
-            }
+            st.killerEntry = KillerEntryAt(name, st.mapId, st.corpseX, st.corpseY);
+            // The healer's graveyard is judged by the same danger test as the
+            // corpse below (OverseerDecisions::JudgePlaceDanger).
+            GraveyardEvidence const evidence =
+                GraveyardEvidenceFor(name, st.mapId, st.corpseX, st.corpseY, st.killerEntry);
             st.healerGrave = sGraveyard->GetClosestGraveyard(bot, bot->GetTeamId());
             if (st.healerGrave)
-                st.healerRefused = GraveyardRefusal(bot, *st.healerGrave);
+                st.healerRefused = GraveyardRefusal(bot, *st.healerGrave, evidence);
             // A caller without the ladder (the natural guilds) takes the
             // spirit healer after repeat deaths, and the nearest healer is
             // the one standing among the guards that failed the test. Run the
             // ghost to a graveyard that passes it instead.
             if (!ladder && st.healerGrave && !st.healerRefused.empty())
-                RerouteHealerGraveyard(bot, name, st, corpse);
+                RerouteHealerGraveyard(bot, name, st, corpse, evidence);
         }
 
         // Live: what is standing near the corpse NOW at or above its level, or
         // of the kind that killed it here.
         uint32 const level = bot->GetLevel();
-        std::list<Creature*> threats;
-        GhostThreatCheck check{bot, st.corpseX, st.corpseY, GHOST_CORPSE_THREAT_RADIUS, level,
-                               st.killerEntry};
-        Acore::CreatureListSearcher<GhostThreatCheck> searcher(bot, threats, check);
+        std::list<Creature*> hostiles;
+        GhostThreatCheck check{bot, st.corpseX, st.corpseY, GHOST_CORPSE_THREAT_RADIUS};
+        Acore::CreatureListSearcher<GhostThreatCheck> searcher(bot, hostiles, check);
         Cell::VisitObjects(st.corpseX, st.corpseY, bot->GetMap(), searcher,
                            GHOST_CORPSE_THREAT_RADIUS);
+        std::vector<Creature*> const live(hostiles.begin(), hostiles.end());
+        OverseerDecisions::PlaceDangerFacts danger;
+        danger.memberLevel = level;
+        danger.killerEntry = st.killerEntry;
+        danger.deathsNear = st.deathsHere;
+        danger.repeatDeaths = GHOST_RECOVERY_LIMITS.repeatDeaths;
+        for (Creature* creature : live)
+            danger.hostiles.push_back({creature->GetLevel(), creature->GetEntry()});
+        OverseerDecisions::PlaceDanger const corpseDanger =
+            OverseerDecisions::JudgePlaceDanger(danger);
         uint32 strongest = st.spawnThreat.level;
         std::string strongestName = st.spawnThreat.name;
-        for (Creature* creature : threats)
-            if (creature->GetLevel() > strongest)
-            {
-                strongest = creature->GetLevel();
-                strongestName = creature->GetName();
-            }
+        if (corpseDanger.threats && corpseDanger.strongest > strongest)
+        {
+            strongest = corpseDanger.strongest;
+            strongestName = live[corpseDanger.strongestAt]->GetName();
+        }
 
         int64 const now = time(nullptr);
         OverseerDecisions::GhostRecoveryFacts facts;
         facts.level = level;
         facts.deathsHere = st.deathsHere;
         facts.strongestNearCorpse = strongest;
-        facts.liveThreatsNearCorpse = static_cast<unsigned>(threats.size());
+        facts.liveThreatsNearCorpse = corpseDanger.threats;
         facts.ghostSeconds = static_cast<long>(now - ghostTime);
         facts.healerGraveyardSafe = st.healerGrave && st.healerRefused.empty();
         facts.choseHealer = st.choseHealer;
@@ -29814,7 +29936,7 @@ private:
                      st.corpseX, st.corpseY, bot->GetExactDist2d(st.corpseX, st.corpseY),
                      st.deathsHere, GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES,
                      GHOST_CORPSE_THREAT_RADIUS, strongest, strongestName.empty() ? "" : " '",
-                     strongestName.empty() ? "" : strongestName + "'", threats.size(),
+                     strongestName.empty() ? "" : strongestName + "'", corpseDanger.threats,
                      st.killerEntry, facts.sick ? "sick" : "not sick",
                      st.healerGrave ? st.healerGrave->name : std::string("none"),
                      st.healerRefused.empty() ? "" : " refused: ", st.healerRefused);
@@ -29853,13 +29975,13 @@ private:
     // graveyard's healer; nothing is granted. With none that passes, the
     // nearest stands as before.
     void RerouteHealerGraveyard(Player* bot, std::string const& name, GhostRecoveryState& st,
-                                Corpse* corpse)
+                                Corpse* corpse, GraveyardEvidence const& evidence)
     {
         std::string refused;
         GraveyardStruct const* const nearest = st.healerGrave;
         GraveyardStruct const* const safe =
             SafeGraveyardNear(bot, nearest, st.mapId, st.corpseX, st.corpseY,
-                              corpse->GetPositionZ(), refused);
+                              corpse->GetPositionZ(), evidence, refused);
         if (OverseerDecisions::PickGuildHealerGraveyard(false, safe != nullptr) !=
             OverseerDecisions::GuildHealerGraveyard::Alternative)
             return;
@@ -45126,6 +45248,10 @@ private:
         std::map<std::string, unsigned> stoneTries;
         // Why nobody was summoned, said when it changes.
         std::string stoneSaid;
+
+        // Seats already given their pre-FORM repair attempt for this order.
+        std::set<std::string> repairAttempted;
+        std::set<std::string> repairWalkSaid;
     };
     std::map<std::string, RaidRunState> _raidRuns;
     // What the raid timeline last wrote for each family (#640).
@@ -46022,6 +46148,74 @@ private:
             std::map<std::string, unsigned> seats;
             if (facts.ordered)
                 seats = LoadRaidSeats(roster.family, keyword);
+
+            // REPAIR BEFORE FORM. A raid order first walks every seat whose
+            // lowest wearable item is below the configured floor to a repairer.
+            // The existing repair executor uses the character's own purse and
+            // reads durability back after the core handler returns.
+            uint32 const repairFloor = std::min<uint32>(
+                100, sConfigMgr->GetOption<uint32>("Overseer.Raid.RepairFloorPct", 70));
+            bool repairPending = false;
+            if (facts.ordered && run.phase == RaidRunPhase::Idle && repairFloor <= 100)
+            {
+                for (auto const& [name, subgroup] : seats)
+                {
+                    (void)subgroup;
+                    if (run.repairAttempted.count(name))
+                        continue;
+                    Player* member = ObjectAccessor::FindPlayerByName(name);
+                    if (!member || !member->IsInWorld())
+                    {
+                        run.repairAttempted.insert(name);
+                        LOG_WARN("module.overseer",
+                                 "overseer: raid run for family '{}' cannot check '{}' for "
+                                 "pre-FORM repair because the seat is not in the world",
+                                 roster.family, name);
+                        continue;
+                    }
+                    uint32 const lowestPct = LowestDurabilityPct(member);
+                    if (!OverseerDecisions::RaidSeatNeedsRepair(lowestPct, repairFloor))
+                        continue;
+
+                    bool oneIsNearby = false;
+                    float nearestYards = -1.f;
+                    if (!CounterInReach(member, OverseerDecisions::CounterRole::Repairer,
+                                        oneIsNearby, nearestYards))
+                    {
+                        repairPending = true;
+                        _travelAims.Claim(name, "repair", OverseerDecisions::TravelOwner::Run);
+                        if (run.repairWalkSaid.insert(name).second)
+                            LOG_INFO("module.overseer",
+                                     "overseer: raid run for family '{}' repair walk for '{}' - "
+                                     "lowest durability {}%, floor {}%",
+                                     roster.family, name, lowestPct, repairFloor);
+                        continue;
+                    }
+
+                    HoldAtTheCounter(member, name);
+                    char const* status = "error";
+                    std::string evidence;
+                    char const* answer = DoRepair(member, "all", status, evidence);
+                    uint32 const afterPct = LowestDurabilityPct(member);
+                    run.repairAttempted.insert(name);
+                    _travelAims.Release(name, "raid pre-FORM repair completed");
+                    ReleaseCounterHold(name, "raid pre-FORM repair completed");
+                    if (OverseerDecisions::RaidSeatNeedsRepair(afterPct, repairFloor))
+                        LOG_WARN("module.overseer",
+                                 "overseer: raid run for family '{}' could not bring '{}' "
+                                 "to the {}% repair floor (lowest {}% after repair): {}",
+                                 roster.family, name, repairFloor, afterPct,
+                                 answer ? answer : "repair was partial or unaffordable");
+                    else
+                        LOG_INFO("module.overseer",
+                                 "overseer: raid run for family '{}' repaired '{}' from {}% "
+                                 "to {}% before FORM",
+                                 roster.family, name, lowestPct, afterPct);
+                    repairPending = true;
+                }
+            }
+            if (repairPending)
+                continue;
 
             // BUSY, FOR CLEAR'S STALL LADDER: somebody inside fighting, dead
             // and waiting on a healer, or the head eating or drinking.
@@ -56220,6 +56414,19 @@ private:
                 take(bag->GetItemByPos(uint8(i)));
         }
         return readings;
+    }
+
+    static uint32 LowestDurabilityPct(Player* who)
+    {
+        uint32 lowest = 100;
+        for (DurabilityReading const& reading : ReadCarriedDurability(who))
+        {
+            uint32 const percent = reading.maximum
+                                      ? reading.current * 100 / reading.maximum
+                                      : 100;
+            lowest = std::min(lowest, percent);
+        }
+        return lowest;
     }
 
     // The core's own repair arithmetic (Player::DurabilityRepair), run without

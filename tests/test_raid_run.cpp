@@ -38,6 +38,7 @@ using OverseerDecisions::RaidDoorFor;
 using OverseerDecisions::RaidKeywordForJob;
 using OverseerDecisions::RaidKnockOrder;
 using OverseerDecisions::RaidRunFacts;
+using OverseerDecisions::RaidSeatNeedsRepair;
 using OverseerDecisions::RaidRunPhase;
 using OverseerDecisions::RaidRunPhaseName;
 using OverseerDecisions::RaidRunStep;
@@ -57,6 +58,14 @@ void Check(char const* what, bool held)
         return;
     ++failures;
     std::printf("FAIL %s\n", what);
+}
+
+void TheRepairFloorIsStrictAndConfigurable()
+{
+    Check("below the floor needs repair", RaidSeatNeedsRepair(69, 70));
+    Check("at the floor does not need repair", !RaidSeatNeedsRepair(70, 70));
+    Check("above the floor does not need repair", !RaidSeatNeedsRepair(100, 70));
+    Check("zero floor disables this gate", !RaidSeatNeedsRepair(0, 0));
 }
 
 void CheckString(char const* what, std::string const& got, std::string const& want)
@@ -442,6 +451,7 @@ void ARaidMapIsNotArmedUntilClearingIsOrdered()
 
 int main()
 {
+    TheRepairFloorIsStrictAndConfigurable();
     TheMoltenCoreDoorIsTheWorldsOwnNumbers();
     OnlyAnExactRaidJobNamesADoor();
     NoOrderIsIdleAndAnEndedOrderReleases();
