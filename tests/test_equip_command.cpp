@@ -35,6 +35,9 @@ int main()
     Check("other verbs are ignored", ParseEquipCommand("nc +grind", parsed), false);
     Check("missing entry is rejected", ParseEquipCommand("e Hitem:", parsed), false);
     Check("zero entry is rejected", ParseEquipCommand("e Hitem:0", parsed), false);
+    Check("zero entry with link suffix is rejected", ParseEquipCommand("e Hitem:0:0", parsed), false);
+    Check("padded zero entry is rejected", ParseEquipCommand("e Hitem:000:0:0", parsed), false);
+    Check("padded entry parses", ParseEquipCommand("e Hitem:0015211:0", parsed) && parsed.entry == 15211, true);
     Check("overflowing entry is rejected", ParseEquipCommand("e Hitem:999999999999999999999999", parsed), false);
     Check("trailing command text is rejected", ParseEquipCommand("e Hitem:15211 junk", parsed), false);
 

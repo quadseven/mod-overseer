@@ -35,9 +35,6 @@ bool ParseEquipCommand(std::string const& command, EquipCommand& out)
     for (std::string::size_type i = 8; i < end; ++i)
         if (command[i] < '0' || command[i] > '9')
             return false;
-    // An item template entry is never zero; reject it before conversion.
-    if (command.find_first_not_of('0', 8) == std::string::npos)
-        return false;
     if (end < command.size())
     {
         // Hyperlink suffixes are numeric item fields only; reject a second
@@ -49,7 +46,8 @@ bool ParseEquipCommand(std::string const& command, EquipCommand& out)
     try
     {
         unsigned long const value = std::stoul(command.substr(8, end - 8));
-        if (value > UINT32_MAX)
+        // An item template entry is never zero, with or without a link suffix.
+        if (value == 0 || value > UINT32_MAX)
             return false;
         out.entry = static_cast<uint32_t>(value);
         return true;
