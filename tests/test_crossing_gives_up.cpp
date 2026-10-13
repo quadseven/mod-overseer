@@ -14,6 +14,8 @@
 #include "overseer_decisions.h"
 
 #include <cstdio>
+#include <fstream>
+#include <iterator>
 #include <string>
 
 using OverseerDecisions::CrossingAttemptLimits;
@@ -227,6 +229,29 @@ int main()
         Check("the second refusal gives the dungeon up",
               last.verdict == CrossingAttemptVerdict::GiveUp && last.attempts == 2 &&
                   CrossingHandedBack(record, DUNGEON, secondRefusedAt) == limits.cooloffSeconds);
+    }
+
+    // The adapter must read the reason for the same berth aim whose refusal
+    // made the crossing stand back. The pure decision cannot inspect that book.
+    {
+        std::ifstream file("src/mod_overseer.cpp");
+        Check("the travel adapter source is readable", file.good());
+        std::string const source((std::istreambuf_iterator<char>(file)),
+                                 std::istreambuf_iterator<char>());
+        std::size_t const reasonStart = source.find("std::string RefusedReason(");
+        std::size_t const reasonEnd = source.find("\n    }", reasonStart);
+        std::string const reasonMethod = reasonStart == std::string::npos ||
+                                                 reasonEnd == std::string::npos
+                                             ? std::string()
+                                             : source.substr(reasonStart, reasonEnd - reasonStart);
+        Check("a refusal reason is scoped to its target",
+              reasonMethod.find("RefusedReason(std::string const& name, std::string const& target) const") !=
+                  std::string::npos &&
+                  reasonMethod.find("it->second.target != target") !=
+                      std::string::npos);
+        Check("the crossing reads the berth aim's refusal reason",
+              source.find("_travelAims.RefusedReason(leaderName, aimText)") !=
+                  std::string::npos);
     }
 
     if (failures)
