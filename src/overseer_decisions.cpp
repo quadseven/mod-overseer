@@ -18593,6 +18593,9 @@ std::string GuildRunAbsentWhy(std::vector<GuildRunAbsentMember> const& members)
     return why;
 }
 
+// Bit i of a mask is encounterIndex i (0-based): the masks are built as
+// 1u << dbcEntry->encounterIndex, so the index returned here is the one
+// EncounterName compares against encounterIndex, with no offset.
 int GuildRunNextBossIndex(std::uint32_t expectedMask, std::uint32_t creditedMask)
 {
     std::uint32_t const left = expectedMask & ~creditedMask;
