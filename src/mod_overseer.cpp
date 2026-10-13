@@ -38831,8 +38831,10 @@ private:
 
     // Each of the run's members with where it stands, for OverseerDecisions::
     // GuildRunAbsentWhy. `instanceId` 0 counts any copy of the run's map.
-    // `seatsOnly` keeps only a tank or healer that is not alive in the copy:
-    // the members a missing-role verdict is about.
+    // `seatsOnly` keeps only a tank or healer that is not both alive and
+    // inside the copy: one dead inside, or one anywhere outside it whatever
+    // its state (alive in combat, other map, not in world). Those are the
+    // members a missing-role verdict is about.
     std::vector<OverseerDecisions::GuildRunAbsentMember> GuildRunAbsentees(
         GuildRun const& run, uint32 instanceId, bool seatsOnly) const
     {
