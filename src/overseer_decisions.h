@@ -16517,6 +16517,14 @@ enum class RaidPullRepairAction { Ignore, Hold, Resume, TimedOut };
 RaidPullRepairAction RaidPullRepairDecision(unsigned bossesDone, bool anySeatBelowFloor,
                                             long heldSeconds, long maximumHoldSeconds);
 
+// The same gate fed with each readable seat's lowest durability percentage, as
+// the run sees them: any seat under the floor holds, and the time limit ends
+// the hold with TimedOut (not Resume) so the run can log which one it was.
+RaidPullRepairAction RaidPullRepairForSeats(unsigned bossesDone,
+                                            std::vector<unsigned> const& seatLowestPcts,
+                                            unsigned floorPct, long heldSeconds,
+                                            long maximumHoldSeconds);
+
 // One poll of the raid run.
 //
 // THE ORDER OF THE CHECKS IS THE ORDER OF THE THINGS THAT OVERRIDE EACH OTHER.

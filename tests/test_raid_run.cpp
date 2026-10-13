@@ -37,6 +37,7 @@ using OverseerDecisions::RaidRunFacts;
 using OverseerDecisions::RaidSeatNeedsRepair;
 using OverseerDecisions::RaidPullRepairAction;
 using OverseerDecisions::RaidPullRepairDecision;
+using OverseerDecisions::RaidPullRepairForSeats;
 using OverseerDecisions::RaidRunPhase;
 using OverseerDecisions::RaidRunPhaseName;
 using OverseerDecisions::RaidRunStep;
@@ -77,6 +78,27 @@ void OnlyMajordomoAndRagnarosPullsWaitForRepair()
           RaidPullRepairDecision(7, true, 10, 300) == RaidPullRepairAction::Ignore);
     Check("first boss pull does not hold",
           RaidPullRepairDecision(0, true, 10, 300) == RaidPullRepairAction::Ignore);
+}
+
+// The run feeds each readable seat's lowest durability to the gate; this is
+// the decision the pull acts on, including the timeout that must be logged as
+// a timeout and not as every seat having repaired.
+void ThePullHoldReadsEverySeat()
+{
+    std::vector<unsigned> const mixed = {100, 69, 90};
+    std::vector<unsigned> const healthy = {100, 70, 90};
+    Check("one seat under the floor holds Majordomo",
+          RaidPullRepairForSeats(8, mixed, 70, 10, 300) == RaidPullRepairAction::Hold);
+    Check("one seat under the floor holds Ragnaros",
+          RaidPullRepairForSeats(9, mixed, 70, 10, 300) == RaidPullRepairAction::Hold);
+    Check("seats at the floor resume the pull",
+          RaidPullRepairForSeats(9, healthy, 70, 10, 300) == RaidPullRepairAction::Resume);
+    Check("the time limit ends the hold as TimedOut",
+          RaidPullRepairForSeats(9, mixed, 70, 300, 300) == RaidPullRepairAction::TimedOut);
+    Check("a mid-raid boss never holds",
+          RaidPullRepairForSeats(4, mixed, 70, 10, 300) == RaidPullRepairAction::Ignore);
+    Check("no readable seats resume",
+          RaidPullRepairForSeats(8, {}, 70, 10, 300) == RaidPullRepairAction::Resume);
 }
 
 void CheckString(char const* what, std::string const& got, std::string const& want)
@@ -314,6 +336,7 @@ int main()
 {
     TheRepairFloorIsStrictAndConfigurable();
     OnlyMajordomoAndRagnarosPullsWaitForRepair();
+    ThePullHoldReadsEverySeat();
     TheMoltenCoreDoorIsTheWorldsOwnNumbers();
     OnlyAnExactRaidJobNamesADoor();
     NoOrderIsIdleAndAnEndedOrderReleases();

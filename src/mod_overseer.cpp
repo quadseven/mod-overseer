@@ -46139,6 +46139,7 @@ private:
                                          bossesDone, true,
                                          long(std::time(nullptr) - run.repairHoldSince), 300) ==
                                      OverseerDecisions::RaidPullRepairAction::TimedOut;
+                std::vector<unsigned> seatPcts;
                 for (auto const& [name, subgroup] : seats)
                 {
                     (void)subgroup;
@@ -46146,6 +46147,7 @@ private:
                     if (!member || !member->IsInWorld())
                         continue;
                     uint32 const pct = LowestDurabilityPct(member);
+                    seatPcts.push_back(pct);
                     if (!OverseerDecisions::RaidSeatNeedsRepair(pct, repairFloor))
                         continue;
                     if (repairHoldTimedOut)
@@ -46181,8 +46183,8 @@ private:
                                  roster.family, name, bossesDone + 1, afterPct,
                                  answer ? answer : "repair was partial or unaffordable");
                 }
-                auto const action = OverseerDecisions::RaidPullRepairDecision(
-                    bossesDone, repairHold,
+                auto const action = OverseerDecisions::RaidPullRepairForSeats(
+                    bossesDone, seatPcts, repairFloor,
                     long(std::time(nullptr) - run.repairHoldSince), 300);
                 if (!run.repairHoldDecisionSaid &&
                     action != OverseerDecisions::RaidPullRepairAction::Hold)

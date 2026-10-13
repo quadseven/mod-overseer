@@ -13538,6 +13538,18 @@ RaidPullRepairAction RaidPullRepairDecision(unsigned bossesDone, bool anySeatBel
                                               : RaidPullRepairAction::Hold;
 }
 
+RaidPullRepairAction RaidPullRepairForSeats(unsigned bossesDone,
+                                            std::vector<unsigned> const& seatLowestPcts,
+                                            unsigned floorPct, long heldSeconds,
+                                            long maximumHoldSeconds)
+{
+    bool anyBelow = false;
+    for (unsigned const pct : seatLowestPcts)
+        if (RaidSeatNeedsRepair(pct, floorPct))
+            anyBelow = true;
+    return RaidPullRepairDecision(bossesDone, anyBelow, heldSeconds, maximumHoldSeconds);
+}
+
 bool RaidGhostMayBeWalked(long ghostSeconds)
 {
     return ghostSeconds < RAID_RUNBACK_WAIT_SECONDS;
