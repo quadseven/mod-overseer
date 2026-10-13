@@ -7469,6 +7469,10 @@ void RestoreGuildRunFinderDungeons()
 // Logouts on a shared account that cleared only their own character's online
 // flag (wow-overseer#874). OverseerDatabaseScript counts them; the world
 // update says the count every PRESENCE_SUMMARY_MS and starts it again.
+// It needs no cap: logouts run from session updates inside the same world
+// update that drains it, so it cannot climb while the timer stalls, and a
+// uint32 would wrap only after some 4 billion logouts in one ten-minute
+// window.
 static std::atomic<uint32> g_characterOnlyLogouts{0};
 static constexpr uint32 PRESENCE_SUMMARY_MS = 10 * 60 * 1000;
 
