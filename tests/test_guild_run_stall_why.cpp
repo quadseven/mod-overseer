@@ -128,6 +128,14 @@ void TheTimedOutWhySaysWhereItStalled()
     CheckSays("no next boss read", GuildRunTimedOutWhy(7201, "", true, 30),
               "inside for 7201s; next boss unknown, last kill 0 min ago");
 
+    CheckSays("a kill this very second is 0 min ago", GuildRunTimedOutWhy(7200, "Gelihast", true, 0),
+              "inside for 7200s; next Gelihast, last kill 0 min ago");
+    CheckSays("59 s floors to 0 min and 60 s is 1 min",
+              GuildRunTimedOutWhy(7200, "Gelihast", true, 59) + "|" +
+                  GuildRunTimedOutWhy(7200, "Gelihast", true, 60),
+              "inside for 7200s; next Gelihast, last kill 0 min ago|"
+              "inside for 7200s; next Gelihast, last kill 1 min ago");
+
     Check("the next boss is the lowest expected bit not credited",
           GuildRunNextBossIndex(0x7Fu, 0x0Bu) == 2);
     Check("nothing expected has no next boss", GuildRunNextBossIndex(0, 0) == -1);
