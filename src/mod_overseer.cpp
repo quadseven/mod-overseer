@@ -41889,6 +41889,8 @@ private:
                     if (OverseerDecisions::ReadCrossingBerthClaim(sinceRefused, refusalSeconds) ==
                         OverseerDecisions::CrossingBerthClaim::StandBack)
                     {
+                        // Read once: the reason both picks how the attempt
+                        // ended and is named in the stand-back line below.
                         std::string const refused = _travelAims.RefusedReason(leaderName);
                         if (CrossingAttemptEnded(
                                 coord, leaderName, leader, portal,
