@@ -218,6 +218,15 @@
 #        Default:     0
 #
 #Overseer.Raid.ConvertRosterParty = 0
+
+#    Overseer.Raid.RepairFloorPct
+#        Description: Before forming an ordered raid, repair each seated
+#                     character whose lowest wearable item is below this
+#                     durability percentage. Repairs use that character's own
+#                     purse. Set to 0 to disable the floor check.
+#        Default:     70
+#
+#Overseer.Raid.RepairFloorPct = 70
 #
 ########################################
 #
