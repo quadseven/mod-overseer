@@ -39,6 +39,8 @@ int main()
     Check("padded zero entry is rejected", ParseEquipCommand("e Hitem:000:0:0", parsed), false);
     Check("padded entry parses", ParseEquipCommand("e Hitem:0015211:0", parsed) && parsed.entry == 15211, true);
     Check("overflowing entry is rejected", ParseEquipCommand("e Hitem:999999999999999999999999", parsed), false);
+    Check("largest uint32 entry parses", ParseEquipCommand("e Hitem:4294967295:0", parsed) && parsed.entry == 4294967295u, true);
+    Check("entry past uint32 is rejected", ParseEquipCommand("e Hitem:4294967296:0", parsed), false);
     Check("trailing command text is rejected", ParseEquipCommand("e Hitem:15211 junk", parsed), false);
 
     EquipRefusal refusal = EquipRefused("EQUIP_ERR_CANT_EQUIP 29");

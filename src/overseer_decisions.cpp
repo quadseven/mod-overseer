@@ -46,7 +46,10 @@ bool ParseEquipCommand(std::string const& command, EquipCommand& out)
     try
     {
         unsigned long const value = std::stoul(command.substr(8, end - 8));
-        // An item template entry is never zero, with or without a link suffix.
+        // An item template entry is never zero, with or without a link suffix,
+        // so `e Hitem:0` is a malformed link, not a real item. A digit run too
+        // long for unsigned long throws out_of_range (caught below); one that
+        // fits a 64-bit long but not uint32 is refused by the bound here.
         if (value == 0 || value > UINT32_MAX)
             return false;
         out.entry = static_cast<uint32_t>(value);
