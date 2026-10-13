@@ -21005,6 +21005,80 @@ GuildRunVerdict GuildRunNext(GuildRunPoll const& poll);
 // "running", "cleared", "wiped", "abandoned", "timed out".
 char const* GuildRunVerdictWord(GuildRunVerdict verdict);
 
+// WHO WAS MISSING AND WHERE IT STALLED (issue 936). 73 guild runs timed out in
+// a day and the row said only "inside for 7200s"; 21 were abandoned and said
+// only "not both alive inside for 300s". The worldserver log holds minutes, so
+// the stall point of any older run was lost, and the finder's wait never named
+// the member it waited on. These words go in the queued poll's log line, the
+// abandoned and timed-out `why`, and (the stall half) the run's heartbeat.
+
+// "tank", "healer", "dps".
+char const* GuildSeatWord(GuildSeat seat);
+
+enum class GuildRunSeatState : std::uint8_t
+{
+    Inside,      // alive in the run's copy and not in combat
+    NotInWorld,
+    Dead,
+    InCombat,
+    OtherMap,    // alive, not in combat, not in the run's copy (another map,
+                 // or another copy of the dungeon's)
+};
+
+// "inside", "not in world", "dead", "in combat", "other map".
+char const* GuildRunSeatStateWord(GuildRunSeatState state);
+
+struct GuildRunSeatFacts
+{
+    std::string name;
+    GuildSeat seat{GuildSeat::Damage};
+    bool inWorld{false};
+    bool alive{false};
+    bool inCombat{false};
+    // On the dungeon's map, in the run's copy of it.
+    bool inRunCopy{false};
+};
+
+// The first that holds: not in world, dead, in combat, not in the run's copy.
+// So the first three are exactly what FinderPollFacts::anyoneNotReady counts.
+GuildRunSeatState GuildRunSeatStateOf(GuildRunSeatFacts const& facts);
+
+// THE FINDER'S WAIT: every member that is not in world, dead or in combat, as
+// "'X' (healer): in combat, 'Y' (dps): dead"; "" when there is none.
+std::string GuildFinderWaitWords(std::vector<GuildRunSeatFacts> const& seats);
+
+// THE MISSING: every member that is not alive in the run's copy, the same way
+// ("'X' (healer): in combat" is a healer alive outside the copy, fighting);
+// "" when there is none. A member alive in the copy is never named, fighting
+// or not.
+std::string GuildRunMissingWords(std::vector<GuildRunSeatFacts> const& seats);
+
+// An Abandoned run's `why`: the group is gone, nobody has been inside for
+// `secondsEmpty`, or the tank and healer were not both alive inside for
+// `secondsWithoutRoles` (as GuildRunNext asks them), then "; missing " and
+// GuildRunMissingWords when that names anybody.
+std::string GuildRunAbandonedWhy(GuildRunPoll const& poll,
+                                 std::vector<GuildRunSeatFacts> const& seats);
+
+// Where a run stands against its bosses.
+struct GuildRunStall
+{
+    // The first boss, by encounter index, that the run expects and the core
+    // has not credited; "" when unknown or none is left.
+    std::string nextBoss;
+    // A boss kill was seen, and how long ago.
+    bool killSeen{false};
+    unsigned secondsSinceKill{0};
+};
+
+// "next Gelihast, last kill 95 min ago"; whole minutes, rounded down. No
+// kill seen says "no boss kill seen"; an empty `nextBoss` leaves "next X, "
+// out.
+std::string GuildRunStallWords(GuildRunStall const& stall);
+
+// A TimedOut run's `why`: "inside for 7200s; " and GuildRunStallWords.
+std::string GuildRunTimedOutWhy(GuildRunPoll const& poll, GuildRunStall const& stall);
+
 // THE ENCOUNTERS A GUILD RUN MUST CREDIT BEFORE IT IS CLEARED. `mapMask` is
 // every bit the map's DungeonEncounter.dbc rows credit; `brainMask` the bits
 // mod-dungeon-clear's roster is armed for in this copy, 0 when unread. As
@@ -21295,6 +21369,13 @@ struct GuildRunResume
     unsigned secondsInside{0};
     unsigned deaths{0};
     unsigned ilvlStart{0};
+    // The run's boss count, and whether a kill had been seen and how long
+    // before the row was written (GuildRunJson's bosses_done and
+    // seconds_since_kill). killSeen is false when seconds_since_kill is null,
+    // absent (a row written before it rode the heartbeat) or not a number.
+    unsigned bossesDone{0};
+    bool killSeen{false};
+    unsigned secondsSinceKill{0};
     // What the run's members had looted when the row was last written
     // (GuildRunJson's loot_items and loot_notable); 0 and none for a row
     // written before the tally rode the heartbeat.

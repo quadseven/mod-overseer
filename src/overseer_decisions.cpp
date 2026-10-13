@@ -18234,6 +18234,14 @@ GuildRunResume ReadGuildRunResume(std::string const& result)
     resume.secondsInside = GuildRunJsonUnsigned(head, "seconds_inside");
     resume.deaths = GuildRunJsonUnsigned(head, "deaths");
     resume.ilvlStart = GuildRunJsonUnsigned(head, "ilvl_start");
+    resume.bossesDone = GuildRunJsonUnsigned(head, "bosses_done");
+    {
+        std::size_t const at = GuildRunJsonValueAt(head, "seconds_since_kill");
+        resume.killSeen = at != std::string::npos && at < head.size() && head[at] >= '0' &&
+                          head[at] <= '9';
+        if (resume.killSeen)
+            resume.secondsSinceKill = GuildRunJsonUnsigned(head, "seconds_since_kill");
+    }
     resume.lootItems = GuildRunJsonUnsigned(head, "loot_items");
     {
         std::size_t at = GuildRunJsonValueAt(head, "loot_notable");
@@ -18533,6 +18541,110 @@ char const* GuildRunVerdictWord(GuildRunVerdict verdict)
         case GuildRunVerdict::TimedOut:  return "timed out";
     }
     return "unknown";
+}
+
+char const* GuildSeatWord(GuildSeat seat)
+{
+    switch (seat)
+    {
+        case GuildSeat::Tank:   return "tank";
+        case GuildSeat::Healer: return "healer";
+        case GuildSeat::Damage: return "dps";
+    }
+    return "dps";
+}
+
+char const* GuildRunSeatStateWord(GuildRunSeatState state)
+{
+    switch (state)
+    {
+        case GuildRunSeatState::Inside:     return "inside";
+        case GuildRunSeatState::NotInWorld: return "not in world";
+        case GuildRunSeatState::Dead:       return "dead";
+        case GuildRunSeatState::InCombat:   return "in combat";
+        case GuildRunSeatState::OtherMap:   return "other map";
+    }
+    return "unknown";
+}
+
+GuildRunSeatState GuildRunSeatStateOf(GuildRunSeatFacts const& facts)
+{
+    if (!facts.inWorld)
+        return GuildRunSeatState::NotInWorld;
+    if (!facts.alive)
+        return GuildRunSeatState::Dead;
+    if (facts.inCombat)
+        return GuildRunSeatState::InCombat;
+    if (!facts.inRunCopy)
+        return GuildRunSeatState::OtherMap;
+    return GuildRunSeatState::Inside;
+}
+
+namespace
+{
+// "'X' (healer): in combat", joined with ", ".
+void AppendSeatWords(std::string& out, GuildRunSeatFacts const& facts)
+{
+    if (!out.empty())
+        out += ", ";
+    out += "'" + facts.name + "' (" + GuildSeatWord(facts.seat) +
+           "): " + GuildRunSeatStateWord(GuildRunSeatStateOf(facts));
+}
+}  // namespace
+
+std::string GuildFinderWaitWords(std::vector<GuildRunSeatFacts> const& seats)
+{
+    std::string out;
+    for (GuildRunSeatFacts const& facts : seats)
+    {
+        GuildRunSeatState const state = GuildRunSeatStateOf(facts);
+        if (state == GuildRunSeatState::NotInWorld || state == GuildRunSeatState::Dead ||
+            state == GuildRunSeatState::InCombat)
+            AppendSeatWords(out, facts);
+    }
+    return out;
+}
+
+std::string GuildRunMissingWords(std::vector<GuildRunSeatFacts> const& seats)
+{
+    std::string out;
+    for (GuildRunSeatFacts const& facts : seats)
+        if (!(facts.inWorld && facts.alive && facts.inRunCopy))
+            AppendSeatWords(out, facts);
+    return out;
+}
+
+std::string GuildRunAbandonedWhy(GuildRunPoll const& poll,
+                                 std::vector<GuildRunSeatFacts> const& seats)
+{
+    std::string why;
+    if (poll.groupGone)
+        why = "the group is gone";
+    else if (!poll.inside)
+        why = "nobody has been inside for " + std::to_string(poll.secondsEmpty) + "s";
+    else
+        why = "the assigned tank and healer roles were not both alive inside for " +
+              std::to_string(poll.secondsWithoutRoles) + "s";
+    std::string const missing = GuildRunMissingWords(seats);
+    if (!missing.empty())
+        why += "; missing " + missing;
+    return why;
+}
+
+std::string GuildRunStallWords(GuildRunStall const& stall)
+{
+    std::string out;
+    if (!stall.nextBoss.empty())
+        out = "next " + stall.nextBoss + ", ";
+    out += stall.killSeen
+               ? "last kill " + std::to_string(stall.secondsSinceKill / 60) + " min ago"
+               : std::string("no boss kill seen");
+    return out;
+}
+
+std::string GuildRunTimedOutWhy(GuildRunPoll const& poll, GuildRunStall const& stall)
+{
+    return "inside for " + std::to_string(poll.secondsInside) + "s; " + GuildRunStallWords(stall);
 }
 
 std::uint32_t GuildRunExpectedMask(std::uint32_t mapId, std::uint32_t mapMask,
