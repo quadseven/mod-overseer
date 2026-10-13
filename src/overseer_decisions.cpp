@@ -7156,6 +7156,12 @@ CrossingBerthClaim ReadCrossingBerthClaim(std::int64_t sinceRefused,
                                                               : CrossingBerthClaim::Claim;
 }
 
+CrossingAttemptEnd CrossingRefusalEnd(std::string const& reason)
+{
+    return reason == NoProgressBackoffReason ? CrossingAttemptEnd::NoProgressBackoff
+                                             : CrossingAttemptEnd::Refused;
+}
+
 DockReading ReadDock(std::uint32_t pathProgressMs, std::uint32_t periodMs,
                      std::vector<TransportStop> const& stops)
 {

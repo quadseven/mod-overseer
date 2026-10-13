@@ -8610,6 +8610,13 @@ enum class CrossingBerthClaim : std::uint8_t
 CrossingBerthClaim ReadCrossingBerthClaim(std::int64_t sinceRefused,
                                           std::int64_t refusalSeconds);
 
+// The reason the travel drive's no-progress backoff refuses an aim with, and
+// how the crossing's stand-back reads a refusal's reason: that backoff is
+// NoProgressBackoff, anything else (deaths) is Refused.
+constexpr char const* NoProgressBackoffReason =
+    "repeated no-progress releases; bounded backoff is active";
+CrossingAttemptEnd CrossingRefusalEnd(std::string const& reason);
+
 // ------------------------------------------- is the transport docked (#303) --
 //
 // A MotionTransport stands still at a stop frame for exactly the interval

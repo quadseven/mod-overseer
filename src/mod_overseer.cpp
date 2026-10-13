@@ -25550,7 +25550,7 @@ private:
                                  name, TRAVEL_STUCK_BACKOFF_RELEASES, target,
                                  static_cast<uint32>(TRAVEL_STUCK_BACKOFF_SECONDS / 60));
                         _travelAims.Refuse(name, target,
-                                           "repeated no-progress releases; bounded backoff is active");
+                                           OverseerDecisions::NoProgressBackoffReason);
                     }
                     LOG_WARN("module.overseer",
                              "overseer: '{}' was sent to '{}' and in {}s got no {} yards nearer, no further along its route and covered under {} yards of ground - releasing the errand, on the ground where it stands",
@@ -42014,11 +42014,8 @@ private:
                         // Read once: the reason both picks how the attempt
                         // ended and is named in the stand-back line below.
                         std::string const refused = _travelAims.RefusedReason(leaderName);
-                        if (CrossingAttemptEnded(
-                                coord, leaderName, leader, portal,
-                                refused.find("no-progress") != std::string::npos
-                                    ? OverseerDecisions::CrossingAttemptEnd::NoProgressBackoff
-                                    : OverseerDecisions::CrossingAttemptEnd::Refused))
+                        if (CrossingAttemptEnded(coord, leaderName, leader, portal,
+                                                 OverseerDecisions::CrossingRefusalEnd(refused)))
                             break;
                         coord.crossingSince = 0;
                         if (!attempts.saidStandBack)

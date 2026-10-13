@@ -21,8 +21,11 @@ using OverseerDecisions::CrossingAttemptReading;
 using OverseerDecisions::CrossingAttempts;
 using OverseerDecisions::CrossingAttemptVerdict;
 using OverseerDecisions::CrossingBerthClaim;
+using OverseerDecisions::CrossingAttemptEnd;
 using OverseerDecisions::CrossingHandedBack;
+using OverseerDecisions::CrossingRefusalEnd;
 using OverseerDecisions::EndCrossingAttempt;
+using OverseerDecisions::NoProgressBackoffReason;
 using OverseerDecisions::OpenCrossingAttempt;
 using OverseerDecisions::ReadCrossingBerthClaim;
 
@@ -172,6 +175,49 @@ int main()
               ReadCrossingBerthClaim(12 * MINUTE, backoff) == CrossingBerthClaim::StandBack);
         Check("an aim whose refusal has run out is claimed again",
               ReadCrossingBerthClaim(backoff, backoff) == CrossingBerthClaim::Claim);
+    }
+
+    // THE GATE ITSELF, poll by poll, as the IDLE crossing runs it: a claim
+    // opens an attempt; a poll that reads StandBack ends it, by the reason the
+    // travel drive refused with, and claims nothing; the polls after it in the
+    // same refusal count nothing more; the claim after the refusal has run out
+    // is the second attempt.
+    {
+        Check("the no-progress backoff's own reason reads as the backoff",
+              CrossingRefusalEnd(NoProgressBackoffReason) ==
+                  CrossingAttemptEnd::NoProgressBackoff);
+        Check("a refusal for deaths reads as a plain refusal",
+              CrossingRefusalEnd("died 3 times on the way") == CrossingAttemptEnd::Refused);
+
+        std::int64_t const backoff = 15 * MINUTE;
+        std::int64_t const refusedAt = START + 4 * MINUTE;
+        CrossingAttempts record;
+        int claims = 0;
+        CrossingAttemptReading last;
+        // One poll every five seconds from START until the second refusal
+        // has stood back for a minute.
+        std::int64_t const secondRefusedAt = refusedAt + backoff + 4 * MINUTE;
+        for (std::int64_t now = START; now < secondRefusedAt + MINUTE; now += 5)
+        {
+            std::int64_t const sinceRefused = now < refusedAt ? -1
+                                              : now < secondRefusedAt ? now - refusedAt
+                                                                      : now - secondRefusedAt;
+            if (ReadCrossingBerthClaim(sinceRefused, backoff) == CrossingBerthClaim::StandBack)
+            {
+                CrossingAttemptReading const ended = EndCrossingAttempt(record, now, limits);
+                if (ended.counted)
+                    last = ended;
+                continue;
+            }
+            ++claims;
+            OpenCrossingAttempt(record, DUNGEON, BERTH, 3100.f, now);
+        }
+        Check("no poll claims the berth aim while the travel drive refuses it",
+              claims == static_cast<int>((refusedAt - START) / 5 +
+                                         (secondRefusedAt - (refusedAt + backoff)) / 5));
+        Check("the second refusal gives the dungeon up",
+              last.verdict == CrossingAttemptVerdict::GiveUp && last.attempts == 2 &&
+                  CrossingHandedBack(record, DUNGEON, secondRefusedAt) == limits.cooloffSeconds);
     }
 
     if (failures)
