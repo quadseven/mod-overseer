@@ -21005,6 +21005,52 @@ GuildRunVerdict GuildRunNext(GuildRunPoll const& poll);
 // "running", "cleared", "wiped", "abandoned", "timed out".
 char const* GuildRunVerdictWord(GuildRunVerdict verdict);
 
+// WHERE A GUILD RUN STALLED, IN WORDS. A run row used to say only "inside for
+// 7200s", and the worldserver log holds minutes, so an older stall was lost.
+// These build the words the queued poll log, the abandoned and timed-out `why`
+// and the run's heartbeat carry. GuildRunVerdictWord is unchanged.
+//
+// Why one seat is not where the run needs it, most specific first.
+enum class GuildSeatState : std::uint8_t
+{
+    Present,     // inside the run's copy, alive and not in combat
+    NotInWorld,
+    Dead,
+    InCombat,
+    OtherMap,    // in the world, not in the dungeon's copy
+};
+
+// "present", "not in world", "dead", "in combat", "other map".
+char const* GuildSeatStateWord(GuildSeatState state);
+
+// "tank", "healer", "dps".
+char const* GuildSeatWord(GuildSeat seat);
+
+struct GuildRunSeatReport
+{
+    std::string name;
+    GuildSeat seat{GuildSeat::Damage};
+    GuildSeatState state{GuildSeatState::Present};
+};
+
+// The seats not Present, as "'X' (healer) never came inside: in combat; 'Y'
+// (dps) never came inside: dead"; empty when every seat is Present.
+std::string GuildRunAbsentWords(std::vector<GuildRunSeatReport> const& seats);
+
+// "next Gelihast, last kill 95 min ago". An empty `nextBoss` leaves the first
+// half out ("next" is unknown, not none); a run with no kill yet says "no boss
+// killed yet". `secondsSinceKill` is read only when `killed` is true.
+std::string GuildRunStallWords(std::string const& nextBoss, bool killed,
+                               unsigned secondsSinceKill);
+
+// The abandoned run's `why`: the group is gone, nobody was inside, or the
+// tank and healer were not both alive inside, each followed by `absent`
+// (GuildRunAbsentWords) when it names someone.
+std::string GuildRunAbandonedWhy(GuildRunPoll const& poll, std::string const& absent);
+
+// "inside for 7200s; next Gelihast, last kill 95 min ago".
+std::string GuildRunTimedOutWhy(unsigned secondsInside, std::string const& stall);
+
 // THE ENCOUNTERS A GUILD RUN MUST CREDIT BEFORE IT IS CLEARED. `mapMask` is
 // every bit the map's DungeonEncounter.dbc rows credit; `brainMask` the bits
 // mod-dungeon-clear's roster is armed for in this copy, 0 when unread. As
