@@ -53557,7 +53557,9 @@ private:
     // Under a real client login on a GM account it would run any of them,
     // `.additem` and `.levelup` included, which is a grant to a member by
     // remote. A human at a client who needs a dot-command types it; this
-    // module does not carry one.
+    // module does not carry one. So it takes no character and no command, and
+    // the row is answered with the caller's default status, `error`, and this
+    // reason: nothing was delivered, so nothing reports `delivered`.
     static char const* DoGmCommand()
     {
         return "kind='gm' is retired: this module runs no dot-command on any character, "
@@ -59087,8 +59089,9 @@ private:
             player->InitTaxiNodesForLevel();
         }
 
-        // A new character's purse, and never more than this one held: a
-        // reset takes back, it does not pay out.
+        // The lower of a new character's purse and what this one held: a
+        // reset takes back, it does not pay out, so a purse below the start
+        // stays where it is.
         // natural-only: the operator's reset (kind='naturalize', Overseer.Natural.Enabled off by
         // default, never a family character) remakes a guild bot as a new character; this is that
         // new character's start, never more than it held.

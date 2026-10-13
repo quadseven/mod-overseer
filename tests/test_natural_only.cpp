@@ -219,7 +219,9 @@ struct Finding
 };
 
 // A cheap first pass: std::regex is slow, and nearly every line names none
-// of these. Every pattern above contains one of these words.
+// of these. Every pattern above contains one of these words: "XP" is in
+// PLAYER_XP, "Talents" in InitTalentsBySpecNo and InitTalentsTree, "pell" in
+// every spell call, and the self-test below finds each pattern through it.
 bool MayGrant(Line const& line)
 {
     static char const* const code[] = {
@@ -302,6 +304,12 @@ void SelfTest()
            "a bare reputation set is found");
     Expect(Unmarked("    PlayerbotFactory factory(bot, 60);\n").size() == 1, "the bot factory is found");
     Expect(Unmarked("    bot->SetUInt32Value(PLAYER_XP, 0);\n").size() == 1, "an experience set is found");
+    Expect(Unmarked("    factory.InitTalentsTree(true);\n").size() == 1, "a talent tree applied is found");
+    Expect(Unmarked("    factory.InitTalentsBySpecNo(bot, 1, true);\n").size() == 1,
+           "a talent spec applied is found");
+    Expect(Unmarked("    player->TeachSpell(133);\n").size() == 1, "a spell taught is found");
+    Expect(Unmarked("    player->SetSkill(129, 1, 75, 75);\n").size() == 1, "a skill set is found");
+    Expect(Unmarked("    handler.ParseCommands(\".additem 1\");\n").size() == 1, "a dot-command is found");
     Expect(Unmarked("    Execute(\"INSERT INTO character_inventory (guid) VALUES (1)\");\n").size() == 1,
            "a direct inventory write is found");
     Expect(Unmarked("    Execute(\"UPDATE characters SET money = 1\");\n").size() == 1,
@@ -322,6 +330,14 @@ void SelfTest()
            "a call named in a block comment is not a call");
     Expect(Unmarked("    Log(\"refused ->TeleportTo( here\");\n").empty(),
            "a call named in a string is not a call");
+    // Each literal closes and the code after it is read again: a lexer that
+    // stayed inside one would blank the call that follows.
+    Expect(Unmarked("    Log(\"a \\\"quoted\\\" word\"); bot->TeleportTo(0, 1.f);\n").size() == 1,
+           "the code after a string literal is read");
+    Expect(Unmarked("    char q = '\"'; bot->TeleportTo(0, 1.f);\n").size() == 1,
+           "the code after a character literal is read");
+    Expect(Unmarked("    Log(R\"x(a \"quote\" inside)x\"); bot->TeleportTo(0, 1.f);\n").size() == 1,
+           "the code after a raw string is read");
     Expect(Unmarked("    Query(\"SELECT skill FROM character_skills\");\n").empty(), "a read is not a write");
     Expect(Unmarked("    bool CanStoreNewItem(int);\n    bot->CanStoreNewItem(1);\n").empty(),
            "asking whether an item fits is not a grant");
