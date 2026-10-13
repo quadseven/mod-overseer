@@ -1,8 +1,9 @@
 /*
  * The raid run's first slice: which door, which job arms it, how one poll
  * moves FORM -> ASSEMBLE -> ENTER -> INSIDE, who is knocked through the door in
- * which order, and that the dungeon brain is never armed on a raid map this
- * slice did not order cleared.
+ * which order, that the dungeon brain is never armed on a raid map this
+ * slice did not order cleared, and who is summoned at the mountain's meeting
+ * stones once the raid has walked in (#922).
  *
  * WHAT THIS FILE PROTECTS, because "the machine steps" is not it:
  *
@@ -27,10 +28,13 @@
 #include <string>
 #include <vector>
 
+using OverseerDecisions::ChooseRaidStoneSummon;
 using OverseerDecisions::DungeonClearMayArmHere;
 using OverseerDecisions::RAID_ASSEMBLE_WAIT_SECONDS;
 using OverseerDecisions::RAID_ENTER_WAIT_SECONDS;
 using OverseerDecisions::RAID_FORM_WAIT_SECONDS;
+using OverseerDecisions::RAID_STONE_SUMMON_AFTER_SECONDS;
+using OverseerDecisions::RAID_STONE_SUMMON_TRIES;
 using OverseerDecisions::RaidDoor;
 using OverseerDecisions::RaidDoorFor;
 using OverseerDecisions::RaidKeywordForJob;
@@ -45,6 +49,9 @@ using OverseerDecisions::RaidPullSeatStep;
 using OverseerDecisions::RaidRunPhase;
 using OverseerDecisions::RaidRunPhaseName;
 using OverseerDecisions::RaidRunStep;
+using OverseerDecisions::RaidStone;
+using OverseerDecisions::RaidStoneSeat;
+using OverseerDecisions::RaidStoneSummon;
 using OverseerDecisions::StepRaidRun;
 
 namespace
@@ -392,6 +399,156 @@ void InsideHoldsAndLetsStragglersThrough()
     Check("and the brain is not armed on arrival", !inside.armClear);
 }
 
+// A raid member in the world, alive, movable, nowhere near the door.
+RaidStoneSeat Seat(char const* name, unsigned level)
+{
+    RaidStoneSeat seat;
+    seat.name = name;
+    seat.inWorld = true;
+    seat.alive = true;
+    seat.summonable = true;
+    seat.level = level;
+    return seat;
+}
+
+RaidStoneSeat AtStone(char const* name, unsigned level, int stone)
+{
+    RaidStoneSeat seat = Seat(name, level);
+    seat.atStone = stone;
+    return seat;
+}
+
+// The two Blackrock Mountain stones as the dev realm's templates read them.
+std::vector<RaidStone> Stones()
+{
+    RaidStone high;
+    high.entry = 179587;
+    high.minLevel = 55;
+    RaidStone low;
+    low.entry = 179586;
+    low.minLevel = 48;
+    return {high, low};
+}
+
+void TheDoorNamesTheMountainsTwoStones()
+{
+    RaidDoor const* door = RaidDoorFor("moltencore");
+    if (!door)
+        return;
+    Check("the level 55 stone", door->meetingStones[0] == 179587);
+    Check("the level 48 stone", door->meetingStones[1] == 179586);
+    CheckString("named for the log", door->stonesName, "Blackrock Mountain");
+}
+
+void StragglersAreSummonedOnlyAfterTheWalk()
+{
+    RaidRunFacts facts = Ready();
+    facts.assembled = 30;
+    facts.heldSeconds = RAID_STONE_SUMMON_AFTER_SECONDS - 1;
+    RaidRunStep const walking = StepRaidRun(RaidRunPhase::Assemble, facts);
+    CheckPhase("still assembling", walking.phase, RaidRunPhase::Assemble);
+    Check("nobody is summoned while the raid is still walking in", !walking.summonStragglers);
+
+    facts.heldSeconds = RAID_STONE_SUMMON_AFTER_SECONDS;
+    RaidRunStep const late = StepRaidRun(RaidRunPhase::Assemble, facts);
+    CheckPhase("after the walk it still assembles", late.phase, RaidRunPhase::Assemble);
+    Check("and the stragglers are summoned", late.summonStragglers);
+
+    facts.headAssembled = false;
+    RaidRunStep const headAway = StepRaidRun(RaidRunPhase::Assemble, facts);
+    Check("not while the head is still walking to the door", !headAway.summonStragglers);
+    facts.headAssembled = true;
+
+    facts.assembled = facts.inWorld;
+    RaidRunStep const all = StepRaidRun(RaidRunPhase::Assemble, facts);
+    CheckPhase("everyone there enters", all.phase, RaidRunPhase::Enter);
+    Check("and nobody is summoned at ENTER", !all.summonStragglers);
+}
+
+void AStragglerIsSummonedByASeatAtTheStone()
+{
+    RaidStoneSeat head = AtStone("Grug", 60, 0);
+    head.head = true;
+    RaidStoneSeat atDoor = Seat("Annian", 60);
+    atDoor.assembled = true;
+    std::vector<RaidStoneSeat> seats{head, atDoor, Seat("Selie", 60),
+                                     AtStone("Bork", 60, 0), AtStone("Og", 52, 0)};
+    RaidStoneSummon const choice = ChooseRaidStoneSummon(seats, Stones());
+    Check("a summon is chosen", choice.summon);
+    CheckString("the seat away from the door", choice.straggler, "Selie");
+    CheckString("clicked by a seat at the stone, never the head", choice.clicker, "Bork");
+    CheckString("the portal by another seat there", choice.helper, "Og");
+    Check("at the stone they stand by", choice.stone == 0);
+
+    // One seat at the stone is not a ritual.
+    std::vector<RaidStoneSeat> alone{head, Seat("Selie", 60), AtStone("Bork", 60, 0)};
+    RaidStoneSummon const one = ChooseRaidStoneSummon(alone, Stones());
+    Check("one clicker summons nobody", !one.summon);
+
+    // Nobody away is nobody to summon.
+    std::vector<RaidStoneSeat> there{head, atDoor, AtStone("Bork", 60, 0),
+                                     AtStone("Og", 60, 0)};
+    Check("everyone at the door is nothing to do",
+          !ChooseRaidStoneSummon(there, Stones()).summon);
+
+    // A seat that cannot be moved is skipped for the next.
+    RaidStoneSeat dead = Seat("Annian", 60);
+    dead.alive = false;
+    RaidStoneSeat noAi = Seat("Selie", 60);
+    noAi.summonable = false;
+    RaidStoneSeat tried = Seat("Kaz", 60);
+    tried.tries = RAID_STONE_SUMMON_TRIES;
+    std::vector<RaidStoneSeat> skips{dead, noAi, tried, Seat("Mog", 60),
+                                     AtStone("Bork", 60, 0), AtStone("Og", 60, 0)};
+    RaidStoneSummon const next = ChooseRaidStoneSummon(skips, Stones());
+    CheckString("the dead, the unmovable and the tried out are passed over", next.straggler,
+                "Mog");
+}
+
+void TheStonesMinimumIsKeptForBothEnds()
+{
+    // A level 50 straggler cannot use the level 55 stone; at the 48 stone he can.
+    std::vector<RaidStoneSeat> high{Seat("Selie", 50), AtStone("Bork", 60, 0),
+                                    AtStone("Og", 60, 0)};
+    RaidStoneSummon const below = ChooseRaidStoneSummon(high, Stones());
+    Check("a seat below the stone's minimum is not summoned", !below.summon);
+    Check("and the reason says it keeps walking",
+          below.why.find("minimum") != std::string::npos);
+
+    // The minimum itself is enough, at either stone.
+    std::vector<RaidStoneSeat> atFloor{Seat("Selie", 55), AtStone("Bork", 60, 0),
+                                       AtStone("Og", 60, 0)};
+    RaidStoneSummon const exact = ChooseRaidStoneSummon(atFloor, Stones());
+    Check("a level 55 seat is summoned at the 55 stone", exact.summon && exact.stone == 0);
+    std::vector<RaidStoneSeat> atLowFloor{Seat("Selie", 48), AtStone("Bork", 60, 1),
+                                          AtStone("Og", 60, 1)};
+    RaidStoneSummon const lowExact = ChooseRaidStoneSummon(atLowFloor, Stones());
+    Check("a level 48 seat is summoned at the 48 stone",
+          lowExact.summon && lowExact.stone == 1);
+
+    std::vector<RaidStoneSeat> low{Seat("Selie", 50), AtStone("Bork", 60, 1),
+                                   AtStone("Og", 60, 1)};
+    RaidStoneSummon const lowStone = ChooseRaidStoneSummon(low, Stones());
+    Check("the 48 stone takes him", lowStone.summon && lowStone.stone == 1);
+
+    std::vector<RaidStoneSeat> floor{Seat("Selie", 47), AtStone("Bork", 60, 1),
+                                     AtStone("Og", 60, 1)};
+    Check("below every stone, he keeps walking",
+          !ChooseRaidStoneSummon(floor, Stones()).summon);
+
+    // The clicker is checked too; the portal's second clicker is not.
+    std::vector<RaidStoneSeat> clickers{Seat("Selie", 60), AtStone("Og", 52, 0),
+                                        AtStone("Bork", 60, 0)};
+    RaidStoneSummon const picked = ChooseRaidStoneSummon(clickers, Stones());
+    CheckString("a clicker below the stone does not click it", picked.clicker, "Bork");
+    CheckString("but may click the portal", picked.helper, "Og");
+
+    std::vector<RaidStoneSeat> lowClickers{Seat("Selie", 60), AtStone("Og", 52, 0),
+                                           AtStone("Kaz", 50, 0)};
+    Check("no clicker who meets the stone is no summon",
+          !ChooseRaidStoneSummon(lowClickers, Stones()).summon);
+}
+
 void ARaidMapIsNotArmedUntilClearingIsOrdered()
 {
     Check("a dungeon map arms as before", DungeonClearMayArmHere(false, false));
@@ -417,6 +574,10 @@ int main()
     TheHeadCrossesLast();
     InsideHoldsAndLetsStragglersThrough();
     ARaidMapIsNotArmedUntilClearingIsOrdered();
+    TheDoorNamesTheMountainsTwoStones();
+    StragglersAreSummonedOnlyAfterTheWalk();
+    AStragglerIsSummonedByASeatAtTheStone();
+    TheStonesMinimumIsKeptForBothEnds();
 
     if (failures)
     {

@@ -44879,6 +44879,20 @@ private:
         // How many ghosts the run-back walked on the last poll, so the line is
         // said when the number changes rather than every five seconds.
         unsigned runBackWalking{0};
+
+        // -- stragglers at the meeting stone (#922) --
+        // The kind='summon' row in flight, found again by its source, and who
+        // it named; empty when none is.
+        std::string stoneRowSource;
+        std::string stoneRowTarget;
+        std::string stoneRowClicker;
+        unsigned stoneRowEntry{0};
+        time_t stoneRowSince{0};
+        // Summons tried per straggler for the whole order.
+        std::map<std::string, unsigned> stoneTries;
+        // Why nobody was summoned, said when it changes.
+        std::string stoneSaid;
+
         // Seats already given their pre-FORM repair attempt for this order.
         std::set<std::string> repairAttempted;
         std::set<std::string> repairWalkSaid;
@@ -45122,6 +45136,220 @@ private:
             group->Disband();
         }
         return true;
+    }
+
+    // ----------------------------------- stragglers at the meeting stone (#922) --
+    //
+    // OverseerDecisions::ChooseRaidStoneSummon decides who is summoned and by
+    // whom; this reads the raid into its seats and hands the choice to
+    // kind='summon', the executor that walks both clickers onto the stone,
+    // waits out the portal and the settle, drives the accept and reads the
+    // straggler back. One row at a time, and its verdict is read before the
+    // next is asked, the way the dungeon's summon rung does it.
+
+    // A door's meeting stone as the world has it: its spawn, and the entry and
+    // minimum level off its template.
+    struct RaidMeetingStone
+    {
+        GameObjectData const* spawn{nullptr};
+        OverseerDecisions::RaidStone stone;
+    };
+
+    // The door's stones that are spawned on its outside map with a meeting
+    // stone template, in the door's order. The tables are loaded once at
+    // start-up, so the answer is kept per door, and a stone the world lacks is
+    // said once when it is first looked for. GetAllGOData hands back the
+    // loaded spawn map by reference and cannot fail; a stone with no matching
+    // spawn, or no meeting stone template, is warned about and left out of the
+    // list, so every stone returned has a spawn.
+    static std::vector<RaidMeetingStone> const& RaidDoorStones(
+        OverseerDecisions::RaidDoor const* door)
+    {
+        static std::map<std::string, std::vector<RaidMeetingStone>> s_stones;
+        auto const known = s_stones.find(door->keyword);
+        if (known != s_stones.end())
+            return known->second;
+        std::vector<RaidMeetingStone>& stones = s_stones[door->keyword];
+        // ONE PASS over the spawn map for all of the door's stones, not one
+        // pass per stone: the map holds every gameobject in the world.
+        std::map<unsigned, GameObjectData const*> spawns;
+        for (auto const& itr : sObjectMgr->GetAllGOData())
+            if (itr.second.mapid == door->outsideMapId &&
+                std::find(std::begin(door->meetingStones), std::end(door->meetingStones),
+                          itr.second.id) != std::end(door->meetingStones))
+                spawns.emplace(itr.second.id, &itr.second);
+        for (unsigned const entry : door->meetingStones)
+        {
+            if (!entry)
+                continue;
+            GameObjectTemplate const* tmpl = sObjectMgr->GetGameObjectTemplate(entry);
+            GameObjectData const* spawn = nullptr;
+            auto const found = spawns.find(entry);
+            if (tmpl && tmpl->type == GAMEOBJECT_TYPE_MEETINGSTONE && found != spawns.end())
+                spawn = found->second;
+            if (!spawn)
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: the {} meeting stone {} for {} is not a spawned meeting "
+                         "stone on map {} in this world, so no straggler is summoned at it",
+                         door->stonesName, entry, door->name, door->outsideMapId);
+                continue;
+            }
+            RaidMeetingStone stone;
+            stone.spawn = spawn;
+            stone.stone.entry = entry;
+            stone.stone.minLevel = tmpl->meetingstone.minLevel;
+            stones.push_back(stone);
+            LOG_INFO("module.overseer",
+                     "overseer: the {} meeting stone {} for {} stands at ({:.1f}, {:.1f}, "
+                     "{:.1f}) on map {}, {:.0f}y from the staging point, minimum level {}",
+                     door->stonesName, entry, door->name, spawn->posX, spawn->posY,
+                     spawn->posZ, spawn->mapid,
+                     std::sqrt((spawn->posX - door->stageX) * (spawn->posX - door->stageX) +
+                               (spawn->posY - door->stageY) * (spawn->posY - door->stageY)),
+                     stone.stone.minLevel);
+        }
+        return stones;
+    }
+
+    void DriveRaidStoneSummon(std::string const& family, RaidRunState& run, Group* group,
+                              OverseerDecisions::RaidDoor const* door, bool mayAsk)
+    {
+        std::vector<RaidMeetingStone> const& stones = RaidDoorStones(door);
+        time_t const now = std::time(nullptr);
+
+        // A ROW IN FLIGHT IS WAITED FOR, and its verdict is read before anything
+        // else is asked. Not found yet is an insert still queued.
+        if (!run.stoneRowSource.empty())
+        {
+            std::string status;
+            std::string detail;
+            bool const found = ReadSummonRow(run.stoneRowSource, status, detail);
+            bool const finished = found && OverseerDecisions::SummonRowFinished(status);
+            if (!finished &&
+                now - run.stoneRowSince < OverseerDecisions::RAID_STONE_SUMMON_ROW_CEILING_SECONDS)
+                return;
+            unsigned const tries = run.stoneTries[run.stoneRowTarget];
+            Player* const straggler = ObjectAccessor::FindPlayerByName(run.stoneRowTarget);
+            if (finished && status == "applied" && straggler && straggler->IsInWorld())
+                // THE WORLD, READ BACK, not the row's word for it.
+                LOG_INFO("module.overseer",
+                         "overseer: raid run for family '{}' - '{}' was summoned to the {} "
+                         "stone {} by '{}' and reads back on map {} at ({:.1f}, {:.1f}, "
+                         "{:.1f}), {:.0f}y from {}'s staging point",
+                         family, run.stoneRowTarget, door->stonesName, run.stoneRowEntry,
+                         run.stoneRowClicker, straggler->GetMapId(), straggler->GetPositionX(),
+                         straggler->GetPositionY(), straggler->GetPositionZ(),
+                         straggler->GetMapId() == door->outsideMapId
+                             ? straggler->GetDistance(door->stageX, door->stageY, door->stageZ)
+                             : -1.f,
+                         door->name);
+            else
+                LOG_WARN("module.overseer",
+                         "overseer: raid run for family '{}' - the summon of '{}' at the {} "
+                         "stone {} by '{}' did not bring it ({}); try {} of {}",
+                         family, run.stoneRowTarget, door->stonesName, run.stoneRowEntry,
+                         run.stoneRowClicker,
+                         !finished ? "no verdict within " +
+                                         std::to_string(OverseerDecisions::
+                                                            RAID_STONE_SUMMON_ROW_CEILING_SECONDS) +
+                                         "s"
+                         : status == "applied"
+                             ? std::string("applied, but it is not in the world to read back")
+                             : status + ": " + (detail.empty() ? std::string("no reason given")
+                                                               : detail),
+                         tries, OverseerDecisions::RAID_STONE_SUMMON_TRIES);
+            run.stoneRowSource.clear();
+            run.stoneRowTarget.clear();
+            run.stoneRowClicker.clear();
+            run.stoneRowEntry = 0;
+            run.stoneRowSince = 0;
+        }
+        if (!mayAsk)
+            return;
+
+        std::vector<OverseerDecisions::RaidStone> facts;
+        for (RaidMeetingStone const& stone : stones)
+            facts.push_back(stone.stone);
+        std::vector<OverseerDecisions::RaidStoneSeat> seats;
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->GetSource();
+            if (!member)
+                continue;
+            OverseerDecisions::RaidStoneSeat seat;
+            seat.name = member->GetName();
+            seat.head = seat.name == run.head;
+            seat.tries = run.stoneTries[seat.name];
+            seat.inWorld = member->IsInWorld();
+            if (seat.inWorld)
+            {
+                seat.alive = member->IsAlive();
+                seat.inCombat = member->IsInCombat();
+                seat.inInstance = member->GetInstanceId() != 0;
+                seat.summonable = GET_PLAYERBOT_AI(member) != nullptr;
+                seat.level = member->GetLevel();
+                seat.assembled =
+                    member->GetMapId() == door->outsideMapId && !seat.inInstance &&
+                    member->GetDistance(door->stageX, door->stageY, door->stageZ) <=
+                        OverseerDecisions::RAID_ASSEMBLE_YARDS;
+                // The nearest stone in reach, which is the one the executor's
+                // own sweep finds for a clicker standing there.
+                float best = OverseerDecisions::RAID_STONE_REACH_YARDS;
+                for (std::size_t i = 0; i < stones.size(); ++i)
+                {
+                    GameObjectData const* spawn = stones[i].spawn;
+                    if (seat.inInstance || member->GetMapId() != spawn->mapid)
+                        continue;
+                    float const yards = member->GetExactDist2d(spawn->posX, spawn->posY);
+                    if (yards <= best)
+                    {
+                        best = yards;
+                        seat.atStone = int(i);
+                    }
+                }
+            }
+            seats.push_back(seat);
+        }
+
+        OverseerDecisions::RaidStoneSummon const choice =
+            OverseerDecisions::ChooseRaidStoneSummon(seats, facts);
+        if (!choice.summon)
+        {
+            if (run.stoneSaid != choice.why)
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: raid run for family '{}' summons nobody at the {} stones "
+                         "- {}",
+                         family, door->stonesName, choice.why);
+                run.stoneSaid = choice.why;
+            }
+            return;
+        }
+        run.stoneSaid.clear();
+
+        OverseerDecisions::RaidStone const& stone = facts[std::size_t(choice.stone)];
+        unsigned const tryNumber = ++run.stoneTries[choice.straggler];
+        std::string source = "raid_stone summon " + choice.straggler + " t" +
+                             std::to_string(tryNumber) + " " + std::to_string(now);
+        if (source.size() > 64)
+            source.resize(64);
+        CharacterDatabase.Execute(
+            "INSERT INTO overseer_command (target_name, command, kind, target_arg, source) "
+            "VALUES ('{}', 'use {}', 'summon', '{}', '{}')",
+            Esc(choice.clicker), Esc(choice.straggler), Esc(choice.helper), Esc(source));
+        run.stoneRowSource = source;
+        run.stoneRowTarget = choice.straggler;
+        run.stoneRowClicker = choice.clicker;
+        run.stoneRowEntry = stone.entry;
+        run.stoneRowSince = now;
+        LOG_INFO("module.overseer",
+                 "overseer: raid run for family '{}' summons '{}' at the {} stone - '{}' "
+                 "clicks stone {} (minimum level {}) with '{}' on the portal, try {} of {}; "
+                 "the kind='summon' row carries source '{}'",
+                 family, choice.straggler, door->stonesName, choice.clicker, stone.entry,
+                 stone.minLevel, choice.helper, tryNumber,
+                 OverseerDecisions::RAID_STONE_SUMMON_TRIES, source);
     }
 
     // ------------------------------------------------ inside the door (#640) --
@@ -46145,6 +46373,12 @@ private:
                                  step.knockHead ? " (the head may cross)" : "");
                 }
             }
+
+            // A row already in flight still has its verdict read after the run
+            // has left ASSEMBLE; only a new summon waits on the step.
+            if ((step.summonStragglers || !run.stoneRowSource.empty()) && group &&
+                group->isRaidGroup())
+                DriveRaidStoneSummon(roster.family, run, group, door, step.summonStragglers);
 
             WriteRaidTimeline(roster, run, door);
         }

@@ -13540,7 +13540,8 @@ RaidDoor const* RaidDoorFor(std::string const& keyword)
     // See RaidDoor for where every number comes from.
     static RaidDoor const doors[] = {
         {"moltencore", "Molten Core", 0, 3529, 409, 2890,
-         -7508.32f, -1039.74f, 180.912f, 50, "moltencore"},
+         -7508.32f, -1039.74f, 180.912f, 50, "moltencore", {179587, 179586},
+         "Blackrock Mountain"},
     };
     for (RaidDoor const& door : doors)
         if (keyword == door.keyword)
@@ -13868,8 +13869,13 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
             }
             step.phase = RaidRunPhase::Assemble;
             step.aimStaging = true;
+            step.summonStragglers = facts.headAssembled &&
+                                    facts.heldSeconds >= RAID_STONE_SUMMON_AFTER_SECONDS;
             step.why = !facts.headAssembled ? "the head is walking to the door"
-                                            : "waiting for the raid at the door";
+                       : step.summonStragglers
+                           ? "waiting for the raid at the door; stragglers are summoned "
+                             "at the meeting stone"
+                           : "waiting for the raid at the door";
             return step;
 
         case RaidRunPhase::Enter:
@@ -13915,6 +13921,100 @@ std::vector<std::string> RaidKnockOrder(std::vector<std::string> const& inDoor,
     if (headInDoor && headMayCross)
         order.push_back(head);
     return order;
+}
+
+RaidStoneSummon ChooseRaidStoneSummon(std::vector<RaidStoneSeat> const& seats,
+                                      std::vector<RaidStone> const& stones,
+                                      unsigned triesPerSeat)
+{
+    RaidStoneSummon choice;
+    if (stones.empty())
+    {
+        choice.why = "the door has no meeting stone in this world";
+        return choice;
+    }
+
+    // WHO CAN CLICK EACH STONE, decided before any straggler is looked at: a
+    // clicker who meets the stone's minimum and a second seat for the portal.
+    std::vector<RaidStoneSeat const*> clickers(stones.size(), nullptr);
+    std::vector<RaidStoneSeat const*> helpers(stones.size(), nullptr);
+    bool anyPair = false;
+    for (std::size_t s = 0; s < stones.size(); ++s)
+    {
+        auto canClick = [&](RaidStoneSeat const& seat)
+        {
+            return !seat.head && seat.inWorld && seat.alive && !seat.inCombat &&
+                   !seat.inInstance && seat.atStone == int(s);
+        };
+        for (RaidStoneSeat const& seat : seats)
+            if (canClick(seat) && seat.level >= stones[s].minLevel)
+            {
+                clickers[s] = &seat;
+                break;
+            }
+        if (!clickers[s])
+            continue;
+        for (RaidStoneSeat const& seat : seats)
+            if (canClick(seat) && &seat != clickers[s])
+            {
+                helpers[s] = &seat;
+                break;
+            }
+        anyPair = anyPair || helpers[s];
+    }
+
+    bool anyAway = false;
+    bool belowFloor = false;
+    bool triedOut = false;
+    bool unmovable = false;
+    for (RaidStoneSeat const& straggler : seats)
+    {
+        if (straggler.head || !straggler.inWorld || straggler.assembled ||
+            straggler.atStone >= 0)
+            continue;
+        anyAway = true;
+        if (!straggler.alive || straggler.inCombat || straggler.inInstance ||
+            !straggler.summonable)
+        {
+            unmovable = true;
+            continue;
+        }
+        if (straggler.tries >= triesPerSeat)
+        {
+            triedOut = true;
+            continue;
+        }
+        for (std::size_t s = 0; s < stones.size(); ++s)
+        {
+            if (!helpers[s])
+                continue;
+            if (straggler.level < stones[s].minLevel)
+            {
+                belowFloor = true;
+                continue;
+            }
+            choice.summon = true;
+            choice.straggler = straggler.name;
+            choice.clicker = clickers[s]->name;
+            choice.helper = helpers[s]->name;
+            choice.stone = int(s);
+            choice.why = "a seat away from the door is summoned at the meeting stone";
+            return choice;
+        }
+    }
+    if (!anyAway)
+        choice.why = "every raid member in the world is at the door or a meeting stone";
+    else if (!anyPair)
+        choice.why = "fewer than two seats who can click stand at a meeting stone";
+    else if (belowFloor)
+        choice.why = "the seats still away are below the meeting stone's minimum level "
+                     "and keep walking";
+    else if (triedOut)
+        choice.why = "the seats still away have had their summons";
+    else if (unmovable)
+        choice.why = "the seats still away are dead, fighting, in an instance or not "
+                     "movable by a summon";
+    return choice;
 }
 
 bool DungeonClearMayArmHere(bool raidMap, bool raidClearOrdered)

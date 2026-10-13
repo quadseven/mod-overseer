@@ -16368,6 +16368,12 @@ struct RaidDoor
     // "moltencore" for map 409). HOLD checks every raid member carries it
     // (#640).
     char const* fightStrategy;
+    // The meeting stones a straggler is summoned at during ASSEMBLE (#922), by
+    // gameobject entry, and the place they stand in for the log. Entries only:
+    // where each stands and its minimum level are read off the core's own
+    // spawn and template tables at run time. 0 is no stone.
+    unsigned meetingStones[2];
+    char const* stonesName;
 };
 
 // The door for `keyword`, or nullptr. Exact, lower case: the queue writes the
@@ -16522,6 +16528,8 @@ struct RaidRunStep
     bool standDown{false};    // leaving CLEAR: tell the brain to let go, once
     bool releaseDead{false};  // RECOVER: release every raid member lying dead inside
     bool runBack{false};      // RECOVER: walk every ghost of the raid to the door
+    // ASSEMBLE, after the walk: summon one straggler at a meeting stone (#922)
+    bool summonStragglers{false};
     char const* why{""};
 };
 
@@ -16592,6 +16600,92 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts);
 // coordinator's measured lesson, kept here.
 std::vector<std::string> RaidKnockOrder(std::vector<std::string> const& inDoor,
                                         std::string const& head, bool headMayCross);
+
+// -- stragglers summoned at the mountain's meeting stones (#922) -------------
+//
+// A FULL RAID HAS NO SLOT FOR A WARLOCK, and Ritual of Summoning only moves a
+// member of the caster's own raid. The Blackrock Mountain meeting stones need
+// neither: GameObject::Use's MEETINGSTONE case lets any raid member standing at
+// the stone summon any other raid member, and refuses only when either of the
+// two is below the stone's minimum level (179587 reads 55 and 179586 reads 48
+// on the dev realm; the adapter reads the template, not these numbers). The
+// seats are already one raid (FormRaidFromSeats) and kind='summon' already
+// drives the whole chain: the walk of both clickers onto the stone, the
+// portal, the settle, the accept and the read-back.
+//
+// AFTER THE WALK. A seat is summoned only once ASSEMBLE has held this long
+// with the head at the door: the raid following him has had its chance to
+// walk in, and what is still away is a seat on a boat or on another continent.
+constexpr long RAID_STONE_SUMMON_AFTER_SECONDS = 5 * 60;
+// A straggler is summoned at most this many times in one order, for the reason
+// the dungeon rung keeps the same number: a summon that failed twice for one
+// character will not work because it was asked a third time.
+constexpr unsigned RAID_STONE_SUMMON_TRIES = 2;
+// How long one summon row may stay unfinished before the run stops waiting for
+// it. The verb's own ceilings add up to under a minute; the rest is the queue.
+constexpr long RAID_STONE_SUMMON_ROW_CEILING_SECONDS = 150;
+// A seat within this many yards of a stone, on its map and outside any
+// instance, can click it: inside the forty yards kind='summon' walks a clicker
+// the last of (#355). The dungeon rung's own reach.
+constexpr float RAID_STONE_REACH_YARDS = 35.f;
+
+// One stone as the world has it: its entry and the minimum level its template
+// carries, which the core checks of both the clicker and the one summoned.
+struct RaidStone
+{
+    unsigned entry{0};
+    unsigned minLevel{0};
+};
+
+// One raid member as the summon reads it.
+struct RaidStoneSeat
+{
+    std::string name;
+    // The head is never chosen: he is the operator's streaming character and
+    // the run owns his walk, so neither the verb's hold nor its walk may take
+    // him.
+    bool head{false};
+    bool inWorld{false};
+    bool alive{false};
+    bool inCombat{false};
+    // In any instance. A seat inside a dungeon or the raid is not pulled out.
+    bool inInstance{false};
+    // Something kind='summon' can move: a character with the bot AI that
+    // answers the far teleport.
+    bool summonable{false};
+    // Within RAID_ASSEMBLE_YARDS of the staging point on the door's map.
+    bool assembled{false};
+    // The index into the stones of the stone this seat stands within
+    // RAID_STONE_REACH_YARDS of, or -1.
+    int atStone{-1};
+    unsigned level{0};
+    // Summons already tried for this seat in this order.
+    unsigned tries{0};
+};
+
+struct RaidStoneSummon
+{
+    bool summon{false};
+    std::string straggler;
+    // Clicks the stone with the straggler selected; the core checks his level.
+    std::string clicker;
+    // Clicks the portal, the ritual's second participant.
+    std::string helper;
+    // Index into the stones, or -1.
+    int stone{-1};
+    std::string why;
+};
+
+// Who is summoned, by whom, at which stone. Stragglers in the order given,
+// stones in the order given, and the first straggler with a stone whose
+// minimum he meets and two seats standing at it - one who meets the minimum
+// to click it, and another to click the portal - is the answer.
+//
+// A SEAT BELOW EVERY STONE'S MINIMUM IS NOT SUMMONED. The core would refuse
+// the click, so the seat keeps walking with the raid.
+RaidStoneSummon ChooseRaidStoneSummon(std::vector<RaidStoneSeat> const& seats,
+                                      std::vector<RaidStone> const& stones,
+                                      unsigned triesPerSeat = RAID_STONE_SUMMON_TRIES);
 
 // May the dungeon brain be armed for a character on this map?
 //
