@@ -45382,7 +45382,10 @@ private:
     // The door's stones that are spawned on its outside map with a meeting
     // stone template, in the door's order. The tables are loaded once at
     // start-up, so the answer is kept per door, and a stone the world lacks is
-    // said once when it is first looked for.
+    // said once when it is first looked for. GetAllGOData hands back the
+    // loaded spawn map by reference and cannot fail; a stone with no matching
+    // spawn, or no meeting stone template, is warned about and left out of the
+    // list, so every stone returned has a spawn.
     static std::vector<RaidMeetingStone> const& RaidDoorStones(
         OverseerDecisions::RaidDoor const* door)
     {
