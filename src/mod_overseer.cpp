@@ -6654,13 +6654,13 @@ public:
         return it->second.count;
     }
 
-    // Why this character's errand was called off, for the line that says it was.
-    // Empty when nothing is refused, which no caller reaches: every reader of
-    // this asks after SecondsSinceRefused has already said there is one.
-    std::string RefusedReason(std::string const& name) const
+    // Why this target was called off for this character. Empty when another
+    // target was refused, or when nothing is refused.
+    std::string RefusedReason(std::string const& name, std::string const& target) const
     {
         auto const it = _refused.find(name);
-        return it == _refused.end() ? std::string() : it->second.reason;
+        return it == _refused.end() || it->second.target != target ? std::string()
+                                                                 : it->second.reason;
     }
 
     // CHARGE ONE POLL OF ECONOMY ERRAND TO THIS CHARACTER, and say whether it
@@ -24365,7 +24365,7 @@ private:
                                      "off because {} - clearing it, and refusing it for "
                                      "another {}s. Something outside this drive keeps "
                                      "writing this column",
-                                     name, target, _travelAims.RefusedReason(name),
+                                     name, target, _travelAims.RefusedReason(name, target),
                                      verdict.coolOffRemaining);
                         _travelAims.Release(name, "the travel drive (an errand refused earlier was written again)");
                         continue;
@@ -41722,7 +41722,7 @@ private:
                     {
                         // Read once: the reason both picks how the attempt
                         // ended and is named in the stand-back line below.
-                        std::string const refused = _travelAims.RefusedReason(leaderName);
+                        std::string const refused = _travelAims.RefusedReason(leaderName, aimText);
                         if (CrossingAttemptEnded(coord, leaderName, leader, portal,
                                                  OverseerDecisions::CrossingRefusalEnd(refused)))
                             break;
