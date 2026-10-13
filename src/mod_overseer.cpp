@@ -25597,7 +25597,7 @@ private:
                          "{} yards for {} minutes - releasing the errand as unreachable",
                          name, target, static_cast<uint32>(state.progress.best),
                          static_cast<uint32>(backstop / 60));
-                _travelAims.Release(name, "the travel drive (travel backstop: no nearer for minutes)");
+                _travelAims.Release(name, OverseerDecisions::TravelBackstopReleaseReason);
                 continue;
             }
 
@@ -25726,7 +25726,7 @@ private:
                              "overseer: '{}' was sent to '{}' and has been refused every "
                              "bearing for {} polls running without getting any nearer - releasing the errand as unreachable",
                              name, target, refusal.consecutive);
-                    _travelAims.Release(name, "the travel drive (every bearing refused, ground give-up)");
+                    _travelAims.Release(name, OverseerDecisions::TravelGroundGiveUpReleaseReason);
                     // A stranded member whose walk to its berth gives up here
                     // may hearth out of it instead (DecideStrandedWay, rule 6b).
                     _strandedGroundGiveUp[name] = std::time(nullptr);
@@ -41632,8 +41632,7 @@ private:
                     {
                         attempts.endSeen = ended.serial;
                         if (ended.target == aimText &&
-                            (ended.why.find("ground give-up") != std::string::npos ||
-                             ended.why.find("travel backstop") != std::string::npos) &&
+                            OverseerDecisions::IsTravelGiveUpRelease(ended.why) &&
                             CrossingAttemptEnded(coord, leaderName, leader, portal,
                                                OverseerDecisions::CrossingAttemptEnd::GroundGiveUp))
                             break;

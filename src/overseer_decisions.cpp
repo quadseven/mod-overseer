@@ -7224,6 +7224,11 @@ CrossingAttemptEnd CrossingRefusalEnd(std::string const& reason)
                                              : CrossingAttemptEnd::Refused;
 }
 
+bool IsTravelGiveUpRelease(std::string const& why)
+{
+    return why == TravelBackstopReleaseReason || why == TravelGroundGiveUpReleaseReason;
+}
+
 DockReading ReadDock(std::uint32_t pathProgressMs, std::uint32_t periodMs,
                      std::vector<TransportStop> const& stops)
 {

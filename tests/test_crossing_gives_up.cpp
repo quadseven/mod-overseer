@@ -25,7 +25,10 @@ using OverseerDecisions::CrossingAttemptEnd;
 using OverseerDecisions::CrossingHandedBack;
 using OverseerDecisions::CrossingRefusalEnd;
 using OverseerDecisions::EndCrossingAttempt;
+using OverseerDecisions::IsTravelGiveUpRelease;
 using OverseerDecisions::NoProgressBackoffReason;
+using OverseerDecisions::TravelBackstopReleaseReason;
+using OverseerDecisions::TravelGroundGiveUpReleaseReason;
 using OverseerDecisions::OpenCrossingAttempt;
 using OverseerDecisions::ReadCrossingBerthClaim;
 
@@ -186,6 +189,12 @@ int main()
         Check("the no-progress backoff's own reason reads as the backoff",
               CrossingRefusalEnd(NoProgressBackoffReason) ==
                   CrossingAttemptEnd::NoProgressBackoff);
+        Check("the travel drive's two give-up releases count as failed attempts",
+              IsTravelGiveUpRelease(TravelBackstopReleaseReason) &&
+                  IsTravelGiveUpRelease(TravelGroundGiveUpReleaseReason));
+        Check("any other end, even one that mentions a give-up, does not",
+              !IsTravelGiveUpRelease("arrived") && !IsTravelGiveUpRelease("") &&
+                  !IsTravelGiveUpRelease("the family's own drive: ground give-up"));
         Check("a refusal for deaths reads as a plain refusal",
               CrossingRefusalEnd("died 3 times on the way") == CrossingAttemptEnd::Refused);
 

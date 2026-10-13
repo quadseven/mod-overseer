@@ -8637,6 +8637,16 @@ constexpr char const* NoProgressBackoffReason =
     "repeated no-progress releases; bounded backoff is active";
 CrossingAttemptEnd CrossingRefusalEnd(std::string const& reason);
 
+// The two reasons the travel drive releases an errand it gave up on, written
+// once so the release and the crossing's reading of it cannot drift apart.
+constexpr char const* TravelBackstopReleaseReason =
+    "the travel drive (travel backstop: no nearer for minutes)";
+constexpr char const* TravelGroundGiveUpReleaseReason =
+    "the travel drive (every bearing refused, ground give-up)";
+// Is this errand-end reason one the travel drive gave up with, which counts as
+// a failed crossing attempt? Exact match: any other end is not one.
+bool IsTravelGiveUpRelease(std::string const& why);
+
 // ------------------------------------------- is the transport docked (#303) --
 //
 // A MotionTransport stands still at a stop frame for exactly the interval
