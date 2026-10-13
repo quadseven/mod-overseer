@@ -44,6 +44,12 @@ int main()
     EquipRefusal refusal = EquipRefused("EQUIP_ERR_CANT_EQUIP 29");
     CheckText("core refusal is terminal error", refusal.status, "error");
     CheckText("core refusal detail survives", refusal.detail, "EQUIP_ERR_CANT_EQUIP 29");
+    // The command loop in mod_overseer.cpp holds the row's status as a
+    // `char const*` and assigns the refusal's status to it; this line is that
+    // assignment and does not compile if the status is not a literal pointer.
+    char const* rowStatus = "verifying";
+    rowStatus = refusal.status;
+    CheckText("refusal status assigns to the row status", rowStatus, "error");
     EquipRefusal applied = EquipReadBack(true);
     CheckText("worn item is applied", applied.status, "applied");
     EquipRefusal unchanged = EquipReadBack(false);

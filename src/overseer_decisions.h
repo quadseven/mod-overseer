@@ -69,7 +69,9 @@ bool ParseEquipCommand(std::string const& command, EquipCommand& out);
 
 struct EquipRefusal
 {
-    std::string status;
+    // A string literal ("error", "applied", "unchanged"), so the command loop
+    // can assign it straight to its own `char const* status` for the row.
+    char const* status;
     std::string detail;
 };
 
