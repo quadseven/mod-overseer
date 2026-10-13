@@ -39832,7 +39832,8 @@ private:
             // The brain's roster is read off the tank only while it stands in
             // the run's copy: a ghost outside reads another map's.
             uint32 const brainMask =
-                tank && tank->IsInWorld() && tank->GetMapId() == run.mapId
+                tank && tank->IsInWorld() && tank->GetMapId() == run.mapId &&
+                        (!run.instanceId || tank->GetInstanceId() == run.instanceId)
                     ? DungeonBrainExpectedEncounterMask(tank)
                     : 0;
             poll.finderEndsDungeon = run.finderEndsDungeon;
