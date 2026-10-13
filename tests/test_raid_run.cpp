@@ -22,6 +22,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -120,6 +122,52 @@ void EachSeatInThePullHoldWalksRepairsOrWaits()
           RaidPullSeatRepairStep(69, 70, true, false, false) == RaidPullSeatStep::TimedOut);
     Check("a timed-out hold leaves a ready seat ready",
           RaidPullSeatRepairStep(90, 70, true, false, false) == RaidPullSeatStep::Ready);
+}
+
+bool Has(std::string const& text, char const* needle)
+{
+    return text.find(needle) != std::string::npos;
+}
+
+// The decisions above only matter if the raid run acts on them. This reads the
+// run's pre-pull block in src/mod_overseer.cpp (run from the repo root) and
+// checks it logs every pull, gates the hold on the decision, repairs through
+// the ordinary verb, logs an unpaid seat, and pauses the brain only while held.
+void ThePrePullHoldIsWiredIntoTheRun()
+{
+    std::ifstream in("src/mod_overseer.cpp");
+    std::stringstream text;
+    text << in.rdbuf();
+    std::string const source = text.str();
+    if (source.empty())
+    {
+        std::printf("FAIL could not read src/mod_overseer.cpp (run from the repo root)\n");
+        ++failures;
+        return;
+    }
+    std::size_t const at = source.find("// Read the seats before every next encounter.");
+    Check("the pre-pull block exists", at != std::string::npos);
+    std::size_t const end = at == std::string::npos ? at : source.find("RaidClearStall(", at);
+    std::string const body = end == std::string::npos ? "" : source.substr(at, end - at);
+    Check("every pull logs the lowest durability line",
+          Has(body, "overseer: raid run for family '{}': lowest durability {} {}%"));
+    Check("a pull with no readable seat is logged, not skipped",
+          Has(body, "cannot log pre-pull"));
+    Check("the hold is gated on the boss decision",
+          Has(body, "RaidPullRepairDecision(bossesDone, false, 0, 300) !=\n"
+                    "                    OverseerDecisions::RaidPullRepairAction::Ignore"));
+    Check("the hold reads every seat", Has(body, "RaidPullRepairForSeats("));
+    Check("each seat steps through the seat decision", Has(body, "RaidPullSeatRepairStep("));
+    Check("the wall clock is read once per poll",
+          Has(body, "long const heldNow = long(std::time(nullptr) - run.repairHoldSince);"));
+    Check("a seat at a repairer pays through the ordinary verb",
+          Has(body, "DoRepair(member, \"all\", status, evidence)"));
+    Check("a seat that cannot pay is logged", Has(body, "could not repair '{}'"));
+    Check("the end of the hold is logged as a timeout or as complete",
+          Has(body, "timed out after 300 seconds") &&
+              Has(body, "complete - every seat is at or above"));
+    Check("the brain pauses only while held and not timed out",
+          Has(body, "bool const shouldPause = repairHold && !repairHoldTimedOut;"));
 }
 
 void CheckString(char const* what, std::string const& got, std::string const& want)
@@ -359,6 +407,7 @@ int main()
     OnlyMajordomoAndRagnarosPullsWaitForRepair();
     ThePullHoldReadsEverySeat();
     EachSeatInThePullHoldWalksRepairsOrWaits();
+    ThePrePullHoldIsWiredIntoTheRun();
     TheMoltenCoreDoorIsTheWorldsOwnNumbers();
     OnlyAnExactRaidJobNamesADoor();
     NoOrderIsIdleAndAnEndedOrderReleases();

@@ -46163,10 +46163,13 @@ private:
                     // The repairer sweep runs only for a seat still owed the repair verb.
                     bool oneIsNearby = false;
                     float nearestYards = -1.f;
+                    // True means a repairer is in reach: the step is then Repair
+                    // and the seat repairs below; false means Walk to one first.
+                    bool const repairerInReach = CounterInReach(
+                        member, OverseerDecisions::CounterRole::Repairer, oneIsNearby,
+                        nearestYards);
                     step = OverseerDecisions::RaidPullSeatRepairStep(
-                        pct, repairFloor, repairHoldTimedOut, attempted,
-                        CounterInReach(member, OverseerDecisions::CounterRole::Repairer,
-                                       oneIsNearby, nearestYards));
+                        pct, repairFloor, repairHoldTimedOut, attempted, repairerInReach);
                     if (step == OverseerDecisions::RaidPullSeatStep::Walk)
                     {
                         _travelAims.Claim(name, "repair", OverseerDecisions::TravelOwner::Run);
