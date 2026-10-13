@@ -45520,19 +45520,23 @@ private:
         if (known != s_stones.end())
             return known->second;
         std::vector<RaidMeetingStone>& stones = s_stones[door->keyword];
+        // ONE PASS over the spawn map for all of the door's stones, not one
+        // pass per stone: the map holds every gameobject in the world.
+        std::map<unsigned, GameObjectData const*> spawns;
+        for (auto const& itr : sObjectMgr->GetAllGOData())
+            if (itr.second.mapid == door->outsideMapId &&
+                std::find(std::begin(door->meetingStones), std::end(door->meetingStones),
+                          itr.second.id) != std::end(door->meetingStones))
+                spawns.emplace(itr.second.id, &itr.second);
         for (unsigned const entry : door->meetingStones)
         {
             if (!entry)
                 continue;
             GameObjectTemplate const* tmpl = sObjectMgr->GetGameObjectTemplate(entry);
             GameObjectData const* spawn = nullptr;
-            if (tmpl && tmpl->type == GAMEOBJECT_TYPE_MEETINGSTONE)
-                for (auto const& itr : sObjectMgr->GetAllGOData())
-                    if (itr.second.id == entry && itr.second.mapid == door->outsideMapId)
-                    {
-                        spawn = &itr.second;
-                        break;
-                    }
+            auto const found = spawns.find(entry);
+            if (tmpl && tmpl->type == GAMEOBJECT_TYPE_MEETINGSTONE && found != spawns.end())
+                spawn = found->second;
             if (!spawn)
             {
                 LOG_WARN("module.overseer",
