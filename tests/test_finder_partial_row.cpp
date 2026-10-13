@@ -255,7 +255,7 @@ void TheAdapterIsWired()
     has("the run's expectation is the guild run's",
         "OverseerDecisions::GuildRunExpectedMask(");
     has("and so is its ceiling",
-        "OverseerDecisions::GuildRunCeilingSeconds(run.finderEndsDungeon, run.bossesTotal);");
+        "OverseerDecisions::GuildRunCeilingForMap(");
 }
 
 }  // namespace
