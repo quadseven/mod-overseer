@@ -78,6 +78,39 @@ struct EquipRefusal
 EquipRefusal EquipRefused(std::string const& reason);
 EquipRefusal EquipReadBack(bool worn);
 
+// THE BOT'S OWN UPGRADE PASS HAS THE LAST WORD ON A GUILD MEMBER'S GEAR (#927).
+// Guild members are random bots, so mod-playerbots' EquipUpgradesPacketAction
+// runs for them on the random tick, on item push and on loot won, and puts back
+// whatever its StatsWeightCalculator prefers. Measured on the live realm: the
+// core put the bridge's piece on within 6 s of every ask, and the bot put its
+// own back 1 to 84 minutes later, after #920's read-back had already said
+// `applied`. So before the whisper the adapter reads the same verdict that pass
+// reads (`ItemUsage` value "item upgrade") and refuses a piece it would undo.
+//
+// The ItemUsage values that verdict can return, mirrored because this file may
+// not include a playerbots header; the adapter static_asserts them against the
+// real enum. The pass equips EQUIP, REPLACE and BAD_EQUIP and nothing else.
+constexpr uint32_t UPGRADE_USAGE_NONE = 0;
+constexpr uint32_t UPGRADE_USAGE_EQUIP = 1;
+constexpr uint32_t UPGRADE_USAGE_REPLACE = 2;
+constexpr uint32_t UPGRADE_USAGE_BAD_EQUIP = 3;
+
+bool UpgradePassKeeps(uint32_t usage);
+
+struct EquipVerdict
+{
+    // true: whisper `e` and wait on the read-back (`row.status` "verifying").
+    // false: never whispered; `row` is the row's final status and detail.
+    bool whisper;
+    EquipRefusal row;
+};
+
+// `worn` is the piece in the slot FindEquipSlot names, empty for an empty
+// slot; both scores are StatsWeightCalculator's with the item set bonus and
+// the overflow penalty off, as the upgrade pass scores them.
+EquipVerdict EquipUpgradeVerdict(uint32_t usage, std::string const& item, float itemScore,
+                                 std::string const& worn, float wornScore);
+
 // A DUNGEON RUN'S LEADER MUST HOLD A CLIENT (#735). Only a client-attached
 // leader can issue the dungeon-clear, so ENTER and CLEARING wait until the
 // leader's socket has stayed open for the settle window (a measured flap ran

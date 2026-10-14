@@ -85,6 +85,24 @@ EquipRefusal EquipReadBack(bool worn)
             worn ? "" : "the bot did not put the item on"};
 }
 
+bool UpgradePassKeeps(uint32_t usage)
+{
+    return usage == UPGRADE_USAGE_EQUIP || usage == UPGRADE_USAGE_REPLACE ||
+           usage == UPGRADE_USAGE_BAD_EQUIP;
+}
+
+EquipVerdict EquipUpgradeVerdict(uint32_t usage, std::string const& item, float itemScore,
+                                 std::string const& worn, float wornScore)
+{
+    if (UpgradePassKeeps(usage))
+        return {true, {"verifying", ""}};
+    std::ostringstream detail;
+    detail << std::fixed << std::setprecision(2) << "the bot keeps "
+           << (worn.empty() ? std::string("an empty slot") : worn) << ": " << item << " scores "
+           << itemScore << " against " << wornScore;
+    return {false, {"unchanged", detail.str()}};
+}
+
 LeaderClientGate DungeonLeaderClientGate(bool socketOpen, std::time_t openSince,
                                          std::time_t now, std::time_t settleSeconds)
 {
