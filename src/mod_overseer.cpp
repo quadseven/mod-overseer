@@ -33404,6 +33404,27 @@ private:
         return mapMask;
     }
 
+    // The name of the lowest-numbered boss in `expected` that `credited` does
+    // not hold: the dungeon brain's next boss. Empty when every expected boss is
+    // credited, or the map names none of them.
+    static std::string NextEncounterName(uint32 mapId, uint32 expected, uint32 credited)
+    {
+        uint32 const left = expected & ~credited;
+        DungeonEncounterList const* encounters =
+            left ? sObjectMgr->GetDungeonEncounterList(mapId, DUNGEON_DIFFICULTY_NORMAL)
+                 : nullptr;
+        if (!encounters)
+            return std::string();
+        DungeonEncounter const* next = nullptr;
+        for (DungeonEncounter const* encounter : *encounters)
+            if (encounter && encounter->dbcEntry && encounter->dbcEntry->encounterIndex < 32 &&
+                (left & (1u << encounter->dbcEntry->encounterIndex)) &&
+                (!next || encounter->dbcEntry->encounterIndex < next->dbcEntry->encounterIndex))
+                next = encounter;
+        return next && next->dbcEntry->encounterName[0] ? next->dbcEntry->encounterName[0]
+                                                         : std::string();
+    }
+
     static uint32 ExpectedEncounterMask(uint32 mapId, Player* member)
     {
         uint32 const mapMask = MapEncounterMask(mapId);
@@ -38472,6 +38493,11 @@ private:
         uint32 ilvlAtEntry{0};
         uint32 bossesDone{0};
         uint32 bossesTotal{0};
+        // Where the run stands, for its end and its heartbeat: the dungeon
+        // brain's next boss (NextEncounterName) and when the boss count last
+        // rose (0 before the first kill of this stay).
+        std::string nextBoss;
+        std::time_t lastKillAt{0};
         // The queued row's last boss is the dungeon's (OverseerDecisions::
         // FinderRowEndsDungeon), and whether the finder's "finished" on a
         // row that is not was said yet.
@@ -38608,13 +38634,36 @@ private:
 
     static char const* GuildSeatWord(OverseerDecisions::GuildSeat seat)
     {
-        switch (seat)
+        return OverseerDecisions::GuildSeatWord(seat);
+    }
+
+    // Each seat's state against the run's copy of the dungeon, for the queued
+    // poll log and the abandoned why (OverseerDecisions::GuildRunAbsentWords).
+    // `instanceId` 0 means the copy is not known yet, so the map alone counts.
+    std::vector<OverseerDecisions::GuildRunSeatReport>
+    GuildRunSeatReports(GuildRun const& run, uint32 instanceId) const
+    {
+        using OverseerDecisions::GuildSeatState;
+        std::vector<OverseerDecisions::GuildRunSeatReport> out;
+        for (std::size_t i = 0; i < run.names.size(); ++i)
         {
-            case OverseerDecisions::GuildSeat::Tank:   return "tank";
-            case OverseerDecisions::GuildSeat::Healer: return "healer";
-            case OverseerDecisions::GuildSeat::Damage: return "dps";
+            Player* const p = ObjectAccessor::FindPlayerByName(run.names[i]);
+            OverseerDecisions::GuildRunSeatReport report;
+            report.name = run.names[i];
+            if (i < run.seats.size())
+                report.seat = run.seats[i];
+            if (!p || !p->IsInWorld())
+                report.state = GuildSeatState::NotInWorld;
+            else if (!p->IsAlive())
+                report.state = GuildSeatState::Dead;
+            else if (p->GetMapId() != run.mapId ||
+                     (instanceId && p->GetInstanceId() != instanceId))
+                report.state = GuildSeatState::OtherMap;
+            else if (p->IsInCombat())
+                report.state = GuildSeatState::InCombat;
+            out.push_back(report);
         }
-        return "dps";
+        return out;
     }
 
     // The row's `result`, from what the run has seen so far.
@@ -38631,7 +38680,12 @@ private:
           << ",\"seconds_inside\":" << (run.enteredAt ? now - run.enteredAt : 0)
           << ",\"deaths\":" << run.deaths << ",\"bosses_done\":" << run.bossesDone
           << ",\"bosses_total\":" << run.bossesTotal
-          << ",\"dc_on\":" << (run.dcAccepted ? "true" : "false")
+          << ",\"next_boss\":" << J(run.nextBoss) << ",\"last_kill_minutes\":";
+        if (run.lastKillAt)
+            o << (now >= run.lastKillAt ? (now - run.lastKillAt) / 60 : 0);
+        else
+            o << "null";
+        o << ",\"dc_on\":" << (run.dcAccepted ? "true" : "false")
           << ",\"ilvl_start\":" << run.ilvlAtEntry << ",\"ilvl_end\":" << ilvlNow;
         if (loot)
         {
@@ -39617,7 +39671,13 @@ private:
             }
             poll.waitedSeconds = static_cast<unsigned>(now - run.queuedAt);
             OverseerDecisions::FinderStep const step = OverseerDecisions::FinderNext(poll);
-            std::string const said = OverseerDecisions::FinderStepWord(step);
+            std::string said = OverseerDecisions::FinderStepWord(step);
+            // A wait names the seats it waits on, and says so again when the
+            // set or a state changes.
+            std::string const absent = OverseerDecisions::GuildRunAbsentWords(
+                GuildRunSeatReports(run, headInstance));
+            if (!absent.empty() && step == OverseerDecisions::FinderStep::Wait)
+                said += " [" + absent + "]";
             if (said != run.said)
                 LOG_INFO("module.overseer",
                          "overseer: guild finder run {} - {} (state {}, {} of {} inside, {}s)",
@@ -39736,6 +39796,7 @@ private:
                 if (!instanceMap)
                     instanceMap = p->GetMap();
             }
+            uint32 const doneBefore = run.bossesDone;
             bool const roleMissing =
                 poll.inside && (!poll.tankAliveInside || !poll.healerAliveInside);
             if (roleMissing)
@@ -39787,6 +39848,9 @@ private:
             }
             poll.bossesDone = run.bossesDone;
             poll.bossesTotal = run.bossesTotal;
+            if (run.bossesDone > doneBefore)
+                run.lastKillAt = now;
+            run.nextBoss = NextEncounterName(run.mapId, poll.expectedMask, poll.creditedMask);
             poll.ceilingSeconds =
                 OverseerDecisions::GuildRunCeilingSeconds(run.finderEndsDungeon, run.bossesTotal);
             poll.finderFinished =
@@ -39907,17 +39971,18 @@ private:
                               std::to_string(poll.secondsRecovering) + "s after the wipe";
                         break;
                     case OverseerDecisions::GuildRunVerdict::Abandoned:
-                        if (poll.groupGone)
-                            why = "the group is gone";
-                        else if (!poll.inside)
-                            why = "nobody has been inside for " +
-                                  std::to_string(poll.secondsEmpty) + "s";
-                        else
-                            why = "the assigned tank and healer roles were not both alive inside "
-                                  "for " + std::to_string(poll.secondsWithoutRoles) + "s";
+                        why = OverseerDecisions::GuildRunAbandonedWhy(
+                            poll, OverseerDecisions::GuildRunAbsentWords(
+                                      GuildRunSeatReports(run, run.instanceId)));
                         break;
                     case OverseerDecisions::GuildRunVerdict::TimedOut:
-                        why = "inside for " + std::to_string(poll.secondsInside) + "s";
+                        why = OverseerDecisions::GuildRunTimedOutWhy(
+                            poll.secondsInside,
+                            OverseerDecisions::GuildRunStallWords(
+                                run.nextBoss, run.lastKillAt != 0,
+                                run.lastKillAt && now >= run.lastKillAt
+                                    ? static_cast<unsigned>(now - run.lastKillAt)
+                                    : 0));
                         break;
                     default:
                         break;

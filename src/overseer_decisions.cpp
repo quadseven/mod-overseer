@@ -18535,6 +18535,79 @@ char const* GuildRunVerdictWord(GuildRunVerdict verdict)
     return "unknown";
 }
 
+char const* GuildSeatStateWord(GuildSeatState state)
+{
+    switch (state)
+    {
+        case GuildSeatState::Present:    return "present";
+        case GuildSeatState::NotInWorld: return "not in world";
+        case GuildSeatState::Dead:       return "dead";
+        case GuildSeatState::InCombat:   return "in combat";
+        case GuildSeatState::OtherMap:   return "other map";
+    }
+    return "unknown";
+}
+
+char const* GuildSeatWord(GuildSeat seat)
+{
+    switch (seat)
+    {
+        case GuildSeat::Tank:   return "tank";
+        case GuildSeat::Healer: return "healer";
+        case GuildSeat::Damage: return "dps";
+    }
+    return "dps";
+}
+
+std::string GuildRunAbsentWords(std::vector<GuildRunSeatReport> const& seats)
+{
+    std::string out;
+    for (GuildRunSeatReport const& s : seats)
+    {
+        if (s.state == GuildSeatState::Present)
+            continue;
+        if (!out.empty())
+            out += "; ";
+        out += "'" + s.name + "' (" + GuildSeatWord(s.seat) + ") never came inside: " +
+               GuildSeatStateWord(s.state);
+    }
+    return out;
+}
+
+std::string GuildRunStallWords(std::string const& nextBoss, bool killed,
+                               unsigned secondsSinceKill)
+{
+    std::string out;
+    if (!nextBoss.empty())
+        out = "next " + nextBoss + ", ";
+    out += killed ? "last kill " + std::to_string(secondsSinceKill / 60) + " min ago"
+                  : std::string("no boss killed yet");
+    return out;
+}
+
+std::string GuildRunAbandonedWhy(GuildRunPoll const& poll, std::string const& absent)
+{
+    std::string why;
+    if (poll.groupGone)
+        why = "the group is gone";
+    else if (!poll.inside)
+        why = "nobody has been inside for " + std::to_string(poll.secondsEmpty) + "s";
+    else
+        why = "the assigned tank and healer roles were not both alive inside for " +
+              std::to_string(poll.secondsWithoutRoles) + "s";
+    if (!absent.empty())
+        why += "; " + absent;
+    return why;
+}
+
+std::string GuildRunTimedOutWhy(unsigned secondsInside, std::string const& stall)
+{
+    std::string why = "inside for " + std::to_string(secondsInside) + "s";
+    if (!stall.empty())
+        why += "; " + stall;
+    return why;
+}
+
 std::uint32_t GuildRunExpectedMask(std::uint32_t mapId, std::uint32_t mapMask,
                                    std::uint32_t brainMask, bool finderEndsDungeon)
 {
