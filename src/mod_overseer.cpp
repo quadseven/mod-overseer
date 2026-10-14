@@ -289,6 +289,10 @@
 #include "GameObject.h"
 #include "Mail.h"
 #include "RBAC.h"
+// kind='bot' `e Hitem:` (#927): the verdict and the scorer mod-playerbots' own
+// upgrade pass reads, asked before the whisper (EquipAction.cpp:1-14 at the pin).
+#include "ItemUsageValue.h"
+#include "StatsWeightCalculator.h"
 
 // PlayerbotsDatabase, the pool the travel-route and mooring reads query. It
 // used to be the core's: the core declared it in DatabaseEnv.h, so it arrived
@@ -52818,6 +52822,76 @@ private:
         _pendingChecks.swap(stillWaiting);
     }
 
+    // AN EQUIP THE BOT'S OWN UPGRADE PASS WOULD UNDO IS NOT WHISPERED (#927).
+    // The core check has passed; this asks the bot. The verdict is the one
+    // EquipAction::SelectInventoryItemsToEquip reads, with the same parameter
+    // (`<entry>` or `<entry>,<randomPropertyId>`). ItemUpgradeValue is a
+    // CalculatedValue with the default check interval, so Get() recalculates
+    // and the verdict is the bot's gear now, not a cached one. True when the
+    // row was ended here; `status` and `detail` are then the row's.
+    static bool WithholdEquipTheBotWouldUndo(Player* bot, PlayerbotAI* botAI, Item* item,
+                                             std::string const& targetName,
+                                             char const*& status, std::string& detail)
+    {
+        static_assert(OverseerDecisions::UPGRADE_USAGE_NONE == uint32(ITEM_USAGE_NONE),
+                      "overseer: UPGRADE_USAGE_NONE disagrees with mod-playerbots' ItemUsage");
+        static_assert(OverseerDecisions::UPGRADE_USAGE_EQUIP == uint32(ITEM_USAGE_EQUIP),
+                      "overseer: UPGRADE_USAGE_EQUIP disagrees with mod-playerbots' ItemUsage");
+        static_assert(OverseerDecisions::UPGRADE_USAGE_REPLACE == uint32(ITEM_USAGE_REPLACE),
+                      "overseer: UPGRADE_USAGE_REPLACE disagrees with mod-playerbots' ItemUsage");
+        static_assert(OverseerDecisions::UPGRADE_USAGE_BAD_EQUIP == uint32(ITEM_USAGE_BAD_EQUIP),
+                      "overseer: UPGRADE_USAGE_BAD_EQUIP disagrees with mod-playerbots' ItemUsage");
+
+        ItemTemplate const* proto = item->GetTemplate();
+        int32 const randomProperty = item->GetItemRandomPropertyId();
+        std::string param = std::to_string(proto->ItemId);
+        if (randomProperty != 0)
+            param += "," + std::to_string(randomProperty);
+
+        AiObjectContext* context = botAI->GetAiObjectContext();
+        Value<ItemUsage>* verdict =
+            context ? context->GetValue<ItemUsage>("item upgrade", param) : nullptr;
+        if (!verdict)
+        {
+            // No verdict to read: whisper as before and let the read-back judge.
+            LOG_WARN("module.overseer",
+                     "overseer: equip for '{}' could not read the bot's upgrade verdict "
+                     "for {} - whispering without it",
+                     targetName, proto->Name1);
+            return false;
+        }
+        ItemUsage const usage = verdict->Get();
+
+        // Scored as the upgrade pass scores them (ItemUsageValue.cpp:222-231).
+        StatsWeightCalculator calculator(bot);
+        calculator.SetItemSetBonus(false);
+        calculator.SetOverflowPenalty(false);
+        if (sRandomPlayerbotMgr.IsSpecPvp(bot->GetGUID().GetCounter(), bot->getClass()))
+            calculator.SetPvpSpec(true);
+        float const itemScore = calculator.CalculateItem(proto->ItemId, randomProperty);
+
+        uint8 const slot = botAI->FindEquipSlot(proto, NULL_SLOT, true);
+        Item* worn = slot < EQUIPMENT_SLOT_END
+            ? bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot) : nullptr;
+        std::string const wornName = worn ? worn->GetTemplate()->Name1 : "";
+        float const wornScore = worn
+            ? calculator.CalculateItem(worn->GetEntry(), worn->GetItemRandomPropertyId())
+            : 0.0f;
+
+        OverseerDecisions::EquipVerdict const outcome = OverseerDecisions::EquipUpgradeVerdict(
+            uint32(usage), proto->Name1, itemScore, wornName, wornScore);
+        if (outcome.whisper)
+            return false;
+        status = outcome.row.status;
+        detail = outcome.row.detail;
+        LOG_WARN("module.overseer",
+                 "overseer: equip for '{}' refused before the whisper - the bot keeps {} "
+                 "(score {:.2f}) over {} (score {:.2f})",
+                 targetName, wornName.empty() ? std::string("an empty slot") : wornName,
+                 wornScore, proto->Name1, itemScore);
+        return true;
+    }
+
     void ResolveEquipChecks(uint32 elapsedMs)
     {
         std::vector<EquipCheck> waiting;
@@ -53394,6 +53468,9 @@ private:
                 bool const equip = kind == "bot" &&
                     OverseerDecisions::ParseEquipCommand(command, equipCommand);
                 bool equipRefused = false;
+                // The core would take it, the bot's own upgrade pass would
+                // not (#927): ended `unchanged` here, never whispered.
+                bool equipWithheld = false;
                 if (equip)
                 {
                     Item* item = player->GetItemByEntry(equipCommand.entry);
@@ -53417,6 +53494,9 @@ private:
                             status = "error";
                             equipRefused = true;
                         }
+                        else
+                            equipWithheld = WithholdEquipTheBotWouldUndo(
+                                player, botAI, item, targetName, status, detail);
                     }
                 }
                 if (checkable)
@@ -53433,7 +53513,7 @@ private:
                     detail = refusal.detail;
                 }
 
-                if (!equipRefused)
+                if (!equipRefused && !equipWithheld)
                     botAI->HandleCommand(CHAT_MSG_WHISPER, command, player);
 
                 if (equipRefused)
@@ -53441,6 +53521,10 @@ private:
                     LOG_WARN("module.overseer",
                              "overseer: '{}' equip item {} refused - {}",
                              targetName, equipCommand.entry, detail);
+                }
+                else if (equipWithheld)
+                {
+                    // Logged, with both scores, where the verdict was read.
                 }
                 else if (equip)
                 {
@@ -53457,7 +53541,7 @@ private:
                 // only the command it HELD, so the log for the Ugga window
                 // contained `holding` lines and no trace whatsoever of the
                 // two commands that actually went out (infra#2819).
-                if (!equipRefused)
+                if (!equipRefused && !equipWithheld)
                     LOG_INFO("module.overseer",
                              "overseer: handed command {} ('{}') to '{}'; {}",
                              id, command, targetName,
@@ -53465,7 +53549,7 @@ private:
                              : checkable ? "reading the live strategy list back before it counts"
                                        : "no post-condition to read back");
 
-                if (equipRefused)
+                if (equipRefused || equipWithheld)
                 {
                     // Preflight refusal is final; the bot never received it.
                 }
