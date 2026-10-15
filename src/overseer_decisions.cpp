@@ -5025,6 +5025,14 @@ void GearSlotSeen(GearSlotShadow& shadow, bool occupied, GearSlotOccupant const&
     shadow.removedStamp = 0;
 }
 
+bool GearSlotDiscovered(GearSlotShadow& shadow, bool occupied, GearSlotOccupant const& item)
+{
+    if (shadow.observed)
+        return false;
+    GearSlotSeen(shadow, occupied, item);
+    return true;
+}
+
 GearSlotBefore GearSlotDisplaced(GearSlotShadow const& shadow, std::uint64_t stamp)
 {
     GearSlotBefore before;

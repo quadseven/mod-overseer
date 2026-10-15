@@ -4470,7 +4470,10 @@ void NoteCouncilKill(Player* killer, Creature* killed)
 // write is behind OnRoster, so this holds one vector of nineteen small structs
 // per enabled roster row and nothing else. The 500 bots never reach it.
 std::mutex g_wornMutex;
-std::map<std::string, std::vector<OverseerDecisions::GearSlotShadow>> g_wornSlots;
+std::map<uint64, std::vector<OverseerDecisions::GearSlotShadow>> g_wornSlots;
+std::set<uint64> g_wornSeededCharacters;
+std::atomic<uint64> g_wornSeedCount{0};
+std::atomic<uint64> g_wornUnknownEquipCount{0};
 
 // The three facts about an item this module keeps, resolved from the template
 // while the Item* is still valid. An unresolvable template leaves the name
@@ -4499,33 +4502,36 @@ uint64 WorldUpdateStamp()
 
 // g_wornMutex must be held. Returns nullptr for anything that is not an
 // equipment slot, which is the caller's cue that there is nothing to remember.
-OverseerDecisions::GearSlotShadow* WornSlotLocked(std::string const& name, uint8 slot)
+OverseerDecisions::GearSlotShadow* WornSlotLocked(uint64 guid, uint8 slot)
 {
     if (slot >= EQUIPMENT_SLOT_END)
         return nullptr;
-    std::vector<OverseerDecisions::GearSlotShadow>& slots = g_wornSlots[LowerName(name)];
+    std::vector<OverseerDecisions::GearSlotShadow>& slots = g_wornSlots[guid];
     if (slots.size() < static_cast<size_t>(EQUIPMENT_SLOT_END))
         slots.resize(EQUIPMENT_SLOT_END);
     return &slots[slot];
 }
 
-// Read every equipment slot off a character once, at login. This is the ONLY
-// place this module looks at a character's gear for this purpose, and the only
-// thing that can establish "this slot is empty" as an observation rather than
-// as silence. Nineteen array reads.
-void SeedWornSlots(Player* player)
+// Read every equipment slot off a character at login or first discovery.
+// This is the only operation that establishes an empty slot as an observation.
+void SeedWornSlots(Player* player, bool discoveredMidSession = false)
 {
     if (!player)
         return;
 
     std::lock_guard<std::mutex> guard(g_wornMutex);
-    std::vector<OverseerDecisions::GearSlotShadow>& slots =
-        g_wornSlots[LowerName(player->GetName())];
+    uint64 const guid = player->GetGUID().GetRawValue();
+    std::vector<OverseerDecisions::GearSlotShadow>& slots = g_wornSlots[guid];
+    if (g_wornSeededCharacters.insert(guid).second)
+        ++g_wornSeedCount;
     slots.resize(EQUIPMENT_SLOT_END);
     for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
     {
         Item const* item = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
-        OverseerDecisions::GearSlotSeen(slots[slot], item != nullptr, WornOccupant(item));
+        if (discoveredMidSession)
+            OverseerDecisions::GearSlotDiscovered(slots[slot], item != nullptr, WornOccupant(item));
+        else
+            OverseerDecisions::GearSlotSeen(slots[slot], item != nullptr, WornOccupant(item));
     }
 }
 
@@ -4538,7 +4544,8 @@ void ForgetWornSlot(Player* player, uint8 slot)
         return;
 
     std::lock_guard<std::mutex> guard(g_wornMutex);
-    if (OverseerDecisions::GearSlotShadow* shadow = WornSlotLocked(player->GetName(), slot))
+    if (OverseerDecisions::GearSlotShadow* shadow = WornSlotLocked(
+            player->GetGUID().GetRawValue(), slot))
         OverseerDecisions::GearSlotCleared(*shadow, WorldUpdateStamp());
 }
 
@@ -4553,7 +4560,8 @@ OverseerDecisions::GearSlotBefore TakeWornSlot(Player* player, uint8 slot, Item 
         return before;
 
     std::lock_guard<std::mutex> guard(g_wornMutex);
-    OverseerDecisions::GearSlotShadow* shadow = WornSlotLocked(player->GetName(), slot);
+    OverseerDecisions::GearSlotShadow* shadow = WornSlotLocked(
+        player->GetGUID().GetRawValue(), slot);
     if (!shadow)
         return before;
 
@@ -7209,6 +7217,8 @@ public:
         // new occupant, because the answer is only right when it is taken
         // before that happens.
         OverseerDecisions::GearSlotBefore const before = TakeWornSlot(player, slot, item);
+        if (before.state == OverseerDecisions::GearSlotState::Unobserved)
+            ++g_wornUnknownEquipCount;
 
         // The detail keeps its existing `slot <n>` opening - the website parses
         // it - and gains a sentence naming what came out. The machine-readable
@@ -7558,6 +7568,9 @@ public:
     // pool closes, so these writes land.
     void OnShutdown() override
     {
+        LOG_INFO("module.overseer",
+                 "overseer: gear slot shadows seeded for {} characters; {} equips answered unknown",
+                 g_wornSeedCount.load(), g_wornUnknownEquipCount.load());
         FlushChat();
         FlushEvents();
         FlushDeaths();
@@ -7601,6 +7614,15 @@ public:
             // restart - which is precisely when a character is most likely to
             // do something worth having a record of.
             ReloadRosterNames();
+            // The module can become active after players are already in the
+            // world. Login hooks cannot cover those characters, so seed the
+            // currently online roster before any later equip can be observed.
+            for (auto const& entry : ObjectAccessor::GetPlayers())
+            {
+                Player* online = entry.second;
+                if (online && online->IsInWorld() && OnRoster(online->GetName()))
+                    SeedWornSlots(online, true);
+            }
             // And the seat targets, so the first level-up after a restart
             // follows its seat rather than playerbots' random pick.
             ReloadRaidSpecTargets();
