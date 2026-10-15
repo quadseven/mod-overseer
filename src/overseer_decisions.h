@@ -19527,6 +19527,8 @@ enum class GhostRecoveryReason : uint8_t
     WaitedOut,        // it waited and the corpse never cleared
     StillSick,        // it still carries Resurrection Sickness; the corpse run
                       // does not stack another
+    SickButThreatened // it still carries Resurrection Sickness, but hostiles
+                      // near the corpse make reclaiming it unsafe
 };
 
 struct GhostRecoveryFacts
@@ -19597,13 +19599,15 @@ struct GhostRecoveryVerdict
 //   1. The spirit healer was already chosen for this death: keep it. A ghost
 //      halfway to the healer is not turned round because a patrol wandered off.
 //   2. It has died `repeatDeaths` times here inside the window: spirit healer.
-//   2a. It still carries Resurrection Sickness and the corpse run is possible:
-//      corpse run, so the sickness does not stack (mod-overseer#747). This
-//      sits BELOW rule 2: a second death at one spot is the death loop, and
-//      walking back into it costs more than a second dose of sickness. It
-//      also ends when the debuff ends, not a fixed 600 seconds after the
-//      healer. On wow-dev 2026-10-04, with it above rule 2 and on a fixed
-//      window, 101 of 311 repeat deaths in 49 minutes were corpse runs it
+//   2a. It still carries Resurrection Sickness, the corpse run is possible,
+//      and the corpse is clear of hostiles: corpse run, so the sickness does
+//      not stack (mod-overseer#747, #958). When the corpse fails the danger
+//      test (live threats or outlevelled), it waits or takes the healer as
+//      in rules 3 and 4. This sits BELOW rule 2: a second death at one spot is
+//      the death loop, and walking back into it costs more than a second dose
+//      of sickness. It also ends when the debuff ends, not a fixed 600 seconds
+//      after the healer. On wow-dev 2026-10-04, with it above rule 2 and on a
+//      fixed window, 101 of 311 repeat deaths in 49 minutes were corpse runs it
 //      forced, 77 of them after the sickness had worn off
 //      (wow-overseer#598).
 //   3. A hostile at least `levelGap` levels above it is near the corpse:

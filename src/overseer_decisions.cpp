@@ -16884,16 +16884,18 @@ GhostRecoveryVerdict DecideGhostRecovery(GhostRecoveryFacts const& facts,
     if (limits.repeatDeaths && facts.deathsHere >= limits.repeatDeaths)
         return healer(GhostRecoveryReason::RepeatDeaths);
 
-    // 2a. Do not stack Resurrection Sickness when the corpse remains reachable.
-    if (facts.sick && facts.corpseRunPossible)
+    // 2a. Do not stack Resurrection Sickness when the corpse remains reachable
+    // and safe (mod-overseer#747, #958).
+    bool const outlevelled = facts.strongestNearCorpse &&
+                             facts.strongestNearCorpse >= facts.level + limits.levelGap;
+    if (facts.sick && facts.corpseRunPossible && facts.liveThreatsNearCorpse == 0 && !outlevelled)
     {
         verdict.reason = GhostRecoveryReason::StillSick;
         return verdict;
     }
 
     // 3. Something near the corpse is well above it.
-    if (facts.strongestNearCorpse &&
-        facts.strongestNearCorpse >= facts.level + limits.levelGap)
+    if (outlevelled)
         return healer(GhostRecoveryReason::Outlevelled);
 
     // 4. Something near the corpse could kill it again, and may move off.
@@ -16902,7 +16904,8 @@ GhostRecoveryVerdict DecideGhostRecovery(GhostRecoveryFacts const& facts,
         if (facts.ghostSeconds < limits.waitSeconds)
         {
             verdict.choice = GhostRecovery::Wait;
-            verdict.reason = GhostRecoveryReason::HostilesNearby;
+            verdict.reason = facts.sick ? GhostRecoveryReason::SickButThreatened
+                                        : GhostRecoveryReason::HostilesNearby;
             return verdict;
         }
         return healer(GhostRecoveryReason::WaitedOut);
@@ -17174,6 +17177,9 @@ char const* GhostRecoveryReasonText(GhostRecoveryReason reason)
         case GhostRecoveryReason::StillSick:
             return "it still carries Resurrection Sickness and the spirit healer would stack "
                    "another";
+        case GhostRecoveryReason::SickButThreatened:
+            return "it still carries Resurrection Sickness, but hostiles near the corpse make "
+                   "reclaiming it unsafe";
     }
     return "unknown";
 }
