@@ -5880,6 +5880,10 @@ void GearSlotCleared(GearSlotShadow& shadow, std::uint64_t stamp);
 // was empty" a fact rather than an absence of evidence.
 void GearSlotSeen(GearSlotShadow& shadow, bool occupied, GearSlotOccupant const& item);
 
+// Seed a slot only when the module first discovers the character mid-session.
+// Returns true when this call established the first observation.
+bool GearSlotDiscovered(GearSlotShadow& shadow, bool occupied, GearSlotOccupant const& item);
+
 // What did the item now in this slot displace? Must be asked BEFORE
 // GearSlotFilled records the new occupant, because after that call the shadow
 // describes the new state and no longer the old one.
