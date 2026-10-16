@@ -29545,7 +29545,7 @@ private:
             // spirit healer after repeat deaths, and the nearest healer is
             // the one standing among the guards that failed the test. Run the
             // ghost to a graveyard that passes it instead.
-            if (!ladder && st.healerGrave && !st.healerRefused.empty())
+            if (st.healerGrave && !st.healerRefused.empty())
                 RerouteHealerGraveyard(bot, name, st, corpse, evidence);
         }
 
@@ -29636,7 +29636,8 @@ private:
         OverseerDecisions::GhostRecovery choice = verdict.choice;
         if (choice == OverseerDecisions::GhostRecovery::Ladder && !ladder)
             choice = OverseerDecisions::GuildGhostFallback(
-                st.deathsHere, st.healerGrave != nullptr, GHOST_RECOVERY_LIMITS.repeatDeaths);
+                st.deathsHere, st.healerGrave != nullptr && facts.healerGraveyardSafe,
+                GHOST_RECOVERY_LIMITS.repeatDeaths);
 
         switch (choice)
         {
