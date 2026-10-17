@@ -81,11 +81,8 @@
  *                     exists in this file four times, on revival paths that
  *                     each argued for themselves, and a fifth with nothing in
  *                     front of it would be an admin shortcut wearing a game
- *                     mechanic's name. THE FIRST OF THREE ROWS IN THIS QUEUE
- *                     THAT CANNOT BE ANSWERED BY THE POLL THAT SENT THEM (the
- *                     others are kind='summon' and kind='conjure'): a
- *                     hearthstone has a cast time, so nothing has happened
- *                     when the handler returns and the row parks in
+ *                     mechanic's name. A hearthstone has a cast time, so nothing
+ *                     has happened when the handler returns and the row parks in
  *                     `verifying` until ResolveHearthChecks reads back where
  *                     the character actually is. See
  *                     2026_09_07_01_overseer_hearth.sql.
@@ -106,11 +103,10 @@
  *                     already (#308). It is deliberately NOT a teleport, and
  *                     it is deliberately not mod-playerbots' own SummonAction,
  *                     which is a teleport with a stone-shaped gate in front of
- *                     it. Parks in `verifying` like the hearth, and for longer:
- *                     a ritual settles on the world's clock, the accept is a
- *                     packet nothing in this fleet has ever sent, and the
- *                     teleport that follows crosses a map. See
- *                     2026_09_08_00_overseer_summon.sql.
+ *                     it. Parks in `verifying` for longer than a hearth: a ritual
+ *                     settles on the world's clock, the accept is a packet nothing
+ *                     in this fleet has ever sent, and the teleport that follows
+ *                     crosses a map. See 2026_09_08_00_overseer_summon.sql.
  *      kind='conjure' - have a character make its own food or water with a
  *                     spell it already knows, and count what actually landed
  *                     in the bags. The family carried zero food and zero drink
@@ -122,9 +118,11 @@
  *                     patches/mod-playerbots/0013 fixes. That patch keeps a
  *                     mage supplied; this verb is how a PARTY gets stocked,
  *                     because upstream's trigger only fires on an empty stack.
- *                     THE THIRD ROW THAT OUTLIVES ITS OWN POLL, and the only
- *                     one of the three that also ACTS more than once: a
- *                     stack is twenty
+ *                     A hearthstone has a cast time, so nothing has happened
+ *                     when the handler returns and the row parks in `verifying`
+ *                     until ResolveConjureChecks reads the bags back. The
+ *                     conjure loop is longer than the hearth, and it is the only
+ *                     one that also ACTS more than once: a stack is twenty
  *                     units, a cast makes two of them, so one row is ten three
  *                     second casts and ResolveConjureChecks reads the bags
  *                     back between every one. `up_to:<n>` is a total and not
