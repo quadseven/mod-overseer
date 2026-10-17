@@ -4831,6 +4831,17 @@ LootCouncilVote LootCouncilVoteFor(bool decided, std::string const& recipient,
     return recipient == voter ? LootCouncilVote::Need : LootCouncilVote::Pass;
 }
 
+LootCouncilVote MandatedLootVote(bool active, bool bindOnPickup,
+                                std::string const& intended,
+                                std::string const& voter)
+{
+    if (!active || !bindOnPickup)
+        return LootCouncilVote::Upstream;
+    if (!intended.empty() && intended == voter)
+        return LootCouncilVote::Need;
+    return LootCouncilVote::Pass;
+}
+
 std::string LootCouncilRollKey(std::uint64_t rollItemGuid)
 {
     return "roll:" + std::to_string(rollItemGuid);

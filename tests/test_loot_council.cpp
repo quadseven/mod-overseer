@@ -289,6 +289,20 @@ void VotesOnAnOpenRoll()
            "the heuristic decides before the upstream vote, and both before the roll ends");
 }
 
+void MandatedBindOnPickupRollsAreExclusive()
+{
+    Expect(MandatedLootVote(true, true, "Ugga", "Ugga") == LootCouncilVote::Need,
+           "only the intended character needs a mandated bind-on-pickup item");
+    Expect(MandatedLootVote(true, true, "Ugga", "Grug") == LootCouncilVote::Pass,
+           "another character passes a mandated bind-on-pickup item");
+    Expect(MandatedLootVote(true, true, "", "Grug") == LootCouncilVote::Pass,
+           "an unresolved recipient cannot take a bind-on-pickup item");
+    Expect(MandatedLootVote(false, true, "Ugga", "Ugga") == LootCouncilVote::Upstream,
+           "a cancelled mandate no longer overrides the ordinary roll");
+    Expect(MandatedLootVote(true, false, "Ugga", "Grug") == LootCouncilVote::Upstream,
+           "a non-bind-on-pickup item keeps ordinary loot policy");
+}
+
 void SeatRoles()
 {
     Expect(GearRoleForSeat(1, "tank") == GearRole::Tank, "a tank seat tanks");
@@ -426,6 +440,7 @@ int main()
     TheMainTankIsGearedFirst();
     TanksThenHealersThenTheRest();
     VotesOnAnOpenRoll();
+    MandatedBindOnPickupRollsAreExclusive();
     SeatRoles();
     KeysAndJson();
     TheAdapterSeams();

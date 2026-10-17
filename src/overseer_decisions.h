@@ -5690,6 +5690,12 @@ enum class LootCouncilVote
 LootCouncilVote LootCouncilVoteFor(bool decided, std::string const& recipient,
                                    std::string const& voter, long openSeconds);
 
+// A live item mandate takes precedence on bind-on-pickup group rolls. Every
+// other member passes, including when the mandate has an invalid recipient.
+LootCouncilVote MandatedLootVote(bool active, bool bindOnPickup,
+                                std::string const& intended,
+                                std::string const& voter);
+
 // The row key: "roll:<roll item guid>" for a group-loot roll, and
 // "ml:<creature raw guid>:<loot slot>" for a master-loot drop.
 std::string LootCouncilRollKey(std::uint64_t rollItemGuid);
