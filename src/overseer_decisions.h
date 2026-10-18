@@ -13894,6 +13894,30 @@ std::string FlightMasterNodeAim(uint32_t nodeId);
 bool FlightMasterAnswersForNode(float fmX, float fmY, float nodeX, float nodeY,
                                 float matchYards);
 
+// CAN THE FLIGHT MASTER THIS CHARACTER WOULD WALK TO SELL IT THE TICKET (#970).
+// `ConsiderFlight` asks this once it knows the departure node and before it
+// looks for a landing. Either refusal is an unreachable flight master, and
+// each is said rather than silently walked past: a character that could
+// have flown and walks instead has to say why, or the missing flight master
+// is never noticed.
+enum class FlightMasterBoarding : std::uint8_t
+{
+    Board,        // a flight master is in reach and answers for the node
+    NoneInReach,  // no flight master this character can deal with on the map
+    WrongNode,    // the nearest one stands too far from the departure node
+};
+
+// `resolved` is whether a flight master was found at all; the positions are
+// only read when it was. The node match is FlightMasterAnswersForNode above,
+// so this and a deliberate flight-master errand agree.
+FlightMasterBoarding ReadFlightMasterBoarding(bool resolved, float fmX, float fmY,
+                                              float nodeX, float nodeY, float matchYards);
+
+// The clause the refusal line says after "but", naming the creature in the
+// `WrongNode` case so the flight master that does not answer can be found.
+// Empty for `Board`, which is not a refusal.
+std::string FlightMasterRefusalReason(FlightMasterBoarding boarding, uint32_t fmEntry);
+
 // The three-way arrival answer for a deliberate flight-master errand,
 // asked of the LIVE creature rather than the recorded spawn point - #378's
 // argument applies here unchanged. `false` (`inReach`) and `false`
