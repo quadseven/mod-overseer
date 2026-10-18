@@ -15874,12 +15874,12 @@ private:
             if (result == SPELL_FAILED_REQUIRES_SPELL_FOCUS)
             {
                 // A CONJURABLE FOCUS IS PROVIDED, not waited for (#534).
-                // natural-only: a spell the character knows (HasSpell), cast
-                // untriggered, the way a cook at a client clicks it.
                 uint32 const lighter =
                     OverseerDecisions::FocusLighterSpell(info->RequiresSpellFocus);
                 if (lighter && bot->HasSpell(lighter))
                 {
+                    // natural-only: a spell the character knows (HasSpell), cast
+                    // untriggered, the way a cook at a client clicks it.
                     SpellCastResult const lit = bot->CastSpell(bot, lighter, false);
                     LOG_INFO("module.overseer",
                              "overseer: '{}' needs spell focus {} for '{}' ({}) and {} "
