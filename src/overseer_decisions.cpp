@@ -22233,4 +22233,9 @@ char const* RebuffStepWord(RebuffStep step)
     return "unknown";
 }
 
+bool HealerStandsDown(HealerStandDownFacts const& facts)
+{
+    return facts.inRun && facts.livingResurrector && facts.deadSeconds < facts.windowSeconds;
+}
+
 }  // namespace OverseerDecisions

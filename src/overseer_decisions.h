@@ -20579,6 +20579,29 @@ struct GhostRecoveryVerdict
 GhostRecoveryVerdict DecideGhostRecovery(GhostRecoveryFacts const& facts,
                                          GhostRecoveryLimits const& limits = GhostRecoveryLimits{});
 
+// THE DUNGEON RESURRECTOR GETS ITS WHOLE WINDOW (mod-overseer#1026).
+//
+// Inside an instance with a run open, the dungeon module walks a living
+// resurrector to a dead member's corpse, so the stuck-revival drive stands
+// down for `windowSeconds` from the death (STUCK_REVIVAL_HEALER_SECONDS)
+// rather than release it to a graveyard outside. All three must hold: a run
+// is open for its map, a living resurrector shares that map, and the death is
+// younger than the window. Nothing else ends the wait early.
+//
+// #753 added a ten-minute "recently used spirit healer" check here. It stamped
+// the mark on the first poll of the wait, when no spirit healer had been used,
+// so the next poll one second later read the mark and gave up on the
+// resurrector. The anti-stacking rule it wanted lives in DecideGhostRecovery
+// (rule 2a, the `sick` fact), which is where a ghost's choice is made.
+struct HealerStandDownFacts
+{
+    int64_t deadSeconds{0};
+    bool inRun{false};
+    bool livingResurrector{false};
+    int64_t windowSeconds{0};
+};
+bool HealerStandsDown(HealerStandDownFacts const& facts);
+
 // WHEN RESURRECTION SICKNESS ENDS. `remainingMs` is what the core's aura (spell
 // 15007) has left at `now`, read the moment the spirit healer revives the
 // character; 0 or less when it carries none (below the sickness level). The
