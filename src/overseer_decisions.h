@@ -20730,16 +20730,28 @@ struct StrandedGhostFacts
     uint32_t standingMapId{0};
     // The map it stands on is an instance, a battleground or an arena.
     bool standingInstanceable{false};
-    // In a group: a run still under way may take it back to its corpse (the
-    // raid run-back walks grouped ghosts to the door), so it is left to it.
+    // In a group.
     bool grouped{false};
+    // A run still under way may take it back to its corpse: a guild run lists
+    // it (its corpse run walks the run's ghosts to the door), or the raid
+    // run-back is walking it inside its window (RaidGhostMayBeWalked).
+    bool runTakesBack{false};
 };
 
-// SpiritHealer only for a released ghost, out of any group, standing in the
-// open world, whose corpse the core knows is on another map. Leave for
-// everything else: alive or not yet released (the dead engine releases it), a
-// corpse on its own map (DecideGhostRecovery decides), a ghost inside an
-// instance, or one in a group.
+// SpiritHealer only for a released ghost standing in the open world, whose
+// corpse the core knows is on another map, unless it is in a group that a run
+// still under way may take back in. Leave for everything else: alive or not
+// yet released (the dead engine releases it), a corpse on its own map
+// (DecideGhostRecovery decides), a ghost inside an instance, or one in a group
+// a run is taking back.
+//
+// A GROUP ALONE IS NOT A RUN (wow-overseer#1093). Measured on the dev realm
+// (2026-10-18): four natural guild members stood as ghosts at the graveyard
+// outside Blackfathom Deeps (map 48) for three to five days, their corpses
+// inside, at least one still leading a group no run owned. A group is not
+// disbanded by every end of a run, and nothing else walks such a ghost: the
+// dead engine cannot see a corpse on another map, and in 26 hours of the
+// world log no stranded ghost line named any of them.
 StrandedGhostStep StrandedGhostNext(StrandedGhostFacts const& facts);
 
 // "leave", "spirit_healer".

@@ -17,9 +17,10 @@
  *   recovery decision at all.
  *
  * Out of the group the instance is no longer theirs, so the corpse cannot be
- * reached: the spirit healer is the way back. A grouped ghost is left to the
- * run that may still take it in, and a corpse on the ghost's own map is
- * DecideGhostRecovery's to judge.
+ * reached: the spirit healer is the way back. A grouped ghost is left to a
+ * run that may still take it in (a guild run listing it, or the raid
+ * run-back inside its window), not to the group alone (wow-overseer#1093),
+ * and a corpse on the ghost's own map is DecideGhostRecovery's to judge.
  *
  * Compiled against src/overseer_decisions.cpp and nothing else, and reads
  * src/mod_overseer.cpp to pin the wiring (run from the repo root).
@@ -90,10 +91,34 @@ void TheMeasuredGhostsTakeTheSpiritHealer()
     Expect("and one with its corpse in Blackfathom Deeps", f, StrandedGhostStep::SpiritHealer);
 }
 
+// wow-overseer#1093, measured on the dev realm (2026-10-18): four guild
+// members stood as ghosts at the graveyard outside Blackfathom Deeps for three
+// to five days, their corpses on map 48, at least one still leading a group
+// that no run owned. A group is not a run, and nothing else walks them.
+void AGroupNoRunOwnsDoesNotHoldTheGhost()
+{
+    StrandedGhostFacts f = TheTankOutsideTheDeadmines();
+    f.corpseMapId = 48;
+    f.standingMapId = 1;
+    f.grouped = true;
+    f.runTakesBack = false;
+    Expect("a grouped ghost no run is taking back takes the spirit healer", f,
+           StrandedGhostStep::SpiritHealer);
+
+    f.runTakesBack = true;
+    Expect("a grouped ghost a run is taking back is left to the run", f,
+           StrandedGhostStep::Leave);
+
+    f.grouped = false;
+    Expect("out of the group the instance is not the run's to take it back into", f,
+           StrandedGhostStep::SpiritHealer);
+}
+
 void EverythingElseIsLeftAlone()
 {
     StrandedGhostFacts f = TheTankOutsideTheDeadmines();
     f.grouped = true;
+    f.runTakesBack = true;
     Expect("a ghost still in its group is left to the run that may take it back", f,
            StrandedGhostStep::Leave);
 
@@ -174,6 +199,8 @@ void TheAdapterIsWired()
         "bot->GetCorpseLocation();");
     has("the decision is the pure one", "OverseerDecisions::StrandedGhostNext(facts)");
     has("the group is a fact", "facts.grouped = bot->GetGroup() != nullptr;");
+    has("so is a run that may take it back",
+        "facts.runTakesBack = InAGuildRun(name) || RaidRunBackWalks(name, now);");
     has("the spirit healer is walked to as for any ghost",
         "WalkGhostToSpiritHealer(bot, botAI, name, st, /*ladder*/ false, now);");
     has("the deploy proof is said", "overseer: stranded ghost '{}'");
@@ -197,6 +224,7 @@ void TheAdapterIsWired()
 int main()
 {
     TheMeasuredGhostsTakeTheSpiritHealer();
+    AGroupNoRunOwnsDoesNotHoldTheGhost();
     EverythingElseIsLeftAlone();
     TheWordsAreFixed();
     TheAdapterIsWired();
