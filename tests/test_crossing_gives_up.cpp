@@ -53,14 +53,16 @@ std::int64_t const START = 1000000;
 std::int64_t const MINUTE = 60;
 
 // One attempt: claimed at `yards` from the berth, walked no nearer than
-// `nearest`, ended at `endAt`.
+// `nearest`, ended at `endAt` by `end` (the travel drive's ground give-up
+// unless a case says otherwise).
 CrossingAttemptReading Attempt(CrossingAttempts& record, float yards, float nearest,
                                std::int64_t at, std::int64_t endAt,
-                               CrossingAttemptLimits const& limits)
+                               CrossingAttemptLimits const& limits,
+                               CrossingAttemptEnd end = CrossingAttemptEnd::GroundGiveUp)
 {
     OpenCrossingAttempt(record, DUNGEON, BERTH, yards, at);
     OpenCrossingAttempt(record, DUNGEON, BERTH, nearest, at + MINUTE);
-    return EndCrossingAttempt(record, endAt, limits);
+    return EndCrossingAttempt(record, endAt, limits, end);
 }
 }  // namespace
 
@@ -70,6 +72,7 @@ int main()
     Check("two attempts, 100 yards, two hours", limits.attempts == 2 &&
                                                     limits.gainYards == 100.f &&
                                                     limits.cooloffSeconds == 2 * 60 * 60);
+    Check("one attempt when the backstop ended it", limits.overdueAttempts == 1);
 
     // TWO FAILED ATTEMPTS WITH NO GAIN GIVE UP, WITH THE COOL-OFF.
     {
@@ -144,7 +147,7 @@ int main()
         CrossingAttempts record;
         Attempt(record, 3100.f, 3090.f, START, START + 4 * MINUTE, limits);
         CrossingAttemptReading const overdue =
-            EndCrossingAttempt(record, START + 30 * MINUTE, limits);
+            EndCrossingAttempt(record, START + 30 * MINUTE, limits, CrossingAttemptEnd::Overdue);
         Check("the overdue end of an attempt already ended is not a second failure",
               !overdue.counted && overdue.attempts == 1 &&
                   overdue.verdict == CrossingAttemptVerdict::Continue);
@@ -154,10 +157,57 @@ int main()
         Check("the walk after the overdue refusal is the second attempt, and gives up",
               again.verdict == CrossingAttemptVerdict::GiveUp && again.attempts == 2);
 
-        // An attempt the backstop itself ends counts once, as any other end.
-        CrossingAttempts byBackstop;
-        Attempt(byBackstop, 3100.f, 3095.f, START, START + 31 * MINUTE, limits);
-        Check("an overdue backstop is a failed attempt", byBackstop.failed == 1);
+        // An attempt a ground give-up ends counts once, as any other end.
+        CrossingAttempts byGround;
+        Attempt(byGround, 3100.f, 3095.f, START, START + 31 * MINUTE, limits);
+        Check("a ground give-up is one failed attempt of two", byGround.failed == 1);
+    }
+
+    // A HALF HOUR THAT GOT NOWHERE GIVES UP AT ONCE (wow-overseer#870). After
+    // #926 shipped, four of the leader's seven hand-backs took 106 to 165
+    // minutes, each ending on the crossing's own backstop: two half hours, and
+    // the gaps between them, before the family was let go. The issue asks for
+    // the docks or a hand-back within thirty minutes.
+    {
+        CrossingAttempts record;
+        std::int64_t const overdueAt = START + 30 * MINUTE;
+        CrossingAttemptReading const byBackstop = Attempt(
+            record, 3100.f, 3095.f, START, overdueAt, limits, CrossingAttemptEnd::Overdue);
+        Check("one overdue attempt with no gain gives the dungeon up",
+              byBackstop.counted && byBackstop.verdict == CrossingAttemptVerdict::GiveUp &&
+                  byBackstop.attempts == 1);
+        Check("within the half hour the backstop ran",
+              byBackstop.seconds <= 30 * MINUTE &&
+                  CrossingHandedBack(record, DUNGEON, overdueAt) == limits.cooloffSeconds);
+
+        // An overdue attempt that did get 100 yards nearer is still progress:
+        // a long walk may need more than one backstop.
+        CrossingAttempts walking;
+        CrossingAttemptReading const longWalk = Attempt(
+            walking, 3100.f, 2900.f, START, overdueAt, limits, CrossingAttemptEnd::Overdue);
+        Check("an overdue attempt that gained 100 yards continues",
+              longWalk.verdict == CrossingAttemptVerdict::Continue && longWalk.attempts == 0 &&
+                  !CrossingHandedBack(walking, DUNGEON, overdueAt));
+
+        // The travel drive's own ends still take two: each is a few minutes,
+        // not a half hour, and a second try costs little.
+        for (CrossingAttemptEnd const end :
+             {CrossingAttemptEnd::GroundGiveUp, CrossingAttemptEnd::NoProgressBackoff,
+              CrossingAttemptEnd::Refused})
+        {
+            CrossingAttempts other;
+            Check("any other end does not give up on the first stall",
+                  Attempt(other, 3100.f, 3095.f, START, START + 4 * MINUTE, limits, end)
+                          .verdict == CrossingAttemptVerdict::Continue);
+        }
+
+        // A short stall followed by an overdue one gives up on the overdue one.
+        CrossingAttempts mixed;
+        Attempt(mixed, 3100.f, 3095.f, START, START + 4 * MINUTE, limits);
+        Check("a stall then an overdue half hour gives up",
+              Attempt(mixed, 3095.f, 3090.f, START + 5 * MINUTE, START + 35 * MINUTE, limits,
+                      CrossingAttemptEnd::Overdue)
+                      .verdict == CrossingAttemptVerdict::GiveUp);
     }
 
     // ANOTHER DUNGEON OR ANOTHER BERTH IS A NEW QUESTION.
@@ -215,7 +265,8 @@ int main()
                                                                       : now - secondRefusedAt;
             if (ReadCrossingBerthClaim(sinceRefused, backoff) == CrossingBerthClaim::StandBack)
             {
-                CrossingAttemptReading const ended = EndCrossingAttempt(record, now, limits);
+                CrossingAttemptReading const ended = EndCrossingAttempt(
+                    record, now, limits, CrossingAttemptEnd::NoProgressBackoff);
                 if (ended.counted)
                     last = ended;
                 continue;
