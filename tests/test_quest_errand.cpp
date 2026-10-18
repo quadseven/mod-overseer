@@ -141,6 +141,96 @@ void HandingInTheFragment()
            "nobody in reach takes it back");
 }
 
+// #19: QUEST 45, DISCOVER ROLF'S FATE, IS HANDED IN AT AN OBJECT. It starts at
+// gameobject 55 (A half-eaten body) and ends at gameobject 56 (Rolf's corpse),
+// with no creature_questender row, and used to be refused in exactly the words
+// a character too far from a real creature gets. It is now handed in at the
+// object when one is in reach, said to be an object when none is, and a quest
+// the world names nothing at all for is a stop, never a wait.
+void AQuestHandedInAtAnObject()
+{
+    QuestErrand const turnin = ParseQuestErrand("turnin quest:45");
+    QuestErrandFacts f = Ready();
+    f.status = 1;
+    f.holder = QuestRelationHolder::GameObject;
+    Expect(QuestErrandRefusal(turnin, f).empty(),
+           "a complete quest whose ender is an object in reach is handed in");
+    f.giverInReach = false;
+    std::string const far = QuestErrandRefusal(turnin, f);
+    Expect(far == "no object that takes that quest in reach",
+           "an object ender out of reach says object, not creature");
+    Expect(far != QuestErrandRefusal(turnin, [] {
+               QuestErrandFacts c = Ready();
+               c.status = 1;
+               c.giverInReach = false;
+               return c;
+           }()),
+           "and is not worded like a creature out of reach");
+    Expect(QuestErrandRefusalRetryable(far), "an object out of reach is a wait");
+
+    QuestErrand const take = ParseQuestErrand("take quest:45");
+    QuestErrandFacts t = Ready();
+    t.holder = QuestRelationHolder::GameObject;
+    Expect(QuestErrandRefusal(take, t).empty(), "a quest an object gives is taken there");
+    t.giverInReach = false;
+    Expect(QuestErrandRefusal(take, t) == "no object that gives that quest in reach",
+           "an object giver out of reach says object");
+}
+
+void AQuestNothingTakesIn()
+{
+    QuestErrand const turnin = ParseQuestErrand("turnin quest:45");
+    QuestErrandFacts f = Ready();
+    f.status = 1;
+    f.holder = QuestRelationHolder::None;
+    std::string const none = QuestErrandRefusal(turnin, f);
+    Expect(none == "the world names no creature and no object that takes that quest in",
+           "a quest nothing takes in is said to be one");
+    Expect(!QuestErrandRefusalRetryable(none),
+           "and is could-not, not did-not-yet: the sender must not re-ask");
+    f.giverInReach = false;
+    Expect(QuestErrandRefusal(turnin, f) == none, "reach does not change it");
+
+    QuestErrand const take = ParseQuestErrand("take quest:45");
+    QuestErrandFacts t = Ready();
+    t.holder = QuestRelationHolder::None;
+    Expect(!QuestErrandRefusalRetryable(QuestErrandRefusal(take, t)),
+           "a quest nothing gives is a stop too");
+    Expect(QuestErrandRefusal(take, t).find("gives") != std::string::npos,
+           "and says gives, not takes in");
+
+    Expect(std::string(QuestRelationHolderName(QuestRelationHolder::Creature)) == "creature" &&
+               std::string(QuestRelationHolderName(QuestRelationHolder::GameObject)) ==
+                   "gameobject" &&
+               std::string(QuestRelationHolderName(QuestRelationHolder::None)) == "none",
+           "the holder names the row carries");
+}
+
+void WhichRefusalsAreAWait()
+{
+    Expect(QuestErrandRefusalRetryable("no taker of that quest in reach") &&
+               QuestErrandRefusalRetryable("no giver of that quest in reach") &&
+               QuestErrandRefusalRetryable("not complete") &&
+               QuestErrandRefusalRetryable("the quest log is full") &&
+               QuestErrandRefusalRetryable("the core will not reward it now"),
+           "the walls that move are a wait");
+    Expect(!QuestErrandRefusalRetryable("no such quest") &&
+               !QuestErrandRefusalRetryable("already turned in") &&
+               !QuestErrandRefusalRetryable("malformed request: want take, turnin or abandon quest:<id>") &&
+               !QuestErrandRefusalRetryable(
+                   "it offers a choice of reward, and nobody here would choose"),
+           "the walls the same row hits for ever are a stop");
+    // Every refusal the decision can return for a turn-in at a creature that
+    // is merely too far is still the same string as before #19, so a sender
+    // reading the old words keeps working.
+    QuestErrandFacts f = Ready();
+    f.status = 1;
+    f.giverInReach = false;
+    Expect(QuestErrandRefusal(ParseQuestErrand("turnin quest:7848"), f) ==
+               "no taker of that quest in reach",
+           "a creature ender out of reach keeps its words");
+}
+
 void TheAdapterSeams()
 {
     std::string const module = Read("src/mod_overseer.cpp");
@@ -152,9 +242,21 @@ void TheAdapterSeams()
     Expect(module.find("GetCreatureQuestRelationMap()") != std::string::npos &&
                module.find("GetCreatureQuestInvolvedRelationMap()") != std::string::npos,
            "the giver and taker come from the world's own quest relations");
-    Expect(module.find("player->AddQuestAndCheckCompletion(quest, npc);") != std::string::npos &&
-               module.find("player->RewardQuest(quest, 0, npc);") != std::string::npos,
+    Expect(module.find("player->AddQuestAndCheckCompletion(quest, giver);") != std::string::npos &&
+               module.find("player->RewardQuest(quest, 0, giver);") != std::string::npos,
            "the core's own calls take and hand in");
+    Expect(module.find("GetGOQuestRelationMap()") != std::string::npos &&
+               module.find("GetGOQuestInvolvedRelationMap()") != std::string::npos,
+           "an object giver and taker come from the world's own relations too (#19)");
+    std::size_t const doQuest = module.find("static char const* DoQuest(");
+    Expect(doQuest != std::string::npos &&
+               module.find("QuestObjectInReach(player, errand.questId, take)", doQuest) !=
+                   std::string::npos &&
+               module.find("QuestHolderKind(errand.questId, take)", doQuest) != std::string::npos,
+           "the errand looks for an object when no creature is in reach (#19)");
+    Expect(module.find("<< \",\\\"holder\\\":\"\n", doQuest) != std::string::npos &&
+               module.find("QuestErrandRefusalRetryable(reason)", doQuest) != std::string::npos,
+           "the row says which kind holds the quest and whether to ask again (#19)");
     Expect(module.find("if (player->GetQuestStatus(errand.questId) == QUEST_STATUS_NONE)") !=
                std::string::npos &&
                module.find("if (!player->GetQuestRewardStatus(errand.questId))") !=
@@ -195,6 +297,9 @@ int main()
     
     TakingAtLothos();
     HandingInTheFragment();
+    AQuestHandedInAtAnObject();
+    AQuestNothingTakesIn();
+    WhichRefusalsAreAWait();
     TheAdapterSeams();
     if (failures)
     {

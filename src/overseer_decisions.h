@@ -5750,11 +5750,41 @@ struct QuestErrand
 // "take quest:7848", "turnin quest:7848" or "abandon quest:7848"; anything else is None.
 QuestErrand ParseQuestErrand(std::string const& command);
 
+// WHAT THE WORLD DATABASE NAMES AS THE OTHER END OF THE ERRAND (#19). A quest
+// is given and taken back by creatures (creature_queststarter /
+// creature_questender) or by gameobjects (gameobject_queststarter /
+// gameobject_questender), and some by neither. Quest 45, Discover Rolf's Fate,
+// is started at gameobject 55 (A half-eaten body) and handed in at gameobject
+// 56 (Rolf's corpse), and has no creature row at either end. A turn-in that
+// only ever looked for a creature refused it with "no taker of that quest in
+// reach", the same words a character standing too far from a real creature
+// gets, so a quest nothing on the creature path can ever hand in sat in the
+// backlog looking like every other stuck quest, for ever.
+//
+// So the adapter says which kind the world names, and the refusal is worded
+// from it: a creature or an object too far away is a wait, and a quest with no
+// creature and no object at that end is a stop the sender must not re-ask.
+enum class QuestRelationHolder
+{
+    Creature,
+    GameObject,
+    None,
+};
+
+// "creature", "gameobject" or "none", as the row's result carries it.
+char const* QuestRelationHolderName(QuestRelationHolder holder);
+
 // What the adapter read, for one row. `status` is the core's QuestStatus
 // (0 none, 1 complete, 3 incomplete, 5 failed, 6 rewarded).
 struct QuestErrandFacts
 {
     bool questKnown{false};
+    // Which kind of thing the world names at the end this verb needs: the
+    // starter for a take, the ender for a turn-in. Creature by default, which
+    // is what every row meant before #19.
+    QuestRelationHolder holder{QuestRelationHolder::Creature};
+    // A live creature, or a spawned object, of an entry the relation names,
+    // within SPAWN_WALK_ARRIVE_YARDS.
     bool giverInReach{false};
     bool rewarded{false};
     int status{0};
@@ -5770,6 +5800,15 @@ struct QuestErrandFacts
 // may. Checked in the order a person would: the quest, the giver, then the
 // character.
 std::string QuestErrandRefusal(QuestErrand const& errand, QuestErrandFacts const& facts);
+
+// IS THIS REFUSAL WORTH ASKING AGAIN WITHOUT CHANGING THE ROW (#19). True for
+// the walls that move: the giver or taker is not in reach yet, the quest is not
+// complete yet, the log is full, the core will not reward it now. False for
+// what the same row will hit for ever, and above all for a quest the world
+// names nothing to hand in to: that is "could not", and a sender that counts it
+// as "did not yet" reports 23 of 24 handed in as nearly done when the 24th can
+// never be. Written into the row's result as `retryable`.
+bool QuestErrandRefusalRetryable(std::string const& reason);
 
 // ------------------------------------------ what an equip displaced (#372) --
 //
