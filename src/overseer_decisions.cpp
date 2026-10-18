@@ -21416,4 +21416,31 @@ LogoutScope LogoutOfflineScope(uint32_t otherInWorldOnAccount)
                                       : LogoutScope::CharacterOnly;
 }
 
+
+ReleasePromptReading ReleasePromptObserve(ReleasePromptClock& clock, std::int64_t now,
+                                          std::int64_t lastDeathAt,
+                                          std::int64_t maxGapSeconds)
+{
+    ReleasePromptReading reading;
+    if (clock.since == 0)
+    {
+        reading.start = ReleasePromptStart::FirstSighting;
+        clock.since = now;
+    }
+    else if (lastDeathAt > clock.since)
+    {
+        reading.start = ReleasePromptStart::NewDeath;
+        clock.since = now;
+    }
+    else if (now - clock.lastSeen > maxGapSeconds)
+    {
+        reading.start = ReleasePromptStart::AfterGap;
+        reading.gapSeconds = now - clock.lastSeen;
+        clock.since = now;
+    }
+    clock.lastSeen = now;
+    reading.deadSeconds = now - clock.since;
+    return reading;
+}
+
 }  // namespace OverseerDecisions

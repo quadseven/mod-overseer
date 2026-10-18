@@ -23552,6 +23552,74 @@ enum class LogoutScope
 };
 LogoutScope LogoutOfflineScope(uint32_t otherInWorldOnAccount);
 
+// THE RELEASE-PROMPT DEAD CLOCK (mod-overseer#252).
+//
+// A character dead on the "release to the nearest graveyard?" prompt has no
+// ghost time yet - a corpse, and so a ghost time, only exists after the
+// release - so the stuck-revival drive keeps its own clock, and releases on
+// the character's behalf once it reads STUCK_REVIVAL_DEAD_SECONDS.
+//
+// That clock was set on the first dead sighting and ended only by a release.
+// A character raised without one (a healer's resurrect, which skips the
+// prompt entirely) kept its clock, so its NEXT death was timed from the
+// first: the drive said "has been dead 368s" about a character the core had
+// booked a fresh death for two seconds earlier, and had booked a revive for
+// in between. It also released that character as soon as it died again,
+// with none of the grace a healer is owed.
+//
+// The clock now covers one unbroken dead spell and nothing more:
+//
+//   - Alive ends it. The drive erases the clock the moment it sees the
+//     character alive (the IsAlive branch of DriveStuckRevival).
+//   - A death booked after the clock started ends it too. `lastDeathAt` is
+//     when the module's own death hook last saw this character die (0 when it
+//     has not); a death later than the clock's start means the character was
+//     alive in between, even if no poll happened to land on that moment.
+//   - A dead sighting more than `maxGapSeconds` after the previous one does
+//     not extend it. Nothing looked at the character in between (it was
+//     offline, mid-login, or the drive took another branch), so nothing can
+//     say it stayed dead, and the clock restarts here with the gap reported
+//     rather than counted.
+//
+// Every restart times from THIS sighting, the same as a first sighting: the
+// reported duration is only ever a run of dead observations the drive made
+// itself, never a span it is guessing across.
+constexpr std::int64_t RELEASE_PROMPT_MAX_GAP_SECONDS = 30;
+
+struct ReleasePromptClock
+{
+    // The first dead sighting of the current spell; 0 = no spell running.
+    std::int64_t since{0};
+    // The most recent dead sighting.
+    std::int64_t lastSeen{0};
+};
+
+enum class ReleasePromptStart
+{
+    // The clock was already running and this sighting extends it.
+    Running,
+    // No spell was running: this is the first sighting.
+    FirstSighting,
+    // The death hook booked a death after the clock started.
+    NewDeath,
+    // The previous sighting was too long ago to vouch for the time between.
+    AfterGap,
+};
+
+struct ReleasePromptReading
+{
+    ReleasePromptStart start{ReleasePromptStart::Running};
+    // The age of the unbroken spell at `now`.
+    std::int64_t deadSeconds{0};
+    // AfterGap only: the unobserved stretch that broke the previous run.
+    std::int64_t gapSeconds{0};
+};
+
+// One dead sighting on the release prompt, at `now`. Updates `clock`.
+ReleasePromptReading ReleasePromptObserve(ReleasePromptClock& clock, std::int64_t now,
+                                          std::int64_t lastDeathAt,
+                                          std::int64_t maxGapSeconds);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

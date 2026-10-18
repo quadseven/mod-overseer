@@ -5008,6 +5008,29 @@ struct PendingDeath
     std::string targetedBy;
 };
 std::mutex g_deathMutex;
+// WHEN EACH ROSTER CHARACTER LAST DIED, by lowercased name (mod-overseer#252).
+// Written by OnPlayerJustDied on a map thread, read by DriveStuckRevival on the
+// world thread, so it has its own lock. It is how the release-prompt dead
+// clock learns about a death that happened after it started - a revive and a
+// second death that both fell between two of the drive's polls - see
+// OverseerDecisions::ReleasePromptObserve. Roster only, so it holds at most
+// one entry per roster character; lost on restart, which costs nothing,
+// because the clock it feeds is lost too.
+std::mutex g_deathStampMutex;
+std::map<std::string, int64> g_lastDeathAt;
+
+void StampDeath(std::string const& name)
+{
+    std::lock_guard<std::mutex> guard(g_deathStampMutex);
+    g_lastDeathAt[LowerName(name)] = int64(time(nullptr));
+}
+
+int64 LastDeathAt(std::string const& name)
+{
+    std::lock_guard<std::mutex> guard(g_deathStampMutex);
+    auto const it = g_lastDeathAt.find(LowerName(name));
+    return it == g_lastDeathAt.end() ? 0 : it->second;
+}
 // THE NEWEST OUTMATCHED DEATH OF EACH NATURAL GUILD MEMBER (2026-10-10): killed
 // by something OverseerDecisions::GUILD_OUTMATCHED_LEVEL_GAP or more levels
 // above it. Written by the death hook on a map thread (LogGuildDeath), read and
@@ -7387,6 +7410,8 @@ public:
             return;
         RecordEvent(player, "death", 0, "", "");
         RecordDeath(player);
+        if (OnRoster(player->GetName()))
+            StampDeath(player->GetName());
     }
 
     // NO FOLLOWER KEEPS A MASTER THAT IS ABOUT TO BE FREED (#131).
@@ -27793,6 +27818,11 @@ private:
                              name);
                 }
 
+                // Alive ends the dead spell, so the release-prompt clock ends
+                // with it (mod-overseer#252). It used to survive a revive that
+                // skipped the release - a healer's resurrect - and time the
+                // NEXT death from the first one's sighting.
+                _awaitingRelease.erase(name);
                 _healerExpected.erase(name);
                 EndGhostRecovery(botAI, name);
                 LadderEnd(botAI, name);
@@ -28006,8 +28036,14 @@ private:
             //
             // TIMED FROM OUR OWN FIRST SIGHTING, because there is no ghost
             // clock yet - that is the whole point. The map is keyed by name and
-            // cleared the moment the character is alive again, so a character
-            // that dies twice is timed from each death rather than the first.
+            // cleared the moment the character is alive again (the IsAlive
+            // branch above), so a character that dies twice is timed from each
+            // death rather than the first. It once was not cleared there, and
+            // said "has been dead 368s" about a character two seconds into its
+            // second death (mod-overseer#252). The clock also restarts on a
+            // death the hook booked after it started, and on a gap in its own
+            // sightings - see OverseerDecisions::ReleasePromptObserve - so the
+            // duration it reports is always one it watched.
             //
             // THE GRACE IS DELIBERATE AND NOT ZERO. A healer in the party may
             // resurrect a corpse, which is better than a graveyard run because
@@ -28025,22 +28061,36 @@ private:
                 }
 
                 int64 const now = time(nullptr);
-                auto const seen = _awaitingRelease.find(name);
-                if (seen == _awaitingRelease.end())
-                {
-                    _awaitingRelease[name] = now;
+                OverseerDecisions::ReleasePromptReading const reading =
+                    OverseerDecisions::ReleasePromptObserve(
+                        _awaitingRelease[name], now, LastDeathAt(name),
+                        OverseerDecisions::RELEASE_PROMPT_MAX_GAP_SECONDS);
+                if (reading.start == OverseerDecisions::ReleasePromptStart::NewDeath)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' died again since its release-prompt clock "
+                             "started, so it was alive in between - the clock restarts "
+                             "from this sighting rather than counting the first death",
+                             name);
+                else if (reading.start == OverseerDecisions::ReleasePromptStart::AfterGap)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' was not seen for {}s between two dead "
+                             "sightings on the release prompt - its clock restarts from "
+                             "this sighting, because nothing can say it stayed dead "
+                             "across the gap",
+                             name, reading.gapSeconds);
+                if (reading.start != OverseerDecisions::ReleasePromptStart::Running)
                     continue;
-                }
-                if (now - seen->second < STUCK_REVIVAL_DEAD_SECONDS)
+                if (reading.deadSeconds < STUCK_REVIVAL_DEAD_SECONDS)
                     continue;
-                if (healerExpected(now - seen->second))
+                if (healerExpected(reading.deadSeconds))
                     continue;
 
                 LOG_WARN("module.overseer",
-                         "overseer: '{}' has been dead {}s on the release prompt with nobody "
-                         "at the keyboard to answer it - releasing on its behalf, because a "
-                         "corpse only exists after the release and every other recovery path "
-                         "here waits for one", name, now - seen->second);
+                         "overseer: '{}' has been dead {}s (unbroken dead sightings) on "
+                         "the release prompt with nobody at the keyboard to answer it - "
+                         "releasing on its behalf, because a corpse only exists after the "
+                         "release and every other recovery path here waits for one",
+                         name, reading.deadSeconds);
                 bot->BuildPlayerRepop();
                 bot->RepopAtGraveyard();
                 _awaitingRelease.erase(name);
@@ -73031,8 +73081,10 @@ private:
     // time, only exists after the release - so the drive has to keep its own.
     // Written and read only from DriveStuckRevival on the world thread, so it
     // is unguarded like TravelAimBook's own maps and _lastAim above, and lost
-    // on restart, which costs at most one extra grace period.
-    std::map<std::string, int64> _awaitingRelease;
+    // on restart, which costs at most one extra grace period. Erased when the
+    // character is seen alive or released; read and advanced only through
+    // OverseerDecisions::ReleasePromptObserve (mod-overseer#252).
+    std::map<std::string, OverseerDecisions::ReleasePromptClock> _awaitingRelease;
 
     // WHICH DEATHS THIS DRIVE HAS SAID IT IS LEAVING TO THE HEALER, by name.
     // Same ownership and lifetime as _awaitingRelease: DriveStuckRevival on
