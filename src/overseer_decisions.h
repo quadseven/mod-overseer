@@ -1870,6 +1870,21 @@ bool DungeonRunMayClaimTravel(bool leaderHasOutstandingErrand);
 bool DungeonRunMayClaimTravel(bool leaderHasOutstandingErrand,
                               bool errandIsTheRunsOwnAim);
 
+// ...OR AN ERRAND THE TRAVEL DRIVE HAS ALREADY GIVEN UP ON (#762). The deferral
+// above trusts the errand's own backstop to end it, and for an aim nobody in
+// this process wrote that backstop cannot: a berth or inn aim a run wrote
+// before a worldserver restart has no claim on this side, so the release that
+// gives up on it skips the column write (a positional aim this book never
+// claimed is protected there) and the aim stands for ever. Measured on the dev
+// realm on 2026-09-27: released as unreachable at 16:12:47, still deferring a
+// new run until the operator cleared the column by hand at 16:16:38. So an
+// errand whose backstop has fired on exactly this aim (see
+// TravelErrandBackstopSpent) holds the run no longer, and the run's own claim
+// outranks the leftover the way it outranks any positional walk (#656).
+bool DungeonRunMayClaimTravel(bool leaderHasOutstandingErrand,
+                              bool errandIsTheRunsOwnAim,
+                              bool errandBackstopSpent);
+
 // `at:<map>:<x>,<y>,<z>`, read back. False for anything else, including an aim
 // with trailing text or a missing separator.
 bool ParsePlaceAim(std::string const& aim, std::uint32_t& mapId, float& x,
@@ -8811,6 +8826,27 @@ constexpr char const* TravelGroundGiveUpReleaseReason =
 // Is this errand-end reason one the travel drive gave up with, which counts as
 // a failed crossing attempt? Exact match: any other end is not one.
 bool IsTravelGiveUpRelease(std::string const& why);
+
+// The travel drive's third give-up: a walk that went nowhere over the stuck
+// window. Not one IsTravelGiveUpRelease counts, because the crossing reads that
+// one through NoProgressBackoffReason's refusal instead; it is named here so
+// TravelErrandBackstopSpent reads the same string the release writes.
+constexpr char const* TravelNoProgressReleaseReason =
+    "the travel drive (no progress over the stuck window)";
+
+// HAS THE ERRAND STANDING IN THE COLUMN ALREADY SPENT ITS OWN BACKSTOP (#762)?
+// True when the last end the travel book recorded for this character was the
+// travel drive giving up (any of its three give-up reasons) on exactly the aim
+// the column still holds. That pairing only happens when the release could not
+// clear the column - an aim this process never wrote, typically one left from
+// before a restart - so what stands there is no longer anybody's live errand.
+// False for anything but an `at:` point aim (a keyword errand is the bridge's,
+// and it clears its own), for an end on another aim, and for any other kind of
+// end (an escort ending, a crossing handing back), which may leave a live walk
+// standing on purpose.
+bool TravelErrandBackstopSpent(std::string const& columnAim,
+                               std::string const& lastEndTarget,
+                               std::string const& lastEndWhy);
 
 // ------------------------------------------- is the transport docked (#303) --
 //

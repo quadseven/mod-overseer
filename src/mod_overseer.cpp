@@ -25993,7 +25993,7 @@ private:
                              static_cast<uint32>(ERRAND_PROGRESS_LIMITS.windowSeconds),
                              static_cast<uint32>(ERRAND_PROGRESS_LIMITS.minGainYards),
                              static_cast<uint32>(ERRAND_PROGRESS_LIMITS.minMovedYards));
-                    _travelAims.Release(name, "the travel drive (no progress over the stuck window)");
+                    _travelAims.Release(name, OverseerDecisions::TravelNoProgressReleaseReason);
                     continue;
                 }
             }
@@ -32670,6 +32670,9 @@ private:
         uint32 resetAttempts{0};
         bool loggedResetWaiting{false};
         bool loggedTravelConflict{false};
+        // Said once per run that it stopped waiting on a spent errand (#762).
+        // Its own flag, because the deferral line before it set the one above.
+        bool loggedSpentErrand{false};
         // A SHORT TOWN STOP ON THE APPROACH (#639): the foreign aim GATHERING
         // is waiting on, when it was first seen, what `stagingSince` read
         // then (so staging's clock stands still while it waits), and whether
@@ -49399,8 +49402,30 @@ private:
                          "restart - adopted rather than waited on (#596)",
                          coord.runNumber, leaderName, leaderAim->second);
             }
+            // AND NOT ON AN ERRAND WHOSE OWN BACKSTOP HAS ALREADY FIRED (#762).
+            // The wait below is bounded only by that backstop, and a berth or
+            // inn aim left from before a restart is one the release cannot
+            // clear: this book never claimed it, so the gate keeps the column.
+            // The travel drive gave up on it; the run stops waiting on it too,
+            // and its own claim takes the column over below.
+            TravelAimBook::ErrandEnd const lastEnd =
+                leaderAim != travelAims.end() ? _travelAims.LastEnd(leaderName)
+                                              : TravelAimBook::ErrandEnd{};
+            bool const spent = !ownAim && leaderAim != travelAims.end() &&
+                               OverseerDecisions::TravelErrandBackstopSpent(
+                                   leaderAim->second, lastEnd.target, lastEnd.why);
+            if (spent && !coord.loggedSpentErrand)
+            {
+                coord.loggedSpentErrand = true;
+                LOG_INFO("module.overseer",
+                         "overseer: dungeon run {} finds leader '{}' still carrying '{}', "
+                         "which the travel drive already gave up on ({}) and whose release "
+                         "could not clear it, since nothing in this worldserver claimed it "
+                         "- the run stops waiting on it and takes the travel column (#762)",
+                         coord.runNumber, leaderName, leaderAim->second, lastEnd.why);
+            }
             if (!OverseerDecisions::DungeonRunMayClaimTravel(leaderAim != travelAims.end(),
-                                                             ownAim))
+                                                             ownAim, spent))
             {
                 // The errand has its own bounded backstop. Do not spend the
                 // dungeon's reset or whole-staging budgets while waiting on
