@@ -3178,6 +3178,11 @@ CounterRole CounterRoleForNpcFlags(std::uint32_t npcFlags)
     return CounterRole::None;
 }
 
+bool SpawnFillsTravelRole(std::uint32_t npcFlags, std::uint32_t roleFlags)
+{
+    return roleFlags != 0 && (npcFlags & roleFlags) == roleFlags;
+}
+
 bool ArrivalAnswersLearnAim(bool aimNamesTrainerRole, bool creatureTrains)
 {
     return aimNamesTrainerRole || creatureTrains;

@@ -14014,11 +14014,20 @@ private:
     // in BOTH directions, because a keyword one side accepts and the other
     // silently ignores is the written-and-unread failure of #2776 wearing a new
     // hat.
+    //
+    // `npcFlag` may name more than one bit, and a spawn fills the role only
+    // when it carries EVERY one of them (OverseerDecisions::SpawnFillsTravelRole,
+    // #544). The pure layer restates the petitioner flags; these pin its copy to
+    // the core's.
     struct TravelRole
     {
         char const* keyword;
         uint32 npcFlag;
     };
+    static_assert(OverseerDecisions::NPC_FLAG_PETITIONER == uint32(UNIT_NPC_FLAG_PETITIONER),
+                  "OverseerDecisions::NPC_FLAG_PETITIONER drifted from UnitDefines.h");
+    static_assert(OverseerDecisions::NPC_FLAG_TABARDDESIGNER == uint32(UNIT_NPC_FLAG_TABARDDESIGNER),
+                  "OverseerDecisions::NPC_FLAG_TABARDDESIGNER drifted from UnitDefines.h");
     static std::vector<TravelRole> const& TravelRoles()
     {
         static std::vector<TravelRole> const roles = {
@@ -14030,7 +14039,13 @@ private:
             {"banker",             UNIT_NPC_FLAG_BANKER},
             {"guild banker",       UNIT_NPC_FLAG_GUILD_BANKER},
             {"auctioneer",         UNIT_NPC_FLAG_AUCTIONEER},
+            // Any petitioner, guild or arena team: the one bit both carry.
+            // Left as it was so nothing that names it changes meaning (#544).
             {"petitioner",         UNIT_NPC_FLAG_PETITIONER},
+            // A Guild Master, the only NPC that sells a guild charter. Both
+            // bits, matched all-or-nothing by SpawnFillsTravelRole, so an Arena
+            // Organizer (petitioner bit only) never fills it (#544).
+            {"guild petitioner",   UNIT_NPC_FLAG_PETITIONER | UNIT_NPC_FLAG_TABARDDESIGNER},
             {"tabard designer",    UNIT_NPC_FLAG_TABARDDESIGNER},
             {"innkeeper",          UNIT_NPC_FLAG_INNKEEPER},
             {"flight master",      UNIT_NPC_FLAG_FLIGHTMASTER},
@@ -14499,7 +14514,9 @@ private:
                 if (spawn.name != wantedName)
                     continue;
             }
-            else if (!(spawn.npcFlags & wantedFlag))
+            // Every bit the role names, not any one of them (#544): a `guild
+            // petitioner` aim must not stop at an Arena Organizer.
+            else if (!OverseerDecisions::SpawnFillsTravelRole(spawn.npcFlags, wantedFlag))
                 continue;
             if (narrowToSkill && !TrainerStartedSkills(spawn.entry).count(wantSkill))
                 continue;

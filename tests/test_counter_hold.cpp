@@ -235,6 +235,7 @@ void OnlyTheFourEconomyKeywordsAreCounters()
         "profession trainer",
         "guild banker",
         "petitioner",
+        "guild petitioner",
         "tabard designer",
         "innkeeper",
         "flight master",
@@ -257,8 +258,8 @@ void TheRunGateAndTheArrivalBranchAgree()
     char const* const everyAim[] = {
         "", "vendor", "banker", "repair", "trainer", "class trainer",
         "profession trainer", "guild banker", "auctioneer", "petitioner",
-        "tabard designer", "innkeeper", "flight master", "stable master",
-        "at:0:-8913.2,554.6,93.8", "trigger:78", "1234",
+        "guild petitioner", "tabard designer", "innkeeper", "flight master",
+        "stable master", "at:0:-8913.2,554.6,93.8", "trigger:78", "1234",
     };
     for (char const* aim : everyAim)
     {

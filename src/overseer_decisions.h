@@ -4003,6 +4003,37 @@ constexpr std::uint32_t NPC_FLAG_AUCTIONEER   = 0x00200000;  // UnitDefines.h:34
 
 CounterRole CounterRoleForNpcFlags(std::uint32_t npcFlags);
 
+// A GUILD PETITIONER IS TWO BITS, NOT ONE (#544).
+//
+// UNIT_NPC_FLAG_PETITIONER alone is carried by guild petitioners and arena team
+// petitioners alike. The pinned core says so on the constant itself
+// (UnitDefines.h:340): "0xC0000 = guild petitions, 0x40000 = arena team
+// petitions". Measured on a dev realm, the petitioner bit without the tabard
+// bit matched six NPCs, every one an Arena Organizer, and
+// `npcflag & 0xC0000 = 0xC0000` matched nine, every one a Guild Master. So the
+// `petitioner` keyword, which asks for the one bit, can walk a character to an
+// Arena Organizer, which never sells a guild charter. `guild petitioner` asks
+// for both bits.
+//
+// Restated here for the same reason as the six above: this file compiles
+// without a core. mod_overseer.cpp static_asserts both against UnitDefines.h.
+constexpr std::uint32_t NPC_FLAG_PETITIONER       = 0x00040000;  // UnitDefines.h:340
+constexpr std::uint32_t NPC_FLAG_TABARDDESIGNER   = 0x00080000;  // UnitDefines.h:341
+constexpr std::uint32_t NPC_FLAG_GUILD_PETITIONER =
+    NPC_FLAG_PETITIONER | NPC_FLAG_TABARDDESIGNER;  // 0xC0000
+
+// DOES A SPAWN CARRYING `npcFlags` FILL A TRAVEL ROLE ASKING FOR `roleFlags`?
+//
+// Every bit the role names, not any one of them. For the roles that name a
+// single bit the two readings are the same question, so their behaviour is
+// unchanged; the rule only differs for a role naming more than one bit, which
+// is exactly `guild petitioner`. Any-bit matching would let an Arena Organizer
+// (0x40000 alone) fill it, which is the defect.
+//
+// A role naming no bits is filled by nothing: 0 is not a role, and "every one
+// of no bits" would otherwise match every spawn on the map.
+bool SpawnFillsTravelRole(std::uint32_t npcFlags, std::uint32_t roleFlags);
+
 // IS THIS ARRIVAL ENTITLED TO CONSUME THE CHARACTER'S LEARN AIM (#402)?
 //
 // WHAT WENT WRONG. TrainOnArrival is called on EVERY creature arrival for which
