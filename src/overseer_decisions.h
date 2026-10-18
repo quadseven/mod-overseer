@@ -22248,8 +22248,10 @@ char const* GuildRunHoldWhyWord(GuildRunHoldWhy why);
 // has no leftover group to clean up and the stray is dropped.
 struct GuildRunStrayFacts
 {
-    // The stray's tank is in the world and in a group.
-    bool tankInGroup{false};
+    // The member the stray is read through is in the world and in a group:
+    // its tank when the tank is in the world, else a member of the lost run in
+    // a finder group the tank is saved in (GuildRunStrayLookAt).
+    bool seenInGroup{false};
     // That group is a finder group (the core's LFG flag).
     bool finderGroup{false};
     // That group is the group of a guild run this process is driving.
@@ -22432,8 +22434,57 @@ bool GuildRunAdoptionTouchDue(std::int64_t secondsSinceTouch);
 // seen in the world; the return is the instant the stray expires, or 0 while
 // the clock has not started.
 constexpr unsigned GUILD_RUN_STRAY_SECONDS = 15 * 60;
-std::int64_t GuildRunStrayExpiry(bool tankInWorld, std::int64_t startedAt, std::int64_t now);
+std::int64_t GuildRunStrayExpiry(bool memberInWorld, std::int64_t startedAt, std::int64_t now);
 bool GuildRunStrayExpired(std::int64_t expiry, std::int64_t now);
+
+// A LOST RUN WHOSE TANK NEVER CAME BACK STILL HAS ITS GROUP. A stray was read
+// through its tank alone: the clock started when the tank was seen and the
+// group was the tank's. A run released at a roll because its tank was not back
+// (wow-overseer#789, #1192) left the other members, back in the world and
+// inside, in a finder group nobody would ever disband; on the dev realm on
+// 2026-10-18 three such groups held 10 online guild bots an hour after their
+// rows ended, and the guild coordinator skips a member in a group. So the
+// stray is read through any of its members: the clock starts when the first is
+// in the world, and the group is the tank's when the tank is in the world,
+// else the first member's finder group that the tank is saved in. A group a
+// live run or a waiting adoption holds is never chosen through a member.
+struct GuildRunStrayMember
+{
+    bool inWorld{false};
+    // In a group, and that group is a finder group.
+    bool inGroup{false};
+    bool finderGroup{false};
+    // The stray's tank is saved in that group (the core's member list, which
+    // holds offline members too).
+    bool tankSavedInGroup{false};
+    // That group is the group of a run this process drives or is waiting to
+    // adopt.
+    bool heldGroup{false};
+};
+
+struct GuildRunStrayLook
+{
+    // Index into the members of the one whose group the stray acts on, or
+    // GUILD_RUN_STRAY_NOBODY.
+    std::size_t witness{static_cast<std::size_t>(-1)};
+    // Any member is in the world: the stray's clock may start.
+    bool anyInWorld{false};
+    GuildRunStrayFacts facts;
+};
+constexpr std::size_t GUILD_RUN_STRAY_NOBODY = static_cast<std::size_t>(-1);
+
+// `members[0]` is the tank. `takenOut` is copied into the facts; `expired` is
+// the caller's, from the clock `anyInWorld` starts.
+GuildRunStrayLook GuildRunStrayLookAt(std::vector<GuildRunStrayMember> const& members,
+                                      bool takenOut);
+
+// A ROW A ROLL ENDED SAYS SO (wow-overseer#789). The read-backs a worldserver
+// holds in memory die with it, and the next one ends their rows as errors
+// (ExpireAbandonedClaims). The detail starts with this word so a bridge pass
+// that backs off a refusal can tell "the world restarted" from "the bot said
+// no" and ask again; the bridge's own stale sweep writes the same word.
+constexpr char RESTART_DETAIL_PREFIX[] = "restart: ";
+std::string ClaimExpiredDetail();
 
 // A ROLL IS NOT A RUN GONE COLD. CloseAbandonedRuns ends an active
 // overseer_dungeon_run row whose heartbeat is 120 s old. A worldserver start

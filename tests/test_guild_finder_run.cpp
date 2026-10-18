@@ -316,7 +316,7 @@ void TheReArmWaitsOutItsCooldownAndNeverPrecedesTheFirstArming()
 void ARestartsStrayNeverTakesANewRunsGroup()
 {
     GuildRunStrayFacts f;
-    f.tankInGroup = true;
+    f.seenInGroup = true;
     f.finderGroup = true;
     f.liveRunGroup = true;
     Check("the stray's tank in a live run's finder group: the stray is dropped",
@@ -339,7 +339,7 @@ void ARestartsOwnLeftoverIsStillTakenOutThenDisbanded()
           GuildRunStrayNext(f) == GuildRunStrayStep::Drop);
 
     f.expired = false;
-    f.tankInGroup = true;
+    f.seenInGroup = true;
     Check("a plain party is not the finder group: wait",
           GuildRunStrayNext(f) == GuildRunStrayStep::Wait);
     f.finderGroup = true;
