@@ -10257,6 +10257,23 @@ bool RouteMarkAdvanced(RouteMark seen, RouteMark now)
     return now.route != 0 && now.route == seen.route && RouteCursorAdvanced(seen.at, now.at);
 }
 
+RatchetVerdict RatchetAlongRoute(RatchetState& state, RouteMark& seenRoute, float reading,
+                                 RouteMark route, time_t now, RatchetLimits const& limits)
+{
+    bool const walkedOnRoute = RouteMarkAdvanced(seenRoute, route);
+    seenRoute = route;
+    RatchetVerdict verdict = Ratchet(state, reading, now, limits);
+    if (verdict.progressed || !walkedOnRoute ||
+        limits.reading != RatchetReading::DistanceToTarget)
+        return verdict;
+    // Further along the route it is walking: progress, whatever the straight
+    // line says. The clock restarts; `best` stays the closest it has been.
+    state.since = now;
+    verdict.progressed = true;
+    verdict.stalled = false;
+    return verdict;
+}
+
 bool EntryUnreachable(bool computed, bool meshAbsent, bool noPath, float endGapYards,
                       float toleranceYards)
 {
