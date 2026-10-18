@@ -21775,19 +21775,45 @@ InstanceRunAnswer InstanceRunMayProceed(SavedInstance const& save, std::time_t n
                                         std::time_t resetSoonSeconds)
 {
     InstanceRunAnswer answer;
-    if (!save.saved || save.resetAt == 0)
+    if (!save.saved)
         return answer;          // nothing bound: the character is free
+    if (save.resetAt == 0)
+    {
+        answer.verdict = InstanceRunVerdict::Saved;
+        answer.reason = "saved with no known reset time";
+        return answer;
+    }
     std::int64_t const remaining = SecondsUntilInstanceReset(save, now);
     if (remaining <= 0)
         return answer;          // the lockout has passed: the character is free
     if (remaining <= static_cast<std::int64_t>(resetSoonSeconds))
+    {
         answer.verdict = InstanceRunVerdict::ResetsSoon;
+        answer.reason = "instance resets soon";
+    }
     else
     {
         answer.verdict = InstanceRunVerdict::Saved;
         answer.reason = SavedInstanceRefusal(save, now);
     }
     return answer;
+}
+
+InstanceRunProposal InstanceRunProposalFor(
+    std::vector<std::pair<std::string, SavedInstance>> const& seats,
+    std::time_t now, std::time_t resetSoonSeconds)
+{
+    InstanceRunProposal proposal;
+    for (auto const& seat : seats)
+    {
+        InstanceRunAnswer const answer =
+            InstanceRunMayProceed(seat.second, now, resetSoonSeconds);
+        if (answer.verdict == InstanceRunVerdict::Proceed)
+            proposal.members.push_back(seat.first);
+        else
+            proposal.refusals.emplace_back(seat.first, answer.reason);
+    }
+    return proposal;
 }
 RebuffSpell RebuffSpellFor(unsigned classId)
 {

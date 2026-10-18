@@ -32798,6 +32798,7 @@ private:
         // The last door refusal said (#578), so the line is said when the
         // reason changes rather than on every poll it holds.
         std::string loggedDoorRefusal;
+        std::string loggedLockoutRefusal;
         // AND THE TWO LINES THE RESET'S EVACUATION SAYS ONCE (#351).
         // `loggedWalkingOut` rations the sentence that explains why anybody is
         // being walked out of an instance at all; `loggedNoWayOut` rations the
@@ -33988,6 +33989,79 @@ private:
             if (bind->save)
                 return bind->save->GetCompletedEncounterMask();
         return 0;
+    }
+
+    static OverseerDecisions::SavedInstance ReadSavedInstance(Player* member, uint32 mapId)
+    {
+        OverseerDecisions::SavedInstance state;
+        state.mapId = mapId;
+        state.difficulty = DUNGEON_DIFFICULTY_NORMAL;
+        if (!member)
+            return state;
+        InstancePlayerBind* const bind = sInstanceSaveMgr->PlayerGetBoundInstance(
+            member->GetGUID(), mapId, DUNGEON_DIFFICULTY_NORMAL);
+        if (!bind || !bind->save)
+            return state;
+        state.saved = bind->perm;
+        state.instanceId = bind->save->GetInstanceId();
+        state.resetAt = bind->save->GetResetTime();
+        state.completedEncounters = bind->save->GetCompletedEncounterMask();
+        uint32 const expected = ExpectedEncounterMask(mapId, member);
+        state.cleared = expected != 0 &&
+                        (state.completedEncounters & expected) == expected;
+        return state;
+    }
+
+    static bool RefuseSavedRunSeats(DungeonRunCoordinatorState& coord,
+                                    std::vector<std::string> const& members,
+                                    uint32 mapId)
+    {
+        std::vector<std::pair<std::string, OverseerDecisions::SavedInstance>> seats;
+        for (std::string const& name : members)
+        {
+            Player* const member = ObjectAccessor::FindPlayerByName(name);
+            if (!member || !member->IsInWorld())
+            {
+                std::string const why = name + " is not in the world for the lockout check";
+                if (coord.loggedLockoutRefusal != why)
+                    LOG_WARN("module.overseer", "overseer: dungeon run waits - {}", why);
+                coord.loggedLockoutRefusal = why;
+                return true;
+            }
+            seats.emplace_back(name, ReadSavedInstance(member, mapId));
+        }
+        OverseerDecisions::InstanceRunProposal const proposal =
+            OverseerDecisions::InstanceRunProposalFor(seats, std::time(nullptr), 20 * 60);
+        if (proposal.refusals.empty())
+        {
+            coord.loggedLockoutRefusal.clear();
+            return false;
+        }
+        std::string refusalKey;
+        for (auto const& refusal : proposal.refusals)
+            refusalKey += refusal.first + ": " + refusal.second + "; ";
+        if (coord.loggedLockoutRefusal == refusalKey)
+            return true;
+        coord.loggedLockoutRefusal = refusalKey;
+        bool chatFailed = false;
+        for (auto const& refusal : proposal.refusals)
+        {
+            std::string const line = refusal.first + ": " + refusal.second;
+            Player* const speaker = ObjectAccessor::FindPlayerByName(refusal.first);
+            char const* status = "";
+            char const* const error = DoChat(speaker, "party", line, "", status);
+            if (*error)
+            {
+                chatFailed = true;
+                LOG_WARN("module.overseer", "overseer: dungeon lockout refusal chat failed: {}",
+                         error);
+            }
+            LOG_INFO("module.overseer", "overseer: dungeon run refused for '{}' on map {}: {}",
+                     refusal.first, mapId, refusal.second);
+        }
+        if (chatFailed)
+            coord.loggedLockoutRefusal.clear();
+        return true;
     }
 
     // THE MAP'S DBC MASK IS THE BOUNDARY; FOR SPLIT MAPS THE DUNGEON BRAIN'S
@@ -48731,6 +48805,11 @@ private:
                 return;
             }
             coord.loggedWithheld = false;
+
+            // A permanent bind is the client's lockout. Refuse before resetting
+            // an instance or taking the party's travel aim.
+            if (RefuseSavedRunSeats(coord, members, portal->insideMapId))
+                return;
 
             // A DOOR THE PARTY CANNOT GET THROUGH IS NOT STAGED AT (#578). The
             // core refuses an under-level member at the knock and a locked door

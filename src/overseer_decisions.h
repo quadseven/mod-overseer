@@ -24060,9 +24060,9 @@ ReleasePromptReading ReleasePromptObserve(ReleasePromptClock& clock, std::int64_
 // ONE CHARACTER'S SAVED STATE FOR ONE INSTANCE, as the instance-lockout window
 // the client opens shows it: whether the character is bound to a copy, when the
 // lockout expires, and which bosses the save already credits. The adapter
-// fills it from character_instance and instance_reset (the core's in-memory
-// bind is the same fact), so a reader can compare it against what the client
-// shows and no two answers disagree.
+// reads it from the core's in-memory bind, which was loaded from
+// character_instance and the instance reset schedule. Only a permanent bind
+// is a client-visible lockout; a temporary normal-dungeon bind can be reset.
 struct SavedInstance
 {
     uint32_t mapId{0};
@@ -24080,9 +24080,8 @@ struct SavedInstance
     bool cleared{false};
 };
 
-// THE LOCKOUT IS LIVE when the reset is still in the future. A zero resetAt
-// means nothing was read and answers "not locked": a fresh character walks into
-// a fresh instance.
+// THE LOCKOUT IS LIVE when the reset is still in the future. A saved bind
+// with no known reset is refused by InstanceRunMayProceed.
 bool InstanceLockoutIsLive(SavedInstance const& save, std::time_t now);
 
 // SECONDS UNTIL THE LOCKOUT EXPIRES, negative once it has passed.
@@ -24122,6 +24121,16 @@ struct InstanceRunAnswer
 
 InstanceRunAnswer InstanceRunMayProceed(SavedInstance const& save, std::time_t now,
                                         std::time_t resetSoonSeconds);
+
+struct InstanceRunProposal
+{
+    std::vector<std::string> members;
+    std::vector<std::pair<std::string, std::string>> refusals;
+};
+
+InstanceRunProposal InstanceRunProposalFor(
+    std::vector<std::pair<std::string, SavedInstance>> const& seats,
+    std::time_t now, std::time_t resetSoonSeconds);
 
 // THE PARTY BUFF IS KEPT, NOT ONLY ALLOWED (mod-overseer#823). KeepBuffStrategies
 // puts `buff` on a priest, a mage and a druid once a minute, and that is all it

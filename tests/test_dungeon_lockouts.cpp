@@ -15,11 +15,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 using OverseerDecisions::InstanceLockoutIsLive;
 using OverseerDecisions::InstanceResetsTooSoon;
 using OverseerDecisions::InstanceRunAnswer;
 using OverseerDecisions::InstanceRunMayProceed;
+using OverseerDecisions::InstanceRunProposalFor;
 using OverseerDecisions::InstanceRunVerdict;
 using OverseerDecisions::SavedInstance;
 using OverseerDecisions::SavedInstanceRefusal;
@@ -181,6 +183,41 @@ void AProposalIsRefusedWhenTheLockoutResetsSoon()
         InstanceRunMayProceed(savedToTuesday(), justBefore, 20 * 60);
     Check("a lockout resetting within the soon bound is refused as resets soon",
           reallySoon.verdict == InstanceRunVerdict::ResetsSoon);
+    CheckString("a soon reset has a chat reason", reallySoon.reason,
+                "instance resets soon");
+}
+
+void AProposalSkipsASavedSeat()
+{
+    auto const proposal = InstanceRunProposalFor(
+        {{"leader", notSaved()}, {"saved member", savedToTuesday()},
+         {"free member", notSaved()}}, nowBefore, 20 * 60);
+    Check("only free seats are proposed", proposal.members ==
+          std::vector<std::string>({"leader", "free member"}));
+    Check("saved seat has one refusal", proposal.refusals.size() == 1);
+    if (proposal.refusals.size() == 1)
+        CheckString("saved seat has a chat reason", proposal.refusals[0].second,
+                    "saved until Tuesday");
+
+    auto const soon = InstanceRunProposalFor(
+        {{"leader", notSaved()}, {"soon member", savedToTuesday()}},
+        tuesdayReset - 600, 20 * 60);
+    Check("a seat resetting soon is skipped", soon.members ==
+          std::vector<std::string>({"leader"}));
+    Check("a soon seat has one refusal", soon.refusals.size() == 1);
+    if (soon.refusals.size() == 1)
+        CheckString("the soon seat gives a reason", soon.refusals[0].second,
+                    "instance resets soon");
+}
+
+void ABindWithoutAResetDoesNotGetAFreePass()
+{
+    SavedInstance unknown = savedToTuesday();
+    unknown.resetAt = 0;
+    InstanceRunAnswer const answer = InstanceRunMayProceed(unknown, nowBefore, 20 * 60);
+    Check("a saved seat without a reset is refused", answer.verdict == InstanceRunVerdict::Saved);
+    CheckString("the unknown reset is said honestly", answer.reason,
+                "saved with no known reset time");
 }
 
 }  // namespace
@@ -195,6 +232,8 @@ int main()
     AProposalMayProceedWhenTheCharacterIsFree();
     AProposalIsRefusedWhenTheCharacterIsSaved();
     AProposalIsRefusedWhenTheLockoutResetsSoon();
+    AProposalSkipsASavedSeat();
+    ABindWithoutAResetDoesNotGetAFreePass();
 
     if (failures)
     {
