@@ -15358,6 +15358,123 @@ bool StoryKnowsItem(ItemStoryBook const& book, std::uint32_t itemGuid)
     return false;
 }
 
+// ------------------------------------------------- vendor, gold, auras (#960) --
+
+char const* GoldSourceName(GoldSource source)
+{
+    switch (source)
+    {
+        case GoldSource::Loot: return "loot";
+        case GoldSource::Quest: return "quest";
+        case GoldSource::Sale: return "sale";
+        case GoldSource::Mail: return "mail";
+        case GoldSource::Trade: return "trade";
+        case GoldSource::Repair: return "repair";
+        case GoldSource::Buy: return "buy";
+        case GoldSource::Training: return "training";
+        case GoldSource::Other: return "other";
+    }
+    return "other";
+}
+
+GoldSource ResolveGoldSource(char const* pending)
+{
+    if (pending)
+    {
+        std::string word = pending;
+        if (word == "loot") return GoldSource::Loot;
+        if (word == "quest") return GoldSource::Quest;
+        if (word == "sale") return GoldSource::Sale;
+        if (word == "mail") return GoldSource::Mail;
+        if (word == "trade") return GoldSource::Trade;
+        if (word == "repair") return GoldSource::Repair;
+        if (word == "buy") return GoldSource::Buy;
+        if (word == "training") return GoldSource::Training;
+        if (word == "other") return GoldSource::Other;
+    }
+    return GoldSource::Other;
+}
+
+bool ShouldRecordGoldChange(int amount)
+{
+    return amount != 0;
+}
+
+OverseerEventFields VendorBuyFields(std::uint32_t itemEntry, std::string const& itemName,
+                                   std::uint32_t count, std::uint32_t copper)
+{
+    OverseerEventFields fields;
+    fields.kind = "vendor_buy";
+    fields.subjectId = itemEntry;
+    fields.subjectName = itemName;
+    fields.detail = std::to_string(count) + " for " + std::to_string(copper) + " copper";
+    FitItemStoryColumn(fields.subjectName);
+    FitItemStoryColumn(fields.detail);
+    return fields;
+}
+
+OverseerEventFields VendorSaleFields(std::uint32_t itemEntry, std::string const& itemName,
+                                    std::uint32_t count, std::uint32_t copper)
+{
+    OverseerEventFields fields;
+    fields.kind = "vendor_sale";
+    fields.subjectId = itemEntry;
+    fields.subjectName = itemName;
+    fields.detail = std::to_string(count) + " for " + std::to_string(copper) + " copper";
+    FitItemStoryColumn(fields.subjectName);
+    FitItemStoryColumn(fields.detail);
+    return fields;
+}
+
+OverseerEventFields GoldChangeFields(int amount, GoldSource source)
+{
+    OverseerEventFields fields;
+    fields.kind = "gold_change";
+    fields.subjectId = static_cast<std::uint32_t>(source);
+    fields.subjectName = GoldSourceName(source);
+    fields.detail = (amount >= 0 ? "+" : "") + std::to_string(amount) + " copper";
+    return fields;
+}
+
+bool ShouldRecordVendorTrade(ItemStoryWho who)
+{
+    return who == ItemStoryWho::Roster || who == ItemStoryWho::GuildMember;
+}
+
+char const* AuraCasterName(AuraCaster caster)
+{
+    switch (caster)
+    {
+        case AuraCaster::Self: return "self";
+        case AuraCaster::Party: return "party";
+        case AuraCaster::Player: return "player";
+        case AuraCaster::Creature: return "creature";
+        case AuraCaster::None: return "none";
+    }
+    return "none";
+}
+
+bool ShouldRecordAuraGained(std::uint32_t durationSeconds, bool positive)
+{
+    return positive && durationSeconds > 60;
+}
+
+OverseerEventFields AuraGainedFields(std::uint32_t spellId, std::string const& spellName,
+                                    std::uint32_t durationSeconds, AuraCaster caster)
+{
+    OverseerEventFields fields;
+    fields.kind = "aura_gained";
+    fields.subjectId = spellId;
+    fields.subjectName = spellName;
+    fields.detail = std::to_string(durationSeconds) + " seconds";
+    fields.source = AuraCasterName(caster);
+    FitItemStoryColumn(fields.subjectName);
+    FitItemStoryColumn(fields.detail);
+    FitItemStoryColumn(fields.source);
+    return fields;
+}
+
+
 
 // ------------------------------------------------- mailbox walk (#569) --
 

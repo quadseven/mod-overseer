@@ -18047,6 +18047,123 @@ void RememberStoryItem(ItemStoryBook& book, std::uint32_t itemGuid);
 
 bool StoryKnowsItem(ItemStoryBook const& book, std::uint32_t itemGuid);
 
+// ------------------------------------------------- vendor, gold, auras (#960) --
+//
+// THE GAP #937 LEFT. #937 removed the module's grants, but its live criterion
+// ("no member gains an item, level, skill, buff or gold without a loot, quest,
+// trainer, vendor or kill event") cannot be checked: `overseer_event` logged
+// item_loot, quest_reward, craft, item_given, learn, level_up, item_equip,
+// tidy, town_trip, repair and death, but nothing for vendor buys, vendor
+// sales, gold changes or auras gained, and `log_money` holds only mail and
+// trade transfers. A gold or buff grant would be invisible. These four kinds
+// close the gap, for guild members only (ItemStoryWho, reused: roster plus
+// the guilds roster characters belong to), and every gold change or long aura
+// whose source cannot be named is written as "other"/"none" rather than
+// dropped, because an unnamed gain is exactly the signal #937 is watching
+// for.
+//
+// THE FOUR KINDS, and where each fact lives. `kind` is a VARCHAR, so none of
+// this is a schema change; the columns are the ones #567 and #372 added:
+//
+//   vendor_buy   subject_id = item entry, subject_name = item name,
+//                detail = "3 for 1200 copper", source = ''
+//   vendor_sale  subject_id = item entry, subject_name = item name,
+//                detail = "3 for 1200 copper", source = ''
+//   gold_change  subject_id = the GoldSource code below, so one hour of
+//                changes splits per source in uq_event without widening the
+//                key (every existing row has item_guid = 0, which is what
+//                #567's widening kept stable, and no gold_change row predates
+//                this), subject_name = the source word, detail = the signed
+//                amount ("+52 copper", "-103 copper"), source = ''
+//   aura_gained  subject_id = spell id, subject_name = spell name,
+//                detail = the duration in seconds ("3600 seconds"),
+//                source = the caster word ("self", "party", "player",
+//                "creature", "none")
+//
+// WHERE THE SOURCE COMES FROM. The gold hook (Player::ModifyMoney) knows an
+// amount but not a reason, so the module leaves a pending source note where
+// it does know one: the loot hook before looted money is added, the quest
+// hook while its reward is granted, the vendor hooks around a purchase, and
+// the module's own mail, trade, repair, buy and training verbs before they
+// move gold. A hook that finds no note says "other". The note is the server's
+// own knowledge at the moment it had it, same as the event writer's posture
+// everywhere else in this file: never guessed later.
+//
+// The pending source is also how the acceptance test's "fail on main" is
+// honest: ResolveGoldSource and the four field builders are pure and live
+// here, where the tests reach them, so a test naming a looted gold change
+// does not compile on main.
+
+// Every reason a guild member's purse can move that this module has seen.
+enum class GoldSource : std::uint32_t
+{
+    Loot = 1,
+    Quest = 2,
+    Sale = 3,
+    Mail = 4,
+    Trade = 5,
+    Repair = 6,
+    Buy = 7,
+    Training = 8,
+    Other = 9,
+};
+
+// The word written to overseer_event.subject_name for a gold_change.
+char const* GoldSourceName(GoldSource source);
+
+// A pending source note, or null when no hook left one. Anything the note
+// cannot name - null, empty, or a word this enum never had - is Other, never
+// dropped: an unnamed gain is the signal, not a reason to stay quiet.
+GoldSource ResolveGoldSource(char const* pending);
+
+// A zero delta is the core telling the hook about a change that changes
+// nothing; the row would say "+0 copper" and teach nobody anything.
+bool ShouldRecordGoldChange(int amount);
+
+// One row's worth of fields. `kind` is one of the four words above;
+// `source` is the overseer_event.source column.
+struct OverseerEventFields
+{
+    char const* kind{nullptr};
+    std::uint32_t subjectId{0};
+    std::string subjectName;
+    std::string detail;
+    std::string source;
+};
+
+OverseerEventFields VendorBuyFields(std::uint32_t itemEntry, std::string const& itemName,
+                                   std::uint32_t count, std::uint32_t copper);
+OverseerEventFields VendorSaleFields(std::uint32_t itemEntry, std::string const& itemName,
+                                    std::uint32_t count, std::uint32_t copper);
+OverseerEventFields GoldChangeFields(int amount, GoldSource source);
+
+// A vendor trade is worth a row only for somebody this record covers, same
+// gate as the item story: roster, or a guild member. Strangers' purchases
+// are the 500 random bots' business, not this table's.
+bool ShouldRecordVendorTrade(ItemStoryWho who);
+
+// Who put the aura there, in the caster's relation to the character wearing
+// it. "none" is not an error: it is the row #937 is watching for, a buff
+// with no caster the server can name.
+enum class AuraCaster
+{
+    Self,
+    Party,
+    Player,
+    Creature,
+    None,
+};
+
+char const* AuraCasterName(AuraCaster caster);
+
+// Long means longer than 60 seconds, and only buffs: a debuff's story is
+// told by the combat around it, while a long buff with no source is a grant
+// until proven otherwise.
+bool ShouldRecordAuraGained(std::uint32_t durationSeconds, bool positive);
+
+OverseerEventFields AuraGainedFields(std::uint32_t spellId, std::string const& spellName,
+                                    std::uint32_t durationSeconds, AuraCaster caster);
+
 // WHICH ITEM A LOOT HOOK MAY READ (#572). The Item* handed to
 // OnPlayerLootItem can already be freed when this module's hook runs. The
 // core calls every script's OnPlayerLootItem in turn with the same pointer,
