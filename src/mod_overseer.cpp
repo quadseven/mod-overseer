@@ -30438,10 +30438,8 @@ private:
     //
     // WHAT IS BUILT: RESET, GATHERING, BARRIER, ENTER, STAGED_INSIDE, CLEARING
     // and EXIT. LOOT and WIPE_RECOVER are not, and LOOT's absence is a
-    // measurement rather than a deferral - see the end-of-run comment in
-    // DriveDungeonRun for why "the dungeon is cleared" is not a fact available
-    // to this module for map 36 today, and why a signal that reads as success
-    // before anything has happened is worse than no signal.
+    // measurement rather than a deferral. Map 36 now finishes on the held
+    // quest objectives read at run start; other maps use encounter credits.
     //
     // AND IT IS A LOOP NOW (#144), which is one new state and one new edge:
     //
@@ -32444,6 +32442,19 @@ private:
     // re-gather, not correctness.
     struct DungeonRunCoordinatorState
     {
+        struct QuestGoalPart
+        {
+            uint32 questId{0};
+            std::string holder;
+            uint8 index{0};
+            bool item{false};
+            uint32 required{0};
+        };
+        std::vector<QuestGoalPart> questGoal;
+        bool questGoalCaptured{false};
+        bool questGoalFinished{false};
+        std::string questsTurnedIn;
+        std::set<uint32> turnedInQuestIds;
         DungeonRunPhase phase{DungeonRunPhase::Idle};
         time_t leaderClientOpenSince{0};
         time_t leaderClientLostSince{0};
@@ -48129,6 +48140,261 @@ private:
     // below was the body of DriveDungeonRun when the world had one coordinator;
     // what changed is that `coord`, `members` and `leaderName` now belong to
     // exactly one family.
+    static bool DungeonObjectiveOnMap(uint32 mapId, int32 entry, bool item,
+                                      bool& onMap)
+    {
+        QueryResult rows;
+        if (item)
+            rows = WorldDatabase.Query(
+                "SELECT COUNT(*) FROM creature_loot_template loot "
+                "JOIN creature_template proto ON proto.lootid = loot.Entry "
+                "JOIN creature spawn ON spawn.id = proto.entry "
+                "WHERE loot.Item = {} AND spawn.map = {}", uint32(entry), mapId);
+        else if (entry > 0)
+            rows = WorldDatabase.Query(
+                "SELECT COUNT(*) FROM creature WHERE id = {} AND map = {}",
+                uint32(entry), mapId);
+        else
+            rows = WorldDatabase.Query(
+                "SELECT COUNT(*) FROM gameobject WHERE id = {} AND map = {}",
+                uint32(-entry), mapId);
+        if (!rows)
+            return false;
+        onMap = rows->Fetch()[0].Get<uint64>() != 0;
+        return true;
+    }
+
+    static void CaptureDungeonQuestGoal(DungeonRunCoordinatorState& coord,
+                                        std::vector<std::string> const& members,
+                                        uint32 mapId)
+    {
+        std::map<std::pair<int32, bool>, bool> resolved;
+        std::map<uint32, std::set<std::string>> holders;
+        coord.questGoal.clear();
+        for (std::string const& name : members)
+        {
+            Player* player = ObjectAccessor::FindPlayerByName(name);
+            if (!player)
+            {
+                LOG_ERROR("module.overseer", "overseer: dungeon quest goal waits for '{}' to be online", name);
+                return;
+            }
+            for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+            {
+                uint32 const id = player->GetQuestSlotQuestId(slot);
+                Quest const* quest = id ? sObjectMgr->GetQuestTemplate(id) : nullptr;
+                if (!quest)
+                    continue;
+                auto add = [&](int32 entry, uint8 index, bool item, uint32 required)
+                {
+                    if (!entry || !required)
+                        return true;
+                    auto const key = std::make_pair(entry, item);
+                    auto found = resolved.find(key);
+                    if (found == resolved.end())
+                    {
+                        bool onMap = false;
+                        if (!DungeonObjectiveOnMap(mapId, entry, item, onMap))
+                        {
+                            LOG_ERROR("module.overseer", "overseer: dungeon quest goal could not resolve objective {} for map {}",
+                                      entry, mapId);
+                            return false;
+                        }
+                        found = resolved.emplace(key, onMap).first;
+                    }
+                    if (found->second)
+                    {
+                        coord.questGoal.push_back({id, name, index, item, required});
+                        holders[id].insert(name);
+                    }
+                    return true;
+                };
+                for (uint8 i = 0; i < QUEST_OBJECTIVES_COUNT; ++i)
+                    if (!add(quest->RequiredNpcOrGo[i], i, false,
+                             quest->RequiredNpcOrGoCount[i]))
+                        return;
+                for (uint8 i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT; ++i)
+                    if (!add(quest->RequiredItemId[i], i, true,
+                             quest->RequiredItemCount[i]))
+                        return;
+            }
+        }
+        coord.questGoalCaptured = true;
+        std::ostringstream goal;
+        for (auto const& [id, names] : holders)
+        {
+            if (goal.tellp() > 0)
+                goal << "; ";
+            goal << id << " [";
+            bool first = true;
+            for (std::string const& name : names)
+            {
+                if (!first)
+                    goal << ',';
+                goal << name;
+                first = false;
+            }
+            goal << ']';
+        }
+        LOG_INFO("module.overseer", "overseer: dungeon run number {} (row {}) quest goal on map {}: {}",
+                 coord.runNumber, coord.runId ? std::to_string(coord.runId) : "pending",
+                 mapId, goal.str().empty() ? "none" : goal.str());
+    }
+
+    static bool DungeonQuestGoalComplete(DungeonRunCoordinatorState const& coord)
+    {
+        std::vector<OverseerDecisions::DungeonQuestObjective> readings;
+        for (auto const& part : coord.questGoal)
+        {
+            Player* player = ObjectAccessor::FindPlayerByName(part.holder);
+            Quest const* quest = sObjectMgr->GetQuestTemplate(part.questId);
+            bool done = false;
+            if (player && quest && HoldsUnfinished(player, part.questId))
+            {
+                if (player->GetQuestStatus(part.questId) == QUEST_STATUS_COMPLETE)
+                    done = true;
+                else if (part.item)
+                    done = player->GetItemCount(quest->RequiredItemId[part.index]) >= part.required;
+                else
+                {
+                    uint16 const slot = player->FindQuestSlot(part.questId);
+                    done = slot < MAX_QUEST_LOG_SIZE &&
+                           player->GetQuestSlotCounter(slot, part.index) >= part.required;
+                }
+            }
+            readings.push_back({part.questId, part.holder, true, done});
+        }
+        return OverseerDecisions::DungeonQuestGoalReady(readings);
+    }
+
+    struct DungeonQuestEnder
+    {
+        uint32 entry{0};
+        uint32 map{0};
+        float x{0.f}, y{0.f}, z{0.f};
+        bool object{false};
+    };
+
+    static bool FindDungeonQuestEnder(uint32 questId, uint32 outsideMap,
+                                      DungeonQuestEnder& ender)
+    {
+        QueryResult row = WorldDatabase.Query(
+            "SELECT spawn.id, spawn.map, spawn.position_x, spawn.position_y, "
+            "spawn.position_z FROM creature spawn "
+            "JOIN creature_questender ender ON ender.id = spawn.id "
+            "WHERE ender.quest = {} AND spawn.map = {} LIMIT 1", questId, outsideMap);
+        if (!row)
+        {
+            row = WorldDatabase.Query(
+                "SELECT spawn.id, spawn.map, spawn.position_x, spawn.position_y, "
+                "spawn.position_z FROM gameobject spawn "
+                "JOIN gameobject_questender ender ON ender.id = spawn.id "
+                "WHERE ender.quest = {} AND spawn.map = {} LIMIT 1", questId, outsideMap);
+            ender.object = true;
+        }
+        if (!row)
+            return false;
+        Field* fields = row->Fetch();
+        ender.entry = fields[0].Get<uint32>();
+        ender.map = fields[1].Get<uint32>();
+        ender.x = fields[2].Get<float>();
+        ender.y = fields[3].Get<float>();
+        ender.z = fields[4].Get<float>();
+        return true;
+    }
+
+    bool GatherAtDungeonQuestEnder(DungeonQuestEnder const& ender,
+                                   std::vector<std::string> const& members,
+                                   WorldObject* giver)
+    {
+        std::ostringstream at;
+        at << "at:" << ender.map << ':' << ender.x << ',' << ender.y << ',' << ender.z;
+        std::vector<float> yards;
+        for (std::string const& name : members)
+        {
+            Player* player = ObjectAccessor::FindPlayerByName(name);
+            if (!player || player->GetMapId() != ender.map)
+                continue;
+            if (giver)
+                yards.push_back(player->GetExactDist(giver));
+            if (!giver || player->GetExactDist(giver) > 20.f)
+                EscortToward(name, at.str(), "QUEST TURN-IN", EscortPurpose::LeaveInstance);
+        }
+        return giver && OverseerDecisions::DungeonQuestTurnInReady(yards, members.size());
+    }
+
+    static bool RewardDungeonQuestHolders(uint32 runId, uint32 questId,
+                                          std::set<std::string> const& names,
+                                          WorldObject* giver)
+    {
+        Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+        if (!quest)
+            return false;
+        for (std::string const& name : names)
+        {
+            Player* player = ObjectAccessor::FindPlayerByName(name);
+            if (!player)
+                return false;
+            if (player->GetQuestRewardStatus(questId))
+                continue;
+            if (player->GetExactDist(giver) >
+                    OverseerDecisions::SPAWN_WALK_ARRIVE_YARDS ||
+                !player->CanSeeOrDetect(giver))
+                return false;
+            if (!player->CanRewardQuest(quest, false))
+            {
+                LOG_WARN("module.overseer", "overseer: dungeon run {} quest {} for '{}' is not rewardable (status {})",
+                         runId, questId, name, static_cast<int>(player->GetQuestStatus(questId)));
+                return false;
+            }
+            player->RewardQuest(quest, 0, giver);
+            if (!player->GetQuestRewardStatus(questId))
+            {
+                LOG_WARN("module.overseer", "overseer: dungeon run {} quest {} for '{}' was not rewarded",
+                         runId, questId, name);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool DriveDungeonQuestTurnIn(DungeonRunCoordinatorState& coord,
+                                 std::vector<std::string> const& members,
+                                 uint32 outsideMap)
+    {
+        std::map<uint32, std::set<std::string>> holders;
+        for (auto const& part : coord.questGoal)
+            holders[part.questId].insert(part.holder);
+        for (auto const& [questId, names] : holders)
+        {
+            if (coord.turnedInQuestIds.count(questId))
+                continue;
+            DungeonQuestEnder ender;
+            if (!FindDungeonQuestEnder(questId, outsideMap, ender))
+            {
+                LOG_ERROR("module.overseer", "overseer: dungeon run {} quest {} has no ender on map {}",
+                          coord.runId, questId, outsideMap);
+                return false;
+            }
+            Player* holder = ObjectAccessor::FindPlayerByName(*names.begin());
+            if (!holder || holder->GetMapId() != ender.map)
+                return false;
+            WorldObject* giver = ender.object
+                ? static_cast<WorldObject*>(holder->FindNearestGameObject(ender.entry, 30.f))
+                : static_cast<WorldObject*>(holder->FindNearestCreature(ender.entry, 30.f));
+            if (!GatherAtDungeonQuestEnder(ender, members, giver) ||
+                !RewardDungeonQuestHolders(coord.runId, questId, names, giver))
+                return false;
+            coord.turnedInQuestIds.insert(questId);
+            if (!coord.questsTurnedIn.empty())
+                coord.questsTurnedIn += ',';
+            coord.questsTurnedIn += std::to_string(questId);
+            LOG_INFO("module.overseer", "overseer: dungeon run {} turned in quest {} with all {} members within 30 yards",
+                     coord.runId, questId, members.size());
+        }
+        return true;
+    }
+
     void DriveDungeonRunFor(std::string const& family,
                             std::vector<std::string> const& members,
                             std::string const& leaderName,
@@ -49283,6 +49549,9 @@ private:
             coord.runsWanted = cap.wanted;
             coord.capKnown = cap.known;
             coord.resetSince = std::time(nullptr);
+
+            if (portal->insideMapId == 36)
+                CaptureDungeonQuestGoal(coord, members, portal->insideMapId);
 
             LOG_INFO("module.overseer",
                      "overseer: dungeon run requested (job=dungeon on leader '{}') - run {} "
@@ -50459,6 +50728,18 @@ private:
                                              EscortPurpose::LeaveInstance, coord))
                 {
                     case DungeonCrossingResult::Through:
+                        if (coord.questGoalFinished)
+                        {
+                            uint32 const id = coord.runId
+                                ? coord.runId : ActiveRunIdOnMap(portal->insideMapId);
+                            if (id)
+                                CharacterDatabase.Execute(
+                                    "UPDATE overseer_dungeon_run SET last_progress_at = NOW() "
+                                    "WHERE id = {} AND state = 'active'", id);
+                            if (!DriveDungeonQuestTurnIn(coord, members,
+                                                         portal->outsideMapId))
+                                return;
+                        }
                         LOG_INFO("module.overseer",
                                  "overseer: all {} roster members came back out through "
                                  "areatrigger {} and are on map {} - the run is over",
@@ -50475,7 +50756,11 @@ private:
                             // that lived on `coord` would be destroyed under a
                             // reference the function still holds.
                             std::string const reason =
-                                coord.provedComplete
+                                coord.questGoalFinished
+                                    ? ("map " + std::to_string(portal->insideMapId) +
+                                       " quest objectives completed and the party turned in quests " +
+                                       coord.questsTurnedIn + " together after EXIT")
+                                : coord.provedComplete
                                     ? ("every encounter map " +
                                        std::to_string(portal->insideMapId) +
                                        " credits was credited, and the party walked back "
@@ -50508,7 +50793,7 @@ private:
                                             coord.leaderClientLostOutcome
                                                 ? "client_lost"
                                                 : OverseerDecisions::DungeonRunExitOutcome(
-                                                      coord.provedComplete,
+                                                      coord.provedComplete || coord.questGoalFinished,
                                                       !coord.stalledReason.empty(),
                                                       coord.evacuated),
                                             reason, IsDungeonJob(leaderJob));
@@ -51051,13 +51336,37 @@ private:
             // and this is not asked again for the run.
             if (!coord.provedComplete)
             {
+                if (portal->insideMapId == 36)
+                {
+                    if (!coord.questGoalCaptured)
+                        CaptureDungeonQuestGoal(coord, members, portal->insideMapId);
+                    if (coord.questGoalCaptured && DungeonQuestGoalComplete(coord))
+                    {
+                        coord.questGoalFinished = true;
+                        coord.phase = DungeonRunPhase::Exiting;
+                        coord.crossing.best = 0.f;
+                        coord.crossing.since = std::time(nullptr);
+                        coord.loggedCrossingAim = false;
+                        coord.loggedCrossingWaiting = false;
+                        std::set<uint32> quests;
+                        for (auto const& part : coord.questGoal)
+                            quests.insert(part.questId);
+                        std::ostringstream ids;
+                        for (uint32 id : quests)
+                            ids << (ids.tellp() > 0 ? "," : "") << id;
+                        LOG_INFO("module.overseer", "overseer: dungeon run {} completed map {} quest objectives [{}]; EXIT begins",
+                                 coord.runId, portal->insideMapId, ids.str());
+                        return;
+                    }
+                }
                 uint32 const expected =
                     ExpectedEncounterMask(portal->insideMapId, leader);
                 uint32 const credited = CompletedEncounters(leader);
                 OverseerDecisions::DungeonCompletion const done =
                     OverseerDecisions::DungeonRunCompletion(expected, credited);
 
-                if (done == OverseerDecisions::DungeonCompletion::Complete)
+                if (portal->insideMapId != 36 &&
+                    done == OverseerDecisions::DungeonCompletion::Complete)
                 {
                     coord.provedComplete = true;
                     coord.phase = DungeonRunPhase::Exiting;
@@ -51082,7 +51391,8 @@ private:
                 // it has today, and an operator watching a campaign on such a
                 // map should be able to read why it never ends 'complete'
                 // rather than deduce it.
-                if (done == OverseerDecisions::DungeonCompletion::Unknowable &&
+                if (portal->insideMapId != 36 &&
+                    done == OverseerDecisions::DungeonCompletion::Unknowable &&
                     !coord.loggedNoCompletionSignal)
                 {
                     coord.loggedNoCompletionSignal = true;
