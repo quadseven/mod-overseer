@@ -4307,6 +4307,41 @@ LandedErrand LandedErrandStep(std::string const& landedAim,
                               int64_t landedForSeconds,
                               int64_t ceilingSeconds);
 
+// DOES A RELEASE THAT SKIPPED ITS COLUMN WRITE LEAVE A LANDING (#722)?
+//
+// The landing above is only remembered for an aim the travel drive was walking
+// and the book never claimed: a claimed aim's release clears the column (#822),
+// and a claim the column moved away from means a newer writer owns what stands
+// now. #814 rewrote "the book holds no claim" as "the claim matches the column"
+// and the landing test kept the word `claimed` without its negation, so from
+// then on no release could land at all. Measured on the dev realm on
+// 2026-10-18: a leader sent to `auctioneer` with no usable counter within the
+// town-service walk was granted the errand, released in 0 s, the write was
+// skipped, and the next poll granted it again - every five seconds, 119 intent
+// changes in ten minutes.
+struct ReleaseLandingFacts
+{
+    // The book holds any claim for this character, matching the column or not.
+    bool anyClaim{false};
+    // The aim the travel drive's state was walking, empty when it had none.
+    std::string driving;
+    // The travel_npc column as the release read it.
+    std::string standing;
+};
+
+bool ReleaseLandsAim(ReleaseLandingFacts const& facts);
+
+// AN UNRESOLVABLE AIM STANDS DOWN AFTER ITS RELEASE, EXCEPT A POINT (#722).
+// The travel drive refuses an aim it cannot resolve from where the character
+// stands (no spawn of that role on the map, or none within the town-service
+// walk it may use) and releases it. A counter keyword or a creature entry the
+// bridge wrote then lands and waits for its writer, so it costs one grant per
+// landing ceiling instead of one per poll, and a rewritten column (a far trip
+// aimed at one counter's entry) is walked at once. An unclaimed `at:` aim does
+// not stand down: the poison-aim breaker (#824) counts its refusals poll by
+// poll and clears it, and a landing would starve that count.
+bool UnresolvedAimStandsDown(std::string const& aim);
+
 // MAY TravelAimBook::Claim WRITE THIS AIM (#560)?
 //
 // TWO FENCES, AND EACH PROTECTS A WALK SOMEBODY ELSE STARTED. A profession
