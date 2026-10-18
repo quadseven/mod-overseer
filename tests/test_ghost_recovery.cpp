@@ -30,6 +30,7 @@ using OverseerDecisions::GhostRecovery;
 using OverseerDecisions::GhostRecoveryFacts;
 using OverseerDecisions::GhostRecoveryLimits;
 using OverseerDecisions::GhostRecoveryReason;
+using OverseerDecisions::GhostRecoveryReasonText;
 using OverseerDecisions::GhostRecoveryVerdict;
 using OverseerDecisions::GhostRecoveryWord;
 using OverseerDecisions::SicknessEndsAt;
@@ -211,20 +212,53 @@ int main()
               DecideGhostRecovery(f), GhostRecovery::Ladder, GhostRecoveryReason::RepeatDeaths);
     }
 
-    // A first death while sick is still a corpse run, so the sickness does not
-    // stack (mod-overseer#747), and the log says why.
+    // A first death while sick is still a corpse run when the corpse is clear,
+    // so the sickness does not stack (mod-overseer#747, #958), and the log says why.
     {
         GhostRecoveryFacts f = Quiet();
         f.sick = true;
         f.corpseRunPossible = true;
-        Check("a sick member's first death here runs back to the corpse",
+        Check("a sick member's first death here runs back to the clear corpse",
               DecideGhostRecovery(f), GhostRecovery::CorpseRun, GhostRecoveryReason::StillSick);
         f.strongestNearCorpse = 30;
-        Check("even beside a hostile well above it", DecideGhostRecovery(f),
-              GhostRecovery::CorpseRun, GhostRecoveryReason::StillSick);
+        Check("but outlevelled at the corpse it takes the spirit healer", DecideGhostRecovery(f),
+              GhostRecovery::SpiritHealer, GhostRecoveryReason::Outlevelled);
         f.corpseRunPossible = false;
         Check("unless the corpse run is not possible", DecideGhostRecovery(f),
               GhostRecovery::SpiritHealer, GhostRecoveryReason::Outlevelled);
+    }
+
+    // #958: A sick ghost does not run back to a corpse its killers stand on.
+    // When live threats stand near the corpse, it waits up to waitSeconds, then
+    // takes the spirit healer (or Ladder when the graveyard is unsafe).
+    {
+        GhostRecoveryFacts f = Quiet();
+        f.level = 30;
+        f.deathsHere = 1;
+        f.sick = true;
+        f.corpseRunPossible = true;
+        f.liveThreatsNearCorpse = 2;
+        f.ghostSeconds = 10;
+        Check("a sick ghost with threats at its corpse waits before waitSeconds",
+              DecideGhostRecovery(f), GhostRecovery::Wait, GhostRecoveryReason::SickButThreatened);
+        f.ghostSeconds = 89;
+        Check("and still waits just before waitSeconds",
+              DecideGhostRecovery(f), GhostRecovery::Wait, GhostRecoveryReason::SickButThreatened);
+        f.ghostSeconds = 90;
+        Check("and takes the spirit healer after waitSeconds",
+              DecideGhostRecovery(f), GhostRecovery::SpiritHealer, GhostRecoveryReason::WaitedOut);
+        f.healerGraveyardSafe = false;
+        Check("or the ladder when the graveyard is unsafe",
+              DecideGhostRecovery(f), GhostRecovery::Ladder, GhostRecoveryReason::WaitedOut);
+    }
+
+    // Reason text for SickButThreatened explains why the sick ghost held.
+    if (std::strcmp(GhostRecoveryReasonText(GhostRecoveryReason::SickButThreatened),
+                    "it still carries Resurrection Sickness, but hostiles near the corpse make "
+                    "reclaiming it unsafe") != 0)
+    {
+        std::printf("FAIL GhostRecoveryReasonText(SickButThreatened) text mismatch\n");
+        ++failures;
     }
 
     // THE HOLD ENDS WITH THE DEBUFF. The core gives a level 13 member three

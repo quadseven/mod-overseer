@@ -47,6 +47,11 @@ void TheAdapterIsWired()
     Check("the module source is readable (run from the repo root)", !source.empty());
     Check("a caller without the ladder uses the fallback",
           source.find("OverseerDecisions::GuildGhostFallback(") != std::string::npos);
+    Check("an unsafe nearest healer is rerouted even with the ladder",
+          source.find("if (st.healerGrave && !st.healerRefused.empty())") != std::string::npos);
+    Check("the no-ladder fallback only treats a safe healer as known",
+          source.find("st.healerGrave != nullptr && facts.healerGraveyardSafe") !=
+              std::string::npos);
 }
 
 }  // namespace

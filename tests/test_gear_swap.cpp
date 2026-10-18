@@ -35,6 +35,7 @@ using OverseerDecisions::GearPriorWord;
 using OverseerDecisions::GearSlotBefore;
 using OverseerDecisions::GearSlotCleared;
 using OverseerDecisions::GearSlotDisplaced;
+using OverseerDecisions::GearSlotDiscovered;
 using OverseerDecisions::GearSlotFilled;
 using OverseerDecisions::GearSlotOccupant;
 using OverseerDecisions::GearSlotSeen;
@@ -194,6 +195,33 @@ void AKnownBareSlotIsNotAnUnknownOne()
     CheckText("reads as empty", GearPriorWord(before.state), "empty");
 }
 
+// A character first encountered after the module is already running has no
+// login callback for this module. Once its current slot is read, its next
+// equip must still name that occupant.
+void ACharacterFirstSeenMidSessionCanNameItsPrior()
+{
+    GearSlotShadow shadow;
+    CheckTrue("first discovery seeds the slot",
+              GearSlotDiscovered(shadow, true, TheWornWeapon()));
+    CheckTrue("a repeated discovery does not reseed",
+              !GearSlotDiscovered(shadow, false, GearSlotOccupant{}));
+    GearSlotBefore const before = GearSlotDisplaced(shadow, ONE_UPDATE);
+    CheckState("mid-session seed", before.state, GearSlotState::Occupied);
+    CheckUnsigned("mid-session prior", before.item.entry, 12969);
+}
+
+// A rename does not change the character's shadow identity; a relog seed is a
+// fresh direct observation and therefore also restores a known prior.
+void RenameOrRelogRetainsASeededShadow()
+{
+    GearSlotShadow shadow = SeededWith(TheWornWeapon());
+    CheckUnsigned("rename keeps seeded occupant",
+                  GearSlotDisplaced(shadow, ONE_UPDATE).item.entry, 12969);
+    GearSlotSeen(shadow, true, TheWornWeapon());
+    CheckUnsigned("relog seed restores occupant",
+                  GearSlotDisplaced(shadow, ONE_UPDATE).item.entry, 12969);
+}
+
 // And a slot nobody ever looked at says exactly that. Folding this into
 // "empty" is the mistake the death context columns document at length: it
 // would write "this was a first ever piece" over an equip that replaced
@@ -329,6 +357,8 @@ int main()
     BothSidesOfTheComparisonAreOnTheRow();
     AClearFromAnEarlierUpdateIsNotADisplacement();
     AKnownBareSlotIsNotAnUnknownOne();
+    ACharacterFirstSeenMidSessionCanNameItsPrior();
+    RenameOrRelogRetainsASeededShadow();
     AnUnobservedSlotIsNeverReportedAsEmpty();
     OneClearExplainsOnlyOneFill();
     AnOccupiedSlotIsAnsweredFromItsOccupant();

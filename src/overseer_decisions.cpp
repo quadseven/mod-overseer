@@ -23,6 +23,86 @@
 namespace OverseerDecisions
 {
 
+bool ParseEquipCommand(std::string const& command, EquipCommand& out)
+{
+    if (command.compare(0, 8, "e Hitem:") != 0)
+        return false;
+    std::string::size_type end = command.find(':', 8);
+    if (end == std::string::npos)
+        end = command.size();
+    if (end == 8)
+        return false;
+    for (std::string::size_type i = 8; i < end; ++i)
+        if (command[i] < '0' || command[i] > '9')
+            return false;
+    if (end < command.size())
+    {
+        // Hyperlink suffixes are numeric item fields only; reject a second
+        // link, whitespace, or arbitrary trailing command text. Every field
+        // holds at least one digit, so a bare trailing or doubled colon
+        // (`e Hitem:15211:`) is a malformed link too.
+        for (std::string::size_type i = end; i < command.size(); ++i)
+        {
+            if (command[i] == ':')
+            {
+                if (i + 1 == command.size() || command[i + 1] == ':')
+                    return false;
+            }
+            else if (command[i] < '0' || command[i] > '9')
+                return false;
+        }
+    }
+    try
+    {
+        unsigned long const value = std::stoul(command.substr(8, end - 8));
+        // An item template entry is never zero, with or without a link suffix,
+        // so `e Hitem:0` is a malformed link, not a real item. A digit run too
+        // long for unsigned long throws out_of_range (caught below); one that
+        // fits a 64-bit long but not uint32 is refused by the bound here.
+        if (value == 0 || value > UINT32_MAX)
+            return false;
+        out.entry = static_cast<uint32_t>(value);
+        return true;
+    }
+    catch (std::invalid_argument const&)
+    {
+        return false;
+    }
+    catch (std::out_of_range const&)
+    {
+        return false;
+    }
+}
+
+EquipRefusal EquipRefused(std::string const& reason)
+{
+    return {"error", reason};
+}
+
+EquipRefusal EquipReadBack(bool worn)
+{
+    return {worn ? "applied" : "unchanged",
+            worn ? "" : "the bot did not put the item on"};
+}
+
+bool UpgradePassKeeps(uint32_t usage)
+{
+    return usage == UPGRADE_USAGE_EQUIP || usage == UPGRADE_USAGE_REPLACE ||
+           usage == UPGRADE_USAGE_BAD_EQUIP;
+}
+
+EquipVerdict EquipUpgradeVerdict(uint32_t usage, std::string const& item, float itemScore,
+                                 std::string const& worn, float wornScore)
+{
+    if (UpgradePassKeeps(usage))
+        return {true, {"verifying", ""}};
+    std::ostringstream detail;
+    detail << std::fixed << std::setprecision(2) << "the bot keeps "
+           << (worn.empty() ? std::string("an empty slot") : worn) << ": " << item << " scores "
+           << itemScore << " against " << wornScore;
+    return {false, {"unchanged", detail.str()}};
+}
+
 LeaderClientGate DungeonLeaderClientGate(bool socketOpen, std::time_t openSince,
                                          std::time_t now, std::time_t settleSeconds)
 {
@@ -4751,6 +4831,17 @@ LootCouncilVote LootCouncilVoteFor(bool decided, std::string const& recipient,
     return recipient == voter ? LootCouncilVote::Need : LootCouncilVote::Pass;
 }
 
+LootCouncilVote MandatedLootVote(bool active, bool bindOnPickup,
+                                std::string const& intended,
+                                std::string const& voter)
+{
+    if (!active || !bindOnPickup)
+        return LootCouncilVote::Upstream;
+    if (!intended.empty() && intended == voter)
+        return LootCouncilVote::Need;
+    return LootCouncilVote::Pass;
+}
+
 std::string LootCouncilRollKey(std::uint64_t rollItemGuid)
 {
     return "roll:" + std::to_string(rollItemGuid);
@@ -4943,6 +5034,14 @@ void GearSlotSeen(GearSlotShadow& shadow, bool occupied, GearSlotOccupant const&
     shadow.removedValid = false;
     shadow.removed = GearSlotOccupant{};
     shadow.removedStamp = 0;
+}
+
+bool GearSlotDiscovered(GearSlotShadow& shadow, bool occupied, GearSlotOccupant const& item)
+{
+    if (shadow.observed)
+        return false;
+    GearSlotSeen(shadow, occupied, item);
+    return true;
 }
 
 GearSlotBefore GearSlotDisplaced(GearSlotShadow const& shadow, std::uint64_t stamp)
@@ -7057,6 +7156,114 @@ std::string GatheringCrossingBlocker(std::string const& leader, std::uint32_t le
                   std::to_string(doorMap);
     return leader + " (" + where + ", crossing for " + std::to_string(crossingSeconds / 60) +
            " minutes; the crossing last read '" + CrossingActionName(action) + "')";
+}
+
+// ------------------------- a crossing that makes no progress gives up (#926) --
+
+char const* CrossingAttemptEndWord(CrossingAttemptEnd end)
+{
+    switch (end)
+    {
+        case CrossingAttemptEnd::Overdue:
+            return "the crossing's own backstop ran out";
+        case CrossingAttemptEnd::GroundGiveUp:
+            return "the travel drive gave the berth walk up as unreachable";
+        case CrossingAttemptEnd::NoProgressBackoff:
+            return "the travel drive's no-progress backoff refused the berth aim";
+        case CrossingAttemptEnd::Refused:
+            return "the travel drive refused the berth aim";
+    }
+    return "the attempt ended";
+}
+
+void OpenCrossingAttempt(CrossingAttempts& record, std::string const& dungeon,
+                         std::string const& berth, float yards, std::int64_t now)
+{
+    if (record.dungeon != dungeon || record.berth != berth)
+    {
+        // A NEW QUESTION, NOT THE OLD ONE AGAIN. The cool-off belongs to the
+        // dungeon, so it survives only a change of berth.
+        std::int64_t const refusedUntil = record.dungeon == dungeon ? record.refusedUntil : 0;
+        record = CrossingAttempts{};
+        record.dungeon = dungeon;
+        record.berth = berth;
+        record.refusedUntil = refusedUntil;
+    }
+    if (!record.firstSeen)
+        record.firstSeen = now;
+    record.open = true;
+    if (yards < 0.f)
+        return;
+    if (record.reference < 0.f)
+        record.reference = yards;
+    if (record.best < 0.f || yards < record.best)
+        record.best = yards;
+}
+
+CrossingAttemptReading EndCrossingAttempt(CrossingAttempts& record, std::int64_t now,
+                                          CrossingAttemptLimits const& limits)
+{
+    CrossingAttemptReading reading;
+    reading.seconds = record.firstSeen ? now - record.firstSeen : 0;
+    reading.attempts = record.failed;
+    if (!record.open)
+        return reading;
+    record.open = false;
+    reading.counted = true;
+    reading.gained = record.reference >= 0.f && record.best >= 0.f
+                         ? record.reference - record.best
+                         : 0.f;
+
+    // AN ATTEMPT THAT GOT SOMEWHERE IS NOT A FAILURE TO GET ANYWHERE. A long
+    // walk can need more than one backstop, and each that ends nearer is
+    // worth another. The count starts again from where it got to.
+    if (reading.gained >= limits.gainYards)
+    {
+        record.failed = 0;
+        record.reference = record.best;
+        reading.attempts = 0;
+        return reading;
+    }
+
+    ++record.failed;
+    reading.attempts = record.failed;
+    if (record.failed < limits.attempts)
+        return reading;
+
+    reading.verdict = CrossingAttemptVerdict::GiveUp;
+    reading.cooloffSeconds = limits.cooloffSeconds;
+    record.refusedUntil = now + limits.cooloffSeconds;
+    record.failed = 0;
+    record.reference = -1.f;
+    record.best = -1.f;
+    record.firstSeen = 0;
+    return reading;
+}
+
+std::int64_t CrossingHandedBack(CrossingAttempts const& record, std::string const& dungeon,
+                                std::int64_t now)
+{
+    if (record.dungeon != dungeon || record.refusedUntil <= now)
+        return 0;
+    return record.refusedUntil - now;
+}
+
+CrossingBerthClaim ReadCrossingBerthClaim(std::int64_t sinceRefused,
+                                          std::int64_t refusalSeconds)
+{
+    return sinceRefused >= 0 && sinceRefused < refusalSeconds ? CrossingBerthClaim::StandBack
+                                                              : CrossingBerthClaim::Claim;
+}
+
+CrossingAttemptEnd CrossingRefusalEnd(std::string const& reason)
+{
+    return reason == NoProgressBackoffReason ? CrossingAttemptEnd::NoProgressBackoff
+                                             : CrossingAttemptEnd::Refused;
+}
+
+bool IsTravelGiveUpRelease(std::string const& why)
+{
+    return why == TravelBackstopReleaseReason || why == TravelGroundGiveUpReleaseReason;
 }
 
 DockReading ReadDock(std::uint32_t pathProgressMs, std::uint32_t periodMs,
@@ -10072,7 +10279,9 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
 {
     RoutePlan plan;
     if (!(limits.entryNodeYards > 0.f) || !(limits.minGainYards >= 0.f) ||
-        !(limits.roundHandoverYards >= 0.f))
+        !(limits.roundHandoverYards >= 0.f) ||
+        (limits.fromZKnown &&
+         (!std::isfinite(limits.fromZ) || !(limits.maxEntryRiseYards >= 0.f))))
     {
         plan.verdict = RoutePlanVerdict::BadLimits;
         return plan;
@@ -10103,12 +10312,34 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
 
     // The way in: the nearest node, and it must be near. A route from a node
     // the character cannot get to is not a route.
+    //
+    // AND ON THE CHARACTER'S OWN FLOOR WHEN ONE IS NEAR (#925). If any node
+    // within reach is inside the height limit, every node outside it is passed
+    // over as the way in; if none is, the nearest is taken as it always was.
+    bool floorOnly = false;
+    if (limits.fromZKnown)
+    {
+        for (RouteNode const& node : here)
+        {
+            if (std::find(limits.refusedEntries.begin(), limits.refusedEntries.end(),
+                          node.id) != limits.refusedEntries.end())
+                continue;
+            if (PlaneDistance(node.x, node.y, fromX, fromY) <= limits.entryNodeYards &&
+                std::fabs(node.z - limits.fromZ) <= limits.maxEntryRiseYards)
+            {
+                floorOnly = true;
+                break;
+            }
+        }
+    }
     std::uint32_t entry = 0;
     float entryDistance = -1.f;
     for (std::uint32_t i = 0; i < here.size(); ++i)
     {
         if (std::find(limits.refusedEntries.begin(), limits.refusedEntries.end(),
                       here[i].id) != limits.refusedEntries.end())
+            continue;
+        if (floorOnly && !(std::fabs(here[i].z - limits.fromZ) <= limits.maxEntryRiseYards))
             continue;
         float const d = PlaneDistance(here[i].x, here[i].y, fromX, fromY);
         if (entryDistance < 0.f || d < entryDistance)
@@ -10286,6 +10517,8 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
     plan.yards = chosen->best[goal];
     plan.endsFromAimYards = goalDistance;
     plan.guardedLegs = guardedOnPlan;
+    if (limits.fromZKnown)
+        plan.entryHeightGapYards = std::fabs(here[entry].z - limits.fromZ);
     return plan;
 }
 
@@ -13452,7 +13685,8 @@ RaidDoor const* RaidDoorFor(std::string const& keyword)
     // See RaidDoor for where every number comes from.
     static RaidDoor const doors[] = {
         {"moltencore", "Molten Core", 0, 3529, 409, 2890,
-         -7508.32f, -1039.74f, 180.912f, 50, "moltencore"},
+         -7508.32f, -1039.74f, 180.912f, 50, "moltencore", {179587, 179586},
+         "Blackrock Mountain"},
     };
     for (RaidDoor const& door : doors)
         if (keyword == door.keyword)
@@ -13492,6 +13726,49 @@ bool RaidWiped(RaidRunFacts const& facts)
     if (facts.insideAlive == 0)
         return true;
     return !facts.insideCombat && facts.insideDead * 100 >= total * RAID_WIPE_PCT;
+}
+
+bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct)
+{
+    return lowestDurabilityPct < floorPct;
+}
+
+RaidPullRepairAction RaidPullRepairDecision(unsigned bossesDone, bool anySeatBelowFloor,
+                                           long heldSeconds, long maximumHoldSeconds)
+{
+    // Molten Core orders Majordomo Executus after the first eight bosses and
+    // Ragnaros after Majordomo.
+    if (bossesDone != 8 && bossesDone != 9)
+        return RaidPullRepairAction::Ignore;
+    if (!anySeatBelowFloor)
+        return RaidPullRepairAction::Resume;
+    return heldSeconds >= maximumHoldSeconds ? RaidPullRepairAction::TimedOut
+                                              : RaidPullRepairAction::Hold;
+}
+
+RaidPullRepairAction RaidPullRepairForSeats(unsigned bossesDone,
+                                            std::vector<unsigned> const& seatLowestPcts,
+                                            unsigned floorPct, long heldSeconds,
+                                            long maximumHoldSeconds)
+{
+    bool anyBelow = false;
+    for (unsigned const pct : seatLowestPcts)
+        if (RaidSeatNeedsRepair(pct, floorPct))
+            anyBelow = true;
+    return RaidPullRepairDecision(bossesDone, anyBelow, heldSeconds, maximumHoldSeconds);
+}
+
+RaidPullSeatStep RaidPullSeatRepairStep(unsigned lowestDurabilityPct, unsigned floorPct,
+                                        bool holdTimedOut, bool alreadyAttempted,
+                                        bool repairerInReach)
+{
+    if (!RaidSeatNeedsRepair(lowestDurabilityPct, floorPct))
+        return RaidPullSeatStep::Ready;
+    if (holdTimedOut)
+        return RaidPullSeatStep::TimedOut;
+    if (alreadyAttempted)
+        return RaidPullSeatStep::Attempted;
+    return repairerInReach ? RaidPullSeatStep::Repair : RaidPullSeatStep::Walk;
 }
 
 bool RaidGhostMayBeWalked(long ghostSeconds)
@@ -13737,8 +14014,13 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
             }
             step.phase = RaidRunPhase::Assemble;
             step.aimStaging = true;
+            step.summonStragglers = facts.headAssembled &&
+                                    facts.heldSeconds >= RAID_STONE_SUMMON_AFTER_SECONDS;
             step.why = !facts.headAssembled ? "the head is walking to the door"
-                                            : "waiting for the raid at the door";
+                       : step.summonStragglers
+                           ? "waiting for the raid at the door; stragglers are summoned "
+                             "at the meeting stone"
+                           : "waiting for the raid at the door";
             return step;
 
         case RaidRunPhase::Enter:
@@ -13784,6 +14066,100 @@ std::vector<std::string> RaidKnockOrder(std::vector<std::string> const& inDoor,
     if (headInDoor && headMayCross)
         order.push_back(head);
     return order;
+}
+
+RaidStoneSummon ChooseRaidStoneSummon(std::vector<RaidStoneSeat> const& seats,
+                                      std::vector<RaidStone> const& stones,
+                                      unsigned triesPerSeat)
+{
+    RaidStoneSummon choice;
+    if (stones.empty())
+    {
+        choice.why = "the door has no meeting stone in this world";
+        return choice;
+    }
+
+    // WHO CAN CLICK EACH STONE, decided before any straggler is looked at: a
+    // clicker who meets the stone's minimum and a second seat for the portal.
+    std::vector<RaidStoneSeat const*> clickers(stones.size(), nullptr);
+    std::vector<RaidStoneSeat const*> helpers(stones.size(), nullptr);
+    bool anyPair = false;
+    for (std::size_t s = 0; s < stones.size(); ++s)
+    {
+        auto canClick = [&](RaidStoneSeat const& seat)
+        {
+            return !seat.head && seat.inWorld && seat.alive && !seat.inCombat &&
+                   !seat.inInstance && seat.atStone == int(s);
+        };
+        for (RaidStoneSeat const& seat : seats)
+            if (canClick(seat) && seat.level >= stones[s].minLevel)
+            {
+                clickers[s] = &seat;
+                break;
+            }
+        if (!clickers[s])
+            continue;
+        for (RaidStoneSeat const& seat : seats)
+            if (canClick(seat) && &seat != clickers[s])
+            {
+                helpers[s] = &seat;
+                break;
+            }
+        anyPair = anyPair || helpers[s];
+    }
+
+    bool anyAway = false;
+    bool belowFloor = false;
+    bool triedOut = false;
+    bool unmovable = false;
+    for (RaidStoneSeat const& straggler : seats)
+    {
+        if (straggler.head || !straggler.inWorld || straggler.assembled ||
+            straggler.atStone >= 0)
+            continue;
+        anyAway = true;
+        if (!straggler.alive || straggler.inCombat || straggler.inInstance ||
+            !straggler.summonable)
+        {
+            unmovable = true;
+            continue;
+        }
+        if (straggler.tries >= triesPerSeat)
+        {
+            triedOut = true;
+            continue;
+        }
+        for (std::size_t s = 0; s < stones.size(); ++s)
+        {
+            if (!helpers[s])
+                continue;
+            if (straggler.level < stones[s].minLevel)
+            {
+                belowFloor = true;
+                continue;
+            }
+            choice.summon = true;
+            choice.straggler = straggler.name;
+            choice.clicker = clickers[s]->name;
+            choice.helper = helpers[s]->name;
+            choice.stone = int(s);
+            choice.why = "a seat away from the door is summoned at the meeting stone";
+            return choice;
+        }
+    }
+    if (!anyAway)
+        choice.why = "every raid member in the world is at the door or a meeting stone";
+    else if (!anyPair)
+        choice.why = "fewer than two seats who can click stand at a meeting stone";
+    else if (belowFloor)
+        choice.why = "the seats still away are below the meeting stone's minimum level "
+                     "and keep walking";
+    else if (triedOut)
+        choice.why = "the seats still away have had their summons";
+    else if (unmovable)
+        choice.why = "the seats still away are dead, fighting, in an instance or not "
+                     "movable by a summon";
+    return choice;
 }
 
 bool DungeonClearMayArmHere(bool raidMap, bool raidClearOrdered)
@@ -16519,16 +16895,18 @@ GhostRecoveryVerdict DecideGhostRecovery(GhostRecoveryFacts const& facts,
     if (limits.repeatDeaths && facts.deathsHere >= limits.repeatDeaths)
         return healer(GhostRecoveryReason::RepeatDeaths);
 
-    // 2a. Do not stack Resurrection Sickness when the corpse remains reachable.
-    if (facts.sick && facts.corpseRunPossible)
+    // 2a. Do not stack Resurrection Sickness when the corpse remains reachable
+    // and safe (mod-overseer#747, #958).
+    bool const outlevelled = facts.strongestNearCorpse &&
+                             facts.strongestNearCorpse >= facts.level + limits.levelGap;
+    if (facts.sick && facts.corpseRunPossible && facts.liveThreatsNearCorpse == 0 && !outlevelled)
     {
         verdict.reason = GhostRecoveryReason::StillSick;
         return verdict;
     }
 
     // 3. Something near the corpse is well above it.
-    if (facts.strongestNearCorpse &&
-        facts.strongestNearCorpse >= facts.level + limits.levelGap)
+    if (outlevelled)
         return healer(GhostRecoveryReason::Outlevelled);
 
     // 4. Something near the corpse could kill it again, and may move off.
@@ -16537,7 +16915,8 @@ GhostRecoveryVerdict DecideGhostRecovery(GhostRecoveryFacts const& facts,
         if (facts.ghostSeconds < limits.waitSeconds)
         {
             verdict.choice = GhostRecovery::Wait;
-            verdict.reason = GhostRecoveryReason::HostilesNearby;
+            verdict.reason = facts.sick ? GhostRecoveryReason::SickButThreatened
+                                        : GhostRecoveryReason::HostilesNearby;
             return verdict;
         }
         return healer(GhostRecoveryReason::WaitedOut);
@@ -16573,6 +16952,27 @@ uint32_t KillerAtCorpse(CreatureKillMark const& mark, uint32_t mapId, float corp
     float const dx = mark.x - corpseX;
     float const dy = mark.y - corpseY;
     return dx * dx + dy * dy <= radius * radius ? mark.entry : 0;
+}
+
+PlaceDanger JudgePlaceDanger(PlaceDangerFacts const& facts)
+{
+    PlaceDanger danger;
+    for (std::size_t i = 0; i < facts.hostiles.size(); ++i)
+    {
+        PlaceHostile const& h = facts.hostiles[i];
+        if (!CorpseThreat(h.level, facts.memberLevel, h.entry, facts.killerEntry))
+            continue;
+        if (!danger.threats++ || h.level > danger.strongest)
+        {
+            danger.strongest = h.level;
+            danger.strongestAt = i;
+        }
+    }
+    if (danger.threats)
+        danger.reason = PlaceDangerReason::Hostiles;
+    else if (facts.repeatDeaths && facts.deathsNear >= facts.repeatDeaths)
+        danger.reason = PlaceDangerReason::RepeatDeaths;
+    return danger;
 }
 
 char const* GhostRecoveryWord(GhostRecovery choice)
@@ -16788,6 +17188,9 @@ char const* GhostRecoveryReasonText(GhostRecoveryReason reason)
         case GhostRecoveryReason::StillSick:
             return "it still carries Resurrection Sickness and the spirit healer would stack "
                    "another";
+        case GhostRecoveryReason::SickButThreatened:
+            return "it still carries Resurrection Sickness, but hostiles near the corpse make "
+                   "reclaiming it unsafe";
     }
     return "unknown";
 }
@@ -18180,6 +18583,79 @@ char const* GuildRunVerdictWord(GuildRunVerdict verdict)
     return "unknown";
 }
 
+char const* GuildSeatStateWord(GuildSeatState state)
+{
+    switch (state)
+    {
+        case GuildSeatState::Present:    return "present";
+        case GuildSeatState::NotInWorld: return "not in world";
+        case GuildSeatState::Dead:       return "dead";
+        case GuildSeatState::InCombat:   return "in combat";
+        case GuildSeatState::OtherMap:   return "other map";
+    }
+    return "unknown";
+}
+
+char const* GuildSeatWord(GuildSeat seat)
+{
+    switch (seat)
+    {
+        case GuildSeat::Tank:   return "tank";
+        case GuildSeat::Healer: return "healer";
+        case GuildSeat::Damage: return "dps";
+    }
+    return "dps";
+}
+
+std::string GuildRunAbsentWords(std::vector<GuildRunSeatReport> const& seats)
+{
+    std::string out;
+    for (GuildRunSeatReport const& s : seats)
+    {
+        if (s.state == GuildSeatState::Present)
+            continue;
+        if (!out.empty())
+            out += "; ";
+        out += "'" + s.name + "' (" + GuildSeatWord(s.seat) + ") never came inside: " +
+               GuildSeatStateWord(s.state);
+    }
+    return out;
+}
+
+std::string GuildRunStallWords(std::string const& nextBoss, bool killed,
+                               unsigned secondsSinceKill)
+{
+    std::string out;
+    if (!nextBoss.empty())
+        out = "next " + nextBoss + ", ";
+    out += killed ? "last kill " + std::to_string(secondsSinceKill / 60) + " min ago"
+                  : std::string("no boss killed yet");
+    return out;
+}
+
+std::string GuildRunAbandonedWhy(GuildRunPoll const& poll, std::string const& absent)
+{
+    std::string why;
+    if (poll.groupGone)
+        why = "the group is gone";
+    else if (!poll.inside)
+        why = "nobody has been inside for " + std::to_string(poll.secondsEmpty) + "s";
+    else
+        why = "the assigned tank and healer roles were not both alive inside for " +
+              std::to_string(poll.secondsWithoutRoles) + "s";
+    if (!absent.empty())
+        why += "; " + absent;
+    return why;
+}
+
+std::string GuildRunTimedOutWhy(unsigned secondsInside, std::string const& stall)
+{
+    std::string why = "inside for " + std::to_string(secondsInside) + "s";
+    if (!stall.empty())
+        why += "; " + stall;
+    return why;
+}
+
 std::uint32_t GuildRunExpectedMask(std::uint32_t mapId, std::uint32_t mapMask,
                                    std::uint32_t brainMask, bool finderEndsDungeon)
 {
@@ -18214,16 +18690,6 @@ unsigned GuildRunCeilingForMap(std::uint32_t mapId, bool finderEndsDungeon,
     if (!perBoss)
         return base;
     return std::max(base, bossesExpected * perBoss + GUILD_RUN_CEILING_MARGIN_SECONDS);
-}
-
-RosterTraining RosterTrainingFor(bool factoryGrants)
-{
-    RosterTraining training;
-    training.skills = factoryGrants;
-    training.classSpells = factoryGrants;
-    training.trainerSpells = factoryGrants;
-    training.talents = true;
-    return training;
 }
 
 // ------------------------------------------------------------------ keep --
@@ -19364,6 +19830,19 @@ std::string LeaderCommandRefusal(bool isFamilyLeader, std::string const& source,
             start = comma + 1;
         }
     }
+    return std::string();
+}
+
+std::string GrantingBotCommandRefusal(std::string const& command)
+{
+    std::string const verb = LowerTrimmed(command);
+    std::string const first = verb.substr(0, verb.find_first_of(" =\t"));
+    static char const* const granting[] = {"maintenance", "autogear", "cheat", "summon", "init",
+                                           "levelup"};
+    for (char const* word : granting)
+        if (first == word)
+            return "`" + first + "` hands a bot what a player would have to earn, and a member "
+                   "gains nothing it did not earn";
     return std::string();
 }
 
@@ -20832,6 +21311,12 @@ bool RowLiftsDeckSettle(std::string const& kind)
 bool HoldYieldsToWalk(std::string const& holdVerb)
 {
     return holdVerb == DECK_SETTLE_HOLD_VERB;
+}
+
+LogoutScope LogoutOfflineScope(uint32_t otherInWorldOnAccount)
+{
+    return otherInWorldOnAccount == 0 ? LogoutScope::Account
+                                      : LogoutScope::CharacterOnly;
 }
 
 }  // namespace OverseerDecisions

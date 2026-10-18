@@ -1,30 +1,24 @@
 /*
- * What a level-up hands the roster, and the switch that stops it.
+ * What a level-up hands the roster: its own talent points, and nothing else.
  *
  * TrainRoster ran PlayerbotFactory::InitSkills, InitClassSpells and
  * InitAvailableSpells on every level change of a roster character, with no
- * trainer and no gold. Measured on the operator's realm: a level 27 druid held
- * two-handed maces, daggers, polearms and fist weapons at 135/135 (27 x 5, the
- * factory's druid list), a warrior held all sixteen weapon skills at 300/300,
- * and every Alliance member held the three riding ranks up to 225.
+ * trainer and no gold, behind Overseer.Train.Factory (default on). Measured on
+ * the operator's realm: a level 27 druid held two-handed maces, daggers,
+ * polearms and fist weapons at 135/135 (27 x 5, the factory's druid list), a
+ * warrior held all sixteen weapon skills at 300/300, and every Alliance member
+ * held the three riding ranks up to 225.
  *
- * Overseer.Train.Factory = 0 turns all three grants off and leaves the
- * talent spend on. These checks pin the decision, and read src/mod_overseer.cpp
- * (run from the repo root) to pin that TrainRoster honours it and reads the key
- * with a default of ON.
- *
- * Compiled against src/overseer_decisions.cpp and nothing else.
+ * Natural only (the operator, 2026-10-12): the grants and the key are gone.
+ * These checks read src/mod_overseer.cpp (run from the repo root) to pin that
+ * TrainRoster makes no factory call, reads no key that could turn one back on,
+ * and still spends the talent points the character earned by levelling.
  */
-
-#include "overseer_decisions.h"
 
 #include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <string>
-
-using OverseerDecisions::RosterTraining;
-using OverseerDecisions::RosterTrainingFor;
 
 namespace
 {
@@ -37,24 +31,6 @@ void Check(char const* what, bool ok)
         return;
     std::printf("FAIL %s\n", what);
     ++failures;
-}
-
-void GrantsOnIsTheOldBehaviour()
-{
-    RosterTraining const on = RosterTrainingFor(true);
-    Check("on: weapon skills and riding are granted", on.skills);
-    Check("on: class spells are granted", on.classSpells);
-    Check("on: trainer spells are granted", on.trainerSpells);
-    Check("on: talents are spent", on.talents);
-}
-
-void GrantsOffGrantsNothing()
-{
-    RosterTraining const off = RosterTrainingFor(false);
-    Check("off: no weapon skills or riding", !off.skills);
-    Check("off: no class spells", !off.classSpells);
-    Check("off: no trainer spells without a trainer", !off.trainerSpells);
-    Check("off: earned talent points are still spent", off.talents);
 }
 
 std::string ReadFile(char const* path)
@@ -75,7 +51,7 @@ std::string TrainRosterBody(std::string const& source)
     return source.substr(begin, end - begin);
 }
 
-void TheAdapterHonoursTheSwitch()
+void TrainRosterGrantsNothing()
 {
     std::string const source = ReadFile("src/mod_overseer.cpp");
     std::string const body = TrainRosterBody(source);
@@ -83,43 +59,24 @@ void TheAdapterHonoursTheSwitch()
     if (body.empty())
         return;
 
-    Check("the key is read with a default of ON",
-          source.find("GetOption<bool>(\"Overseer.Train.Factory\", true)") != std::string::npos);
-    Check("TrainRoster asks the decision",
-          body.find("OverseerDecisions::RosterTrainingFor(RosterFactoryGrants())") != std::string::npos);
-    Check("InitSkills only when skills are granted",
-          body.find("if (training.skills)\n                factory.InitSkills();") != std::string::npos);
-    Check("InitClassSpells only when class spells are granted",
-          body.find("if (training.classSpells)\n                factory.InitClassSpells();") !=
-              std::string::npos);
-
-    std::size_t const gate = body.find("if (training.trainerSpells)");
-    std::size_t const sweep = body.find("factory.InitAvailableSpells();");
-    Check("InitAvailableSpells only inside the trainer-spells gate",
-          gate != std::string::npos && sweep != std::string::npos && gate < sweep);
-
-    // Every factory call in TrainRoster sits behind one of the three flags.
-    std::size_t calls = 0;
-    for (std::size_t at = body.find("factory.Init"); at != std::string::npos;
-         at = body.find("factory.Init", at + 1))
-        ++calls;
-    Check("TrainRoster makes exactly three factory grants, all gated", calls == 3);
-
-    Check("the off path says so",
-          body.find("factory grants are \"\n                         \"off") != std::string::npos);
+    Check("TrainRoster builds no bot factory", body.find("PlayerbotFactory factory") == std::string::npos);
+    Check("TrainRoster makes no factory grant", body.find("factory.Init") == std::string::npos);
+    Check("the factory key is read nowhere",
+          source.find("GetOption<bool>(\"Overseer.Train.Factory\"") == std::string::npos);
+    Check("TrainRoster still spends the earned talent points",
+          body.find("SpendTalents(bot, static_cast<uint32>(specTab));") != std::string::npos);
 
     std::string const dist = ReadFile("conf/mod_overseer.conf.dist");
-    Check("the dist declares the key, commented, at its default",
-          dist.find("\n#Overseer.Train.Factory = 1\n") != std::string::npos);
+    Check("the dist no longer offers the key", dist.find("\n#Overseer.Train.Factory = ") == std::string::npos);
+    Check("the dist says the key is retired",
+          dist.find("Overseer.Train.Factory is retired") != std::string::npos);
 }
 
 }  // namespace
 
 int main()
 {
-    GrantsOnIsTheOldBehaviour();
-    GrantsOffGrantsNothing();
-    TheAdapterHonoursTheSwitch();
+    TrainRosterGrantsNothing();
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);

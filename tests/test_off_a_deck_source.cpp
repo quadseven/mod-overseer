@@ -3,8 +3,8 @@
  *
  * The decision is proved in test_off_a_deck.cpp. What only the adapter can get
  * wrong is whether it ASKS: measures a transport within reach, passes the
- * lethal-drop bound into the limits, and acts on SetDown on the character's own
- * map at its own x and y. A rung nothing feeds is the failure this repository
+ * lethal-drop bound into the limits, and answers SetDown with a loud line and
+ * no teleport (natural only, 2026-10-12). A rung nothing feeds is the failure this repository
  * has shipped before, so the wiring is pinned as text.
  */
 
@@ -57,13 +57,13 @@ int main()
         text.find("verdict.remedy == OverseerDecisions::TerrainRemedy::SetDown");
     if (act == std::string::npos)
         return Fail("the drive must act on SetDown");
-    std::size_t const tele = text.find("bot->TeleportTo(bot->GetMapId(), fromX, fromY, downZ", act);
     std::size_t const lift =
         text.find("verdict.remedy == OverseerDecisions::TerrainRemedy::LiftToSurface", act);
-    if (tele == std::string::npos || lift == std::string::npos || !(tele < lift))
-        return Fail("a set-down stays on the character's own map at its own x and y");
-    if (!Has(text, "WAS IN THE AIR beside", act))
+    if (lift == std::string::npos ||
+        text.substr(act, lift - act).find("TeleportTo") != std::string::npos)
+        return Fail("a set-down moves nobody: nothing here teleports a member");
+    if (!Has(text, "IS IN THE AIR beside", act))
         return Fail("a set-down must be logged loudly, by name");
-    std::cout << "the set-down is measured, bounded, applied and logged\n";
+    std::cout << "the set-down is measured, bounded and logged, and moves nobody\n";
     return EXIT_SUCCESS;
 }

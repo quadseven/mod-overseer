@@ -58,6 +58,59 @@
 namespace OverseerDecisions
 {
 
+struct EquipCommand
+{
+    uint32_t entry{0};
+};
+
+// Accept the bridge's one-item equip form only: `e Hitem:<entry>` with an
+// optional numeric hyperlink suffix. Extra links or trailing text are invalid.
+bool ParseEquipCommand(std::string const& command, EquipCommand& out);
+
+struct EquipRefusal
+{
+    // A string literal ("error", "applied", "unchanged"), so the command loop
+    // can assign it straight to its own `char const* status` for the row.
+    char const* status;
+    std::string detail;
+};
+
+EquipRefusal EquipRefused(std::string const& reason);
+EquipRefusal EquipReadBack(bool worn);
+
+// THE BOT'S OWN UPGRADE PASS HAS THE LAST WORD ON A GUILD MEMBER'S GEAR (#927).
+// Guild members are random bots, so mod-playerbots' EquipUpgradesPacketAction
+// runs for them on the random tick, on item push and on loot won, and puts back
+// whatever its StatsWeightCalculator prefers. Measured on the live realm: the
+// core put the bridge's piece on within 6 s of every ask, and the bot put its
+// own back 1 to 84 minutes later, after #920's read-back had already said
+// `applied`. So before the whisper the adapter reads the same verdict that pass
+// reads (`ItemUsage` value "item upgrade") and refuses a piece it would undo.
+//
+// The ItemUsage values that verdict can return, mirrored because this file may
+// not include a playerbots header; the adapter static_asserts them against the
+// real enum. The pass equips EQUIP, REPLACE and BAD_EQUIP and nothing else.
+constexpr uint32_t UPGRADE_USAGE_NONE = 0;
+constexpr uint32_t UPGRADE_USAGE_EQUIP = 1;
+constexpr uint32_t UPGRADE_USAGE_REPLACE = 2;
+constexpr uint32_t UPGRADE_USAGE_BAD_EQUIP = 3;
+
+bool UpgradePassKeeps(uint32_t usage);
+
+struct EquipVerdict
+{
+    // true: whisper `e` and wait on the read-back (`row.status` "verifying").
+    // false: never whispered; `row` is the row's final status and detail.
+    bool whisper;
+    EquipRefusal row;
+};
+
+// `worn` is the piece in the slot FindEquipSlot names, empty for an empty
+// slot; both scores are StatsWeightCalculator's with the item set bonus and
+// the overflow penalty off, as the upgrade pass scores them.
+EquipVerdict EquipUpgradeVerdict(uint32_t usage, std::string const& item, float itemScore,
+                                 std::string const& worn, float wornScore);
+
 // A DUNGEON RUN'S LEADER MUST HOLD A CLIENT (#735). Only a client-attached
 // leader can issue the dungeon-clear, so ENTER and CLEARING wait until the
 // leader's socket has stayed open for the settle window (a measured flap ran
@@ -5637,6 +5690,12 @@ enum class LootCouncilVote
 LootCouncilVote LootCouncilVoteFor(bool decided, std::string const& recipient,
                                    std::string const& voter, long openSeconds);
 
+// A live item mandate takes precedence on bind-on-pickup group rolls. Every
+// other member passes, including when the mandate has an invalid recipient.
+LootCouncilVote MandatedLootVote(bool active, bool bindOnPickup,
+                                std::string const& intended,
+                                std::string const& voter);
+
 // The row key: "roll:<roll item guid>" for a group-loot roll, and
 // "ml:<creature raw guid>:<loot slot>" for a master-loot drop.
 std::string LootCouncilRollKey(std::uint64_t rollItemGuid);
@@ -5826,6 +5885,10 @@ void GearSlotCleared(GearSlotShadow& shadow, std::uint64_t stamp);
 // for every slot including the bare ones, which is what makes a later "the slot
 // was empty" a fact rather than an absence of evidence.
 void GearSlotSeen(GearSlotShadow& shadow, bool occupied, GearSlotOccupant const& item);
+
+// Seed a slot only when the module first discovers the character mid-session.
+// Returns true when this call established the first observation.
+bool GearSlotDiscovered(GearSlotShadow& shadow, bool occupied, GearSlotOccupant const& item);
 
 // What did the item now in this slot displace? Must be asked BEFORE
 // GearSlotFilled records the new occupant, because after that call the shadow
@@ -8490,6 +8553,143 @@ std::string GatheringCrossingBlocker(std::string const& leader, std::uint32_t le
                                      std::uint32_t doorMap, CrossingAction action,
                                      std::uint32_t crossingSeconds);
 
+// ------------------------- a crossing that makes no progress gives up (#926) --
+//
+// Refs wow-overseer#870. One leader's walk to the Menethil berth was restarted
+// 424 times over 4.7 hours, and the family's queue head had 0 runs of 9. Two
+// backstops existed and neither held against an aim the crossing owns. The
+// travel drive's no-progress backoff refused the aim for fifteen minutes, but
+// the IDLE crossing claimed it again on every poll and the refusal only
+// released it again: 131 times in 12 minutes. And the crossing's own backstop,
+// after half an hour, refused and zeroed its clock, so the next poll walked
+// again with a fresh half hour: released at 15:44:59, walking at 15:45:04.
+//
+// So the crossing keeps a record per leader that a Refuse does not reset:
+// attempts, the nearest the leader has got to the berth, and when the record
+// started. An attempt opens when the crossing claims the berth aim and closes
+// when one of the things below ends it. Two closed attempts in a row that got
+// no 100 yards nearer hand the dungeon back for two hours.
+
+// What ended an attempt at the berth.
+enum class CrossingAttemptEnd : std::uint8_t
+{
+    // The crossing's own half-hour backstop read it overdue.
+    Overdue,
+    // The travel drive refused every bearing toward the berth, or got no
+    // nearer to it for its whole backstop, and released the aim as unreachable.
+    GroundGiveUp,
+    // The travel drive's no-progress backoff refused the berth aim.
+    NoProgressBackoff,
+    // The travel drive refused the berth aim for another reason (deaths).
+    Refused,
+};
+
+// The clause a log line names the end with.
+char const* CrossingAttemptEndWord(CrossingAttemptEnd end);
+
+struct CrossingAttemptLimits
+{
+    // Failed attempts in a row, none of them gaining `gainYards`, before the
+    // crossing gives up.
+    std::uint32_t attempts{2};
+    float gainYards{100.f};
+    // How long a dungeon given up on stays refused to the family. Long enough
+    // that the family's own drives get a real evening's share, short enough
+    // that a guard who moved or a route fixed by a deploy is tried again.
+    std::int64_t cooloffSeconds{2 * 60 * 60};
+};
+
+// One leader's record. World thread only, lost on a restart, which costs one
+// more attempt.
+struct CrossingAttempts
+{
+    // What the record is about: the dungeon and the berth aim. A different
+    // either one starts a fresh record (the cool-off stays with the dungeon).
+    std::string dungeon;
+    std::string berth;
+    // Closed attempts in a row that gained less than `gainYards`.
+    std::uint32_t failed{0};
+    // The nearest the leader has been to the berth, and the reading the next
+    // gain is measured from. Below zero when nothing has been read.
+    float best{-1.f};
+    float reference{-1.f};
+    std::int64_t firstSeen{0};
+    // An attempt is under way: the crossing claimed the berth aim and nothing
+    // has ended it yet. A second end of the same attempt (the backoff, then
+    // the backstop) is one failure, not two.
+    bool open{false};
+    // The dungeon is refused until this moment; zero when it is not.
+    std::int64_t refusedUntil{0};
+};
+
+// The crossing is about to claim `berth` for `dungeon`, with the leader
+// `yards` from it. Starts a fresh record for a different dungeon or berth,
+// opens an attempt, and keeps the nearest reading.
+void OpenCrossingAttempt(CrossingAttempts& record, std::string const& dungeon,
+                         std::string const& berth, float yards, std::int64_t now);
+
+enum class CrossingAttemptVerdict : std::uint8_t
+{
+    // Nothing to do: no attempt was under way, or one ended having gained
+    // enough, or not enough of them have failed yet.
+    Continue,
+    // Hand the dungeon back for the cool-off.
+    GiveUp,
+};
+
+struct CrossingAttemptReading
+{
+    CrossingAttemptVerdict verdict{CrossingAttemptVerdict::Continue};
+    // Whether this end closed an attempt (false when none was open).
+    bool counted{false};
+    // Failed attempts in a row, including this one.
+    std::uint32_t attempts{0};
+    // How much nearer the berth the attempts since the count last started got.
+    float gained{0.f};
+    std::int64_t cooloffSeconds{0};
+    // Seconds since the record started, for the line that says it gave up.
+    std::int64_t seconds{0};
+};
+
+// The attempt under way ended (for one of the CrossingAttemptEnd reasons). On
+// GiveUp the record is refused until now + cooloffSeconds and its count starts
+// again, so the attempt after the cool-off is the first of a new two.
+CrossingAttemptReading EndCrossingAttempt(CrossingAttempts& record, std::int64_t now,
+                                          CrossingAttemptLimits const& limits);
+
+// Is `dungeon` handed back at `now`? Seconds of cool-off left, or 0.
+std::int64_t CrossingHandedBack(CrossingAttempts const& record, std::string const& dungeon,
+                                std::int64_t now);
+
+// May the crossing claim its berth aim on this poll? Not while the travel
+// drive refuses that aim: a claim would only be released again by the
+// refusal, every poll, for the whole of it. `sinceRefused` is seconds since
+// the aim was refused, below zero when it never was.
+enum class CrossingBerthClaim : std::uint8_t
+{
+    Claim,
+    StandBack,
+};
+CrossingBerthClaim ReadCrossingBerthClaim(std::int64_t sinceRefused,
+                                          std::int64_t refusalSeconds);
+
+// The reason the travel drive's no-progress backoff refuses an aim with, and
+// how the crossing's stand-back reads a refusal's reason: that backoff is
+// NoProgressBackoff, anything else (deaths) is Refused.
+constexpr char const* NoProgressBackoffReason =
+    "repeated no-progress releases; bounded backoff is active";
+CrossingAttemptEnd CrossingRefusalEnd(std::string const& reason);
+
+// The two reasons the travel drive releases an errand it gave up on, written
+// once so the release and the crossing's reading of it cannot drift apart.
+constexpr char const* TravelBackstopReleaseReason =
+    "the travel drive (travel backstop: no nearer for minutes)";
+constexpr char const* TravelGroundGiveUpReleaseReason =
+    "the travel drive (every bearing refused, ground give-up)";
+// Is this errand-end reason one the travel drive gave up with, which counts as
+// a failed crossing attempt? Exact match: any other end is not one.
+bool IsTravelGiveUpRelease(std::string const& why);
+
 // ------------------------------------------- is the transport docked (#303) --
 //
 // A MotionTransport stands still at a stop frame for exactly the interval
@@ -11117,7 +11317,9 @@ enum class HearthVerb
     // home, had no stone and no way to buy one, and no walk can climb 266 yards.
     // Same spell, cast time, cooldown, interrupts and destination as the item
     // (the character's own bind point); refused for a character that carries a
-    // stone, which must use it.
+    // stone, which must use it. PARSED BUT REFUSED by the executor since
+    // 2026-10-12 (natural only): a stone's spell without the stone is not
+    // something a player can cast.
     Recall,
 };
 
@@ -11428,6 +11630,10 @@ struct RoutePlan
     // one where it was not enough, and the difference between this and the extra
     // yards the way round would have cost is exactly how short it fell.
     float detourBudgetYards{0.f};
+    // How far the entry node stands above or below the character (#925), so
+    // the route line can name it. Negative when the character's height was
+    // not given or nothing was planned.
+    float entryHeightGapYards{-1.f};
 };
 
 struct RoutePlanLimits
@@ -11480,6 +11686,30 @@ struct RoutePlanLimits
     // node here. A refused node is only refused as the ENTRY: a route may still
     // pass through it, since a recorded path leaves it from where it stands.
     std::vector<std::uint32_t> refusedEntries;
+    // THE WAY IN IS ON THE CHARACTER'S OWN FLOOR (#925). Plane distance cannot
+    // tell a floor from the roof above it: a leader in the Stormwind Wizard's
+    // Sanctum at z 29.6 was given node 1689, the Mage Tower roof 37 yards
+    // across and 119 yards up, reachable only through an areatrigger, while
+    // node 1690 stood on his own floor 47 yards off with a walk link to the
+    // street. He never moved. When `fromZKnown` is set, a node within
+    // `entryNodeYards` whose height differs from `fromZ` by more than
+    // `maxEntryRiseYards` is passed over as the way in, but only while some
+    // node inside that gap is also within `entryNodeYards`. When none is, the
+    // nearest node is taken as before, so a character on a hillside with
+    // nothing level near it still gets a route.
+    //
+    // LEFT UNKNOWN, NOTHING CHANGES. `fromZKnown` defaults to false, and every
+    // caller that does not set it gets the plan this planner has always made.
+    //
+    // WHY FORTY. Over the shipped survey, 2720 walk links join two nodes less
+    // than 100 yards apart on the plane; 122 of them climb more than 40 yards
+    // and 312 climb more than 20. Forty leaves nearly every real slope alone
+    // and is a third of the gap that stranded the Sanctum leader. A smaller
+    // step, like the 9 yards of the Orgrimmar barracks exit, is still the
+    // navmesh entry check's question and not this one.
+    bool fromZKnown{false};
+    float fromZ{0.f};
+    float maxEntryRiseYards{40.f};
 };
 
 // THE NODE SEQUENCE, AND THE ONE CHOICE THAT MAKES IT WORK.
@@ -16318,6 +16548,12 @@ struct RaidDoor
     // "moltencore" for map 409). HOLD checks every raid member carries it
     // (#640).
     char const* fightStrategy;
+    // The meeting stones a straggler is summoned at during ASSEMBLE (#922), by
+    // gameobject entry, and the place they stand in for the log. Entries only:
+    // where each stands and its minimum level are read off the core's own
+    // spawn and template tables at run time. 0 is no stone.
+    unsigned meetingStones[2];
+    char const* stonesName;
 };
 
 // The door for `keyword`, or nullptr. Exact, lower case: the queue writes the
@@ -16472,11 +16708,42 @@ struct RaidRunStep
     bool standDown{false};    // leaving CLEAR: tell the brain to let go, once
     bool releaseDead{false};  // RECOVER: release every raid member lying dead inside
     bool runBack{false};      // RECOVER: walk every ghost of the raid to the door
+    // ASSEMBLE, after the walk: summon one straggler at a meeting stone (#922)
+    bool summonStragglers{false};
     char const* why{""};
 };
 
 // Is the raid wiped, by RAID_WIPE_PCT? See that constant.
 bool RaidWiped(RaidRunFacts const& facts);
+
+// A raid seat is due for repair when its lowest wearable item is below the
+// configured floor. An item with no maximum durability is not part of the
+// measurement; callers pass the already-computed lowest percentage.
+bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct);
+
+enum class RaidPullRepairAction { Ignore, Hold, Resume, TimedOut };
+
+// The Molten Core repair gate is only before Majordomo Executus and Ragnaros.
+RaidPullRepairAction RaidPullRepairDecision(unsigned bossesDone, bool anySeatBelowFloor,
+                                            long heldSeconds, long maximumHoldSeconds);
+
+// The same gate fed with each readable seat's lowest durability percentage, as
+// the run sees them: any seat under the floor holds, and the time limit ends
+// the hold with TimedOut (not Resume) so the run can log which one it was.
+RaidPullRepairAction RaidPullRepairForSeats(unsigned bossesDone,
+                                            std::vector<unsigned> const& seatLowestPcts,
+                                            unsigned floorPct, long heldSeconds,
+                                            long maximumHoldSeconds);
+
+// What the run does for one seat during the repair hold before Majordomo or
+// Ragnaros: a seat at or above the floor is Ready; once the hold has timed out
+// a seat under it is left as TimedOut; a seat already sent through the repair
+// verb is not charged twice (Attempted); otherwise it Walks to a repairer, or
+// Repairs when one is in reach. Every step but Ready and TimedOut holds the pull.
+enum class RaidPullSeatStep { Ready, TimedOut, Attempted, Walk, Repair };
+RaidPullSeatStep RaidPullSeatRepairStep(unsigned lowestDurabilityPct, unsigned floorPct,
+                                        bool holdTimedOut, bool alreadyAttempted,
+                                        bool repairerInReach);
 
 // One poll of the raid run.
 //
@@ -16513,6 +16780,92 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts);
 // coordinator's measured lesson, kept here.
 std::vector<std::string> RaidKnockOrder(std::vector<std::string> const& inDoor,
                                         std::string const& head, bool headMayCross);
+
+// -- stragglers summoned at the mountain's meeting stones (#922) -------------
+//
+// A FULL RAID HAS NO SLOT FOR A WARLOCK, and Ritual of Summoning only moves a
+// member of the caster's own raid. The Blackrock Mountain meeting stones need
+// neither: GameObject::Use's MEETINGSTONE case lets any raid member standing at
+// the stone summon any other raid member, and refuses only when either of the
+// two is below the stone's minimum level (179587 reads 55 and 179586 reads 48
+// on the dev realm; the adapter reads the template, not these numbers). The
+// seats are already one raid (FormRaidFromSeats) and kind='summon' already
+// drives the whole chain: the walk of both clickers onto the stone, the
+// portal, the settle, the accept and the read-back.
+//
+// AFTER THE WALK. A seat is summoned only once ASSEMBLE has held this long
+// with the head at the door: the raid following him has had its chance to
+// walk in, and what is still away is a seat on a boat or on another continent.
+constexpr long RAID_STONE_SUMMON_AFTER_SECONDS = 5 * 60;
+// A straggler is summoned at most this many times in one order, for the reason
+// the dungeon rung keeps the same number: a summon that failed twice for one
+// character will not work because it was asked a third time.
+constexpr unsigned RAID_STONE_SUMMON_TRIES = 2;
+// How long one summon row may stay unfinished before the run stops waiting for
+// it. The verb's own ceilings add up to under a minute; the rest is the queue.
+constexpr long RAID_STONE_SUMMON_ROW_CEILING_SECONDS = 150;
+// A seat within this many yards of a stone, on its map and outside any
+// instance, can click it: inside the forty yards kind='summon' walks a clicker
+// the last of (#355). The dungeon rung's own reach.
+constexpr float RAID_STONE_REACH_YARDS = 35.f;
+
+// One stone as the world has it: its entry and the minimum level its template
+// carries, which the core checks of both the clicker and the one summoned.
+struct RaidStone
+{
+    unsigned entry{0};
+    unsigned minLevel{0};
+};
+
+// One raid member as the summon reads it.
+struct RaidStoneSeat
+{
+    std::string name;
+    // The head is never chosen: he is the operator's streaming character and
+    // the run owns his walk, so neither the verb's hold nor its walk may take
+    // him.
+    bool head{false};
+    bool inWorld{false};
+    bool alive{false};
+    bool inCombat{false};
+    // In any instance. A seat inside a dungeon or the raid is not pulled out.
+    bool inInstance{false};
+    // Something kind='summon' can move: a character with the bot AI that
+    // answers the far teleport.
+    bool summonable{false};
+    // Within RAID_ASSEMBLE_YARDS of the staging point on the door's map.
+    bool assembled{false};
+    // The index into the stones of the stone this seat stands within
+    // RAID_STONE_REACH_YARDS of, or -1.
+    int atStone{-1};
+    unsigned level{0};
+    // Summons already tried for this seat in this order.
+    unsigned tries{0};
+};
+
+struct RaidStoneSummon
+{
+    bool summon{false};
+    std::string straggler;
+    // Clicks the stone with the straggler selected; the core checks his level.
+    std::string clicker;
+    // Clicks the portal, the ritual's second participant.
+    std::string helper;
+    // Index into the stones, or -1.
+    int stone{-1};
+    std::string why;
+};
+
+// Who is summoned, by whom, at which stone. Stragglers in the order given,
+// stones in the order given, and the first straggler with a stone whose
+// minimum he meets and two seats standing at it - one who meets the minimum
+// to click it, and another to click the portal - is the answer.
+//
+// A SEAT BELOW EVERY STONE'S MINIMUM IS NOT SUMMONED. The core would refuse
+// the click, so the seat keeps walking with the raid.
+RaidStoneSummon ChooseRaidStoneSummon(std::vector<RaidStoneSeat> const& seats,
+                                      std::vector<RaidStone> const& stones,
+                                      unsigned triesPerSeat = RAID_STONE_SUMMON_TRIES);
 
 // May the dungeon brain be armed for a character on this map?
 //
@@ -19180,6 +19533,8 @@ enum class GhostRecoveryReason : uint8_t
     WaitedOut,        // it waited and the corpse never cleared
     StillSick,        // it still carries Resurrection Sickness; the corpse run
                       // does not stack another
+    SickButThreatened // it still carries Resurrection Sickness, but hostiles
+                      // near the corpse make reclaiming it unsafe
 };
 
 struct GhostRecoveryFacts
@@ -19250,13 +19605,15 @@ struct GhostRecoveryVerdict
 //   1. The spirit healer was already chosen for this death: keep it. A ghost
 //      halfway to the healer is not turned round because a patrol wandered off.
 //   2. It has died `repeatDeaths` times here inside the window: spirit healer.
-//   2a. It still carries Resurrection Sickness and the corpse run is possible:
-//      corpse run, so the sickness does not stack (mod-overseer#747). This
-//      sits BELOW rule 2: a second death at one spot is the death loop, and
-//      walking back into it costs more than a second dose of sickness. It
-//      also ends when the debuff ends, not a fixed 600 seconds after the
-//      healer. On wow-dev 2026-10-04, with it above rule 2 and on a fixed
-//      window, 101 of 311 repeat deaths in 49 minutes were corpse runs it
+//   2a. It still carries Resurrection Sickness, the corpse run is possible,
+//      and the corpse is clear of hostiles: corpse run, so the sickness does
+//      not stack (mod-overseer#747, #958). When the corpse fails the danger
+//      test (live threats or outlevelled), it waits or takes the healer as
+//      in rules 3 and 4. This sits BELOW rule 2: a second death at one spot is
+//      the death loop, and walking back into it costs more than a second dose
+//      of sickness. It also ends when the debuff ends, not a fixed 600 seconds
+//      after the healer. On wow-dev 2026-10-04, with it above rule 2 and on a
+//      fixed window, 101 of 311 repeat deaths in 49 minutes were corpse runs it
 //      forced, 77 of them after the sickness had worn off
 //      (wow-overseer#598).
 //   3. A hostile at least `levelGap` levels above it is near the corpse:
@@ -19312,6 +19669,52 @@ struct CreatureKillMark
 // place or an old death is never read as this one's.
 uint32_t KillerAtCorpse(CreatureKillMark const& mark, uint32_t mapId, float corpseX,
                         float corpseY, float radius, int64_t now, int64_t maxAgeSeconds);
+
+// ONE DANGER TEST FOR A CORPSE AND A GRAVEYARD (mod-overseer#933). The
+// graveyard safety test counted hostile spawns ABOVE the member's level, while
+// the repeat-death line near a corpse counted hostiles AT or above it, or of its
+// killer's kind, and its own repeat deaths. On wow-dev 2026-10-12, 15 Horde
+// guild members at levels 26 and 27 died 355 times in 24 hours to Hillsbrad
+// Footmen (level 26) within 25 yards of the Hillsbrad Fields graveyard: for a
+// level 26 ghost no footman is above it, so the graveyard passed as safe and the
+// repeat-death rung sent the ghost to the healer there. Both now ask this one
+// function, so the two tests cannot drift apart again.
+//
+// `hostiles` are the creatures hostile to the member and able to fight it near
+// the place (live grid or spawn table, the caller's choice). One counts when
+// CorpseThreat counts it. `deathsNear` is the member's own deaths within the
+// repeat radius of the place inside the repeat window.
+struct PlaceHostile
+{
+    uint32_t level{0};
+    uint32_t entry{0};
+};
+
+struct PlaceDangerFacts
+{
+    uint32_t memberLevel{0};
+    uint32_t killerEntry{0};  // the kind that killed it, 0 when none is known
+    std::vector<PlaceHostile> hostiles;
+    unsigned deathsNear{0};
+    unsigned repeatDeaths{2};  // the ghost recovery's own death loop count
+};
+
+enum class PlaceDangerReason : uint8_t
+{
+    Safe,
+    Hostiles,      // a hostile at or above its level, or of its killer's kind
+    RepeatDeaths,  // it has died here `repeatDeaths` times inside the window
+};
+
+struct PlaceDanger
+{
+    PlaceDangerReason reason{PlaceDangerReason::Safe};
+    unsigned threats{0};        // hostiles CorpseThreat counts
+    uint32_t strongest{0};      // the highest level among them, 0 for none
+    std::size_t strongestAt{0}; // its index in `hostiles`, meaningful when threats
+};
+
+PlaceDanger JudgePlaceDanger(PlaceDangerFacts const& facts);
 
 // A GUILD MEMBER THAT MAY NOT USE THE LADDER STILL LEAVES A DEATH LOOP. When the
 // ghost decision answers Ladder (the spirit healer's graveyard failed its safety
@@ -20653,6 +21056,52 @@ GuildRunVerdict GuildRunNext(GuildRunPoll const& poll);
 // "running", "cleared", "wiped", "abandoned", "timed out".
 char const* GuildRunVerdictWord(GuildRunVerdict verdict);
 
+// WHERE A GUILD RUN STALLED, IN WORDS. A run row used to say only "inside for
+// 7200s", and the worldserver log holds minutes, so an older stall was lost.
+// These build the words the queued poll log, the abandoned and timed-out `why`
+// and the run's heartbeat carry. GuildRunVerdictWord is unchanged.
+//
+// Why one seat is not where the run needs it, most specific first.
+enum class GuildSeatState : std::uint8_t
+{
+    Present,     // inside the run's copy, alive and not in combat
+    NotInWorld,
+    Dead,
+    InCombat,
+    OtherMap,    // in the world, not in the dungeon's copy
+};
+
+// "present", "not in world", "dead", "in combat", "other map".
+char const* GuildSeatStateWord(GuildSeatState state);
+
+// "tank", "healer", "dps".
+char const* GuildSeatWord(GuildSeat seat);
+
+struct GuildRunSeatReport
+{
+    std::string name;
+    GuildSeat seat{GuildSeat::Damage};
+    GuildSeatState state{GuildSeatState::Present};
+};
+
+// The seats not Present, as "'X' (healer) never came inside: in combat; 'Y'
+// (dps) never came inside: dead"; empty when every seat is Present.
+std::string GuildRunAbsentWords(std::vector<GuildRunSeatReport> const& seats);
+
+// "next Gelihast, last kill 95 min ago". An empty `nextBoss` leaves the first
+// half out ("next" is unknown, not none); a run with no kill yet says "no boss
+// killed yet". `secondsSinceKill` is read only when `killed` is true.
+std::string GuildRunStallWords(std::string const& nextBoss, bool killed,
+                               unsigned secondsSinceKill);
+
+// The abandoned run's `why`: the group is gone, nobody was inside, or the
+// tank and healer were not both alive inside, each followed by `absent`
+// (GuildRunAbsentWords) when it names someone.
+std::string GuildRunAbandonedWhy(GuildRunPoll const& poll, std::string const& absent);
+
+// "inside for 7200s; next Gelihast, last kill 95 min ago".
+std::string GuildRunTimedOutWhy(unsigned secondsInside, std::string const& stall);
+
 // THE ENCOUNTERS A GUILD RUN MUST CREDIT BEFORE IT IS CLEARED. `mapMask` is
 // every bit the map's DungeonEncounter.dbc rows credit; `brainMask` the bits
 // mod-dungeon-clear's roster is armed for in this copy, 0 when unread. As
@@ -21098,33 +21547,6 @@ bool GuildRunStrayExpired(std::int64_t expiry, std::int64_t now);
 constexpr unsigned RUN_CLOSE_STARTUP_HOLD_SECONDS = 10 * 60;
 bool RunCloseHeldAfterStartup(std::int64_t secondsSinceStart);
 
-// ------------------------- what a level-up hands the roster (the operator) --
-//
-// TrainRoster runs on every level change of a roster character. With factory
-// grants ON (the default, and the module's behaviour before this switch) it
-// hands out, with no trainer and no gold:
-//
-//   - skills: every weapon skill of the class at level x 5, and the riding
-//     ranks at 20, 40 and 60 (PlayerbotFactory::InitSkills);
-//   - class spells: the class's spells (InitClassSpells);
-//   - trainer spells: every rank any trainer in the world would teach
-//     (InitAvailableSpells), with the first rank of a primary profession held
-//     shut.
-//
-// Overseer.Train.Factory = 0 turns all three off. The family then
-// learns only at a real trainer and pays for it (the training stop walks it
-// there), and gains weapon skill by using the weapon. Talent points are still
-// spent, because a character earns them by levelling.
-struct RosterTraining
-{
-    bool skills{false};
-    bool classSpells{false};
-    bool trainerSpells{false};
-    bool talents{false};
-};
-
-RosterTraining RosterTrainingFor(bool factoryGrants);
-
 // ------------------------------------------------------------------ keep --
 //
 // AN ITEM A CHARACTER MUST KEEP, whatever else wants it (overseer_keep). The
@@ -21301,7 +21723,7 @@ struct NaturalizeFacts
     unsigned openBids{0};            // auctions it holds the high bid on
     unsigned codMail{0};             // COD mail waiting in its inbox
     bool playerbotsGateCovers{false};// AiPlayerbot.NaturalGuild names its guild
-    bool trainFactoryOn{true};       // Overseer.Train.Factory
+    bool trainFactoryOn{true};       // retired Overseer.Train.Factory; the adapter says false
     unsigned partsAlreadyDone{0};    // ledger bits already recorded for it
     unsigned level{0};               // its level now
 };
@@ -21868,6 +22290,17 @@ bool CommandSourceIsOperator(std::string const& source);
 // command may run.
 std::string LeaderCommandRefusal(bool isFamilyLeader, std::string const& source,
                                  std::string const& command);
+
+// NATURAL ONLY (the operator, 2026-10-12): a member gains nothing it could not
+// earn. A bridge row with no kind of its own is handed to mod-playerbots as a
+// whisper, verbatim, and several of its verbs hand a bot things out of thin
+// air: `maintenance` (bags, ammo, food, reagents, potions, spells, mounts,
+// glyphs, enchants), `autogear` (gear created for its level), `cheat` (gold,
+// taxi, health, mana and cooldown cheats), `summon` (a teleport to whoever
+// asked), and the factory's `init` and `levelup`. Refused for every source,
+// the operator's own included, because no member may have them at all.
+// Returns the refusal reason, empty when the command may run.
+std::string GrantingBotCommandRefusal(std::string const& command);
 
 // ------------------------------------------------------------------------
 // AN ERRAND IS STUCK ONLY WHEN IT HAS STOPPED GETTING ANYWHERE FOR A WINDOW.
@@ -22984,6 +23417,22 @@ bool RowLiftsDeckSettle(std::string const& kind);
 // May a walk row take this hold over rather than be refused by it, the way it
 // replaces its own linger? True for the settle on the deck.
 bool HoldYieldsToWalk(std::string const& holdVerb);
+
+// WHICH ROWS A LOGOUT MARKS OFFLINE. The core's logout clears the online flag
+// for every character on the leaving character's ACCOUNT. Under playerbots
+// many characters on one account are in the world at once, so one bot's logout
+// marked always-online guild members offline until their next save, 15 minutes
+// later (wow-overseer#874: 42 characters in the world read online 0 on the dev
+// realm). A logout with account-mates still in the world clears only its own
+// character; a lone session keeps the core's account-wide statement.
+// `otherInWorldOnAccount` counts the in-world players on the same account,
+// the leaving one excluded.
+enum class LogoutScope
+{
+    Account,
+    CharacterOnly,
+};
+LogoutScope LogoutOfflineScope(uint32_t otherInWorldOnAccount);
 
 }  // namespace OverseerDecisions
 

@@ -16,6 +16,7 @@
 
 #include <cstdio>
 #include <string>
+#include <vector>
 
 using OverseerDecisions::FINDER_ROLE_DAMAGE;
 using OverseerDecisions::FINDER_ROLE_HEALER;
@@ -43,6 +44,12 @@ using OverseerDecisions::GuildRunStrayStep;
 using OverseerDecisions::GuildRunPoll;
 using OverseerDecisions::GuildRunVerdict;
 using OverseerDecisions::GuildRunVerdictWord;
+using OverseerDecisions::GuildRunAbandonedWhy;
+using OverseerDecisions::GuildRunAbsentWords;
+using OverseerDecisions::GuildRunSeatReport;
+using OverseerDecisions::GuildRunStallWords;
+using OverseerDecisions::GuildRunTimedOutWhy;
+using OverseerDecisions::GuildSeatState;
 using OverseerDecisions::GuildSeat;
 using OverseerDecisions::GuildSeatRoleMask;
 using OverseerDecisions::IsGuildFinderRow;
@@ -425,8 +432,59 @@ void OnlyAPugMayComeFromOutsideTheGuildAndNeverFromTheOtherSide()
           GuildFinderKinOf(lone) == GuildFinderKinship::AnchorInNoGuild);
 }
 
+bool Has(std::string const& hay, char const* needle)
+{
+    return hay.find(needle) != std::string::npos;
+}
+
+void AnEndedRunSaysWhoWasMissingAndWhereItStalled()
+{
+    std::vector<GuildRunSeatReport> seats{
+        {"Tanka", GuildSeat::Tank, GuildSeatState::Present},
+        {"Heala", GuildSeat::Healer, GuildSeatState::InCombat},
+        {"Dpsa", GuildSeat::Damage, GuildSeatState::Dead},
+        {"Dpsb", GuildSeat::Damage, GuildSeatState::OtherMap},
+        {"Dpsc", GuildSeat::Damage, GuildSeatState::NotInWorld}};
+    std::string const absent = GuildRunAbsentWords(seats);
+    Check("the healer in combat is named with its state",
+          Has(absent, "'Heala' (healer) never came inside: in combat"));
+    Check("a dead dps, one on another map and one not in the world are named",
+          Has(absent, "'Dpsa' (dps) never came inside: dead") &&
+              Has(absent, "'Dpsb' (dps) never came inside: other map") &&
+              Has(absent, "'Dpsc' (dps) never came inside: not in world"));
+    Check("the present seat is not named", !Has(absent, "Tanka"));
+    Check("nobody absent says nothing",
+          GuildRunAbsentWords({{"Tanka", GuildSeat::Tank, GuildSeatState::Present}}).empty());
+
+    GuildRunPoll roles = Inside(4, 4);
+    roles.healerAliveInside = false;
+    roles.secondsWithoutRoles = 300;
+    std::string const abandoned = GuildRunAbandonedWhy(roles, absent);
+    Check("the abandoned why keeps the role words and names the absent",
+          Has(abandoned, "not both alive inside for 300s") &&
+              Has(abandoned, "'Heala' (healer) never came inside: in combat"));
+    GuildRunPoll gone = Inside(0, 0);
+    gone.secondsEmpty = 90;
+    Check("an empty run keeps its words",
+          Has(GuildRunAbandonedWhy(gone, ""), "nobody has been inside for 90s") &&
+              GuildRunAbandonedWhy(gone, "") == "nobody has been inside for 90s");
+
+    Check("the stall names the next boss and the minutes since the last kill",
+          GuildRunStallWords("Gelihast", true, 95 * 60 + 20) == "next Gelihast, last kill 95 min ago");
+    Check("no kill yet says so", GuildRunStallWords("Gelihast", false, 0) ==
+                                     "next Gelihast, no boss killed yet");
+    Check("an unnamed next boss is left out",
+          GuildRunStallWords("", true, 60) == "last kill 1 min ago");
+    Check("the timed-out why",
+          GuildRunTimedOutWhy(7200, GuildRunStallWords("Gelihast", true, 95 * 60)) ==
+              "inside for 7200s; next Gelihast, last kill 95 min ago");
+    Check("the timed-out why with no stall words is the old one",
+          GuildRunTimedOutWhy(7200, "") == "inside for 7200s");
+}
+
 int main()
 {
+    AnEndedRunSaysWhoWasMissingAndWhereItStalled();
     TheRowIsRoutedOnItsFirstWord();
     AWellFormedRowNamesTheDoorAndTheFourOthers();
     AMalformedRowIsRefusedWithItsGrammar();
