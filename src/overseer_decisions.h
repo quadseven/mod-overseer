@@ -4280,6 +4280,62 @@ std::string TravelReleaseGate(TravelReleaseGateFacts const& facts);
 // ends? A newer or unrelated aim must remain untouched.
 bool RunAimMayBeReleased(std::string const& current, std::string const& recordedRunAim);
 
+// ------------- the poison-aim circuit breaker (#824) -------------------------
+//
+// A FOREIGN `at:` AIM THE TRAVEL DRIVE CAN NEVER RESOLVE LOOPS FOR EVER. The
+// drive refuses an `at:` aim whose map is not the character's own (and a
+// malformed one, and one outside the classic world) and releases it; the
+// release gate then skips the column write, because an unclaimed `at:` aim is
+// foreign and IsForeignTravelAim protects it. The column keeps the aim, the
+// next poll reads it again, refuses it again and skips the write again - and
+// while it stands, every claim another drive makes is refused as foreign too.
+// Measured: a leader held `at:36:...` (a point inside an instance) from outside
+// that instance and was refused every poll with nothing else able to aim him.
+//
+// THE FENCE STAYS; ONLY A LOOP THAT PROVES ITSELF IS BROKEN. Each refusal of
+// the same unclaimed `at:` aim, from the same map, is counted. When the count
+// reaches `refusals` AND the first of them is at least `minSeconds` old, the
+// breaker trips and the caller clears that exact aim (compare-and-swap on the
+// column, so a newer aim is never erased). Anything that says the loop is not
+// a loop starts the count again:
+//   - a different aim in the column (the writer moved on);
+//   - the character standing on a different map from the last refusal (a
+//     crossing is under way, and a cross-map aim may yet be reached);
+//   - a gap longer than `gapSeconds` since the last refusal (something else
+//     was walking the character in between).
+// An aim this book claimed, or one that is not `at:`, never counts: the
+// release already clears a claimed aim (#822), and counter keywords and
+// `trigger:` aims are outside this breaker's argument.
+struct PoisonAimLimits
+{
+    uint32_t refusals{20};
+    int64_t minSeconds{300};
+    int64_t gapSeconds{120};
+};
+
+// Twenty refusals over at least five minutes: at the travel drive's fifteen
+// second poll that is five minutes of an unbroken loop, long enough that a
+// cross-map aim waiting on a crossing has had every chance to change map.
+constexpr PoisonAimLimits POISON_AIM_LIMITS{};
+
+// One character's run of identical refusals. Zero-initialised means "none".
+struct PoisonAimState
+{
+    std::string aim;
+    uint32_t mapId{0};
+    uint32_t refusals{0};
+    int64_t firstAt{0};
+    int64_t lastAt{0};
+};
+
+// Count one refusal of `aim` by a character standing on `mapId` at `now`.
+// `claimed` is whether the travel book wrote the aim itself. True means the
+// breaker has tripped: the caller clears the aim, and `state` is reset so the
+// next aim starts from nothing.
+bool PoisonAimStep(PoisonAimState& state, std::string const& aim, bool claimed,
+                   uint32_t mapId, int64_t now,
+                   PoisonAimLimits const& limits = POISON_AIM_LIMITS);
+
 // ------------- a point aim left over from before a restart (#658) ------------
 //
 // TravelAimBook remembers which aims it wrote in memory only. After a restart
