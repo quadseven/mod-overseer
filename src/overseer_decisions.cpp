@@ -2946,9 +2946,28 @@ uint32_t EventGatedEncounterMask(uint32_t mapId)
     }
 }
 
+uint32_t RaidWingEncounterMask(uint32_t mapId)
+{
+    // Bits from DungeonEncounter.dbc, normal difficulty, read off the dev
+    // realm's client data on 2026-10-18.
+    switch (mapId)
+    {
+        case 229:  // Blackrock Spire. Bits 0 to 8 are the Lower Spire, Highlord
+                   // Omokk to Overlord Wyrmthalak, the boss the finder row for
+                   // the Lower Spire (LFGDungeons 32) finishes on. Bits 9 to 13
+                   // are the Upper Spire, Pyroguard Emberseer to General
+                   // Drakkisath, which the client lists as a raid
+                   // (LFGDungeons 44, type 2) and no portal row runs (#580).
+            return 0x1Fu << 9;
+        default:
+            return 0;
+    }
+}
+
 uint32_t DungeonRunExpectedMask(uint32_t mapId, uint32_t mapMask, uint32_t wingMask)
 {
-    uint32_t const required = mapMask & ~EventGatedEncounterMask(mapId);
+    uint32_t const required =
+        mapMask & ~EventGatedEncounterMask(mapId) & ~RaidWingEncounterMask(mapId);
     if (!DungeonMapHasIndependentWings(mapId))
         return required;
     return required & wingMask;

@@ -3694,6 +3694,15 @@ DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completed
 // instance until the clearing watchdog ends it 'stalled'.
 uint32_t EventGatedEncounterMask(uint32_t mapId);
 
+// The encounter bits of a raid wing that shares a map with a five-player door
+// and is reached from it inside the instance: Upper Blackrock Spire, behind the
+// Lower Spire's door on map 229 (#580). No portal row runs that wing, so a run
+// through the shared door is the five-player dungeon and is complete when that
+// dungeon's bosses are down. Taken out of every expectation the same way as
+// EventGatedEncounterMask, so a Lower Spire run is not held open by five raid
+// bosses it was never sent for.
+uint32_t RaidWingEncounterMask(uint32_t mapId);
+
 uint32_t DungeonRunExpectedMask(uint32_t mapId, uint32_t mapMask,
                                 uint32_t wingMask);
 

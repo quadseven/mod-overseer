@@ -30808,8 +30808,9 @@ private:
             // wings, every Dire Maul door and Scholomance waited here for
             // box-trigger support and are now at the end of the table (#577).
             // Upper Blackrock Spire shares every trigger with the Lower Spire
-            // and is split from it by a door inside the instance, which a row
-            // of two areatriggers cannot name.
+            // and is a raid wing behind an open door inside the instance; it
+            // is not supported, and the `lower-blackrock-spire` row says why
+            // (#580).
 
             // BLACKFATHOM DEEPS, on map 1 at the Zoram Strand. The door stands
             // at z -23 in a sunken temple, and the last stretch down to it is
@@ -30940,11 +30941,22 @@ private:
             // different ledge, (-7558.39, -1309.43, 248.454); this row walks
             // out by 1470 only.
             //
-            // AND THIS ROW IS NOT UPPER BLACKROCK SPIRE. Both wings share
-            // trigger 1468, trigger 1470 and map 229. The Upper Spire starts at
-            // the Dragonspine Door, gameobject 164725, inside map 229, which
-            // opens for a party carrying the Seal of Ascension. A row of two
-            // areatriggers cannot name that door, so there is no Upper row.
+            // AND THIS ROW IS NOT UPPER BLACKROCK SPIRE, WHICH IS NOT
+            // SUPPORTED (#580). Both wings share trigger 1468, trigger 1470 and
+            // map 229, so a row keyed on 1468 would be this one again. The
+            // Upper Spire starts at the Dragonspine Door, gameobject 164725 at
+            // (126.879, -319.109, 70.935) inside map 229. On this core the door
+            // asks for nothing: its spawn is open (gameobject.state 0, the
+            // template's startOpen 1), its lock is 0, it has no AIName or
+            // ScriptName, the instance script never names it, and no condition
+            // reads the Seal of Ascension (item 12344). So the Seal is not a
+            // prerequisite here and a Lower Spire party can walk on. It is
+            // still not this row's run: the client lists the Upper Spire as a
+            // raid (LFGDungeons 44, type 2; the Lower Spire is 32, type 1, and
+            // finishes on Overlord Wyrmthalak), and this table is the five
+            // player doors (#548). A run through 1468 is complete when the
+            // Lower Spire's nine bosses are down; the five Upper bosses are
+            // taken out of its expectation by RaidWingEncounterMask.
             //
             // areatrigger.sql: (1468,0,-7518.19,-1239.13,287.243,10,0,0,0,0)
             // areatrigger_teleport.sql: (1468,'Blackrock Spire - Searing Gorge Instance (Inside)',229,78.5083,-225.044,49.839,5.1)
