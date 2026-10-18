@@ -6795,6 +6795,7 @@ public:
         refusal.reason = reason;
         refusal.at = std::time(nullptr);
         refusal.said = 0;
+        KeepRefusal(name);
     }
 
     // Record one more lethal release of `target` for `name` and return the
@@ -6810,7 +6811,76 @@ public:
         strike.count = again ? strike.count + 1 : 1;
         strike.target = target;
         strike.at = now;
-        return strike.count;
+        uint32_t const count = strike.count;
+        KeepRefusal(name);
+        return count;
+    }
+
+    // THE REFUSAL MEMORY OUTLIVES A ROLL (wow-overseer#1193). `_refused` and
+    // `_lethal` used to die with the process, so an aim still in the column, or
+    // one the bridge wrote again a minute later, was walked from zero strikes:
+    // a target the drive had called off because it was killing the character
+    // was walked straight back to. Each Refuse and NoteLethal now writes the
+    // character's one row in overseer_travel_refusal, and RestoreRefusals reads
+    // back what OverseerDecisions::RestoreTravelRefusal says is still live.
+    //
+    // SYNCHRONOUS ON PURPOSE, like ForgetLeftover. A release writes the strike
+    // and then the refusal on the same poll, and two queued writes of the same
+    // row may land in either order; the later one has to win. These are rare
+    // events (a release, a refusal), not a per-poll write.
+    //
+    // Absent table (2026_10_18_00_overseer_travel_refusal.sql not applied): the
+    // book keeps its memory in the process only, as before, and says so once
+    // at start-up. See OverseerWorldScript::OnStartup.
+    std::size_t RestoreRefusals(bool tablePresent)
+    {
+        _keepRefusals = tablePresent;
+        if (!tablePresent)
+            return 0;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, refused_target, reason, refused_at, strike_target, strikes, struck_at "
+            "FROM overseer_travel_refusal");
+        if (!result)
+            return 0;
+        int64_t const now = static_cast<int64_t>(std::time(nullptr));
+        std::size_t restored = 0;
+        do
+        {
+            Field* fields = result->Fetch();
+            std::string const name = fields[0].Get<std::string>();
+            OverseerDecisions::KeptTravelRefusal row;
+            row.refusedTarget = fields[1].Get<std::string>();
+            row.reason = fields[2].Get<std::string>();
+            row.refusedAt = fields[3].Get<int64>();
+            row.strikeTarget = fields[4].Get<std::string>();
+            row.strikes = fields[5].Get<uint32>();
+            row.struckAt = fields[6].Get<int64>();
+            OverseerDecisions::RestoredTravelRefusal const kept =
+                OverseerDecisions::RestoreTravelRefusal(row, now, ERRAND_DEATH_LIMITS);
+            if (kept.strike)
+            {
+                LethalStrike& strike = _lethal[name];
+                strike.target = row.strikeTarget;
+                strike.count = row.strikes;
+                strike.at = static_cast<time_t>(row.struckAt);
+            }
+            if (kept.refusal)
+            {
+                // `said` starts at 0, so the first re-issue after the roll is
+                // said again ("an errand called off because ...").
+                Refusal& refusal = _refused[name];
+                refusal.target = row.refusedTarget;
+                refusal.reason = row.reason;
+                refusal.at = static_cast<time_t>(row.refusedAt);
+                refusal.said = 0;
+                ++restored;
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' still refuses '{}' after this worldserver started, "
+                         "an errand called off {}s before now because {} (wow-overseer#1193)",
+                         name, row.refusedTarget, now - row.refusedAt, row.reason);
+            }
+        } while (result->NextRow());
+        return restored;
     }
 
     // The strike count for this target, 0 when its last lethal release was
@@ -6892,6 +6962,44 @@ public:
     }
 
 private:
+    // Write this character's refusal and strike, as the book now holds them,
+    // into its one row (wow-overseer#1193). See RestoreRefusals.
+    void KeepRefusal(std::string const& name)
+    {
+        if (!_keepRefusals)
+            return;
+        std::string refusedTarget;
+        std::string reason;
+        int64 refusedAt = 0;
+        auto const refused = _refused.find(name);
+        if (refused != _refused.end())
+        {
+            refusedTarget = refused->second.target.substr(0, 255);
+            reason = refused->second.reason.substr(0, 255);
+            refusedAt = static_cast<int64>(refused->second.at);
+        }
+        std::string strikeTarget;
+        uint32 strikes = 0;
+        int64 struckAt = 0;
+        auto const lethal = _lethal.find(name);
+        if (lethal != _lethal.end())
+        {
+            strikeTarget = lethal->second.target.substr(0, 255);
+            strikes = lethal->second.count;
+            struckAt = static_cast<int64>(lethal->second.at);
+        }
+        CharacterDatabase.DirectExecute(
+            "REPLACE INTO overseer_travel_refusal "
+            "(name, refused_target, reason, refused_at, strike_target, strikes, struck_at) "
+            "VALUES ('{}', '{}', '{}', {}, '{}', {}, {})",
+            Esc(name), Esc(refusedTarget), Esc(reason), refusedAt, Esc(strikeTarget), strikes,
+            struckAt);
+    }
+
+    // Whether overseer_travel_refusal is there to write (#1193). Set once, by
+    // RestoreRefusals at start-up.
+    bool _keepRefusals{false};
+
     // One errand a character was called off, why, and when.
     struct Refusal
     {
@@ -7816,6 +7924,30 @@ public:
     {
         RestoreGuildRunFinderDungeons();
         RestoreFamilyRunFinderDungeons();
+        RestoreTravelRefusals();
+    }
+
+    // THE TRAVEL BOOK'S REFUSALS COME BACK BEFORE THE FIRST TRAVEL POLL
+    // (wow-overseer#1193), so an aim refused as lethal before the roll is
+    // refused on the first poll after it rather than walked.
+    void RestoreTravelRefusals()
+    {
+        bool const present = SchemaHasColumns(
+            "overseer_travel_refusal",
+            "'name','refused_target','reason','refused_at','strike_target','strikes','struck_at'",
+            7);
+        std::size_t const restored = _travelAims.RestoreRefusals(present);
+        if (present)
+            LOG_INFO("module.overseer",
+                     "overseer: travel refusals kept across restarts - {} still inside "
+                     "their cool-off were read back",
+                     restored);
+        else
+            LOG_WARN("module.overseer",
+                     "overseer: overseer_travel_refusal is missing "
+                     "(2026_10_18_00_overseer_travel_refusal.sql has not been applied), so "
+                     "an errand refused as lethal or as going nowhere is forgotten at every "
+                     "restart and walked again");
     }
 
     // THE QUEUES ARE WRITTEN ONCE MORE AT SHUTDOWN. Chat, events, deaths and

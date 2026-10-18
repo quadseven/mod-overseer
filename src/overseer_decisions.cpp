@@ -8643,6 +8643,24 @@ int64_t ErrandCooloffSeconds(uint32_t strikes, ErrandDeathLimits const& limits)
     return cooloff < cap ? cooloff : cap;
 }
 
+RestoredTravelRefusal RestoreTravelRefusal(KeptTravelRefusal const& row, int64_t now,
+                                           ErrandDeathLimits const& limits)
+{
+    RestoredTravelRefusal kept;
+
+    int64_t const struckAge = now - row.struckAt;
+    kept.strike = !row.strikeTarget.empty() && row.strikes > 0 && row.struckAt > 0 &&
+                  struckAge >= 0 && struckAge < limits.strikeMemorySeconds;
+
+    if (row.refusedTarget.empty() || row.refusedAt <= 0)
+        return kept;
+    int64_t const refusedAge = now - row.refusedAt;
+    uint32_t const strikes =
+        kept.strike && row.strikeTarget == row.refusedTarget ? row.strikes : 0;
+    kept.refusal = refusedAge >= 0 && refusedAge < ErrandCooloffSeconds(strikes, limits);
+    return kept;
+}
+
 // ------------------------------- an errand that is eating the questing --
 
 ErrandSpend ErrandSpendAfter(ErrandSpend const& before, time_t now, int64_t heldSeconds,

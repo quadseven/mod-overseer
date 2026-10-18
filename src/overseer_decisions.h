@@ -10551,6 +10551,47 @@ struct ErrandDeathVerdict
 ErrandDeathVerdict ErrandDeathBreaker(ErrandDeathToll const& toll,
                                       ErrandDeathLimits const& limits);
 
+// ------------------------------------- a refusal that outlives a roll --
+//
+// THE TRAVEL BOOK'S REFUSAL MEMORY, AS IT IS KEPT ACROSS A WORLDSERVER ROLL
+// (wow-overseer#1193, layer 5 of wow-overseer#789). The book refuses an errand
+// that was killing a character, or that was going nowhere, and counts the
+// lethal releases of one target in a row (#776). Both lived in memory only, so
+// a roll forgot them: the bridge re-armed the column, or the aim was still in
+// it, and the character walked straight back to what had been killing it, on
+// strike one with a fifteen minute cool-off instead of the doubled one.
+//
+// ONE ROW PER CHARACTER, the book's own shape: one refusal and one strike
+// record, each overwritten by the next. Times are Unix seconds.
+struct KeptTravelRefusal
+{
+    std::string refusedTarget;  // empty = no refusal on record
+    std::string reason;
+    int64_t refusedAt{0};
+    std::string strikeTarget;   // empty = no lethal strike on record
+    uint32_t strikes{0};
+    int64_t struckAt{0};
+};
+
+// Which halves of a kept row are still live at `now`.
+struct RestoredTravelRefusal
+{
+    bool refusal{false};
+    bool strike{false};
+};
+
+// WHAT A ROLL KEEPS IS EXACTLY WHAT THE LIVE BOOK WOULD STILL ACT ON, and
+// nothing longer. The strike survives inside strikeMemorySeconds, which is
+// where TravelAimBook::LethalStrikes stops counting it. The refusal survives
+// inside the cool-off ErrandDeathBreaker would give it, which is
+// ErrandCooloffSeconds of the strikes for THAT target (zero when the strike on
+// record is another target or has aged out), the same reading the breaker makes
+// on every poll. A stamp from the future is dropped, as the breaker drops a
+// negative `sinceRefused`: it reads as "never refused", so keeping it would
+// keep nothing.
+RestoredTravelRefusal RestoreTravelRefusal(KeptTravelRefusal const& row, int64_t now,
+                                           ErrandDeathLimits const& limits);
+
 // ---------------------------------- an errand that is eating the questing --
 //
 // THE SECOND WAY AN ERRAND GOES WRONG, AND THE ONE THE BREAKER ABOVE CANNOT
