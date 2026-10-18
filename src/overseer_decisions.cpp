@@ -21727,6 +21727,94 @@ ReleasePromptReading ReleasePromptObserve(ReleasePromptClock& clock, std::int64_
     return reading;
 }
 
+// --------------------------------------- dungeon run lockouts (#963) ---------
+
+bool InstanceLockoutIsLive(SavedInstance const& save, std::time_t now)
+{
+    return save.saved && save.resetAt != 0 && save.resetAt > now;
+}
+
+std::int64_t SecondsUntilInstanceReset(SavedInstance const& save, std::time_t now)
+{
+    if (!save.saved || save.resetAt == 0)
+        return 0;
+    return static_cast<std::int64_t>(save.resetAt) -
+           static_cast<std::int64_t>(now);
+}
+
+bool InstanceResetsTooSoon(SavedInstance const& save, std::time_t now,
+                           std::time_t resetSoonSeconds)
+{
+    if (!save.saved || save.resetAt == 0)
+        return false;
+    std::int64_t const remaining = SecondsUntilInstanceReset(save, now);
+    return remaining > 0 &&
+           remaining <= static_cast<std::int64_t>(resetSoonSeconds);
+}
+
+std::string WeekdayName(std::time_t when)
+{
+    constexpr char const* weekdays[] = {"Thursday", "Friday", "Saturday", "Sunday",
+                                        "Monday", "Tuesday", "Wednesday"};
+    // 1970-01-01 was a Thursday.
+    std::int64_t const days = static_cast<std::int64_t>(when) / 86400;
+    std::int64_t index = days % 7;
+    while (index < 0)
+        index += 7;
+    return weekdays[static_cast<std::size_t>(index)];
+}
+
+std::string SavedInstanceRefusal(SavedInstance const& save, std::time_t now)
+{
+    if (!InstanceLockoutIsLive(save, now))
+        return std::string();
+    return "saved until " + WeekdayName(save.resetAt);
+}
+
+InstanceRunAnswer InstanceRunMayProceed(SavedInstance const& save, std::time_t now,
+                                        std::time_t resetSoonSeconds)
+{
+    InstanceRunAnswer answer;
+    if (!save.saved)
+        return answer;          // nothing bound: the character is free
+    if (save.resetAt == 0)
+    {
+        answer.verdict = InstanceRunVerdict::Saved;
+        answer.reason = "saved with no known reset time";
+        return answer;
+    }
+    std::int64_t const remaining = SecondsUntilInstanceReset(save, now);
+    if (remaining <= 0)
+        return answer;          // the lockout has passed: the character is free
+    if (remaining <= static_cast<std::int64_t>(resetSoonSeconds))
+    {
+        answer.verdict = InstanceRunVerdict::ResetsSoon;
+        answer.reason = "instance resets soon";
+    }
+    else
+    {
+        answer.verdict = InstanceRunVerdict::Saved;
+        answer.reason = SavedInstanceRefusal(save, now);
+    }
+    return answer;
+}
+
+InstanceRunProposal InstanceRunProposalFor(
+    std::vector<std::pair<std::string, SavedInstance>> const& seats,
+    std::time_t now, std::time_t resetSoonSeconds)
+{
+    InstanceRunProposal proposal;
+    for (auto const& seat : seats)
+    {
+        InstanceRunAnswer const answer =
+            InstanceRunMayProceed(seat.second, now, resetSoonSeconds);
+        if (answer.verdict == InstanceRunVerdict::Proceed)
+            proposal.members.push_back(seat.first);
+        else
+            proposal.refusals.emplace_back(seat.first, answer.reason);
+    }
+    return proposal;
+}
 RebuffSpell RebuffSpellFor(unsigned classId)
 {
     RebuffSpell spell;

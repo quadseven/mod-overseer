@@ -24055,6 +24055,83 @@ ReleasePromptReading ReleasePromptObserve(ReleasePromptClock& clock, std::int64_
                                           std::int64_t lastDeathAt,
                                           std::int64_t maxGapSeconds);
 
+// --------------------------------------- dungeon run lockouts (#963) ---------
+
+// ONE CHARACTER'S SAVED STATE FOR ONE INSTANCE, as the instance-lockout window
+// the client opens shows it: whether the character is bound to a copy, when the
+// lockout expires, and which bosses the save already credits. The adapter
+// reads it from the core's in-memory bind, which was loaded from
+// character_instance and the instance reset schedule. Only a permanent bind
+// is a client-visible lockout; a temporary normal-dungeon bind can be reset.
+struct SavedInstance
+{
+    uint32_t mapId{0};
+    uint32_t difficulty{0};
+    bool saved{false};
+    uint32_t instanceId{0};
+    // When the lockout expires, seconds since the epoch. Zero when the
+    // character is not bound or no reset was read.
+    std::time_t resetAt{0};
+    // The bosses the save credits as done, the same mask the core sets on each
+    // kill (InstanceSave::GetCompletedEncounterMask).
+    uint32_t completedEncounters{0};
+    // Every expected boss for this map is down, so the instance is cleared for
+    // this character even while the lockout clock still runs.
+    bool cleared{false};
+};
+
+// THE LOCKOUT IS LIVE when the reset is still in the future. A saved bind
+// with no known reset is refused by InstanceRunMayProceed.
+bool InstanceLockoutIsLive(SavedInstance const& save, std::time_t now);
+
+// SECONDS UNTIL THE LOCKOUT EXPIRES, negative once it has passed.
+std::int64_t SecondsUntilInstanceReset(SavedInstance const& save, std::time_t now);
+
+// AN INSTANCE THAT RESETS SOON IS NOT PROPOSED. A run whose lockout expires
+// within `resetSoonSeconds` is refused so the family is not sent into a dungeon
+// that will vanish under it mid-run.
+bool InstanceResetsTooSoon(SavedInstance const& save, std::time_t now,
+                           std::time_t resetSoonSeconds);
+
+// THE WEEKDAY A TIME_T FALLS ON, so a refusal can name "saved until Tuesday"
+// instead of an epoch the player cannot read. 1970-01-01 was a Thursday.
+std::string WeekdayName(std::time_t when);
+
+// THE REFUSAL SENTENCE for a run this character cannot join: empty when there
+// is no refusal, otherwise words a chat line can carry, e.g. "saved until
+// Tuesday". Names the weekday the lockout expires so the refusal is honest
+// about when the instance opens again.
+std::string SavedInstanceRefusal(SavedInstance const& save, std::time_t now);
+
+// May this instance be proposed to a character, given its saved state? The
+// reason is empty when the verdict is Proceed and otherwise names why the run
+// is refused, in words a chat line can carry.
+enum class InstanceRunVerdict : std::uint8_t
+{
+    Proceed,   // may be proposed and entered
+    Saved,     // refused: the character is saved to a live lockout
+    ResetsSoon,// refused: the lockout expires within the soon bound
+};
+
+struct InstanceRunAnswer
+{
+    InstanceRunVerdict verdict{InstanceRunVerdict::Proceed};
+    std::string reason;
+};
+
+InstanceRunAnswer InstanceRunMayProceed(SavedInstance const& save, std::time_t now,
+                                        std::time_t resetSoonSeconds);
+
+struct InstanceRunProposal
+{
+    std::vector<std::string> members;
+    std::vector<std::pair<std::string, std::string>> refusals;
+};
+
+InstanceRunProposal InstanceRunProposalFor(
+    std::vector<std::pair<std::string, SavedInstance>> const& seats,
+    std::time_t now, std::time_t resetSoonSeconds);
+
 // THE PARTY BUFF IS KEPT, NOT ONLY ALLOWED (mod-overseer#823). KeepBuffStrategies
 // puts `buff` on a priest, a mage and a druid once a minute, and that is all it
 // does: whether the buff is then cast is left to the bot's non-combat engine,
