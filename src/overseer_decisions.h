@@ -3268,6 +3268,18 @@ bool DungeonRunEnteredTheInstance(std::string const& outcome);
 // campaign progress, even when the party spent time inside the map.
 bool DungeonRunCountsAsDone(std::string const& outcome);
 
+struct DungeonQuestObjective
+{
+    uint32_t questId{0};
+    std::string holder;
+    bool onMap{false};
+    bool complete{false};
+};
+
+// A goal exists only if at least one held objective resolves to this map.
+bool DungeonQuestGoalReady(std::vector<DungeonQuestObjective> const& objectives);
+bool DungeonQuestTurnInReady(std::vector<float> const& memberYards, size_t partySize);
+
 // HOW MANY OF THE NEWEST ATTEMPTS IN A ROW NEVER GOT INSIDE, counting back from
 // the newest and stopping at the first that did.
 //

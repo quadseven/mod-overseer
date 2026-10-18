@@ -2931,6 +2931,28 @@ DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completed
                                                           : DungeonCompletion::NotYet;
 }
 
+bool DungeonQuestGoalReady(std::vector<DungeonQuestObjective> const& objectives)
+{
+    bool hasGoal = false;
+    for (DungeonQuestObjective const& objective : objectives)
+    {
+        if (!objective.onMap)
+            continue;
+        hasGoal = true;
+        if (!objective.complete)
+            return false;
+    }
+    return hasGoal;
+}
+
+bool DungeonQuestTurnInReady(std::vector<float> const& memberYards, size_t partySize)
+{
+    if (!partySize || memberYards.size() != partySize)
+        return false;
+    return std::all_of(memberYards.begin(), memberYards.end(),
+                       [](float yards) { return yards <= 30.f; });
+}
+
 uint32_t EventGatedEncounterMask(uint32_t mapId)
 {
     // Bits from DungeonEncounter.dbc for each map, read off the dev realm's
