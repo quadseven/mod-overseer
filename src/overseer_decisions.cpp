@@ -11749,6 +11749,31 @@ bool FlightMasterAnswersForNode(float fmX, float fmY, float nodeX, float nodeY,
     return dx * dx + dy * dy <= matchYards * matchYards;
 }
 
+FlightMasterBoarding ReadFlightMasterBoarding(bool resolved, float fmX, float fmY,
+                                              float nodeX, float nodeY, float matchYards)
+{
+    if (!resolved)
+        return FlightMasterBoarding::NoneInReach;
+    if (!FlightMasterAnswersForNode(fmX, fmY, nodeX, nodeY, matchYards))
+        return FlightMasterBoarding::WrongNode;
+    return FlightMasterBoarding::Board;
+}
+
+std::string FlightMasterRefusalReason(FlightMasterBoarding boarding, uint32_t fmEntry)
+{
+    switch (boarding)
+    {
+        case FlightMasterBoarding::NoneInReach:
+            return "no flight master it can deal with is in reach on this map";
+        case FlightMasterBoarding::WrongNode:
+            return "the nearest flight master it can deal with (creature " +
+                   std::to_string(fmEntry) + ") does not answer for that node";
+        case FlightMasterBoarding::Board:
+            break;
+    }
+    return "";
+}
+
 FlightDiscoveryArrival FlightDiscoveryArrivalStep(bool inReach, bool oneIsNearby)
 {
     // IN REACH OUTRANKS EVERYTHING ELSE, for the identical reason
