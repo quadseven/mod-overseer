@@ -16357,7 +16357,23 @@ private:
         uint32 fmEntry = 0;
         WorldPosition fmPos;
         if (!ResolveTravelTarget(bot, "flight master", fmEntry, fmPos))
+        {
+            // SAID ONCE PER ERRAND, like every other refusal in this
+            // function. This is the "unreachable flight master" case #970
+            // asks to hear about: a character that would have flown but has
+            // no flight master it can deal with on this map, saying so
+            // rather than silently walking.
+            if (!state.flightSaid)
+            {
+                state.flightSaid = true;
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is sent to '{}' {} yards away and could fly from "
+                         "node {}, but no flight master it can deal with is in reach on "
+                         "this map - walking instead",
+                         name, state.target, static_cast<uint32>(walkYards), fromNode);
+            }
             return false;
+        }
 
         // ...and it must be the creature that answers for the departure node.
         // See TRAVEL_FLIGHT_NODE_MATCH_YARDS: in a contested zone the nearest
@@ -16370,7 +16386,24 @@ private:
         float const nodeDy = fmPos.GetPositionY() - departure->y;
         if (nodeDx * nodeDx + nodeDy * nodeDy >
             TRAVEL_FLIGHT_NODE_MATCH_YARDS * TRAVEL_FLIGHT_NODE_MATCH_YARDS)
+        {
+            // SAID ONCE PER ERRAND: the other half of the unreachable flight
+            // master case. The nearest flight master this character can deal
+            // with does not answer for the departure node, so walking to it
+            // would end standing next to somebody who cannot sell a ticket -
+            // said rather than silently walking (#970).
+            if (!state.flightSaid)
+            {
+                state.flightSaid = true;
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is sent to '{}' {} yards away and could fly from "
+                         "node {}, but the nearest flight master it can deal with "
+                         "(creature {}) does not answer for that node - walking instead",
+                         name, state.target, static_cast<uint32>(walkYards), fromNode,
+                         fmEntry);
+            }
             return false;
+        }
 
         // THE LEADER DOES NOT BOARD WHILE A FOLLOWER IS ON FOOT (#138), AND
         // SINCE #360 THE ANSWER TO THAT IS TO PUT THE FOLLOWER ON A TAXI.
