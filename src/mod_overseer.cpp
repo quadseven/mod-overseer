@@ -1564,7 +1564,8 @@ constexpr uint32 CROSSING_STEP_POINT_ID = 0;
 constexpr uint32 CROSSING_BACKSTOP_SECONDS = 1800;
 // HOW MANY OF THOSE, AND OF THE TRAVEL DRIVE'S OWN GIVE-UPS, A CROSSING TAKES
 // BEFORE IT HANDS THE DUNGEON BACK (#926). Two attempts in a row that got no
-// 100 yards nearer the berth, then two hours with the dungeon refused. See
+// 100 yards nearer the berth, or one that ran this whole backstop without
+// that (wow-overseer#870), then two hours with the dungeon refused. See
 // OverseerDecisions::CrossingAttemptLimits.
 constexpr OverseerDecisions::CrossingAttemptLimits CROSSING_ATTEMPT_LIMITS{};
 // HOW LONG A LEADER WAITS AT A BERTH BEFORE HE GOES BACK FOR A HELD FOLLOWER
@@ -42807,7 +42808,7 @@ private:
         std::string const berth = attempts.record.berth;
         OverseerDecisions::CrossingAttemptReading const reading =
             OverseerDecisions::EndCrossingAttempt(attempts.record, std::time(nullptr),
-                                                  CROSSING_ATTEMPT_LIMITS);
+                                                  CROSSING_ATTEMPT_LIMITS, end);
         if (!reading.counted)
             return false;
         if (reading.verdict != OverseerDecisions::CrossingAttemptVerdict::GiveUp)

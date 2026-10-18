@@ -8737,6 +8737,14 @@ std::string GatheringCrossingBlocker(std::string const& leader, std::uint32_t le
 // started. An attempt opens when the crossing claims the berth aim and closes
 // when one of the things below ends it. Two closed attempts in a row that got
 // no 100 yards nearer hand the dungeon back for two hours.
+//
+// AND ONE IS ENOUGH WHEN IT RAN THE WHOLE HALF HOUR (wow-overseer#870). The
+// crossing's own backstop ends an attempt only after thirty minutes, so two of
+// them were an hour or more of a leader going nowhere before the hand-back:
+// measured after #926 shipped, three of the leader's seven hand-backs took 106
+// to 165 minutes, each ending on that backstop. The issue asks for the docks
+// or a hand-back within thirty minutes, and an attempt that walked for the
+// whole of them without getting 100 yards nearer has answered the question.
 
 // What ended an attempt at the berth.
 enum class CrossingAttemptEnd : std::uint8_t
@@ -8760,6 +8768,10 @@ struct CrossingAttemptLimits
     // Failed attempts in a row, none of them gaining `gainYards`, before the
     // crossing gives up.
     std::uint32_t attempts{2};
+    // The same count when the attempt that just failed was ended by the
+    // crossing's own half-hour backstop (Overdue): it already walked the whole
+    // backstop without gaining, so it gives up at once (wow-overseer#870).
+    std::uint32_t overdueAttempts{1};
     float gainYards{100.f};
     // How long a dungeon given up on stays refused to the family. Long enough
     // that the family's own drives get a real evening's share, short enough
@@ -8819,11 +8831,14 @@ struct CrossingAttemptReading
     std::int64_t seconds{0};
 };
 
-// The attempt under way ended (for one of the CrossingAttemptEnd reasons). On
-// GiveUp the record is refused until now + cooloffSeconds and its count starts
-// again, so the attempt after the cool-off is the first of a new two.
+// The attempt under way ended, for the reason `end`. An Overdue end that did
+// not gain gives up after `overdueAttempts` failures, any other after
+// `attempts`. On GiveUp the record is refused until now + cooloffSeconds and
+// its count starts again, so the attempt after the cool-off is the first of a
+// new count.
 CrossingAttemptReading EndCrossingAttempt(CrossingAttempts& record, std::int64_t now,
-                                          CrossingAttemptLimits const& limits);
+                                          CrossingAttemptLimits const& limits,
+                                          CrossingAttemptEnd end);
 
 // Is `dungeon` handed back at `now`? Seconds of cool-off left, or 0.
 std::int64_t CrossingHandedBack(CrossingAttempts const& record, std::string const& dungeon,

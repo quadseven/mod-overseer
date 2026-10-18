@@ -7321,7 +7321,8 @@ void OpenCrossingAttempt(CrossingAttempts& record, std::string const& dungeon,
 }
 
 CrossingAttemptReading EndCrossingAttempt(CrossingAttempts& record, std::int64_t now,
-                                          CrossingAttemptLimits const& limits)
+                                          CrossingAttemptLimits const& limits,
+                                          CrossingAttemptEnd end)
 {
     CrossingAttemptReading reading;
     reading.seconds = record.firstSeen ? now - record.firstSeen : 0;
@@ -7345,9 +7346,14 @@ CrossingAttemptReading EndCrossingAttempt(CrossingAttempts& record, std::int64_t
         return reading;
     }
 
+    // A HALF HOUR THAT GOT NOWHERE IS THE WHOLE ANSWER (wow-overseer#870).
+    // The backstop is already thirty minutes of walking; a second one doubled
+    // the time a stalled leader held the family before the hand-back.
     ++record.failed;
     reading.attempts = record.failed;
-    if (record.failed < limits.attempts)
+    std::uint32_t const allowed =
+        end == CrossingAttemptEnd::Overdue ? limits.overdueAttempts : limits.attempts;
+    if (record.failed < allowed)
         return reading;
 
     reading.verdict = CrossingAttemptVerdict::GiveUp;
