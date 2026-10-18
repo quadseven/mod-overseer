@@ -41842,7 +41842,17 @@ private:
             uint32 const entry = transports->Fetch()[0].Get<uint32>();
             TransportTemplate const* tmpl = sTransportMgr->GetTransportTemplate(entry);
             GameObjectTemplate const* go = sObjectMgr->GetGameObjectTemplate(entry);
-            if (!tmpl || !go || tmpl->inInstance || tmpl->mapsUsed.size() < 2)
+            if (!tmpl || !go)
+                continue;
+            // A crossing between two maps, or a ride between two stops of one
+            // (the Undercity to Grom'gol zeppelin, which never leaves map 0).
+            OverseerDecisions::CatalogueCandidate candidate;
+            candidate.inInstance = tmpl->inInstance;
+            candidate.mapsUsed = tmpl->mapsUsed.size();
+            for (KeyFrame const& frame : tmpl->keyFrames)
+                if (frame.Node && frame.IsStopFrame())
+                    ++candidate.stopFrames;
+            if (!OverseerDecisions::AdmitToCrossingCatalogue(candidate))
                 continue;
 
             CrossingTransportInfo info;

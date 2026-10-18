@@ -9163,6 +9163,29 @@ enum class CrewWelcome : std::uint8_t
 
 CrewWelcome ReadCrewWelcome(std::size_t crewRead, std::size_t crewUnwelcoming);
 
+// ------------------------------ which transports the catalogue holds (#1029) --
+//
+// THE CATALOGUE ONCE HELD ONLY A TRANSPORT WHOSE PATH NAMES TWO MAPS, so The
+// Purple Princess (176495), the Undercity to Grom'gol zeppelin, which never
+// leaves map 0, was never read, and every `ride-to-stop` row was refused with
+// no route. Measured on the dev realm 2026-10-18: ten catalogue lines at
+// start-up, none of them 176495, though the world `transports` table holds it.
+//
+// A transport is admitted when it is not an instance's own (a dungeon or raid
+// transport is part of that instance, never a route), and either its path names
+// two or more maps (a crossing), or it names one map and stops at least twice
+// on it (a ride between two stops). Admitting the one-map kind changes no
+// crossing: pricing a crossing asks for both maps in the path, and a ride
+// already refuses boarding and landing at one stop.
+struct CatalogueCandidate
+{
+    bool inInstance{false};
+    std::size_t mapsUsed{0};    // distinct maps its path names
+    std::size_t stopFrames{0};  // frames of its path it stops at
+};
+
+bool AdmitToCrossingCatalogue(CatalogueCandidate const& candidate);
+
 // ---------------------------------------------- pricing a crossing (#389) --
 //
 // SEVERAL TRANSPORTS CAN JOIN THE SAME TWO MAPS, and the first version took
@@ -23996,8 +24019,9 @@ char const* PartyEndsWord(PartyEnds ends);
 //   kind='job'  cross-to-map map:<map id>
 //
 // THE ROUTE TABLE IS THE MODULE'S OWN CROSSING CATALOGUE, not a second list
-// here: every row of the world `transports` table whose path names two maps
-// (ReadCrossingCatalogue), priced by PriceCrossings, which already refuses a
+// here: every row of the world `transports` table whose path names two maps,
+// or stops twice on one (ReadCrossingCatalogue, AdmitToCrossingCatalogue),
+// priced by PriceCrossings, which already refuses a
 // transport whose crew is hostile to the walker (the faction filter), one with
 // no surveyed berth level with its deck at either end, and one that does not
 // call on both maps. `routeKnown` below is that pricing's answer.

@@ -7625,6 +7625,15 @@ CrewWelcome ReadCrewWelcome(std::size_t crewRead, std::size_t crewUnwelcoming)
     return CrewWelcome::Welcome;
 }
 
+bool AdmitToCrossingCatalogue(CatalogueCandidate const& candidate)
+{
+    if (candidate.inInstance)
+        return false;
+    if (candidate.mapsUsed >= 2)
+        return true;
+    return candidate.mapsUsed == 1 && candidate.stopFrames >= 2;
+}
+
 char const* OfferVerdictName(OfferVerdict verdict)
 {
     switch (verdict)
