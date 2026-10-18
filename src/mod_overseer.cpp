@@ -71600,6 +71600,63 @@ private:
         return nullptr;
     }
 
+    // THE OTHER HALF OF THE WORLD'S QUEST RELATIONS (#19). Some quests are given
+    // and taken back by an object rather than a creature: quest 45, Discover
+    // Rolf's Fate, starts at gameobject 55 and is handed in at gameobject 56 and
+    // has no creature row at either end, so a turn-in that only read
+    // creature_questender refused it as "no taker in reach" for ever, in the
+    // words a character standing too far from a real creature gets. This reads
+    // gameobject_queststarter / gameobject_questender the same way, within the
+    // same reach, and a client's own turn-in at an object reaches the same
+    // Player::RewardQuest with the object as the quest giver.
+    static GameObject* QuestObjectInReach(Player* player, uint32 questId, bool starter)
+    {
+        QuestRelations const* relations = starter ? sObjectMgr->GetGOQuestRelationMap()
+                                                  : sObjectMgr->GetGOQuestInvolvedRelationMap();
+        if (!relations)
+            return nullptr;
+        for (auto const& [entry, quest] : *relations)
+        {
+            if (quest != questId)
+                continue;
+            GameObject* object =
+                player->FindNearestGameObject(entry, OverseerDecisions::SPAWN_WALK_ARRIVE_YARDS);
+            if (object && object->isSpawned())
+                return object;
+            LOG_INFO("module.overseer",
+                     "overseer: quest {} object {} for '{}': none spawned within {:.0f} yards",
+                     questId, entry, player->GetName(), OverseerDecisions::SPAWN_WALK_ARRIVE_YARDS);
+        }
+        return nullptr;
+    }
+
+    static bool QuestRelationNames(QuestRelations const* relations, uint32 questId)
+    {
+        if (!relations)
+            return false;
+        for (auto const& [entry, quest] : *relations)
+            if (quest == questId)
+                return true;
+        return false;
+    }
+
+    // Which kind of thing the world names at the end this verb needs, for the
+    // refusal's words and the row's `holder`. A creature is preferred when the
+    // world names both, which is what every row meant before #19.
+    static OverseerDecisions::QuestRelationHolder QuestHolderKind(uint32 questId, bool starter)
+    {
+        using OverseerDecisions::QuestRelationHolder;
+        if (QuestRelationNames(starter ? sObjectMgr->GetCreatureQuestRelationMap()
+                                       : sObjectMgr->GetCreatureQuestInvolvedRelationMap(),
+                               questId))
+            return QuestRelationHolder::Creature;
+        if (QuestRelationNames(starter ? sObjectMgr->GetGOQuestRelationMap()
+                                       : sObjectMgr->GetGOQuestInvolvedRelationMap(),
+                               questId))
+            return QuestRelationHolder::GameObject;
+        return QuestRelationHolder::None;
+    }
+
     static char const* DoQuest(Player* player, std::string const& command, char const*& status,
                                std::string& out)
     {
@@ -71611,11 +71668,28 @@ private:
 
         OverseerDecisions::QuestErrandFacts facts;
         facts.questKnown = quest != nullptr;
-        Creature* npc = nullptr;
+        // The creature or object the quest is taken from or handed in to. A
+        // creature in reach wins, then an object in reach (#19); with neither,
+        // `holder` still says which kind the world names, or that it names none.
+        WorldObject* giver = nullptr;
         if (quest && errand.verb != OverseerDecisions::QuestErrandVerb::None)
         {
-            npc = abandon ? nullptr : QuestCreatureInReach(player, errand.questId, take);
-            facts.giverInReach = npc != nullptr;
+            if (!abandon)
+            {
+                if (Creature* npc = QuestCreatureInReach(player, errand.questId, take))
+                {
+                    giver = npc;
+                    facts.holder = OverseerDecisions::QuestRelationHolder::Creature;
+                }
+                else if (GameObject* object = QuestObjectInReach(player, errand.questId, take))
+                {
+                    giver = object;
+                    facts.holder = OverseerDecisions::QuestRelationHolder::GameObject;
+                }
+                else
+                    facts.holder = QuestHolderKind(errand.questId, take);
+            }
+            facts.giverInReach = giver != nullptr;
             facts.rewarded = player->GetQuestRewardStatus(errand.questId);
             facts.status = static_cast<int>(player->GetQuestStatus(errand.questId));
             if (take)
@@ -71632,14 +71706,22 @@ private:
             }
         }
 
+        // `holder` and, on a refusal, `retryable` are what let a sender tell
+        // "could not" from "did not yet" (#19): a quest the world names nothing
+        // to hand in to is refused with retryable false and holder "none".
         auto describe = [&](char const* outcome, std::string const& reason)
         {
             std::ostringstream o;
             o << "{\"outcome\":" << J(outcome) << ",\"reason\":" << J(reason)
               << ",\"who\":" << J(player->GetName()) << ",\"quest_id\":" << errand.questId
-              << ",\"giver\":" << (npc ? npc->GetEntry() : 0)
-              << ",\"status\":" << static_cast<int>(player->GetQuestStatus(errand.questId))
-              << ",\"request\":" << J(command) << "}";
+              << ",\"giver\":" << (giver ? giver->GetEntry() : 0)
+              << ",\"holder\":"
+              << J(abandon ? "" : OverseerDecisions::QuestRelationHolderName(facts.holder))
+              << ",\"status\":" << static_cast<int>(player->GetQuestStatus(errand.questId));
+            if (std::string(outcome) == "refused")
+                o << ",\"retryable\":"
+                  << (OverseerDecisions::QuestErrandRefusalRetryable(reason) ? "true" : "false");
+            o << ",\"request\":" << J(command) << "}";
             out = o.str();
         };
 
@@ -71684,26 +71766,26 @@ private:
 
         if (take)
         {
-            player->AddQuestAndCheckCompletion(quest, npc);
+            player->AddQuestAndCheckCompletion(quest, giver);
             if (player->GetQuestStatus(errand.questId) == QUEST_STATUS_NONE)
             {
                 describe("error", "the quest did not land in the log");
                 return "the quest did not land in the log";
             }
             LOG_INFO("module.overseer", "overseer: '{}' took quest {} ({}) from '{}'",
-                     player->GetName(), errand.questId, quest->GetTitle(), npc->GetName());
+                     player->GetName(), errand.questId, quest->GetTitle(), giver->GetName());
             describe("taken", "");
         }
         else
         {
-            player->RewardQuest(quest, 0, npc);
+            player->RewardQuest(quest, 0, giver);
             if (!player->GetQuestRewardStatus(errand.questId))
             {
                 describe("error", "the quest was not rewarded");
                 return "the quest was not rewarded";
             }
             LOG_INFO("module.overseer", "overseer: '{}' handed quest {} ({}) in to '{}'",
-                     player->GetName(), errand.questId, quest->GetTitle(), npc->GetName());
+                     player->GetName(), errand.questId, quest->GetTitle(), giver->GetName());
             describe("handed in", "");
         }
         status = "delivered";

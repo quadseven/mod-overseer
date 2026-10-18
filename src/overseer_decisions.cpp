@@ -4961,6 +4961,47 @@ QuestErrand ParseQuestErrand(std::string const& command)
     return out;
 }
 
+char const* QuestRelationHolderName(QuestRelationHolder holder)
+{
+    switch (holder)
+    {
+        case QuestRelationHolder::Creature:
+            return "creature";
+        case QuestRelationHolder::GameObject:
+            return "gameobject";
+        case QuestRelationHolder::None:
+            break;
+    }
+    return "none";
+}
+
+namespace
+{
+// The refusals QuestErrandRefusalRetryable says yes to, kept beside the
+// strings they name so a reworded refusal cannot fall out of the list unseen.
+constexpr char const* QUEST_NO_GIVER_IN_REACH = "no giver of that quest in reach";
+constexpr char const* QUEST_NO_TAKER_IN_REACH = "no taker of that quest in reach";
+constexpr char const* QUEST_NO_GIVER_OBJECT_IN_REACH = "no object that gives that quest in reach";
+constexpr char const* QUEST_NO_TAKER_OBJECT_IN_REACH = "no object that takes that quest in reach";
+constexpr char const* QUEST_NOT_COMPLETE = "not complete";
+constexpr char const* QUEST_LOG_FULL = "the quest log is full";
+constexpr char const* QUEST_CORE_WILL_NOT_REWARD = "the core will not reward it now";
+}  // namespace
+
+bool QuestErrandRefusalRetryable(std::string const& reason)
+{
+    static char const* const retryable[] = {
+        QUEST_NO_GIVER_IN_REACH,        QUEST_NO_TAKER_IN_REACH,
+        QUEST_NO_GIVER_OBJECT_IN_REACH, QUEST_NO_TAKER_OBJECT_IN_REACH,
+        QUEST_NOT_COMPLETE,             QUEST_LOG_FULL,
+        QUEST_CORE_WILL_NOT_REWARD,
+    };
+    for (char const* candidate : retryable)
+        if (reason == candidate)
+            return true;
+    return false;
+}
+
 std::string QuestErrandRefusal(QuestErrand const& errand, QuestErrandFacts const& facts)
 {
     constexpr int STATUS_NONE = 0;
@@ -4979,25 +5020,34 @@ std::string QuestErrandRefusal(QuestErrand const& errand, QuestErrandFacts const
             return "it is complete; hand it in";
         return "";
     }
+    bool const take = errand.verb == QuestErrandVerb::Take;
+    // Nothing at that end at all is said before reach, and in different words
+    // from it (#19): no walk brings a character into reach of nothing.
+    if (facts.holder == QuestRelationHolder::None)
+        return take ? "the world names no creature and no object that gives that quest"
+                    : "the world names no creature and no object that takes that quest in";
     if (!facts.giverInReach)
-        return errand.verb == QuestErrandVerb::Take ? "no giver of that quest in reach"
-                                                    : "no taker of that quest in reach";
-    if (errand.verb == QuestErrandVerb::Take)
+    {
+        if (facts.holder == QuestRelationHolder::GameObject)
+            return take ? QUEST_NO_GIVER_OBJECT_IN_REACH : QUEST_NO_TAKER_OBJECT_IN_REACH;
+        return take ? QUEST_NO_GIVER_IN_REACH : QUEST_NO_TAKER_IN_REACH;
+    }
+    if (take)
     {
         if (facts.status != STATUS_NONE)
             return "already in the quest log";
         if (!facts.logHasRoom)
-            return "the quest log is full";
+            return QUEST_LOG_FULL;
         if (!facts.eligible)
             return "not eligible (level, race, class, prerequisite or exclusive group)";
         return "";
     }
     if (facts.status != STATUS_COMPLETE)
-        return "not complete";
+        return QUEST_NOT_COMPLETE;
     if (facts.rewardChoice)
         return "it offers a choice of reward, and nobody here would choose";
     if (!facts.rewardable)
-        return "the core will not reward it now";
+        return QUEST_CORE_WILL_NOT_REWARD;
     return "";
 }
 
