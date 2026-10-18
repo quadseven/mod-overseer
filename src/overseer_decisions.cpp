@@ -17609,7 +17609,7 @@ StrandedGhostStep StrandedGhostNext(StrandedGhostFacts const& facts)
         return StrandedGhostStep::Leave;
     if (facts.corpseMapId == facts.standingMapId)
         return StrandedGhostStep::Leave;
-    if (facts.standingInstanceable || facts.grouped)
+    if (facts.standingInstanceable || (facts.grouped && facts.runTakesBack))
         return StrandedGhostStep::Leave;
     return StrandedGhostStep::SpiritHealer;
 }

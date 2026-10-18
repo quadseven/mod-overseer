@@ -29443,7 +29443,9 @@ private:
     // see them. They stood there for hours. Out of the group the instance is no
     // longer theirs to enter, so the game's own way back is the spirit healer
     // at the graveyard they stand at, asked as a client asks it: resurrection
-    // sickness and durability loss apply, and nothing is granted.
+    // sickness and durability loss apply, and nothing is granted. A group that
+    // outlived its run is the same case (wow-overseer#1093): nothing walks its
+    // ghosts back in, so only a run still under way holds one here.
     //
     // The ghost recovery state is keyed on the corpse's place, which the core
     // keeps across maps (GetCorpseLocation), so a second death starts afresh.
@@ -29457,6 +29459,10 @@ private:
         facts.standingMapId = bot->GetMapId();
         facts.standingInstanceable = bot->GetMap()->Instanceable();
         facts.grouped = bot->GetGroup() != nullptr;
+        // A group alone is not a run (wow-overseer#1093): only a guild run
+        // that lists it, or the raid run-back inside its window, takes a
+        // grouped ghost back in. Any other group leaves it at the graveyard.
+        facts.runTakesBack = InAGuildRun(name) || RaidRunBackWalks(name, now);
         if (OverseerDecisions::StrandedGhostNext(facts) !=
             OverseerDecisions::StrandedGhostStep::SpiritHealer)
         {
@@ -29504,7 +29510,7 @@ private:
         // The deploy proof: "stranded ghost" is said nowhere else.
         LOG_INFO("module.overseer",
                  "overseer: stranded ghost '{}' (level {}) - its corpse lies on map {} "
-                 "({:.0f}, {:.0f}) and it stands on map {} out of any group, where neither "
+                 "({:.0f}, {:.0f}) and it stands on map {} with no run taking it back, where neither "
                  "the dead engine nor a run can take it back; {} the spirit healer at '{}'{}{}",
                  name, bot->GetLevel(), st.mapId, st.corpseX, st.corpseY,
                  static_cast<uint32>(bot->GetMapId()), retry ? "trying again for" : "it takes",
@@ -46907,6 +46913,16 @@ private:
     std::set<std::string> _raidRunBackStayLeased;
     // When the run first saw each raid ghost, for its run-back window.
     std::map<std::string, time_t> _raidGhostSince;
+
+    // Is the raid run-back walking `name` now: a ghost the raid drive saw
+    // released, still inside RaidGhostMayBeWalked's window. Past it the ghost
+    // is the ordinary recoveries' again (WalkRaidGhostsBack skips it too).
+    bool RaidRunBackWalks(std::string const& name, int64 now) const
+    {
+        auto const since = _raidGhostSince.find(name);
+        return since != _raidGhostSince.end() &&
+               OverseerDecisions::RaidGhostMayBeWalked(long(now - since->second));
+    }
 
     // Hand `stay` back to every ghost that is alive again, gone, or no longer
     // being walked. `walking` is who the run-back still walks this poll.
