@@ -21164,6 +21164,23 @@ std::string GuildRunAbsentWords(std::vector<GuildRunSeatReport> const& seats);
 std::string GuildRunStallWords(std::string const& nextBoss, bool killed,
                                unsigned secondsSinceKill);
 
+// THE KILL CLOCK RISES ON A NEW HIGH, NOT ON A RISE FROM THE LAST POLL. A
+// guild run's boss count is read again on every poll, and for a script that
+// keeps no boss list it is read off the tank's own instance bind, which answers
+// 0 while the tank is a ghost on another map. A count that dips and comes back
+// is the same kills, so it must not move "last kill" (GuildRunStallWords) to the
+// poll it came back on. `best` is the most bosses this stay has read down;
+// `lastKillAt` when that last rose, 0 before the first kill.
+struct GuildRunKillClock
+{
+    unsigned best{0};
+    std::time_t lastKillAt{0};
+};
+
+// The clock after one poll read `bossesDone` at `now`.
+GuildRunKillClock GuildRunKillAfter(GuildRunKillClock clock, unsigned bossesDone,
+                                    std::time_t now);
+
 // The abandoned run's `why`: the group is gone, nobody was inside, or the
 // tank and healer were not both alive inside, each followed by `absent`
 // (GuildRunAbsentWords) when it names someone.

@@ -18691,6 +18691,17 @@ std::string GuildRunStallWords(std::string const& nextBoss, bool killed,
     return out;
 }
 
+GuildRunKillClock GuildRunKillAfter(GuildRunKillClock clock, unsigned bossesDone,
+                                    std::time_t now)
+{
+    if (bossesDone > clock.best)
+    {
+        clock.best = bossesDone;
+        clock.lastKillAt = now;
+    }
+    return clock;
+}
+
 std::string GuildRunAbandonedWhy(GuildRunPoll const& poll, std::string const& absent)
 {
     std::string why;
