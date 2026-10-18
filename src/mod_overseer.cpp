@@ -7864,6 +7864,11 @@ public:
             // is still marking, and DriveTravel picks the claim up a few lines
             // further down instead of a whole poll later.
             DriveHomeBind();
+            // The party's own clock, because what it keeps is the party's
+            // buff (#823). Thirty seconds rather than the minute
+            // KeepBuffStrategies runs on: an ask buffs one member, so a family
+            // of five is covered in two and a half minutes, not five.
+            DriveRebuff();
         }
         if (_trainTimer >= TRAIN_POLL_MS)
         {
@@ -52244,6 +52249,127 @@ private:
         } while (result->NextRow());
     }
 
+    // Keep the party buff on the family, not only the strategy that allows it
+    // (mod-overseer#823). The decision and why it is shaped this way are
+    // OverseerDecisions::DecideRebuff; this reads the caster and its group,
+    // and on Cast asks the caster's OWN party buff action, which picks the
+    // target and the rank and spends the caster's own mana as its trigger
+    // would. Nothing here casts a spell itself.
+    //
+    // SAID ON A CHANGE, AND EVERY ASK IS READ BACK. A step other than Cast is
+    // said when it differs from the last one said for that caster, so a priest
+    // that sits under its reserve says so once rather than twice a minute. An
+    // ask is said with the action's answer, and the next poll says how many
+    // members were missing the buff before the ask and how many are now: the
+    // action answering true is a postmark, the aura count is the delivery.
+    void DriveRebuff()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name FROM overseer_roster WHERE enabled = 1");
+        if (!result)
+            return;
+
+        do
+        {
+            std::string const name = result->Fetch()[0].Get<std::string>();
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            PlayerbotAI* botAI = SteerableAI(bot);
+            if (!botAI)
+                continue;
+
+            OverseerDecisions::RebuffSpell const spell =
+                OverseerDecisions::RebuffSpellFor(static_cast<unsigned>(bot->getClass()));
+            if (!spell.action)
+                continue;
+
+            OverseerDecisions::RebuffFacts facts;
+            AiObjectContext* context = botAI->GetAiObjectContext();
+            uint32 const spellId =
+                context ? context->GetValue<uint32>("spell id", spell.aura)->Get() : 0;
+            SpellInfo const* info = spellId ? sSpellMgr->GetSpellInfo(spellId) : nullptr;
+            facts.knowsSpell = info && bot->HasSpell(spellId);
+            facts.alive = bot->IsAlive();
+            facts.inCombat = bot->IsInCombat();
+            facts.casting = bot->IsNonMeleeSpellCast(false);
+            facts.mounted = bot->IsMounted() || bot->IsInFlight();
+            facts.mana = bot->GetPower(POWER_MANA);
+            facts.maxMana = bot->GetMaxPower(POWER_MANA);
+            if (info)
+            {
+                int32 const cost = info->CalcPowerCost(bot, info->GetSchoolMask());
+                facts.cost = cost > 0 ? static_cast<uint32>(cost) : 0;
+            }
+
+            auto readMember = [&](Player* member) {
+                OverseerDecisions::RebuffMember seen;
+                seen.alive = member->IsAlive();
+                seen.sameMap = member->IsInWorld() && member->GetMap() == bot->GetMap();
+                seen.hasBuff = botAI->HasAura(spell.aura, member) ||
+                               botAI->HasAura(spell.groupAura, member);
+                if (seen.sameMap)
+                {
+                    seen.yards = member == bot ? 0.0f : bot->GetDistance(member);
+                    seen.inSight = member == bot || bot->IsWithinLOSInMap(member);
+                }
+                facts.members.push_back(seen);
+            };
+            if (Group* group = bot->GetGroup())
+            {
+                for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                    if (Player* member = ref->GetSource())
+                        readMember(member);
+            }
+            else
+                readMember(bot);
+
+            OverseerDecisions::RebuffDecision const decision = OverseerDecisions::DecideRebuff(facts);
+
+            auto const asked = _rebuffAsked.find(name);
+            if (asked != _rebuffAsked.end())
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' asked for '{}' last poll with {} member(s) missing "
+                         "'{}' - {} missing now",
+                         name, spell.action, static_cast<uint32>(asked->second), spell.aura,
+                         static_cast<uint32>(decision.missing));
+                _rebuffAsked.erase(asked);
+            }
+
+            if (decision.step != OverseerDecisions::RebuffStep::Cast)
+            {
+                auto const said = _rebuffSaid.find(name);
+                if (said != _rebuffSaid.end() && said->second == decision.step)
+                    continue;
+                _rebuffSaid[name] = decision.step;
+                // The two ordinary states are remembered but not said.
+                if (decision.step == OverseerDecisions::RebuffStep::NoSpell ||
+                    decision.step == OverseerDecisions::RebuffStep::NothingMissing)
+                    continue;
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' does not rebuff '{}' - {} ({} member(s) missing it, "
+                         "{} within {} yards and sight; mana {} of {}, the cast costs {})",
+                         name, spell.aura, OverseerDecisions::RebuffStepWord(decision.step),
+                         static_cast<uint32>(decision.missing), static_cast<uint32>(decision.inReach),
+                         static_cast<uint32>(OverseerDecisions::REBUFF_REACH_YARDS), facts.mana,
+                         facts.maxMana, facts.cost);
+                continue;
+            }
+
+            _rebuffSaid[name] = decision.step;
+            bool const took = botAI->DoSpecificAction(spell.action, Event(), true);
+            if (took)
+                _rebuffAsked[name] = decision.missing;
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is asked for '{}' - {} member(s) missing '{}', {} within "
+                     "{} yards and sight, mana {} of {} for a cost of {}; the action {}",
+                     name, spell.action, static_cast<uint32>(decision.missing), spell.aura,
+                     static_cast<uint32>(decision.inReach),
+                     static_cast<uint32>(OverseerDecisions::REBUFF_REACH_YARDS), facts.mana,
+                     facts.maxMana, facts.cost,
+                     took ? "ran" : "refused (useless, impossible or failed)");
+        } while (result->NextRow());
+    }
+
     // THIS REALM SAYS WHAT IT IS AND WHAT IT IS RUNNING (mod-overseer#184).
     //
     // WHY THE REALM WRITES THIS RATHER THAN ANYTHING ELSE READING IT. Three
@@ -73724,6 +73850,10 @@ private:
     std::map<std::string, TrainingStopLegState> _trainingStopLegs;
     // Who has been told once that the tank strategies would not take.
     std::set<std::string> _tankStrategyRefused;
+    // DriveRebuff (#823): the last step said for each caster, and the members
+    // missing the buff when its party buff action was last asked to run.
+    std::map<std::string, OverseerDecisions::RebuffStep> _rebuffSaid;
+    std::map<std::string, std::size_t> _rebuffAsked;
 
     // The unlearn this module has already refused for each character, so a
     // standing disagreement about the price is said once rather than twice a

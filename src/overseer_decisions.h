@@ -23899,6 +23899,95 @@ ReleasePromptReading ReleasePromptObserve(ReleasePromptClock& clock, std::int64_
                                           std::int64_t lastDeathAt,
                                           std::int64_t maxGapSeconds);
 
+// THE PARTY BUFF IS KEPT, NOT ONLY ALLOWED (mod-overseer#823). KeepBuffStrategies
+// puts `buff` on a priest, a mage and a druid once a minute, and that is all it
+// does: whether the buff is then cast is left to the bot's non-combat engine,
+// and a family went with no Fortitude on any of its five members for over
+// twenty minutes of a town trip with the strategy in place the whole time.
+//
+// So the drive reads the party back and, when a buff is missing on a member the
+// caster can reach and the caster can pay for it, asks the caster's OWN party
+// buff action to run (PlayerbotAI::DoSpecificAction, "power word: fortitude on
+// party"). That action picks its own target and its own rank and spends the
+// caster's own mana, exactly as the trigger would have: nothing is granted and
+// the AI's choice is not replaced, it is only asked for. Every reason it is NOT
+// asked is a step with a word, so the next town trip with no buffs says whether
+// the caster was out of mana, out of reach, in combat or had nothing to do.
+//
+// WHY A MANA RESERVE. The same family's dungeon logs said "Waiting on <priest>
+// (low mana)" forty times. A rebuff that leaves the healer under the reserve
+// trades a buff for another wait on the next pull, so the nudge waits for regen
+// instead and says so (LowMana). The bot's own engine may still cast earlier.
+
+// The buff a class keeps on its party, by the names mod-playerbots uses: the
+// aura on the target, its group variant (which counts as the buff), and the
+// party action that casts it. All three are null for a class that keeps none.
+struct RebuffSpell
+{
+    char const* aura{nullptr};         // "power word: fortitude"
+    char const* groupAura{nullptr};    // "prayer of fortitude"
+    char const* action{nullptr};       // "power word: fortitude on party"
+};
+
+// By the core's class id: 5 priest, 8 mage, 11 druid. Every other class keeps
+// no party buff here (a paladin's blessings are mod-playerbots' own greater
+// blessing system and are not this drive's to ask).
+RebuffSpell RebuffSpellFor(unsigned classId);
+
+// One member of the caster's group, the caster included, as the caster sees it.
+struct RebuffMember
+{
+    bool alive{true};
+    bool sameMap{true};       // in the world, on the caster's map
+    bool hasBuff{false};      // the aura or its group variant, from any caster
+    float yards{0.0f};        // from the caster
+    bool inSight{true};       // line of sight from the caster
+};
+
+struct RebuffFacts
+{
+    bool knowsSpell{false};   // the caster has learned a rank of the buff
+    bool alive{true};
+    bool inCombat{false};
+    bool casting{false};      // a cast is already going
+    bool mounted{false};      // or on a flight path: a rebuff would dismount it
+    std::uint32_t mana{0};
+    std::uint32_t maxMana{0};
+    std::uint32_t cost{0};    // of the rank the caster would cast
+    std::vector<RebuffMember> members;
+};
+
+enum class RebuffStep : std::uint8_t
+{
+    NoSpell,         // the class keeps no buff, or the caster has not learned it
+    Dead,
+    InCombat,        // the engine's combat priorities are not second-guessed
+    Casting,
+    Mounted,
+    NothingMissing,  // every living member on the map carries it
+    OutOfReach,      // members lack it, none within reach and sight
+    LowMana,         // the cast would leave the caster under the reserve
+    Cast,            // ask the caster's party buff action
+};
+
+// Within the yards mod-playerbots casts a spell from (AiPlayerbot.SpellDistance,
+// 28.5 by default) and not the 57 its party pick looks across, so a Cast is a
+// member the action can buff from where the caster stands.
+constexpr float REBUFF_REACH_YARDS = 28.0f;
+// The mana the caster keeps after the cast, as a percent of its maximum.
+constexpr std::uint32_t REBUFF_MANA_RESERVE_PERCENT = 30;
+
+struct RebuffDecision
+{
+    RebuffStep step{RebuffStep::NoSpell};
+    std::size_t missing{0};   // living members on the map without the buff
+    std::size_t inReach{0};   // of those, within reach and sight
+};
+
+RebuffDecision DecideRebuff(RebuffFacts const& facts);
+
+char const* RebuffStepWord(RebuffStep step);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
