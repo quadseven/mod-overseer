@@ -18980,6 +18980,22 @@ bool MayCraftNow(std::string const& job, bool inDungeonRun, bool alive, bool inC
 // character off a taxi would cancel an errand nobody asked to cancel.
 bool CraftDismountsFirst(bool mounted, bool inFlight);
 
+// THE SPELL THAT CONJURES A RECIPE'S SPELL FOCUS WHERE THE CRAFTER STANDS, or
+// 0 when no such spell exists and the focus is a world object somebody must be
+// walked to. Keyed on SpellInfo::RequiresSpellFocus (SpellFocusObject.dbc) so
+// any other conjurable focus is one more case here, not a second drive.
+//
+// Focus 4 is "Cooking Fire", and every Cooking recipe a family below 75 can
+// reach carries it (quadseven/mod-overseer#534: 181 abilities on skill 185,
+// none focus-free in that range). Spell 818 "Basic Campfire" (skill 185,
+// AcquireMethod 1, ClassMask 0, no reagent, no focus of its own) summons
+// gameobject 29784, type 8 GAMEOBJECT_TYPE_SPELL_FOCUS, Data0 4, Data1 10
+// yards, centred on the caster. A Forge (3) or an Anvil (1) is a world spawn,
+// so those answer 0 and the refusal stands as it always has.
+constexpr unsigned SPELL_FOCUS_COOKING_FIRE = 4;
+constexpr unsigned SPELL_BASIC_CAMPFIRE = 818;
+unsigned FocusLighterSpell(unsigned requiresSpellFocus);
+
 
 // A TRADE OPENED TO A SELFBOT HEAD IS ANSWERED LIKE A PERSON WOULD. mod-playerbots'
 // TradeStatusAction returns at once for a selfbot (a human is assumed at the

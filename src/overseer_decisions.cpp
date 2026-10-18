@@ -16230,6 +16230,11 @@ bool CraftDismountsFirst(bool mounted, bool inFlight)
     return mounted && !inFlight;
 }
 
+unsigned FocusLighterSpell(unsigned requiresSpellFocus)
+{
+    return requiresSpellFocus == SPELL_FOCUS_COOKING_FIRE ? SPELL_BASIC_CAMPFIRE : 0;
+}
+
 GhostRecovery GuildGhostFallback(unsigned deathsHere, bool healerGraveKnown,
                                  unsigned repeatDeaths)
 {

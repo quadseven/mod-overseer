@@ -15657,15 +15657,23 @@ private:
     // TrainOnArrival's own comment warns against for TeachSpell, wearing a
     // different verb.
     //
-    // SPELL FOCUS IS A REAL REQUIREMENT THIS DRIVE DOES NOT SATISFY. Some
-    // recipes need a nearby gameobject (a forge, an anvil) and this function
-    // does not walk anyone to one - v1's scoping decision, per the design
-    // doc, is that the Python planner must only ever hand this column a
-    // recipe with no such requirement. A recipe that needs one anyway is not
-    // a crash here: CheckCast refuses it (SPELL_FAILED_REQUIRES_SPELL_FOCUS),
-    // this function logs the refusal and leaves the errand standing, and
-    // nothing is crafted out of thin air - the same "fail closed, not open"
-    // shape every other drive in this file holds to.
+    // SPELL FOCUS: A FIRE IS LIT, A FORGE IS NOT WALKED TO. Some recipes need
+    // a nearby gameobject. A world spawn (a forge, an anvil) is not walked to
+    // here - v1's scoping decision, per the design doc, is that the Python
+    // planner must only ever hand this column such a recipe once something
+    // brings the crafter to one. A recipe that needs one anyway is not a
+    // crash: CheckCast refuses it (SPELL_FAILED_REQUIRES_SPELL_FOCUS), this
+    // function logs the refusal and leaves the errand standing, and nothing
+    // is crafted out of thin air - the same "fail closed, not open" shape
+    // every other drive in this file holds to.
+    //
+    // A focus the crafter can conjure where it stands is provided instead
+    // (OverseerDecisions::FocusLighterSpell, quadseven/mod-overseer#534):
+    // every Cooking recipe needs a Cooking Fire, and Basic Campfire (818)
+    // lights one under the caster. The recipe's own CheckCast is the test for
+    // "is a fire already here", so the fire is lit only on that refusal and
+    // never on top of one still burning; the recipe is cast on the next poll,
+    // after the campfire's own cast and the global cooldown have run.
     // When each roster selfbot's open trade was first seen, for
     // AnswerTradeAtHead's waits. World thread only, like every register here.
     std::map<std::string, time_t> _headTradeSeen;
@@ -15865,6 +15873,29 @@ private:
 
             if (result == SPELL_FAILED_REQUIRES_SPELL_FOCUS)
             {
+                // A CONJURABLE FOCUS IS PROVIDED, not waited for (#534).
+                // natural-only: a spell the character knows (HasSpell), cast
+                // untriggered, the way a cook at a client clicks it.
+                uint32 const lighter =
+                    OverseerDecisions::FocusLighterSpell(info->RequiresSpellFocus);
+                if (lighter && bot->HasSpell(lighter))
+                {
+                    SpellCastResult const lit = bot->CastSpell(bot, lighter, false);
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' needs spell focus {} for '{}' ({}) and {} "
+                             "spell {} to provide it (SpellCastResult {}) - leaving the "
+                             "errand standing for the next poll", name, info->RequiresSpellFocus,
+                             info->SpellName[LOCALE_enUS], spellId,
+                             lit == SPELL_CAST_OK ? "cast" : "was refused casting",
+                             lighter, static_cast<uint32>(lit));
+                    continue;
+                }
+                if (lighter)
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' needs spell focus {} for '{}' ({}) and does "
+                             "not know spell {} that would provide it", name,
+                             info->RequiresSpellFocus, info->SpellName[LOCALE_enUS],
+                             spellId, lighter);
                 LOG_WARN("module.overseer",
                          "overseer: '{}' tried to craft '{}' ({}) but is not near the "
                          "required spell focus {} ({}; SpellCastResult {}) - leaving the "
