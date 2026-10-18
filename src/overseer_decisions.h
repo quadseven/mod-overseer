@@ -21238,6 +21238,11 @@ struct TrainingStopFacts
     // A member was walked for in this stop and its learns are still owed: its
     // visit taught nothing, or was cut short, and its tries are spent.
     bool learnsOwed{false};
+    // A questing head is partway through an objective of the quest it is
+    // working (QuestObjectiveInProgress), and how long the trip has waited for
+    // it (#965). Read only while no stop is open.
+    bool questObjectiveOpen{false};
+    uint32_t questHeldSeconds{0};
 };
 
 enum class TrainingStopStep : uint8_t
@@ -21249,6 +21254,7 @@ enum class TrainingStopStep : uint8_t
     SpentItsTime,     // this stop has run TRAINING_STOP_MAX_SECONDS
     NobodyOnHeadMap,    // every member with a learn is on another map or unavailable
     NoTrainerInTown,  // every learn's trainer is past TrainingStopReach, or on no spawn
+    QuestObjectiveOpen,  // a questing head finishes the objective it is partway through first
     ColumnTaken,      // an errand the stop may not take holds the head's travel column
     Walk,             // walk the head to `member`'s trainer
     LearnsOwed,       // a visit taught nothing and its tries are spent: not "nothing left"
@@ -21382,9 +21388,15 @@ uint32_t TrainingStopRestSeconds(TrainingStopStep step);
 // trainer says nothing about a town that has one: when the head has since
 // changed maps (the dungeon finder walks the family out of the Stockade into
 // Stormwind, where every class has a trainer within a few hundred yards) the
-// rest is over. Any other ending rests as it always did.
+// rest is over.
+//
+// A LEVEL GAINED SINCE THE STOP ENDED ENDS ITS REST, whatever the ending
+// (#965). A level is what puts new spells on a trainer's list, so a rest that
+// was earned by "nothing left to learn" is answered by it, and the trip
+// follows the level-up instead of the next half hour. Any other ending rests
+// as it always did.
 bool TrainingStopRestStillApplies(TrainingStopStep lastEnd, uint32_t endedOnMap,
-                                  uint32_t headMap);
+                                  uint32_t headMap, bool levelledSinceEnd);
 
 // THE RUN'S REPAIR LEG WAITS FOR AN OPEN TRAINING STOP (2026-09-29). Right after
 // a Stockade run the dungeon finder has put the family in Stormwind, and the
@@ -21401,6 +21413,72 @@ bool TrainingStopHoldsRepairLeg(bool stopOpen, uint32_t heldSeconds);
 // reagent vendor's) or a flight-master discovery walk. Not the empty column,
 // and not the keywords that carry a trainer's or a run's own walk.
 bool TrainingStopMayPreempt(std::string const& column);
+
+// ------------------- a level-up sends the family to its trainers (#965) ----
+//
+// The operator asked whether the family goes to a class trainer for its new
+// spells or upgrades itself where it stands. TrainRoster used to grant them in
+// place (PlayerbotFactory::InitAvailableSpells); the training stop above walks
+// the family to its trainers and pays instead. These are the parts that make
+// the walk follow the level-up, reach every trainer the grant reached, leave a
+// quest objective alone, and do the trainer's own class quests while there.
+
+// Did any member gain a level since the last stop ended? `levelsAtEnd` is each
+// member's level when it ended and `levelsNow` its level now; a member missing
+// from either says nothing.
+bool FamilyLevelledSince(std::map<std::string, uint32_t> const& levelsAtEnd,
+                         std::map<std::string, uint32_t> const& levelsNow);
+
+// THE TRAINER THAT TEACHES. InitAvailableSpells granted every spell any class
+// trainer of the member's class would teach; a stop that walks only to the
+// nearest trainer never reaches a spell another trainer holds (a mage's portal
+// trainer can stand nearer than its mage trainer and teach it nothing). One
+// class trainer on the head's map, as the stop sees it.
+struct ClassTrainerOption
+{
+    uint32_t entry{0};
+    float yards{-1.f};        // from the head
+    uint32_t affordable{0};   // class spells it would teach the member now, paid for
+};
+
+// The nearest option with something to teach, else the nearest of all (so the
+// stop can still say how far the member's trainer is), or -1 when there is
+// none. A tie is the first listed.
+int PickClassTrainer(std::vector<ClassTrainerOption> const& options);
+
+// AN OBJECTIVE IN PROGRESS IS FINISHED FIRST. A player who levels halfway
+// through eight boars kills the other four and then goes to town. One counted
+// objective of the quest the head is working: a kill or use counter, or a
+// required item, with what it has and what it needs.
+struct QuestObjectiveCount
+{
+    uint32_t have{0};
+    uint32_t need{0};
+};
+
+// Some objective has been started and some objective is unfinished. A quest
+// not begun, or one whose objectives are all done, is not in progress.
+bool QuestObjectiveInProgress(std::vector<QuestObjectiveCount> const& objectives);
+
+// How long a questing family's trip waits for that objective, from the first
+// poll it held. A chosen bound, not a measurement: as long as one stop may
+// run, so a quest that is never finished cannot keep the spells from the
+// family. Past it the trip goes, and the quest is paused, not dropped: the
+// quest drive stands down for the travel errand and picks it back up after.
+constexpr uint32_t TRAINING_TRIP_QUEST_HOLD_SECONDS = 15 * 60;
+
+// Does the trip wait for the head's objective now: a questing family, no stop
+// open yet, an objective in progress, and the hold not spent.
+bool TrainingTripWaitsForQuest(TrainingStopFacts const& facts);
+
+// THE TRAINER'S OWN CLASS QUESTS. A class trainer gives its class's quests
+// (A Warrior's Training at level 10) and takes the letters a new character
+// is sent to it with. At the visit, the member hands in what the trainer takes
+// and then takes what it gives, through the quest errand's own refusal
+// (QuestErrandRefusal). A quest is taken only when it is a class quest of the
+// member's class: `questClasses` is Quest::GetRequiredClasses, 0 for every
+// class.
+bool TrainerVisitTakesQuest(uint32_t questClasses, uint32_t memberClassMask);
 
 // ------------------ the fallback ladder: summon, then the dungeon finder --
 //

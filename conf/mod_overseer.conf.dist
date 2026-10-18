@@ -561,8 +561,9 @@
 #    Each time a roster character changes level the module spends its free
 #    talent points in its roster tree. It hands out nothing else: spells and
 #    trades are learned at a real trainer and paid for (the training stop
-#    walks the family there), and weapon skill is gained by using the
-#    weapon.
+#    walks the family there once a level puts a spell on its trainer's
+#    list, and hands in and takes the trainer's class quests while it is
+#    there), and weapon skill is gained by using the weapon.
 #
 #    Overseer.Train.Factory is retired (natural only, 2026-10-12). It used to
 #    grant the roster weapon skills, riding, class spells and every trainer
