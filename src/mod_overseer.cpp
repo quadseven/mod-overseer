@@ -41827,6 +41827,10 @@ private:
         // passengers: a transport on an unloaded grid has not spawned its crew,
         // and whose boat it is must not depend on whether somebody is nearby.
         std::map<uint32, std::vector<CrossingCrewMember>> crewByMap;
+        // THE SAME SPAWNS, AS GROUND SOMEBODY STANDS ON (#1030): every creature
+        // that walks rather than flies or floats, for a stop the survey never
+        // reached the pier of. Same struct, read as world positions.
+        std::map<uint32, std::vector<CrossingCrewMember>> walkersByMap;
         for (auto const& [spawnId, data] : sObjectMgr->GetAllCreatureData())
         {
             (void)spawnId;
@@ -41835,6 +41839,9 @@ private:
                 continue;
             crewByMap[data.mapid].push_back(
                 CrossingCrewMember{tmpl->faction, data.posX, data.posY, data.posZ});
+            if (tmpl->Movement.IsGroundAllowed() && !tmpl->Movement.IsFlightAllowed())
+                walkersByMap[data.mapid].push_back(
+                    CrossingCrewMember{tmpl->faction, data.posX, data.posY, data.posZ});
         }
 
         do
@@ -41885,17 +41892,33 @@ private:
                 std::vector<float> decks;
                 for (CrossingCrewMember const& c : info.crew)
                     decks.push_back(stop.mooringZ + c.z);
-                // PickBerth again and again, taking each pick out, gives every
-                // level candidate in its own order of preference.
-                for (;;)
+                // The walkers within reach of this mooring, each read against
+                // every crew member: one crew member it is hostile to is enough
+                // to keep a passenger from being sent to stand by it.
+                std::vector<OverseerDecisions::PierSpawn> pier;
+                for (CrossingCrewMember const& w : walkersByMap[stop.mapId])
                 {
-                    int const pick = OverseerDecisions::PickBerth(mine, stop.mooringX,
-                                                                  stop.mooringY, decks, limits);
-                    if (pick < 0)
-                        break;
-                    stop.levelBerths.push_back(mine[pick]);
-                    mine.erase(mine.begin() + pick);
+                    if (std::hypot(w.x - stop.mooringX, w.y - stop.mooringY) >
+                        CROSSING_BERTH_REACH_YARDS)
+                        continue;
+                    OverseerDecisions::PierSpawn spawn;
+                    spawn.x = w.x;
+                    spawn.y = w.y;
+                    spawn.z = w.z;
+                    spawn.groundWalker = true;
+                    FactionTemplateEntry const* theirs = sFactionTemplateStore.LookupEntry(w.faction);
+                    spawn.hostileToCrew = !theirs || info.crew.empty();
+                    for (CrossingCrewMember const& c : info.crew)
+                    {
+                        FactionTemplateEntry const* crewFaction =
+                            sFactionTemplateStore.LookupEntry(c.faction);
+                        if (theirs && (!crewFaction || theirs->IsHostileTo(*crewFaction)))
+                            spawn.hostileToCrew = true;
+                    }
+                    pier.push_back(spawn);
                 }
+                stop.levelBerths = OverseerDecisions::LevelBerths(
+                    std::move(mine), pier, stop.mooringX, stop.mooringY, decks, limits);
                 if (stop.levelBerths.empty())
                     continue;
                 stop.berthKnown = true;
