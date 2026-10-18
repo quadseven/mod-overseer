@@ -58546,6 +58546,11 @@ private:
     // read and tested. The WHERE clause is a way of not fetching two thousand
     // rows nobody will look at; it is not where the rule lives, and it must not
     // become where the rule lives.
+    //
+    // THE ACCOUNT AND THE ROSTER ARE READ HERE AND JUDGED THERE (#525). Every
+    // row comes back with two more facts: whether its account is a random-bot
+    // account, and whether its name is an overseer_roster row. Neither is a
+    // WHERE clause; RecruitDiscoveryFrom is what drops them, and says how many.
     static std::vector<OverseerDecisions::RecruitCandidate> GuildCandidateFacts(
         OverseerDecisions::RecruitBand const& band)
     {
@@ -58568,15 +58573,20 @@ private:
         uint32 const floorLevel = band.lowest ? band.lowest : 1u;
         uint32 const ceilLevel = band.highest ? band.highest : 255u;
 
+        // Any overseer_roster row, enabled or not: a parked family member is
+        // still the family, and still not a recruit.
         QueryResult rows = CharacterDatabase.Query(
-            "SELECT c.guid, c.name, c.race, c.class, c.level FROM characters c "
+            "SELECT c.guid, c.name, c.race, c.class, c.level, c.account, roster.name "
+            "FROM characters c "
             "LEFT JOIN guild_member gm ON gm.guid = c.guid "
+            "LEFT JOIN overseer_roster roster ON roster.name = c.name "
             "WHERE gm.guid IS NULL AND c.deleteDate IS NULL "
             "AND c.level BETWEEN {} AND {} ORDER BY c.name LIMIT {}",
             floorLevel, ceilLevel, GUILD_CANDIDATE_CAP);
         if (!rows)
             return candidates;
 
+        std::vector<uint32> accountOf;
         do
         {
             Field* row = rows->Fetch();
@@ -58586,9 +58596,43 @@ private:
                 static_cast<unsigned>(Player::TeamIdForRace(row[2].Get<uint8>()));
             candidate.classId = row[3].Get<uint8>();
             candidate.level = row[4].Get<uint8>();
+            candidate.onRoster = !row[6].IsNull();
             byGuid[row[0].Get<uint32>()] = candidates.size();
+            accountOf.push_back(row[5].Get<uint32>());
             candidates.push_back(candidate);
         } while (rows->NextRow());
+
+        // THE ACCOUNT NAMES ARE ONE QUERY, NOT ONE PER CANDIDATE. They live in
+        // the auth database, which no join from `characters` can reach by a
+        // name this module may assume, and AccountMgr::GetName is a blocking
+        // round trip each - two thousand of them for one shortlist. The id list
+        // is integers this function read out of the database itself, the same
+        // as the skills pool below. An account that does not come back leaves
+        // randomBotAccount false, so it is dropped rather than admitted.
+        std::set<uint32> const accountIds(accountOf.begin(), accountOf.end());
+        std::ostringstream accountPool;
+        for (std::set<uint32>::const_iterator it = accountIds.begin();
+             it != accountIds.end(); ++it)
+            accountPool << (it == accountIds.begin() ? "" : ",") << *it;
+
+        std::map<uint32, std::string> accountName;
+        if (QueryResult accounts = LoginDatabase.Query(
+                "SELECT id, username FROM account WHERE id IN ({})", accountPool.str()))
+        {
+            do
+            {
+                Field* row = accounts->Fetch();
+                accountName[row[0].Get<uint32>()] = row[1].Get<std::string>();
+            } while (accounts->NextRow());
+        }
+        for (size_t i = 0; i < candidates.size(); ++i)
+        {
+            std::map<uint32, std::string>::const_iterator name = accountName.find(accountOf[i]);
+            candidates[i].randomBotAccount =
+                name != accountName.end() &&
+                OverseerDecisions::AccountNameHasPrefix(
+                    name->second, sPlayerbotAIConfig.randomBotAccountPrefix);
+        }
 
         // THE SECOND QUERY IS BOUND BY THE FIRST QUERY'S ANSWER, NOT BY ITS
         // WHERE CLAUSE. Repeating the band and the guild join here would
@@ -62298,7 +62342,10 @@ private:
             // READ-ONLY. This verb invites nobody and changes nothing; it
             // answers who WOULD be worth asking and why, so that the judgement
             // can be read before it is acted on.
-            std::vector<RecruitCandidate> const candidates = GuildCandidateFacts(needs.band);
+            std::vector<RecruitCandidate> const found = GuildCandidateFacts(needs.band);
+            OverseerDecisions::RecruitDiscovery const discovery =
+                OverseerDecisions::RecruitDiscoveryFrom(found);
+            std::vector<RecruitCandidate> const& candidates = discovery.kept;
             RecruitShortlistReport const report =
                 RecruitShortlistReportFor(candidates, needs, request.atMost);
             std::vector<RecruitPick> const& picks = report.picks;
@@ -62309,6 +62356,9 @@ private:
               << ",\"target_size\":" << needs.targetSize
               << ",\"band\":{\"lowest\":" << needs.band.lowest
               << ",\"highest\":" << needs.band.highest << '}'
+              << ",\"found\":" << found.size()
+              << ",\"dropped\":{\"not_random_bot\":" << discovery.notRandomBot
+              << ",\"on_roster\":" << discovery.onRoster << '}'
               << ",\"considered\":" << candidates.size()
               << ",\"refused\":{";
             for (size_t i = 0; i < report.refused.size(); ++i)

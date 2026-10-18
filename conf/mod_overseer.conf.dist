@@ -36,6 +36,13 @@
 #    target size, is refused by RecruitVerdictFor on both paths. Widening these
 #    is the only way to reach a candidate; it is not a display preference.
 #
+#    THE SHORTLIST DRAWS ONLY FROM RANDOM BOTS. Before any candidate is judged,
+#    discovery drops every character not on an account named with
+#    AiPlayerbot.RandomBotAccountPrefix, and every character whose name is an
+#    overseer_roster row (enabled or not). The shortlist reports both counts
+#    under "dropped". The by-name `guild invite` verb is not filtered this way:
+#    a name an operator types is judged by RecruitVerdictFor alone.
+#
 
 #
 #    Overseer.Recruit.TargetSize

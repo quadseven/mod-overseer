@@ -15956,6 +15956,15 @@ struct RecruitCandidate
     unsigned teamId{0};
     // The character row is flagged for deletion.
     bool gone{false};
+    // The character is on a random-bot account: its account name begins with
+    // AiPlayerbot.RandomBotAccountPrefix (AccountNameHasPrefix, the same test
+    // the retire path asks). FALSE UNTIL SOMEBODY READ THE ACCOUNT AND SAID
+    // OTHERWISE, so a candidate whose account could not be read is dropped by
+    // discovery rather than admitted by it. See RecruitDiscoveryFrom.
+    bool randomBotAccount{false};
+    // The character's name is a row in `overseer_roster`, the named family
+    // this module keeps alive itself. See RecruitDiscoveryFrom.
+    bool onRoster{false};
     std::vector<ProfessionHolding> professions;
 };
 
@@ -16170,6 +16179,39 @@ std::vector<RecruitPick> RecruitShortlist(
 RecruitShortlistReport RecruitShortlistReportFor(
     std::vector<RecruitCandidate> const& candidates, GuildNeeds const& needs,
     unsigned atMost);
+
+// WHO IS IN THE POOL AT ALL, decided before anybody in it is judged.
+//
+// The recruit pool is the random-bot population, and only that. Discovery
+// used to take every unguilded, undeleted character in the band, which is
+// right for two thousand random bots and wrong for anything else that lands
+// in `characters`: the named family (overseer_roster), which this module
+// keeps alive on its own named accounts and the random-bot manager does not
+// drive, or a person's own character on a person's own account. Neither is a
+// recruit target, and nothing downstream would have said so - the shortlist
+// would simply have named them.
+//
+// TWO GATES, INDEPENDENT ON PURPOSE. The account gate is the rule: a
+// candidate not on a random-bot account is dropped. The roster gate is a
+// second, cheap check that does not depend on the first: a roster name is
+// dropped even on an account that passes the prefix test, so a family member
+// moved onto a prefixed account, or a prefix configured wider than it should
+// be, still cannot put the family on a shortlist. A candidate failing both is
+// counted once, under the roster, because that is the more specific reason.
+//
+// WHY THIS IS NOT A RecruitRefusal. A refusal is a verdict on somebody who
+// could be asked; these are characters who are not in the pool to be asked,
+// and the invite verb's by-name path (which an operator types) is deliberately
+// left judged by RecruitVerdictFor alone. The counts are returned so the
+// shortlist can say how many were dropped and why, rather than leaving a
+// smaller pool to be noticed.
+struct RecruitDiscovery
+{
+    std::vector<RecruitCandidate> kept;
+    unsigned notRandomBot{0};
+    unsigned onRoster{0};
+};
+RecruitDiscovery RecruitDiscoveryFrom(std::vector<RecruitCandidate> const& found);
 
 // -- the raid, and the eight groups it is made of (infra#3763) ---------------
 //
