@@ -39510,6 +39510,22 @@ private:
         return OnRoster(leader) && FamilyOfCharacter(leader) == family;
     }
 
+    // The coordinator owns the family's party, not every roster character who
+    // happens to stand on the same dungeon map (notably a finder group).
+    std::vector<std::string> FamilyPartyMembers(
+        std::vector<std::string> const& members, std::string const& family) const
+    {
+        std::vector<std::string> party;
+        party.reserve(members.size());
+        for (std::string const& name : members)
+        {
+            Player* const member = ObjectAccessor::FindPlayerByName(name);
+            if (InItsFamilyParty(member, family))
+                party.push_back(name);
+        }
+        return party;
+    }
+
     // THE LENT MEMBER LEAVES ITS FAMILY'S PARTY, the way a player types
     // /leave, and stops following its family (as SendSittingOutMemberOff does
     // for a member sitting out). The one-group rule takes it back once its
@@ -48688,7 +48704,7 @@ private:
         for (std::string const& member : members)
         {
             Player* const candidate = ObjectAccessor::FindPlayerByName(member);
-            if (!candidate || !InDungeonRun(candidate))
+            if (!candidate || !InItsFamilyParty(candidate, family) || !InDungeonRun(candidate))
                 continue;
             hasInsideMember = true;
             if (!AuthorizedDcIssuer(candidate))
@@ -48727,7 +48743,7 @@ private:
         // vendor that clears it - otherwise the coordinator waits for a trip
         // the town drive does not think is owed.
         {
-            RunBagReading const bags = ReadRunBags(members);
+            RunBagReading const bags = ReadRunBags(FamilyPartyMembers(members, family));
 
             bool const runHasMembersInside = bags.anyMemberInside &&
                 (coord.phase == DungeonRunPhase::Enter ||
@@ -48950,11 +48966,13 @@ private:
             // maintenance pass) leaves the run row active while the idle
             // coordinator returns before it can reach EXIT.
             Player* currentLeader = ObjectAccessor::FindPlayerByName(leaderName);
-            Player* activeInside = currentLeader && InDungeonRun(currentLeader)
+            std::vector<std::string> const familyParty = FamilyPartyMembers(members, family);
+            Player* activeInside = currentLeader && InItsFamilyParty(currentLeader, family) &&
+                                           InDungeonRun(currentLeader)
                                        ? currentLeader
                                        : nullptr;
             if (!activeInside)
-                for (std::string const& member : members)
+                for (std::string const& member : familyParty)
                 {
                     Player* candidate = ObjectAccessor::FindPlayerByName(member);
                     if (candidate && InDungeonRun(candidate))
@@ -49083,7 +49101,7 @@ private:
 
                 uint32 adoptedInside = 0;
                 std::vector<OverseerDecisions::DungeonRunEntryState> const adoptedStates =
-                    DungeonRunCensus(members, entryDoor, inside->insideMapId, adoptedInside,
+                    DungeonRunCensus(familyParty, entryDoor, inside->insideMapId, adoptedInside,
                                      leaderName);
 
                 // AND THIS COORDINATOR DELIBERATELY HAS NO STAGING POINT (#220).
@@ -51172,7 +51190,8 @@ private:
             // of which are about who is inside rather than about a door.
             uint32 inside = 0;
             std::vector<OverseerDecisions::DungeonRunEntryState> const states =
-                DungeonRunCensus(members, door, portal->insideMapId, inside, leaderName);
+                DungeonRunCensus(FamilyPartyMembers(members, family), door,
+                                 portal->insideMapId, inside, leaderName);
 
             // A MEMBER IN ANOTHER COPY OF THE DUNGEON IS NOT INSIDE WITH US (#620),
             // and the census already does not count it (#628). Waiting was the
