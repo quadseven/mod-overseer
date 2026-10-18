@@ -3239,11 +3239,29 @@ bool IsForeignTravelAim(std::string const& aim)
     // the keywords, so a fifth counter follows both readers.
     if (IsMaintenanceErrand(aim))
         return true;
+    // An operator's guard is nobody's errand to end but the operator's (#163).
+    if (IsTravelGuardAim(aim))
+        return true;
     // AND A POSITIONAL AIM IS THE HALF THAT WAS NOT. `rfind(s, 0) == 0` is the
     // starts-with every other aim-shape test in this module already uses, kept
     // the same here so a reader comparing them does not have to check whether
     // two spellings mean two things.
     return aim.rfind("at:", 0) == 0;
+}
+
+bool IsTravelGuardAim(std::string const& aim)
+{
+    return aim.rfind(TRAVEL_GUARD_PREFIX, 0) == 0;
+}
+
+std::string TravelGuardPlace(std::string const& aim)
+{
+    if (!IsTravelGuardAim(aim))
+        return std::string();
+    std::string const place = aim.substr(sizeof(TRAVEL_GUARD_PREFIX) - 1);
+    if (place.empty())
+        return std::string();
+    return "at:" + place;
 }
 
 LandedErrand LandedErrandStep(std::string const& landedAim,
@@ -3267,6 +3285,13 @@ LandedErrand LandedErrandStep(std::string const& landedAim,
 
 TravelClaim ReadTravelClaim(TravelClaimFacts const& facts)
 {
+    // AN OPERATOR'S GUARD BEFORE ANYTHING (#163). It outranks every owner this
+    // book claims for, a live run and a training stop included, because the
+    // guard is the person saying "not there" and every one of those walks is
+    // the module's own opinion. The book never writes a guard, so neither rule
+    // below can be about one; asked first so no later rule has to remember it.
+    if (IsTravelGuardAim(facts.column))
+        return TravelClaim::RefusedForeign;
     // THE BOOK'S OWN AIM FIRST. Replacing it disturbs nobody's walk but the
     // book's own, and asking the fences about it would refuse every re-aim of
     // a catch-up walk and every next leg of a run.
@@ -8406,6 +8431,11 @@ ErrandDeathVerdict ErrandDeathBreaker(ErrandDeathToll const& toll,
                                       ErrandDeathLimits const& limits)
 {
     ErrandDeathVerdict verdict;
+
+    // 0. AN OPERATOR'S GUARD IS NEVER CALLED OFF (#163). The deaths are why it
+    //    was written; releasing or refusing it is what stopped the walk out.
+    if (toll.guard)
+        return verdict;
 
     int64_t const cooloff = ErrandCooloffSeconds(toll.strikes, limits);
     bool const coolingOff = toll.sinceRefused >= 0 && toll.sinceRefused < cooloff;

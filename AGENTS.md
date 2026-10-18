@@ -219,6 +219,16 @@ Aim the party **leader** only, and watch the death table while it walks. If deat
 exceed roughly three in five minutes, clear the aim - the destination is not worth
 the crossing.
 
+The opposite lever, for when the party is dying where it already is: write
+`guard:<map>:<x>,<y>,<z>` into each roster row's `travel_npc`, in whole yards
+(the column is 32 characters), instead of an `at:` aim. An `at:` aim is an errand
+like any other and was released, written over and called off as lethal within
+minutes of being applied (#163). A guard is walked to and held: no release,
+claim or death count in this module ends it, and the quest drive stands down for every
+character carrying one, followers included. The log says when each guard is
+first seen and when it is cleared. Clear the column by hand to end it; the quest
+drive takes the character back on its next poll.
+
 ### "Is there ground here" and "which ground" are two questions
 
 The map's height field under and beside Stormwind is a flat placeholder at z
