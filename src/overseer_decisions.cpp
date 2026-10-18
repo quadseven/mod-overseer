@@ -7266,6 +7266,27 @@ std::string CrossingExplanation(CrossingStep const& step, CrossingWorld const& w
     return "the crossing is refused";
 }
 
+char const* BoardApproachName(BoardApproach approach)
+{
+    switch (approach)
+    {
+        case BoardApproach::CloseOnBerth: return "close on the berth";
+        case BoardApproach::StepAboard:   return "step aboard";
+    }
+    return "unknown";
+}
+
+BoardApproach BoardApproachFrom(bool levelWithBerth, float berthYards,
+                                std::uint32_t approachesSoFar,
+                                BoardApproachLimits const& limits)
+{
+    if (!levelWithBerth)
+        return BoardApproach::CloseOnBerth;
+    if (berthYards > limits.fromBerthYards && approachesSoFar < limits.maxApproaches)
+        return BoardApproach::CloseOnBerth;
+    return BoardApproach::StepAboard;
+}
+
 bool CrossingHoldsTheFamily(CrossingAction action)
 {
     switch (action)

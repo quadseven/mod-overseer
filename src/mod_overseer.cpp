@@ -1531,6 +1531,11 @@ constexpr uint32 CROSSING_STEP_WALK_SECONDS = 15;
 constexpr float CROSSING_BOARD_FROM_BERTH_YARDS = 4.0f;
 // Polls a job spends closing on the berth before it boards from where it stands.
 constexpr uint32 CROSSING_BOARD_APPROACH_TRIES = 6;
+// BOTH CROSSINGS CLOSE THE SAME WAY (#1018). The member crossing had this from
+// #913; the run leader's crossing stepped aboard from anywhere inside
+// CROSSING_BERTH_ARRIVED_YARDS and missed the Lady Mehley from 13 yards out.
+constexpr OverseerDecisions::BoardApproachLimits CROSSING_BOARD_APPROACH{
+    CROSSING_BOARD_FROM_BERTH_YARDS, CROSSING_BOARD_APPROACH_TRIES};
 // A landing is clear of the hull when none of the ring of points this far round
 // it is on the transport (OverseerDecisions::PickLanding).
 constexpr float CROSSING_HULL_CLEAR_YARDS = 3.0f;
@@ -33144,6 +33149,13 @@ private:
         uint8 crossingSaid{255};
         // When a long berth hold last said why it is still holding.
         time_t crossingHoldSaidAt{0};
+        // Polls of this Board spent closing on the berth (#1018). Zero on any
+        // other step, so each docked stop starts with the full count.
+        uint32 crossingBoardApproaches{0};
+        // The step aboard has been said for this Board. Its own flag because
+        // a Board that closed on the berth first is no longer fresh when he
+        // steps, and that line is the one that says how far he stepped from.
+        bool crossingBoardStepSaid{false};
         // The berth sweep, kept against the berth it answered about. See
         // BerthIsGuarded: this caches a reading of static spawn data, not a
         // reading of the live grid, which is the only reason it may be
@@ -42562,6 +42574,11 @@ private:
         uint8 const said = static_cast<uint8>(step.action);
         bool const fresh = coord.crossingSaid != said;
         coord.crossingSaid = said;
+        if (step.action != OverseerDecisions::CrossingAction::Board)
+        {
+            coord.crossingBoardApproaches = 0;
+            coord.crossingBoardStepSaid = false;
+        }
 
         std::string const why = OverseerDecisions::CrossingExplanation(step, route.world);
         std::string const boat =
@@ -42722,17 +42739,28 @@ private:
                 // with the berth: a hold is a root, and a leader rooted a few
                 // yards short on a ramp below it could never step aboard.
                 holdTheLeader();
-                // A LEVEL OFF IT, he is walked the rest under the hold rather
-                // than rooted short of it.
-                if (!LevelWithBerth(leader, route) &&
-                    !StepTowardBerth(leader, route.world.originMap, route.berthX, route.berthY,
-                                     route.berthZ) &&
-                    fresh)
-                    LOG_WARN("module.overseer",
-                             "overseer: '{}' is by the berth for '{}' but {:.1f} yards above "
-                             "or below it and no proved step toward it holds ground - {}",
-                             leaderName, boat,
-                             std::fabs(leader->GetPositionZ() - route.berthZ), why);
+                // A LEVEL OFF IT, OR MORE THAN A SHORT STEP FROM IT, he is
+                // walked the rest under the hold rather than rooted short of
+                // it. The step aboard is taken from the berth itself (#1018):
+                // the member crossing has closed to it since #913, and a
+                // leader rooted twelve yards out stepped aboard from there and
+                // missed.
+                {
+                    bool const holdLevel = LevelWithBerth(leader, route);
+                    if (OverseerDecisions::BoardApproachFrom(
+                            holdLevel, leader->GetExactDist2d(route.berthX, route.berthY), 0,
+                            CROSSING_BOARD_APPROACH) ==
+                            OverseerDecisions::BoardApproach::CloseOnBerth &&
+                        !StepTowardBerth(leader, route.world.originMap, route.berthX,
+                                         route.berthY, route.berthZ) &&
+                        !holdLevel && fresh)
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' is by the berth for '{}' but {:.1f} yards "
+                                 "above or below it and no proved step toward it holds "
+                                 "ground - {}",
+                                 leaderName, boat,
+                                 std::fabs(leader->GetPositionZ() - route.berthZ), why);
+                }
                 if (fresh)
                 {
                     coord.crossingHoldSaidAt = std::time(nullptr);
@@ -42882,7 +42910,34 @@ private:
                 if (fresh)
                     _travelAims.Release(leaderName, "the dungeon run coordinator");
                 holdTheLeader();
-                if (!LevelWithBerth(leader, route))
+                bool const boardLevel = LevelWithBerth(leader, route);
+                float const fromBerth = leader->GetExactDist2d(route.berthX, route.berthY);
+                if (OverseerDecisions::BoardApproachFrom(boardLevel, fromBerth,
+                                                         coord.crossingBoardApproaches,
+                                                         CROSSING_BOARD_APPROACH) ==
+                        OverseerDecisions::BoardApproach::CloseOnBerth &&
+                    boardLevel)
+                {
+                    // LEVEL, BUT MORE THAN A SHORT STEP FROM THE BERTH (#1018).
+                    // Closed on it first, bounded, as the member crossing is:
+                    // a step aboard from twelve yards out is the one measured
+                    // to miss.
+                    ++coord.crossingBoardApproaches;
+                    bool const stepped = StepTowardBerth(leader, route.world.originMap,
+                                                         route.berthX, route.berthY,
+                                                         route.berthZ);
+                    if (fresh)
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' is {:.1f} yards from the berth for '{}', more "
+                                 "than the {:.0f} a step aboard is taken from, so he closes on "
+                                 "it first ({}) - {}",
+                                 leaderName, fromBerth, boat, CROSSING_BOARD_FROM_BERTH_YARDS,
+                                 stepped ? "a proved step toward it"
+                                         : "no proved step toward it holds ground",
+                                 why);
+                    break;
+                }
+                if (!boardLevel)
                 {
                     // Not level with the deck yet: the proved step up first,
                     // and the step aboard on a later poll.
@@ -42929,12 +42984,16 @@ private:
                                                      /*generatePath*/ false,
                                                      /*forceDestination*/ false);
                 LetHeldCharacterWalk(leaderName, CROSSING_STEP_WALK_SECONDS);
-                if (fresh)
+                if (!coord.crossingBoardStepSaid)
+                {
+                    coord.crossingBoardStepSaid = true;
                     LOG_INFO("module.overseer",
                              "overseer: '{}' steps aboard '{}' at ({:.1f}, {:.1f}, {:.1f}) on "
-                             "map {}, {:.1f} yards from where he stands - {}",
+                             "map {}, {:.1f} yards from where he stands and {:.1f} from the "
+                             "berth - {}",
                              leaderName, boat, x, y, z, route.world.originMap,
-                             leader->GetExactDist2d(x, y), why);
+                             leader->GetExactDist2d(x, y), fromBerth, why);
+                }
                 break;
             }
 
@@ -44303,8 +44362,9 @@ private:
                 holdIt();
                 // WAITING FOR THE BOAT IS WAITING ON ITS BERTH: close the last
                 // yards now, so the step aboard is a short one when it docks.
-                if (!LevelWithBerth(p, route) ||
-                    p->GetExactDist2d(route.berthX, route.berthY) > CROSSING_BOARD_FROM_BERTH_YARDS)
+                if (OverseerDecisions::BoardApproachFrom(
+                        LevelWithBerth(p, route), p->GetExactDist2d(route.berthX, route.berthY),
+                        0, CROSSING_BOARD_APPROACH) == OverseerDecisions::BoardApproach::CloseOnBerth)
                     StepTowardBerth(p, origin, route.berthX, route.berthY, route.berthZ);
                 if (fresh || std::time(nullptr) - memo.holdSaidAt >= 60)
                 {
@@ -44324,10 +44384,10 @@ private:
                 holdIt();
                 // BOUNDED, so a berth nobody can stand within a few yards of
                 // never keeps the boat from being boarded at all.
-                if (!LevelWithBerth(p, route) ||
-                    (p->GetExactDist2d(route.berthX, route.berthY) >
-                         CROSSING_BOARD_FROM_BERTH_YARDS &&
-                     memo.boardApproaches < CROSSING_BOARD_APPROACH_TRIES))
+                if (OverseerDecisions::BoardApproachFrom(
+                        LevelWithBerth(p, route), p->GetExactDist2d(route.berthX, route.berthY),
+                        memo.boardApproaches, CROSSING_BOARD_APPROACH) ==
+                    OverseerDecisions::BoardApproach::CloseOnBerth)
                 {
                     ++memo.boardApproaches;
                     StepTowardBerth(p, origin, route.berthX, route.berthY, route.berthZ);

@@ -8751,6 +8751,44 @@ CrossingStep ReadCrossing(CrossingWorld const& world,
 // that does not say which fact was missing trains an operator to ignore it.
 std::string CrossingExplanation(CrossingStep const& step, CrossingWorld const& world);
 
+// ------------------------------- the step aboard is taken from the berth (#1018) --
+//
+// WHAT WAS MEASURED. A crossing reads "at the berth" from twelve yards out,
+// and on the dev realm a step aboard the Menethil boat taken from 11.6 and 12.5
+// yards left the walker 28 yards from the berth and not aboard, both times,
+// while one taken from 7.8 yards sailed (#913). The fix closed the walker on
+// the berth first - but only in the member crossing. The run leader's own
+// crossing stepped him aboard from wherever he stood inside the twelve yards,
+// and a step that missed left him further out than the tolerance, so the next
+// reading said Walk and he was sent back to the pier with the ship still
+// docked (#758). Both crossings now ask this one question.
+enum class BoardApproach : std::uint8_t
+{
+    // Step toward the berth this poll, and do not step aboard yet.
+    CloseOnBerth,
+    // Step aboard from where the walker stands.
+    StepAboard,
+};
+
+char const* BoardApproachName(BoardApproach approach);
+
+struct BoardApproachLimits
+{
+    // Within this of the berth on the plane, a step aboard is a short one.
+    float fromBerthYards{0.f};
+    // Polls spent closing on the berth before boarding from where it stands,
+    // so a berth nobody can stand near never stops the boat being boarded.
+    std::uint32_t maxApproaches{0};
+};
+
+// LEVEL FIRST, AND UNBOUNDED: a walker above or below the deck is not one
+// step from it, however many polls that takes, so that case never boards. The
+// distance is bounded by `maxApproaches`. Waiting for the boat (Hold) asks
+// with `approachesSoFar` zero, so the walker is already close when it docks.
+BoardApproach BoardApproachFrom(bool levelWithBerth, float berthYards,
+                                std::uint32_t approachesSoFar,
+                                BoardApproachLimits const& limits);
+
 // ------------------------ a run that gathers across an ocean (2026-10-09) --
 //
 // WHAT WAS MEASURED. 55 family campaign runs in 72 hours on the dev realm: 12
