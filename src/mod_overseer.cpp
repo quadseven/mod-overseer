@@ -118,11 +118,13 @@
  *                     patches/mod-playerbots/0013 fixes. That patch keeps a
  *                     mage supplied; this verb is how a PARTY gets stocked,
  *                     because upstream's trigger only fires on an empty stack.
- *                     A hearthstone has a cast time, so nothing has happened
- *                     when the handler returns and the row parks in `verifying`
- *                     until ResolveConjureChecks reads the bags back. The
- *                     conjure loop is longer than the hearth, and it is the only
- *                     one that also ACTS more than once: a stack is twenty
+ *                     NOTHING IS CAST WHEN THE HANDLER RETURNS (#325): a
+ *                     character claimed off this queue is usually walking, and
+ *                     a timed cast at a moving caster is thrown away, so the
+ *                     row parks in `verifying` with the character held still
+ *                     and ResolveConjureChecks sends the first cast on the
+ *                     first poll that finds it standing. Unlike the hearth and
+ *                     the summon, it also ACTS more than once: a stack is twenty
  *                     units, a cast makes two of them, so one row is ten three
  *                     second casts and ResolveConjureChecks reads the bags
  *                     back between every one. `up_to:<n>` is a total and not
