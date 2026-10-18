@@ -147,6 +147,33 @@ void AnEventGatedBossIsNotRequired()
              DungeonRunExpectedMask(389, 0b1111, 0) == 0b1111, true);
 }
 
+void TheUpperSpireIsNotPartOfALowerSpireRun()
+{
+    // #580. DungeonEncounter.dbc, map 229, normal difficulty (dev realm client
+    // data, 2026-10-18): 14 encounters, bits 0 to 13. Bits 0 to 8 are the
+    // Lower Spire, Highlord Omokk to Overlord Wyrmthalak; bits 9 to 13 the
+    // Upper Spire, Pyroguard Emberseer to General Drakkisath. Both share
+    // areatriggers 1468 and 1470, and the Dragonspine Door between them
+    // (gameobject 164725) spawns open with lock 0, so nothing at the door
+    // stops a Lower Spire party walking on. The client lists the Upper Spire
+    // as a raid (LFGDungeons 44, type 2), and no portal row runs it.
+    constexpr uint32_t spire = (1u << 14) - 1;
+    constexpr uint32_t lower = (1u << 9) - 1;
+    constexpr uint32_t wyrmthalak = 1u << 8;
+    CheckBool("a Lower Spire run expects the Lower Spire's nine bosses",
+             DungeonRunExpectedMask(229, spire, 0) == lower, true);
+    Check("a Lower Spire run is complete at Overlord Wyrmthalak",
+          DungeonRunCompletion(DungeonRunExpectedMask(229, spire, 0), lower),
+          DungeonCompletion::Complete);
+    Check("and not before him",
+          DungeonRunCompletion(DungeonRunExpectedMask(229, spire, 0), lower & ~wyrmthalak),
+          DungeonCompletion::NotYet);
+    CheckBool("Blackrock Spire is not a split-wing map",
+             DungeonMapHasIndependentWings(229), false);
+    CheckBool("Blackrock Depths, next door, keeps its whole mask",
+             DungeonRunExpectedMask(230, (1u << 19) - 1, 0) == (1u << 19) - 1, true);
+}
+
 void TheOutcomeWordPrefersProofOverInference()
 {
     CheckWord("plain walk out", DungeonRunExitOutcome(false, false, false), "left");
@@ -201,6 +228,7 @@ int main()
     BitsTheMapDoesNotCreditAreIgnored();
     IndependentWingsUseOnlyTheirVerifiedEncounters();
     AnEventGatedBossIsNotRequired();
+    TheUpperSpireIsNotPartOfALowerSpireRun();
     TheOutcomeWordPrefersProofOverInference();
     TheNewWordStillCountsAsARun();
     if (!failures)
