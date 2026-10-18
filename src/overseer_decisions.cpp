@@ -18687,7 +18687,9 @@ unsigned GuildRunCeilingForMap(std::uint32_t mapId, bool finderEndsDungeon,
 {
     unsigned const base = GuildRunCeilingSeconds(finderEndsDungeon, bossesExpected);
     unsigned const perBoss = GuildRunSecondsPerBoss(mapId);
-    if (!perBoss)
+    // No bosses read yet means nothing to scale: keep the base ceiling rather
+    // than the margin alone, whatever the margin is set to.
+    if (!perBoss || bossesExpected == 0)
         return base;
     return std::max(base, bossesExpected * perBoss + GUILD_RUN_CEILING_MARGIN_SECONDS);
 }

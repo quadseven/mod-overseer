@@ -21129,7 +21129,8 @@ unsigned GuildRunCeilingSeconds(bool finderEndsDungeon, unsigned bossesExpected)
 // GuildRunSecondsPerBoss gets that many seconds a boss for the bosses it
 // expects, plus GUILD_RUN_CEILING_MARGIN_SECONDS, never less than the base
 // ceiling. A seven-boss Blackfathom gets 7 * 1800 + 1800 = 14400 s. Every map not in
-// the table, and every map whose boss count gives less, keeps GuildRunCeilingSeconds.
+// the table, every run with no bosses read yet, and every map whose boss count
+// gives less, keeps GuildRunCeilingSeconds.
 constexpr unsigned GUILD_RUN_CEILING_MARGIN_SECONDS = 30 * 60;
 // Seconds a boss for a map with a measured slow clear; 0 for every other map.
 unsigned GuildRunSecondsPerBoss(std::uint32_t mapId);
