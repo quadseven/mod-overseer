@@ -1,0 +1,3 @@
+# Seeded-negative probe for the leak scan. DO NOT MERGE.
+# Planted fake private-range address (not a real host):
+probe_target = "10.99.88.77"
