@@ -16281,6 +16281,24 @@ std::vector<uint32_t> ClassSpellsToBuy(std::vector<ClassSpellOffer> offers, uint
     return bought;
 }
 
+std::vector<uint32_t> ClassSpellsToBuyThisPass(std::vector<ClassSpellOffer> offers, uint64_t money,
+                                               std::vector<uint32_t> const& tried)
+{
+    offers.erase(std::remove_if(offers.begin(), offers.end(),
+                                [&tried](ClassSpellOffer const& offer)
+                                {
+                                    return std::find(tried.begin(), tried.end(), offer.spell) !=
+                                           tried.end();
+                                }),
+                 offers.end());
+    return ClassSpellsToBuy(std::move(offers), money);
+}
+
+bool ClassWalkReadsAgain(uint32_t pass, uint32_t boughtThisPass)
+{
+    return boughtThisPass > 0 && pass + 1 < CLASS_LEARN_MAX_PASSES;
+}
+
 VendorWalkRequest ParseVendorWalkRequest(std::string const& command)
 {
     VendorWalkRequest request;

@@ -18946,6 +18946,22 @@ struct ClassSpellOffer
 // at its level. Spell 0 is never bought.
 std::vector<uint32_t> ClassSpellsToBuy(std::vector<ClassSpellOffer> offers, uint64_t money);
 
+// ONE VISIT BUYS EVERY RANK THE PURSE COVERS (wow-overseer#792). The core
+// offers rank N only once rank N-1 is known (Trainer::GetDefaultSpellState),
+// so the list a class walk reads at the door holds first ranks only, and a
+// member far behind used to need one walk per rank, three hours apart. So the
+// arrival reads the list again after each pass, as the guild drive and the
+// family's training stop already do (BuyAffordableClassSpells), and buys:
+// ClassSpellsToBuy over the offers not `tried` earlier in the same visit (one
+// the core refused is not asked again, whatever it cost).
+std::vector<uint32_t> ClassSpellsToBuyThisPass(std::vector<ClassSpellOffer> offers, uint64_t money,
+                                               std::vector<uint32_t> const& tried);
+
+// Whether the visit reads the trainer's list again after pass `pass` (from 0),
+// which bought `boughtThisPass` spells: only after a pass that bought one, and
+// never past CLASS_LEARN_MAX_PASSES passes in all.
+bool ClassWalkReadsAgain(uint32_t pass, uint32_t boughtThisPass);
+
 struct VendorWalkRequest
 {
     uint32_t item{0};
