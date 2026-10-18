@@ -143,6 +143,33 @@ LockboxStep LockboxNext(LockboxFacts const& facts)
     return LockboxStep::UnlockAndOpen;
 }
 
+std::vector<std::size_t> LockboxesToOpen(std::vector<LockboxCarried> const& carried)
+{
+    std::vector<std::size_t> out;
+    for (std::size_t i = 0; i < carried.size(); ++i)
+    {
+        LockboxCarried const& item = carried[i];
+        if (item.lockbox && item.hasLoot && !item.locked && !item.wrapped)
+            out.push_back(i);
+    }
+    return out;
+}
+
+LockboxOpenVerdict LockboxOpenOutcome(LockboxOpenTally const& tally)
+{
+    if (tally.openable == 0)
+        return {"delivered", "no_unlocked_box"};
+    if (tally.windowBusy)
+        return {"unchanged", "loot_window_busy"};
+    if (tally.opened == 0)
+        return {"error", "not_opened"};
+    if (tally.consumed == 0)
+        return {"unchanged", "kept"};
+    if (tally.kept > 0)
+        return {"delivered", "partly_consumed"};
+    return {"delivered", "consumed"};
+}
+
 void RememberDamage(DamageHistory& history, DamageTaken sample)
 {
     if (history.size() == DEATH_DAMAGE_HISTORY_SIZE)

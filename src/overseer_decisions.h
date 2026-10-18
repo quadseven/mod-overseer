@@ -181,6 +181,49 @@ enum class LockboxStep : std::uint8_t
 
 LockboxStep LockboxNext(LockboxFacts const& facts);
 
+// ONE CARRIED ITEM, AS THE OPENER SEES IT (mod-overseer#531). Read off the item
+// instance, never off its entry: upstream's FindOpenableItem and
+// FindLockedItem test `GetItemByEntry(entry)->IsLocked()`, the FIRST box of an
+// entry, so a rogue holding ten boxes of one entry whose first one is still
+// locked never opens the nine already picked.
+struct LockboxCarried
+{
+    bool lockbox{false};  // item_template.LockID != 0
+    bool hasLoot{false};  // ITEM_FLAG_HAS_LOOT: the core's open handler takes it
+    bool locked{false};   // this instance, not the entry
+    bool wrapped{false};  // a gift wrap opens to an item, not to loot
+};
+
+// Indexes, in bag order, of the carried lockboxes the holder can open now: a
+// lockbox, with loot, unlocked on this instance, not wrapped.
+std::vector<std::size_t> LockboxesToOpen(std::vector<LockboxCarried> const& carried);
+
+// WHAT ONE `open items` ROW DID, read back off the bags after each box was
+// opened, its loot taken and the window released. A box the core destroys on
+// release is consumed; one it keeps still holds loot that did not fit.
+struct LockboxOpenTally
+{
+    std::uint32_t openable{0};  // unlocked boxes found in the bags
+    std::uint32_t opened{0};    // the core opened a loot window on it
+    std::uint32_t consumed{0};  // gone from the bags after the release
+    std::uint32_t kept{0};      // still carried after the release
+    bool windowBusy{false};     // a loot window was already open: none tried
+};
+
+struct LockboxOpenVerdict
+{
+    std::string status;   // overseer_command.status
+    std::string outcome;  // the `outcome` field of the row's result
+};
+
+// `delivered` when at least one box was consumed, or when no box was unlocked
+// yet (only the unlock half was queued). `unchanged` when boxes were opened and
+// every one is still carried - its loot did not fit - so a full rogue reads
+// differently from one that emptied its boxes, and `unchanged` when another
+// loot window was open so none was tried. `error` when an unlocked box was
+// found and the core opened none of them.
+LockboxOpenVerdict LockboxOpenOutcome(LockboxOpenTally const& tally);
+
 // The bounded evidence retained for a death. An empty source means that the
 // sampler could see health fall but could not identify the damage source.
 struct DamageTaken

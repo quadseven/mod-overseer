@@ -55170,9 +55170,27 @@ private:
         SayHowTheQueueIsDoing(pending, executed, held, oldestPendingAge);
     }
 
-    // Queue the playerbot actions that naturally unlock and open carried
-    // lockboxes. The upstream actions perform the Pick Lock spell and skill
-    // checks; this module only refuses a character that cannot perform them.
+    // Queue the playerbot action that naturally picks carried lockboxes, and
+    // open the boxes already picked. The upstream unlock action performs the
+    // Pick Lock spell and skill checks; this module only refuses a character
+    // that cannot perform them.
+    //
+    // THE OPEN HALF IS DONE HERE, NOT HANDED TO `open items` (#531). Measured
+    // on the dev realm: `open items` was delivered for weeks and the picked
+    // boxes stayed in the rogue's bags, full of their loot. Two upstream
+    // reasons, both read in mod-playerbots: OpenItemAction only sends
+    // CMSG_OPEN_ITEM and leaves the window to the bot's loot strategy, which
+    // closes a window untaken when the bags are over 80 percent full (the same
+    // wall TakeChestLoot was written for); and FindOpenableItem tests the lock
+    // on GetItemByEntry, the FIRST box of an entry, so one still-locked box
+    // hides every picked box of the same entry behind it. So each picked box is
+    // chosen on its own instance (LockboxesToOpen) and opened with the packets
+    // a client's right-click sends: CMSG_OPEN_ITEM, a CMSG_AUTOSTORE_LOOT_ITEM
+    // per slot (the core's StoreLootItem refuses what the bags cannot hold),
+    // CMSG_LOOT_MONEY, then CMSG_LOOT_RELEASE, on which the core destroys a box
+    // whose loot is all taken and keeps one that still holds some. Whether each
+    // box left the bags is read back, so a full rogue's row says so instead of
+    // `delivered` over an unchanged bag.
     static char const* DoOpenLockboxes(Player* player, char const*& status,
                                        std::string& rowResult)
     {
@@ -55188,14 +55206,120 @@ private:
             return "target has no bot AI (selfbot not enabled?)";
 
         botAI->HandleCommand(CHAT_MSG_WHISPER, "unlock items", player);
-        botAI->HandleCommand(CHAT_MSG_WHISPER, "open items", player);
-        status = "delivered";
-        rowResult = "{\"outcome\":\"queued\",\"mechanism\":\"Pick Lock spell and Lockpicking skill\",\"actions\":[\"unlock items\",\"open items\"]}";
+
+        std::vector<ObjectGuid> boxes;
+        std::vector<OverseerDecisions::LockboxCarried> carried;
+        auto note = [&](Item* item)
+        {
+            if (!item)
+                return;
+            ItemTemplate const* proto = item->GetTemplate();
+            if (!proto)
+                return;
+            OverseerDecisions::LockboxCarried facts;
+            facts.lockbox = proto->LockID != 0;
+            facts.hasLoot = proto->HasFlag(ITEM_FLAG_HAS_LOOT);
+            facts.locked = item->IsLocked();
+            facts.wrapped = item->IsWrapped();
+            boxes.push_back(item->GetGUID());
+            carried.push_back(facts);
+        };
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            note(player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
+        for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+            if (Bag* bag = player->GetBagByPos(bagSlot))
+                for (uint32 i = 0; i < bag->GetBagSize(); ++i)
+                    note(bag->GetItemByPos(i));
+
+        std::vector<std::size_t> const open = OverseerDecisions::LockboxesToOpen(carried);
+        OverseerDecisions::LockboxOpenTally tally;
+        tally.openable = static_cast<uint32>(open.size());
+        uint32 itemsTaken = 0;
+        WorldSession* const session = player->GetSession();
+        // A loot window already open is the bot's own (a corpse, a chest); the
+        // core would release it to open the box, so the boxes wait a pass.
+        tally.windowBusy = !player->GetLootGUID().IsEmpty() || !session;
+        for (std::size_t const index : open)
+        {
+            if (tally.windowBusy)
+                break;
+            ObjectGuid const boxGuid = boxes[index];
+            Item* box = player->GetItemByGuid(boxGuid);
+            if (!box)
+                continue;
+
+            WorldPacket openPacket(CMSG_OPEN_ITEM, 2);
+            openPacket << uint8(box->GetBagSlot()) << uint8(box->GetSlot());
+            openPacket.rpos(0);
+            session->HandleOpenItemOpcode(openPacket);
+            if (player->GetLootGUID() != boxGuid)
+                continue;
+            ++tally.opened;
+
+            box = player->GetItemByGuid(boxGuid);
+            if (box)
+            {
+                Loot& loot = box->loot;
+                uint32 const before = loot.unlootedCount;
+                for (uint8 const slot : OverseerDecisions::ChestLootSlots(
+                         boxGuid.GetRawValue(), player->GetLootGUID().GetRawValue(),
+                         loot.items.size(), loot.quest_items.size()))
+                {
+                    WorldPacket take(CMSG_AUTOSTORE_LOOT_ITEM, 1);
+                    take << slot;
+                    take.rpos(0);
+                    session->HandleAutostoreLootItemOpcode(take);
+                }
+                if (loot.gold)
+                {
+                    WorldPacket gold(CMSG_LOOT_MONEY, 0);
+                    session->HandleLootMoneyOpcode(gold);
+                }
+                if (before > loot.unlootedCount)
+                    itemsTaken += before - loot.unlootedCount;
+            }
+
+            WorldPacket release(CMSG_LOOT_RELEASE, 8);
+            release << boxGuid;
+            release.rpos(0);
+            session->HandleLootReleaseOpcode(release);
+
+            if (player->GetItemByGuid(boxGuid))
+                ++tally.kept;
+            else
+                ++tally.consumed;
+        }
+
+        OverseerDecisions::LockboxOpenVerdict const verdict =
+            OverseerDecisions::LockboxOpenOutcome(tally);
+        rowResult = "{\"outcome\":\"" + verdict.outcome + "\",\"openable\":" +
+                    std::to_string(tally.openable) + ",\"opened\":" +
+                    std::to_string(tally.opened) + ",\"consumed\":" +
+                    std::to_string(tally.consumed) + ",\"kept\":" +
+                    std::to_string(tally.kept) + ",\"items_taken\":" +
+                    std::to_string(itemsTaken) +
+                    ",\"mechanism\":\"Pick Lock spell and Lockpicking skill; "
+                    "CMSG_OPEN_ITEM and the loot packets\",\"queued\":[\"unlock items\"]}";
         LOG_INFO("module.overseer",
-                 "overseer: queued natural lockbox opening for '{}' through Pick Lock and "
-                 "Lockpicking; no skill was granted",
-                 player->GetName());
-        return "";
+                 "overseer: '{}' lockboxes - {} unlocked, {} opened, {} consumed, {} kept, "
+                 "{} loot item(s) reached the bags ({}); `unlock items` queued for the rest; "
+                 "no skill was granted",
+                 player->GetName(), tally.openable, tally.opened, tally.consumed, tally.kept,
+                 itemsTaken, verdict.outcome);
+        if (verdict.status == "delivered")
+        {
+            status = "delivered";
+            return "";
+        }
+        if (verdict.status == "unchanged")
+        {
+            status = "unchanged";
+            return tally.windowBusy ? "a loot window was already open; the boxes wait a pass"
+                                    : "every opened lockbox is still carried: its loot did not "
+                                      "fit in the bags";
+        }
+        status = "error";
+        return "the core opened none of the unlocked lockboxes";
     }
 
     // Speak as the character would. Language matches mod-playerbots' own
