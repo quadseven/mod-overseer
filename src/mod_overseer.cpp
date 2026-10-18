@@ -74021,6 +74021,291 @@ void SpendTalentsTowardSeat(Player* player, char const* when)
 // both land. Refusing it is what a group that agreed to go to town first does
 // at the door: it does not go in. Only a held family, only onto a map with a
 // portal row, only an alive character this module steers.
+// --------------------------------------------- vendor, gold, auras (#960) --
+//
+// WHAT THIS RECORDS. overseer_event held item_loot, quest_reward, craft,
+// item_given, learn, level_up, item_equip, tidy, town_trip, repair and death,
+// but nothing for vendor buys, vendor sales, gold changes or auras gained, so
+// a gold or buff grant was invisible to #937. Four new kinds close the gap,
+// for roster characters and the guilds they belong to only (ItemStoryWho,
+// reused: the same gate the item story uses):
+//
+//   vendor_buy   subject_id = item entry, subject_name = item name,
+//                detail = "3 for 1200 copper"
+//   vendor_sale  subject_id = item entry, subject_name = item name,
+//                detail = "1 for 45 copper"
+//   gold_change  subject_id = the GoldSource code, subject_name = the source
+//                word, detail = the signed amount ("+52 copper", "-103 copper")
+//   aura_gained  subject_id = spell id, subject_name = spell name,
+//                detail = the duration ("3600 seconds", "permanent"),
+//                source = the caster word
+//
+// `kind` is a VARCHAR, so none of this is a schema change: the columns are
+// the ones #567 and #372 added, and the row shapes are built by the pure
+// functions in OverseerDecisions (tests/test_vendor_gold_aura.cpp), where a
+// test naming them does not compile on main.
+//
+// WHERE THE SOURCE COMES FROM. OnPlayerMoneyChanged knows an amount but not
+// a reason, so the hooks that do know leave a pending note: the loot-money
+// hooks before looted money is added, the vendor hooks around a purchase or
+// a sale. A money change that finds no note says "other" rather than staying
+// silent, because an unnamed gain is the signal #937 watches for, not a
+// reason to drop the row. Quest money is the known gap: RewardQuest moves it
+// before OnPlayerCompleteQuest fires (PlayerQuest.cpp), so no hook can name
+// it and it reads "other" - the quest_reward row beside it is the
+// correlation, not this table's guess.
+//
+// A NOTE IS CONSUMED, NOT STORED. The note lives only until the character's
+// next money change, and a note older than kGoldNoteTtlSeconds is dead on
+// arrival: the buy hook fires before the core validates the purchase, so a
+// refused buy must not mislabel the next loot. The buy and sell flows are
+// synchronous - hook, validation, money - so a note consumed within the TTL
+// is the same flow, and anything older is someone else's money.
+
+// One money change's explanation, left by a hook that knew the reason and
+// consumed by OnPlayerMoneyChanged. For buy/sale the hook also stashes what
+// moved, because the money hook knows the exact price but not the item.
+struct GoldNote
+{
+    std::string source;  // "loot", "buy", "sale"; empty when never noted
+    std::time_t at = 0;
+    uint32 itemEntry = 0;
+    uint32 itemCount = 0;
+    std::string itemName;
+};
+
+std::mutex g_goldNoteMutex;
+std::map<uint32, GoldNote> g_goldNotes;  // player guid counter -> pending note
+
+// The buy and sell flows are synchronous (hook, validation, money), so five
+// seconds is generous; anything older is a refused purchase, not a reason.
+std::time_t const kGoldNoteTtlSeconds = 5;
+
+void PurgeStaleGoldNotes(std::time_t now)  // g_goldNoteMutex is held
+{
+    for (auto it = g_goldNotes.begin(); it != g_goldNotes.end();)
+    {
+        if (now - it->second.at > kGoldNoteTtlSeconds)
+            it = g_goldNotes.erase(it);
+        else
+            ++it;
+    }
+}
+
+void NoteGoldSource(Player* player, char const* source)
+{
+    if (!player || !source)
+        return;
+    std::time_t const now = std::time(nullptr);
+    std::lock_guard<std::mutex> guard(g_goldNoteMutex);
+    PurgeStaleGoldNotes(now);
+    GoldNote& note = g_goldNotes[player->GetGUID().GetCounter()];
+    note.source = source;
+    note.at = now;
+    note.itemEntry = 0;
+    note.itemCount = 0;
+    note.itemName.clear();
+}
+
+void NoteVendorTrade(Player* player, char const* source, uint32 itemEntry,
+                     uint32 itemCount, std::string const& itemName)
+{
+    if (!player || !source)
+        return;
+    std::time_t const now = std::time(nullptr);
+    std::lock_guard<std::mutex> guard(g_goldNoteMutex);
+    PurgeStaleGoldNotes(now);
+    GoldNote& note = g_goldNotes[player->GetGUID().GetCounter()];
+    note.source = source;
+    note.at = now;
+    note.itemEntry = itemEntry;
+    note.itemCount = itemCount;
+    note.itemName = itemName;
+}
+
+// The note a money change consumes: the pending one when it is fresh, empty
+// otherwise. Consumed either way - a note explains one change.
+GoldNote TakeGoldNote(Player* player)
+{
+    GoldNote taken;
+    if (!player)
+        return taken;
+    std::time_t const now = std::time(nullptr);
+    std::lock_guard<std::mutex> guard(g_goldNoteMutex);
+    auto it = g_goldNotes.find(player->GetGUID().GetCounter());
+    if (it == g_goldNotes.end())
+        return taken;
+    if (now - it->second.at <= kGoldNoteTtlSeconds)
+        taken = it->second;
+    g_goldNotes.erase(it);
+    return taken;
+}
+
+class OverseerLedgerScript : public PlayerScript
+{
+public:
+    // Only the hooks this script implements - see OverseerEventScript for why
+    // the list is explicit.
+    OverseerLedgerScript() : PlayerScript("OverseerLedgerScript", {
+        PLAYERHOOK_ON_MONEY_CHANGED,
+        PLAYERHOOK_ON_BEFORE_LOOT_MONEY,
+        PLAYERHOOK_ON_AFTER_CREATURE_LOOT_MONEY,
+        PLAYERHOOK_ON_BEFORE_BUY_ITEM_FROM_VENDOR,
+        PLAYERHOOK_CAN_SELL_ITEM,
+    }) {}
+
+    // EVERY GOLD CHANGE. ModifyMoney calls this with the signed delta before
+    // it moves anything (Player.cpp), so this is the one place all gold
+    // movement is visible: loot, quest rewards, vendor trade, mail, training,
+    // GM grants. The note names the source where a hook knew it; anything
+    // else is "other", which is the signal, not a gap.
+    void OnPlayerMoneyChanged(Player* player, int32& amount) override
+    {
+        if (!player || !OverseerDecisions::ShouldRecordGoldChange(amount))
+            return;
+        if (!OverseerDecisions::ShouldRecordVendorTrade(StoryWho(player)))
+            return;
+        GoldNote const note = TakeGoldNote(player);
+        OverseerDecisions::GoldSource const source =
+            OverseerDecisions::ResolveGoldSource(
+                note.source.empty() ? nullptr : note.source.c_str());
+        OverseerDecisions::OverseerEventFields const fields =
+            OverseerDecisions::GoldChangeFields(amount, source);
+        RecordEvent(player, fields.kind, fields.subjectId, fields.subjectName,
+                    fields.detail);
+
+        // The vendor event rides the same change: the buy/sell hook stashed
+        // what moved, and this amount is the exact price the core charged or
+        // paid. The direction has to agree with the note, or a stale note is
+        // writing fiction about someone else's money.
+        bool const bought = source == OverseerDecisions::GoldSource::Buy && amount < 0;
+        bool const sold = source == OverseerDecisions::GoldSource::Sale && amount > 0;
+        if (note.itemEntry != 0 && (bought || sold))
+        {
+            OverseerDecisions::OverseerEventFields const trade = bought
+                ? OverseerDecisions::VendorBuyFields(note.itemEntry, note.itemName,
+                                                    note.itemCount, uint32(-amount))
+                : OverseerDecisions::VendorSaleFields(note.itemEntry, note.itemName,
+                                                     note.itemCount, uint32(amount));
+            EventExtra extra;
+            extra.source = trade.source;
+            RecordEvent(player, trade.kind, trade.subjectId, trade.subjectName,
+                        trade.detail, extra);
+        }
+    }
+
+    void OnPlayerBeforeLootMoney(Player* player, Loot* /*loot*/) override
+    {
+        if (!player || !OverseerDecisions::ShouldRecordVendorTrade(StoryWho(player)))
+            return;
+        NoteGoldSource(player, "loot");
+    }
+
+    void OnPlayerAfterCreatureLootMoney(Player* player) override
+    {
+        if (!player || !OverseerDecisions::ShouldRecordVendorTrade(StoryWho(player)))
+            return;
+        NoteGoldSource(player, "loot");
+    }
+
+    // Fires before the core validates the purchase (Player.cpp), which is why
+    // the note has a TTL: a refused buy leaves a note the next loot must not
+    // wear.
+    void OnPlayerBeforeBuyItemFromVendor(Player* player, ObjectGuid /*vendorguid*/,
+                                         uint32 /*vendorslot*/, uint32& item, uint8 count,
+                                         uint8 /*bag*/, uint8 /*slot*/) override
+    {
+        if (!player || !OverseerDecisions::ShouldRecordVendorTrade(StoryWho(player)))
+            return;
+        std::string name;
+        if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(item))
+            name = proto->Name1;
+        NoteVendorTrade(player, "buy", item, count, name);
+    }
+
+    // A veto hook asked by the sell opcode before anything moves, so the sale
+    // is a note plus a stash: the money hook files both events when the gold
+    // actually lands. Returns true always - this script records, it does not
+    // refuse; OverseerKeepScript is the refusing one.
+    bool OnPlayerCanSellItem(Player* player, Item* item, Creature* /*creature*/) override
+    {
+        if (!player || !item ||
+            !OverseerDecisions::ShouldRecordVendorTrade(StoryWho(player)))
+            return true;
+        std::string name;
+        if (ItemTemplate const* proto = item->GetTemplate())
+            name = proto->Name1;
+        NoteVendorTrade(player, "sale", item->GetEntry(), item->GetCount(), name);
+        return true;
+    }
+};
+
+class OverseerAuraScript : public UnitScript
+{
+public:
+    OverseerAuraScript() : UnitScript("OverseerAuraScript", true, {
+        UNITHOOK_ON_AURA_APPLY,
+    }) {}
+
+    // THE BUSIEST HOOK IN THIS FILE, so it is shaped like the equip hook's
+    // cheap tests: a null aura, a non-positive aura and a short aura all
+    // leave on field reads, and only a long buff on a covered character
+    // reaches the roster lookup.
+    void OnAuraApply(Unit* unit, Aura* aura) override
+    {
+        if (!unit || !aura || !aura->IsPositive())
+            return;
+        int32 const maxMs = aura->GetMaxDuration();
+        bool const permanent = maxMs < 0;
+        if (!permanent && maxMs <= 60 * 1000)
+            return;
+        Player* player = unit->ToPlayer();
+        if (!player)
+            return;
+        if (!OverseerDecisions::ShouldRecordVendorTrade(StoryWho(player)))
+            return;
+        SpellInfo const* info = aura->GetSpellInfo();
+        uint32 const spellId = info ? info->Id : 0;
+        std::string const spellName = info ? info->SpellName[LOCALE_enUS] : "";
+        OverseerDecisions::OverseerEventFields fields =
+            OverseerDecisions::AuraGainedFields(
+                spellId, spellName, permanent ? 0 : uint32(maxMs / 1000),
+                ClassifyAuraCaster(player, aura));
+        if (permanent)
+            fields.detail = "permanent";
+        EventExtra extra;
+        extra.source = fields.source;
+        RecordEvent(player, fields.kind, fields.subjectId, fields.subjectName,
+                    fields.detail, extra);
+    }
+
+private:
+    // Who put the aura there, in the caster's relation to the wearer. A caster
+    // the server cannot produce is "none", and that row is the one #937 is
+    // watching for.
+    static OverseerDecisions::AuraCaster ClassifyAuraCaster(Player* wearer, Aura* aura)
+    {
+        ObjectGuid const casterGuid = aura->GetCasterGUID();
+        if (casterGuid.IsEmpty())
+            return OverseerDecisions::AuraCaster::None;
+        if (casterGuid == wearer->GetGUID())
+            return OverseerDecisions::AuraCaster::Self;
+        Unit* caster = aura->GetCaster();
+        if (!caster)
+            return OverseerDecisions::AuraCaster::None;
+        if (Player* casterPlayer = caster->ToPlayer())
+        {
+            Group* wearerGroup = wearer->GetGroup();
+            if (wearerGroup && wearerGroup == casterPlayer->GetGroup())
+                return OverseerDecisions::AuraCaster::Party;
+            return OverseerDecisions::AuraCaster::Player;
+        }
+        if (caster->ToCreature())
+            return OverseerDecisions::AuraCaster::Creature;
+        return OverseerDecisions::AuraCaster::None;
+    }
+};
+
 // THE CORE'S OWN GATES FOR A KEPT ITEM (overseer_keep). The executors above
 // refuse a reserved item by name, but a character can also be sold from, mailed
 // from or traded from by something that is not this module: the bot's own AI
@@ -74349,6 +74634,8 @@ void Addmod_overseerScripts()
     new OverseerFinderScript();
     new OverseerKeepScript();
     new OverseerMeterScript();
+    new OverseerLedgerScript();
+    new OverseerAuraScript();
     new OverseerAuctionScript();
     new OverseerDatabaseScript();
 }
