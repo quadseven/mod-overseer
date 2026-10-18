@@ -5,8 +5,11 @@
  * core's door minimum (dungeon_access_template), which refuses an under-level
  * member at the knock, and a locked door on the approach, which does not open
  * without its key. The numbers below are the world's own: the door minimums
- * read from dungeon_access_template, and lock 1562 read from Lock.dbc, whose
- * LOCK_KEY_ITEM case is item 18249, the Crescent Key.
+ * read from dungeon_access_template, and the locks read from Lock.dbc, whose
+ * LOCK_KEY_ITEM cases are: lock 1562 -> item 18249 (the Crescent Key), lock 92
+ * -> item 6893 (the Workshop Key), lock 299 -> item 7146 (the Scarlet Key), lock
+ * 879 -> item 12382 (the Key to the City) and lock 1159 -> item 13704 (the
+ * Skeleton Key).
  *
  * The last part reads src/mod_overseer.cpp (run from the repo root) to pin the
  * rows that name a locked door and the one call that asks.
@@ -78,6 +81,17 @@ DoorPrerequisites DireMaulWestNorth()
     return door;
 }
 
+// Gnomeregan, the Train Depot door: map 90, min_level 15 for the map, and the
+// Workshop Door, gameobject 90566, locked (flags 34), lock 92 -> item 6893.
+DoorPrerequisites GnomereganDepot()
+{
+    DoorPrerequisites door;
+    door.minLevel = 15;
+    door.keyDoorEntry = 90566;
+    door.keyItems = {6893};
+    return door;
+}
+
 void AFamilyThatStraddlesTheFloorIsRefused()
 {
     // The Horde family as #578 measured it, about 16 to 20.
@@ -138,6 +152,23 @@ void ALockedDoorNeedsOneKeyInTheParty()
           ReadDoorReadiness(east, party).verdict == DoorReadiness::Ready);
 }
 
+void TheWorkshopDoorNeedsTheWorkshopKey()
+{
+    // Over the floor, so the key is the only question asked.
+    std::vector<DoorCandidate> party = {Member("Zug", 30), Member("Zrog", 29),
+                                        Member("Zork", 28), Member("Oz", 28),
+                                        Member("Uzza", 27)};
+    DoorReadinessReading const none = ReadDoorReadiness(GnomereganDepot(), party);
+    Check("nobody carries the Workshop Key: refused", none.verdict == DoorReadiness::NoKey);
+    CheckString("workshop no key reason", DoorReadinessReason(none, GnomereganDepot(), party),
+                "gameobject 90566 on the approach is locked and nobody in the party "
+                "carries item 6893");
+
+    party[1].carriesKey = true;
+    Check("one Workshop Key is enough",
+          ReadDoorReadiness(GnomereganDepot(), party).verdict == DoorReadiness::Ready);
+}
+
 std::string ReadModule()
 {
     std::ifstream source("src/mod_overseer.cpp");
@@ -167,6 +198,25 @@ void TheRowsAndTheCallAreWired()
     has("the North Wing names its door",
         "{\"dire-maul-north\", 1, 3189, 429, 3193, 0.f, 0.f, 0.f, {}, 0.f, 0.f, 0.f,\n"
         "             nullptr, 177192},");
+    has("the Train Depot names the Workshop Door",
+        "{\"gnomeregan-depot\", 0, 523, 90, 525, 0.f, 0.f, 0.f, {}, 0.f, 0.f, 0.f,\n"
+        "             nullptr, 90566},");
+    has("the Gnomeregan front door names none",
+        "{\"gnomeregan\", 0, 324, 90, 322, 0.f, 0.f, 0.f},");
+    has("the Armory names the Armory Door",
+        "{\"scarlet-armory\", 0, 612, 189, 606, 0.f, 0.f, 0.f, {}, 0.f, 0.f, 0.f,\n"
+        "             nullptr, 101851},");
+    has("the Cathedral names the Cathedral Door",
+        "{\"scarlet-cathedral\", 0, 610, 189, 604, 0.f, 0.f, 0.f, {}, 0.f, 0.f, 0.f,\n"
+        "             nullptr, 101850},");
+    has("the Library, where the Scarlet Key drops, names none",
+        "{\"scarlet-library\", 0, 614, 189, 608, 0.f, 0.f, 0.f},");
+    has("the Stratholme service entrance names the Elders' Square door",
+        "except through the locked Elders' Square Service Entrance (#582)\",\n"
+        "             175369},");
+    has("Scholomance names the Scholomance Door",
+        "{\"scholomance\", 0, 2567, 289, 2568, 0.f, 0.f, 0.f, {}, 0.f, 0.f, 0.f,\n"
+        "             nullptr, 174626},");
     has("the East wing's outer door names none",
         "{\"dire-maul-east-east\", 1, 3185, 429, 3196, 0.f, 0.f, 0.f},");
     has("the level floor is the core's own row",
@@ -183,6 +233,7 @@ int main()
 {
     AFamilyThatStraddlesTheFloorIsRefused();
     ALockedDoorNeedsOneKeyInTheParty();
+    TheWorkshopDoorNeedsTheWorkshopKey();
     TheRowsAndTheCallAreWired();
 
     if (failures)

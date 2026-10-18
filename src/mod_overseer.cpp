@@ -30542,10 +30542,14 @@ private:
             // areatrigger_teleport.sql: (608,'Scarlet Monastery - Library (Exit)',0,2870.9,-820.16,160.33,0.3879)
             {"scarlet-library", 0, 614, 189, 608, 0.f, 0.f, 0.f},
             // THE ARMORY, BEHIND HEROD'S DOOR, which the Scarlet Key opens and
-            // nothing else does. A run aimed here before `scarlet-library` has
-            // acquired the key stands at a door that will not move; this module
-            // does not check for the key or order the two runs itself, so that
-            // ordering is on whoever starts the run.
+            // nothing else a bot does. The door is the Armory Door, gameobject
+            // 101851 at (2886.31, -827.261, 160.336) on map 0, 14.6 yards from
+            // trigger 612, locked with lock 299, whose LOCK_KEY_ITEM case is
+            // item 7146, the Scarlet Key (#578). The row names it in
+            // `keyDoorEntry`, so IDLE refuses to open a run here until one
+            // member carries the key and logs that nobody does. This module
+            // still does not order the runs: `scarlet-library` is where the key
+            // drops, and choosing to run it first is the council's.
             //
             // AND THE ONE RADIUS IN THIS TABLE THAT IS NOT 8: areatrigger 612 is
             // 6. It is not a special case anywhere this table is read. Both
@@ -30562,16 +30566,21 @@ private:
             // areatrigger_teleport.sql: (612,'Scarlet Monastery - Armory (Entrance)',189,1610.83,-323.43,18.67,6.2802)
             // areatrigger.sql: (606,189,1608.65,-308.97,20.782,8,0,0,0,0)
             // areatrigger_teleport.sql: (606,'Scarlet Monastery - Armory (Exit)',0,2884.45,-822.01,160.33,1.9527)
-            {"scarlet-armory", 0, 612, 189, 606, 0.f, 0.f, 0.f},
+            {"scarlet-armory", 0, 612, 189, 606, 0.f, 0.f, 0.f, {}, 0.f, 0.f, 0.f,
+             nullptr, 101851},
             // THE CATHEDRAL, BEHIND THE HIGH INQUISITOR'S DOOR - the other lock
-            // the Scarlet Key opens. Same constraint as the armory above and for
-            // the same reason: run `scarlet-library` first.
+            // the Scarlet Key opens. The Cathedral Door, gameobject 101850 at
+            // (2908.18, -818.203, 160.332) on map 0, 17.2 yards from trigger
+            // 610, lock 299 like the armory's. Named in `keyDoorEntry` and
+            // checked the same way (#578): no run opens here until one member
+            // carries item 7146.
             //
             // areatrigger.sql: (610,0,2925.18,-820.545,161.634,8,0,0,0,0)
             // areatrigger_teleport.sql: (610,'Scarlet Monastery - Cathedral (Entrance)',189,855.68,1321.5,18.67,0.0017)
             // areatrigger.sql: (604,189,853.679,1308.1,19.671,8,0,0,0,0)
             // areatrigger_teleport.sql: (604,'Scarlet Monastery - Cathedral (Exit)',0,2906.14,-813.77,160.33,1.9574)
-            {"scarlet-cathedral", 0, 610, 189, 604, 0.f, 0.f, 0.f},
+            {"scarlet-cathedral", 0, 610, 189, 604, 0.f, 0.f, 0.f, {}, 0.f, 0.f, 0.f,
+             nullptr, 101850},
             // areatrigger.sql: (101,0,-8761.85,848.557,87.8052,0,4.972,9.694,7.444,0.6632)
             // areatrigger_teleport.sql: (101,'Stormwind Stockades Entrance',34,54.23,0.28,-18.34,6.26)
             // areatrigger.sql: (503,34,39.3741,0.803469,-12.7883,8,0,0,0,0)
@@ -30845,17 +30854,18 @@ private:
             // GNOMEREGAN, THE TRAIN DEPOT DOOR, in the same cavern. Between the
             // cavern and this trigger stands the Workshop Door, gameobject
             // 90566 at (-4861.05, 740.452, 249.389), locked (flags 34, lock
-            // 92), and the Workshop Key is what opens it. Nobody in either
-            // family is known to hold one, and this module does not check for
-            // it, so a run aimed here without the key stands at a door that
-            // will not move. Same constraint as the Scarlet Key above: the
-            // ordering is on whoever starts the run. Prefer the front door.
+            // 92), and lock 92's LOCK_KEY_ITEM case is item 6893, the Workshop
+            // Key. Nobody in either family is known to hold one. The row names
+            // the door in `keyDoorEntry` (#578), so IDLE refuses to open a run
+            // here until one member carries the key, rather than staging at a
+            // door that will not move. Prefer the front door.
             //
             // areatrigger.sql: (523,0,-4858.27,785.03,241.06,12,0,0,0,0)
             // areatrigger_teleport.sql: (523,'Gnomeregan Train Depot Entrance',90,-736.51,2.71,-249.99,3.14)
             // areatrigger.sql: (525,90,-717.868,1.37207,-241.293,12,0,0,0,0)
             // areatrigger_teleport.sql: (525,'Gnomeregan Train Depot Instance',0,-4858.27,756.435,244.923,0)
-            {"gnomeregan-depot", 0, 523, 90, 525, 0.f, 0.f, 0.f},
+            {"gnomeregan-depot", 0, 523, 90, 525, 0.f, 0.f, 0.f, {}, 0.f, 0.f, 0.f,
+             nullptr, 90566},
             // ULDAMAN, THE FRONT DOOR, on map 0 at the bottom of the dig site
             // cave in Loch Modan. The trigger is at z 213.7 with the surface
             // about 165 yards over it, which is the "door at the bottom of a
@@ -30975,9 +30985,11 @@ private:
             // stands the Elders' Square Service Entrance, gameobject 175369 at
             // (3185.48, -4039.1, 107.792), locked (flags 34, lock 879), and in
             // practice the Key to the City is what opens it. The key drops on
-            // the Live side, so run `stratholme-live` first. This module does
-            // not check for the key, the same as the Scarlet Key above. Door
-            // minimum level 45; the entry is a 10 yard box.
+            // the Live side, so run `stratholme-live` first. Lock 879's
+            // LOCK_KEY_ITEM case is item 12382, the Key to the City, and the row
+            // names the door in `keyDoorEntry` (#578), so once the row is no
+            // longer withheld IDLE still refuses a run here until one member
+            // carries the key. Door minimum level 45; the entry is a 10 yard box.
             //
             // THE EXIT YARD IS ENCLOSED, AND BOTH STRATHOLME ROWS ARE WITHHELD
             // UNTIL A WAY OUT EXISTS (#582). Settled from the navmesh, not by
@@ -31015,7 +31027,8 @@ private:
             // areatrigger_teleport.sql: (2221,'Stratholme - Eastern Plaguelands Instance (Inside)',0,3235.46,-4050.6,108.45,1.93522)
             {"stratholme-undead", 0, 2214, 329, 2221, 0.f, 0.f, 0.f, {}, 0.f, 0.f, 0.f,
              "its way out, areatrigger 2221, lands in a yard the navmesh closes "
-             "except through the locked Elders' Square Service Entrance (#582)"},
+             "except through the locked Elders' Square Service Entrance (#582)",
+             175369},
             // THE TEN BOX DOORS (#577). Each of these doors has a BOX trigger
             // (radius 0, with a length, width, height and orientation) on the way
             // out, and every one of their entries is a box too. They were held
@@ -31142,13 +31155,18 @@ private:
             // key is what gets a party deep into Scholomance. Whether that door
             // also stands between the staging point and the trigger is not
             // known, and if it does, a party without the key cannot reach this
-            // door at all. This module does not check for the key (#578).
+            // door at all. Lock 1159's LOCK_KEY_ITEM case is item 13704 in
+            // Lock.dbc too, so the row names the door in `keyDoorEntry` (#578)
+            // and IDLE refuses a run here until one member carries the key. That
+            // refusal is the cautious reading of the unknown above: if the door
+            // turns out not to stand on the walk in, drop the entry.
             //
             // areatrigger: (2567,0,1282.05,-2548.73,85.3994,0,10.56,13.03,21.67,0.4712)
             // areatrigger_teleport: (2567,'Scholomance Entrance',289,196.37,127.05,134.91,6.09)
             // areatrigger: (2568,289,182.265,126.45,143.707,0,12.33,8.889,16.39,0)
             // areatrigger_teleport: (2568,'Scholomance Instance',0,1275.05,-2552.03,90.3994,3.6631)
-            {"scholomance", 0, 2567, 289, 2568, 0.f, 0.f, 0.f},
+            {"scholomance", 0, 2567, 289, 2568, 0.f, 0.f, 0.f, {}, 0.f, 0.f, 0.f,
+             nullptr, 174626},
             // DIRE MAUL, SIX DOORS INTO ONE MAP, on map 1 in Feralas. Each row
             // is named by its wing and the side of that wing its door is on,
             // after the world's own names for the triggers: East Wing [East],
