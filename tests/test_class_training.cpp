@@ -247,6 +247,15 @@ void OneVisitEveryRank()
     Check("a refused rank is not retried and its chain waits", refused.size() == 1);
     Check("the refusal ends the visit once nothing else is bought", passes == 2);
 
+    // The pass ceiling holds on a chain longer than it: a rank per pass, every
+    // pass buying, and the visit still ends at CLASS_LEARN_MAX_PASSES.
+    std::vector<TrainerLine> chain;
+    for (uint32_t rank = 0; rank < CLASS_LEARN_MAX_PASSES + 5; ++rank)
+        chain.push_back({9000 + rank, rank ? 9000 + rank - 1 : 0, 1, 1});
+    std::vector<uint32_t> const ceiling = Visit(chain, 60, 100000, 0, &passes);
+    Check("a chain longer than the ceiling stops at the ceiling",
+          passes == CLASS_LEARN_MAX_PASSES && ceiling.size() == CLASS_LEARN_MAX_PASSES);
+
     Check("a pass that bought nothing ends the visit", !ClassWalkReadsAgain(0, 0));
     Check("a pass that bought reads the list again", ClassWalkReadsAgain(0, 1));
     Check("never past the pass ceiling", !ClassWalkReadsAgain(CLASS_LEARN_MAX_PASSES - 1, 5));
