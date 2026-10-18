@@ -1,5 +1,6 @@
 /*
- * Whether a dungeon run is finished, and what word that puts on its row (#226).
+ * Whether an encounter or quest goal finishes a dungeon run, and what word
+ * that puts on its row (#226, #972).
  *
  * This compiles against the pure decision file and nothing from AzerothCore.
  * The world adapter builds the expected mask out of the same DungeonEncounter
@@ -18,6 +19,8 @@ using OverseerDecisions::DungeonRunCompletion;
 using OverseerDecisions::DungeonRunExpectedMask;
 using OverseerDecisions::DungeonMapHasIndependentWings;
 using OverseerDecisions::DungeonRunExitOutcome;
+using OverseerDecisions::DungeonQuestObjective;
+using OverseerDecisions::DungeonQuestGoalReady;
 
 namespace
 {
@@ -207,6 +210,31 @@ void TheNewWordStillCountsAsARun()
     }
 }
 
+void EveryHolderMustFinishOnlyObjectivesOnThisMap()
+{
+    std::vector<DungeonQuestObjective> goals = {
+        {100, "tank", true, true}, {100, "healer", true, false},
+        {100, "healer", false, false}, {200, "tank", false, false}};
+    CheckBool("one holder is still short", DungeonQuestGoalReady(goals), false);
+    goals[1].complete = true;
+    CheckBool("other-map objectives do not block", DungeonQuestGoalReady(goals), true);
+    goals.erase(goals.begin(), goals.begin() + 3);
+    CheckBool("a quest with no objective on this map is not a goal",
+              DungeonQuestGoalReady(goals), false);
+    goals.clear();
+    CheckBool("an empty quest log cannot finish a run", DungeonQuestGoalReady(goals), false);
+}
+
+void TurnInWaitsForTheWholeParty()
+{
+    CheckBool("all five within thirty yards",
+              OverseerDecisions::DungeonQuestTurnInReady({12, 16, 22, 29, 30}, 5), true);
+    CheckBool("one member too far",
+              OverseerDecisions::DungeonQuestTurnInReady({12, 16, 22, 29, 31}, 5), false);
+    CheckBool("one member absent",
+              OverseerDecisions::DungeonQuestTurnInReady({12, 16, 22, 29}, 5), false);
+}
+
 } // namespace
 
 int main()
@@ -231,6 +259,8 @@ int main()
     TheUpperSpireIsNotPartOfALowerSpireRun();
     TheOutcomeWordPrefersProofOverInference();
     TheNewWordStillCountsAsARun();
+    EveryHolderMustFinishOnlyObjectivesOnThisMap();
+    TurnInWaitsForTheWholeParty();
     if (!failures)
         std::printf("a finished dungeon is provable, and an unknowable one is not finished\n");
     return failures ? 1 : 0;

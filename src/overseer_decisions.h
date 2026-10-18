@@ -1870,6 +1870,21 @@ bool DungeonRunMayClaimTravel(bool leaderHasOutstandingErrand);
 bool DungeonRunMayClaimTravel(bool leaderHasOutstandingErrand,
                               bool errandIsTheRunsOwnAim);
 
+// ...OR AN ERRAND THE TRAVEL DRIVE HAS ALREADY GIVEN UP ON (#762). The deferral
+// above trusts the errand's own backstop to end it, and for an aim nobody in
+// this process wrote that backstop cannot: a berth or inn aim a run wrote
+// before a worldserver restart has no claim on this side, so the release that
+// gives up on it skips the column write (a positional aim this book never
+// claimed is protected there) and the aim stands for ever. Measured on the dev
+// realm on 2026-09-27: released as unreachable at 16:12:47, still deferring a
+// new run until the operator cleared the column by hand at 16:16:38. So an
+// errand whose backstop has fired on exactly this aim (see
+// TravelErrandBackstopSpent) holds the run no longer, and the run's own claim
+// outranks the leftover the way it outranks any positional walk (#656).
+bool DungeonRunMayClaimTravel(bool leaderHasOutstandingErrand,
+                              bool errandIsTheRunsOwnAim,
+                              bool errandBackstopSpent);
+
 // `at:<map>:<x>,<y>,<z>`, read back. False for anything else, including an aim
 // with trailing text or a missing separator.
 bool ParsePlaceAim(std::string const& aim, std::uint32_t& mapId, float& x,
@@ -3253,6 +3268,18 @@ bool DungeonRunEnteredTheInstance(std::string const& outcome);
 // campaign progress, even when the party spent time inside the map.
 bool DungeonRunCountsAsDone(std::string const& outcome);
 
+struct DungeonQuestObjective
+{
+    uint32_t questId{0};
+    std::string holder;
+    bool onMap{false};
+    bool complete{false};
+};
+
+// A goal exists only if at least one held objective resolves to this map.
+bool DungeonQuestGoalReady(std::vector<DungeonQuestObjective> const& objectives);
+bool DungeonQuestTurnInReady(std::vector<float> const& memberYards, size_t partySize);
+
 // HOW MANY OF THE NEWEST ATTEMPTS IN A ROW NEVER GOT INSIDE, counting back from
 // the newest and stopping at the first that did.
 //
@@ -4002,6 +4029,37 @@ constexpr std::uint32_t NPC_FLAG_BANKER       = 0x00020000;  // UnitDefines.h:33
 constexpr std::uint32_t NPC_FLAG_AUCTIONEER   = 0x00200000;  // UnitDefines.h:343
 
 CounterRole CounterRoleForNpcFlags(std::uint32_t npcFlags);
+
+// A GUILD PETITIONER IS TWO BITS, NOT ONE (#544).
+//
+// UNIT_NPC_FLAG_PETITIONER alone is carried by guild petitioners and arena team
+// petitioners alike. The pinned core says so on the constant itself
+// (UnitDefines.h:340): "0xC0000 = guild petitions, 0x40000 = arena team
+// petitions". Measured on a dev realm, the petitioner bit without the tabard
+// bit matched six NPCs, every one an Arena Organizer, and
+// `npcflag & 0xC0000 = 0xC0000` matched nine, every one a Guild Master. So the
+// `petitioner` keyword, which asks for the one bit, can walk a character to an
+// Arena Organizer, which never sells a guild charter. `guild petitioner` asks
+// for both bits.
+//
+// Restated here for the same reason as the six above: this file compiles
+// without a core. mod_overseer.cpp static_asserts both against UnitDefines.h.
+constexpr std::uint32_t NPC_FLAG_PETITIONER       = 0x00040000;  // UnitDefines.h:340
+constexpr std::uint32_t NPC_FLAG_TABARDDESIGNER   = 0x00080000;  // UnitDefines.h:341
+constexpr std::uint32_t NPC_FLAG_GUILD_PETITIONER =
+    NPC_FLAG_PETITIONER | NPC_FLAG_TABARDDESIGNER;  // 0xC0000
+
+// DOES A SPAWN CARRYING `npcFlags` FILL A TRAVEL ROLE ASKING FOR `roleFlags`?
+//
+// Every bit the role names, not any one of them. For the roles that name a
+// single bit the two readings are the same question, so their behaviour is
+// unchanged; the rule only differs for a role naming more than one bit, which
+// is exactly `guild petitioner`. Any-bit matching would let an Arena Organizer
+// (0x40000 alone) fill it, which is the defect.
+//
+// A role naming no bits is filled by nothing: 0 is not a role, and "every one
+// of no bits" would otherwise match every spawn on the map.
+bool SpawnFillsTravelRole(std::uint32_t npcFlags, std::uint32_t roleFlags);
 
 // IS THIS ARRIVAL ENTITLED TO CONSUME THE CHARACTER'S LEARN AIM (#402)?
 //
@@ -8691,6 +8749,14 @@ std::string GatheringCrossingBlocker(std::string const& leader, std::uint32_t le
 // started. An attempt opens when the crossing claims the berth aim and closes
 // when one of the things below ends it. Two closed attempts in a row that got
 // no 100 yards nearer hand the dungeon back for two hours.
+//
+// AND ONE IS ENOUGH WHEN IT RAN THE WHOLE HALF HOUR (wow-overseer#870). The
+// crossing's own backstop ends an attempt only after thirty minutes, so two of
+// them were an hour or more of a leader going nowhere before the hand-back:
+// measured after #926 shipped, three of the leader's seven hand-backs took 106
+// to 165 minutes, each ending on that backstop. The issue asks for the docks
+// or a hand-back within thirty minutes, and an attempt that walked for the
+// whole of them without getting 100 yards nearer has answered the question.
 
 // What ended an attempt at the berth.
 enum class CrossingAttemptEnd : std::uint8_t
@@ -8714,6 +8780,10 @@ struct CrossingAttemptLimits
     // Failed attempts in a row, none of them gaining `gainYards`, before the
     // crossing gives up.
     std::uint32_t attempts{2};
+    // The same count when the attempt that just failed was ended by the
+    // crossing's own half-hour backstop (Overdue): it already walked the whole
+    // backstop without gaining, so it gives up at once (wow-overseer#870).
+    std::uint32_t overdueAttempts{1};
     float gainYards{100.f};
     // How long a dungeon given up on stays refused to the family. Long enough
     // that the family's own drives get a real evening's share, short enough
@@ -8773,11 +8843,14 @@ struct CrossingAttemptReading
     std::int64_t seconds{0};
 };
 
-// The attempt under way ended (for one of the CrossingAttemptEnd reasons). On
-// GiveUp the record is refused until now + cooloffSeconds and its count starts
-// again, so the attempt after the cool-off is the first of a new two.
+// The attempt under way ended, for the reason `end`. An Overdue end that did
+// not gain gives up after `overdueAttempts` failures, any other after
+// `attempts`. On GiveUp the record is refused until now + cooloffSeconds and
+// its count starts again, so the attempt after the cool-off is the first of a
+// new count.
 CrossingAttemptReading EndCrossingAttempt(CrossingAttempts& record, std::int64_t now,
-                                          CrossingAttemptLimits const& limits);
+                                          CrossingAttemptLimits const& limits,
+                                          CrossingAttemptEnd end);
 
 // Is `dungeon` handed back at `now`? Seconds of cool-off left, or 0.
 std::int64_t CrossingHandedBack(CrossingAttempts const& record, std::string const& dungeon,
@@ -8811,6 +8884,27 @@ constexpr char const* TravelGroundGiveUpReleaseReason =
 // Is this errand-end reason one the travel drive gave up with, which counts as
 // a failed crossing attempt? Exact match: any other end is not one.
 bool IsTravelGiveUpRelease(std::string const& why);
+
+// The travel drive's third give-up: a walk that went nowhere over the stuck
+// window. Not one IsTravelGiveUpRelease counts, because the crossing reads that
+// one through NoProgressBackoffReason's refusal instead; it is named here so
+// TravelErrandBackstopSpent reads the same string the release writes.
+constexpr char const* TravelNoProgressReleaseReason =
+    "the travel drive (no progress over the stuck window)";
+
+// HAS THE ERRAND STANDING IN THE COLUMN ALREADY SPENT ITS OWN BACKSTOP (#762)?
+// True when the last end the travel book recorded for this character was the
+// travel drive giving up (any of its three give-up reasons) on exactly the aim
+// the column still holds. That pairing only happens when the release could not
+// clear the column - an aim this process never wrote, typically one left from
+// before a restart - so what stands there is no longer anybody's live errand.
+// False for anything but an `at:` point aim (a keyword errand is the bridge's,
+// and it clears its own), for an end on another aim, and for any other kind of
+// end (an escort ending, a crossing handing back), which may leave a live walk
+// standing on purpose.
+bool TravelErrandBackstopSpent(std::string const& columnAim,
+                               std::string const& lastEndTarget,
+                               std::string const& lastEndWhy);
 
 // ------------------------------------------- is the transport docked (#303) --
 //
@@ -14001,6 +14095,95 @@ FlightMasterBoarding ReadFlightMasterBoarding(bool resolved, float fmX, float fm
 // Empty for `Board`, which is not a refusal.
 std::string FlightMasterRefusalReason(FlightMasterBoarding boarding, uint32_t fmEntry);
 
+// --------------- a route this character's own team can fly (#501) ---------
+//
+// Upstream's taxi BFS (TravelNodeMap::FindTaxiPath) is built once over every
+// row of TaxiPath.dbc and answers ONE route per pair of nodes, whoever asks.
+// It does not know that half the network belongs to the other side. Logged
+// on the dev realm 2026-09-19, twice: an Alliance family was told it "could
+// fly node 79 to node 80, but has not discovered node 40" and that
+// `flight master:40` would go learn it. Node 40 is Gadgetzan's HORDE flight
+// point; the Alliance one, node 39, stands 180 yards away and the family
+// already holds it. No Alliance character can ever learn node 40, so the
+// suggestion named an errand that could never finish, and the route through
+// it was never a route at all.
+//
+// Learnability per team is not a judgement call: WorldSession::
+// SendLearnNewTaxiNode learns exactly the node ObjectMgr::GetNearestTaxiNode
+// returns for the character's GetTeamId(true), and that function skips a node
+// whose mount for the team is zero (the death knight node excepted) or that
+// is not on the taxi network mask. The predicate below is that test, so the
+// route search and the game cannot disagree about whose node this is.
+
+// TaxiNodes.dbc MountCreatureID[0] of Acherus' own node. ObjectMgr::
+// GetNearestTaxiNode lets it through for either team.
+constexpr std::uint32_t TAXI_DEATH_KNIGHT_MOUNT_CREATURE = 32981;
+
+// Can a character of this team ever hold this node? `hordeMount` and
+// `allianceMount` are MountCreatureID[0] and [1]; `onTaxiNetwork` is the
+// node's bit in sTaxiNodesMask.
+bool TaxiNodeServesTeam(bool onTaxiNetwork, std::uint32_t hordeMount,
+                        std::uint32_t allianceMount, bool alliance);
+
+// One ONE-WAY row of TaxiPath.dbc, as a caller read it.
+struct TaxiEdge
+{
+    std::uint32_t from{0};
+    std::uint32_t to{0};
+};
+
+// The taxi graph one team can fly: every edge whose two ends both serve the
+// team, nothing else. Built once per team by the caller and kept; the rows
+// it is read from do not change after startup.
+struct TeamTaxiGraph
+{
+    std::map<std::uint32_t, std::vector<std::uint32_t>> next;
+};
+
+// `teamNodes` is every node TaxiNodeServesTeam passed for the team. An edge
+// with either end outside it is dropped, so no route through the graph can
+// ever enter the other side's node. Neighbours are kept sorted, so the
+// search below is deterministic rather than ordered by DBC row.
+TeamTaxiGraph BuildTeamTaxiGraph(std::vector<TaxiEdge> const& edges,
+                                 std::vector<std::uint32_t> const& teamNodes);
+
+// The fewest-hops route `from` -> `to` over that graph, both ends included,
+// in the same shape FindTaxiPath returns. Empty when the two are the same
+// node or no route of this team's joins them - which is the honest answer
+// for an Alliance character asked to reach a node only Horde nodes lead to.
+std::vector<std::uint32_t> FindTeamTaxiPath(TeamTaxiGraph const& graph,
+                                            std::uint32_t from, std::uint32_t to);
+
+// One hop of a route, as the character reads it.
+struct TaxiHopRead
+{
+    std::uint32_t node{0};
+    bool known{false};       // in the character's taximask
+    bool servesTeam{false};  // TaxiNodeServesTeam for the character's team
+};
+
+enum class TaxiRouteVerdict : std::uint8_t
+{
+    Fly,        // every hop after the departure is known
+    LearnHop,   // the first missing hop is one this character can learn
+    Unflyable,  // empty route, or a hop the character's team can never hold
+};
+
+// THE UNKNOWN-HOP SCAN, and what it is allowed to suggest. Hop zero is the
+// departure and is deliberately not required: the flight master teaches the
+// node it stands at when the window opens. Every later hop must be known.
+// The first one that is not is named in `learnNode` ONLY when the team can
+// learn it; a hop the team can never hold makes the route Unflyable with
+// `learnNode` zero, so no caller and no log line can name an errand that
+// cannot finish.
+struct TaxiRouteScan
+{
+    TaxiRouteVerdict verdict{TaxiRouteVerdict::Unflyable};
+    std::uint32_t learnNode{0};
+};
+
+TaxiRouteScan ScanTaxiRoute(std::vector<TaxiHopRead> const& hops);
+
 // The three-way arrival answer for a deliberate flight-master errand,
 // asked of the LIVE creature rather than the recorded spawn point - #378's
 // argument applies here unchanged. `false` (`inReach`) and `false`
@@ -18940,6 +19123,22 @@ bool MayCraftNow(std::string const& job, bool inDungeonRun, bool alive, bool inC
 // crafted. In flight is left alone: the handler refuses it, and taking a
 // character off a taxi would cancel an errand nobody asked to cancel.
 bool CraftDismountsFirst(bool mounted, bool inFlight);
+
+// THE SPELL THAT CONJURES A RECIPE'S SPELL FOCUS WHERE THE CRAFTER STANDS, or
+// 0 when no such spell exists and the focus is a world object somebody must be
+// walked to. Keyed on SpellInfo::RequiresSpellFocus (SpellFocusObject.dbc) so
+// any other conjurable focus is one more case here, not a second drive.
+//
+// Focus 4 is "Cooking Fire", and every Cooking recipe a family below 75 can
+// reach carries it (quadseven/mod-overseer#534: 181 abilities on skill 185,
+// none focus-free in that range). Spell 818 "Basic Campfire" (skill 185,
+// AcquireMethod 1, ClassMask 0, no reagent, no focus of its own) summons
+// gameobject 29784, type 8 GAMEOBJECT_TYPE_SPELL_FOCUS, Data0 4, Data1 10
+// yards, centred on the caster. A Forge (3) or an Anvil (1) is a world spawn,
+// so those answer 0 and the refusal stands as it always has.
+constexpr unsigned SPELL_FOCUS_COOKING_FIRE = 4;
+constexpr unsigned SPELL_BASIC_CAMPFIRE = 818;
+unsigned FocusLighterSpell(unsigned requiresSpellFocus);
 
 
 // A TRADE OPENED TO A SELFBOT HEAD IS ANSWERED LIKE A PERSON WOULD. mod-playerbots'
@@ -24015,6 +24214,83 @@ struct ReleasePromptReading
 ReleasePromptReading ReleasePromptObserve(ReleasePromptClock& clock, std::int64_t now,
                                           std::int64_t lastDeathAt,
                                           std::int64_t maxGapSeconds);
+
+// --------------------------------------- dungeon run lockouts (#963) ---------
+
+// ONE CHARACTER'S SAVED STATE FOR ONE INSTANCE, as the instance-lockout window
+// the client opens shows it: whether the character is bound to a copy, when the
+// lockout expires, and which bosses the save already credits. The adapter
+// reads it from the core's in-memory bind, which was loaded from
+// character_instance and the instance reset schedule. Only a permanent bind
+// is a client-visible lockout; a temporary normal-dungeon bind can be reset.
+struct SavedInstance
+{
+    uint32_t mapId{0};
+    uint32_t difficulty{0};
+    bool saved{false};
+    uint32_t instanceId{0};
+    // When the lockout expires, seconds since the epoch. Zero when the
+    // character is not bound or no reset was read.
+    std::time_t resetAt{0};
+    // The bosses the save credits as done, the same mask the core sets on each
+    // kill (InstanceSave::GetCompletedEncounterMask).
+    uint32_t completedEncounters{0};
+    // Every expected boss for this map is down, so the instance is cleared for
+    // this character even while the lockout clock still runs.
+    bool cleared{false};
+};
+
+// THE LOCKOUT IS LIVE when the reset is still in the future. A saved bind
+// with no known reset is refused by InstanceRunMayProceed.
+bool InstanceLockoutIsLive(SavedInstance const& save, std::time_t now);
+
+// SECONDS UNTIL THE LOCKOUT EXPIRES, negative once it has passed.
+std::int64_t SecondsUntilInstanceReset(SavedInstance const& save, std::time_t now);
+
+// AN INSTANCE THAT RESETS SOON IS NOT PROPOSED. A run whose lockout expires
+// within `resetSoonSeconds` is refused so the family is not sent into a dungeon
+// that will vanish under it mid-run.
+bool InstanceResetsTooSoon(SavedInstance const& save, std::time_t now,
+                           std::time_t resetSoonSeconds);
+
+// THE WEEKDAY A TIME_T FALLS ON, so a refusal can name "saved until Tuesday"
+// instead of an epoch the player cannot read. 1970-01-01 was a Thursday.
+std::string WeekdayName(std::time_t when);
+
+// THE REFUSAL SENTENCE for a run this character cannot join: empty when there
+// is no refusal, otherwise words a chat line can carry, e.g. "saved until
+// Tuesday". Names the weekday the lockout expires so the refusal is honest
+// about when the instance opens again.
+std::string SavedInstanceRefusal(SavedInstance const& save, std::time_t now);
+
+// May this instance be proposed to a character, given its saved state? The
+// reason is empty when the verdict is Proceed and otherwise names why the run
+// is refused, in words a chat line can carry.
+enum class InstanceRunVerdict : std::uint8_t
+{
+    Proceed,   // may be proposed and entered
+    Saved,     // refused: the character is saved to a live lockout
+    ResetsSoon,// refused: the lockout expires within the soon bound
+};
+
+struct InstanceRunAnswer
+{
+    InstanceRunVerdict verdict{InstanceRunVerdict::Proceed};
+    std::string reason;
+};
+
+InstanceRunAnswer InstanceRunMayProceed(SavedInstance const& save, std::time_t now,
+                                        std::time_t resetSoonSeconds);
+
+struct InstanceRunProposal
+{
+    std::vector<std::string> members;
+    std::vector<std::pair<std::string, std::string>> refusals;
+};
+
+InstanceRunProposal InstanceRunProposalFor(
+    std::vector<std::pair<std::string, SavedInstance>> const& seats,
+    std::time_t now, std::time_t resetSoonSeconds);
 
 // THE PARTY BUFF IS KEPT, NOT ONLY ALLOWED (mod-overseer#823). KeepBuffStrategies
 // puts `buff` on a priest, a mage and a druid once a minute, and that is all it

@@ -259,6 +259,14 @@ bool DungeonRunMayClaimTravel(bool leaderHasOutstandingErrand,
     return !leaderHasOutstandingErrand || errandIsTheRunsOwnAim;
 }
 
+bool DungeonRunMayClaimTravel(bool leaderHasOutstandingErrand,
+                              bool errandIsTheRunsOwnAim,
+                              bool errandBackstopSpent)
+{
+    return DungeonRunMayClaimTravel(leaderHasOutstandingErrand, errandIsTheRunsOwnAim) ||
+           errandBackstopSpent;
+}
+
 namespace
 {
 
@@ -2923,6 +2931,28 @@ DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completed
                                                           : DungeonCompletion::NotYet;
 }
 
+bool DungeonQuestGoalReady(std::vector<DungeonQuestObjective> const& objectives)
+{
+    bool hasGoal = false;
+    for (DungeonQuestObjective const& objective : objectives)
+    {
+        if (!objective.onMap)
+            continue;
+        hasGoal = true;
+        if (!objective.complete)
+            return false;
+    }
+    return hasGoal;
+}
+
+bool DungeonQuestTurnInReady(std::vector<float> const& memberYards, size_t partySize)
+{
+    if (!partySize || memberYards.size() != partySize)
+        return false;
+    return std::all_of(memberYards.begin(), memberYards.end(),
+                       [](float yards) { return yards <= 30.f; });
+}
+
 uint32_t EventGatedEncounterMask(uint32_t mapId)
 {
     // Bits from DungeonEncounter.dbc for each map, read off the dev realm's
@@ -3176,6 +3206,11 @@ CounterRole CounterRoleForNpcFlags(std::uint32_t npcFlags)
     // and giving one a hold it cannot use would pin a character for the hold's
     // whole ceiling for nothing.
     return CounterRole::None;
+}
+
+bool SpawnFillsTravelRole(std::uint32_t npcFlags, std::uint32_t roleFlags)
+{
+    return roleFlags != 0 && (npcFlags & roleFlags) == roleFlags;
 }
 
 bool ArrivalAnswersLearnAim(bool aimNamesTrainerRole, bool creatureTrains)
@@ -7308,7 +7343,8 @@ void OpenCrossingAttempt(CrossingAttempts& record, std::string const& dungeon,
 }
 
 CrossingAttemptReading EndCrossingAttempt(CrossingAttempts& record, std::int64_t now,
-                                          CrossingAttemptLimits const& limits)
+                                          CrossingAttemptLimits const& limits,
+                                          CrossingAttemptEnd end)
 {
     CrossingAttemptReading reading;
     reading.seconds = record.firstSeen ? now - record.firstSeen : 0;
@@ -7332,9 +7368,14 @@ CrossingAttemptReading EndCrossingAttempt(CrossingAttempts& record, std::int64_t
         return reading;
     }
 
+    // A HALF HOUR THAT GOT NOWHERE IS THE WHOLE ANSWER (wow-overseer#870).
+    // The backstop is already thirty minutes of walking; a second one doubled
+    // the time a stalled leader held the family before the hand-back.
     ++record.failed;
     reading.attempts = record.failed;
-    if (record.failed < limits.attempts)
+    std::uint32_t const allowed =
+        end == CrossingAttemptEnd::Overdue ? limits.overdueAttempts : limits.attempts;
+    if (record.failed < allowed)
         return reading;
 
     reading.verdict = CrossingAttemptVerdict::GiveUp;
@@ -7371,6 +7412,19 @@ CrossingAttemptEnd CrossingRefusalEnd(std::string const& reason)
 bool IsTravelGiveUpRelease(std::string const& why)
 {
     return why == TravelBackstopReleaseReason || why == TravelGroundGiveUpReleaseReason;
+}
+
+bool TravelErrandBackstopSpent(std::string const& columnAim,
+                               std::string const& lastEndTarget,
+                               std::string const& lastEndWhy)
+{
+    // A POINT AIM ONLY. A berth, an inn or a staging point is written as one,
+    // and a run's claim outranks one (#656). A keyword errand belongs to the
+    // bridge, which clears it itself, and a run's claim would not outrank a
+    // counter keyword anyway.
+    if (columnAim.rfind("at:", 0) != 0 || lastEndTarget != columnAim)
+        return false;
+    return IsTravelGiveUpRelease(lastEndWhy) || lastEndWhy == TravelNoProgressReleaseReason;
 }
 
 DockReading ReadDock(std::uint32_t pathProgressMs, std::uint32_t periodMs,
@@ -11831,6 +11885,109 @@ std::string FlightMasterRefusalReason(FlightMasterBoarding boarding, uint32_t fm
     return "";
 }
 
+bool TaxiNodeServesTeam(bool onTaxiNetwork, uint32_t hordeMount, uint32_t allianceMount,
+                        bool alliance)
+{
+    // ObjectMgr::GetNearestTaxiNode, term for term: the team's own mount, or
+    // the death knight node either team may use, and on the network mask.
+    if (!onTaxiNetwork)
+        return false;
+    return (alliance ? allianceMount : hordeMount) != 0 ||
+           hordeMount == TAXI_DEATH_KNIGHT_MOUNT_CREATURE;
+}
+
+TeamTaxiGraph BuildTeamTaxiGraph(std::vector<TaxiEdge> const& edges,
+                                 std::vector<uint32_t> const& teamNodes)
+{
+    std::vector<uint32_t> serves(teamNodes);
+    std::sort(serves.begin(), serves.end());
+    auto const servesTeam = [&serves](uint32_t node) {
+        return std::binary_search(serves.begin(), serves.end(), node);
+    };
+
+    TeamTaxiGraph graph;
+    for (TaxiEdge const& edge : edges)
+    {
+        // Upstream's BuildTaxiGraph skips the same two "to nowhere" values.
+        if (!edge.from || !edge.to || edge.to == uint32_t(-1) || edge.from == edge.to)
+            continue;
+        if (!servesTeam(edge.from) || !servesTeam(edge.to))
+            continue;
+        graph.next[edge.from].push_back(edge.to);
+    }
+    for (auto& entry : graph.next)
+    {
+        std::vector<uint32_t>& out = entry.second;
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+    }
+    return graph;
+}
+
+std::vector<uint32_t> FindTeamTaxiPath(TeamTaxiGraph const& graph, uint32_t from, uint32_t to)
+{
+    if (!from || !to || from == to)
+        return {};
+
+    // Plain breadth-first search, so "fewest hops" means what it means in
+    // upstream's own FindTaxiPath; the only difference is the graph.
+    std::map<uint32_t, uint32_t> parent;
+    parent[from] = 0;
+    std::vector<uint32_t> frontier{from};
+    for (size_t head = 0; head < frontier.size(); ++head)
+    {
+        uint32_t const current = frontier[head];
+        if (current == to)
+            break;
+        auto const out = graph.next.find(current);
+        if (out == graph.next.end())
+            continue;
+        for (uint32_t const next : out->second)
+        {
+            if (parent.count(next))
+                continue;
+            parent[next] = current;
+            frontier.push_back(next);
+        }
+    }
+    if (!parent.count(to))
+        return {};
+
+    std::vector<uint32_t> path;
+    for (uint32_t node = to; node; node = parent[node])
+        path.push_back(node);
+    std::reverse(path.begin(), path.end());
+    return path;
+}
+
+TaxiRouteScan ScanTaxiRoute(std::vector<TaxiHopRead> const& hops)
+{
+    TaxiRouteScan scan;
+    if (hops.size() < 2)
+        return scan;   // no route: Unflyable, nothing to learn
+
+    // A hop the team can never hold condemns the route whether or not an
+    // earlier hop is also missing: learning the earlier one would only walk
+    // the character to the next dead end. So this is asked of every hop
+    // before any suggestion is made.
+    for (size_t hop = 1; hop < hops.size(); ++hop)
+    {
+        if (!hops[hop].servesTeam)
+            return scan;
+    }
+    for (size_t hop = 1; hop < hops.size(); ++hop)
+    {
+        if (!hops[hop].known)
+        {
+            scan.verdict = TaxiRouteVerdict::LearnHop;
+            scan.learnNode = hops[hop].node;
+            return scan;
+        }
+    }
+    scan.verdict = TaxiRouteVerdict::Fly;
+    return scan;
+}
+
 FlightDiscoveryArrival FlightDiscoveryArrivalStep(bool inReach, bool oneIsNearby)
 {
     // IN REACH OUTRANKS EVERYTHING ELSE, for the identical reason
@@ -16216,6 +16373,11 @@ bool MayCraftNow(std::string const& job, bool inDungeonRun, bool alive, bool inC
 bool CraftDismountsFirst(bool mounted, bool inFlight)
 {
     return mounted && !inFlight;
+}
+
+unsigned FocusLighterSpell(unsigned requiresSpellFocus)
+{
+    return requiresSpellFocus == SPELL_FOCUS_COOKING_FIRE ? SPELL_BASIC_CAMPFIRE : 0;
 }
 
 GhostRecovery GuildGhostFallback(unsigned deathsHere, bool healerGraveKnown,
@@ -21715,6 +21877,94 @@ ReleasePromptReading ReleasePromptObserve(ReleasePromptClock& clock, std::int64_
     return reading;
 }
 
+// --------------------------------------- dungeon run lockouts (#963) ---------
+
+bool InstanceLockoutIsLive(SavedInstance const& save, std::time_t now)
+{
+    return save.saved && save.resetAt != 0 && save.resetAt > now;
+}
+
+std::int64_t SecondsUntilInstanceReset(SavedInstance const& save, std::time_t now)
+{
+    if (!save.saved || save.resetAt == 0)
+        return 0;
+    return static_cast<std::int64_t>(save.resetAt) -
+           static_cast<std::int64_t>(now);
+}
+
+bool InstanceResetsTooSoon(SavedInstance const& save, std::time_t now,
+                           std::time_t resetSoonSeconds)
+{
+    if (!save.saved || save.resetAt == 0)
+        return false;
+    std::int64_t const remaining = SecondsUntilInstanceReset(save, now);
+    return remaining > 0 &&
+           remaining <= static_cast<std::int64_t>(resetSoonSeconds);
+}
+
+std::string WeekdayName(std::time_t when)
+{
+    constexpr char const* weekdays[] = {"Thursday", "Friday", "Saturday", "Sunday",
+                                        "Monday", "Tuesday", "Wednesday"};
+    // 1970-01-01 was a Thursday.
+    std::int64_t const days = static_cast<std::int64_t>(when) / 86400;
+    std::int64_t index = days % 7;
+    while (index < 0)
+        index += 7;
+    return weekdays[static_cast<std::size_t>(index)];
+}
+
+std::string SavedInstanceRefusal(SavedInstance const& save, std::time_t now)
+{
+    if (!InstanceLockoutIsLive(save, now))
+        return std::string();
+    return "saved until " + WeekdayName(save.resetAt);
+}
+
+InstanceRunAnswer InstanceRunMayProceed(SavedInstance const& save, std::time_t now,
+                                        std::time_t resetSoonSeconds)
+{
+    InstanceRunAnswer answer;
+    if (!save.saved)
+        return answer;          // nothing bound: the character is free
+    if (save.resetAt == 0)
+    {
+        answer.verdict = InstanceRunVerdict::Saved;
+        answer.reason = "saved with no known reset time";
+        return answer;
+    }
+    std::int64_t const remaining = SecondsUntilInstanceReset(save, now);
+    if (remaining <= 0)
+        return answer;          // the lockout has passed: the character is free
+    if (remaining <= static_cast<std::int64_t>(resetSoonSeconds))
+    {
+        answer.verdict = InstanceRunVerdict::ResetsSoon;
+        answer.reason = "instance resets soon";
+    }
+    else
+    {
+        answer.verdict = InstanceRunVerdict::Saved;
+        answer.reason = SavedInstanceRefusal(save, now);
+    }
+    return answer;
+}
+
+InstanceRunProposal InstanceRunProposalFor(
+    std::vector<std::pair<std::string, SavedInstance>> const& seats,
+    std::time_t now, std::time_t resetSoonSeconds)
+{
+    InstanceRunProposal proposal;
+    for (auto const& seat : seats)
+    {
+        InstanceRunAnswer const answer =
+            InstanceRunMayProceed(seat.second, now, resetSoonSeconds);
+        if (answer.verdict == InstanceRunVerdict::Proceed)
+            proposal.members.push_back(seat.first);
+        else
+            proposal.refusals.emplace_back(seat.first, answer.reason);
+    }
+    return proposal;
+}
 RebuffSpell RebuffSpellFor(unsigned classId)
 {
     RebuffSpell spell;

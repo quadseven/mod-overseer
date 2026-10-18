@@ -117,7 +117,7 @@ void NothingElseIsForeign()
     char const* const others[] = {
         "trainer", "class trainer", "profession trainer", "guild banker",
         "innkeeper", "flight master", "stable master", "petitioner",
-        "tabard designer", "1234", "nothing",
+        "guild petitioner", "tabard designer", "1234", "nothing",
     };
     for (char const* aim : others)
         Check(aim, IsForeignTravelAim(aim), false);
@@ -133,8 +133,8 @@ void ItProtectsEverythingTheOldGuardDid()
     char const* const everyAim[] = {
         "", "vendor", "banker", "repair", "trainer", "class trainer",
         "profession trainer", "guild banker", "auctioneer", "petitioner",
-        "tabard designer", "innkeeper", "flight master", "stable master",
-        "at:0:-8913.2,554.6,93.8", "trigger:78", "1234",
+        "guild petitioner", "tabard designer", "innkeeper", "flight master",
+        "stable master", "at:0:-8913.2,554.6,93.8", "trigger:78", "1234",
     };
     for (char const* aim : everyAim)
     {
