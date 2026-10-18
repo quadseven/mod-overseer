@@ -174,10 +174,9 @@ void AProposalIsRefusedWhenTheCharacterIsSaved()
 
 void AProposalIsRefusedWhenTheLockoutResetsSoon()
 {
-    InstanceRunAnswer const soon =
-        InstanceRunMayProceed(savedToTuesday(), nowBefore, 20 * 60);
-    // tuesdayReset (5 days) is far beyond twenty minutes, so this is "saved",
-    // not "resets soon". Force a soon reset by moving now close to the reset.
+    // A reset five days out is "saved", not "resets soon" (checked in
+    // AProposalIsRefusedWhenTheCharacterIsSaved). Force a soon reset by moving
+    // now close to the reset.
     std::time_t const justBefore = tuesdayReset - 600; // ten minutes before reset
     InstanceRunAnswer const reallySoon =
         InstanceRunMayProceed(savedToTuesday(), justBefore, 20 * 60);
