@@ -83,6 +83,9 @@ int main()
     Check("a client leader opens exactly as before",
           static_cast<int>(DungeonLeaderClientGate(clientSeat, 800, 1000)),
           static_cast<int>(LeaderClientGate::Open));
+    Check("a connected leader outside the instance does not lose its client",
+          static_cast<int>(DungeonLeaderClientLoss(clientSeat, true, 0, 1000)),
+          static_cast<int>(LeaderClientLossAction::Continue));
 
     std::printf("%d failures\n", failures);
     return failures ? 1 : 0;
