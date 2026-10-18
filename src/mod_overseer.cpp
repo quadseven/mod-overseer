@@ -33217,6 +33217,11 @@ private:
         // approach read walkable while the family may still be standing on the
         // deck, and without this the crossing would never be consulted again.
         bool crossingPassengers{false};
+        // THIS POLL READ THE FAMILY'S CROSSING (#758). Cleared before the
+        // family is driven and set by DriveCampaignCrossing, so a crossing
+        // hold on a leader that no path read this poll is let go after it
+        // (ReleaseUnreadCrossingHold) rather than left to its ceiling.
+        bool crossingReadThisPoll{false};
         // WHEN THIS ATTEMPT'S GATHERING FIRST READ A CROSSING (2026-10-09),
         // zero until it does. The crossing's own clock restarts whenever it
         // refuses and walks again, so the staging clock's wait is measured from
@@ -43276,6 +43281,7 @@ private:
             }
         }
 
+        coord.crossingReadThisPoll = true;
         AreaTrigger const* door = sObjectMgr->GetAreaTrigger(portal.entryTriggerId);
         CrossingRoute route = ReadCrossingFromWorld(
             coord, members, leaderName, leader, crossingOrigin, portal.outsideMapId,
@@ -43471,6 +43477,35 @@ private:
                  "to the door",
                  coord.runNumber, leaderName);
         ReleaseHold(leaderName, leader, "the crossing that placed this hold is over",
+                    CROSSING_HOLD_VERB);
+    }
+
+    // A CROSSING'S HOLD THAT NO PATH READ THIS POLL (#758). Asked after the
+    // family's coordinator has run, whichever way it returned: IDLE's bag gate
+    // returned before its crossing for half an hour while the leader stood
+    // rooted on the Theramore pier under the hold, refused the town trip that
+    // would have emptied the bags. See OverseerDecisions::CrossingHoldIsLeftOver.
+    void ReleaseUnreadCrossingHold(DungeonRunCoordinatorState const& coord,
+                                   std::string const& leaderName)
+    {
+        auto const hold = HoldsInForce().find(leaderName);
+        if (hold == HoldsInForce().end())
+            return;
+        Player* const leader = ObjectAccessor::FindPlayerByName(leaderName, false);
+        OverseerDecisions::CrossingHoldFacts facts;
+        facts.crossingHold = hold->second.verb == CROSSING_HOLD_VERB;
+        facts.crossingRead = coord.crossingReadThisPoll;
+        facts.aboard = leader && leader->GetTransport();
+        facts.crossingAlone = CrossingAlone(leaderName);
+        if (!OverseerDecisions::CrossingHoldIsLeftOver(facts))
+            return;
+        LOG_WARN("module.overseer",
+                 "overseer: '{}' still carries the crossing's hold, but nothing read his "
+                 "family's crossing this poll (the coordinator returned before it, at {}), so "
+                 "the hold is let go and his own drives move him; the crossing holds him "
+                 "again on the poll it is read",
+                 leaderName, DungeonRunPhaseName(coord.phase));
+        ReleaseHold(leaderName, leader, "no crossing was read for him this poll",
                     CROSSING_HOLD_VERB);
     }
 
@@ -48439,7 +48474,9 @@ private:
             // THE RUN'S PARTY, not the roster: a member sitting out is not
             // counted, staged, crossed or judged, and its guest is.
             std::vector<std::string> const members = FamilyRunParty(*roster);
+            _dungeonRunCoordinators[roster->family].crossingReadThisPoll = false;
             DriveDungeonRunFor(roster->family, members, roster->leader, jobs);
+            ReleaseUnreadCrossingHold(_dungeonRunCoordinators[roster->family], roster->leader);
             bool familyMemberInsideInstance = false;
             for (std::string const& memberName : members)
             {

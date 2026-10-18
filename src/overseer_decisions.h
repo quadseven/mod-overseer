@@ -8832,6 +8832,39 @@ BoardApproach BoardApproachFrom(bool levelWithBerth, float berthYards,
                                 std::uint32_t approachesSoFar,
                                 BoardApproachLimits const& limits);
 
+// ------------------- a crossing's hold that no crossing read this poll (#758) --
+//
+// WHAT WAS MEASURED. On 2026-10-18 the run leader reached the Theramore berth
+// and the crossing held him there to wait for the Lady Mehley. Fifty seconds
+// later a family member's bags filled, and IDLE's bag gate returned on every
+// poll after that before it reached the crossing. Nothing read the crossing
+// again, so nothing let go of the hold it keeps on its leader: he stood rooted
+// on the pier for the hold's whole 1800s ceiling, refused the town trip that
+// would have emptied those bags, and was released by the ceiling with the
+// family still split across two maps. GATHERING already lets go of such a hold
+// (ReleaseLeftoverCrossingHold); IDLE has a dozen ways to return before its
+// crossing and none of them did.
+//
+// SO THE QUESTION IS ASKED ONCE PER FAMILY PER POLL, after the coordinator
+// has run: did any path this poll read the family's crossing? A crossing hold
+// on a leader that nothing read is nobody's, and it is let go. Two holds are
+// kept anyway: a leader standing on a transport, because a passenger let go on
+// a deck is one his own strategies walk over the side, and a leader on a
+// member crossing of his own, whose hold that crossing placed and releases.
+struct CrossingHoldFacts
+{
+    // The hold in force on the leader is the crossing's (verb `cross`).
+    bool crossingHold{false};
+    // This poll's coordinator drove the family's crossing at all.
+    bool crossingRead{false};
+    // The leader stands on a transport.
+    bool aboard{false};
+    // The leader is on a member crossing of his own.
+    bool crossingAlone{false};
+};
+
+bool CrossingHoldIsLeftOver(CrossingHoldFacts const& facts);
+
 // ------------------------ a run that gathers across an ocean (2026-10-09) --
 //
 // WHAT WAS MEASURED. 55 family campaign runs in 72 hours on the dev realm: 12
