@@ -164,7 +164,7 @@ int main()
     }
 
     // A HALF HOUR THAT GOT NOWHERE GIVES UP AT ONCE (wow-overseer#870). After
-    // #926 shipped, four of the leader's seven hand-backs took 106 to 165
+    // #926 shipped, three of the leader's seven hand-backs took 106 to 165
     // minutes, each ending on the crossing's own backstop: two half hours, and
     // the gaps between them, before the family was let go. The issue asks for
     // the docks or a hand-back within thirty minutes.

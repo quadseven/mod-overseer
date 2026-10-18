@@ -8741,7 +8741,7 @@ std::string GatheringCrossingBlocker(std::string const& leader, std::uint32_t le
 // AND ONE IS ENOUGH WHEN IT RAN THE WHOLE HALF HOUR (wow-overseer#870). The
 // crossing's own backstop ends an attempt only after thirty minutes, so two of
 // them were an hour or more of a leader going nowhere before the hand-back:
-// measured after #926 shipped, four of the leader's seven hand-backs took 106
+// measured after #926 shipped, three of the leader's seven hand-backs took 106
 // to 165 minutes, each ending on that backstop. The issue asks for the docks
 // or a hand-back within thirty minutes, and an attempt that walked for the
 // whole of them without getting 100 yards nearer has answered the question.
