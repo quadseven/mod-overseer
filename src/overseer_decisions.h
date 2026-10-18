@@ -18983,6 +18983,83 @@ RoadSamples RoadSamplesAlong(std::vector<RoutePoint> const& route, std::size_t f
 // weaker than a party, so this refuses only what a party would refuse too.
 RouteLimits FarWalkRoadLimits();
 
+// ------------- a long errand reads its road before the family walks it (#836) --
+//
+// MEASURED ON THE DEV REALM, 2026-10-04. A family of levels 37 to 41 died 23
+// times in 24 hours between runs, nearly all of them with job `town run`, and 12
+// of those in Burning Steppes (creatures 50 to 58). The newest rows were aimed at
+// a place by the Stormwind inn, from Gnomeregan, and the travel survey's road
+// between the two halves of the Eastern Kingdoms runs through Searing Gorge and
+// Burning Steppes. The far walk learned to read that road on 2026-10-10; the
+// travel drive's own walk of a place aim never did. ConsiderFlight has its turn
+// first, and when no flight carried the leader the leader walked the road, and
+// the family followed it in.
+//
+// A player of that level takes the tram or a flight, or hearths, or waits for
+// the hearthstone. So a long walk to a PLACE reads the road it was planned along,
+// at the level of the youngest member walking it, under the same rule a far walk
+// is judged by (FarWalkRoadLimits). A road that passes is walked as before.
+// A road that fails is not:
+//
+//   * the walker's bind is beside the aim and its stone is ready: hearth;
+//   * the bind is beside the aim and the stone is on cooldown: wait for it,
+//     held where it stands with the family, and ask again;
+//   * otherwise the errand is refused, and the writer of the aim learns why.
+//
+// NOT JUDGED HERE, ON PURPOSE. A catch-up walk has its own leg rule (#697) and a
+// live dungeon run's walks are the run's; neither is this decision's to stop.
+// An aim at a creature is not judged either: ResolveTravelTarget already reads
+// the line to it before it is chosen (#300), and it has no planned road.
+
+// A walk shorter than this is not a journey and is walked as before.
+// TRAVEL_FLIGHT_MIN_YARDS: the distance at which this module already calls a
+// walk long enough to be worth a flight.
+constexpr float ERRAND_ROAD_MIN_YARDS = 1500.f;
+
+// A bind this close to the aim is a hearthstone that lands where the errand was
+// going. The lone leg's own number (LoneLegLimits::hearthNearYards).
+constexpr float ERRAND_ROAD_HEARTH_NEAR_YARDS = 500.f;
+
+struct ErrandRoadFacts
+{
+    // How far the walker still has to go to the aim, in yards.
+    float walkYards{0.f};
+    // The aim is a place (`at:` or `trigger:`), which is what has a planned road.
+    bool placeAim{false};
+    // A catch-up walk (#697 judges it) or a live run's walk (the run's).
+    bool catchUp{false};
+    bool liveRun{false};
+    // JudgeRoute of the planned road from where the walker stands, read at the
+    // youngest walking member's level under FarWalkRoadLimits. Unread is
+    // survivable, JudgeRoute's own convention.
+    RouteVerdict road;
+    // The walker carries a hearthstone, and it is off cooldown.
+    bool carriesStone{false};
+    bool hearthReady{false};
+    // The walker's bind to the aim, in yards; negative when the bind is on
+    // another map or unread.
+    float bindYardsFromAim{-1.f};
+};
+
+enum class ErrandRoadStep : std::uint8_t
+{
+    Walk,           // nothing against the road, or not this decision's: walk it
+    Hearth,         // the bind is beside the aim and the stone is ready
+    WaitForHearth,  // the bind is beside the aim and the stone is on cooldown
+    Refuse,         // nothing carries it there but the road: the errand is refused
+};
+
+// THE ORDER IS THE PREFERENCE, and a flight is not in it because it is asked
+// before this is.
+ErrandRoadStep DecideErrandRoad(ErrandRoadFacts const& facts);
+
+// "walk", "hearth", "wait for hearth", "refuse".
+char const* ErrandRoadStepWord(ErrandRoadStep step);
+
+// The refusal recorded against the aim, and said to whoever wrote it.
+constexpr char const* ErrandLethalRoad =
+    "the road to the errand crosses ground far above the family's level";
+
 // ---------------------------------------------------------------------------
 // THE DUNGEON RUN TIMELINE (overseer_dungeon_run_event).
 //

@@ -16407,6 +16407,33 @@ RouteLimits FarWalkRoadLimits()
     return RouteLimits{FAR_WALK_ROAD_LEVEL_GAP, FAR_WALK_ROAD_LETHAL_RUN_YARDS};
 }
 
+ErrandRoadStep DecideErrandRoad(ErrandRoadFacts const& facts)
+{
+    if (!facts.placeAim || facts.catchUp || facts.liveRun)
+        return ErrandRoadStep::Walk;
+    if (facts.walkYards < ERRAND_ROAD_MIN_YARDS)
+        return ErrandRoadStep::Walk;
+    if (facts.road.survivable)
+        return ErrandRoadStep::Walk;
+    bool const bindBesideAim = facts.bindYardsFromAim >= 0.f &&
+                               facts.bindYardsFromAim <= ERRAND_ROAD_HEARTH_NEAR_YARDS;
+    if (bindBesideAim && facts.carriesStone)
+        return facts.hearthReady ? ErrandRoadStep::Hearth : ErrandRoadStep::WaitForHearth;
+    return ErrandRoadStep::Refuse;
+}
+
+char const* ErrandRoadStepWord(ErrandRoadStep step)
+{
+    switch (step)
+    {
+        case ErrandRoadStep::Walk:          return "walk";
+        case ErrandRoadStep::Hearth:        return "hearth";
+        case ErrandRoadStep::WaitForHearth: return "wait for hearth";
+        case ErrandRoadStep::Refuse:        return "refuse";
+    }
+    return "unknown";
+}
+
 void NoteStoredItem(LootStoreNote& note, std::uint64_t looter, std::uint32_t itemGuid,
                     std::uint32_t count, bool notable)
 {
