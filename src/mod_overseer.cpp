@@ -24237,6 +24237,15 @@ private:
         if (_belowTerrain.count(LowerName(name)))
             return true;
 
+        // 0. AN OPERATOR'S GUARD (#163), whoever carries it. Unlike case 1 this
+        //    holds an unaimable follower too, on purpose: the guard's whole
+        //    point is that nobody re-picks an objective in the zone the party
+        //    was pulled out of while it is held, and a follower the quest drive
+        //    steers back in is the walk back the guard was written to stop.
+        //    Clearing the column is what hands the wheel back.
+        if (OverseerDecisions::IsTravelGuardAim(travelTarget))
+            return true;
+
         // 1. AN ERRAND IS OUTSTANDING. Not merely "the column is set": an aim
         //    on a character that cannot act on it moves nobody, and standing
         //    the quest drive down for one would quietly take an unaimable
@@ -24398,6 +24407,59 @@ private:
     // one of the three has done none of the job. The dungeon run coordinator
     // used to do exactly that in eight places; see that class for what it cost.
 
+    // WHO IS HELD BY AN OPERATOR'S GUARD, WHY, AND SINCE WHEN (#163). Said once
+    // when a guard is first seen and once when it is gone, so the log answers
+    // all three without a line every poll. A guard is the person's lever, and
+    // a lever whose state nobody can read is how the last one was found undone
+    // fourteen minutes after it was pulled. See OverseerDecisions::
+    // TRAVEL_GUARD_PREFIX for what holding one means.
+    //
+    // `aims` is this poll's Load(). A failed read answers empty, so a database
+    // hiccup reads as every guard cleared and the next poll as each one set
+    // again: two extra lines, and the guard itself is untouched in the column.
+    void NoteTravelGuards(std::map<std::string, std::string> const& aims)
+    {
+        time_t const now = std::time(nullptr);
+        for (auto const& [name, aim] : aims)
+        {
+            if (!OverseerDecisions::IsTravelGuardAim(aim))
+                continue;
+            auto const seen = _travelGuards.find(name);
+            if (seen != _travelGuards.end() && seen->second.aim == aim)
+                continue;
+            _travelGuards[name] = TravelGuardSeen{aim, now};
+            std::string const place = OverseerDecisions::TravelGuardPlace(aim);
+            if (place.empty())
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' carries the operator guard '{}', which names no "
+                         "place - the quest drive stands down for it and nothing walks it "
+                         "anywhere until the column is cleared or names a place (#163)",
+                         name, aim);
+            else
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is held by the operator guard '{}' from now on - it "
+                         "is walked to {} and kept there, no release, claim or death count "
+                         "ends it, and the quest drive stands down until a person clears "
+                         "the column (#163)",
+                         name, aim, place);
+        }
+        for (auto it = _travelGuards.begin(); it != _travelGuards.end();)
+        {
+            auto const current = aims.find(it->first);
+            if (current != aims.end() && current->second == it->second.aim)
+            {
+                ++it;
+                continue;
+            }
+            LOG_INFO("module.overseer",
+                     "overseer: the operator guard '{}' on '{}' was cleared after {}s - "
+                     "the quest drive has it back on its next poll (#163)",
+                     it->second.aim, it->first,
+                     static_cast<long long>(now - it->second.since));
+            it = _travelGuards.erase(it);
+        }
+    }
+
     // THE FIRST TRAVEL POLL CLEARS WHAT A GONE PROCESS LEFT BEHIND (#658). See
     // OverseerDecisions::ReadLeftoverAim. Once per process, before the first
     // Load, because the only aims it can be wrong about are the ones written
@@ -24455,6 +24517,7 @@ private:
         // errand". The WHERE clause that used to live here lives in the loader:
         // an empty target never reaches this loop, exactly as before.
         std::map<std::string, std::string> const aims = _travelAims.Load();
+        NoteTravelGuards(aims);
         // Read once for the whole sweep rather than per character: the errands
         // and the trades are the same handful of rows, and this is the read
         // that decides both WHERE a character is sent and what it does when it
@@ -24525,10 +24588,22 @@ private:
             // arrival and strips the `new rpg` the errand's writer handed back.
             // The errand stays in the column and is walked on the first poll
             // after the bind lands or the trip is given up.
-            std::string const bindAim = HomeBindAim(name);
+            //
+            // AN OPERATOR'S GUARD OUTRANKS THE BIND TRIP AND EVERYTHING ELSE
+            // (#163), and is walked as the `at:` place it names. The column
+            // keeps the guard; only `target` is the translation, so every
+            // release below reads the guard back and leaves it standing.
+            bool const guarded = OverseerDecisions::IsTravelGuardAim(columnAim);
+            std::string const bindAim = guarded ? std::string() : HomeBindAim(name);
             std::string const target =
-                OverseerDecisions::TravelAimBesideBind(bindAim, columnAim);
-            if (target != columnAim && SayHomeBindOnce(name, "an errand waits for the bind"))
+                guarded ? OverseerDecisions::TravelGuardPlace(columnAim)
+                        : OverseerDecisions::TravelAimBesideBind(bindAim, columnAim);
+            // A guard that names no place holds the character from questing and
+            // walks it nowhere; NoteTravelGuards has already said so.
+            if (target.empty())
+                continue;
+            if (!guarded && target != columnAim &&
+                SayHomeBindOnce(name, "an errand waits for the bind"))
                 LOG_INFO("module.overseer",
                          "overseer: '{}' was handed errand '{}' while it is on its campaign "
                          "bind trip to {} - the errand waits in the column and is walked "
@@ -24745,6 +24820,9 @@ private:
                 // rather than released, and neither may be deferred to as if a
                 // run's phase timer were going to finish it.
                 toll.catchUp = IsCatchingUp(name) || IsWalkingHome(name);
+                // AN OPERATOR'S GUARD IS NEVER CALLED OFF (#163): the deaths
+                // are why it was written. See ErrandDeathToll::guard.
+                toll.guard = guarded;
 
                 // THE SECOND REASON TO CALL AN ERRAND OFF, CHARGED HERE AND
                 // ANSWERED BY THE RULE BELOW. The breaker asks whether an
@@ -25417,7 +25495,10 @@ private:
                 // map, a malformed one - would be refused here every poll for
                 // ever. Counted first, because the release erases the claim the
                 // count reads.
-                bool const poisoned =
+                // NOT FOR AN OPERATOR'S GUARD (#163): the column holds the guard
+                // and not `target`, so the breaker's compare-and-swap could not
+                // clear it anyway, and only a person ends a guard.
+                bool const poisoned = !guarded &&
                     _travelAims.NoteUnresolvedAim(name, target, static_cast<uint32>(bot->GetMapId()));
                 _travelAims.Release(name, "the travel drive (no such spawn on this map)");
                 if (poisoned)
@@ -25507,6 +25588,26 @@ private:
                     // backstop still bounds it, and now bounds the right thing:
                     // a character that has stopped getting nearer to a door it
                     // cannot open is exactly what it is for.
+                }
+                else if (guarded)
+                {
+                    // AN OPERATOR'S GUARD IS NOT ENDED BY ARRIVING (#163). The
+                    // place is where the person wants this character to STAY,
+                    // so it is held there the way an escort is: not released,
+                    // not `continue`, and the re-issue guard below renews the
+                    // walk's lease every poll so upstream's own status roll
+                    // cannot walk it back to the ground it was pulled out of.
+                    // Said once per errand; the guard itself was said when it
+                    // was first seen (NoteTravelGuards).
+                    if (!state.arrived)
+                    {
+                        state.arrived = true;
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' has reached the place its operator guard "
+                                 "'{}' names and is held there until a person clears the "
+                                 "column (#163)",
+                                 name, columnAim);
+                    }
                 }
                 else if (escorted)
                 {
@@ -74509,6 +74610,14 @@ private:
     // process left in the roster (#658), and how many polls have asked.
     bool _leftoverAimsSwept = false;
     uint32 _leftoverSweepPolls = 0;
+    // Who carries an operator's guard (#163), the guard, and since when this
+    // process first saw it. See NoteTravelGuards.
+    struct TravelGuardSeen
+    {
+        std::string aim;
+        time_t since{0};
+    };
+    std::map<std::string, TravelGuardSeen> _travelGuards;
     // The talent reset errand (#626). Who is walking to a class trainer for
     // one, and the tree the reset is for; when the last walk ended without a
     // reset; which reason not to walk was last said; and how many arrival polls

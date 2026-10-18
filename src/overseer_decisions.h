@@ -4165,7 +4165,47 @@ bool IsMaintenanceErrand(std::string const& aim);
 // only `trigger:` this would newly protect is one no longer claimed, where
 // clearing a stale door aim is the safer reading. Widening it to match
 // ReadSplitErrand is a change to dungeon behaviour and wants its own argument.
+//
+// AN OPERATOR'S GUARD IS FOREIGN TOO (#163), so no release ever blanks it.
 bool IsForeignTravelAim(std::string const& aim);
+
+// ------------- the operator's guard: "get out, and stay out" (#163) ----------
+//
+// THE EMERGENCY LEVER DID NOT STAY PULLED. The operator's procedure for a death
+// spike was to write a homebind `at:` aim into every roster row. Nothing told
+// that aim apart from one the module or the bridge wrote for its own reasons,
+// so it was treated like any other errand: released, overwritten by a live run
+// or a training stop, cleared by a pass that aims somebody else, and called off
+// by the death breaker as "killing this character" when the deaths were the
+// reason it was written. Measured: four of five aims gone fourteen minutes
+// after they were applied, and all five characters back on the ground they had
+// been pulled out of.
+//
+// SO THE GUARD HAS A SPELLING OF ITS OWN: `guard:<map>:<x>,<y>,<z>`, the same
+// place an `at:` aim names behind a prefix nothing in this module writes. Its
+// whole meaning is that it holds until a person clears it:
+//   - no release blanks it, whatever ended the walk (IsForeignTravelAim);
+//   - no claim writes over it, a live run and a training stop included
+//     (ReadTravelClaim answers RefusedForeign for every owner);
+//   - arriving does not end it: the character is held where it was sent;
+//   - the death breaker never calls it off (ErrandDeathToll::guard);
+//   - the quest drive stands down for every character carrying one, a follower
+//     included, so nobody re-picks an objective in the zone it was pulled out
+//     of while the guard is held.
+// Clearing the column by hand is the one way it ends, and the next quest poll
+// takes the character back.
+//
+// The column is VARCHAR(32), so write the place in whole yards:
+// `guard:0:-8950,-132,84` is 21 characters.
+constexpr char TRAVEL_GUARD_PREFIX[] = "guard:";
+
+// Is this `travel_npc` value an operator's guard?
+bool IsTravelGuardAim(std::string const& aim);
+
+// The `at:` aim a guard names, for the travel drive to walk: `guard:0:1,2,3`
+// is `at:0:1,2,3`. Empty for anything that is not a guard, and for a guard
+// that names no place at all.
+std::string TravelGuardPlace(std::string const& aim);
 
 // WHAT THE TRAVEL DRIVE DOES WITH AN AIM IT LET GO OF AND COULD NOT CLEAR
 // (#558).
@@ -10269,6 +10309,13 @@ struct ErrandDeathToll
     // outcome='staging_failed'. The deference is right and its coverage was
     // wrong. A claim nothing answers for is answered here instead.
     bool catchUp{false};
+
+    // THE AIM IS AN OPERATOR'S GUARD (#163), and this rule never calls it off.
+    // A guard is written BECAUSE characters are dying, so deaths on the way
+    // out are the reason for it and not evidence against it: refusing one
+    // stopped the walk out and left the party where it was dying. Only a
+    // person clearing the column ends a guard. See TRAVEL_GUARD_PREFIX.
+    bool guard{false};
 };
 
 enum class ErrandDeathRemedy
