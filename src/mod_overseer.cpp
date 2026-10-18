@@ -39951,8 +39951,16 @@ private:
             run.bossesBest = kills.best;
             run.lastKillAt = kills.lastKillAt;
             run.nextBoss = NextEncounterName(run.mapId, poll.expectedMask, poll.creditedMask);
-            poll.ceilingSeconds =
-                OverseerDecisions::GuildRunCeilingSeconds(run.finderEndsDungeon, run.bossesTotal);
+            poll.ceilingSeconds = OverseerDecisions::GuildRunCeilingForMap(
+                run.mapId, run.finderEndsDungeon, run.bossesTotal);
+            {
+                // IsEncounterInProgress  InstanceScript.h
+                InstanceScript* const script =
+                    tank && tank->IsInWorld() && tank->GetMapId() == run.mapId
+                        ? tank->GetInstanceScript()
+                        : nullptr;
+                poll.bossInCombat = script && script->IsEncounterInProgress();
+            }
             poll.finderFinished =
                 ourGroup && sLFGMgr->GetState(group->GetGUID()) == lfg::LFG_STATE_FINISHED_DUNGEON;
             if (poll.finderFinished && !run.finderEndsDungeon && !run.finderSliceSaid)
