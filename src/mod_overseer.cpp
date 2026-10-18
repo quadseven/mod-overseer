@@ -28134,8 +28134,13 @@ private:
             std::string travelTarget;
             std::string job;
             uint32 questAim = 0;
-            uint16 aimedMap = 0;
-            float aimedX = 0.f, aimedY = 0.f, aimedZ = 0.f;
+            // WHERE THE CHARACTER STOOD WHEN DRIVEQUESTS LAST READ THE AIM, and
+            // not the aim's own coordinates (#188): AimSnapshot keeps the
+            // character's position beside the aim (RememberAim), and the target
+            // itself is `travelTarget`. The give-up lines used to label these as
+            // the aim's position, which a reader takes for the target.
+            uint16 seenMap = 0;
+            float seenX = 0.f, seenY = 0.f, seenZ = 0.f;
             {
                 std::lock_guard<std::mutex> guard(g_aimMutex);
                 auto const it = g_aimSnapshot.find(LowerName(name));
@@ -28144,10 +28149,10 @@ private:
                     travelTarget = it->second.travelTarget;
                     job = it->second.job;
                     questAim = it->second.questAim;
-                    aimedMap = it->second.mapId;
-                    aimedX = it->second.x;
-                    aimedY = it->second.y;
-                    aimedZ = it->second.z;
+                    seenMap = it->second.mapId;
+                    seenX = it->second.x;
+                    seenY = it->second.y;
+                    seenZ = it->second.z;
                 }
             }
             // Recovery is terminal for the unsafe travel aim. Capture the
@@ -28236,6 +28241,18 @@ private:
             // or the spirit healer.
             if (verdict.remedy == OverseerDecisions::TerrainRemedy::LiftToSurface)
             {
+                // THE FLOOR AS A NUMBER, beside the surface overhead (#188). The
+                // two readings together are what separate "under a roof" from
+                // "in a void", and this line used to measure the floor and then
+                // print only whether it was found.
+                std::ostringstream floorOut;
+                if (reading.floorBelowValid)
+                    floorOut << "the nearest floor under it at z " << std::fixed
+                             << std::setprecision(1) << reading.floorBelowZ
+                             << ", more than a stride away";
+                else
+                    floorOut << "no floor found under its feet";
+                std::string const floorBelow = floorOut.str();
                 LOG_ERROR("module.overseer",
                           "overseer: '{}' reads as below the world at map {} position "
                           "({:.1f}, {:.1f}, {:.1f}), surface z {:.1f} ({:.1f} yards up), "
@@ -28248,9 +28265,7 @@ private:
                           memory.fallingSince
                               ? static_cast<uint32>(std::time(nullptr) - memory.fallingSince)
                               : 0u,
-                          reading.floorBelowValid
-                              ? "the nearest floor under it more than a stride away"
-                              : "no floor found under its feet",
+                          floorBelow,
                           nearThePlane ? ", inside the catch height above the kill plane" : "",
                           job, questAim, travelTarget);
                 continue;
@@ -28380,13 +28395,13 @@ private:
                               "either. It is NOT being moved and NOT being sent anywhere "
                               "off this map (#188). It gets the lift again in {}s if the "
                               "condition is still true then. Aim job='{}' quest={} "
-                              "travel='{}' last aimed position map {} ({:.1f}, {:.1f}, "
-                              "{:.1f})",
+                              "travel='{}', read while it stood at map {} ({:.1f}, "
+                              "{:.1f}, {:.1f})",
                               name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
                               surface - fromZ, surface, footing,
                               static_cast<uint32>(TERRAIN_RECOVERY_FORGET_SECONDS), job,
-                              questAim, travelTarget, static_cast<uint32>(aimedMap),
-                              aimedX, aimedY, aimedZ);
+                              questAim, travelTarget, static_cast<uint32>(seenMap),
+                              seenX, seenY, seenZ);
                     continue;
                 }
                 LOG_ERROR("module.overseer",
@@ -28404,14 +28419,14 @@ private:
                           "WHERE IT STANDS is reported and retried rather than relocated. "
                           "If it falls from here it is caught again within {:.0f} yards "
                           "of the kill plane. Aim job='{}' quest={} travel='{}' "
-                          "last aimed position map {} ({:.1f}, {:.1f}, {:.1f}). Somebody "
+                          "read while it stood at map {} ({:.1f}, {:.1f}, {:.1f}). Somebody "
                           "needs to look at what is under these coordinates",
                           name, static_cast<uint32>(fromMap), fromX, fromY, fromZ,
                           surface, surface - fromZ, footing,
                           static_cast<uint32>(TERRAIN_RECOVERY_FORGET_SECONDS),
                           TERRAIN_RECOVERY_VOID_CATCH_YARDS, job,
-                          questAim, travelTarget, static_cast<uint32>(aimedMap),
-                          aimedX, aimedY, aimedZ);
+                          questAim, travelTarget, static_cast<uint32>(seenMap),
+                          seenX, seenY, seenZ);
             }
         }
     }
