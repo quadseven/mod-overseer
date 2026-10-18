@@ -7324,6 +7324,11 @@ BoardApproach BoardApproachFrom(bool levelWithBerth, float berthYards,
     return BoardApproach::StepAboard;
 }
 
+bool CrossingHoldIsLeftOver(CrossingHoldFacts const& facts)
+{
+    return facts.crossingHold && !facts.crossingRead && !facts.aboard && !facts.crossingAlone;
+}
+
 bool CrossingHoldsTheFamily(CrossingAction action)
 {
     switch (action)
