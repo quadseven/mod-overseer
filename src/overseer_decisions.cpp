@@ -19126,6 +19126,40 @@ bool RunCloseHeldAfterStartup(std::int64_t secondsSinceStart)
     return secondsSinceStart < static_cast<std::int64_t>(RUN_CLOSE_STARTUP_HOLD_SECONDS);
 }
 
+LeaderClientLossAction DungeonLeaderClientLossAfterStart(bool socketOpen,
+                                                         bool partyIssuerAvailable,
+                                                         std::time_t lostSince, std::time_t now,
+                                                         std::int64_t secondsSinceStart)
+{
+    LeaderClientLossAction const loss =
+        DungeonLeaderClientLoss(socketOpen, partyIssuerAvailable, lostSince, now);
+    if (loss == LeaderClientLossAction::Abandon && RunCloseHeldAfterStartup(secondsSinceStart))
+        return LeaderClientLossAction::Hold;
+    return loss;
+}
+
+std::vector<std::string> GuildRunAdoptLogins(
+    std::vector<GuildRunAdoptLoginMember> const& members, bool rosterKnown)
+{
+    std::vector<std::string> ask;
+    if (!rosterKnown)
+        return ask;
+    auto due = [](GuildRunAdoptLoginMember const& m)
+    {
+        if (m.name.empty() || m.inWorld || m.loading || m.familyCharacter || m.clientComing)
+            return false;
+        return m.secondsSinceAsked < 0 ||
+               m.secondsSinceAsked >= static_cast<std::int64_t>(GUILD_RUN_ADOPT_LOGIN_RETRY_SECONDS);
+    };
+    for (GuildRunAdoptLoginMember const& m : members)
+        if (m.tank && due(m))
+            ask.push_back(m.name);
+    for (GuildRunAdoptLoginMember const& m : members)
+        if (!m.tank && due(m))
+            ask.push_back(m.name);
+    return ask;
+}
+
 namespace
 {
 bool GuildRunCleared(GuildRunPoll const& poll)
