@@ -41181,6 +41181,14 @@ private:
     // (OverseerDecisions::GuildRunStrayNext): the tank seated in a new run
     // inside the quarter hour used to have the new run's group disbanded under
     // it.
+    //
+    // A ROW A ROLL ALREADY ENDED IS READ TOO (wow-overseer#789): one released
+    // as `lost at the restart` or ended as `restart:` in the last three hours.
+    // Its group lives in the database and the stray that would have disbanded
+    // it lived in the last process's memory, so a second roll inside the
+    // quarter hour left it for ever. And a stray is read through any of its
+    // members, not the tank alone (OverseerDecisions::GuildRunStrayLookAt): a
+    // run lost because its tank never came back left the rest in the group.
     void DriveGuildRunStrays(std::time_t now)
     {
         if (!_guildRunStraysRead)
@@ -41189,9 +41197,11 @@ private:
             if (QueryResult rows = CharacterDatabase.Query(
                     "SELECT target_name, command, id, status, claimed_by, result, "
                     "TIMESTAMPDIFF(SECOND, updated_at, NOW()) FROM overseer_command "
-                    "WHERE kind = 'guild' "
-                    "AND command LIKE 'finder-run %' AND status IN ('claimed', 'verifying') "
-                    "AND claimed_by <> '{}' AND created_at > NOW() - INTERVAL 3 HOUR",
+                    "WHERE kind = 'guild' AND command LIKE 'finder-run %' "
+                    "AND ((status IN ('claimed', 'verifying') AND claimed_by <> '{}' "
+                    "AND created_at > NOW() - INTERVAL 3 HOUR) "
+                    "OR (status = 'error' AND (detail LIKE 'lost at the restart:%' "
+                    "OR detail LIKE 'restart:%') AND updated_at > NOW() - INTERVAL 3 HOUR))",
                     g_runToken))
                 do
                 {
@@ -41260,29 +41270,54 @@ private:
         }
         if (_guildRunStrays.empty())
             return;
+        // THE GROUPS NO STRAY MAY TAKE: every live run's, and the group of any
+        // member of a run still waiting to be adopted.
+        std::set<uint64> held;
+        for (GuildRun const& run : _guildRuns)
+            held.insert(run.groupGuid);
+        for (GuildRunAdoption const& adoption : _guildRunAdoptions)
+        {
+            std::vector<std::string> names{adoption.tank, adoption.request.healer};
+            names.insert(names.end(), adoption.request.damage.begin(),
+                         adoption.request.damage.end());
+            for (std::string const& name : names)
+                if (Player* const p = ObjectAccessor::FindPlayerByName(name))
+                    if (Group* const g = p->IsInWorld() ? p->GetGroup() : nullptr)
+                        held.insert(g->GetGUID().GetRawValue());
+        }
         std::vector<GuildRunStray> still;
         for (GuildRunStray& stray : _guildRunStrays)
         {
-            Player* const tank = ObjectAccessor::FindPlayerByName(stray.tank);
-            Group* const group = tank ? tank->GetGroup() : nullptr;
-            OverseerDecisions::GuildRunStrayFacts facts;
-            facts.tankInGroup = group != nullptr;
-            facts.finderGroup = group && group->isLFGGroup();
-            if (group)
+            ObjectGuid const tankGuid = sCharacterCache->GetCharacterGuidByName(stray.tank);
+            std::vector<OverseerDecisions::GuildRunStrayMember> members;
+            std::vector<Group*> groups;
+            // names[0] is the tank: GuildRunStrayLookAt reads it first.
+            for (std::string const& name : stray.names)
             {
-                uint64 const groupGuid = group->GetGUID().GetRawValue();
-                for (GuildRun const& run : _guildRuns)
-                    if (run.groupGuid == groupGuid)
-                        facts.liveRunGroup = true;
+                Player* const p = ObjectAccessor::FindPlayerByName(name);
+                bool const inWorld = p && p->IsInWorld();
+                Group* const g = inWorld ? p->GetGroup() : nullptr;
+                OverseerDecisions::GuildRunStrayMember member;
+                member.inWorld = inWorld;
+                member.inGroup = g != nullptr;
+                member.finderGroup = g && g->isLFGGroup();
+                member.tankSavedInGroup = g && !tankGuid.IsEmpty() && g->IsMember(tankGuid);
+                member.heldGroup = g && held.count(g->GetGUID().GetRawValue()) > 0;
+                members.push_back(member);
+                groups.push_back(g);
             }
-            facts.takenOut = stray.teleported;
-            // THE QUARTER HOUR STARTS WHEN THE TANK IS FIRST SEEN IN THE WORLD,
-            // not when the row was read: a tank back after a long login queue
-            // used to find its stray dropped, the finder group never disbanded
-            // and its bots counted as already grouped.
-            stray.until = OverseerDecisions::GuildRunStrayExpiry(
-                tank && tank->IsInWorld(), stray.until, now);
-            facts.expired = OverseerDecisions::GuildRunStrayExpired(stray.until, now);
+            // THE QUARTER HOUR STARTS WHEN THE FIRST OF THEM IS SEEN IN THE
+            // WORLD, not when the row was read: a tank back after a long login
+            // queue used to find its stray dropped, the finder group never
+            // disbanded and its bots counted as already grouped.
+            OverseerDecisions::GuildRunStrayLook look =
+                OverseerDecisions::GuildRunStrayLookAt(members, stray.teleported);
+            stray.until = OverseerDecisions::GuildRunStrayExpiry(look.anyInWorld, stray.until, now);
+            look.facts.expired = OverseerDecisions::GuildRunStrayExpired(stray.until, now);
+            OverseerDecisions::GuildRunStrayFacts const& facts = look.facts;
+            Group* const group =
+                look.witness == OverseerDecisions::GUILD_RUN_STRAY_NOBODY ? nullptr
+                                                                         : groups[look.witness];
             OverseerDecisions::GuildRunStrayStep const step =
                 OverseerDecisions::GuildRunStrayNext(facts);
             if (step == OverseerDecisions::GuildRunStrayStep::Wait)
@@ -41301,6 +41336,12 @@ private:
             }
             if (step == OverseerDecisions::GuildRunStrayStep::TakeOut)
             {
+                if (look.witness != 0)
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' led a guild finder run lost at a restart and is "
+                             "not back; its finder group, read through '{}', is taken out and "
+                             "disbanded without it",
+                             stray.tank, stray.names[look.witness]);
                 stray.teleported = true;
                 for (std::string const& name : stray.names)
                 {
@@ -54067,6 +54108,13 @@ private:
     // The bridge sweeps these too, and this write is guarded on the status and
     // the token it is collecting, so whichever gets there second changes
     // nothing.
+    //
+    // THE DETAIL SAYS IT WAS A RESTART (wow-overseer#789). A claim held by
+    // another run token is one a worldserver that is gone left behind, and the
+    // read-backs it held (strategy, hearth, summon, cast, learn, retire, ...)
+    // died with it, not because the bot refused. A bridge pass that backs off
+    // a refusal read the plain error as one; `restart:` is the word it reads as
+    // "ask again" (OverseerDecisions::RESTART_DETAIL_PREFIX).
     void ExpireAbandonedClaims()
     {
         QueryResult holders = CharacterDatabase.Query(
@@ -54101,9 +54149,9 @@ private:
 
             CharacterDatabase.Execute(
                 "UPDATE overseer_command SET status = 'error', "
-                "detail = 'claim expired: the run holding it is gone', claimed_by = '' "
+                "detail = '{}', claimed_by = '' "
                 "WHERE id = {} AND status IN ('claimed', 'verifying') AND claimed_by = '{}'",
-                id, Esc(claimedBy));
+                Esc(OverseerDecisions::ClaimExpiredDetail()), id, Esc(claimedBy));
         } while (holders->NextRow());
     }
 
