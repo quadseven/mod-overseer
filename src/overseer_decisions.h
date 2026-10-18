@@ -22625,6 +22625,52 @@ std::string ClaimExpiredDetail();
 constexpr unsigned RUN_CLOSE_STARTUP_HOLD_SECONDS = 10 * 60;
 bool RunCloseHeldAfterStartup(std::int64_t secondsSinceStart);
 
+// A ROLL IS NOT A LEADER CLIENT LOST EITHER (wow-overseer#1192). At 4 of 5
+// worldserver starts with a family run inside (2026-10-11 to 10-16), the run
+// ended `client_lost` 383 to 511 s after the start: the leader-client hold
+// starts its 300 s window on the first poll after the start, and the stream
+// clients were not back by then. The window still runs as before, but while
+// the startup hold above is on the hold never turns into an evacuation, so a
+// roll gives the clients the same ten minutes it gives CloseAbandonedRuns.
+LeaderClientLossAction DungeonLeaderClientLossAfterStart(bool socketOpen,
+                                                         bool partyIssuerAvailable,
+                                                         std::time_t lostSince, std::time_t now,
+                                                         std::int64_t secondsSinceStart);
+
+// A HELD GUILD RUN'S MEMBERS ARE LOGGED BACK IN (wow-overseer#1192). Across
+// 19 worldserver starts (2026-10-10 to 10-18) 39 adopted runs ended `lost at
+// the restart: its tank was not back in the world within a quarter hour`, 1
+// to 5 per roll, every one after the full adoption wait. Nothing asked for
+// the tank: it came back only if the random-bot login cycle happened to pick
+// it inside the quarter hour, and for those runs it did not. So a waiting
+// adoption asks the bot manager to log in every member that is not in the
+// world, the tank first, and asks again a minute later if one is still not
+// there.
+//
+// NEVER A FAMILY CHARACTER. The camera rule keeps a roster character out of
+// the world unless its client is attached, so one is never logged in without
+// it here, and nobody is asked for while the roster is not yet read (an
+// unread roster cannot say who is family). A member whose account has a
+// client session open is coming in through that client and is left to it.
+struct GuildRunAdoptLoginMember
+{
+    std::string name;
+    bool tank{false};
+    bool inWorld{false};
+    // A Player exists for it but is not in the world yet: on its way in.
+    bool loading{false};
+    bool familyCharacter{false};
+    bool clientComing{false};
+    // Seconds since this adoption last asked for it; negative: never asked.
+    std::int64_t secondsSinceAsked{-1};
+};
+
+constexpr unsigned GUILD_RUN_ADOPT_LOGIN_RETRY_SECONDS = 60;
+
+// The names to ask the bot manager for now, the tank first.
+std::vector<std::string> GuildRunAdoptLogins(
+    std::vector<GuildRunAdoptLoginMember> const& members, bool rosterKnown);
+
 // ------------------------------------------------------------------ keep --
 //
 // AN ITEM A CHARACTER MUST KEEP, whatever else wants it (overseer_keep). The

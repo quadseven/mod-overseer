@@ -39610,6 +39610,9 @@ private:
         std::time_t until{0};
         // When the row was last written while the adoption waited.
         std::time_t touchedAt{0};
+        // When this adoption last asked the bot manager to log a member in
+        // (OverseerDecisions::GuildRunAdoptLogins).
+        std::map<std::string, std::time_t> loginAskedAt;
     };
     std::vector<GuildRunAdoption> _guildRunAdoptions;
 
@@ -41034,6 +41037,53 @@ private:
         return false;
     }
 
+    // A WAITING ADOPTION'S MEMBERS ARE ASKED FOR (OverseerDecisions::
+    // GuildRunAdoptLogins, wow-overseer#1192), instead of waiting on the
+    // random-bot login cycle to pick them. The login is the bot manager's own
+    // (sRandomPlayerbotMgr.AddPlayerBot, as the naturalize and rename verbs
+    // log a character in); the member logs in to its saved finder group, and
+    // a bot in a group is never logged out by that manager's rotation
+    // (RandomPlayerbotMgr::ProcessBot).
+    void AskGuildRunAdoptLogins(GuildRunAdoption& adoption,
+                                std::vector<std::string> const& names, std::time_t now)
+    {
+        std::vector<OverseerDecisions::GuildRunAdoptLoginMember> members;
+        std::map<std::string, ObjectGuid> guids;
+        bool const rosterKnown = g_rosterKnown.load(std::memory_order_relaxed);
+        for (std::size_t i = 0; i < names.size(); ++i)
+        {
+            OverseerDecisions::GuildRunAdoptLoginMember member;
+            member.name = names[i];
+            member.tank = i == 0;
+            ObjectGuid const guid = sCharacterCache->GetCharacterGuidByName(names[i]);
+            if (guid.IsEmpty())
+                continue;
+            guids[names[i]] = guid;
+            Player* const p = ObjectAccessor::FindConnectedPlayer(guid);
+            member.inWorld = p && p->IsInWorld();
+            member.loading = (p && !p->IsInWorld()) || sRandomPlayerbotMgr.GetPlayerBot(guid);
+            member.familyCharacter = rosterKnown && OnRoster(names[i]);
+            uint32 const account = sCharacterCache->GetCharacterAccountIdByGuid(guid);
+            member.clientComing = account != 0 && sWorldSessionMgr->FindSession(account) != nullptr;
+            auto const asked = adoption.loginAskedAt.find(names[i]);
+            member.secondsSinceAsked =
+                asked == adoption.loginAskedAt.end() ? -1 : static_cast<std::int64_t>(now - asked->second);
+            members.push_back(member);
+        }
+        for (std::string const& name : OverseerDecisions::GuildRunAdoptLogins(members, rosterKnown))
+        {
+            bool const again = adoption.loginAskedAt.count(name) > 0;
+            adoption.loginAskedAt[name] = now;
+            // The deploy proof: "is asked to log back in" is said nowhere else.
+            LOG_INFO("module.overseer",
+                     "overseer: guild finder run {} - '{}'{} is asked to log back in after the "
+                     "restart{}, so the run is not lost waiting on the random login cycle",
+                     adoption.id, name, name == adoption.tank ? " (its tank)" : "",
+                     again ? " again" : "");
+            sRandomPlayerbotMgr.AddPlayerBot(guids[name], 0);
+        }
+    }
+
     // A RESTARTED WORLDSERVER'S RUN, TAKEN BACK UP (OverseerDecisions::
     // GuildRunAdoptNext). The row is already this process's (the restart read
     // below claimed it), so ExpireAbandonedClaims leaves it alone while the
@@ -41097,6 +41147,7 @@ private:
                              "touched so the bridge does not end it as stale",
                              adoption.id, adoption.tank, facts.membersInWorld, facts.groupSize);
                 }
+                AskGuildRunAdoptLogins(adoption, names, now);
                 still.push_back(adoption);
                 continue;
             }
@@ -48870,9 +48921,10 @@ private:
             if (runHasMembersInside)
             {
                 OverseerDecisions::LeaderClientLossAction const loss =
-                    OverseerDecisions::DungeonLeaderClientLoss(
+                    OverseerDecisions::DungeonLeaderClientLossAfterStart(
                         leaderSocketOpen, partyIssuerAvailable,
-                        coord.leaderClientLostSince, clientNow);
+                        coord.leaderClientLostSince, clientNow,
+                        static_cast<std::int64_t>(clientNow) - g_startedAt);
                 if (loss == OverseerDecisions::LeaderClientLossAction::Hold)
                 {
                     coord.leaderClientHoldActive = true;
@@ -48882,9 +48934,11 @@ private:
                         LOG_WARN("module.overseer",
                                  "overseer: dungeon run for '{}' is held because the leader's "
                                  "client or an authorized party issuer is unavailable; members "
-                                 "inside stay put for up to {} seconds",
+                                 "inside stay put for up to {} seconds, and never less than "
+                                 "{} seconds after a worldserver start",
                                  leaderName, static_cast<uint32>(
-                                     OverseerDecisions::DUNGEON_LEADER_CLIENT_LOST_SECONDS));
+                                     OverseerDecisions::DUNGEON_LEADER_CLIENT_LOST_SECONDS),
+                                 OverseerDecisions::RUN_CLOSE_STARTUP_HOLD_SECONDS);
                     }
                     for (std::string const& member : members)
                     {
