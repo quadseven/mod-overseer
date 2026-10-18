@@ -3977,7 +3977,8 @@ void RecordEvent(Player* actor, char const* kind, uint32 subjectId,
 //
 // WHAT THIS RECORDS. Three moments in one item instance's life, joined by its
 // guid: looted (`item_loot`), handed on by one of this module's commands
-// (`item_given`), and put on (`item_equip`). Rare and up only. The gates and
+// (`item_given`), and put on (`item_equip`). Rare and up, plus any equippable
+// item a roster character loots or hands to another (#768). The gates and
 // the sentences are in OverseerDecisions, where test_item_story.cpp reaches
 // them; this section only feeds them what the world knows.
 //
@@ -3987,10 +3988,10 @@ void RecordEvent(Player* actor, char const* kind, uint32 subjectId,
 // family that forms a guild brings it into the record on the next poll.
 //
 // THE COST ON THE HOT PATH. The store, loot and equip hooks fire for every
-// player on the world. Each one asks the item's quality first, which is a
-// field on a template already in hand, and returns there for everything below
-// rare (the loot hooks ask it of the note the store hook left, #572). Only a
-// notable item gets as far as a lock.
+// player on the world. Each one asks the item's quality and inventory type
+// first, which are fields on a template already in hand, and returns there for
+// anything neither rare nor wearable (the loot hooks ask it of the note the
+// store hook left, #572). Only a story candidate gets as far as a lock.
 
 std::mutex g_storyMutex;
 std::vector<unsigned> g_storyGuilds;
@@ -4024,6 +4025,26 @@ bool StoryKnowsItem(uint32 itemGuid)
 // one note per loot in flight and needs no lock.
 thread_local OverseerDecisions::LootStoreNote t_lootStoreNote;
 
+bool IsEquippable(ItemTemplate const* proto)
+{
+    return proto && OverseerDecisions::IsEquippableInventoryType(proto->InventoryType);
+}
+
+bool IsItemStoryCandidate(ItemTemplate const* proto)
+{
+    return proto && OverseerDecisions::IsItemStoryCandidate(proto->Quality, IsEquippable(proto));
+}
+
+// The entry of a looted item when it is notable, else 0. The guild run and hunt
+// tallies list notable loot only; the store note now also finds wearable
+// greens (#768), so the tallies ask the quality of the live item themselves.
+uint32 NotableLootEntry(Item const* live)
+{
+    ItemTemplate const* proto = live ? live->GetTemplate() : nullptr;
+    return proto && OverseerDecisions::IsNotableItemQuality(proto->Quality) ? live->GetEntry()
+                                                                            : 0;
+}
+
 void NoteStoredItem(Player const* player, Item const* item, uint32 count)
 {
     if (!player)
@@ -4031,7 +4052,7 @@ void NoteStoredItem(Player const* player, Item const* item, uint32 count)
     ItemTemplate const* proto = item ? item->GetTemplate() : nullptr;
     OverseerDecisions::NoteStoredItem(
         t_lootStoreNote, player->GetGUID().GetRawValue(), item ? item->GetGUID().GetCounter() : 0,
-        count, proto && OverseerDecisions::IsNotableItemQuality(proto->Quality));
+        count, IsItemStoryCandidate(proto));
 }
 
 // The looted item as the looter's bags hold it now, or null. `handed` is the
@@ -4097,13 +4118,17 @@ void RecordItemLoot(Player* looter, Item* item, char const* via, std::string con
     if (!looter || !item)
         return;
     ItemTemplate const* proto = item->GetTemplate();
-    if (!proto || !OverseerDecisions::IsNotableItemQuality(proto->Quality))
+    if (!IsItemStoryCandidate(proto))
         return;
-    if (!OverseerDecisions::ShouldRecordItemLoot(proto->Quality, StoryWho(looter)))
+    if (!OverseerDecisions::ShouldRecordItemLoot(proto->Quality, IsEquippable(proto),
+                                                 StoryWho(looter)))
         return;
 
     uint32 const itemGuid = item->GetGUID().GetCounter();
-    RememberStoryItem(itemGuid);
+    // The book serves one question, a guild member's equip, which is asked of
+    // notable items only; a roster green kept here would only push rares out.
+    if (OverseerDecisions::IsNotableItemQuality(proto->Quality))
+        RememberStoryItem(itemGuid);
 
     EventExtra extra;
     extra.subjectQuality = proto->Quality;
@@ -4129,7 +4154,7 @@ void RecordItemGiven(Player* giver, Player const* receiver, std::string const& r
     if (!giver)
         return;
     ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemEntry);
-    if (!proto || !OverseerDecisions::IsNotableItemQuality(proto->Quality))
+    if (!IsItemStoryCandidate(proto))
         return;
 
     OverseerDecisions::ItemStoryWho to = OverseerDecisions::ItemStoryWho::Stranger;
@@ -4142,10 +4167,12 @@ void RecordItemGiven(Player* giver, Player const* receiver, std::string const& r
             ? 0 : static_cast<uint32>(sCharacterCache->GetCharacterGuildIdByGuid(guid));
         to = StoryWho(OnRoster(receiverName), guildId);
     }
-    if (!OverseerDecisions::ShouldRecordItemGiven(proto->Quality, StoryWho(giver), to))
+    if (!OverseerDecisions::ShouldRecordItemGiven(proto->Quality, IsEquippable(proto),
+                                                  StoryWho(giver), to))
         return;
 
-    RememberStoryItem(itemGuid);
+    if (OverseerDecisions::IsNotableItemQuality(proto->Quality))
+        RememberStoryItem(itemGuid);
 
     std::string const toName = receiver ? receiver->GetName() : receiverName;
     std::string const source = (std::string(via) == OverseerDecisions::ItemVia::Mail)
@@ -7372,8 +7399,9 @@ public:
         Item* live = TakeLootedItem(player, item, count);
         // A guild finder run's tally counts every loot, notable or not; only
         // the entry of a notable one is read, off the item found alive.
-        NoteGuildRunLoot(player, count, live ? live->GetEntry() : 0);
-        NoteHuntLoot(player, count, live ? live->GetEntry() : 0);
+        uint32 const notableEntry = NotableLootEntry(live);
+        NoteGuildRunLoot(player, count, notableEntry);
+        NoteHuntLoot(player, count, notableEntry);
         if (!live)
             return;
         RecordItemLoot(player, live, OverseerDecisions::ItemVia::Loot,
@@ -7397,7 +7425,7 @@ public:
         // pointer is trusted: only the name and the roll's own guid are read
         // here, plus the item's guid when the store hook found it alive.
         Item* live = TakeLootedItem(player, item, count);
-        NoteGuildRunLoot(player, count, live ? live->GetEntry() : 0);
+        NoteGuildRunLoot(player, count, NotableLootEntry(live));
         if (player && roll)
         {
             std::lock_guard<std::mutex> guard(g_councilMutex);

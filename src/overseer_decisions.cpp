@@ -15185,6 +15185,16 @@ bool IsNotableItemQuality(unsigned quality)
     return quality >= NOTABLE_ITEM_QUALITY;
 }
 
+bool IsEquippableInventoryType(unsigned inventoryType)
+{
+    return inventoryType != 0;   // INVTYPE_NON_EQUIP
+}
+
+bool IsItemStoryCandidate(unsigned quality, bool equippable)
+{
+    return equippable || IsNotableItemQuality(quality);
+}
+
 ItemStoryWho ClassifyItemStoryCharacter(bool onRoster, unsigned guildId,
                                         std::vector<unsigned> const& storyGuilds)
 {
@@ -15200,13 +15210,18 @@ ItemStoryWho ClassifyItemStoryCharacter(bool onRoster, unsigned guildId,
     return ItemStoryWho::Stranger;
 }
 
-bool ShouldRecordItemLoot(unsigned quality, ItemStoryWho looter)
+bool ShouldRecordItemLoot(unsigned quality, bool equippable, ItemStoryWho looter)
 {
+    if (equippable && looter == ItemStoryWho::Roster)
+        return true;
     return IsNotableItemQuality(quality) && looter != ItemStoryWho::Stranger;
 }
 
-bool ShouldRecordItemGiven(unsigned quality, ItemStoryWho from, ItemStoryWho to)
+bool ShouldRecordItemGiven(unsigned quality, bool equippable, ItemStoryWho from,
+                           ItemStoryWho to)
 {
+    if (equippable && from == ItemStoryWho::Roster && to == ItemStoryWho::Roster)
+        return true;
     if (!IsNotableItemQuality(quality))
         return false;
     return from != ItemStoryWho::Stranger || to != ItemStoryWho::Stranger;
