@@ -74827,7 +74827,11 @@ public:
     // reaches the roster lookup.
     void OnAuraApply(Unit* unit, Aura* aura) override
     {
-        if (!unit || !aura || !aura->IsPositive())
+        if (!unit || !aura)
+            return;
+        // Aura has no IsPositive of its own; the spell's template carries it.
+        SpellInfo const* info = aura->GetSpellInfo();
+        if (!info || !info->IsPositive())
             return;
         int32 const maxMs = aura->GetMaxDuration();
         bool const permanent = maxMs < 0;
@@ -74838,12 +74842,10 @@ public:
             return;
         if (!OverseerDecisions::ShouldRecordVendorTrade(StoryWho(player)))
             return;
-        SpellInfo const* info = aura->GetSpellInfo();
-        uint32 const spellId = info ? info->Id : 0;
-        std::string const spellName = info ? info->SpellName[LOCALE_enUS] : "";
         OverseerDecisions::OverseerEventFields fields =
             OverseerDecisions::AuraGainedFields(
-                spellId, spellName, permanent ? 0 : uint32(maxMs / 1000),
+                info->Id, info->SpellName[LOCALE_enUS],
+                permanent ? 0 : uint32(maxMs / 1000),
                 ClassifyAuraCaster(player, aura));
         if (permanent)
             fields.detail = "permanent";
