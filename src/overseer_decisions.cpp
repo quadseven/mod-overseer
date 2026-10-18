@@ -21541,4 +21541,84 @@ ReleasePromptReading ReleasePromptObserve(ReleasePromptClock& clock, std::int64_
     return reading;
 }
 
+RebuffSpell RebuffSpellFor(unsigned classId)
+{
+    RebuffSpell spell;
+    switch (classId)
+    {
+        case 5:   // priest
+            spell.aura = "power word: fortitude";
+            spell.groupAura = "prayer of fortitude";
+            spell.action = "power word: fortitude on party";
+            break;
+        case 8:   // mage
+            spell.aura = "arcane intellect";
+            spell.groupAura = "arcane brilliance";
+            spell.action = "arcane intellect on party";
+            break;
+        case 11:  // druid
+            spell.aura = "mark of the wild";
+            spell.groupAura = "gift of the wild";
+            spell.action = "mark of the wild on party";
+            break;
+        default:
+            break;
+    }
+    return spell;
+}
+
+RebuffDecision DecideRebuff(RebuffFacts const& facts)
+{
+    RebuffDecision decision;
+    // Counted before any refusal, so a step that does not cast still says how
+    // many were missing and how many were in reach.
+    for (RebuffMember const& member : facts.members)
+    {
+        if (!member.alive || !member.sameMap || member.hasBuff)
+            continue;
+        ++decision.missing;
+        if (member.inSight && member.yards <= REBUFF_REACH_YARDS)
+            ++decision.inReach;
+    }
+
+    if (!facts.knowsSpell)
+        decision.step = RebuffStep::NoSpell;
+    else if (!facts.alive)
+        decision.step = RebuffStep::Dead;
+    else if (facts.inCombat)
+        decision.step = RebuffStep::InCombat;
+    else if (facts.casting)
+        decision.step = RebuffStep::Casting;
+    else if (facts.mounted)
+        decision.step = RebuffStep::Mounted;
+    else if (decision.missing == 0)
+        decision.step = RebuffStep::NothingMissing;
+    else if (decision.inReach == 0)
+        decision.step = RebuffStep::OutOfReach;
+    else if (facts.mana < facts.cost ||
+             static_cast<std::uint64_t>(facts.mana - facts.cost) * 100 <
+                 static_cast<std::uint64_t>(facts.maxMana) * REBUFF_MANA_RESERVE_PERCENT)
+        decision.step = RebuffStep::LowMana;
+    else
+        decision.step = RebuffStep::Cast;
+    return decision;
+}
+
+char const* RebuffStepWord(RebuffStep step)
+{
+    switch (step)
+    {
+        case RebuffStep::NoSpell:        return "no party buff learned";
+        case RebuffStep::Dead:           return "the caster is dead";
+        case RebuffStep::InCombat:       return "in combat";
+        case RebuffStep::Casting:        return "already casting";
+        case RebuffStep::Mounted:        return "mounted or flying";
+        case RebuffStep::NothingMissing: return "every member carries it";
+        case RebuffStep::OutOfReach:     return "no member without it is within reach and sight";
+        case RebuffStep::LowMana:        return "the cast would leave the caster under its mana reserve";
+        case RebuffStep::Cast:           return "cast";
+    }
+    return "unknown";
+}
+
 }  // namespace OverseerDecisions
