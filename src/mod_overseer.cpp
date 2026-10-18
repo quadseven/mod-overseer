@@ -5851,6 +5851,12 @@ public:
         // clock on. Nothing here reads or writes `best`, so the meaning of a
         // zero mark stays entirely OverseerDecisions::Ratchet's to define.
         OverseerDecisions::RatchetState progress;
+        // Where on which surveyed route `progress` was last read (#70). A step
+        // further along the same route restarts the ratchet's clock, because a
+        // route round a rim walks away from the aim for most of its length.
+        // See OverseerDecisions::RatchetAlongRoute. Route serials are never
+        // reused, so a mark left over from an earlier errand never matches.
+        OverseerDecisions::RouteMark progressRoute;
         // THE STUCK WINDOW (wow-overseer#335 follow-up): distance, route and
         // ground over about a minute, read before an errand is released as
         // making no progress. See OverseerDecisions::ReadErrandProgress.
@@ -22322,6 +22328,9 @@ private:
     std::string _regroupLeader;
     std::string _regroupWaitingFor;
     OverseerDecisions::RatchetState _regroupProgress{};
+    // Where on its catch-up route the straggler was when `_regroupProgress` was
+    // last read (#70). See OverseerDecisions::RatchetAlongRoute.
+    OverseerDecisions::RouteMark _regroupProgressRoute{};
     // Followers whose catch-up aim the travel book refused THIS poll, and the
     // fence that refused it (#560). Written by DriveCatchUp and CatchUpToward,
     // cleared by DriveCatchUp at the top of each member's turn, and read by
@@ -22352,6 +22361,7 @@ private:
         std::string leader;
         std::string waitingFor;
         OverseerDecisions::RatchetState progress{};
+        OverseerDecisions::RouteMark progressRoute{};
     };
     std::map<std::string, RegroupSlot> _regroupSlots;
 
@@ -22367,6 +22377,7 @@ private:
             _owner._regroupLeader = slot.leader;
             _owner._regroupWaitingFor = slot.waitingFor;
             _owner._regroupProgress = slot.progress;
+            _owner._regroupProgressRoute = slot.progressRoute;
         }
 
         ~RegroupTurn()
@@ -22381,6 +22392,7 @@ private:
                 _owner._regroupLeader.clear();
                 _owner._regroupWaitingFor.clear();
                 _owner._regroupProgress = OverseerDecisions::RatchetState{};
+                _owner._regroupProgressRoute = OverseerDecisions::RouteMark{};
                 return;
             }
             RegroupSlot& slot = _owner._regroupSlots[_key];
@@ -22389,12 +22401,14 @@ private:
             slot.leader = _owner._regroupLeader;
             slot.waitingFor = _owner._regroupWaitingFor;
             slot.progress = _owner._regroupProgress;
+            slot.progressRoute = _owner._regroupProgressRoute;
             // The working registers are only meaningful inside a turn.
             _owner._regroupWaiting = false;
             _owner._regroupWanted = false;
             _owner._regroupLeader.clear();
             _owner._regroupWaitingFor.clear();
             _owner._regroupProgress = OverseerDecisions::RatchetState{};
+            _owner._regroupProgressRoute = OverseerDecisions::RouteMark{};
         }
 
         RegroupTurn(RegroupTurn const&) = delete;
@@ -22443,6 +22457,7 @@ private:
         _regroupLeader.clear();
         _regroupWaitingFor.clear();
         _regroupProgress = OverseerDecisions::RatchetState{};
+        _regroupProgressRoute = OverseerDecisions::RouteMark{};
         _regroupCarriedOnSaid.clear();
         ReleaseRegroupHold(held, why.c_str());
         LOG_INFO("module.overseer",
@@ -22651,7 +22666,10 @@ private:
         // character's progress as another's - and, worse, would make a second
         // straggler appearing look like the first one falling back.
         if (verdict.waitingFor != _regroupWaitingFor)
+        {
             _regroupProgress = OverseerDecisions::RatchetState{};
+            _regroupProgressRoute = OverseerDecisions::RouteMark{};
+        }
 
         // IS IT ACTUALLY CLOSING? See REGROUP_RATCHET. This is the backstop
         // that makes the wait safe to place at all, and it is measured against
@@ -22659,9 +22677,14 @@ private:
         // previous poll, so a character circling or jammed against scenery
         // cannot keep beating it while one that is really walking beats it
         // every time.
-        OverseerDecisions::RatchetVerdict const closing =
-            OverseerDecisions::Ratchet(_regroupProgress, verdict.worstYards,
-                                       std::time(nullptr), REGROUP_RATCHET);
+        //
+        // AND A STRAGGLER FURTHER ALONG ITS CATCH-UP ROUTE IS CLOSING IT (#70),
+        // whatever the straight-line gap says: the route round a rim walks away
+        // from the leader for most of its length, and on the straight line
+        // alone this wait gave up on members who arrived minutes later.
+        OverseerDecisions::RatchetVerdict const closing = OverseerDecisions::RatchetAlongRoute(
+            _regroupProgress, _regroupProgressRoute, verdict.worstYards,
+            _travelAims.RouteMarkOf(verdict.waitingFor), std::time(nullptr), REGROUP_RATCHET);
         if (closing.stalled)
         {
             _regroupStandDown[verdict.waitingFor] = std::time(nullptr);
@@ -22675,7 +22698,7 @@ private:
             LOG_ERROR("module.overseer",
                       "overseer: the family waited up to {} minutes for '{}' with the "
                       "leader holding still, and it is {} yards back having made up no "
-                      "ground - so the wait ends, '{}' is left alone for {} minutes, "
+                      "ground, nor got further along its route - so the wait ends, '{}' is left alone for {} minutes, "
                       "and the family carries on without it. A member that cannot close "
                       "a gap against a stationary leader needs something other than "
                       "walking",
@@ -25614,8 +25637,16 @@ private:
                 target, TRAVEL_BACKSTOP_SECONDS, ECONOMY_TRAVEL_BACKSTOP_SECONDS);
             OverseerDecisions::RatchetLimits limits = TRAVEL_RATCHET;
             limits.patienceSeconds = backstop;
-            OverseerDecisions::RatchetVerdict const progress = OverseerDecisions::Ratchet(
-                state.progress, distance, std::time(nullptr), limits);
+            // ON THE ROUTE AS WELL AS THE STRAIGHT LINE (#70). `distance` is the
+            // straight line to the aim, and a surveyed route round a crater rim
+            // walks AWAY from it for most of its length: measured, a catch-up
+            // walker read 1614, 1415, 1229, 1596 yards while its route left to
+            // walk fell 5784 to 2811, and arrived four minutes later. A poll
+            // further along the same route is progress; see RatchetAlongRoute.
+            OverseerDecisions::RatchetVerdict const progress =
+                OverseerDecisions::RatchetAlongRoute(state.progress, state.progressRoute, distance,
+                                                     _travelAims.RouteMarkOf(name),
+                                                     std::time(nullptr), limits);
 
             // BACKSTOP. An errand that can never land must not pin a character
             // to it forever - that is a character standing still, which is the
@@ -25632,7 +25663,7 @@ private:
                          // says why it fired, and a phrase split across two
                          // string literals is invisible to it.
                          "overseer: '{}' was sent to '{}' and has not got any nearer than "
-                         "{} yards for {} minutes - releasing the errand as unreachable",
+                         "{} yards, nor further along any surveyed route, for {} minutes - releasing the errand as unreachable",
                          name, target, static_cast<uint32>(state.progress.best),
                          static_cast<uint32>(backstop / 60));
                 _travelAims.Release(name, OverseerDecisions::TravelBackstopReleaseReason);
