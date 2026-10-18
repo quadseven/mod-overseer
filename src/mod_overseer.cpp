@@ -52609,7 +52609,8 @@ private:
     // World thread only - both DeliverPendingCommands and ResolveStrategyChecks
     // run from OnUpdate - so unguarded, like _lastAim. Bounded by construction:
     // at most COMMANDS_PER_POLL entries are added per poll and every entry is
-    // resolved within VERIFY_GRACE_MS.
+    // resolved within VERIFY_GRACE_MS, or within VERIFY_GRACE_MS plus
+    // HEARTH_SETTLE_CEILING_MS when its bot is mid-teleport (#319).
     std::vector<StrategyCheck> _pendingChecks;
 
     struct EquipCheck
@@ -52833,6 +52834,10 @@ private:
     // which is the row this whole section exists to be able to write.
     void ResolveStrategyChecks(uint32 elapsedMs)
     {
+        using OverseerDecisions::ReadTeleportFlight;
+        using OverseerDecisions::TeleportFlight;
+        using OverseerDecisions::TeleportFlightWord;
+
         std::vector<StrategyCheck> stillWaiting;
         stillWaiting.reserve(_pendingChecks.size());
 
@@ -52840,9 +52845,32 @@ private:
         {
             check.waitedMs += elapsedMs;
 
-            Player* bot = ObjectAccessor::FindPlayerByName(check.targetName);
-            PlayerbotAI* botAI = bot ? GET_PLAYERBOT_AI(bot) : nullptr;
-            if (!botAI)
+            // ASKED WITH checkInWorld FALSE, the hearth's #310 lesson carried
+            // here (#319). A strategy command teleports nobody, but
+            // mod-playerbots moves bots on its own initiative, and
+            // Player::TeleportTo takes a character OUT OF THE WORLD for the
+            // whole length of a map change. With the default the lookup
+            // answered null for a bot that was crossing, and this read-back
+            // wrote `error` about a character that was still logged in.
+            uint32 const ceilingMs = VERIFY_GRACE_MS + HEARTH_SETTLE_CEILING_MS;
+            Player* bot = ObjectAccessor::FindPlayerByName(check.targetName, false);
+            TeleportFlight const flight =
+                ReadTeleportFlight(bot != nullptr, bot && bot->IsInWorld(),
+                                   bot && bot->IsBeingTeleported(), check.waitedMs,
+                                   ceilingMs);
+
+            // STILL CROSSING IS "ASK AGAIN", not a reading. Nothing is read off
+            // an engine that is mid-teleport; the ceiling ends the wait, after
+            // which the reading is Stranded and is judged where it stands.
+            if (flight == TeleportFlight::InFlight)
+            {
+                stillWaiting.push_back(check);
+                continue;
+            }
+
+            PlayerbotAI* botAI =
+                flight == TeleportFlight::Gone ? nullptr : GET_PLAYERBOT_AI(bot);
+            if (flight == TeleportFlight::Gone || !botAI)
             {
                 // Said out loud rather than dropped. A character that logged
                 // out mid-check is a perfectly good explanation, and an
@@ -52882,6 +52910,7 @@ private:
             o << "{\"outcome\":" << J(holds ? "applied" : "unchanged")
               << ",\"command\":" << J(check.command)
               << ",\"waited_ms\":" << check.waitedMs
+              << ",\"flight\":" << J(TeleportFlightWord(flight))
               << ",\"items\":[";
             bool first = true;
             for (StrategyItem const& item : check.items)
