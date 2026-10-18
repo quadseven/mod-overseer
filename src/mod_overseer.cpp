@@ -5843,6 +5843,14 @@ public:
         // silent on purpose: a flight that never happens and never explains
         // itself is indistinguishable from the bug #68 is about.
         bool flightSaid{false};
+        // THE ROAD THIS ERRAND WAS PLANNED ALONG, JUDGED (#836). Read once per
+        // planned route (`roadReadSerial` against `routeSerial`), because it is
+        // one pass over every creature spawn in the world. `roadSaid` is the
+        // last step said, so each answer is said once per errand rather than
+        // every poll it is asked again.
+        std::uint64_t roadReadSerial{0};
+        OverseerDecisions::RouteVerdict road;
+        int roadSaid{-1};
         // "Already said that upstream's stuck teleport was about to fire", so a
         // walk that keeps failing to get nearer is reported once per errand
         // rather than every poll it is held on the ground (#138). See the
@@ -10495,6 +10503,26 @@ private:
             return;
         HoldCharacterStill(member, botAI, name, FAR_HOLD_VERB,
                            static_cast<uint32>(CATCH_UP_FAR_HOLD_SECONDS), false);
+    }
+
+    // THE WAIT FOR A HEARTHSTONE, IN PLACE OF A ROAD THAT KILLS (#836). The
+    // leader of a long errand whose road crosses ground far above its family,
+    // bound beside where it is going with its stone on cooldown, is held where
+    // it stands, and the family with it, rather than walked down that road.
+    // Short, so the travel drive asks again each time it lifts: a flight may
+    // have become possible, and the stone comes off cooldown on its own clock.
+    static constexpr char const* ROAD_HOLD_VERB = "wait for its hearthstone";
+    static constexpr uint32 ROAD_HOLD_SECONDS = 60;
+
+    static void HoldForTheHearth(Player* member, std::string const& name)
+    {
+        auto const other = HoldsInForce().find(name);
+        if (other != HoldsInForce().end() && other->second.verb != ROAD_HOLD_VERB)
+            return;
+        PlayerbotAI* botAI = member ? GET_PLAYERBOT_AI(member) : nullptr;
+        if (!botAI)
+            return;
+        HoldCharacterStill(member, botAI, name, ROAD_HOLD_VERB, ROAD_HOLD_SECONDS, false);
     }
 
     // ------------------------------------------ the counter hold (#378) --
@@ -20644,6 +20672,76 @@ private:
         return false;
     }
 
+    // THE ROUTE IS PLANNED ONCE PER ERRAND, by whichever asks first: the walk
+    // below, or the road reading that decides whether it is walked at all
+    // (#836). One plan, so the road that was judged is the road that is walked.
+    static void PlanRouteOnce(Player* bot, WorldPosition const& want,
+                              TravelAimBook::TravelState& state, std::string const& name,
+                              std::string const& target)
+    {
+        if (state.routePlanned)
+            return;
+        state.routePlanned = true;
+        state.route = PlanRoute(bot, want, name, target, state.routeIsMeasured,
+                                state.routeJoinsCorridor);
+        state.routeCursor = OverseerDecisions::RouteCursor{};
+        state.routeSerial = TravelAimBook::NextRouteSerial();
+    }
+
+    // THE ROAD A LONG ERRAND TO A PLACE WAS PLANNED ALONG, JUDGED (#836). The
+    // far walk's reading (FarWalkRoadLethal) applied to the travel drive's own
+    // route: the points along it from where the walker has got to, the worst
+    // creature within the threat radius of each, judged by FarWalkRoadLimits at
+    // the level of the youngest member of the walker's party on its map, since
+    // the family walks the road behind its leader. Read once per planned route.
+    // A walk with no route (no survey, or nothing it improves on) has nothing to
+    // read and is survivable, JudgeRoute's own convention.
+    static OverseerDecisions::RouteVerdict ReadErrandRoad(Player* bot, WorldPosition const& want,
+                                                          TravelAimBook::TravelState& state,
+                                                          std::string const& name,
+                                                          std::string const& target)
+    {
+        PlanRouteOnce(bot, want, state, name, target);
+        if (state.route.empty())
+            return OverseerDecisions::RouteVerdict{};
+        if (state.roadReadSerial == state.routeSerial)
+            return state.road;
+        state.roadReadSerial = state.routeSerial;
+        state.road = OverseerDecisions::RouteVerdict{};
+        OverseerDecisions::RoadSamples const road = OverseerDecisions::RoadSamplesAlong(
+            state.route, state.routeCursor.at, TRAVEL_WALK_SAMPLE_YARDS,
+            OverseerDecisions::FAR_WALK_ROAD_MAX_SAMPLES);
+        if (road.points.empty())
+            return state.road;
+
+        uint32 level = bot->GetLevel();
+        if (Group* group = bot->GetGroup())
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+            {
+                Player* member = ref->GetSource();
+                if (member && member->IsInWorld() && member->GetMapId() == bot->GetMapId() &&
+                    member->GetLevel() < level)
+                    level = member->GetLevel();
+            }
+
+        std::vector<std::pair<float, float>> points;
+        points.reserve(road.points.size());
+        for (OverseerDecisions::RoutePoint const& p : road.points)
+            points.emplace_back(p.x, p.y);
+        OverseerDecisions::RouteLimits const limits = OverseerDecisions::FarWalkRoadLimits();
+        std::vector<NearbyThreat> ground;
+        HostileSpawnsNearEach(bot, bot->GetMapId(), points, TRAVEL_THREAT_RADIUS,
+                              level + limits.unknownLevelDiff - 1, false, ground);
+        OverseerDecisions::RouteReading reading;
+        reading.characterLevel = level;
+        reading.sampleSpacingYards = road.spacingYards;
+        reading.worstLevelAtSample.reserve(ground.size());
+        for (NearbyThreat const& threat : ground)
+            reading.worstLevelAtSample.push_back(threat.level);
+        state.road = OverseerDecisions::JudgeRoute(reading, limits);
+        return state.road;
+    }
+
     // WHERE TO SEND THIS CHARACTER THIS POLL, given the errand it is on. `want`
     // is the errand and never moves; the answer is a point on the route while
     // there is one and `want` itself otherwise.
@@ -20692,14 +20790,7 @@ private:
         // would have to be walked under the wrong ones for half its length.
         for (unsigned pass = 0; pass < 2; ++pass)
         {
-            if (!state.routePlanned)
-            {
-                state.routePlanned = true;
-                state.route = PlanRoute(bot, want, name, target,
-                                        state.routeIsMeasured, state.routeJoinsCorridor);
-                state.routeCursor = OverseerDecisions::RouteCursor{};
-                state.routeSerial = TravelAimBook::NextRouteSerial();
-            }
+            PlanRouteOnce(bot, want, state, name, target);
             if (state.route.empty())
                 return want;
 
@@ -25746,6 +25837,100 @@ private:
                         HoldFarFromLeader(bot, name);
                         continue;
                     }
+                }
+            }
+
+            // A LONG WALK TO A PLACE READS ITS ROAD BEFORE THE FAMILY WALKS IT
+            // (#836). ConsiderFlight has had its turn and issued nothing, so
+            // what is left is the foot walk along the surveyed road, and between
+            // Gnomeregan and Stormwind that road runs through Burning Steppes: a
+            // family of 37 to 41 died there twelve times in a day on its town
+            // runs. A road that crosses ground far above the youngest member is
+            // not walked. The walker hearths when its bind is beside the aim,
+            // waits for the stone when it is on cooldown, and otherwise the
+            // errand is refused. See OverseerDecisions::DecideErrandRoad.
+            {
+                OverseerDecisions::ErrandRoadFacts road;
+                road.walkYards = distance;
+                road.placeAim = entry == 0;
+                road.catchUp = IsCatchingUp(name);
+                OverseerDecisions::TravelOwner owner = OverseerDecisions::TravelOwner::TownTrip;
+                road.liveRun = _travelAims.ClaimedBy(name, target, owner) &&
+                               OverseerDecisions::TravelOwnerIsALiveRun(owner);
+                bool const judged = road.placeAim && !road.catchUp && !road.liveRun &&
+                                    distance >= OverseerDecisions::ERRAND_ROAD_MIN_YARDS;
+                if (judged)
+                {
+                    road.road = ReadErrandRoad(bot, pos, state, name, target);
+                    uint32 const stone = HearthstoneSpellOf(bot);
+                    road.carriesStone = stone != 0;
+                    road.hearthReady = stone && !bot->HasSpellCooldown(stone);
+                    if (bot->m_homebindMapId == bot->GetMapId())
+                    {
+                        float const bx = bot->m_homebindX - pos.GetPositionX();
+                        float const by = bot->m_homebindY - pos.GetPositionY();
+                        road.bindYardsFromAim = std::sqrt(bx * bx + by * by);
+                    }
+                }
+                OverseerDecisions::ErrandRoadStep const step =
+                    OverseerDecisions::DecideErrandRoad(road);
+                bool const sayIt = state.roadSaid != static_cast<int>(step);
+                state.roadSaid = static_cast<int>(step);
+                if (step != OverseerDecisions::ErrandRoadStep::Walk && sayIt)
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' is sent to '{}', {} yards off, and no flight "
+                             "carried it. The road it was planned along crosses {} unbroken "
+                             "yards of ground holding creatures ten or more levels above its "
+                             "party's youngest member (worst {}), so it is not walked - {} "
+                             "(#836)",
+                             name, target, static_cast<uint32>(distance),
+                             static_cast<uint32>(road.road.longestLethalRunYards),
+                             road.road.worstLevel,
+                             OverseerDecisions::ErrandRoadStepWord(step));
+                if (step == OverseerDecisions::ErrandRoadStep::Refuse)
+                {
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' has no bind beside '{}' to hearth to and no flight "
+                             "there - releasing the errand, and refusing it for {} minutes, "
+                             "because {}",
+                             name, target,
+                             static_cast<uint32>(ERRAND_DEATH_LIMITS.cooloffSeconds / 60),
+                             OverseerDecisions::ErrandLethalRoad);
+                    _travelAims.Refuse(name, target, OverseerDecisions::ErrandLethalRoad);
+                    _travelAims.Release(name, "the travel drive (the road crosses ground far "
+                                              "above the family's level)");
+                    continue;
+                }
+                if (step == OverseerDecisions::ErrandRoadStep::Hearth ||
+                    step == OverseerDecisions::ErrandRoadStep::WaitForHearth)
+                {
+                    // The errand's clock is held while it waits, as it is on a
+                    // flight leg: not walking is the decision, not a stall.
+                    state.progress.since = std::time(nullptr);
+                    // A CAST IN FLIGHT IS LEFT ALONE: no second cast, and no
+                    // hold over the top of the one DoHearth placed for it. Once
+                    // it lands the walk is a doorstep and is not judged; if it
+                    // did not, the stone is on cooldown and this waits for it.
+                    if (HearthPendingFor(name))
+                        continue;
+                    if (step == OverseerDecisions::ErrandRoadStep::Hearth)
+                    {
+                        // A refusal is a reason the cast cannot start this poll
+                        // (moving, which DoHearth answers with its own hold, or
+                        // a fight); the next poll asks again.
+                        char const* status = "error";
+                        std::string evidence;
+                        char const* const refusal =
+                            DoHearth(bot, "use", status, evidence, _pendingHearths, 0);
+                        if (!refusal || !*refusal)
+                            LOG_WARN("module.overseer",
+                                     "overseer: '{}' hearths to its bind beside '{}' instead "
+                                     "of walking the road there (#836)",
+                                     name, target);
+                        continue;
+                    }
+                    HoldForTheHearth(bot, name);
+                    continue;
                 }
             }
 
