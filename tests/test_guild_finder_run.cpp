@@ -46,6 +46,8 @@ using OverseerDecisions::GuildRunVerdict;
 using OverseerDecisions::GuildRunVerdictWord;
 using OverseerDecisions::GuildRunAbandonedWhy;
 using OverseerDecisions::GuildRunAbsentWords;
+using OverseerDecisions::GuildRunKillAfter;
+using OverseerDecisions::GuildRunKillClock;
 using OverseerDecisions::GuildRunSeatReport;
 using OverseerDecisions::GuildRunStallWords;
 using OverseerDecisions::GuildRunTimedOutWhy;
@@ -482,9 +484,34 @@ void AnEndedRunSaysWhoWasMissingAndWhereItStalled()
           GuildRunTimedOutWhy(7200, "") == "inside for 7200s");
 }
 
+// A scriptless dungeon's boss count is read off the tank's own bind, which
+// reads 0 while the tank is a ghost on another map. The kills it comes back
+// with are the same kills, so "last kill" keeps the time of the real one.
+void ABossCountThatDipsAndComesBackIsNotAKill()
+{
+    GuildRunKillClock clock;
+    clock = GuildRunKillAfter(clock, 0, 100);
+    Check("no kill yet leaves the clock unset", clock.lastKillAt == 0 && clock.best == 0);
+    clock = GuildRunKillAfter(clock, 2, 1000);
+    Check("the first kills set the clock", clock.lastKillAt == 1000 && clock.best == 2);
+    clock = GuildRunKillAfter(clock, 0, 1100);
+    Check("a dip to 0 keeps the clock and the best", clock.lastKillAt == 1000 && clock.best == 2);
+    clock = GuildRunKillAfter(clock, 2, 1200);
+    Check("the count coming back is not a kill", clock.lastKillAt == 1000 && clock.best == 2);
+    clock = GuildRunKillAfter(clock, 1, 1300);
+    Check("a partial dip is not a kill either", clock.lastKillAt == 1000 && clock.best == 2);
+    clock = GuildRunKillAfter(clock, 3, 1400);
+    Check("a new high is a kill", clock.lastKillAt == 1400 && clock.best == 3);
+    Check("the stall reads the real kill",
+          GuildRunStallWords("", clock.lastKillAt != 0,
+                             static_cast<unsigned>(1400 + 95 * 60 - clock.lastKillAt)) ==
+              "last kill 95 min ago");
+}
+
 int main()
 {
     AnEndedRunSaysWhoWasMissingAndWhereItStalled();
+    ABossCountThatDipsAndComesBackIsNotAKill();
     TheRowIsRoutedOnItsFirstWord();
     AWellFormedRowNamesTheDoorAndTheFourOthers();
     AMalformedRowIsRefusedWithItsGrammar();

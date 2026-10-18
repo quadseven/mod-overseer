@@ -38528,9 +38528,11 @@ private:
         uint32 bossesTotal{0};
         // Where the run stands, for its end and its heartbeat: the dungeon
         // brain's next boss (NextEncounterName) and when the boss count last
-        // rose (0 before the first kill of this stay).
+        // rose above the most it had read (OverseerDecisions::GuildRunKillAfter;
+        // 0 before the first kill of this stay).
         std::string nextBoss;
         std::time_t lastKillAt{0};
+        uint32 bossesBest{0};
         // The queued row's last boss is the dungeon's (OverseerDecisions::
         // FinderRowEndsDungeon), and whether the finder's "finished" on a
         // row that is not was said yet.
@@ -39829,7 +39831,6 @@ private:
                 if (!instanceMap)
                     instanceMap = p->GetMap();
             }
-            uint32 const doneBefore = run.bossesDone;
             bool const roleMissing =
                 poll.inside && (!poll.tankAliveInside || !poll.healerAliveInside);
             if (roleMissing)
@@ -39881,8 +39882,10 @@ private:
             }
             poll.bossesDone = run.bossesDone;
             poll.bossesTotal = run.bossesTotal;
-            if (run.bossesDone > doneBefore)
-                run.lastKillAt = now;
+            OverseerDecisions::GuildRunKillClock const kills = OverseerDecisions::GuildRunKillAfter(
+                {run.bossesBest, run.lastKillAt}, run.bossesDone, now);
+            run.bossesBest = kills.best;
+            run.lastKillAt = kills.lastKillAt;
             run.nextBoss = NextEncounterName(run.mapId, poll.expectedMask, poll.creditedMask);
             poll.ceilingSeconds =
                 OverseerDecisions::GuildRunCeilingSeconds(run.finderEndsDungeon, run.bossesTotal);
