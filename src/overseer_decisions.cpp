@@ -259,6 +259,14 @@ bool DungeonRunMayClaimTravel(bool leaderHasOutstandingErrand,
     return !leaderHasOutstandingErrand || errandIsTheRunsOwnAim;
 }
 
+bool DungeonRunMayClaimTravel(bool leaderHasOutstandingErrand,
+                              bool errandIsTheRunsOwnAim,
+                              bool errandBackstopSpent)
+{
+    return DungeonRunMayClaimTravel(leaderHasOutstandingErrand, errandIsTheRunsOwnAim) ||
+           errandBackstopSpent;
+}
+
 namespace
 {
 
@@ -7376,6 +7384,19 @@ CrossingAttemptEnd CrossingRefusalEnd(std::string const& reason)
 bool IsTravelGiveUpRelease(std::string const& why)
 {
     return why == TravelBackstopReleaseReason || why == TravelGroundGiveUpReleaseReason;
+}
+
+bool TravelErrandBackstopSpent(std::string const& columnAim,
+                               std::string const& lastEndTarget,
+                               std::string const& lastEndWhy)
+{
+    // A POINT AIM ONLY. A berth, an inn or a staging point is written as one,
+    // and a run's claim outranks one (#656). A keyword errand belongs to the
+    // bridge, which clears it itself, and a run's claim would not outrank a
+    // counter keyword anyway.
+    if (columnAim.rfind("at:", 0) != 0 || lastEndTarget != columnAim)
+        return false;
+    return IsTravelGiveUpRelease(lastEndWhy) || lastEndWhy == TravelNoProgressReleaseReason;
 }
 
 DockReading ReadDock(std::uint32_t pathProgressMs, std::uint32_t periodMs,
