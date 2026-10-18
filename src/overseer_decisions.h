@@ -9211,6 +9211,45 @@ struct BerthLimits
 int PickBerth(std::vector<BerthCandidate> const& candidates, float mooringX, float mooringY,
               std::vector<float> const& deckLevels, BerthLimits const& limits);
 
+// ------------------------------- the pier the survey walked past (#1030) --
+//
+// THE SURVEY DOES NOT ALWAYS END ON THE PIER. At Valaar's Berth, the Elune's
+// Blessing's stop off Azuremyst (map 530), both walks into the mooring node
+// (-4265, -11317.2, 0) end at z 0.57, the water line, under the pier. The
+// ship's crew stands 4.31 to 16.62 above the mooring, so the nearest deck is
+// 3.74 above every surveyed point and the stop had no berth at all: every
+// Draenei's crossing to Kalimdor was refused as having no route.
+//
+// THE WORLD'S OWN SPAWNS ARE STANDING ON IT. Two Draenei Commoners (19171) are
+// spawned on that pier at z 5.58 and 5.81, 16.9 and 20.1 yards from the
+// mooring, 0.53 and 0.30 below the 6.11 deck. A creature's spawn point is
+// ground the world puts somebody on, which is proved where a point under a
+// mooring is not. So a spawn is a candidate when the creature walks (a ground
+// walker, not one that flies or floats) and is not hostile to the transport's
+// own crew, and it STILL goes through PickBerth's test: within reach of the
+// mooring and a step from a deck level.
+//
+// THE SURVEY STILL COMES FIRST. Spawns are read only for a stop where no
+// surveyed point is level with the deck, so the berths every working crossing
+// already uses are exactly the ones it had.
+struct PierSpawn
+{
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+    bool groundWalker{false};  // walks on ground; never flies or floats
+    bool hostileToCrew{true};  // hostile to at least one of the transport's crew
+};
+
+// Every berth for one stop, in PickBerth's order of preference (nearest the
+// mooring first): the level surveyed points, or, only when there are none, the
+// level points of the walking, unhostile pier spawns. Empty when neither has
+// one, which refuses the crossing at that end.
+std::vector<BerthCandidate> LevelBerths(std::vector<BerthCandidate> survey,
+                                        std::vector<PierSpawn> const& pier, float mooringX,
+                                        float mooringY, std::vector<float> const& deckLevels,
+                                        BerthLimits const& limits);
+
 // --------------------------------- whose boat it is (faction-correct docks) --
 //
 // MEASURED, NOT ASSUMED: the dev realm offered an Alliance leader the Horde

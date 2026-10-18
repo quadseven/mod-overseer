@@ -7631,6 +7631,47 @@ int PickBerth(std::vector<BerthCandidate> const& candidates, float mooringX, flo
     return best;
 }
 
+namespace
+{
+// PickBerth again and again, taking each pick out, gives every level candidate
+// in its own order of preference.
+std::vector<BerthCandidate> EveryLevelBerth(std::vector<BerthCandidate> candidates,
+                                            float mooringX, float mooringY,
+                                            std::vector<float> const& deckLevels,
+                                            BerthLimits const& limits)
+{
+    std::vector<BerthCandidate> level;
+    for (;;)
+    {
+        int const pick = PickBerth(candidates, mooringX, mooringY, deckLevels, limits);
+        if (pick < 0)
+            break;
+        level.push_back(candidates[static_cast<std::size_t>(pick)]);
+        candidates.erase(candidates.begin() + pick);
+    }
+    return level;
+}
+}  // namespace
+
+std::vector<BerthCandidate> LevelBerths(std::vector<BerthCandidate> survey,
+                                        std::vector<PierSpawn> const& pier, float mooringX,
+                                        float mooringY, std::vector<float> const& deckLevels,
+                                        BerthLimits const& limits)
+{
+    std::vector<BerthCandidate> level =
+        EveryLevelBerth(std::move(survey), mooringX, mooringY, deckLevels, limits);
+    if (!level.empty())
+        return level;
+
+    // Only a creature that walks shows ground, and only one that would not
+    // meet the crew as an enemy is somewhere a passenger is sent to stand.
+    std::vector<BerthCandidate> standing;
+    for (PierSpawn const& spawn : pier)
+        if (spawn.groundWalker && !spawn.hostileToCrew)
+            standing.push_back(BerthCandidate{spawn.x, spawn.y, spawn.z});
+    return EveryLevelBerth(std::move(standing), mooringX, mooringY, deckLevels, limits);
+}
+
 CrewWelcome ReadCrewWelcome(std::size_t crewRead, std::size_t crewUnwelcoming)
 {
     if (crewUnwelcoming)
