@@ -67,7 +67,7 @@ void Check(char const* what, bool got, bool want)
 // Every keyword `overseer_roster.travel_npc` may name, copied from TravelRoles()
 // in src/mod_overseer.cpp. Not shared with it on purpose: that table lives
 // beside the NPC flags it maps onto and this decision deliberately does not
-// consult it, so this list is here as the STATEMENT that all thirteen are
+// consult it, so this list is here as the STATEMENT that all fourteen are
 // self-contained rather than as a dependency on the table's shape.
 std::vector<std::string> const& EveryRole()
 {
@@ -75,6 +75,7 @@ std::vector<std::string> const& EveryRole()
         "trainer",         "class trainer",   "profession trainer",
         "vendor",          "repair",          "banker",
         "guild banker",    "auctioneer",      "petitioner",
+        "guild petitioner",
         "tabard designer", "innkeeper",       "flight master",
         "stable master",
     };

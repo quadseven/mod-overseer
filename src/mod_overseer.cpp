@@ -7698,6 +7698,90 @@ void RestoreGuildRunFinderDungeons()
 static std::atomic<uint64> g_characterOnlyLogouts{0};
 static constexpr uint32 PRESENCE_SUMMARY_MS = 10 * 60 * 1000;
 
+// A TAXI ROUTE THIS CHARACTER'S OWN TEAM CAN FLY (#501).
+//
+// Upstream's sTravelNodeMap.FindTaxiPath is one BFS over every TaxiPath.dbc
+// row for both sides, so an Alliance character asked to reach node 80 from
+// node 79 was handed 79 -> 40 -> 80 through Gadgetzan's HORDE node, and the
+// unknown-hop scan then told it to go learn node 40. It never can. These read
+// the same rows and the same team test the game uses
+// (OverseerDecisions::TaxiNodeServesTeam, which is ObjectMgr::
+// GetNearestTaxiNode's own) into a graph per team, and every route the flight
+// code reads comes from that graph instead.
+
+// DBCStores.h - the node's bit in the taxi network mask, asked exactly the
+// way ObjectMgr::GetNearestTaxiNode asks it.
+static bool TaxiNodeOnNetwork(uint32 node)
+{
+    if (!node)
+        return false;
+    uint32 const field = (node - 1) / 32;
+    uint32 const submask = 1u << ((node - 1) % 32);
+    return field < TaxiMaskSize && (sTaxiNodesMask[field] & submask) != 0;
+}
+
+static bool TaxiNodeServesTeamId(uint32 node, uint32 team)
+{
+    TaxiNodesEntry const* const entry = sTaxiNodesStore.LookupEntry(node);
+    if (!entry)
+        return false;
+    return OverseerDecisions::TaxiNodeServesTeam(TaxiNodeOnNetwork(node),
+                                                 entry->MountCreatureID[0],
+                                                 entry->MountCreatureID[1],
+                                                 team == TEAM_ALLIANCE);
+}
+
+static OverseerDecisions::TeamTaxiGraph BuildTaxiGraphForTeam(uint32 team)
+{
+    std::vector<OverseerDecisions::TaxiEdge> edges;
+    // The rows upstream's BuildTaxiGraph reads (TravelNode.cpp), unchanged.
+    for (uint32 i = 0; i < sTaxiPathStore.GetNumRows(); ++i)
+    {
+        TaxiPathEntry const* const path = sTaxiPathStore.LookupEntry(i);
+        if (path)
+            edges.push_back({path->from, path->to});
+    }
+    std::vector<uint32_t> nodes;
+    for (uint32 id = 1; id < sTaxiNodesStore.GetNumRows(); ++id)
+    {
+        if (TaxiNodeServesTeamId(id, team))
+            nodes.push_back(id);
+    }
+    return OverseerDecisions::BuildTeamTaxiGraph(edges, nodes);
+}
+
+// Built once per team on first use and read-only afterwards: the DBC stores
+// are loaded before any script runs and never change. Function-local statics
+// are initialised exactly once even when two map threads ask together.
+static std::vector<uint32> TeamTaxiPath(uint32 fromNode, uint32 toNode, uint32 team)
+{
+    static OverseerDecisions::TeamTaxiGraph const alliance =
+        BuildTaxiGraphForTeam(TEAM_ALLIANCE);
+    static OverseerDecisions::TeamTaxiGraph const horde = BuildTaxiGraphForTeam(TEAM_HORDE);
+    std::vector<uint32_t> const path = OverseerDecisions::FindTeamTaxiPath(
+        team == TEAM_ALLIANCE ? alliance : horde, fromNode, toNode);
+    return std::vector<uint32>(path.begin(), path.end());
+}
+
+// The unknown-hop scan's reading of one route for one character: which hops
+// it holds, and which its team could ever hold.
+static OverseerDecisions::TaxiRouteScan ScanTaxiRouteFor(Player* who,
+                                                         std::vector<uint32> const& path)
+{
+    uint32 const team = who->GetTeamId(true);
+    std::vector<OverseerDecisions::TaxiHopRead> hops;
+    hops.reserve(path.size());
+    for (uint32 const node : path)
+    {
+        OverseerDecisions::TaxiHopRead hop;
+        hop.node = node;
+        hop.known = who->m_taxi.IsTaximaskNodeKnown(node);
+        hop.servesTeam = TaxiNodeServesTeamId(node, team);
+        hops.push_back(hop);
+    }
+    return OverseerDecisions::ScanTaxiRoute(hops);
+}
+
 class OverseerWorldScript : public WorldScript
 {
     // The level-up and login hooks spend a guild raider's points with the same
@@ -14014,11 +14098,20 @@ private:
     // in BOTH directions, because a keyword one side accepts and the other
     // silently ignores is the written-and-unread failure of #2776 wearing a new
     // hat.
+    //
+    // `npcFlag` may name more than one bit, and a spawn fills the role only
+    // when it carries EVERY one of them (OverseerDecisions::SpawnFillsTravelRole,
+    // #544). The pure layer restates the petitioner flags; these pin its copy to
+    // the core's.
     struct TravelRole
     {
         char const* keyword;
         uint32 npcFlag;
     };
+    static_assert(OverseerDecisions::NPC_FLAG_PETITIONER == uint32(UNIT_NPC_FLAG_PETITIONER),
+                  "OverseerDecisions::NPC_FLAG_PETITIONER drifted from UnitDefines.h");
+    static_assert(OverseerDecisions::NPC_FLAG_TABARDDESIGNER == uint32(UNIT_NPC_FLAG_TABARDDESIGNER),
+                  "OverseerDecisions::NPC_FLAG_TABARDDESIGNER drifted from UnitDefines.h");
     static std::vector<TravelRole> const& TravelRoles()
     {
         static std::vector<TravelRole> const roles = {
@@ -14030,7 +14123,13 @@ private:
             {"banker",             UNIT_NPC_FLAG_BANKER},
             {"guild banker",       UNIT_NPC_FLAG_GUILD_BANKER},
             {"auctioneer",         UNIT_NPC_FLAG_AUCTIONEER},
+            // Any petitioner, guild or arena team: the one bit both carry.
+            // Left as it was so nothing that names it changes meaning (#544).
             {"petitioner",         UNIT_NPC_FLAG_PETITIONER},
+            // A Guild Master, the only NPC that sells a guild charter. Both
+            // bits, matched all-or-nothing by SpawnFillsTravelRole, so an Arena
+            // Organizer (petitioner bit only) never fills it (#544).
+            {"guild petitioner",   UNIT_NPC_FLAG_PETITIONER | UNIT_NPC_FLAG_TABARDDESIGNER},
             {"tabard designer",    UNIT_NPC_FLAG_TABARDDESIGNER},
             {"innkeeper",          UNIT_NPC_FLAG_INNKEEPER},
             {"flight master",      UNIT_NPC_FLAG_FLIGHTMASTER},
@@ -14499,7 +14598,9 @@ private:
                 if (spawn.name != wantedName)
                     continue;
             }
-            else if (!(spawn.npcFlags & wantedFlag))
+            // Every bit the role names, not any one of them (#544): a `guild
+            // petitioner` aim must not stop at an Arena Organizer.
+            else if (!OverseerDecisions::SpawnFillsTravelRole(spawn.npcFlags, wantedFlag))
                 continue;
             if (narrowToSkill && !TrainerStartedSkills(spawn.entry).count(wantSkill))
                 continue;
@@ -16351,10 +16452,10 @@ private:
         if (!seat.read.masterInReach)
             return;
 
-        // TravelNode.h:585, the same precomputed BFS the leader's own candidate
-        // loop reads. A member starts from its OWN node, so this is a different
-        // route from the leader's even when both end at `toNode`.
-        seat.path = sTravelNodeMap.FindTaxiPath(fromNode, toNode);
+        // The same team-aware route the leader's own candidate loop reads
+        // (TeamTaxiPath, #501). A member starts from its OWN node, so this is a
+        // different route from the leader's even when both end at `toNode`.
+        seat.path = TeamTaxiPath(fromNode, toNode, member->GetTeamId(true));
         if (seat.path.size() < 2)
             return;   // no route at all: `undiscoveredNode` stays zero, and that
                       // zero is the only thing telling the two refusals apart
@@ -16364,14 +16465,14 @@ private:
         // window opens (SendLearnNewTaxiNode), which is what upstream's
         // NewRpgTravelFlightAction calls before it activates. Requiring the
         // departure node in advance would be stricter than the game rather than
-        // safer than it. See the identical check in ConsiderFlight.
-        for (size_t hop = 1; hop < seat.path.size(); ++hop)
+        // safer than it. See the identical check in ConsiderFlight. A hop this
+        // member's team can never hold is no route, not an undiscovered node,
+        // so `undiscoveredNode` stays zero and names nothing to go learn.
+        OverseerDecisions::TaxiRouteScan const scan = ScanTaxiRouteFor(member, seat.path);
+        if (scan.verdict != OverseerDecisions::TaxiRouteVerdict::Fly)
         {
-            if (!member->m_taxi.IsTaximaskNodeKnown(seat.path[hop]))
-            {
-                seat.read.undiscoveredNode = seat.path[hop];
-                return;
-            }
+            seat.read.undiscoveredNode = scan.learnNode;
+            return;
         }
 
         // THE FARE, CHECKED HERE RATHER THAN DISCOVERED AT THE COUNTER, and
@@ -16655,11 +16756,16 @@ private:
             if (toMaster + fromLanding + TRAVEL_FLIGHT_SAVING_YARDS >= walkYards)
                 break;
 
-            // TravelNode.h:585, public. A precomputed BFS over the whole taxi
-            // graph, built once at startup by TravelMgr (TravelMgr.cpp:4361),
-            // so this is a map lookup rather than a search. Fewer than two
-            // nodes is no route: ActivateTaxiPathTo refuses that outright.
-            std::vector<uint32> const path = sTravelNodeMap.FindTaxiPath(fromNode, toNode);
+            // THIS TEAM'S ROUTE, NOT EVERYBODY'S (#501). Upstream's
+            // sTravelNodeMap.FindTaxiPath is one BFS over both sides' network,
+            // and it routed an Alliance family 79 -> 40 -> 80 through
+            // Gadgetzan's Horde node, which no Alliance character can ever
+            // learn. TeamTaxiPath searches only nodes this character's team
+            // can hold, so where a same-side road exists (79 -> 39 -> 80) it
+            // is the one taken, and where none does there is no route. Fewer
+            // than two nodes is no route: ActivateTaxiPathTo refuses that
+            // outright.
+            std::vector<uint32> const path = TeamTaxiPath(fromNode, toNode, team);
             if (path.size() < 2)
                 continue;
 
@@ -16673,16 +16779,18 @@ private:
             // activating, so the departure node is learned on arrival the same
             // way a player learns it - and requiring it in advance would be
             // stricter than the game, not safer than it.
-            uint32 unknownHop = 0;
-            for (size_t hop = 1; hop < path.size(); ++hop)
-            {
-                if (!bot->m_taxi.IsTaximaskNodeKnown(path[hop]))
-                {
-                    unknownHop = path[hop];
-                    break;
-                }
-            }
-            if (unknownHop)
+            //
+            // AND THE HOP IT NAMES IS ONE THIS CHARACTER CAN LEARN (#501).
+            // OverseerDecisions::ScanTaxiRoute names the first unknown hop
+            // only when the character's team could ever hold it; a hop on the
+            // other side's network makes the route unflyable with nothing to
+            // learn, so this line can never send anybody to a flight master
+            // who will not teach them.
+            OverseerDecisions::TaxiRouteScan const scan = ScanTaxiRouteFor(bot, path);
+            if (scan.verdict == OverseerDecisions::TaxiRouteVerdict::Unflyable)
+                continue;
+            uint32 const unknownHop = scan.learnNode;
+            if (scan.verdict == OverseerDecisions::TaxiRouteVerdict::LearnHop)
             {
                 // SAID ONCE PER ERRAND. This is the report #68 asks for in
                 // place of a silent no-op, and it is the line that turns "they
@@ -25993,7 +26101,7 @@ private:
                              static_cast<uint32>(ERRAND_PROGRESS_LIMITS.windowSeconds),
                              static_cast<uint32>(ERRAND_PROGRESS_LIMITS.minGainYards),
                              static_cast<uint32>(ERRAND_PROGRESS_LIMITS.minMovedYards));
-                    _travelAims.Release(name, "the travel drive (no progress over the stuck window)");
+                    _travelAims.Release(name, OverseerDecisions::TravelNoProgressReleaseReason);
                     continue;
                 }
             }
@@ -32670,6 +32778,9 @@ private:
         uint32 resetAttempts{0};
         bool loggedResetWaiting{false};
         bool loggedTravelConflict{false};
+        // Said once per run that it stopped waiting on a spent errand (#762).
+        // Its own flag, because the deferral line before it set the one above.
+        bool loggedSpentErrand{false};
         // A SHORT TOWN STOP ON THE APPROACH (#639): the foreign aim GATHERING
         // is waiting on, when it was first seen, what `stagingSince` read
         // then (so staging's clock stands still while it waits), and whether
@@ -49399,8 +49510,30 @@ private:
                          "restart - adopted rather than waited on (#596)",
                          coord.runNumber, leaderName, leaderAim->second);
             }
+            // AND NOT ON AN ERRAND WHOSE OWN BACKSTOP HAS ALREADY FIRED (#762).
+            // The wait below is bounded only by that backstop, and a berth or
+            // inn aim left from before a restart is one the release cannot
+            // clear: this book never claimed it, so the gate keeps the column.
+            // The travel drive gave up on it; the run stops waiting on it too,
+            // and its own claim takes the column over below.
+            TravelAimBook::ErrandEnd const lastEnd =
+                leaderAim != travelAims.end() ? _travelAims.LastEnd(leaderName)
+                                              : TravelAimBook::ErrandEnd{};
+            bool const spent = !ownAim && leaderAim != travelAims.end() &&
+                               OverseerDecisions::TravelErrandBackstopSpent(
+                                   leaderAim->second, lastEnd.target, lastEnd.why);
+            if (spent && !coord.loggedSpentErrand)
+            {
+                coord.loggedSpentErrand = true;
+                LOG_INFO("module.overseer",
+                         "overseer: dungeon run {} finds leader '{}' still carrying '{}', "
+                         "which the travel drive already gave up on ({}) and whose release "
+                         "could not clear it, since nothing in this worldserver claimed it "
+                         "- the run stops waiting on it and takes the travel column (#762)",
+                         coord.runNumber, leaderName, leaderAim->second, lastEnd.why);
+            }
             if (!OverseerDecisions::DungeonRunMayClaimTravel(leaderAim != travelAims.end(),
-                                                             ownAim))
+                                                             ownAim, spent))
             {
                 // The errand has its own bounded backstop. Do not spend the
                 // dungeon's reset or whole-staging budgets while waiting on
