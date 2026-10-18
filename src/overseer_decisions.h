@@ -11951,6 +11951,31 @@ struct RouteMark
 // reading of one is not progress, for the reasons RouteCursorAdvanced gives.
 bool RouteMarkAdvanced(RouteMark seen, RouteMark now);
 
+// THE DISTANCE RATCHET, FOR A WALKER THAT MAY HOLD A SURVEYED ROUTE (#70).
+//
+// The twenty-minute travel backstop and the regroup wait both ask Ratchet
+// whether a straight-line distance has got nearer. A surveyed route round a
+// crater rim does not reduce that number for most of its length: measured on
+// the dev realm, five of the seven nodes of a 5784-yard catch-up route were
+// further from the aim than the walker started, one of them 407 yards
+// further, and the logged gap went 1614, 1415, 1229, 1596 while the route
+// left to walk fell 5784, 5694, 3967, 2811. Read on the straight line alone,
+// that is a stalled walker; it was a walker arriving four minutes later.
+//
+// So a poll on which the walker got further along the SAME route
+// (RouteMarkAdvanced) restarts the clock the way a new best distance does.
+// What it deliberately does NOT do:
+//   - it does not move `best`. The best straight-line reading still only
+//     falls on a real approach, so arrival and the "got no nearer than N
+//     yards" figure keep meaning what the errand means.
+//   - a new or replanned route is not progress by itself, and a walker wedged
+//     mid-corridor never moves its cursor, so it still stalls on time.
+//   - a reading that is not a DistanceToTarget is left exactly to Ratchet.
+// `seenRoute` is the caller's memory of the last mark and is always moved to
+// `route`, whichever way the verdict goes.
+RatchetVerdict RatchetAlongRoute(RatchetState& state, RouteMark& seenRoute, float reading,
+                                 RouteMark route, time_t now, RatchetLimits const& limits);
+
 // A FOLLOWER IS LENT `new rpg` FOR A PARTY FLIGHT, AND GIVEN IT BACK ON LANDING
 // (2026-09-23). Every party flight on the dev realm was refused with "'Zrog' is
 // not a character this module steers": a follower does not carry `new rpg`,
