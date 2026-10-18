@@ -19796,6 +19796,7 @@ struct PlaceDangerFacts
     std::vector<PlaceHostile> hostiles;
     unsigned deathsNear{0};
     unsigned repeatDeaths{2};  // the ghost recovery's own death loop count
+    uint32_t threatLevelGap{0}; // count hostiles this many levels below the member
 };
 
 enum class PlaceDangerReason : uint8_t

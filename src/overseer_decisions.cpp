@@ -17040,7 +17040,11 @@ PlaceDanger JudgePlaceDanger(PlaceDangerFacts const& facts)
     for (std::size_t i = 0; i < facts.hostiles.size(); ++i)
     {
         PlaceHostile const& h = facts.hostiles[i];
-        if (!CorpseThreat(h.level, facts.memberLevel, h.entry, facts.killerEntry))
+        bool const withinThreatLevelGap =
+            facts.threatLevelGap && h.level < facts.memberLevel &&
+            facts.memberLevel - h.level <= facts.threatLevelGap;
+        if (!CorpseThreat(h.level, facts.memberLevel, h.entry, facts.killerEntry) &&
+            !withinThreatLevelGap)
             continue;
         if (!danger.threats++ || h.level > danger.strongest)
         {

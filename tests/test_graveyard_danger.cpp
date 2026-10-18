@@ -130,6 +130,20 @@ int main()
         ExpectNumber("nothing counts", d.threats, 0);
     }
 
+    // At a resurrection destination, a nearby camp a few levels below the
+    // ghost is still dangerous: it can attack before the ghost gets away.
+    {
+        PlaceDangerFacts facts;
+        facts.memberLevel = 30;
+        facts.hostiles = {{26, HILLSBRAD_FOOTMAN}, {26, HILLSBRAD_FOOTMAN},
+                          {26, HILLSBRAD_FOOTMAN}};
+        facts.threatLevelGap = 5;
+        PlaceDanger const d = JudgePlaceDanger(facts);
+        ExpectReason("three level 26 hostiles refuse the healer for a level 30 ghost", d,
+                     PlaceDangerReason::Hostiles);
+        ExpectNumber("all three nearby camp hostiles count", d.threats, 3);
+    }
+
     // The killer's kind counts at any level: a level 27 member killed by a
     // level 26 footman, and even a level 10 one.
     {
@@ -183,6 +197,8 @@ int main()
                    refusal.find("OverseerDecisions::JudgePlaceDanger(") != std::string::npos);
         ExpectTrue("GraveyardRefusal no longer counts spawns above the level itself",
                    refusal.find("HostileSpawnsNear(") == std::string::npos);
+        ExpectTrue("GraveyardRefusal counts hostiles a few levels below the ghost",
+                   refusal.find("facts.threatLevelGap = 5;") != std::string::npos);
 
         std::size_t const drive = text.find("bool DriveGhostRecovery(");
         std::size_t const line = text.find("live hostile(s) there at or above its level", drive);
