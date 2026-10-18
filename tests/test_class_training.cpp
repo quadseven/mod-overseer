@@ -17,13 +17,18 @@
 #include "overseer_decisions.h"
 
 #include <cstdio>
+#include <algorithm>
+#include <cstdint>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
 
 using OverseerDecisions::ClassSpellOffer;
+using OverseerDecisions::CLASS_LEARN_MAX_PASSES;
 using OverseerDecisions::ClassSpellsToBuy;
+using OverseerDecisions::ClassSpellsToBuyThisPass;
+using OverseerDecisions::ClassWalkReadsAgain;
 using OverseerDecisions::ErrandWalkRefusalRetryable;
 using OverseerDecisions::JudgeTrainerVisit;
 using OverseerDecisions::ParseTrainerWalkRequest;
@@ -156,6 +161,102 @@ void TheVerdict()
           !ErrandWalkRefusalRetryable(E::NoClassSpellTrainerOnMap));
 }
 
+// ONE VISIT, EVERY RANK (wow-overseer#792). A model of the core's trainer
+// window: a line is offered once the member's level reaches it and the rank it
+// needs (ReqAbility1) is known. The rows are a mage's Frostbolt chain off the
+// acore_world trainer_spell table (116 at 4, 205 at 8, 837 at 14) and Arcane
+// Intellect (1459 at 1), with their MoneyCost in copper.
+struct TrainerLine
+{
+    uint32_t spell;
+    uint32_t needs;
+    uint32_t level;
+    uint32_t cost;
+};
+
+std::vector<ClassSpellOffer> Offered(std::vector<TrainerLine> const& lines,
+                                     std::vector<uint32_t> const& known, uint32_t level)
+{
+    std::vector<ClassSpellOffer> out;
+    for (TrainerLine const& line : lines)
+    {
+        bool const have = std::find(known.begin(), known.end(), line.spell) != known.end();
+        bool const ready = !line.needs ||
+                           std::find(known.begin(), known.end(), line.needs) != known.end();
+        if (!have && ready && line.level <= level)
+            out.push_back({line.spell, line.level, line.cost});
+    }
+    return out;
+}
+
+// The arrival's loop as the adapter runs it, with `refuse` the one spell the
+// core will not teach (a learn hook said no): what the visit learned.
+std::vector<uint32_t> Visit(std::vector<TrainerLine> const& lines, uint32_t level, uint64_t money,
+                            uint32_t refuse, uint32_t* passes)
+{
+    std::vector<uint32_t> known, tried;
+    for (uint32_t pass = 0;; ++pass)
+    {
+        *passes = pass + 1;
+        std::vector<uint32_t> const buy =
+            ClassSpellsToBuyThisPass(Offered(lines, known, level), money, tried);
+        uint32_t bought = 0;
+        for (uint32_t spell : buy)
+        {
+            tried.push_back(spell);
+            if (spell == refuse)
+                continue;
+            for (TrainerLine const& line : lines)
+                if (line.spell == spell)
+                    money -= line.cost;
+            known.push_back(spell);
+            ++bought;
+        }
+        if (!ClassWalkReadsAgain(pass, bought))
+            break;
+    }
+    return known;
+}
+
+void OneVisitEveryRank()
+{
+    std::vector<TrainerLine> const mage = {
+        {1459, 0, 1, 10}, {116, 0, 4, 100}, {205, 116, 8, 200}, {837, 205, 14, 600}};
+
+    // The door list alone holds first ranks only: what one pass buys.
+    std::vector<uint32_t> const door = ClassSpellsToBuy(Offered(mage, {}, 14), 100000);
+    Check("the door list offers no second rank", door.size() == 2);
+
+    uint32_t passes = 0;
+    std::vector<uint32_t> const learned = Visit(mage, 14, 100000, 0, &passes);
+    Check("a level 14 mage far behind learns all four in one visit", learned.size() == 4);
+    Check("rank 3 of Frostbolt is among them",
+          std::find(learned.begin(), learned.end(), 837u) != learned.end());
+    Check("the visit stops on the pass that bought nothing", passes == 4);
+
+    // The purse still decides: 310 copper buys Arcane Intellect, rank 1 and
+    // rank 2 and stops short of rank 3's 600.
+    std::vector<uint32_t> const short_ = Visit(mage, 14, 310, 0, &passes);
+    Check("a short purse buys what it covers across passes", short_.size() == 3);
+    Check("and not the rank it cannot pay for",
+          std::find(short_.begin(), short_.end(), 837u) == short_.end());
+
+    // A spell the core refused is not asked for again in the same visit, and
+    // the chain behind it is not offered.
+    std::vector<uint32_t> const refused = Visit(mage, 14, 100000, 116, &passes);
+    Check("a refused rank is not retried and its chain waits", refused.size() == 1);
+    Check("the refusal ends the visit once nothing else is bought", passes == 2);
+
+    Check("a pass that bought nothing ends the visit", !ClassWalkReadsAgain(0, 0));
+    Check("a pass that bought reads the list again", ClassWalkReadsAgain(0, 1));
+    Check("never past the pass ceiling", !ClassWalkReadsAgain(CLASS_LEARN_MAX_PASSES - 1, 5));
+    std::vector<uint32_t> const tried = {116};
+    std::vector<uint32_t> const again =
+        ClassSpellsToBuyThisPass({{116, 4, 100}, {1459, 1, 10}}, 1000, tried);
+    Check("an offer tried earlier in the visit is skipped",
+          again.size() == 1 && again[0] == 1459u);
+}
+
 std::string ReadModule()
 {
     std::ifstream source("src/mod_overseer.cpp");
@@ -180,7 +281,10 @@ void TheAdapterIsWired()
     has("only a class trainer with a spell to teach serves a class walk",
         "if (ev.classSpells)\n            return TrainerServesClassOf(entry, who) && ClassTrainerTeaches(trainer, who);");
     has("the arrival buys class spells", "return ClassSpellsAtTheTrainer(bot, ev, reason);");
-    has("the purse decides which", "D::ClassSpellsToBuy(offers, uint64(bot->GetMoney()))");
+    has("the purse decides which, pass by pass",
+        "D::ClassSpellsToBuyThisPass(offers, uint64(bot->GetMoney()), tried)");
+    has("the list is read again after a pass that bought",
+        "if (!D::ClassWalkReadsAgain(pass, boughtThisPass))");
     has("each through the core's own trainer window", "trainer->TeachSpell(npc, bot, spellId);");
     has("a learn spell the core casts is witnessed by the purse",
         "if (bot->HasSpell(spellId) || bot->GetMoney() < purseBefore)");
@@ -202,6 +306,7 @@ int main()
     TheGrammar();
     ThePurse();
     TheVerdict();
+    OneVisitEveryRank();
     TheAdapterIsWired();
     if (failures)
     {

@@ -71679,35 +71679,55 @@ private:
         if (trainer && TrainerServesClassOf(ev.mailboxEntry, bot))
         {
             float const discount = bot->GetReputationPriceDiscount(npc);
-            std::vector<D::ClassSpellOffer> offers;
-            for (Trainer::Spell const& spell : trainer->GetSpells())
+            // IN PASSES (wow-overseer#792): rank N is offered only once rank
+            // N-1 is known, so the list is read again after each pass that
+            // bought, until a pass buys nothing. `offered` counts each spell
+            // once however many passes offered it; `tried` is every spell
+            // asked for this visit, bought or refused.
+            std::vector<uint32_t> seen;
+            std::vector<uint32_t> tried;
+            for (uint32 pass = 0;; ++pass)
             {
-                if (!trainer->CanTeachSpell(bot, &spell))
-                    continue;
-                D::ClassSpellOffer offer;
-                offer.spell = spell.SpellId;
-                offer.reqLevel = spell.ReqLevel;
-                offer.cost = static_cast<uint32>(std::floor(spell.MoneyCost * discount));
-                offers.push_back(offer);
+                std::vector<D::ClassSpellOffer> offers;
+                for (Trainer::Spell const& spell : trainer->GetSpells())
+                {
+                    if (!trainer->CanTeachSpell(bot, &spell))
+                        continue;
+                    D::ClassSpellOffer offer;
+                    offer.spell = spell.SpellId;
+                    offer.reqLevel = spell.ReqLevel;
+                    offer.cost = static_cast<uint32>(std::floor(spell.MoneyCost * discount));
+                    offers.push_back(offer);
+                    if (std::find(seen.begin(), seen.end(), offer.spell) == seen.end())
+                        seen.push_back(offer.spell);
+                }
+                std::vector<uint32_t> const buy =
+                    D::ClassSpellsToBuyThisPass(offers, uint64(bot->GetMoney()), tried);
+                uint32 boughtThisPass = 0;
+                // READ BACK TWO WAYS. A trainer line whose spell is a LEARN
+                // spell is cast rather than learned (Trainer::TeachSpell,
+                // IsCastable), so the walker may never hold that id itself; the
+                // core takes the money only on the path that teaches, so a
+                // purse that dropped is the other witness.
+                for (uint32 spellId : buy)
+                {
+                    tried.push_back(spellId);
+                    uint32 const purseBefore = bot->GetMoney();
+                    // natural-only: bought at a trainer in reach, which takes its price (TeachSpell).
+                    trainer->TeachSpell(npc, bot, spellId);  // Trainer.h:73
+                    if (bot->HasSpell(spellId) || bot->GetMoney() < purseBefore)
+                    {
+                        ev.taught.push_back(spellId);
+                        ++boughtThisPass;
+                    }
+                    else
+                        ev.notTaught.push_back(spellId);
+                }
+                if (!D::ClassWalkReadsAgain(pass, boughtThisPass))
+                    break;
             }
-            ev.offered = static_cast<uint32>(offers.size());
-            std::vector<uint32_t> const buy = D::ClassSpellsToBuy(offers, uint64(bot->GetMoney()));
-            ev.tooDear = ev.offered - static_cast<uint32>(buy.size());
-            // READ BACK TWO WAYS. A trainer line whose spell is a LEARN spell
-            // is cast rather than learned (Trainer::TeachSpell, IsCastable), so
-            // the walker may never hold that id itself; the core takes the
-            // money only on the path that teaches, so a purse that dropped is
-            // the other witness.
-            for (uint32 spellId : buy)
-            {
-                uint32 const purseBefore = bot->GetMoney();
-                // natural-only: bought at a trainer in reach, which takes its price (TeachSpell).
-                trainer->TeachSpell(npc, bot, spellId);  // Trainer.h:73
-                if (bot->HasSpell(spellId) || bot->GetMoney() < purseBefore)
-                    ev.taught.push_back(spellId);
-                else
-                    ev.notTaught.push_back(spellId);
-            }
+            ev.offered = static_cast<uint32>(seen.size());
+            ev.tooDear = ev.offered - static_cast<uint32>(tried.size());
         }
         facts.asked = ev.offered;
         facts.learned = static_cast<uint32_t>(ev.taught.size());
