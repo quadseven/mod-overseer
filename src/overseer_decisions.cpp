@@ -14951,6 +14951,19 @@ bool HeadlessMakesWayForAClient(bool streamRowClaimsAClient, bool realSessionOnA
     return streamRowClaimsAClient || realSessionOnAccount;
 }
 
+RosterSessionKind ClassifyRosterSession(RosterSessionFacts const& facts)
+{
+    if (facts.clientAttached)
+        return RosterSessionKind::LiveClient;
+    if (!facts.hasSession)
+        return RosterSessionKind::Settling;
+    if (facts.isBotSession)
+        return RosterSessionKind::HeadlessBot;
+    if (facts.alreadyKicked)
+        return RosterSessionKind::Settling;
+    return RosterSessionKind::LostClient;
+}
+
 std::vector<FamilyRoster> PartitionRosterByFamily(std::vector<FamilyMember> const& rows)
 {
     std::vector<FamilyRoster> out;

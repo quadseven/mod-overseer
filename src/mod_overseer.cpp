@@ -8297,14 +8297,24 @@ private:
                 continue;
             }
 
-            if (ClientAttached(player))
+            // WHICH OF THE THREE KINDS THIS IS, decided where a test can reach
+            // it (#134): see OverseerDecisions::ClassifyRosterSession.
+            WorldSession* session = player->GetSession();
+            OverseerDecisions::RosterSessionFacts sessionFacts;
+            sessionFacts.clientAttached = ClientAttached(player);
+            sessionFacts.hasSession = session != nullptr;
+            sessionFacts.isBotSession = session && session->IsBot();
+            sessionFacts.alreadyKicked = session && session->IsKicked();
+            OverseerDecisions::RosterSessionKind const kind =
+                OverseerDecisions::ClassifyRosterSession(sessionFacts);
+
+            if (kind == OverseerDecisions::RosterSessionKind::LiveClient)
                 continue;   // a real client is playing it; leave it alone
 
-            WorldSession* session = player->GetSession();
-            if (!session)
-                continue;   // mid-teardown already; nothing to add
+            if (kind == OverseerDecisions::RosterSessionKind::Settling)
+                continue;   // mid-teardown or already kicked; the session sweep will take it
 
-            if (session->IsBot())
+            if (kind == OverseerDecisions::RosterSessionKind::HeadlessBot)
             {
                 // A CLIENT IS COMING FOR IT (infra#4835): log the headless
                 // copy out now, on the world thread, so the client finds the
@@ -8335,9 +8345,7 @@ private:
                 continue;   // player is freed
             }
 
-            if (session->IsKicked())
-                continue;   // already marked; the session sweep will take it
-
+            // RosterSessionKind::LostClient: a real session whose socket closed.
             LOG_INFO("module.overseer",
                      "overseer: '{}' has lost its client (socket closed) - kicking the "
                      "session so it logs out now rather than standing unobserved for "

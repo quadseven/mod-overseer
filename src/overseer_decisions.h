@@ -17642,6 +17642,41 @@ bool StreamRowClaimsAClient(std::string const& state, long long secondsSinceWrit
 // Should a character on the headless roster make way for a client now?
 bool HeadlessMakesWayForAClient(bool streamRowClaimsAClient, bool realSessionOnAccount);
 
+// WHAT KIND OF SESSION AN IN-WORLD ROSTER CHARACTER HAS (#134).
+//
+// KeepRosterAttended sorts every roster character it finds in the world into
+// one of three kinds, and each kind gets a different answer:
+//   - LiveClient: a real game client holds the session. Spared, always.
+//   - HeadlessBot: a bot session with no client. Handed to the headless rules
+//     (make way for a coming client, play on if allowed, else be logged out).
+//   - LostClient: a real session whose socket has closed. Kicked, so it logs
+//     out now rather than standing unobserved for the core's resume window.
+// and a fourth answer that is not a kind but a "not yet": no session at all
+// (mid-teardown) or a session already marked kicked, both of which the core's
+// own session sweep is about to finish, so the sweep adds nothing.
+//
+// THE ORDER IS THE DECISION. A live client is asked first, so nothing that
+// holds a client is ever evicted or kicked whatever else is true of it; a bot
+// is asked before the kicked mark, so a headless bot is never mistaken for a
+// lost client. This was inlined in the sweep with no test until #134 lifted it.
+enum class RosterSessionKind : std::uint8_t
+{
+    LiveClient,
+    HeadlessBot,
+    LostClient,
+    Settling,
+};
+
+struct RosterSessionFacts
+{
+    bool clientAttached{false};   // in the world and a real socket is open
+    bool hasSession{false};
+    bool isBotSession{false};
+    bool alreadyKicked{false};
+};
+
+RosterSessionKind ClassifyRosterSession(RosterSessionFacts const& facts);
+
 // ------------------------------------------- the story of a notable item (#567) --
 //
 // WHAT THIS RECORDS. Three moments in the life of one item instance, keyed by
