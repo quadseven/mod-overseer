@@ -18863,9 +18863,9 @@ GuildRunStrayStep GuildRunStrayNext(GuildRunStrayFacts const& facts)
 {
     // Asked first: a live run's group is never the leftover, whatever else is
     // true of it, and its tank can have no other group to clean up.
-    if (facts.tankInGroup && facts.liveRunGroup)
+    if (facts.seenInGroup && facts.liveRunGroup)
         return GuildRunStrayStep::Drop;
-    if (!facts.tankInGroup || !facts.finderGroup)
+    if (!facts.seenInGroup || !facts.finderGroup)
         return facts.expired ? GuildRunStrayStep::Drop : GuildRunStrayStep::Wait;
     return facts.takenOut ? GuildRunStrayStep::Disband : GuildRunStrayStep::TakeOut;
 }
@@ -19039,11 +19039,57 @@ bool GuildRunAdoptionTouchDue(std::int64_t secondsSinceTouch)
     return secondsSinceTouch >= static_cast<std::int64_t>(GUILD_RUN_ADOPT_TOUCH_SECONDS);
 }
 
-std::int64_t GuildRunStrayExpiry(bool tankInWorld, std::int64_t startedAt, std::int64_t now)
+std::int64_t GuildRunStrayExpiry(bool memberInWorld, std::int64_t startedAt, std::int64_t now)
 {
     if (startedAt != 0)
         return startedAt;
-    return tankInWorld ? now + static_cast<std::int64_t>(GUILD_RUN_STRAY_SECONDS) : 0;
+    return memberInWorld ? now + static_cast<std::int64_t>(GUILD_RUN_STRAY_SECONDS) : 0;
+}
+
+std::string ClaimExpiredDetail()
+{
+    return std::string(RESTART_DETAIL_PREFIX) + "claim expired: the run holding it is gone";
+}
+
+GuildRunStrayLook GuildRunStrayLookAt(std::vector<GuildRunStrayMember> const& members,
+                                      bool takenOut)
+{
+    GuildRunStrayLook look;
+    look.facts.takenOut = takenOut;
+    for (GuildRunStrayMember const& member : members)
+        if (member.inWorld)
+            look.anyInWorld = true;
+    if (members.empty())
+        return look;
+
+    // The tank in the world decides alone, exactly as before: its group is the
+    // stray's, or a live run's (dropped), or none (wait).
+    GuildRunStrayMember const& tank = members.front();
+    if (tank.inWorld)
+    {
+        look.witness = 0;
+        look.facts.seenInGroup = tank.inGroup;
+        look.facts.finderGroup = tank.inGroup && tank.finderGroup;
+        look.facts.liveRunGroup = tank.inGroup && tank.heldGroup;
+        return look;
+    }
+
+    // Through a member, only the lost run's own finder group: the tank saved
+    // in it and nobody holding it. Anything else waits for the tank or the
+    // clock, and never drops the stray on a member's say.
+    for (std::size_t i = 1; i < members.size(); ++i)
+    {
+        GuildRunStrayMember const& member = members[i];
+        if (member.inWorld && member.inGroup && member.finderGroup && member.tankSavedInGroup &&
+            !member.heldGroup)
+        {
+            look.witness = i;
+            look.facts.seenInGroup = true;
+            look.facts.finderGroup = true;
+            return look;
+        }
+    }
+    return look;
 }
 
 bool GuildRunStrayExpired(std::int64_t expiry, std::int64_t now)

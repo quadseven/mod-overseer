@@ -73,7 +73,7 @@ void AStrayClockStartsWhenTheTankIsSeen()
 
     // What the late tank now gets: its finder group is taken out and disbanded.
     GuildRunStrayFacts facts;
-    facts.tankInGroup = true;
+    facts.seenInGroup = true;
     facts.finderGroup = true;
     facts.expired = GuildRunStrayExpired(expiry, seen);
     Check("a late tank in its finder group is taken out", GuildRunStrayNext(facts) ==
