@@ -12079,9 +12079,25 @@ RepairLegStep RepairLegMemberStep(RepairLegFacts const& facts)
     return RepairLegStep::Walk;
 }
 
-bool RepairLegMustEvacuate(bool anyMemberInsideInstance)
+RepairLegExit RepairLegInstanceStep(bool anyMemberInsideInstance,
+                                    time_t heldForSeconds, time_t boundSeconds)
 {
-    return anyMemberInsideInstance;
+    if (!anyMemberInsideInstance)
+        return RepairLegExit::Proceed;
+    if (heldForSeconds >= boundSeconds)
+        return RepairLegExit::GiveUp;
+    return RepairLegExit::Evacuate;
+}
+
+char const* RepairLegExitWord(RepairLegExit step)
+{
+    switch (step)
+    {
+        case RepairLegExit::Proceed:  return "proceed";
+        case RepairLegExit::Evacuate: return "evacuate";
+        case RepairLegExit::GiveUp:   return "give up";
+    }
+    return "unknown";
 }
 
 char const* RepairLegStepWord(RepairLegStep step)

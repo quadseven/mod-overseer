@@ -14548,10 +14548,42 @@ enum class RepairLegStep : std::uint8_t
 // the inn bind and the counter hold each paid for at the other end of the trip.
 RepairLegStep RepairLegMemberStep(RepairLegFacts const& facts);
 
-// Repairing needs a town repairer; an instance map has none. If any roster
-// member is still in an instance, the repair phase must walk occupants out
-// before it can send anyone to a repairer.
-bool RepairLegMustEvacuate(bool anyMemberInsideInstance);
+// ------------------- the repair leg while somebody is still inside (#723) --
+//
+// Repairing needs a town repairer; an instance map has none. Before #807 the leg
+// aimed every damaged member at the `repair` role wherever it stood, and on map
+// 209 the travel drive released that aim as "no such spawn on map 209" and the
+// leg wrote it again on the next poll: 360 re-aims in a day, about one every ten
+// seconds, each a movement handoff on the leader. #807 made the leg walk the
+// occupants out first. This answers the half it left open: that walk is a WAIT,
+// and every wait in this leg is bounded.
+enum class RepairLegExit : std::uint8_t
+{
+    Proceed,   // nobody is inside an instance: repair as usual
+    Evacuate,  // somebody is inside: walk them out, aim nobody at `repair`
+    GiveUp,    // still inside past the bound: end the leg, the repair is owed
+};
+
+// NO REPAIR AIM IS EVER WRITTEN WHILE ANY MEMBER IS ON AN INSTANCED MAP.
+// Evacuate and GiveUp both mean that; they differ only in whether the leg holds.
+// The whole party waits rather than only the members inside, because the leg is
+// one phase of one run: walking the outside members off to a town while the
+// inside ones are still being walked to the door splits the family for a repair.
+//
+// AND THE WAIT IS BOUNDED BY THE LEG'S OWN BOUND, counted from the moment the
+// leg opened. Without it an exit that never lands (no door configured for the
+// map, a door nobody reaches) held the run in REPAIRING forever, which is a
+// worse failure than the one #807 fixed: the old re-aim at least ended on the
+// bound. GiveUp hands the run to RESETTING, which already owns walking
+// stragglers out on its own clock, and the repair is owed after the next run.
+//
+// A BOUND OF ZERO GIVES UP ON THE FIRST POLL with anybody inside, for the reason
+// RepairLegStatus gives: a zero read as "no bound" is a wait that never ends.
+RepairLegExit RepairLegInstanceStep(bool anyMemberInsideInstance,
+                                    time_t heldForSeconds, time_t boundSeconds);
+
+// "proceed", "evacuate", "give up".
+char const* RepairLegExitWord(RepairLegExit step);
 
 // "wait", "done", "repair", "walk". Here rather than in the adapter so the word
 // a log line carries is the word a test pins.
