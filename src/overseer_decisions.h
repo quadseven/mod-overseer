@@ -147,6 +147,24 @@ LeaderClientLossAction DungeonLeaderClientLoss(bool socketOpen, bool partyIssuer
                                                std::time_t now,
                                                std::time_t maxWaitSeconds = DUNGEON_LEADER_CLIENT_LOST_SECONDS);
 
+// WHO HOLDS A RUN'S LEADING SEAT (#792). #735 asked the leader for an open
+// socket, and MayIssueDcCommands asked the issuer for one, so a family whose
+// head plays headless (Overseer.HeadlessRoster, #549) entered its dungeon and
+// could never clear it: the brain stayed OFF, the run was held for a client
+// that does not exist by design, and it ended `client_lost`, every run. A
+// headless roster leader is already kept its own master by KeepRosterFollowing,
+// so the socket test was the only thing refusing it.
+//
+// The seat is held by an open client socket, or by a headless bot that is in
+// the world and NAMED on the headless roster. Only the list counts, not
+// Overseer.RequireClient = 0: an unlisted bot, a character out of the world and
+// a real session that lost its client still do not hold it, so a dropped
+// client keeps its settle window, its loss hold and its `client_lost` outcome.
+bool HeadlessLeaderSteerable(bool inWorld, bool isBotSession, std::string const& name,
+                             std::vector<std::string> const& headless);
+
+bool DungeonLeaderHoldsTheSeat(bool clientSocketOpen, bool headlessSteerable);
+
 struct LockboxFacts
 {
     bool rogue{false};

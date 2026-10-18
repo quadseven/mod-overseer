@@ -26583,9 +26583,24 @@ private:
     // one whose name a command goes out under - #131 has it out of the world
     // within a poll anyway. Group membership, IsAuthorized's third
     // condition, is the caller's to check.
+    //
+    // OR A LISTED HEADLESS BOT (#792). A headless roster head has no socket by
+    // design, so the socket test alone left a headless family's brain OFF for
+    // ever. The seat test (DungeonLeaderHoldsTheSeat) admits a bot in the
+    // world named on Overseer.HeadlessRoster; the IsSelfBot / IsRealPlayer
+    // test still applies, so of those only the leader, its own master, issues.
+    static bool LeaderHoldsTheSeat(Player const* player)
+    {
+        WorldSession const* session = player && player->IsInWorld() ? player->GetSession() : nullptr;
+        bool const headless = session && OverseerDecisions::HeadlessLeaderSteerable(
+                                             player->IsInWorld(), session->IsBot(),
+                                             player->GetName(), HeadlessRosterCache());
+        return OverseerDecisions::DungeonLeaderHoldsTheSeat(ClientAttached(player), headless);
+    }
+
     static bool MayIssueDcCommands(Player* member)
     {
-        return ClientAttached(member) && (IsRealPlayer(member) || IsSelfBot(member));
+        return LeaderHoldsTheSeat(member) && (IsRealPlayer(member) || IsSelfBot(member));
     }
 
     // A groupmate the dungeon module will accept a command FROM.
@@ -27006,8 +27021,8 @@ private:
                     LOG_WARN("module.overseer",
                              "overseer: '{}' is inside map {} but no groupmate may issue a "
                              "dungeon-clear command - the module refuses a true bot as "
-                             "issuer and no client-attached member of the party is a "
-                             "selfbot or a person, so the dungeon brain stays OFF. Holding "
+                             "issuer and no client-attached or listed headless member of "
+                             "the party is a selfbot or a person, so the dungeon brain stays OFF. Holding "
                              "until one is back; said once for this stretch",
                              name, static_cast<uint32>(bot->GetMapId()));
                 }
@@ -47690,10 +47705,11 @@ private:
         DungeonRunCoordinatorState& coord = _dungeonRunCoordinators[family];
         time_t const clientNow = std::time(nullptr);
         Player* const clientLeader = ObjectAccessor::FindPlayerByName(leaderName);
-        WorldSession* const leaderSession = clientLeader && clientLeader->IsInWorld()
-                                                ? clientLeader->GetSession()
-                                                : nullptr;
-        bool const leaderSocketOpen = leaderSession && !leaderSession->IsSocketClosed();
+        // The seat rather than the socket (#792): a listed headless leader in
+        // the world holds it too, so a headless family's run settles, opens
+        // its door gate and is not held for a client it never has. A client
+        // leader is decided exactly as before.
+        bool const leaderSocketOpen = LeaderHoldsTheSeat(clientLeader);
         bool hasInsideMember = false;
         bool allInsideMembersHaveIssuer = true;
         for (std::string const& member : members)

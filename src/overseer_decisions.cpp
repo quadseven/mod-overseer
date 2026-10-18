@@ -124,6 +124,17 @@ LeaderClientLossAction DungeonLeaderClientLoss(bool socketOpen, bool partyIssuer
     return LeaderClientLossAction::Abandon;
 }
 
+bool HeadlessLeaderSteerable(bool inWorld, bool isBotSession, std::string const& name,
+                             std::vector<std::string> const& headless)
+{
+    return inWorld && isBotSession && NamedInHeadlessRoster(name, headless);
+}
+
+bool DungeonLeaderHoldsTheSeat(bool clientSocketOpen, bool headlessSteerable)
+{
+    return clientSocketOpen || headlessSteerable;
+}
+
 LockboxStep LockboxNext(LockboxFacts const& facts)
 {
     if (!facts.rogue || !facts.holdsLockedBox || !facts.hasPickLockSpell
