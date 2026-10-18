@@ -13318,6 +13318,21 @@ std::vector<RecruitPick> RecruitShortlist(
     return RecruitShortlistReportFor(candidates, needs, atMost).picks;
 }
 
+RecruitDiscovery RecruitDiscoveryFrom(std::vector<RecruitCandidate> const& found)
+{
+    RecruitDiscovery discovery;
+    for (RecruitCandidate const& candidate : found)
+    {
+        if (candidate.onRoster)
+            ++discovery.onRoster;
+        else if (!candidate.randomBotAccount)
+            ++discovery.notRandomBot;
+        else
+            discovery.kept.push_back(candidate);
+    }
+    return discovery;
+}
+
 char const* RaidSeatName(RaidSeat seat)
 {
     switch (seat)
@@ -18534,7 +18549,12 @@ GuildRunVerdict GuildRunNext(GuildRunPoll const& poll)
     if (poll.groupGone)
         return GuildRunVerdict::Abandoned;
     if (poll.secondsInside >= poll.ceilingSeconds)
-        return GuildRunVerdict::TimedOut;
+    {
+        bool const fighting = poll.bossInCombat && poll.aliveInside > 0 &&
+                              poll.secondsInside < poll.ceilingSeconds + GUILD_RUN_BOSS_EXTENSION_SECONDS;
+        if (!fighting)
+            return GuildRunVerdict::TimedOut;
+    }
     if (poll.aliveInside == 0)
         return GuildRunNobodyAlive(poll);
     return GuildRunSeats(poll);
@@ -18764,6 +18784,24 @@ unsigned GuildRunCeilingSeconds(bool finderEndsDungeon, unsigned bossesExpected)
     if (finderEndsDungeon)
         return GUILD_RUN_CEILING_SECONDS;
     return std::max(GUILD_RUN_CEILING_SECONDS, bossesExpected * GUILD_RUN_SECONDS_PER_BOSS);
+}
+
+unsigned GuildRunSecondsPerBoss(std::uint32_t mapId)
+{
+    // Blackfathom Deeps: about 30 minutes a boss (wow-overseer#835).
+    return mapId == 48 ? 30 * 60 : 0;
+}
+
+unsigned GuildRunCeilingForMap(std::uint32_t mapId, bool finderEndsDungeon,
+                               unsigned bossesExpected)
+{
+    unsigned const base = GuildRunCeilingSeconds(finderEndsDungeon, bossesExpected);
+    unsigned const perBoss = GuildRunSecondsPerBoss(mapId);
+    // No bosses read yet means nothing to scale: keep the base ceiling rather
+    // than the margin alone, whatever the margin is set to.
+    if (!perBoss || bossesExpected == 0)
+        return base;
+    return std::max(base, bossesExpected * perBoss + GUILD_RUN_CEILING_MARGIN_SECONDS);
 }
 
 // ------------------------------------------------------------------ keep --
@@ -21391,6 +21429,33 @@ LogoutScope LogoutOfflineScope(uint32_t otherInWorldOnAccount)
 {
     return otherInWorldOnAccount == 0 ? LogoutScope::Account
                                       : LogoutScope::CharacterOnly;
+}
+
+
+ReleasePromptReading ReleasePromptObserve(ReleasePromptClock& clock, std::int64_t now,
+                                          std::int64_t lastDeathAt,
+                                          std::int64_t maxGapSeconds)
+{
+    ReleasePromptReading reading;
+    if (clock.since == 0)
+    {
+        reading.start = ReleasePromptStart::FirstSighting;
+        clock.since = now;
+    }
+    else if (lastDeathAt > clock.since)
+    {
+        reading.start = ReleasePromptStart::NewDeath;
+        clock.since = now;
+    }
+    else if (now - clock.lastSeen > maxGapSeconds)
+    {
+        reading.start = ReleasePromptStart::AfterGap;
+        reading.gapSeconds = now - clock.lastSeen;
+        clock.since = now;
+    }
+    clock.lastSeen = now;
+    reading.deadSeconds = now - clock.since;
+    return reading;
 }
 
 }  // namespace OverseerDecisions

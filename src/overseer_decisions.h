@@ -15956,6 +15956,15 @@ struct RecruitCandidate
     unsigned teamId{0};
     // The character row is flagged for deletion.
     bool gone{false};
+    // The character is on a random-bot account: its account name begins with
+    // AiPlayerbot.RandomBotAccountPrefix (AccountNameHasPrefix, the same test
+    // the retire path asks). FALSE UNTIL SOMEBODY READ THE ACCOUNT AND SAID
+    // OTHERWISE, so a candidate whose account could not be read is dropped by
+    // discovery rather than admitted by it. See RecruitDiscoveryFrom.
+    bool randomBotAccount{false};
+    // The character's name is a row in `overseer_roster`, the named family
+    // this module keeps alive itself. See RecruitDiscoveryFrom.
+    bool onRoster{false};
     std::vector<ProfessionHolding> professions;
 };
 
@@ -16170,6 +16179,39 @@ std::vector<RecruitPick> RecruitShortlist(
 RecruitShortlistReport RecruitShortlistReportFor(
     std::vector<RecruitCandidate> const& candidates, GuildNeeds const& needs,
     unsigned atMost);
+
+// WHO IS IN THE POOL AT ALL, decided before anybody in it is judged.
+//
+// The recruit pool is the random-bot population, and only that. Discovery
+// used to take every unguilded, undeleted character in the band, which is
+// right for two thousand random bots and wrong for anything else that lands
+// in `characters`: the named family (overseer_roster), which this module
+// keeps alive on its own named accounts and the random-bot manager does not
+// drive, or a person's own character on a person's own account. Neither is a
+// recruit target, and nothing downstream would have said so - the shortlist
+// would simply have named them.
+//
+// TWO GATES, INDEPENDENT ON PURPOSE. The account gate is the rule: a
+// candidate not on a random-bot account is dropped. The roster gate is a
+// second, cheap check that does not depend on the first: a roster name is
+// dropped even on an account that passes the prefix test, so a family member
+// moved onto a prefixed account, or a prefix configured wider than it should
+// be, still cannot put the family on a shortlist. A candidate failing both is
+// counted once, under the roster, because that is the more specific reason.
+//
+// WHY THIS IS NOT A RecruitRefusal. A refusal is a verdict on somebody who
+// could be asked; these are characters who are not in the pool to be asked,
+// and the invite verb's by-name path (which an operator types) is deliberately
+// left judged by RecruitVerdictFor alone. The counts are returned so the
+// shortlist can say how many were dropped and why, rather than leaving a
+// smaller pool to be noticed.
+struct RecruitDiscovery
+{
+    std::vector<RecruitCandidate> kept;
+    unsigned notRandomBot{0};
+    unsigned onRoster{0};
+};
+RecruitDiscovery RecruitDiscoveryFrom(std::vector<RecruitCandidate> const& found);
 
 // -- the raid, and the eight groups it is made of (infra#3763) ---------------
 //
@@ -21119,6 +21161,10 @@ struct GuildRunPoll
     // The group is gone, or the tank is no longer in it.
     bool groupGone{false};
     unsigned ceilingSeconds{GUILD_RUN_CEILING_SECONDS};
+    // A boss encounter is under way in the run's copy (the instance script's
+    // IsEncounterInProgress). Past the ceiling it buys the run
+    // GUILD_RUN_BOSS_EXTENSION_SECONDS, once.
+    bool bossInCombat{false};
     unsigned emptySeconds{GUILD_RUN_EMPTY_SECONDS};
     // THE CORPSE RUN (GUILD_RUN_RECOVERY_SECONDS). Ghosts of the run whose
     // corpse is on the dungeon's map, standing outside it.
@@ -21235,6 +21281,25 @@ std::uint32_t GuildRunExpectedMask(std::uint32_t mapId, std::uint32_t mapMask,
 // than the ceiling; every other run keeps the ceiling.
 constexpr unsigned GUILD_RUN_SECONDS_PER_BOSS = 15 * 60;
 unsigned GuildRunCeilingSeconds(bool finderEndsDungeon, unsigned bossesExpected);
+
+// A LONG DUNGEON SCALES THE CEILING WITH ITS BOSSES. Blackfathom Deeps, seven
+// bosses at about half an hour each, ended `timed out` six times with no clear
+// (wow-overseer#835): the last at 7230 s with four of seven down. A map in
+// GuildRunSecondsPerBoss gets that many seconds a boss for the bosses it
+// expects, plus GUILD_RUN_CEILING_MARGIN_SECONDS, never less than the base
+// ceiling. A seven-boss Blackfathom gets 7 * 1800 + 1800 = 14400 s. Every map not in
+// the table, every run with no bosses read yet, and every map whose boss count
+// gives less, keeps GuildRunCeilingSeconds.
+constexpr unsigned GUILD_RUN_CEILING_MARGIN_SECONDS = 30 * 60;
+// Seconds a boss for a map with a measured slow clear; 0 for every other map.
+unsigned GuildRunSecondsPerBoss(std::uint32_t mapId);
+unsigned GuildRunCeilingForMap(std::uint32_t mapId, bool finderEndsDungeon,
+                               unsigned bossesExpected);
+
+// A BOSS STILL BEING FOUGHT WHEN THE CEILING HITS GETS THIS MUCH MORE, ONCE:
+// the extension is measured from the ceiling, so a run past ceiling plus
+// extension is timed out whatever is in combat.
+constexpr unsigned GUILD_RUN_BOSS_EXTENSION_SECONDS = 10 * 60;
 
 // THE DUNGEON BRAIN IS ASKED AGAIN, NOT ONLY ONCE. A guild run is armed once
 // per stay (`dc on`), and the dungeon module can disable itself afterwards (a
@@ -23528,6 +23593,74 @@ enum class LogoutScope
     CharacterOnly,
 };
 LogoutScope LogoutOfflineScope(uint32_t otherInWorldOnAccount);
+
+// THE RELEASE-PROMPT DEAD CLOCK (mod-overseer#252).
+//
+// A character dead on the "release to the nearest graveyard?" prompt has no
+// ghost time yet - a corpse, and so a ghost time, only exists after the
+// release - so the stuck-revival drive keeps its own clock, and releases on
+// the character's behalf once it reads STUCK_REVIVAL_DEAD_SECONDS.
+//
+// That clock was set on the first dead sighting and ended only by a release.
+// A character raised without one (a healer's resurrect, which skips the
+// prompt entirely) kept its clock, so its NEXT death was timed from the
+// first: the drive said "has been dead 368s" about a character the core had
+// booked a fresh death for two seconds earlier, and had booked a revive for
+// in between. It also released that character as soon as it died again,
+// with none of the grace a healer is owed.
+//
+// The clock now covers one unbroken dead spell and nothing more:
+//
+//   - Alive ends it. The drive erases the clock the moment it sees the
+//     character alive (the IsAlive branch of DriveStuckRevival).
+//   - A death booked after the clock started ends it too. `lastDeathAt` is
+//     when the module's own death hook last saw this character die (0 when it
+//     has not); a death later than the clock's start means the character was
+//     alive in between, even if no poll happened to land on that moment.
+//   - A dead sighting more than `maxGapSeconds` after the previous one does
+//     not extend it. Nothing looked at the character in between (it was
+//     offline, mid-login, or the drive took another branch), so nothing can
+//     say it stayed dead, and the clock restarts here with the gap reported
+//     rather than counted.
+//
+// Every restart times from THIS sighting, the same as a first sighting: the
+// reported duration is only ever a run of dead observations the drive made
+// itself, never a span it is guessing across.
+constexpr std::int64_t RELEASE_PROMPT_MAX_GAP_SECONDS = 30;
+
+struct ReleasePromptClock
+{
+    // The first dead sighting of the current spell; 0 = no spell running.
+    std::int64_t since{0};
+    // The most recent dead sighting.
+    std::int64_t lastSeen{0};
+};
+
+enum class ReleasePromptStart
+{
+    // The clock was already running and this sighting extends it.
+    Running,
+    // No spell was running: this is the first sighting.
+    FirstSighting,
+    // The death hook booked a death after the clock started.
+    NewDeath,
+    // The previous sighting was too long ago to vouch for the time between.
+    AfterGap,
+};
+
+struct ReleasePromptReading
+{
+    ReleasePromptStart start{ReleasePromptStart::Running};
+    // The age of the unbroken spell at `now`.
+    std::int64_t deadSeconds{0};
+    // AfterGap only: the unobserved stretch that broke the previous run.
+    std::int64_t gapSeconds{0};
+};
+
+// One dead sighting on the release prompt, at `now`. Updates `clock`.
+ReleasePromptReading ReleasePromptObserve(ReleasePromptClock& clock, std::int64_t now,
+                                          std::int64_t lastDeathAt,
+                                          std::int64_t maxGapSeconds);
 
 }  // namespace OverseerDecisions
 

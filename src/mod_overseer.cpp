@@ -3283,6 +3283,26 @@ constexpr uint32 DEATH_FLUSH_MS = 3000;
 // there is a cohort's worth of rows to look at.
 constexpr uint32 DEATH_RETENTION_DAYS = 90;
 
+// HOW LONG AN ANSWERED PROBE IS KEPT. A kind 'probe' row is a read-only
+// question (auras, meter, a tool's probe) whose asker reads the answer back by
+// id within seconds of asking and never reads it again: nothing selects a
+// probe by anything but its id, and the member's activity read already skips
+// them. On the dev realm on 2026-10-10 they were 562,489 of overseer_command's
+// 828,287 rows and 663 MB of its `result`, kept forever. A day is a hundred
+// times longer than any asker waits, and long enough to read one back by hand.
+//
+// ONLY PROBES. Every other kind is the realm's history and some reader treats
+// it as such: the naturalize audit reads delivered 'buy' and 'gm' rows to tell
+// earned items from granted ones, the guild bank reads its last tab purchase,
+// and the bridge reads a member's last job order. Pruning those needs each
+// reader given a bound first.
+constexpr uint32 PROBE_RETENTION_HOURS = 24;
+// At most this many rows a sweep, so the backlog of months drains over hours
+// (about ten at one sweep each five minutes) instead of in one statement that
+// holds the async writer while it deletes half a million rows. After that a
+// sweep finds the few hundred probes of one day.
+constexpr uint32 PROBE_SWEEP_BATCH = 5000;
+
 // The hour an event fell in, as the grouping half of the unique key. See
 // 2026_08_24_02_overseer_event.sql for why the timeline is coarsened to an
 // hour rather than collapsed entirely or kept per-occurrence.
@@ -4988,6 +5008,29 @@ struct PendingDeath
     std::string targetedBy;
 };
 std::mutex g_deathMutex;
+// WHEN EACH ROSTER CHARACTER LAST DIED, by lowercased name (mod-overseer#252).
+// Written by OnPlayerJustDied on a map thread, read by DriveStuckRevival on the
+// world thread, so it has its own lock. It is how the release-prompt dead
+// clock learns about a death that happened after it started - a revive and a
+// second death that both fell between two of the drive's polls - see
+// OverseerDecisions::ReleasePromptObserve. Roster only, so it holds at most
+// one entry per roster character; lost on restart, which costs nothing,
+// because the clock it feeds is lost too.
+std::mutex g_deathStampMutex;
+std::map<std::string, int64> g_lastDeathAt;
+
+void StampDeath(std::string const& name)
+{
+    std::lock_guard<std::mutex> guard(g_deathStampMutex);
+    g_lastDeathAt[LowerName(name)] = int64(time(nullptr));
+}
+
+int64 LastDeathAt(std::string const& name)
+{
+    std::lock_guard<std::mutex> guard(g_deathStampMutex);
+    auto const it = g_lastDeathAt.find(LowerName(name));
+    return it == g_lastDeathAt.end() ? 0 : it->second;
+}
 // THE NEWEST OUTMATCHED DEATH OF EACH NATURAL GUILD MEMBER (2026-10-10): killed
 // by something OverseerDecisions::GUILD_OUTMATCHED_LEVEL_GAP or more levels
 // above it. Written by the death hook on a map thread (LogGuildDeath), read and
@@ -7367,6 +7410,8 @@ public:
             return;
         RecordEvent(player, "death", 0, "", "");
         RecordDeath(player);
+        if (OnRoster(player->GetName()))
+            StampDeath(player->GetName());
     }
 
     // NO FOLLOWER KEEPS A MASTER THAT IS ABOUT TO BE FREED (#131).
@@ -7922,6 +7967,13 @@ public:
             CharacterDatabase.Execute(
                 "DELETE FROM overseer_level WHERE created_at < NOW() - INTERVAL {} DAY",
                 DEATH_RETENTION_DAYS);
+            // Answered probes past a day, a batch at a time (see
+            // PROBE_RETENTION_HOURS). On updated_at, which is when the answer
+            // was written; (kind, status, updated_at) serves it.
+            CharacterDatabase.Execute(
+                "DELETE FROM overseer_command WHERE kind = 'probe' "
+                "AND updated_at < NOW() - INTERVAL {} HOUR LIMIT {}",
+                PROBE_RETENTION_HOURS, PROBE_SWEEP_BATCH);
             // The run timeline: swept on created_at like the deaths, because a
             // row is never updated after it is written.
             if (RunTimelinePresent())
@@ -27799,6 +27851,11 @@ private:
                              name);
                 }
 
+                // Alive ends the dead spell, so the release-prompt clock ends
+                // with it (mod-overseer#252). It used to survive a revive that
+                // skipped the release - a healer's resurrect - and time the
+                // NEXT death from the first one's sighting.
+                _awaitingRelease.erase(name);
                 _healerExpected.erase(name);
                 EndGhostRecovery(botAI, name);
                 LadderEnd(botAI, name);
@@ -28012,8 +28069,14 @@ private:
             //
             // TIMED FROM OUR OWN FIRST SIGHTING, because there is no ghost
             // clock yet - that is the whole point. The map is keyed by name and
-            // cleared the moment the character is alive again, so a character
-            // that dies twice is timed from each death rather than the first.
+            // cleared the moment the character is alive again (the IsAlive
+            // branch above), so a character that dies twice is timed from each
+            // death rather than the first. It once was not cleared there, and
+            // said "has been dead 368s" about a character two seconds into its
+            // second death (mod-overseer#252). The clock also restarts on a
+            // death the hook booked after it started, and on a gap in its own
+            // sightings - see OverseerDecisions::ReleasePromptObserve - so the
+            // duration it reports is always one it watched.
             //
             // THE GRACE IS DELIBERATE AND NOT ZERO. A healer in the party may
             // resurrect a corpse, which is better than a graveyard run because
@@ -28031,22 +28094,36 @@ private:
                 }
 
                 int64 const now = time(nullptr);
-                auto const seen = _awaitingRelease.find(name);
-                if (seen == _awaitingRelease.end())
-                {
-                    _awaitingRelease[name] = now;
+                OverseerDecisions::ReleasePromptReading const reading =
+                    OverseerDecisions::ReleasePromptObserve(
+                        _awaitingRelease[name], now, LastDeathAt(name),
+                        OverseerDecisions::RELEASE_PROMPT_MAX_GAP_SECONDS);
+                if (reading.start == OverseerDecisions::ReleasePromptStart::NewDeath)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' died again since its release-prompt clock "
+                             "started, so it was alive in between - the clock restarts "
+                             "from this sighting rather than counting the first death",
+                             name);
+                else if (reading.start == OverseerDecisions::ReleasePromptStart::AfterGap)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' was not seen for {}s between two dead "
+                             "sightings on the release prompt - its clock restarts from "
+                             "this sighting, because nothing can say it stayed dead "
+                             "across the gap",
+                             name, reading.gapSeconds);
+                if (reading.start != OverseerDecisions::ReleasePromptStart::Running)
                     continue;
-                }
-                if (now - seen->second < STUCK_REVIVAL_DEAD_SECONDS)
+                if (reading.deadSeconds < STUCK_REVIVAL_DEAD_SECONDS)
                     continue;
-                if (healerExpected(now - seen->second))
+                if (healerExpected(reading.deadSeconds))
                     continue;
 
                 LOG_WARN("module.overseer",
-                         "overseer: '{}' has been dead {}s on the release prompt with nobody "
-                         "at the keyboard to answer it - releasing on its behalf, because a "
-                         "corpse only exists after the release and every other recovery path "
-                         "here waits for one", name, now - seen->second);
+                         "overseer: '{}' has been dead {}s (unbroken dead sightings) on "
+                         "the release prompt with nobody at the keyboard to answer it - "
+                         "releasing on its behalf, because a corpse only exists after the "
+                         "release and every other recovery path here waits for one",
+                         name, reading.deadSeconds);
                 bot->BuildPlayerRepop();
                 bot->RepopAtGraveyard();
                 _awaitingRelease.erase(name);
@@ -39957,8 +40034,16 @@ private:
             run.bossesBest = kills.best;
             run.lastKillAt = kills.lastKillAt;
             run.nextBoss = NextEncounterName(run.mapId, poll.expectedMask, poll.creditedMask);
-            poll.ceilingSeconds =
-                OverseerDecisions::GuildRunCeilingSeconds(run.finderEndsDungeon, run.bossesTotal);
+            poll.ceilingSeconds = OverseerDecisions::GuildRunCeilingForMap(
+                run.mapId, run.finderEndsDungeon, run.bossesTotal);
+            {
+                // IsEncounterInProgress  InstanceScript.h
+                InstanceScript* const script =
+                    tank && tank->IsInWorld() && tank->GetMapId() == run.mapId
+                        ? tank->GetInstanceScript()
+                        : nullptr;
+                poll.bossInCombat = script && script->IsEncounterInProgress();
+            }
             poll.finderFinished =
                 ourGroup && sLFGMgr->GetState(group->GetGUID()) == lfg::LFG_STATE_FINISHED_DUNGEON;
             if (poll.finderFinished && !run.finderEndsDungeon && !run.finderSliceSaid)
@@ -52607,7 +52692,8 @@ private:
     // World thread only - both DeliverPendingCommands and ResolveStrategyChecks
     // run from OnUpdate - so unguarded, like _lastAim. Bounded by construction:
     // at most COMMANDS_PER_POLL entries are added per poll and every entry is
-    // resolved within VERIFY_GRACE_MS.
+    // resolved within VERIFY_GRACE_MS, or within VERIFY_GRACE_MS plus
+    // HEARTH_SETTLE_CEILING_MS when its bot is mid-teleport (#319).
     std::vector<StrategyCheck> _pendingChecks;
 
     struct EquipCheck
@@ -52831,6 +52917,10 @@ private:
     // which is the row this whole section exists to be able to write.
     void ResolveStrategyChecks(uint32 elapsedMs)
     {
+        using OverseerDecisions::ReadTeleportFlight;
+        using OverseerDecisions::TeleportFlight;
+        using OverseerDecisions::TeleportFlightWord;
+
         std::vector<StrategyCheck> stillWaiting;
         stillWaiting.reserve(_pendingChecks.size());
 
@@ -52838,9 +52928,32 @@ private:
         {
             check.waitedMs += elapsedMs;
 
-            Player* bot = ObjectAccessor::FindPlayerByName(check.targetName);
-            PlayerbotAI* botAI = bot ? GET_PLAYERBOT_AI(bot) : nullptr;
-            if (!botAI)
+            // ASKED WITH checkInWorld FALSE, the hearth's #310 lesson carried
+            // here (#319). A strategy command teleports nobody, but
+            // mod-playerbots moves bots on its own initiative, and
+            // Player::TeleportTo takes a character OUT OF THE WORLD for the
+            // whole length of a map change. With the default the lookup
+            // answered null for a bot that was crossing, and this read-back
+            // wrote `error` about a character that was still logged in.
+            uint32 const ceilingMs = VERIFY_GRACE_MS + HEARTH_SETTLE_CEILING_MS;
+            Player* bot = ObjectAccessor::FindPlayerByName(check.targetName, false);
+            TeleportFlight const flight =
+                ReadTeleportFlight(bot != nullptr, bot && bot->IsInWorld(),
+                                   bot && bot->IsBeingTeleported(), check.waitedMs,
+                                   ceilingMs);
+
+            // STILL CROSSING IS "ASK AGAIN", not a reading. Nothing is read off
+            // an engine that is mid-teleport; the ceiling ends the wait, after
+            // which the reading is Stranded and is judged where it stands.
+            if (flight == TeleportFlight::InFlight)
+            {
+                stillWaiting.push_back(check);
+                continue;
+            }
+
+            PlayerbotAI* botAI =
+                flight == TeleportFlight::Gone ? nullptr : GET_PLAYERBOT_AI(bot);
+            if (flight == TeleportFlight::Gone || !botAI)
             {
                 // Said out loud rather than dropped. A character that logged
                 // out mid-check is a perfectly good explanation, and an
@@ -52880,6 +52993,7 @@ private:
             o << "{\"outcome\":" << J(holds ? "applied" : "unchanged")
               << ",\"command\":" << J(check.command)
               << ",\"waited_ms\":" << check.waitedMs
+              << ",\"flight\":" << J(TeleportFlightWord(flight))
               << ",\"items\":[";
             bool first = true;
             for (StrategyItem const& item : check.items)
@@ -58465,6 +58579,11 @@ private:
     // read and tested. The WHERE clause is a way of not fetching two thousand
     // rows nobody will look at; it is not where the rule lives, and it must not
     // become where the rule lives.
+    //
+    // THE ACCOUNT AND THE ROSTER ARE READ HERE AND JUDGED THERE (#525). Every
+    // row comes back with two more facts: whether its account is a random-bot
+    // account, and whether its name is an overseer_roster row. Neither is a
+    // WHERE clause; RecruitDiscoveryFrom is what drops them, and says how many.
     static std::vector<OverseerDecisions::RecruitCandidate> GuildCandidateFacts(
         OverseerDecisions::RecruitBand const& band)
     {
@@ -58487,15 +58606,20 @@ private:
         uint32 const floorLevel = band.lowest ? band.lowest : 1u;
         uint32 const ceilLevel = band.highest ? band.highest : 255u;
 
+        // Any overseer_roster row, enabled or not: a parked family member is
+        // still the family, and still not a recruit.
         QueryResult rows = CharacterDatabase.Query(
-            "SELECT c.guid, c.name, c.race, c.class, c.level FROM characters c "
+            "SELECT c.guid, c.name, c.race, c.class, c.level, c.account, roster.name "
+            "FROM characters c "
             "LEFT JOIN guild_member gm ON gm.guid = c.guid "
+            "LEFT JOIN overseer_roster roster ON roster.name = c.name "
             "WHERE gm.guid IS NULL AND c.deleteDate IS NULL "
             "AND c.level BETWEEN {} AND {} ORDER BY c.name LIMIT {}",
             floorLevel, ceilLevel, GUILD_CANDIDATE_CAP);
         if (!rows)
             return candidates;
 
+        std::vector<uint32> accountOf;
         do
         {
             Field* row = rows->Fetch();
@@ -58505,9 +58629,43 @@ private:
                 static_cast<unsigned>(Player::TeamIdForRace(row[2].Get<uint8>()));
             candidate.classId = row[3].Get<uint8>();
             candidate.level = row[4].Get<uint8>();
+            candidate.onRoster = !row[6].IsNull();
             byGuid[row[0].Get<uint32>()] = candidates.size();
+            accountOf.push_back(row[5].Get<uint32>());
             candidates.push_back(candidate);
         } while (rows->NextRow());
+
+        // THE ACCOUNT NAMES ARE ONE QUERY, NOT ONE PER CANDIDATE. They live in
+        // the auth database, which no join from `characters` can reach by a
+        // name this module may assume, and AccountMgr::GetName is a blocking
+        // round trip each - two thousand of them for one shortlist. The id list
+        // is integers this function read out of the database itself, the same
+        // as the skills pool below. An account that does not come back leaves
+        // randomBotAccount false, so it is dropped rather than admitted.
+        std::set<uint32> const accountIds(accountOf.begin(), accountOf.end());
+        std::ostringstream accountPool;
+        for (std::set<uint32>::const_iterator it = accountIds.begin();
+             it != accountIds.end(); ++it)
+            accountPool << (it == accountIds.begin() ? "" : ",") << *it;
+
+        std::map<uint32, std::string> accountName;
+        if (QueryResult accounts = LoginDatabase.Query(
+                "SELECT id, username FROM account WHERE id IN ({})", accountPool.str()))
+        {
+            do
+            {
+                Field* row = accounts->Fetch();
+                accountName[row[0].Get<uint32>()] = row[1].Get<std::string>();
+            } while (accounts->NextRow());
+        }
+        for (size_t i = 0; i < candidates.size(); ++i)
+        {
+            std::map<uint32, std::string>::const_iterator name = accountName.find(accountOf[i]);
+            candidates[i].randomBotAccount =
+                name != accountName.end() &&
+                OverseerDecisions::AccountNameHasPrefix(
+                    name->second, sPlayerbotAIConfig.randomBotAccountPrefix);
+        }
 
         // THE SECOND QUERY IS BOUND BY THE FIRST QUERY'S ANSWER, NOT BY ITS
         // WHERE CLAUSE. Repeating the band and the guild join here would
@@ -62217,7 +62375,10 @@ private:
             // READ-ONLY. This verb invites nobody and changes nothing; it
             // answers who WOULD be worth asking and why, so that the judgement
             // can be read before it is acted on.
-            std::vector<RecruitCandidate> const candidates = GuildCandidateFacts(needs.band);
+            std::vector<RecruitCandidate> const found = GuildCandidateFacts(needs.band);
+            OverseerDecisions::RecruitDiscovery const discovery =
+                OverseerDecisions::RecruitDiscoveryFrom(found);
+            std::vector<RecruitCandidate> const& candidates = discovery.kept;
             RecruitShortlistReport const report =
                 RecruitShortlistReportFor(candidates, needs, request.atMost);
             std::vector<RecruitPick> const& picks = report.picks;
@@ -62228,6 +62389,9 @@ private:
               << ",\"target_size\":" << needs.targetSize
               << ",\"band\":{\"lowest\":" << needs.band.lowest
               << ",\"highest\":" << needs.band.highest << '}'
+              << ",\"found\":" << found.size()
+              << ",\"dropped\":{\"not_random_bot\":" << discovery.notRandomBot
+              << ",\"on_roster\":" << discovery.onRoster << '}'
               << ",\"considered\":" << candidates.size()
               << ",\"refused\":{";
             for (size_t i = 0; i < report.refused.size(); ++i)
@@ -73029,8 +73193,10 @@ private:
     // time, only exists after the release - so the drive has to keep its own.
     // Written and read only from DriveStuckRevival on the world thread, so it
     // is unguarded like TravelAimBook's own maps and _lastAim above, and lost
-    // on restart, which costs at most one extra grace period.
-    std::map<std::string, int64> _awaitingRelease;
+    // on restart, which costs at most one extra grace period. Erased when the
+    // character is seen alive or released; read and advanced only through
+    // OverseerDecisions::ReleasePromptObserve (mod-overseer#252).
+    std::map<std::string, OverseerDecisions::ReleasePromptClock> _awaitingRelease;
 
     // WHICH DEATHS THIS DRIVE HAS SAID IT IS LEAVING TO THE HEALER, by name.
     // Same ownership and lifetime as _awaitingRelease: DriveStuckRevival on

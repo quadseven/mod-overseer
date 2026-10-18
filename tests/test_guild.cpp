@@ -59,6 +59,8 @@ using OverseerDecisions::ProfessionName;
 using OverseerDecisions::RecruitBand;
 using OverseerDecisions::RecruitBandFrom;
 using OverseerDecisions::RecruitCandidate;
+using OverseerDecisions::RecruitDiscovery;
+using OverseerDecisions::RecruitDiscoveryFrom;
 using OverseerDecisions::RecruitNeed;
 using OverseerDecisions::RecruitPick;
 using OverseerDecisions::RecruitShortlistReport;
@@ -789,6 +791,63 @@ void AWiderShortlistIsWhatRoutesRoundNamesThisModuleCannotSee()
                 "Recruit06");
 }
 
+// THE POOL IS THE RANDOM-BOT POPULATION, AND THE FAMILY IS NOT IN IT (#525).
+// Every candidate below passes every recruit gate - unguilded, alive, horde,
+// in the band - and the first two would be the very first picks, because each
+// fills the one profession hole the family has. Discovery has to drop them
+// anyway: one is on an account that is not a random bot, the other is a name
+// on overseer_roster, and the roster check holds even on an account that
+// passes the prefix test.
+void DiscoveryKeepsOnlyRandomBotsAndNeverTheRoster()
+{
+    GuildNeeds const needs = FamilyNeeds();
+
+    RecruitCandidate person = Candidate("Aelith", HUNTER, 36, ENGINEERING, 0);
+    person.randomBotAccount = false;
+    RecruitCandidate family = Candidate("Brakk", HUNTER, 36, ENGINEERING, 0);
+    family.randomBotAccount = true;
+    family.onRoster = true;
+    RecruitCandidate bot = Candidate("Sprok", HUNTER, 36, ENGINEERING, 0);
+    bot.randomBotAccount = true;
+    // The default is the fail-closed one: a candidate nobody read the account
+    // of is not a random bot.
+    RecruitCandidate unread = Candidate("Zaxx", HUNTER, 36, ENGINEERING, 0);
+
+    std::vector<RecruitCandidate> const found = {person, family, bot, unread};
+
+    // Without discovery, the shortlist would name the person first: that is
+    // the hole this closes, and the reason the test is not vacuous.
+    std::vector<RecruitPick> const raw = RecruitShortlist(found, needs, 1);
+    Check("without discovery the person tops the shortlist",
+          raw.size() == 1 && found[raw[0].index].name == "Aelith");
+
+    RecruitDiscovery const discovery = RecruitDiscoveryFrom(found);
+    Check("only the random bot is kept",
+          discovery.kept.size() == 1 && discovery.kept[0].name == "Sprok");
+    Check("the person and the unread account count as not random bots",
+          discovery.notRandomBot == 2);
+    Check("the roster name counts as on the roster", discovery.onRoster == 1);
+
+    std::vector<RecruitPick> const picks = RecruitShortlist(discovery.kept, needs, 10);
+    bool clean = true;
+    for (RecruitPick const& pick : picks)
+    {
+        std::string const& name = discovery.kept[pick.index].name;
+        clean = clean && name != "Aelith" && name != "Brakk" && name != "Zaxx";
+    }
+    Check("no dropped candidate reaches the shortlist", clean);
+    Check("the random bot is still the pick",
+          picks.size() == 1 && discovery.kept[picks[0].index].name == "Sprok");
+
+    // A roster name on an account that is not a random bot is counted once,
+    // under the roster, the more specific of its two reasons.
+    RecruitCandidate both = Candidate("Gorm", HUNTER, 36, 0, 0);
+    both.onRoster = true;
+    RecruitDiscovery const once = RecruitDiscoveryFrom({both});
+    Check("a candidate failing both gates is counted once",
+          once.kept.empty() && once.onRoster == 1 && once.notRandomBot == 0);
+}
+
 void TheShortlistTakesTheHolesInTheOrderTheyMatter()
 {
     GuildNeeds const needs = FamilyNeeds();
@@ -1481,6 +1540,7 @@ int main()
     TheShortlistStopsAtTheCapAndAtAFullRoster();
     TheShortlistFillsToWhatWasAskedForAndNotToTheOpenSeatCount();
     AWiderShortlistIsWhatRoutesRoundNamesThisModuleCannotSee();
+    DiscoveryKeepsOnlyRandomBotsAndNeverTheRoster();
     TheShortlistTakesTheHolesInTheOrderTheyMatter();
     TheShortlistReportsWhyCandidatesWereRefused();
     FormationWaitsForTheFounderBeforeItTriesToCreate();
