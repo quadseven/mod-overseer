@@ -14022,39 +14022,55 @@ private:
             return false;
         }
 
-        // The lease already names this quest, and the aim has not moved since
-        // we last looked - leave it alone. Re-issuing ChangeToDoQuest on every
-        // poll would reset objectiveIdx, pos and lastReachPOI
-        // (NewRpgInfo.h:47-54) every twenty seconds, which is a character that
-        // walks toward an objective forever and never arrives.
+        // ONE DECISION, ChosenQuestStepFor (tests/test_chosen_quest_hand_in.cpp).
         //
-        // BUT NOT WHEN THE AIM HAS JUST CHANGED, and that distinction is the
-        // whole errand. Measured in dev on 2026-08-24: Ymrossi drifted onto
-        // quest 233 by itself, was re-asserted onto the council's 3109, handed
-        // 3109 in, and its rpg then re-rolled back onto 233. Aiming it at 233
-        // for its SECOND errand hit this guard - `working == questId` was true,
-        // so this returned silently and nothing happened. The bot sat holding a
-        // DoQuest state for 233 whose objective pointer belonged to its own
-        // earlier pursuit, and 233 was already COMPLETE, so there was no
-        // objective left to walk to and it never advanced to the hand-in.
+        // LEAVE: the lease already names this quest, and the aim has not moved
+        // since we last looked. Re-issuing ChangeToDoQuest on every poll would
+        // reset objectiveIdx, pos and lastReachPOI (NewRpgInfo.h:47-54) every
+        // twenty seconds, which is a character that walks toward an objective
+        // forever and never arrives.
         //
-        // The first errand only worked BECAUSE ChangeToDoQuest was called
-        // fresh and reset that pointer. A new errand needs the same reset even
-        // when the id happens to match, because the state behind it belongs to
-        // a different, self-chosen pursuit. Re-issue once on the change, then
-        // go quiet again - which keeps the walks-forever loop this guard was
-        // written to prevent.
-        if (working == questId && !aimChanged)
-            return true;
+        // REISSUE: BUT NOT WHEN THE AIM HAS JUST CHANGED. Measured in dev on
+        // 2026-08-24: a character drifted onto quest 233 by itself, was
+        // re-asserted onto the council's 3109, handed 3109 in, and its rpg then
+        // re-rolled back onto 233. Aiming it at 233 for its SECOND errand left
+        // it alone because `working == questId` - and it sat holding a DoQuest
+        // state for 233 whose objective pointer belonged to its own earlier
+        // pursuit. A new errand needs the reset even when the id matches. Re-
+        // issue once on the change, then go quiet again.
+        //
+        // HAND IN (#180): a COMPLETE quest whose taker is in reach is handed in
+        // here, by the module, whatever the lease names. Upstream's own
+        // hand-in is a search for a quest giver that refuses a reward it cannot
+        // store and gives the quest up after five minutes at the point of
+        // interest (NewRpgAction.cpp:625), after which this drive re-asserted
+        // the lease and the walk back to the giver started again. Quest 90 was
+        // carried COMPLETE for half an hour that way.
+        WorldObject* taker = nullptr;
+        OverseerDecisions::ChosenQuestFacts facts;
+        facts.status = static_cast<int>(status);
+        facts.working = working == questId;
+        facts.aimChanged = aimChanged;
+        facts.handInReady = status == QUEST_STATUS_COMPLETE &&
+                            ChosenQuestHandInReady(name, bot, quest, taker);
 
-        if (working == questId)
+        switch (OverseerDecisions::ChosenQuestStepFor(facts))
         {
-            LOG_INFO("module.overseer",
-                     "overseer: '{}' was already on quest {} ({}) by its own choice - "
-                     "re-issuing for the new errand so the objective pointer resets",
-                     name, questId, quest->GetTitle());
-            botAI->rpgInfo.ChangeToDoQuest(questId, quest);  // NewRpgInfo.h:106
-            return true;
+            case OverseerDecisions::ChosenQuestStep::NotHeld:
+                return false;  // refused above already; kept for the switch
+            case OverseerDecisions::ChosenQuestStep::HandIn:
+                return HandInChosenQuest(name, bot, quest, taker);
+            case OverseerDecisions::ChosenQuestStep::Leave:
+                return true;
+            case OverseerDecisions::ChosenQuestStep::Reissue:
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' was already on quest {} ({}) by its own choice - "
+                         "re-issuing for the new errand so the objective pointer resets",
+                         name, questId, quest->GetTitle());
+                botAI->rpgInfo.ChangeToDoQuest(questId, quest);  // NewRpgInfo.h:106
+                return true;
+            case OverseerDecisions::ChosenQuestStep::Assert:
+                break;
         }
 
         if (working)
@@ -14071,6 +14087,81 @@ private:
                      "RPG_DO_QUEST lease had lapsed", name, questId, quest->GetTitle());
 
         botAI->rpgInfo.ChangeToDoQuest(questId, quest);  // NewRpgInfo.h:106
+        return true;
+    }
+
+    // Is the COMPLETE chosen quest ready to hand in where the character stands
+    // (#180)? The same facts and the same refusal as an operator's
+    // `turnin quest:<id>` row (QuestErrandRefusal), so the drive never hands in
+    // something that row would refuse - with one difference: `rewardable` asks
+    // CanRewardQuest(quest, 0, false), which also checks the reward items fit
+    // in the bags, because a reward the core cannot store is dropped on the
+    // floor by RewardQuest. A taker not yet in reach is the ordinary case on
+    // the walk back and is not logged; any other refusal is said once per
+    // character and quest, because the character is standing at the taker and
+    // still cannot hand in, which is the stall the operator has to see.
+    bool ChosenQuestHandInReady(std::string const& name, Player* bot, Quest const* quest,
+                                WorldObject*& taker)
+    {
+        uint32 const questId = quest->GetQuestId();
+        taker = nullptr;
+        OverseerDecisions::QuestErrand errand;
+        errand.verb = OverseerDecisions::QuestErrandVerb::TurnIn;
+        errand.questId = questId;
+        OverseerDecisions::QuestErrandFacts facts;
+        facts.questKnown = true;
+        if (Creature* npc = QuestCreatureInReach(bot, questId, false, false))
+        {
+            taker = npc;
+            facts.holder = OverseerDecisions::QuestRelationHolder::Creature;
+        }
+        else if (GameObject* object = QuestObjectInReach(bot, questId, false, false))
+        {
+            taker = object;
+            facts.holder = OverseerDecisions::QuestRelationHolder::GameObject;
+        }
+        else
+            facts.holder = QuestHolderKind(questId, false);
+        facts.giverInReach = taker != nullptr;
+        facts.rewarded = bot->GetQuestRewardStatus(questId);  // Player.h:1491
+        facts.status = static_cast<int>(bot->GetQuestStatus(questId));
+        facts.rewardChoice = quest->GetRewChoiceItemsCount() > 0;
+        facts.rewardable = bot->CanRewardQuest(quest, 0, false);
+        std::string const refusal = OverseerDecisions::QuestErrandRefusal(errand, facts);
+        if (refusal.empty())
+            return true;
+        if (facts.giverInReach && _chosenHandInRefusalSaid.insert({name, questId}).second)
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is at the taker of chosen quest {} ({}) but cannot "
+                     "hand it in: {} - leaving it to its own quest-giver search",
+                     name, questId, quest->GetTitle(), refusal);
+        return false;
+    }
+
+    // Hand the COMPLETE chosen quest in to the taker ChosenQuestHandInReady
+    // found, and read the reward back: a turn-in is reported only once the core
+    // has recorded it. RewardQuest takes the quest's required items, which is
+    // what frees the bag space a carried finished quest was holding. Returns
+    // true either way - the aim stays in force, and the next poll's primary
+    // release (GetQuestRewardStatus) is what lets it go.
+    bool HandInChosenQuest(std::string const& name, Player* bot, Quest const* quest,
+                           WorldObject* taker)
+    {
+        uint32 const questId = quest->GetQuestId();
+        bot->RewardQuest(quest, 0, taker);
+        if (!bot->GetQuestRewardStatus(questId))  // Player.h:1491
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' tried to hand in chosen quest {} ({}) to '{}' and "
+                     "the core did not record the reward (status {})",
+                     name, questId, quest->GetTitle(), taker->GetName(),
+                     static_cast<uint32>(bot->GetQuestStatus(questId)));
+            return true;
+        }
+        _chosenHandInRefusalSaid.erase(std::make_pair(name, questId));
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' handed chosen quest {} ({}) in to '{}' at {:.1f} yards",
+                 name, questId, quest->GetTitle(), taker->GetName(), bot->GetExactDist(taker));
         return true;
     }
 
@@ -72839,7 +72930,8 @@ private:
     // relation maps), so a row can only ever reach a creature the world
     // database says gives or takes that quest. Every exit writes `out`, and
     // 'delivered' is set only once the log has been read back.
-    static Creature* QuestCreatureInReach(Player* player, uint32 questId, bool starter)
+    static Creature* QuestCreatureInReach(Player* player, uint32 questId, bool starter,
+                                          bool sayWhy = true)
     {
         QuestRelations const* relations = starter
                                               ? sObjectMgr->GetCreatureQuestRelationMap()
@@ -72859,6 +72951,10 @@ private:
                 player->FindNearestCreature(entry, OverseerDecisions::SPAWN_WALK_ARRIVE_YARDS);
             if (npc && npc->IsAlive())
                 return npc;
+            // The quest drive asks every poll on the walk back (#180), where
+            // "not in reach yet" is the ordinary answer and not worth a line.
+            if (!sayWhy)
+                continue;
             // SAY WHY NOTHING WAS IN REACH (2026-10-08): Brug stood 19 yards from
             // Instructor Razuvious and was told there was no giver. The nearest
             // creature of the entry within 120 yards, with its distances, its
@@ -72895,7 +72991,8 @@ private:
     // gameobject_queststarter / gameobject_questender the same way, within the
     // same reach, and a client's own turn-in at an object reaches the same
     // Player::RewardQuest with the object as the quest giver.
-    static GameObject* QuestObjectInReach(Player* player, uint32 questId, bool starter)
+    static GameObject* QuestObjectInReach(Player* player, uint32 questId, bool starter,
+                                          bool sayWhy = true)
     {
         QuestRelations const* relations = starter ? sObjectMgr->GetGOQuestRelationMap()
                                                   : sObjectMgr->GetGOQuestInvolvedRelationMap();
@@ -72909,6 +73006,8 @@ private:
                 player->FindNearestGameObject(entry, OverseerDecisions::SPAWN_WALK_ARRIVE_YARDS);
             if (object && object->isSpawned())
                 return object;
+            if (!sayWhy)
+                continue;
             LOG_INFO("module.overseer",
                      "overseer: quest {} object {} for '{}': none spawned within {:.0f} yards",
                      questId, entry, player->GetName(), OverseerDecisions::SPAWN_WALK_ARRIVE_YARDS);
@@ -74493,6 +74592,10 @@ private:
         RepickMemory repick;
     };
     std::map<std::string, AimState> _lastAim;
+    // (name, quest) pairs whose drive hand-in refusal at the taker has been
+    // said (#180), so a character stood at a taker it cannot hand in to is
+    // logged once rather than every poll. Erased when that quest is handed in.
+    std::set<std::pair<std::string, uint32>> _chosenHandInRefusalSaid;
     // A campaign phase holds each leader's quest drive. One line per
     // continuous wait; cleared when the coordinator returns to Idle.
     std::set<std::string> _questCampaignWaitSaid;

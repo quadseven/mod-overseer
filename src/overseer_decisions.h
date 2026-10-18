@@ -278,6 +278,50 @@ std::map<std::string, uint32_t> QuestAimsAfterRead(
     std::map<std::string, uint32_t> const& previous,
     std::map<std::string, uint32_t> const& loaded, bool readSucceeded);
 
+// WHAT THE QUEST DRIVE DOES WITH A CHOSEN QUEST THIS POLL (#180). The family
+// held quest 90 COMPLETE for half an hour: the drive re-issued ChangeToDoQuest,
+// which restarts the walk back to the giver, and the hand-in itself was left to
+// upstream's quest-giver search, which refuses a reward it cannot store and
+// gives the quest up after five minutes at the point of interest. Nothing in
+// the module ever handed the quest in.
+//
+//   NotHeld  the character does not carry the quest (status neither COMPLETE
+//            nor INCOMPLETE): aiming would idle it, so fall back to its log.
+//   HandIn   COMPLETE, a taker in reach and the core will reward it: hand it
+//            in now, whatever the lease names. The next poll then sees the
+//            reward and releases the aim.
+//   Leave    the lease already names the quest and the aim has not moved:
+//            re-issuing would restart the walk, so leave it alone.
+//   Reissue  the lease names the quest but the aim has just changed: a new
+//            errand resets the stale objective pointer once (the quest 233
+//            regression the old guard was written for).
+//   Assert   anything else: drifted, newly aimed, or the 30-minute lease
+//            lapsed.
+enum class ChosenQuestStep
+{
+    NotHeld,
+    HandIn,
+    Leave,
+    Reissue,
+    Assert,
+};
+
+struct ChosenQuestFacts
+{
+    // QuestStatus as the core numbers it: 1 COMPLETE, 3 INCOMPLETE.
+    int status{0};
+    // The RPG_DO_QUEST lease names this quest right now.
+    bool working{false};
+    // The aim differs from the one the drive saw on its last poll.
+    bool aimChanged{false};
+    // A taker in reach and QuestErrandRefusal empty for a turn-in, which is the
+    // same check an operator's `turnin quest:<id>` row has to pass.
+    bool handInReady{false};
+};
+
+ChosenQuestStep ChosenQuestStepFor(ChosenQuestFacts const& facts);
+char const* ChosenQuestStepName(ChosenQuestStep step);
+
 // THE MODULE'S OWN VERSION, and the reason it lives in this header rather than
 // in mod_overseer.cpp: this file is the one part of the module that compiles
 // on its own, with no AzerothCore include path (see check.decisions.yml, which

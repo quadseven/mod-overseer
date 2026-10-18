@@ -248,6 +248,37 @@ std::map<std::string, uint32_t> QuestAimsAfterRead(
     return readSucceeded ? loaded : previous;
 }
 
+ChosenQuestStep ChosenQuestStepFor(ChosenQuestFacts const& facts)
+{
+    constexpr int STATUS_COMPLETE = 1;
+    constexpr int STATUS_INCOMPLETE = 3;
+    if (facts.status != STATUS_COMPLETE && facts.status != STATUS_INCOMPLETE)
+        return ChosenQuestStep::NotHeld;
+    if (facts.status == STATUS_COMPLETE && facts.handInReady)
+        return ChosenQuestStep::HandIn;
+    if (facts.working)
+        return facts.aimChanged ? ChosenQuestStep::Reissue : ChosenQuestStep::Leave;
+    return ChosenQuestStep::Assert;
+}
+
+char const* ChosenQuestStepName(ChosenQuestStep step)
+{
+    switch (step)
+    {
+        case ChosenQuestStep::NotHeld:
+            return "not held";
+        case ChosenQuestStep::HandIn:
+            return "hand in";
+        case ChosenQuestStep::Leave:
+            return "leave";
+        case ChosenQuestStep::Reissue:
+            return "reissue";
+        case ChosenQuestStep::Assert:
+            return "assert";
+    }
+    return "unknown";
+}
+
 bool DungeonRunMayClaimTravel(bool leaderHasOutstandingErrand)
 {
     return !leaderHasOutstandingErrand;
