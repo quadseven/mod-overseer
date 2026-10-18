@@ -52882,6 +52882,20 @@ private:
         // a trainer in reach and nothing to hold the stop back (a Walk or a
         // taken column). Read by the run start, which waits for it.
         time_t reachableAt{0};
+        // Every member's level when the last stop ended, so a level gained
+        // since ends its rest (OverseerDecisions::FamilyLevelledSince, #965).
+        std::map<std::string, uint32> endedLevels;
+        // When a questing family's trip first waited for the head's quest
+        // objective; 0 when it is not waiting (TRAINING_TRIP_QUEST_HOLD_SECONDS).
+        time_t questHeldSince{0};
+    };
+    // One roster row as the training stop reads it.
+    struct TrainingStopRosterRow
+    {
+        std::string name;
+        bool lead{false};
+        std::string job;
+        uint32 learnSkill{0};
     };
 
     // Read on the train poll after DriveRespec, and once more for one family
@@ -52894,13 +52908,7 @@ private:
         if (!result)
             return;
 
-        struct Row
-        {
-            std::string name;
-            bool lead{false};
-            std::string job;
-            uint32 learnSkill{0};
-        };
+        using Row = TrainingStopRosterRow;
         std::map<std::string, std::vector<Row>> families;
         do
         {
@@ -52982,11 +52990,20 @@ private:
                 facts.sinceLastStop =
                     static_cast<uint32>(std::max<time_t>(0, now - stop.endedAt));
                 // A stop that ended for want of a trainer rested for the town
-                // it ended in, not for this one.
+                // it ended in, not for this one, and a level gained since it
+                // ended is what its rest was waiting for (#965).
                 if (!OverseerDecisions::TrainingStopRestStillApplies(
-                        stop.endedStep, stop.endedMap, head->GetMapId()))
+                        stop.endedStep, stop.endedMap, head->GetMapId(),
+                        OverseerDecisions::FamilyLevelledSince(stop.endedLevels, FamilyLevels(rows))))
                     facts.sinceLastStop = UINT32_MAX;
             }
+            // AN OBJECTIVE IN PROGRESS IS FINISHED FIRST (#965): a questing
+            // head halfway through one is not walked to town until it is done,
+            // for TRAINING_TRIP_QUEST_HOLD_SECONDS from the first poll that held.
+            facts.questObjectiveOpen = facts.questing && HeadObjectiveInProgress(head);
+            if (stop.questHeldSince)
+                facts.questHeldSeconds =
+                    static_cast<uint32>(std::max<time_t>(0, now - stop.questHeldSince));
 
             // THE HEAD FIRST when he has a learn of his own, then the others by
             // name, which is the order PickTrainingStopLeg walks them in.
@@ -53025,21 +53042,15 @@ private:
                         else
                             trainer = 0;
                     }
-                    else if (bot->GetMoney() > 0 &&
-                             ResolveTravelTarget(bot, "class trainer", trainer, where))
-                    {
-                        // NO PROFESSION TO LEARN, SO A CLASS SPELL IS THE
-                        // LEARN (2026-09-29): the family is granted none
-                        // (TrainRoster grants nothing) and no other path sends
-                        // it to a trainer, so a level 35 priest held no
-                        // Fortitude and nobody had a buff.
-                        Trainer::Trainer* classTrainer = sObjectMgr->GetTrainer(trainer);
-                        member.classSpells =
-                            classTrainer ? AffordableClassSpells(classTrainer, bot) : 0;
-                        member.trainerYards =
-                            head->GetExactDist2d(where.GetPositionX(), where.GetPositionY());
-                    }
-                    else
+                    // NO PROFESSION TO LEARN, SO A CLASS SPELL IS THE LEARN
+                    // (2026-09-29): the family is granted none (TrainRoster
+                    // grants nothing) and no other path sends it to a trainer,
+                    // so a level 35 priest held no Fortitude and nobody had a
+                    // buff. The trainer is the nearest one that would teach it
+                    // something (ClassTrainerToVisit, #965).
+                    else if (bot->GetMoney() == 0 ||
+                             !ClassTrainerToVisit(bot, head, trainer, member.classSpells,
+                                                  member.trainerYards))
                         trainer = 0;
 
                     // NO TRAINER OF ITS CLASS IN REACH IS SAID, AND SKIPPED
@@ -53073,6 +53084,7 @@ private:
 
             OverseerDecisions::TrainingStopLeg const pick =
                 OverseerDecisions::PickTrainingStopLeg(facts, members);
+            KeepTripClocks(stop, pick.step, now, FamilyLevels(rows));
             if (OverseerDecisions::TrainingStopEnds(pick.step, stop.openedAt != 0))
             {
                 stop.restSeconds = OverseerDecisions::TrainingStopRestSeconds(pick.step);
@@ -53086,6 +53098,7 @@ private:
                 stop.endedAt = now;
                 stop.endedStep = pick.step;
                 stop.endedMap = head->GetMapId();
+                stop.endedLevels = FamilyLevels(rows);
                 stop.walked.clear();
                 stop.retried.clear();
                 stop.tries.clear();
@@ -53107,6 +53120,7 @@ private:
                 bool const opening = stop.openedAt == 0;
                 if (opening)
                     stop.openedAt = now;
+                stop.questHeldSince = 0;
                 stop.walked.insert(member.name);
                 stop.saidAny = false;
                 TrainingStopLegState leg;
@@ -53154,6 +53168,108 @@ private:
         }
     }
 
+    // Every member's level, of those in the world now.
+    static std::map<std::string, uint32> FamilyLevels(std::vector<TrainingStopRosterRow> const& rows)
+    {
+        std::map<std::string, uint32> levels;
+        for (TrainingStopRosterRow const& row : rows)
+            if (Player* bot = ObjectAccessor::FindPlayerByName(row.name))
+                levels[row.name] = bot->GetLevel();
+        return levels;
+    }
+
+    // What a pick leaves for the next poll (#965). The wait for the head's
+    // objective is counted from its first poll and ends when a leg sets off
+    // or nothing is left to learn; nothing to learn also makes the levels as
+    // they stand the ones the next level is measured from, so a level that
+    // brought no spell a member can buy does not lift the rest every poll.
+    static void KeepTripClocks(TrainingStopState& stop, OverseerDecisions::TrainingStopStep step,
+                               time_t now, std::map<std::string, uint32> levels)
+    {
+        using OverseerDecisions::TrainingStopStep;
+        if (step == TrainingStopStep::QuestObjectiveOpen)
+        {
+            if (!stop.questHeldSince)
+                stop.questHeldSince = now;
+            return;
+        }
+        if (step != TrainingStopStep::NothingToLearn)
+            return;
+        stop.questHeldSince = 0;
+        stop.endedLevels = std::move(levels);
+    }
+
+    // THE TRAINER THAT TEACHES (#965). "class trainer" resolves to the nearest
+    // trainer of the member's class, and the nearest can have nothing to teach
+    // it that another would: InitAvailableSpells, which this trip replaced,
+    // granted from every class trainer of the class. Each class trainer of the
+    // class on the head's map is counted by the arrival's own rule
+    // (AffordableClassSpells), the pure pick takes the nearest with something
+    // to teach, and the walk to it is resolved as the leg's own
+    // `trainer:<entry>` aim, through every gate any travel target passes.
+    // False, with `trainer` 0, when no class trainer there serves the member.
+    bool ClassTrainerToVisit(Player* bot, Player* head, uint32& trainer, uint32& classSpells,
+                             float& trainerYards)
+    {
+        auto const& spots = _classTrainerSpots[bot->getClass()];
+        auto const& entries = _classTrainerEntries[bot->getClass()];
+        std::map<uint32, unsigned> affordableOf;
+        std::vector<OverseerDecisions::ClassTrainerOption> options;
+        for (std::size_t i = 0; i < spots.size(); ++i)
+        {
+            uint32 const entry = entries[i].first;
+            Trainer::Trainer* classTrainer = sObjectMgr->GetTrainer(entry);
+            CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(entry);
+            if (spots[i].mapId != head->GetMapId() || !classTrainer || !tmpl ||
+                !classTrainer->IsTrainerValidForPlayer(bot) ||
+                !OverseerDecisions::MayInteractAt(ReactionTowardCharacter(bot, tmpl->faction)))
+                continue;
+            auto known = affordableOf.find(entry);
+            if (known == affordableOf.end())
+                known = affordableOf.emplace(entry, AffordableClassSpells(classTrainer, bot)).first;
+            options.push_back({entry, head->GetExactDist2d(spots[i].x, spots[i].y), known->second});
+        }
+        int const pick = OverseerDecisions::PickClassTrainer(options);
+        WorldPosition where;
+        if (pick < 0 ||
+            !ResolveTravelTarget(bot, OverseerDecisions::TrainingStopLegAim(options[pick].entry),
+                                 trainer, where))
+        {
+            trainer = 0;
+            return false;
+        }
+        classSpells = options[pick].affordable;
+        trainerYards = head->GetExactDist2d(where.GetPositionX(), where.GetPositionY());
+        return true;
+    }
+
+    // THE QUEST THE HEAD IS WORKING, AND WHETHER IT IS HALF DONE (#965). The
+    // quest drive puts it in the head's rpg status (RPG_DO_QUEST). A quest
+    // still INCOMPLETE is read objective by objective: the log slot's kill and
+    // use counters, and the items it asks for as the core counts them (bank
+    // included), leaving out the item the quest itself handed over.
+    static bool HeadObjectiveInProgress(Player* head)
+    {
+        PlayerbotAI* headAI = SteerableAI(head);
+        if (!headAI || headAI->rpgInfo.GetStatus() != RPG_DO_QUEST)  // NewRpgInfo.h:99
+            return false;
+        NewRpgInfo::DoQuest const* doQuest = std::get_if<NewRpgInfo::DoQuest>(&headAI->rpgInfo.data);
+        Quest const* quest = doQuest ? sObjectMgr->GetQuestTemplate(doQuest->questId) : nullptr;
+        uint16 const slot = quest ? head->FindQuestSlot(doQuest->questId) : MAX_QUEST_LOG_SIZE;
+        if (slot >= MAX_QUEST_LOG_SIZE ||
+            head->GetQuestStatus(doQuest->questId) != QUEST_STATUS_INCOMPLETE)
+            return false;
+        std::vector<OverseerDecisions::QuestObjectiveCount> counts;
+        for (uint8 i = 0; i < QUEST_OBJECTIVES_COUNT; ++i)
+            if (quest->RequiredNpcOrGo[i])
+                counts.push_back({head->GetQuestSlotCounter(slot, i), quest->RequiredNpcOrGoCount[i]});
+        for (uint8 i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT; ++i)
+            if (quest->RequiredItemId[i] && quest->RequiredItemId[i] != quest->GetSrcItemId())
+                counts.push_back({head->GetItemCount(quest->RequiredItemId[i], true),
+                                  quest->RequiredItemCount[i]});
+        return OverseerDecisions::QuestObjectiveInProgress(counts);
+    }
+
     // The head has reached the trainer of a training stop leg: every member
     // who set off with him and whose learn this trainer teaches buys it here.
     //
@@ -53183,6 +53299,113 @@ private:
                 stop.walked.erase(name);
             else
                 stop.owed.insert(name);
+        }
+    }
+
+    // THE TRAINER'S OWN QUESTS, A SIDE EFFECT OF THE VISIT (#965). A class
+    // trainer takes in the letters a new character is sent to it with and
+    // gives its class's quests (A Warrior's Training at level 10). The member
+    // standing at it hands in what it takes, then takes the class quests it
+    // gives, each judged by the refusal an operator's quest row is judged by
+    // (OverseerDecisions::QuestErrandRefusal) and read back from the log. A
+    // quest taken here is then the quest drive's to work, like any other in
+    // the log.
+    static void HandInAtTrainer(Creature* npc, Player* bot, uint32 questId)
+    {
+        Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+        // Not finished, or not held: the ordinary case at a trainer.
+        if (!quest || bot->GetQuestStatus(questId) != QUEST_STATUS_COMPLETE)
+            return;
+        OverseerDecisions::QuestErrand errand;
+        errand.verb = OverseerDecisions::QuestErrandVerb::TurnIn;
+        errand.questId = questId;
+        OverseerDecisions::QuestErrandFacts facts;
+        facts.questKnown = true;
+        facts.giverInReach = true;
+        facts.rewarded = bot->GetQuestRewardStatus(questId);
+        facts.status = static_cast<int>(bot->GetQuestStatus(questId));
+        facts.rewardChoice = quest->GetRewChoiceItemsCount() > 0;
+        facts.rewardable = bot->CanRewardQuest(quest, 0, false);
+        std::string const refusal = OverseerDecisions::QuestErrandRefusal(errand, facts);
+        if (!refusal.empty())
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is at trainer {} with quest {} ({}) complete and cannot "
+                     "hand it in: {}",
+                     bot->GetName(), npc->GetEntry(), questId, quest->GetTitle(), refusal);
+            return;
+        }
+        bot->RewardQuest(quest, 0, npc);
+        if (!bot->GetQuestRewardStatus(questId))
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' handed quest {} ({}) to trainer {} and the core did not "
+                     "record the reward (status {})",
+                     bot->GetName(), questId, quest->GetTitle(), npc->GetEntry(),
+                     static_cast<uint32>(bot->GetQuestStatus(questId)));
+            return;
+        }
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' handed quest {} ({}) in to its trainer {} at the training stop",
+                 bot->GetName(), questId, quest->GetTitle(), npc->GetEntry());
+    }
+
+    static void TakeClassQuestAtTrainer(Creature* npc, Player* bot, uint32 questId)
+    {
+        Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+        if (!quest ||
+            !OverseerDecisions::TrainerVisitTakesQuest(quest->GetRequiredClasses(), bot->getClassMask()))
+            return;
+        OverseerDecisions::QuestErrand errand;
+        errand.verb = OverseerDecisions::QuestErrandVerb::Take;
+        errand.questId = questId;
+        OverseerDecisions::QuestErrandFacts facts;
+        facts.questKnown = true;
+        facts.giverInReach = true;
+        facts.rewarded = bot->GetQuestRewardStatus(questId);
+        facts.status = static_cast<int>(bot->GetQuestStatus(questId));
+        facts.logHasRoom = bot->SatisfyQuestLog(false);
+        facts.eligible = bot->CanTakeQuest(quest, false) && bot->SatisfyQuestStatus(quest, false) &&
+                         bot->CanAddQuest(quest, false);
+        std::string const refusal = OverseerDecisions::QuestErrandRefusal(errand, facts);
+        if (!refusal.empty())
+        {
+            // Held, done, or not yet for this member (a level 10 quest at
+            // level 8): the ordinary answers, said at debug.
+            LOG_DEBUG("module.overseer",
+                      "overseer: '{}' does not take class quest {} ({}) from trainer {}: {}",
+                      bot->GetName(), questId, quest->GetTitle(), npc->GetEntry(), refusal);
+            return;
+        }
+        bot->AddQuestAndCheckCompletion(quest, npc);
+        if (bot->GetQuestStatus(questId) == QUEST_STATUS_NONE)
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' took class quest {} ({}) from trainer {} and it did not "
+                     "land in the log",
+                     bot->GetName(), questId, quest->GetTitle(), npc->GetEntry());
+            return;
+        }
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' took class quest {} ({}) from its trainer {} at the training stop",
+                 bot->GetName(), questId, quest->GetTitle(), npc->GetEntry());
+    }
+
+    // Hand in first, so a follow-up the trainer gives is offered on the same
+    // visit.
+    static void DoTrainerQuests(Creature* npc, Player* bot)
+    {
+        if (QuestRelations const* ends = sObjectMgr->GetCreatureQuestInvolvedRelationMap())
+        {
+            auto const range = ends->equal_range(npc->GetEntry());
+            for (auto it = range.first; it != range.second; ++it)
+                HandInAtTrainer(npc, bot, it->second);
+        }
+        if (QuestRelations const* starts = sObjectMgr->GetCreatureQuestRelationMap())
+        {
+            auto const range = starts->equal_range(npc->GetEntry());
+            for (auto it = range.first; it != range.second; ++it)
+                TakeClassQuestAtTrainer(npc, bot, it->second);
         }
     }
 
@@ -53266,6 +53489,7 @@ private:
                          "training stop, trainer {}, for {} copper of its own",
                          name, bot->GetLevel(), bought, static_cast<uint32>(offered), leg.entry,
                          before - bot->GetMoney());
+                DoTrainerQuests(npc, bot);
                 if (bought)
                     ++learned;
                 else if (OverseerDecisions::TrainingStopLegRetries(

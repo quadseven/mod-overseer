@@ -18009,6 +18009,11 @@ TrainingStopLeg PickTrainingStopLeg(TrainingStopFacts const& facts,
         leg.step = TrainingStopStep::NoTrainerInTown;
         return leg;
     }
+    if (TrainingTripWaitsForQuest(facts))
+    {
+        leg.step = TrainingStopStep::QuestObjectiveOpen;
+        return leg;
+    }
     leg.step = facts.columnFree || facts.columnPreemptible ? TrainingStopStep::Walk
                                                              : TrainingStopStep::ColumnTaken;
     return leg;
@@ -18018,6 +18023,8 @@ char const* TrainingStopStepWord(TrainingStopStep step)
 {
     static_assert(TRAINING_STOP_YARDS == 1500.f, "the NoTrainerInTown sentence below says 1500 yards");
     static_assert(TRAINING_TRIP_YARDS == 3000.f, "the NoTrainerInTown sentence below says 3000 yards");
+    static_assert(TRAINING_TRIP_QUEST_HOLD_SECONDS == 15 * 60,
+                  "the QuestObjectiveOpen sentence below says 15 minutes");
     switch (step)
     {
         case TrainingStopStep::NotACampaign:
@@ -18035,6 +18042,9 @@ char const* TrainingStopStepWord(TrainingStopStep step)
         case TrainingStopStep::NoTrainerInTown:
             return "no trainer for the learns left is within 1500 yards of the head in a "
                    "campaign's town, or 3000 on a questing family's trip";
+        case TrainingStopStep::QuestObjectiveOpen:
+            return "the head is partway through a quest objective, and the trip waits up to "
+                   "15 minutes for it to be finished";
         case TrainingStopStep::ColumnTaken:
             return "an errand a training stop may not take holds the head's travel column";
         case TrainingStopStep::Walk:
@@ -18059,6 +18069,7 @@ uint32_t TrainingStopRestSeconds(TrainingStopStep step)
         case TrainingStopStep::NotACampaign:
         case TrainingStopStep::NothingToLearn:
         case TrainingStopStep::Resting:
+        case TrainingStopStep::QuestObjectiveOpen:
         case TrainingStopStep::ColumnTaken:
         case TrainingStopStep::Walk:
             return TRAINING_STOP_REST_SECONDS;
@@ -18067,9 +18078,64 @@ uint32_t TrainingStopRestSeconds(TrainingStopStep step)
 }
 
 bool TrainingStopRestStillApplies(TrainingStopStep lastEnd, uint32_t endedOnMap,
-                                  uint32_t headMap)
+                                  uint32_t headMap, bool levelledSinceEnd)
 {
+    if (levelledSinceEnd)
+        return false;
     return !(lastEnd == TrainingStopStep::NoTrainerInTown && endedOnMap != headMap);
+}
+
+bool FamilyLevelledSince(std::map<std::string, uint32_t> const& levelsAtEnd,
+                         std::map<std::string, uint32_t> const& levelsNow)
+{
+    for (auto const& [name, level] : levelsNow)
+    {
+        auto const then = levelsAtEnd.find(name);
+        if (then != levelsAtEnd.end() && level > then->second)
+            return true;
+    }
+    return false;
+}
+
+int PickClassTrainer(std::vector<ClassTrainerOption> const& options)
+{
+    int teaching = -1;
+    int nearest = -1;
+    for (std::size_t i = 0; i < options.size(); ++i)
+    {
+        int const index = static_cast<int>(i);
+        if (nearest < 0 || options[i].yards < options[nearest].yards)
+            nearest = index;
+        if (options[i].affordable > 0 &&
+            (teaching < 0 || options[i].yards < options[teaching].yards))
+            teaching = index;
+    }
+    return teaching >= 0 ? teaching : nearest;
+}
+
+bool QuestObjectiveInProgress(std::vector<QuestObjectiveCount> const& objectives)
+{
+    bool started = false;
+    bool unfinished = false;
+    for (QuestObjectiveCount const& objective : objectives)
+    {
+        if (objective.need == 0)
+            continue;
+        started = started || objective.have > 0;
+        unfinished = unfinished || objective.have < objective.need;
+    }
+    return started && unfinished;
+}
+
+bool TrainingTripWaitsForQuest(TrainingStopFacts const& facts)
+{
+    return facts.questing && facts.stopSeconds == 0 && facts.questObjectiveOpen &&
+           facts.questHeldSeconds < TRAINING_TRIP_QUEST_HOLD_SECONDS;
+}
+
+bool TrainerVisitTakesQuest(uint32_t questClasses, uint32_t memberClassMask)
+{
+    return (questClasses & memberClassMask) != 0;
 }
 
 bool TrainingStopLegRetries(uint32_t offered, uint32_t learned, uint32_t triesSoFar)

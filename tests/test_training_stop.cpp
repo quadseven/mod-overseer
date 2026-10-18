@@ -510,7 +510,7 @@ void TheAdapterIsWired()
 
     // THE FAMILY'S CLASS SPELLS (2026-09-29).
     Check("a member with no profession learn is asked for its class trainer",
-          source.find("ResolveTravelTarget(bot, \"class trainer\", trainer, where)") !=
+          source.find("ClassTrainerToVisit(bot, head, trainer, member.classSpells,") !=
               std::string::npos);
     std::size_t const teachBody = source.find("bool TeachAtTrainingStop(TrainingStopLegState& leg)");
     std::size_t const buys = source.find("BuyAffordableClassSpells(", teachBody);
@@ -600,13 +600,13 @@ void TheStormwindTrainersAreInReach()
 void ARestEarnedInRatchetIsNotServedInStormwind()
 {
     Check("a stop that ended for want of a trainer stops resting once the head is on another map",
-          !TrainingStopRestStillApplies(TrainingStopStep::NoTrainerInTown, 1, 0));
+          !TrainingStopRestStillApplies(TrainingStopStep::NoTrainerInTown, 1, 0, false));
     Check("on the same map it still rests",
-          TrainingStopRestStillApplies(TrainingStopStep::NoTrainerInTown, 1, 1));
+          TrainingStopRestStillApplies(TrainingStopStep::NoTrainerInTown, 1, 1, false));
     Check("a stop that served everybody rests wherever the head goes",
-          TrainingStopRestStillApplies(TrainingStopStep::NothingToLearn, 1, 0));
+          TrainingStopRestStillApplies(TrainingStopStep::NothingToLearn, 1, 0, false));
     Check("and so does one that spent its time",
-          TrainingStopRestStillApplies(TrainingStopStep::SpentItsTime, 1, 0));
+          TrainingStopRestStillApplies(TrainingStopStep::SpentItsTime, 1, 0, false));
 }
 
 void TheRepairLegWaitsForAnOpenStopAndNoLonger()
