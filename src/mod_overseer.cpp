@@ -42187,7 +42187,15 @@ private:
                                  CROSSING_LANDED_YARDS))
             {
                 ++releases;
-                transport->RemovePassenger(who);
+                // WITH ALL, as the core and the bot AI's own transport check
+                // do (#279). The one-argument call only erases him from the
+                // transport's passenger set: GetTransport() still names the
+                // boat, every poll reads him aboard, and the bot AI's check
+                // can never finish the job because its own erase then finds
+                // nothing. The spline he walked here was laid in the deck's
+                // frame, so it is stopped with the transport it belonged to.
+                transport->RemovePassenger(who, /*withAll*/ true);
+                who->StopMovingOnCurrentPos();
                 LOG_INFO("module.overseer",
                          "overseer: '{}' steps off '{}' onto the dock, {:.1f} yards from "
                          "surveyed ground - the transport lets go of it here (release {}; a "
