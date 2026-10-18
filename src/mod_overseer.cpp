@@ -6230,6 +6230,11 @@ public:
         // new aim is a new errand, and this has to outlive that erase.
         _claimed[name] = target;
         _claimOwner[name] = owner;
+        // AND WHAT IT WROTE, KEPT PAST THE CLAIM (#824). `_claimed` ends with
+        // the errand; this does not, so a poisoned aim found later can be told
+        // apart: one this module wrote and lost the claim on, or one a writer
+        // outside it put there. One entry per roster character, overwritten.
+        _lastWrite[name] = LastWrite{target, owner, std::time(nullptr)};
         return true;
     }
 
@@ -6665,6 +6670,51 @@ public:
         _state.erase(name);
     }
 
+    // ONE MORE REFUSAL OF AN AIM THE TRAVEL DRIVE CANNOT RESOLVE (#824), asked
+    // BEFORE the Release that follows it, because Release erases the claim this
+    // has to read. True when the poison-aim breaker has tripped and the caller
+    // must clear the aim with ClearPoisonedAim. See
+    // OverseerDecisions::PoisonAimStep for the rule and its numbers.
+    bool NoteUnresolvedAim(std::string const& name, std::string const& target, uint32 mapId)
+    {
+        return OverseerDecisions::PoisonAimStep(_poisonAims[name], target, RunOwns(name, target),
+                                                mapId, static_cast<int64_t>(std::time(nullptr)));
+    }
+
+    // WHO WROTE A POISONED AIM, as far as this book can tell (#824). The
+    // breaker's log line carries it, so the writer of a stale or cross-map aim
+    // is named rather than guessed at.
+    std::string PoisonedAimWriter(std::string const& name, std::string const& target)
+    {
+        auto const it = _lastWrite.find(name);
+        if (it == _lastWrite.end() || it->second.aim != target)
+            return "this module has not written that aim since this worldserver started, "
+                   "so it came from a writer outside the module (the bridge, an operator, "
+                   "or a row older than this process)";
+        OverseerDecisions::LeaderIntentKind kind = OverseerDecisions::LeaderIntentKind::None;
+        std::string word;
+        LeaderIntentForTravelOwner(it->second.owner, kind, word);
+        return "this module wrote that aim itself (" + (word.empty() ? std::string("an owner") : word) +
+               ", " + std::to_string(static_cast<long long>(std::time(nullptr) - it->second.at)) +
+               "s ago) and no longer holds the claim on it";
+    }
+
+    // CLEAR A POISONED AIM (#824). The same compare-and-swap ForgetLeftover
+    // uses, so a column somebody rewrote since the read is left alone; called
+    // after the Release that has already ended the book's own bookkeeping.
+    // `learn_skill` is not touched.
+    void ClearPoisonedAim(std::string const& name, std::string const& target)
+    {
+        CharacterDatabase.DirectExecute(
+            "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}' AND travel_npc = '{}' "
+            "AND enabled = 1",
+            Esc(name), Esc(target));
+        _lastEnd[name] = ErrandEnd{"the poison-aim breaker (an aim the travel drive could never "
+                                   "resolve, refused until it proved a loop, #824)",
+                                   false, target, ++_endSerial};
+        _landed.erase(name);
+    }
+
     // THIS TARGET KILLED THIS CHARACTER AND THE ERRAND WAS CALLED OFF FOR IT.
     // Recorded rather than merely released because this module is not the only
     // writer of the column: a release with no memory is undone by the next
@@ -6839,6 +6889,17 @@ private:
     // Refuse. World thread only, like everything else on this loop.
     std::map<std::string, Refusal> _refused;
     std::map<std::string, NoProgressBackoff> _noProgressBackoff;
+    // THE POISON-AIM BREAKER'S COUNT (#824), per character. See
+    // OverseerDecisions::PoisonAimStep. Bounded at the size of the roster.
+    std::map<std::string, OverseerDecisions::PoisonAimState> _poisonAims;
+    // The last aim Claim wrote for each character, never erased (#824).
+    struct LastWrite
+    {
+        std::string aim;
+        OverseerDecisions::TravelOwner owner{};
+        time_t at{0};
+    };
+    std::map<std::string, LastWrite> _lastWrite;
     // The fence that refused each character's last claim, as said in the log,
     // so a refusal is said once per state rather than every poll (#560).
     // Erased when a claim writes. World thread only.
@@ -24993,7 +25054,28 @@ private:
                          "the errand", name, target,
                          said.empty() ? std::string("there is no such spawn") : said,
                          static_cast<uint32>(bot->GetMapId()));
+                // THE POISON-AIM BREAKER (#824). The release below skips its
+                // column write for an `at:` aim this book did not claim, so a
+                // foreign aim this drive can never resolve - a point on another
+                // map, a malformed one - would be refused here every poll for
+                // ever. Counted first, because the release erases the claim the
+                // count reads.
+                bool const poisoned =
+                    _travelAims.NoteUnresolvedAim(name, target, static_cast<uint32>(bot->GetMapId()));
                 _travelAims.Release(name, "the travel drive (no such spawn on this map)");
+                if (poisoned)
+                {
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' has had the aim '{}' refused {} times over at least "
+                             "{}s from map {} and nothing has changed - clearing it, because a "
+                             "foreign aim this drive cannot resolve is a loop and not an errand. "
+                             "Writer: {} (#824)",
+                             name, target, OverseerDecisions::POISON_AIM_LIMITS.refusals,
+                             static_cast<long long>(OverseerDecisions::POISON_AIM_LIMITS.minSeconds),
+                             static_cast<uint32>(bot->GetMapId()),
+                             _travelAims.PoisonedAimWriter(name, target));
+                    _travelAims.ClearPoisonedAim(name, target);
+                }
                 continue;
             }
 

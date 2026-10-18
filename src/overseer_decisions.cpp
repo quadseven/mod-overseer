@@ -3324,6 +3324,33 @@ bool RunAimMayBeReleased(std::string const& current,
            current.rfind("at:", 0) == 0;
 }
 
+bool PoisonAimStep(PoisonAimState& state, std::string const& aim, bool claimed,
+                   uint32_t mapId, int64_t now, PoisonAimLimits const& limits)
+{
+    // Only an unclaimed `at:` aim is the breaker's business; anything else
+    // ends whatever run was being counted.
+    if (claimed || aim.rfind("at:", 0) != 0)
+    {
+        state = PoisonAimState{};
+        return false;
+    }
+    bool const sameRun = state.refusals != 0 && state.aim == aim &&
+                         state.mapId == mapId && now - state.lastAt <= limits.gapSeconds;
+    if (!sameRun)
+    {
+        state.aim = aim;
+        state.mapId = mapId;
+        state.refusals = 0;
+        state.firstAt = now;
+    }
+    ++state.refusals;
+    state.lastAt = now;
+    if (state.refusals < limits.refusals || now - state.firstAt < limits.minSeconds)
+        return false;
+    state = PoisonAimState{};
+    return true;
+}
+
 LeftoverAim ReadLeftoverAim(LeftoverAimFacts const& facts)
 {
     if (facts.target.rfind("at:", 0) != 0)
