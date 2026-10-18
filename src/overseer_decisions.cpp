@@ -3341,6 +3341,16 @@ LandedErrand LandedErrandStep(std::string const& landedAim,
                                              : LandedErrand::Resume;
 }
 
+bool ReleaseLandsAim(ReleaseLandingFacts const& facts)
+{
+    return !facts.anyClaim && !facts.standing.empty() && facts.driving == facts.standing;
+}
+
+bool UnresolvedAimStandsDown(std::string const& aim)
+{
+    return !aim.empty() && aim.rfind("at:", 0) != 0;
+}
+
 TravelClaim ReadTravelClaim(TravelClaimFacts const& facts)
 {
     // AN OPERATOR'S GUARD BEFORE ANYTHING (#163). It outranks every owner this

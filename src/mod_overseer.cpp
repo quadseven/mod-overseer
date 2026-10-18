@@ -6441,10 +6441,16 @@ public:
         std::string const fence = OverseerDecisions::TravelReleaseGate(gateFacts);
         // ONLY AN AIM THIS BOOK WAS DRIVING LANDS. A release that finds an aim
         // in the column the travel drive was not walking has not walked it at
-        // all, and must not stop the travel drive from starting it.
+        // all, and must not stop the travel drive from starting it. AND ONLY AN
+        // AIM THE BOOK HOLDS NO CLAIM FOR (#722): see
+        // OverseerDecisions::ReleaseLandsAim for the inverted test that stopped
+        // every landing from #814 on.
         auto const driving = _state.find(name);
-        bool const wasDriving = claimed && driving != _state.end() && !standing.empty() &&
-                                driving->second.target == standing;
+        OverseerDecisions::ReleaseLandingFacts landingFacts;
+        landingFacts.anyClaim = claimedAim != _claimed.end();
+        landingFacts.driving = driving != _state.end() ? driving->second.target : std::string();
+        landingFacts.standing = standing;
+        bool const wasDriving = OverseerDecisions::ReleaseLandsAim(landingFacts);
         if (!fence.empty())
         {
             LOG_INFO("module.overseer",
@@ -6497,6 +6503,14 @@ public:
         if (it == _landed.end() || it->second.aim != target)
             return;
         it->second.atCounter = true;
+    }
+
+    // Drop the landing the last Release left, so the aim is read again on the
+    // next poll. For the unresolved `at:` aim the poison-aim breaker counts
+    // (#722, #824); see OverseerDecisions::UnresolvedAimStandsDown.
+    void ForgetLanding(std::string const& name)
+    {
+        _landed.erase(name);
     }
 
     // WHAT DriveTravel DOES WITH THIS ROW, asked of the landing this book
@@ -25506,6 +25520,14 @@ private:
                 bool const poisoned = !guarded &&
                     _travelAims.NoteUnresolvedAim(name, target, static_cast<uint32>(bot->GetMapId()));
                 _travelAims.Release(name, "the travel drive (no such spawn on this map)");
+                // A KEYWORD OR AN ENTRY STANDS DOWN; A POINT IS COUNTED (#722).
+                // The release above leaves a landing for a foreign aim it could
+                // not clear, which is what keeps an unreachable `auctioneer`
+                // from being granted and released again every poll. A point is
+                // the breaker's to clear, and the breaker counts refusals poll
+                // by poll, so its landing is dropped.
+                if (!OverseerDecisions::UnresolvedAimStandsDown(target))
+                    _travelAims.ForgetLanding(name);
                 if (poisoned)
                 {
                     LOG_WARN("module.overseer",
