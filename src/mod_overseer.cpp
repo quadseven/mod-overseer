@@ -5843,6 +5843,14 @@ public:
         // silent on purpose: a flight that never happens and never explains
         // itself is indistinguishable from the bug #68 is about.
         bool flightSaid{false};
+        // THE ROAD THIS ERRAND WAS PLANNED ALONG, JUDGED (#836). Read once per
+        // planned route (`roadReadSerial` against `routeSerial`), because it is
+        // one pass over every creature spawn in the world. `roadSaid` is the
+        // last step said, so each answer is said once per errand rather than
+        // every poll it is asked again.
+        std::uint64_t roadReadSerial{0};
+        OverseerDecisions::RouteVerdict road;
+        int roadSaid{-1};
         // "Already said that upstream's stuck teleport was about to fire", so a
         // walk that keeps failing to get nearer is reported once per errand
         // rather than every poll it is held on the ground (#138). See the
@@ -7856,6 +7864,11 @@ public:
             // is still marking, and DriveTravel picks the claim up a few lines
             // further down instead of a whole poll later.
             DriveHomeBind();
+            // The party's own clock, because what it keeps is the party's
+            // buff (#823). Thirty seconds rather than the minute
+            // KeepBuffStrategies runs on: an ask buffs one member, so a family
+            // of five is covered in two and a half minutes, not five.
+            DriveRebuff();
         }
         if (_trainTimer >= TRAIN_POLL_MS)
         {
@@ -10495,6 +10508,26 @@ private:
             return;
         HoldCharacterStill(member, botAI, name, FAR_HOLD_VERB,
                            static_cast<uint32>(CATCH_UP_FAR_HOLD_SECONDS), false);
+    }
+
+    // THE WAIT FOR A HEARTHSTONE, IN PLACE OF A ROAD THAT KILLS (#836). The
+    // leader of a long errand whose road crosses ground far above its family,
+    // bound beside where it is going with its stone on cooldown, is held where
+    // it stands, and the family with it, rather than walked down that road.
+    // Short, so the travel drive asks again each time it lifts: a flight may
+    // have become possible, and the stone comes off cooldown on its own clock.
+    static constexpr char const* ROAD_HOLD_VERB = "wait for its hearthstone";
+    static constexpr uint32 ROAD_HOLD_SECONDS = 60;
+
+    static void HoldForTheHearth(Player* member, std::string const& name)
+    {
+        auto const other = HoldsInForce().find(name);
+        if (other != HoldsInForce().end() && other->second.verb != ROAD_HOLD_VERB)
+            return;
+        PlayerbotAI* botAI = member ? GET_PLAYERBOT_AI(member) : nullptr;
+        if (!botAI)
+            return;
+        HoldCharacterStill(member, botAI, name, ROAD_HOLD_VERB, ROAD_HOLD_SECONDS, false);
     }
 
     // ------------------------------------------ the counter hold (#378) --
@@ -20644,6 +20677,76 @@ private:
         return false;
     }
 
+    // THE ROUTE IS PLANNED ONCE PER ERRAND, by whichever asks first: the walk
+    // below, or the road reading that decides whether it is walked at all
+    // (#836). One plan, so the road that was judged is the road that is walked.
+    static void PlanRouteOnce(Player* bot, WorldPosition const& want,
+                              TravelAimBook::TravelState& state, std::string const& name,
+                              std::string const& target)
+    {
+        if (state.routePlanned)
+            return;
+        state.routePlanned = true;
+        state.route = PlanRoute(bot, want, name, target, state.routeIsMeasured,
+                                state.routeJoinsCorridor);
+        state.routeCursor = OverseerDecisions::RouteCursor{};
+        state.routeSerial = TravelAimBook::NextRouteSerial();
+    }
+
+    // THE ROAD A LONG ERRAND TO A PLACE WAS PLANNED ALONG, JUDGED (#836). The
+    // far walk's reading (FarWalkRoadLethal) applied to the travel drive's own
+    // route: the points along it from where the walker has got to, the worst
+    // creature within the threat radius of each, judged by FarWalkRoadLimits at
+    // the level of the youngest member of the walker's party on its map, since
+    // the family walks the road behind its leader. Read once per planned route.
+    // A walk with no route (no survey, or nothing it improves on) has nothing to
+    // read and is survivable, JudgeRoute's own convention.
+    static OverseerDecisions::RouteVerdict ReadErrandRoad(Player* bot, WorldPosition const& want,
+                                                          TravelAimBook::TravelState& state,
+                                                          std::string const& name,
+                                                          std::string const& target)
+    {
+        PlanRouteOnce(bot, want, state, name, target);
+        if (state.route.empty())
+            return OverseerDecisions::RouteVerdict{};
+        if (state.roadReadSerial == state.routeSerial)
+            return state.road;
+        state.roadReadSerial = state.routeSerial;
+        state.road = OverseerDecisions::RouteVerdict{};
+        OverseerDecisions::RoadSamples const road = OverseerDecisions::RoadSamplesAlong(
+            state.route, state.routeCursor.at, TRAVEL_WALK_SAMPLE_YARDS,
+            OverseerDecisions::FAR_WALK_ROAD_MAX_SAMPLES);
+        if (road.points.empty())
+            return state.road;
+
+        uint32 level = bot->GetLevel();
+        if (Group* group = bot->GetGroup())
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+            {
+                Player* member = ref->GetSource();
+                if (member && member->IsInWorld() && member->GetMapId() == bot->GetMapId() &&
+                    member->GetLevel() < level)
+                    level = member->GetLevel();
+            }
+
+        std::vector<std::pair<float, float>> points;
+        points.reserve(road.points.size());
+        for (OverseerDecisions::RoutePoint const& p : road.points)
+            points.emplace_back(p.x, p.y);
+        OverseerDecisions::RouteLimits const limits = OverseerDecisions::FarWalkRoadLimits();
+        std::vector<NearbyThreat> ground;
+        HostileSpawnsNearEach(bot, bot->GetMapId(), points, TRAVEL_THREAT_RADIUS,
+                              level + limits.unknownLevelDiff - 1, false, ground);
+        OverseerDecisions::RouteReading reading;
+        reading.characterLevel = level;
+        reading.sampleSpacingYards = road.spacingYards;
+        reading.worstLevelAtSample.reserve(ground.size());
+        for (NearbyThreat const& threat : ground)
+            reading.worstLevelAtSample.push_back(threat.level);
+        state.road = OverseerDecisions::JudgeRoute(reading, limits);
+        return state.road;
+    }
+
     // WHERE TO SEND THIS CHARACTER THIS POLL, given the errand it is on. `want`
     // is the errand and never moves; the answer is a point on the route while
     // there is one and `want` itself otherwise.
@@ -20692,14 +20795,7 @@ private:
         // would have to be walked under the wrong ones for half its length.
         for (unsigned pass = 0; pass < 2; ++pass)
         {
-            if (!state.routePlanned)
-            {
-                state.routePlanned = true;
-                state.route = PlanRoute(bot, want, name, target,
-                                        state.routeIsMeasured, state.routeJoinsCorridor);
-                state.routeCursor = OverseerDecisions::RouteCursor{};
-                state.routeSerial = TravelAimBook::NextRouteSerial();
-            }
+            PlanRouteOnce(bot, want, state, name, target);
             if (state.route.empty())
                 return want;
 
@@ -25749,6 +25845,100 @@ private:
                 }
             }
 
+            // A LONG WALK TO A PLACE READS ITS ROAD BEFORE THE FAMILY WALKS IT
+            // (#836). ConsiderFlight has had its turn and issued nothing, so
+            // what is left is the foot walk along the surveyed road, and between
+            // Gnomeregan and Stormwind that road runs through Burning Steppes: a
+            // family of 37 to 41 died there twelve times in a day on its town
+            // runs. A road that crosses ground far above the youngest member is
+            // not walked. The walker hearths when its bind is beside the aim,
+            // waits for the stone when it is on cooldown, and otherwise the
+            // errand is refused. See OverseerDecisions::DecideErrandRoad.
+            {
+                OverseerDecisions::ErrandRoadFacts road;
+                road.walkYards = distance;
+                road.placeAim = entry == 0;
+                road.catchUp = IsCatchingUp(name);
+                OverseerDecisions::TravelOwner owner = OverseerDecisions::TravelOwner::TownTrip;
+                road.liveRun = _travelAims.ClaimedBy(name, target, owner) &&
+                               OverseerDecisions::TravelOwnerIsALiveRun(owner);
+                bool const judged = road.placeAim && !road.catchUp && !road.liveRun &&
+                                    distance >= OverseerDecisions::ERRAND_ROAD_MIN_YARDS;
+                if (judged)
+                {
+                    road.road = ReadErrandRoad(bot, pos, state, name, target);
+                    uint32 const stone = HearthstoneSpellOf(bot);
+                    road.carriesStone = stone != 0;
+                    road.hearthReady = stone && !bot->HasSpellCooldown(stone);
+                    if (bot->m_homebindMapId == bot->GetMapId())
+                    {
+                        float const bx = bot->m_homebindX - pos.GetPositionX();
+                        float const by = bot->m_homebindY - pos.GetPositionY();
+                        road.bindYardsFromAim = std::sqrt(bx * bx + by * by);
+                    }
+                }
+                OverseerDecisions::ErrandRoadStep const step =
+                    OverseerDecisions::DecideErrandRoad(road);
+                bool const sayIt = state.roadSaid != static_cast<int>(step);
+                state.roadSaid = static_cast<int>(step);
+                if (step != OverseerDecisions::ErrandRoadStep::Walk && sayIt)
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' is sent to '{}', {} yards off, and no flight "
+                             "carried it. The road it was planned along crosses {} unbroken "
+                             "yards of ground holding creatures ten or more levels above its "
+                             "party's youngest member (worst {}), so it is not walked - {} "
+                             "(#836)",
+                             name, target, static_cast<uint32>(distance),
+                             static_cast<uint32>(road.road.longestLethalRunYards),
+                             road.road.worstLevel,
+                             OverseerDecisions::ErrandRoadStepWord(step));
+                if (step == OverseerDecisions::ErrandRoadStep::Refuse)
+                {
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' has no bind beside '{}' to hearth to and no flight "
+                             "there - releasing the errand, and refusing it for {} minutes, "
+                             "because {}",
+                             name, target,
+                             static_cast<uint32>(ERRAND_DEATH_LIMITS.cooloffSeconds / 60),
+                             OverseerDecisions::ErrandLethalRoad);
+                    _travelAims.Refuse(name, target, OverseerDecisions::ErrandLethalRoad);
+                    _travelAims.Release(name, "the travel drive (the road crosses ground far "
+                                              "above the family's level)");
+                    continue;
+                }
+                if (step == OverseerDecisions::ErrandRoadStep::Hearth ||
+                    step == OverseerDecisions::ErrandRoadStep::WaitForHearth)
+                {
+                    // The errand's clock is held while it waits, as it is on a
+                    // flight leg: not walking is the decision, not a stall.
+                    state.progress.since = std::time(nullptr);
+                    // A CAST IN FLIGHT IS LEFT ALONE: no second cast, and no
+                    // hold over the top of the one DoHearth placed for it. Once
+                    // it lands the walk is a doorstep and is not judged; if it
+                    // did not, the stone is on cooldown and this waits for it.
+                    if (HearthPendingFor(name))
+                        continue;
+                    if (step == OverseerDecisions::ErrandRoadStep::Hearth)
+                    {
+                        // A refusal is a reason the cast cannot start this poll
+                        // (moving, which DoHearth answers with its own hold, or
+                        // a fight); the next poll asks again.
+                        char const* status = "error";
+                        std::string evidence;
+                        char const* const refusal =
+                            DoHearth(bot, "use", status, evidence, _pendingHearths, 0);
+                        if (!refusal || !*refusal)
+                            LOG_WARN("module.overseer",
+                                     "overseer: '{}' hearths to its bind beside '{}' instead "
+                                     "of walking the road there (#836)",
+                                     name, target);
+                        continue;
+                    }
+                    HoldForTheHearth(bot, name);
+                    continue;
+                }
+            }
+
             // PROGRESS RESTARTS THE BACKSTOP'S CLOCK (#63). This is the site the
             // lesson was measured on and the rule is now written down once, in
             // OverseerDecisions::Ratchet, which carries that measurement and the
@@ -26583,9 +26773,24 @@ private:
     // one whose name a command goes out under - #131 has it out of the world
     // within a poll anyway. Group membership, IsAuthorized's third
     // condition, is the caller's to check.
+    //
+    // OR A LISTED HEADLESS BOT (#792). A headless roster head has no socket by
+    // design, so the socket test alone left a headless family's brain OFF for
+    // ever. The seat test (DungeonLeaderHoldsTheSeat) admits a bot in the
+    // world named on Overseer.HeadlessRoster; the IsSelfBot / IsRealPlayer
+    // test still applies, so of those only the leader, its own master, issues.
+    static bool LeaderHoldsTheSeat(Player const* player)
+    {
+        WorldSession const* session = player && player->IsInWorld() ? player->GetSession() : nullptr;
+        bool const headless = session && OverseerDecisions::HeadlessLeaderSteerable(
+                                             player->IsInWorld(), session->IsBot(),
+                                             player->GetName(), HeadlessRosterCache());
+        return OverseerDecisions::DungeonLeaderHoldsTheSeat(ClientAttached(player), headless);
+    }
+
     static bool MayIssueDcCommands(Player* member)
     {
-        return ClientAttached(member) && (IsRealPlayer(member) || IsSelfBot(member));
+        return LeaderHoldsTheSeat(member) && (IsRealPlayer(member) || IsSelfBot(member));
     }
 
     // A groupmate the dungeon module will accept a command FROM.
@@ -27006,8 +27211,8 @@ private:
                     LOG_WARN("module.overseer",
                              "overseer: '{}' is inside map {} but no groupmate may issue a "
                              "dungeon-clear command - the module refuses a true bot as "
-                             "issuer and no client-attached member of the party is a "
-                             "selfbot or a person, so the dungeon brain stays OFF. Holding "
+                             "issuer and no client-attached or listed headless member of "
+                             "the party is a selfbot or a person, so the dungeon brain stays OFF. Holding "
                              "until one is back; said once for this stretch",
                              name, static_cast<uint32>(bot->GetMapId()));
                 }
@@ -30793,8 +30998,9 @@ private:
             // wings, every Dire Maul door and Scholomance waited here for
             // box-trigger support and are now at the end of the table (#577).
             // Upper Blackrock Spire shares every trigger with the Lower Spire
-            // and is split from it by a door inside the instance, which a row
-            // of two areatriggers cannot name.
+            // and is a raid wing behind an open door inside the instance; it
+            // is not supported, and the `lower-blackrock-spire` row says why
+            // (#580).
 
             // BLACKFATHOM DEEPS, on map 1 at the Zoram Strand. The door stands
             // at z -23 in a sunken temple, and the last stretch down to it is
@@ -30925,11 +31131,22 @@ private:
             // different ledge, (-7558.39, -1309.43, 248.454); this row walks
             // out by 1470 only.
             //
-            // AND THIS ROW IS NOT UPPER BLACKROCK SPIRE. Both wings share
-            // trigger 1468, trigger 1470 and map 229. The Upper Spire starts at
-            // the Dragonspine Door, gameobject 164725, inside map 229, which
-            // opens for a party carrying the Seal of Ascension. A row of two
-            // areatriggers cannot name that door, so there is no Upper row.
+            // AND THIS ROW IS NOT UPPER BLACKROCK SPIRE, WHICH IS NOT
+            // SUPPORTED (#580). Both wings share trigger 1468, trigger 1470 and
+            // map 229, so a row keyed on 1468 would be this one again. The
+            // Upper Spire starts at the Dragonspine Door, gameobject 164725 at
+            // (126.879, -319.109, 70.935) inside map 229. On this core the door
+            // asks for nothing: its spawn is open (gameobject.state 0, the
+            // template's startOpen 1), its lock is 0, it has no AIName or
+            // ScriptName, the instance script never names it, and no condition
+            // reads the Seal of Ascension (item 12344). So the Seal is not a
+            // prerequisite here and a Lower Spire party can walk on. It is
+            // still not this row's run: the client lists the Upper Spire as a
+            // raid (LFGDungeons 44, type 2; the Lower Spire is 32, type 1, and
+            // finishes on Overlord Wyrmthalak), and this table is the five
+            // player doors (#548). A run through 1468 is complete when the
+            // Lower Spire's nine bosses are down; the five Upper bosses are
+            // taken out of its expectation by RaidWingEncounterMask.
             //
             // areatrigger.sql: (1468,0,-7518.19,-1239.13,287.243,10,0,0,0,0)
             // areatrigger_teleport.sql: (1468,'Blackrock Spire - Searing Gorge Instance (Inside)',229,78.5083,-225.044,49.839,5.1)
@@ -47690,10 +47907,11 @@ private:
         DungeonRunCoordinatorState& coord = _dungeonRunCoordinators[family];
         time_t const clientNow = std::time(nullptr);
         Player* const clientLeader = ObjectAccessor::FindPlayerByName(leaderName);
-        WorldSession* const leaderSession = clientLeader && clientLeader->IsInWorld()
-                                                ? clientLeader->GetSession()
-                                                : nullptr;
-        bool const leaderSocketOpen = leaderSession && !leaderSession->IsSocketClosed();
+        // The seat rather than the socket (#792): a listed headless leader in
+        // the world holds it too, so a headless family's run settles, opens
+        // its door gate and is not held for a client it never has. A client
+        // leader is decided exactly as before.
+        bool const leaderSocketOpen = LeaderHoldsTheSeat(clientLeader);
         bool hasInsideMember = false;
         bool allInsideMembersHaveIssuer = true;
         for (std::string const& member : members)
@@ -52028,6 +52246,127 @@ private:
                              name, strategy);
                 }
             }
+        } while (result->NextRow());
+    }
+
+    // Keep the party buff on the family, not only the strategy that allows it
+    // (mod-overseer#823). The decision and why it is shaped this way are
+    // OverseerDecisions::DecideRebuff; this reads the caster and its group,
+    // and on Cast asks the caster's OWN party buff action, which picks the
+    // target and the rank and spends the caster's own mana as its trigger
+    // would. Nothing here casts a spell itself.
+    //
+    // SAID ON A CHANGE, AND EVERY ASK IS READ BACK. A step other than Cast is
+    // said when it differs from the last one said for that caster, so a priest
+    // that sits under its reserve says so once rather than twice a minute. An
+    // ask is said with the action's answer, and the next poll says how many
+    // members were missing the buff before the ask and how many are now: the
+    // action answering true is a postmark, the aura count is the delivery.
+    void DriveRebuff()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name FROM overseer_roster WHERE enabled = 1");
+        if (!result)
+            return;
+
+        do
+        {
+            std::string const name = result->Fetch()[0].Get<std::string>();
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            PlayerbotAI* botAI = SteerableAI(bot);
+            if (!botAI)
+                continue;
+
+            OverseerDecisions::RebuffSpell const spell =
+                OverseerDecisions::RebuffSpellFor(static_cast<unsigned>(bot->getClass()));
+            if (!spell.action)
+                continue;
+
+            OverseerDecisions::RebuffFacts facts;
+            AiObjectContext* context = botAI->GetAiObjectContext();
+            uint32 const spellId =
+                context ? context->GetValue<uint32>("spell id", spell.aura)->Get() : 0;
+            SpellInfo const* info = spellId ? sSpellMgr->GetSpellInfo(spellId) : nullptr;
+            facts.knowsSpell = info && bot->HasSpell(spellId);
+            facts.alive = bot->IsAlive();
+            facts.inCombat = bot->IsInCombat();
+            facts.casting = bot->IsNonMeleeSpellCast(false);
+            facts.mounted = bot->IsMounted() || bot->IsInFlight();
+            facts.mana = bot->GetPower(POWER_MANA);
+            facts.maxMana = bot->GetMaxPower(POWER_MANA);
+            if (info)
+            {
+                int32 const cost = info->CalcPowerCost(bot, info->GetSchoolMask());
+                facts.cost = cost > 0 ? static_cast<uint32>(cost) : 0;
+            }
+
+            auto readMember = [&](Player* member) {
+                OverseerDecisions::RebuffMember seen;
+                seen.alive = member->IsAlive();
+                seen.sameMap = member->IsInWorld() && member->GetMap() == bot->GetMap();
+                seen.hasBuff = botAI->HasAura(spell.aura, member) ||
+                               botAI->HasAura(spell.groupAura, member);
+                if (seen.sameMap)
+                {
+                    seen.yards = member == bot ? 0.0f : bot->GetDistance(member);
+                    seen.inSight = member == bot || bot->IsWithinLOSInMap(member);
+                }
+                facts.members.push_back(seen);
+            };
+            if (Group* group = bot->GetGroup())
+            {
+                for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                    if (Player* member = ref->GetSource())
+                        readMember(member);
+            }
+            else
+                readMember(bot);
+
+            OverseerDecisions::RebuffDecision const decision = OverseerDecisions::DecideRebuff(facts);
+
+            auto const asked = _rebuffAsked.find(name);
+            if (asked != _rebuffAsked.end())
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' asked for '{}' last poll with {} member(s) missing "
+                         "'{}' - {} missing now",
+                         name, spell.action, static_cast<uint32>(asked->second), spell.aura,
+                         static_cast<uint32>(decision.missing));
+                _rebuffAsked.erase(asked);
+            }
+
+            if (decision.step != OverseerDecisions::RebuffStep::Cast)
+            {
+                auto const said = _rebuffSaid.find(name);
+                if (said != _rebuffSaid.end() && said->second == decision.step)
+                    continue;
+                _rebuffSaid[name] = decision.step;
+                // The two ordinary states are remembered but not said.
+                if (decision.step == OverseerDecisions::RebuffStep::NoSpell ||
+                    decision.step == OverseerDecisions::RebuffStep::NothingMissing)
+                    continue;
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' does not rebuff '{}' - {} ({} member(s) missing it, "
+                         "{} within {} yards and sight; mana {} of {}, the cast costs {})",
+                         name, spell.aura, OverseerDecisions::RebuffStepWord(decision.step),
+                         static_cast<uint32>(decision.missing), static_cast<uint32>(decision.inReach),
+                         static_cast<uint32>(OverseerDecisions::REBUFF_REACH_YARDS), facts.mana,
+                         facts.maxMana, facts.cost);
+                continue;
+            }
+
+            _rebuffSaid[name] = decision.step;
+            bool const took = botAI->DoSpecificAction(spell.action, Event(), true);
+            if (took)
+                _rebuffAsked[name] = decision.missing;
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is asked for '{}' - {} member(s) missing '{}', {} within "
+                     "{} yards and sight, mana {} of {} for a cost of {}; the action {}",
+                     name, spell.action, static_cast<uint32>(decision.missing), spell.aura,
+                     static_cast<uint32>(decision.inReach),
+                     static_cast<uint32>(OverseerDecisions::REBUFF_REACH_YARDS), facts.mana,
+                     facts.maxMana, facts.cost,
+                     took ? "ran" : "refused (useless, impossible or failed)");
         } while (result->NextRow());
     }
 
@@ -73511,6 +73850,10 @@ private:
     std::map<std::string, TrainingStopLegState> _trainingStopLegs;
     // Who has been told once that the tank strategies would not take.
     std::set<std::string> _tankStrategyRefused;
+    // DriveRebuff (#823): the last step said for each caster, and the members
+    // missing the buff when its party buff action was last asked to run.
+    std::map<std::string, OverseerDecisions::RebuffStep> _rebuffSaid;
+    std::map<std::string, std::size_t> _rebuffAsked;
 
     // The unlearn this module has already refused for each character, so a
     // standing disagreement about the price is said once rather than twice a

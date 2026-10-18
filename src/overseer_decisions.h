@@ -147,6 +147,24 @@ LeaderClientLossAction DungeonLeaderClientLoss(bool socketOpen, bool partyIssuer
                                                std::time_t now,
                                                std::time_t maxWaitSeconds = DUNGEON_LEADER_CLIENT_LOST_SECONDS);
 
+// WHO HOLDS A RUN'S LEADING SEAT (#792). #735 asked the leader for an open
+// socket, and MayIssueDcCommands asked the issuer for one, so a family whose
+// head plays headless (Overseer.HeadlessRoster, #549) entered its dungeon and
+// could never clear it: the brain stayed OFF, the run was held for a client
+// that does not exist by design, and it ended `client_lost`, every run. A
+// headless roster leader is already kept its own master by KeepRosterFollowing,
+// so the socket test was the only thing refusing it.
+//
+// The seat is held by an open client socket, or by a headless bot that is in
+// the world and NAMED on the headless roster. Only the list counts, not
+// Overseer.RequireClient = 0: an unlisted bot, a character out of the world and
+// a real session that lost its client still do not hold it, so a dropped
+// client keeps its settle window, its loss hold and its `client_lost` outcome.
+bool HeadlessLeaderSteerable(bool inWorld, bool isBotSession, std::string const& name,
+                             std::vector<std::string> const& headless);
+
+bool DungeonLeaderHoldsTheSeat(bool clientSocketOpen, bool headlessSteerable);
+
 struct LockboxFacts
 {
     bool rogue{false};
@@ -3675,6 +3693,15 @@ DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completed
 // killed everything else proves the run complete instead of standing in the
 // instance until the clearing watchdog ends it 'stalled'.
 uint32_t EventGatedEncounterMask(uint32_t mapId);
+
+// The encounter bits of a raid wing that shares a map with a five-player door
+// and is reached from it inside the instance: Upper Blackrock Spire, behind the
+// Lower Spire's door on map 229 (#580). No portal row runs that wing, so a run
+// through the shared door is the five-player dungeon and is complete when that
+// dungeon's bosses are down. Taken out of every expectation the same way as
+// EventGatedEncounterMask, so a Lower Spire run is not held open by five raid
+// bosses it was never sent for.
+uint32_t RaidWingEncounterMask(uint32_t mapId);
 
 uint32_t DungeonRunExpectedMask(uint32_t mapId, uint32_t mapMask,
                                 uint32_t wingMask);
@@ -18956,6 +18983,83 @@ RoadSamples RoadSamplesAlong(std::vector<RoutePoint> const& route, std::size_t f
 // weaker than a party, so this refuses only what a party would refuse too.
 RouteLimits FarWalkRoadLimits();
 
+// ------------- a long errand reads its road before the family walks it (#836) --
+//
+// MEASURED ON THE DEV REALM, 2026-10-04. A family of levels 37 to 41 died 23
+// times in 24 hours between runs, nearly all of them with job `town run`, and 12
+// of those in Burning Steppes (creatures 50 to 58). The newest rows were aimed at
+// a place by the Stormwind inn, from Gnomeregan, and the travel survey's road
+// between the two halves of the Eastern Kingdoms runs through Searing Gorge and
+// Burning Steppes. The far walk learned to read that road on 2026-10-10; the
+// travel drive's own walk of a place aim never did. ConsiderFlight has its turn
+// first, and when no flight carried the leader the leader walked the road, and
+// the family followed it in.
+//
+// A player of that level takes the tram or a flight, or hearths, or waits for
+// the hearthstone. So a long walk to a PLACE reads the road it was planned along,
+// at the level of the youngest member walking it, under the same rule a far walk
+// is judged by (FarWalkRoadLimits). A road that passes is walked as before.
+// A road that fails is not:
+//
+//   * the walker's bind is beside the aim and its stone is ready: hearth;
+//   * the bind is beside the aim and the stone is on cooldown: wait for it,
+//     held where it stands with the family, and ask again;
+//   * otherwise the errand is refused, and the writer of the aim learns why.
+//
+// NOT JUDGED HERE, ON PURPOSE. A catch-up walk has its own leg rule (#697) and a
+// live dungeon run's walks are the run's; neither is this decision's to stop.
+// An aim at a creature is not judged either: ResolveTravelTarget already reads
+// the line to it before it is chosen (#300), and it has no planned road.
+
+// A walk shorter than this is not a journey and is walked as before.
+// TRAVEL_FLIGHT_MIN_YARDS: the distance at which this module already calls a
+// walk long enough to be worth a flight.
+constexpr float ERRAND_ROAD_MIN_YARDS = 1500.f;
+
+// A bind this close to the aim is a hearthstone that lands where the errand was
+// going. The lone leg's own number (LoneLegLimits::hearthNearYards).
+constexpr float ERRAND_ROAD_HEARTH_NEAR_YARDS = 500.f;
+
+struct ErrandRoadFacts
+{
+    // How far the walker still has to go to the aim, in yards.
+    float walkYards{0.f};
+    // The aim is a place (`at:` or `trigger:`), which is what has a planned road.
+    bool placeAim{false};
+    // A catch-up walk (#697 judges it) or a live run's walk (the run's).
+    bool catchUp{false};
+    bool liveRun{false};
+    // JudgeRoute of the planned road from where the walker stands, read at the
+    // youngest walking member's level under FarWalkRoadLimits. Unread is
+    // survivable, JudgeRoute's own convention.
+    RouteVerdict road;
+    // The walker carries a hearthstone, and it is off cooldown.
+    bool carriesStone{false};
+    bool hearthReady{false};
+    // The walker's bind to the aim, in yards; negative when the bind is on
+    // another map or unread.
+    float bindYardsFromAim{-1.f};
+};
+
+enum class ErrandRoadStep : std::uint8_t
+{
+    Walk,           // nothing against the road, or not this decision's: walk it
+    Hearth,         // the bind is beside the aim and the stone is ready
+    WaitForHearth,  // the bind is beside the aim and the stone is on cooldown
+    Refuse,         // nothing carries it there but the road: the errand is refused
+};
+
+// THE ORDER IS THE PREFERENCE, and a flight is not in it because it is asked
+// before this is.
+ErrandRoadStep DecideErrandRoad(ErrandRoadFacts const& facts);
+
+// "walk", "hearth", "wait for hearth", "refuse".
+char const* ErrandRoadStepWord(ErrandRoadStep step);
+
+// The refusal recorded against the aim, and said to whoever wrote it.
+constexpr char const* ErrandLethalRoad =
+    "the road to the errand crosses ground far above the family's level";
+
 // ---------------------------------------------------------------------------
 // THE DUNGEON RUN TIMELINE (overseer_dungeon_run_event).
 //
@@ -23862,6 +23966,95 @@ struct InstanceRunAnswer
 
 InstanceRunAnswer InstanceRunMayProceed(SavedInstance const& save, std::time_t now,
                                         std::time_t resetSoonSeconds);
+
+// THE PARTY BUFF IS KEPT, NOT ONLY ALLOWED (mod-overseer#823). KeepBuffStrategies
+// puts `buff` on a priest, a mage and a druid once a minute, and that is all it
+// does: whether the buff is then cast is left to the bot's non-combat engine,
+// and a family went with no Fortitude on any of its five members for over
+// twenty minutes of a town trip with the strategy in place the whole time.
+//
+// So the drive reads the party back and, when a buff is missing on a member the
+// caster can reach and the caster can pay for it, asks the caster's OWN party
+// buff action to run (PlayerbotAI::DoSpecificAction, "power word: fortitude on
+// party"). That action picks its own target and its own rank and spends the
+// caster's own mana, exactly as the trigger would have: nothing is granted and
+// the AI's choice is not replaced, it is only asked for. Every reason it is NOT
+// asked is a step with a word, so the next town trip with no buffs says whether
+// the caster was out of mana, out of reach, in combat or had nothing to do.
+//
+// WHY A MANA RESERVE. The same family's dungeon logs said "Waiting on <priest>
+// (low mana)" forty times. A rebuff that leaves the healer under the reserve
+// trades a buff for another wait on the next pull, so the nudge waits for regen
+// instead and says so (LowMana). The bot's own engine may still cast earlier.
+
+// The buff a class keeps on its party, by the names mod-playerbots uses: the
+// aura on the target, its group variant (which counts as the buff), and the
+// party action that casts it. All three are null for a class that keeps none.
+struct RebuffSpell
+{
+    char const* aura{nullptr};         // "power word: fortitude"
+    char const* groupAura{nullptr};    // "prayer of fortitude"
+    char const* action{nullptr};       // "power word: fortitude on party"
+};
+
+// By the core's class id: 5 priest, 8 mage, 11 druid. Every other class keeps
+// no party buff here (a paladin's blessings are mod-playerbots' own greater
+// blessing system and are not this drive's to ask).
+RebuffSpell RebuffSpellFor(unsigned classId);
+
+// One member of the caster's group, the caster included, as the caster sees it.
+struct RebuffMember
+{
+    bool alive{true};
+    bool sameMap{true};       // in the world, on the caster's map
+    bool hasBuff{false};      // the aura or its group variant, from any caster
+    float yards{0.0f};        // from the caster
+    bool inSight{true};       // line of sight from the caster
+};
+
+struct RebuffFacts
+{
+    bool knowsSpell{false};   // the caster has learned a rank of the buff
+    bool alive{true};
+    bool inCombat{false};
+    bool casting{false};      // a cast is already going
+    bool mounted{false};      // or on a flight path: a rebuff would dismount it
+    std::uint32_t mana{0};
+    std::uint32_t maxMana{0};
+    std::uint32_t cost{0};    // of the rank the caster would cast
+    std::vector<RebuffMember> members;
+};
+
+enum class RebuffStep : std::uint8_t
+{
+    NoSpell,         // the class keeps no buff, or the caster has not learned it
+    Dead,
+    InCombat,        // the engine's combat priorities are not second-guessed
+    Casting,
+    Mounted,
+    NothingMissing,  // every living member on the map carries it
+    OutOfReach,      // members lack it, none within reach and sight
+    LowMana,         // the cast would leave the caster under the reserve
+    Cast,            // ask the caster's party buff action
+};
+
+// Within the yards mod-playerbots casts a spell from (AiPlayerbot.SpellDistance,
+// 28.5 by default) and not the 57 its party pick looks across, so a Cast is a
+// member the action can buff from where the caster stands.
+constexpr float REBUFF_REACH_YARDS = 28.0f;
+// The mana the caster keeps after the cast, as a percent of its maximum.
+constexpr std::uint32_t REBUFF_MANA_RESERVE_PERCENT = 30;
+
+struct RebuffDecision
+{
+    RebuffStep step{RebuffStep::NoSpell};
+    std::size_t missing{0};   // living members on the map without the buff
+    std::size_t inReach{0};   // of those, within reach and sight
+};
+
+RebuffDecision DecideRebuff(RebuffFacts const& facts);
+
+char const* RebuffStepWord(RebuffStep step);
 
 }  // namespace OverseerDecisions
 

@@ -124,6 +124,17 @@ LeaderClientLossAction DungeonLeaderClientLoss(bool socketOpen, bool partyIssuer
     return LeaderClientLossAction::Abandon;
 }
 
+bool HeadlessLeaderSteerable(bool inWorld, bool isBotSession, std::string const& name,
+                             std::vector<std::string> const& headless)
+{
+    return inWorld && isBotSession && NamedInHeadlessRoster(name, headless);
+}
+
+bool DungeonLeaderHoldsTheSeat(bool clientSocketOpen, bool headlessSteerable)
+{
+    return clientSocketOpen || headlessSteerable;
+}
+
 LockboxStep LockboxNext(LockboxFacts const& facts)
 {
     if (!facts.rogue || !facts.holdsLockedBox || !facts.hasPickLockSpell
@@ -2935,9 +2946,28 @@ uint32_t EventGatedEncounterMask(uint32_t mapId)
     }
 }
 
+uint32_t RaidWingEncounterMask(uint32_t mapId)
+{
+    // Bits from DungeonEncounter.dbc, normal difficulty, read off the dev
+    // realm's client data on 2026-10-18.
+    switch (mapId)
+    {
+        case 229:  // Blackrock Spire. Bits 0 to 8 are the Lower Spire, Highlord
+                   // Omokk to Overlord Wyrmthalak, the boss the finder row for
+                   // the Lower Spire (LFGDungeons 32) finishes on. Bits 9 to 13
+                   // are the Upper Spire, Pyroguard Emberseer to General
+                   // Drakkisath, which the client lists as a raid
+                   // (LFGDungeons 44, type 2) and no portal row runs (#580).
+            return 0x1Fu << 9;
+        default:
+            return 0;
+    }
+}
+
 uint32_t DungeonRunExpectedMask(uint32_t mapId, uint32_t mapMask, uint32_t wingMask)
 {
-    uint32_t const required = mapMask & ~EventGatedEncounterMask(mapId);
+    uint32_t const required =
+        mapMask & ~EventGatedEncounterMask(mapId) & ~RaidWingEncounterMask(mapId);
     if (!DungeonMapHasIndependentWings(mapId))
         return required;
     return required & wingMask;
@@ -16377,6 +16407,33 @@ RouteLimits FarWalkRoadLimits()
     return RouteLimits{FAR_WALK_ROAD_LEVEL_GAP, FAR_WALK_ROAD_LETHAL_RUN_YARDS};
 }
 
+ErrandRoadStep DecideErrandRoad(ErrandRoadFacts const& facts)
+{
+    if (!facts.placeAim || facts.catchUp || facts.liveRun)
+        return ErrandRoadStep::Walk;
+    if (facts.walkYards < ERRAND_ROAD_MIN_YARDS)
+        return ErrandRoadStep::Walk;
+    if (facts.road.survivable)
+        return ErrandRoadStep::Walk;
+    bool const bindBesideAim = facts.bindYardsFromAim >= 0.f &&
+                               facts.bindYardsFromAim <= ERRAND_ROAD_HEARTH_NEAR_YARDS;
+    if (bindBesideAim && facts.carriesStone)
+        return facts.hearthReady ? ErrandRoadStep::Hearth : ErrandRoadStep::WaitForHearth;
+    return ErrandRoadStep::Refuse;
+}
+
+char const* ErrandRoadStepWord(ErrandRoadStep step)
+{
+    switch (step)
+    {
+        case ErrandRoadStep::Walk:          return "walk";
+        case ErrandRoadStep::Hearth:        return "hearth";
+        case ErrandRoadStep::WaitForHearth: return "wait for hearth";
+        case ErrandRoadStep::Refuse:        return "refuse";
+    }
+    return "unknown";
+}
+
 void NoteStoredItem(LootStoreNote& note, std::uint64_t looter, std::uint32_t itemGuid,
                     std::uint32_t count, bool notable)
 {
@@ -21602,6 +21659,85 @@ InstanceRunAnswer InstanceRunMayProceed(SavedInstance const& save, std::time_t n
         answer.reason = SavedInstanceRefusal(save, now);
     }
     return answer;
+}
+RebuffSpell RebuffSpellFor(unsigned classId)
+{
+    RebuffSpell spell;
+    switch (classId)
+    {
+        case 5:   // priest
+            spell.aura = "power word: fortitude";
+            spell.groupAura = "prayer of fortitude";
+            spell.action = "power word: fortitude on party";
+            break;
+        case 8:   // mage
+            spell.aura = "arcane intellect";
+            spell.groupAura = "arcane brilliance";
+            spell.action = "arcane intellect on party";
+            break;
+        case 11:  // druid
+            spell.aura = "mark of the wild";
+            spell.groupAura = "gift of the wild";
+            spell.action = "mark of the wild on party";
+            break;
+        default:
+            break;
+    }
+    return spell;
+}
+
+RebuffDecision DecideRebuff(RebuffFacts const& facts)
+{
+    RebuffDecision decision;
+    // Counted before any refusal, so a step that does not cast still says how
+    // many were missing and how many were in reach.
+    for (RebuffMember const& member : facts.members)
+    {
+        if (!member.alive || !member.sameMap || member.hasBuff)
+            continue;
+        ++decision.missing;
+        if (member.inSight && member.yards <= REBUFF_REACH_YARDS)
+            ++decision.inReach;
+    }
+
+    if (!facts.knowsSpell)
+        decision.step = RebuffStep::NoSpell;
+    else if (!facts.alive)
+        decision.step = RebuffStep::Dead;
+    else if (facts.inCombat)
+        decision.step = RebuffStep::InCombat;
+    else if (facts.casting)
+        decision.step = RebuffStep::Casting;
+    else if (facts.mounted)
+        decision.step = RebuffStep::Mounted;
+    else if (decision.missing == 0)
+        decision.step = RebuffStep::NothingMissing;
+    else if (decision.inReach == 0)
+        decision.step = RebuffStep::OutOfReach;
+    else if (facts.mana < facts.cost ||
+             static_cast<std::uint64_t>(facts.mana - facts.cost) * 100 <
+                 static_cast<std::uint64_t>(facts.maxMana) * REBUFF_MANA_RESERVE_PERCENT)
+        decision.step = RebuffStep::LowMana;
+    else
+        decision.step = RebuffStep::Cast;
+    return decision;
+}
+
+char const* RebuffStepWord(RebuffStep step)
+{
+    switch (step)
+    {
+        case RebuffStep::NoSpell:        return "no party buff learned";
+        case RebuffStep::Dead:           return "the caster is dead";
+        case RebuffStep::InCombat:       return "in combat";
+        case RebuffStep::Casting:        return "already casting";
+        case RebuffStep::Mounted:        return "mounted or flying";
+        case RebuffStep::NothingMissing: return "every member carries it";
+        case RebuffStep::OutOfReach:     return "no member without it is within reach and sight";
+        case RebuffStep::LowMana:        return "the cast would leave the caster under its mana reserve";
+        case RebuffStep::Cast:           return "cast";
+    }
+    return "unknown";
 }
 
 }  // namespace OverseerDecisions
