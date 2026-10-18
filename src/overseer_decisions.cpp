@@ -13318,6 +13318,21 @@ std::vector<RecruitPick> RecruitShortlist(
     return RecruitShortlistReportFor(candidates, needs, atMost).picks;
 }
 
+RecruitDiscovery RecruitDiscoveryFrom(std::vector<RecruitCandidate> const& found)
+{
+    RecruitDiscovery discovery;
+    for (RecruitCandidate const& candidate : found)
+    {
+        if (candidate.onRoster)
+            ++discovery.onRoster;
+        else if (!candidate.randomBotAccount)
+            ++discovery.notRandomBot;
+        else
+            discovery.kept.push_back(candidate);
+    }
+    return discovery;
+}
+
 char const* RaidSeatName(RaidSeat seat)
 {
     switch (seat)
