@@ -8,6 +8,8 @@
  * the gates that decide which of those moments are written:
  *
  *   - only rare (quality 3) and better is notable, for loot and hand-overs,
+ *   - except equippable gear a roster character loots or hands to another
+ *     roster character, which is written at any quality (#768),
  *   - a roster character still gets every equip it always got,
  *   - a guild member's equip is written only for an item the record already
  *     knows was looted or handed over, so factory-issued bot gear stays out,
@@ -26,6 +28,8 @@
 
 using OverseerDecisions::ClassifyItemStoryCharacter;
 using OverseerDecisions::FitItemStoryColumn;
+using OverseerDecisions::IsEquippableInventoryType;
+using OverseerDecisions::IsItemStoryCandidate;
 using OverseerDecisions::IsNotableItemQuality;
 using OverseerDecisions::ItemGivenDetail;
 using OverseerDecisions::ItemLootDetail;
@@ -135,22 +139,65 @@ void MembershipComesFromTheRosterGuilds()
 
 void LootIsWrittenForTheGuildsAndNotableOnly()
 {
-    CheckTrue("guild member loots an epic", ShouldRecordItemLoot(4, ItemStoryWho::GuildMember));
-    CheckTrue("roster loots a rare", ShouldRecordItemLoot(3, ItemStoryWho::Roster));
-    CheckFalse("guild member loots a green", ShouldRecordItemLoot(2, ItemStoryWho::GuildMember));
-    CheckFalse("stranger loots an epic", ShouldRecordItemLoot(4, ItemStoryWho::Stranger));
+    CheckTrue("guild member loots an epic",
+              ShouldRecordItemLoot(4, false, ItemStoryWho::GuildMember));
+    CheckTrue("roster loots a rare", ShouldRecordItemLoot(3, false, ItemStoryWho::Roster));
+    CheckFalse("guild member loots a green",
+               ShouldRecordItemLoot(2, false, ItemStoryWho::GuildMember));
+    CheckFalse("stranger loots an epic", ShouldRecordItemLoot(4, false, ItemStoryWho::Stranger));
 }
 
 void AHandOverNeedsOneSideInTheRecord()
 {
-    CheckTrue("member to roster", ShouldRecordItemGiven(4, ItemStoryWho::GuildMember,
+    CheckTrue("member to roster", ShouldRecordItemGiven(4, false, ItemStoryWho::GuildMember,
                                                         ItemStoryWho::Roster));
-    CheckTrue("stranger to member", ShouldRecordItemGiven(3, ItemStoryWho::Stranger,
+    CheckTrue("stranger to member", ShouldRecordItemGiven(3, false, ItemStoryWho::Stranger,
                                                           ItemStoryWho::GuildMember));
-    CheckFalse("stranger to stranger", ShouldRecordItemGiven(4, ItemStoryWho::Stranger,
+    CheckFalse("stranger to stranger", ShouldRecordItemGiven(4, false, ItemStoryWho::Stranger,
                                                              ItemStoryWho::Stranger));
-    CheckFalse("a green between roster characters",
-               ShouldRecordItemGiven(2, ItemStoryWho::Roster, ItemStoryWho::Roster));
+    CheckFalse("a green that cannot be worn, between roster characters",
+               ShouldRecordItemGiven(2, false, ItemStoryWho::Roster, ItemStoryWho::Roster));
+}
+
+// #768: the character sheet says where each worn piece came from, and the
+// families level in greens. So an equippable item is recorded at ANY quality
+// when a roster character loots it or one roster character hands it to
+// another; everybody else keeps the rare-and-up rule.
+void EquippableGearOnTheRosterIsRecordedAtAnyQuality()
+{
+    CheckTrue("cloth chest is equippable", IsEquippableInventoryType(5));
+    CheckTrue("a bag is equippable", IsEquippableInventoryType(18));
+    CheckFalse("a trade good is not", IsEquippableInventoryType(0));
+
+    CheckTrue("a green to wear is a candidate", IsItemStoryCandidate(2, true));
+    CheckTrue("a grey to wear is a candidate", IsItemStoryCandidate(0, true));
+    CheckTrue("a rare trade good is a candidate", IsItemStoryCandidate(3, false));
+    CheckFalse("a green trade good is not", IsItemStoryCandidate(2, false));
+
+    for (unsigned quality = 0; quality <= 7; ++quality)
+    {
+        CheckTrue("roster loots equippable gear, any quality",
+                  ShouldRecordItemLoot(quality, true, ItemStoryWho::Roster));
+        CheckTrue("roster hands equippable gear to roster, any quality",
+                  ShouldRecordItemGiven(quality, true, ItemStoryWho::Roster,
+                                        ItemStoryWho::Roster));
+    }
+
+    CheckFalse("roster loots a green trade good",
+               ShouldRecordItemLoot(2, false, ItemStoryWho::Roster));
+    CheckFalse("guild member off the roster loots a green to wear",
+               ShouldRecordItemLoot(2, true, ItemStoryWho::GuildMember));
+    CheckTrue("guild member off the roster loots a rare to wear",
+              ShouldRecordItemLoot(3, true, ItemStoryWho::GuildMember));
+    CheckFalse("stranger loots a green to wear",
+               ShouldRecordItemLoot(2, true, ItemStoryWho::Stranger));
+
+    CheckFalse("roster hands a green to wear to a guild member off the roster",
+               ShouldRecordItemGiven(2, true, ItemStoryWho::Roster, ItemStoryWho::GuildMember));
+    CheckFalse("guild member hands a green to wear to roster",
+               ShouldRecordItemGiven(2, true, ItemStoryWho::GuildMember, ItemStoryWho::Roster));
+    CheckTrue("guild member hands a rare to wear to roster",
+              ShouldRecordItemGiven(3, true, ItemStoryWho::GuildMember, ItemStoryWho::Roster));
 }
 
 void EquipKeepsTheRosterAndGatesTheGuildOnTheStory()
@@ -252,6 +299,7 @@ int main()
     MembershipComesFromTheRosterGuilds();
     LootIsWrittenForTheGuildsAndNotableOnly();
     AHandOverNeedsOneSideInTheRecord();
+    EquippableGearOnTheRosterIsRecordedAtAnyQuality();
     EquipKeepsTheRosterAndGatesTheGuildOnTheStory();
     TheSentencesNameWhatHappened();
     ACutNeverSplitsACharacter();

@@ -17813,7 +17813,13 @@ RosterSessionKind ClassifyRosterSession(RosterSessionFacts const& facts);
 // its guid so a reader can join them: somebody in one of the families' guilds
 // looted it (`item_loot`), somebody handed it to somebody else through one of
 // this module's commands (`item_given`), and somebody put it on
-// (`item_equip`). Only items of NOTABLE quality, which is rare (blue) and up.
+// (`item_equip`). Only items of NOTABLE quality, which is rare (blue) and up,
+// with one exception: an EQUIPPABLE item a roster character loots, or that is
+// handed from one roster character to another, is recorded at any quality
+// (#768). The character sheet says where each worn piece came from, and the
+// green gear the families level in is the gear the operator most wants to
+// trace. A guild member off the roster keeps the rare-and-up rule, so the
+// loot stories are not buried under the random bots' greens.
 //
 // WHICH GUILDS. The guilds that at least one enabled roster character belongs
 // to, read from the database on the roster poll. Nothing is configured: a
@@ -17836,6 +17842,16 @@ constexpr unsigned NOTABLE_ITEM_QUALITY = 3;
 
 bool IsNotableItemQuality(unsigned quality);
 
+// Whether an ItemTemplate::InventoryType can be worn at all. 0 is
+// INVTYPE_NON_EQUIP; every other value names a slot (a bag, ammo and a quiver
+// included, since they go in a slot too).
+bool IsEquippableInventoryType(unsigned inventoryType);
+
+// The cheap test a hot hook asks before anything that takes a lock: could this
+// item be recorded for anybody? Notable, or equippable (#768). Both are fields
+// on a template already in hand.
+bool IsItemStoryCandidate(unsigned quality, bool equippable);
+
 // Who a character is to this record. Roster outranks guild membership: a
 // roster character is also usually a guild member, and the roster answer is
 // the one that decides equips.
@@ -17851,12 +17867,16 @@ enum class ItemStoryWho
 ItemStoryWho ClassifyItemStoryCharacter(bool onRoster, unsigned guildId,
                                         std::vector<unsigned> const& storyGuilds);
 
-// A loot or a roll won: notable quality, looted by anybody this record covers.
-bool ShouldRecordItemLoot(unsigned quality, ItemStoryWho looter);
+// A loot or a roll won: an equippable item looted by a roster character, at
+// any quality (#768); otherwise notable quality, looted by anybody this record
+// covers.
+bool ShouldRecordItemLoot(unsigned quality, bool equippable, ItemStoryWho looter);
 
-// A hand-over: notable quality, and either side is somebody this record
-// covers. The row is written under the giver's name either way.
-bool ShouldRecordItemGiven(unsigned quality, ItemStoryWho from, ItemStoryWho to);
+// A hand-over: an equippable item from one roster character to another, at
+// any quality (#768); otherwise notable quality, and either side is somebody
+// this record covers. The row is written under the giver's name either way.
+bool ShouldRecordItemGiven(unsigned quality, bool equippable, ItemStoryWho from,
+                           ItemStoryWho to);
 
 // An equip. A roster character: always, whatever the quality, which is what
 // `item_equip` has always meant. A guild member: only a notable item the record
@@ -17925,13 +17945,14 @@ bool StoryKnowsItem(ItemStoryBook const& book, std::uint32_t itemGuid);
 // So the loot hooks never read the pointer. Player::StoreNewItem calls
 // OnPlayerStoreNewItem BEFORE any loot hook, on the same thread, while the
 // item is certainly alive (StoreNewItem itself returns it to its caller). That
-// hook notes the stored item here if it is notable; the loot hook takes the
+// hook notes the stored item here if it could be recorded (notable, or
+// equippable, #768: IsItemStoryCandidate); the loot hook takes the
 // note and looks the guid up in the looter's own bags, which can only answer
 // with an item that is really there.
 struct LootStoreNote
 {
     std::uint64_t looter{0};
-    std::uint32_t itemGuid{0};   // 0: the last store was not a notable item
+    std::uint32_t itemGuid{0};   // 0: the last store was not a story candidate
     std::uint32_t count{0};
 };
 
