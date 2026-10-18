@@ -32436,6 +32436,9 @@ private:
         // same reason: the sentences carry live counts and would otherwise
         // repeat themselves every poll.
         std::map<std::string, std::string> repairSaid;
+        // Whether the leg has said it is waiting for the party to leave an
+        // instance before anybody is aimed at a repairer (#723). Once per run.
+        bool loggedRepairWaitsForExit{false};
 
         // --- crossing a continent (#241) -----------------------------
         //
@@ -43904,6 +43907,7 @@ private:
         coord.trainingHoldSince = 0;
         coord.repairSettled.clear();
         coord.repairSaid.clear();
+        coord.loggedRepairWaitsForExit = false;
         coord.phase = DungeonRunPhase::Resetting;
     }
 
@@ -44004,6 +44008,13 @@ private:
         // travel role has no valid spawn and would retry forever. Let the same
         // exit-trigger walk and server-side crossing packet used by reset move
         // every instance occupant out before any member is sent to a repairer.
+        //
+        // AND THAT WAIT IS BOUNDED (#723). It used to return before the leg's
+        // bound was ever asked, so a door that never landed held the run here
+        // forever. RepairLegInstanceStep counts it on the leg's own clock: past
+        // the bound the leg ends without having aimed anybody at `repair`
+        // inside, RESETTING walks the stragglers out on its own clock, and the
+        // repair is owed after the next run.
         std::vector<uint32> occupiedInstanceMaps;
         for (std::string const& name : members)
         {
@@ -44015,8 +44026,46 @@ private:
                 occupiedInstanceMaps.end())
                 occupiedInstanceMaps.push_back(mapId);
         }
-        if (OverseerDecisions::RepairLegMustEvacuate(!occupiedInstanceMaps.empty()))
+        time_t const heldFor =
+            coord.repairSince ? std::time(nullptr) - coord.repairSince : 0;
+        std::string insideMaps;
+        for (uint32 const mapId : occupiedInstanceMaps)
         {
+            if (!insideMaps.empty())
+                insideMaps += ", ";
+            insideMaps += std::to_string(mapId);
+        }
+        OverseerDecisions::RepairLegExit const exitStep =
+            OverseerDecisions::RepairLegInstanceStep(!occupiedInstanceMaps.empty(), heldFor,
+                                                     DUNGEON_REPAIR_BACKSTOP_SECONDS);
+        if (exitStep == OverseerDecisions::RepairLegExit::GiveUp)
+        {
+            // Said once because it ends the leg: EndRepairLeg moves the run on.
+            LOG_ERROR("module.overseer",
+                      "overseer: the repair leg for '{}'s party gives up after {} minutes, "
+                      "past the {} minute bound, with members still inside map {}. Nobody "
+                      "was aimed at a repairer inside the instance, because none stands "
+                      "there. RESET takes over walking them out, and the repair is owed "
+                      "after the next run",
+                      leaderName, uint32(heldFor / 60),
+                      uint32(DUNGEON_REPAIR_BACKSTOP_SECONDS / 60), insideMaps);
+            EndRepairLeg(coord, members);
+            return;
+        }
+        if (exitStep == OverseerDecisions::RepairLegExit::Evacuate)
+        {
+            // ONCE PER RUN, NOT ONCE PER POLL (#723): the reason is a standing
+            // fact for as long as the walk out takes, and the poll is seconds.
+            if (!coord.loggedRepairWaitsForExit)
+            {
+                coord.loggedRepairWaitsForExit = true;
+                LOG_INFO("module.overseer",
+                         "overseer: the repair leg for '{}'s party waits for everybody to "
+                         "leave map {} - no repairer stands on an instanced map, so nobody "
+                         "is aimed at one until the party is out, for at most {} minutes",
+                         leaderName, insideMaps,
+                         uint32(DUNGEON_REPAIR_BACKSTOP_SECONDS / 60));
+            }
             for (uint32 const mapId : occupiedInstanceMaps)
             {
                 DungeonPortal const* const portal =
@@ -44193,9 +44242,6 @@ private:
                     break;
             }
         }
-
-        time_t const heldFor =
-            coord.repairSince ? std::time(nullptr) - coord.repairSince : 0;
 
         switch (OverseerDecisions::RepairLegStatus(outstanding, heldFor,
                                                    DUNGEON_REPAIR_BACKSTOP_SECONDS))

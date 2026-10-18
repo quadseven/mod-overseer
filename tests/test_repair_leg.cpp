@@ -46,7 +46,9 @@ using OverseerDecisions::REPAIR_CANNOT_AFFORD;
 using OverseerDecisions::RepairLegMayTryAgain;
 using OverseerDecisions::RepairLegFacts;
 using OverseerDecisions::RepairLegMemberStep;
-using OverseerDecisions::RepairLegMustEvacuate;
+using OverseerDecisions::RepairLegExit;
+using OverseerDecisions::RepairLegExitWord;
+using OverseerDecisions::RepairLegInstanceStep;
 using OverseerDecisions::RepairLegStatus;
 using OverseerDecisions::RepairLegStep;
 using OverseerDecisions::RepairLegStepWord;
@@ -118,20 +120,56 @@ void ADamagedMemberIsWalkedToARepairer()
          RepairLegStep::Walk);
 }
 
+void Exit(char const* what, bool inside, time_t held, time_t bound, RepairLegExit want)
+{
+    RepairLegExit const got = RepairLegInstanceStep(inside, held, bound);
+    if (got == want)
+        return;
+    std::printf("FAIL %s: wanted '%s', got '%s'\n", what, RepairLegExitWord(want),
+                RepairLegExitWord(got));
+    ++failures;
+}
+
+// ------------------------------------------- somebody is still inside (#723) --
+
+// MEASURED: a leader on map 209 was aimed at `repair` 360 times in a day, one
+// every ten seconds, and the travel drive released each one as "no such spawn on
+// map 209". An instanced map has no repairer, so while anybody is inside the leg
+// walks them out and aims nobody at a counter.
 void RepairWaitsForEveryInstanceOccupantToLeave()
 {
-    if (RepairLegMustEvacuate(true))
-        return;
-    std::printf("FAIL an occupied instance must be evacuated before repair\n");
-    ++failures;
+    Exit("a member inside, the leg two minutes old", true, 120, 1200,
+         RepairLegExit::Evacuate);
 }
 
 void RepairProceedsWhenNobodyIsInsideAnInstance()
 {
-    if (!RepairLegMustEvacuate(false))
-        return;
-    std::printf("FAIL repair must proceed when no roster member is inside an instance\n");
-    ++failures;
+    Exit("nobody inside", false, 120, 1200, RepairLegExit::Proceed);
+}
+
+// THE WAIT FOR THE DOOR IS BOUNDED. #807 returned before the bound was ever
+// asked, so an exit that never landed held the run in REPAIRING forever. Past
+// the bound the leg ends and RESETTING owns the walk out; the repair is owed
+// after the next run.
+void AnExitThatNeverLandsEndsTheLegOnTheBound()
+{
+    Exit("still inside at the bound", true, 1200, 1200, RepairLegExit::GiveUp);
+    Exit("still inside past the bound", true, 5400, 1200, RepairLegExit::GiveUp);
+    Exit("one second short of the bound", true, 1199, 1200, RepairLegExit::Evacuate);
+}
+
+// THE BOUND IS ABOUT THE DOOR, NOT ABOUT THE TRIP. Out of the instance past the
+// bound is the ordinary leg, and RepairLegStatus is what says it is overdue -
+// with the list of who is still owed, which this decision cannot give.
+void OutsidePastTheBoundIsTheOrdinaryLeg()
+{
+    Exit("outside, past the bound", false, 5400, 1200, RepairLegExit::Proceed);
+}
+
+// A zero bound is no time at all, as RepairLegStatus reads it, never "unbounded".
+void AZeroBoundGivesUpOnTheFirstPollInside()
+{
+    Exit("inside, zero bound", true, 0, 0, RepairLegExit::GiveUp);
 }
 
 // AND THE POLL IT ARRIVES ON IS THE POLL TO SPEND. 47 of the 67 repair rows ever
@@ -426,6 +464,9 @@ int main()
     ADamagedMemberIsWalkedToARepairer();
     RepairWaitsForEveryInstanceOccupantToLeave();
     RepairProceedsWhenNobodyIsInsideAnInstance();
+    AnExitThatNeverLandsEndsTheLegOnTheBound();
+    OutsidePastTheBoundIsTheOrdinaryLeg();
+    AZeroBoundGivesUpOnTheFirstPollInside();
     AMemberAlreadyAtARepairerIsRepairedNow();
     ARepairerInReachIsPreferredToAnyWalk();
     AnUndamagedMemberIsFinishedWhereverItStands();
