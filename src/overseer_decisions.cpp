@@ -11831,6 +11831,109 @@ std::string FlightMasterRefusalReason(FlightMasterBoarding boarding, uint32_t fm
     return "";
 }
 
+bool TaxiNodeServesTeam(bool onTaxiNetwork, uint32_t hordeMount, uint32_t allianceMount,
+                        bool alliance)
+{
+    // ObjectMgr::GetNearestTaxiNode, term for term: the team's own mount, or
+    // the death knight node either team may use, and on the network mask.
+    if (!onTaxiNetwork)
+        return false;
+    return (alliance ? allianceMount : hordeMount) != 0 ||
+           hordeMount == TAXI_DEATH_KNIGHT_MOUNT_CREATURE;
+}
+
+TeamTaxiGraph BuildTeamTaxiGraph(std::vector<TaxiEdge> const& edges,
+                                 std::vector<uint32_t> const& teamNodes)
+{
+    std::vector<uint32_t> serves(teamNodes);
+    std::sort(serves.begin(), serves.end());
+    auto const servesTeam = [&serves](uint32_t node) {
+        return std::binary_search(serves.begin(), serves.end(), node);
+    };
+
+    TeamTaxiGraph graph;
+    for (TaxiEdge const& edge : edges)
+    {
+        // Upstream's BuildTaxiGraph skips the same two "to nowhere" values.
+        if (!edge.from || !edge.to || edge.to == uint32_t(-1) || edge.from == edge.to)
+            continue;
+        if (!servesTeam(edge.from) || !servesTeam(edge.to))
+            continue;
+        graph.next[edge.from].push_back(edge.to);
+    }
+    for (auto& entry : graph.next)
+    {
+        std::vector<uint32_t>& out = entry.second;
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+    }
+    return graph;
+}
+
+std::vector<uint32_t> FindTeamTaxiPath(TeamTaxiGraph const& graph, uint32_t from, uint32_t to)
+{
+    if (!from || !to || from == to)
+        return {};
+
+    // Plain breadth-first search, so "fewest hops" means what it means in
+    // upstream's own FindTaxiPath; the only difference is the graph.
+    std::map<uint32_t, uint32_t> parent;
+    parent[from] = 0;
+    std::vector<uint32_t> frontier{from};
+    for (size_t head = 0; head < frontier.size(); ++head)
+    {
+        uint32_t const current = frontier[head];
+        if (current == to)
+            break;
+        auto const out = graph.next.find(current);
+        if (out == graph.next.end())
+            continue;
+        for (uint32_t const next : out->second)
+        {
+            if (parent.count(next))
+                continue;
+            parent[next] = current;
+            frontier.push_back(next);
+        }
+    }
+    if (!parent.count(to))
+        return {};
+
+    std::vector<uint32_t> path;
+    for (uint32_t node = to; node; node = parent[node])
+        path.push_back(node);
+    std::reverse(path.begin(), path.end());
+    return path;
+}
+
+TaxiRouteScan ScanTaxiRoute(std::vector<TaxiHopRead> const& hops)
+{
+    TaxiRouteScan scan;
+    if (hops.size() < 2)
+        return scan;   // no route: Unflyable, nothing to learn
+
+    // A hop the team can never hold condemns the route whether or not an
+    // earlier hop is also missing: learning the earlier one would only walk
+    // the character to the next dead end. So this is asked of every hop
+    // before any suggestion is made.
+    for (size_t hop = 1; hop < hops.size(); ++hop)
+    {
+        if (!hops[hop].servesTeam)
+            return scan;
+    }
+    for (size_t hop = 1; hop < hops.size(); ++hop)
+    {
+        if (!hops[hop].known)
+        {
+            scan.verdict = TaxiRouteVerdict::LearnHop;
+            scan.learnNode = hops[hop].node;
+            return scan;
+        }
+    }
+    scan.verdict = TaxiRouteVerdict::Fly;
+    return scan;
+}
+
 FlightDiscoveryArrival FlightDiscoveryArrivalStep(bool inReach, bool oneIsNearby)
 {
     // IN REACH OUTRANKS EVERYTHING ELSE, for the identical reason

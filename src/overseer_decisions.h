@@ -14001,6 +14001,95 @@ FlightMasterBoarding ReadFlightMasterBoarding(bool resolved, float fmX, float fm
 // Empty for `Board`, which is not a refusal.
 std::string FlightMasterRefusalReason(FlightMasterBoarding boarding, uint32_t fmEntry);
 
+// --------------- a route this character's own team can fly (#501) ---------
+//
+// Upstream's taxi BFS (TravelNodeMap::FindTaxiPath) is built once over every
+// row of TaxiPath.dbc and answers ONE route per pair of nodes, whoever asks.
+// It does not know that half the network belongs to the other side. Logged
+// on the dev realm 2026-09-19, twice: an Alliance family was told it "could
+// fly node 79 to node 80, but has not discovered node 40" and that
+// `flight master:40` would go learn it. Node 40 is Gadgetzan's HORDE flight
+// point; the Alliance one, node 39, stands 180 yards away and the family
+// already holds it. No Alliance character can ever learn node 40, so the
+// suggestion named an errand that could never finish, and the route through
+// it was never a route at all.
+//
+// Learnability per team is not a judgement call: WorldSession::
+// SendLearnNewTaxiNode learns exactly the node ObjectMgr::GetNearestTaxiNode
+// returns for the character's GetTeamId(true), and that function skips a node
+// whose mount for the team is zero (the death knight node excepted) or that
+// is not on the taxi network mask. The predicate below is that test, so the
+// route search and the game cannot disagree about whose node this is.
+
+// TaxiNodes.dbc MountCreatureID[0] of Acherus' own node. ObjectMgr::
+// GetNearestTaxiNode lets it through for either team.
+constexpr std::uint32_t TAXI_DEATH_KNIGHT_MOUNT_CREATURE = 32981;
+
+// Can a character of this team ever hold this node? `hordeMount` and
+// `allianceMount` are MountCreatureID[0] and [1]; `onTaxiNetwork` is the
+// node's bit in sTaxiNodesMask.
+bool TaxiNodeServesTeam(bool onTaxiNetwork, std::uint32_t hordeMount,
+                        std::uint32_t allianceMount, bool alliance);
+
+// One ONE-WAY row of TaxiPath.dbc, as a caller read it.
+struct TaxiEdge
+{
+    std::uint32_t from{0};
+    std::uint32_t to{0};
+};
+
+// The taxi graph one team can fly: every edge whose two ends both serve the
+// team, nothing else. Built once per team by the caller and kept; the rows
+// it is read from do not change after startup.
+struct TeamTaxiGraph
+{
+    std::map<std::uint32_t, std::vector<std::uint32_t>> next;
+};
+
+// `teamNodes` is every node TaxiNodeServesTeam passed for the team. An edge
+// with either end outside it is dropped, so no route through the graph can
+// ever enter the other side's node. Neighbours are kept sorted, so the
+// search below is deterministic rather than ordered by DBC row.
+TeamTaxiGraph BuildTeamTaxiGraph(std::vector<TaxiEdge> const& edges,
+                                 std::vector<std::uint32_t> const& teamNodes);
+
+// The fewest-hops route `from` -> `to` over that graph, both ends included,
+// in the same shape FindTaxiPath returns. Empty when the two are the same
+// node or no route of this team's joins them - which is the honest answer
+// for an Alliance character asked to reach a node only Horde nodes lead to.
+std::vector<std::uint32_t> FindTeamTaxiPath(TeamTaxiGraph const& graph,
+                                            std::uint32_t from, std::uint32_t to);
+
+// One hop of a route, as the character reads it.
+struct TaxiHopRead
+{
+    std::uint32_t node{0};
+    bool known{false};       // in the character's taximask
+    bool servesTeam{false};  // TaxiNodeServesTeam for the character's team
+};
+
+enum class TaxiRouteVerdict : std::uint8_t
+{
+    Fly,        // every hop after the departure is known
+    LearnHop,   // the first missing hop is one this character can learn
+    Unflyable,  // empty route, or a hop the character's team can never hold
+};
+
+// THE UNKNOWN-HOP SCAN, and what it is allowed to suggest. Hop zero is the
+// departure and is deliberately not required: the flight master teaches the
+// node it stands at when the window opens. Every later hop must be known.
+// The first one that is not is named in `learnNode` ONLY when the team can
+// learn it; a hop the team can never hold makes the route Unflyable with
+// `learnNode` zero, so no caller and no log line can name an errand that
+// cannot finish.
+struct TaxiRouteScan
+{
+    TaxiRouteVerdict verdict{TaxiRouteVerdict::Unflyable};
+    std::uint32_t learnNode{0};
+};
+
+TaxiRouteScan ScanTaxiRoute(std::vector<TaxiHopRead> const& hops);
+
 // The three-way arrival answer for a deliberate flight-master errand,
 // asked of the LIVE creature rather than the recorded spawn point - #378's
 // argument applies here unchanged. `false` (`inReach`) and `false`
