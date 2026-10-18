@@ -1205,6 +1205,11 @@ static std::string GraveyardRefusal(Player* bot, GraveyardStruct const& g,
     OverseerDecisions::PlaceDangerFacts facts;
     facts.memberLevel = level;
     facts.killerEntry = evidence.killerEntry;
+    // A ghost revived beside a slightly lower-level camp can still be killed
+    // before it gets clear. Hillsbrad Footmen are level 25-26; ghosts there
+    // are commonly level 27-31, so the killer-kind test alone misses them on
+    // the first resurrection.
+    facts.threatLevelGap = 5;
     facts.hostiles = HostileSpawnListNear(bot, g.Map, g.x, g.y, GRAVEYARD_THREAT_RADIUS, &templates);
     facts.deathsNear = OverseerDecisions::CountGuildDeathsNear(
         evidence.deaths, time(nullptr), g.Map, g.x, g.y, GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES);
@@ -1224,7 +1229,8 @@ static std::string GraveyardRefusal(Player* bot, GraveyardStruct const& g,
             break;
     }
     return std::to_string(danger.threats) + " hostile spawn(s) at or above level " +
-           std::to_string(level) + " or of its killer's kind (entry " +
+           std::to_string(level) + ", within " + std::to_string(facts.threatLevelGap) +
+           " levels below it, or of its killer's kind (entry " +
            std::to_string(evidence.killerEntry) + ") within " +
            std::to_string(uint32(GRAVEYARD_THREAT_RADIUS)) + " yards, up to '" +
            templates[danger.strongestAt]->Name + "' (level " + std::to_string(danger.strongest) +
