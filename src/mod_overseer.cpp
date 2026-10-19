@@ -22985,6 +22985,9 @@ private:
                     uint32 const stone = HearthstoneSpellOf(p);
                     ground.hearthReady = stone && !p->HasSpellCooldown(stone) &&
                                          !HearthPendingFor(name);
+                    // A stone bound on another map is a hearth to another
+                    // continent from the family (#274), never a way off here.
+                    ground.boundOnMemberMap = p->m_homebindMapId == p->GetMapId();
                     if (OverseerDecisions::HeldGroundNeedsSafeSpot(ground))
                     {
                         safeGrave = SafeHeldGroundFor(p, name);
@@ -23005,9 +23008,14 @@ private:
                         _heldGroundSaid.insert(name).second)
                         LOG_WARN("module.overseer",
                                  "overseer: '{}' (level {}) is held on ground where spawns reach "
-                                 "level {}, its hearthstone is not ready, and it stays held - {} "
+                                 "level {}, its hearthstone {}, and it stays held - {} "
                                  "(#744)",
-                                 name, ground.memberLevel, ground.groundTopLevel, verdict.reason);
+                                 name, ground.memberLevel, ground.groundTopLevel,
+                                 ground.hearthReady
+                                     ? "is bound on another map, and a hearth there would "
+                                       "leave it on another continent from its family (#274)"
+                                     : "is not ready",
+                                 verdict.reason);
                     if (verdict.step == OverseerDecisions::HeldGroundStep::Hearth)
                     {
                         LethalLegHold& held = _lethalLegHeld[name];
@@ -29427,6 +29435,8 @@ private:
         facts.levelGap = LONE_LEG_LIMITS.levelGap;
         uint32 const stone = HearthstoneSpellOf(bot);
         facts.hearthReady = stone && !bot->HasSpellCooldown(stone) && !HearthPendingFor(name);
+        // A stone bound on another map is a hearth to another continent (#274).
+        facts.boundOnMemberMap = bot->m_homebindMapId == bot->GetMapId();
         facts.restWhileSick = restWhileSick;
         if (!state.deathsRead)
         {

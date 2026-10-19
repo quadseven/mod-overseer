@@ -22,6 +22,7 @@ int main()
     facts.memberLevel = 35;
     facts.groundTopLevel = 38;
     facts.hearthReady = true;
+    facts.boundOnMemberMap = true;
     check("sick member hearths on lethal ground when ready", facts,
           RevivedSickGroundStep::Hearth);
     facts.hearthReady = false;
@@ -42,6 +43,7 @@ int main()
     loop.repeatDeaths = 2;
     loop.deathsHere = 21;
     loop.hearthReady = true;
+    loop.boundOnMemberMap = true;
     check("a death loop hearths out though no hostile outlevels it", loop,
           RevivedSickGroundStep::Hearth);
     loop.hearthReady = false;
