@@ -4959,6 +4959,130 @@ std::string GearNeedWinner(std::vector<GearContender> const& contenders)
     return winner;
 }
 
+// ---------------------------------------- the open world seeks upgrades (#973) --
+
+namespace
+{
+
+// The index of the largest `key` among the options `admit` lets in, the
+// earlier one on a tie; -1 when none is admitted.
+template <typename Option, typename Admit, typename Key>
+int FirstLargest(std::vector<Option> const& options, Admit admit, Key key)
+{
+    int best = -1;
+    for (std::size_t i = 0; i < options.size(); ++i)
+    {
+        if (!admit(options[i]))
+            continue;
+        if (best < 0 || key(options[i]) > key(options[static_cast<std::size_t>(best)]))
+            best = static_cast<int>(i);
+    }
+    return best;
+}
+
+// The sibling a choice upgrades most, or nullptr when it upgrades none. The
+// earlier name in the list on a tie, so the walk order of the family decides
+// nothing the scores could.
+QuestRewardSibling const* BestSiblingUpgrade(QuestRewardOption const& option)
+{
+    QuestRewardSibling const* best = nullptr;
+    for (QuestRewardSibling const& sibling : option.siblings)
+        if (sibling.comparison == GearComparison::Better &&
+            (!best || sibling.percent > best->percent))
+            best = &sibling;
+    return best;
+}
+
+}  // namespace
+
+QuestRewardPick ChooseQuestReward(std::vector<QuestRewardOption> const& options)
+{
+    QuestRewardPick pick;
+    auto const holderScore = [](QuestRewardOption const& o) { return o.holderScore; };
+
+    pick.index = FirstLargest(
+        options, [](QuestRewardOption const& o) { return o.holder == GearComparison::Better; },
+        holderScore);
+    if (pick.index >= 0)
+    {
+        pick.why = QuestRewardWhy::HolderUpgrade;
+        return pick;
+    }
+
+    pick.index = FirstLargest(
+        options, [](QuestRewardOption const& o) { return BestSiblingUpgrade(o) != nullptr; },
+        [](QuestRewardOption const& o) { return BestSiblingUpgrade(o)->percent; });
+    if (pick.index >= 0)
+    {
+        pick.why = QuestRewardWhy::SiblingUpgrade;
+        pick.recipient = BestSiblingUpgrade(options[static_cast<std::size_t>(pick.index)])->name;
+        return pick;
+    }
+
+    pick.index = FirstLargest(
+        options, [](QuestRewardOption const& o) { return o.holderWearable; }, holderScore);
+    if (pick.index >= 0)
+    {
+        pick.why = QuestRewardWhy::HolderBest;
+        return pick;
+    }
+
+    pick.index = FirstLargest(
+        options, [](QuestRewardOption const&) { return true; },
+        [](QuestRewardOption const& o) { return o.sellPrice; });
+    if (pick.index >= 0)
+        pick.why = QuestRewardWhy::SellPrice;
+    return pick;
+}
+
+std::string QuestRewardDetail(QuestRewardOption const& chosen, QuestRewardPick const& pick)
+{
+    std::string why;
+    switch (pick.why)
+    {
+        case QuestRewardWhy::HolderUpgrade: why = "an upgrade for the holder"; break;
+        case QuestRewardWhy::SiblingUpgrade: why = "an upgrade for " + pick.recipient; break;
+        case QuestRewardWhy::HolderBest: why = "the holder's best score, an upgrade for nobody"; break;
+        case QuestRewardWhy::SellPrice: why = "the best sale price"; break;
+        case QuestRewardWhy::None: why = "no choice offered"; break;
+    }
+    return "reward " + std::to_string(chosen.entry) + ", " + why;
+}
+
+int ChooseBagPurchase(std::vector<BagOffer> const& offers, int emptyBagSlots,
+                      std::uint64_t money)
+{
+    if (emptyBagSlots <= 0)
+        return -1;
+    int best = -1;
+    for (std::size_t i = 0; i < offers.size(); ++i)
+    {
+        BagOffer const& offer = offers[i];
+        if (!offer.inStock || offer.slots <= 0 || offer.price > money)
+            continue;
+        BagOffer const* held = best < 0 ? nullptr : &offers[static_cast<std::size_t>(best)];
+        if (!held || offer.slots > held->slots ||
+            (offer.slots == held->slots && offer.price < held->price))
+            best = static_cast<int>(i);
+    }
+    return best;
+}
+
+int ChooseVendorUpgrade(std::vector<VendorUpgradeOffer> const& offers, int emptyBagSlots,
+                        std::uint64_t money)
+{
+    if (emptyBagSlots > 0)
+        return -1;
+    std::uint64_t const budget = money / 2;
+    return FirstLargest(
+        offers,
+        [budget](VendorUpgradeOffer const& o)
+        {
+            return o.inStock && o.comparison == GearComparison::Better && o.price <= budget;
+        },
+        [](VendorUpgradeOffer const& o) { return o.gain; });
+}
+
 // ------------------------------------------------------ the loot council --
 
 LootRules LootRulesFor(bool raid)
@@ -5428,8 +5552,6 @@ std::string QuestErrandRefusal(QuestErrand const& errand, QuestErrandFacts const
     }
     if (facts.status != STATUS_COMPLETE)
         return QUEST_NOT_COMPLETE;
-    if (facts.rewardChoice)
-        return "it offers a choice of reward, and nobody here would choose";
     if (!facts.rewardable)
         return QUEST_CORE_WILL_NOT_REWARD;
     return "";
