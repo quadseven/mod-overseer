@@ -12582,6 +12582,30 @@ struct RouteLegLimits
     // is closed. One point at a time, every leg is about 91 yards of navmesh
     // and every one of them answers.
     std::uint32_t maxPointsAhead{0};
+
+    // AND A MEASURED CORRIDOR'S CURSOR MOVES ON ARRIVAL, NOT ON NEARNESS
+    // (#759). The nearest-point cursor below hands a character the NEXT point
+    // as soon as it is nearer the point it is walking to than the one it left,
+    // which is halfway along the leg. On a surveyed road that is harmless,
+    // because the next point is five yards on. On a measured corridor it is
+    // the corner the corridor was written down to stop anybody cutting: the
+    // character is sent from the middle of one leg straight at the end of the
+    // next, past the point between them. Measured on the dev realm at Ragefire
+    // Chasm on 2026-09-27: a leader joined at point 3 of 11, 0 yards away, and
+    // within seventy seconds stood 230 yards off every point of it on
+    // Orgrimmar's upper walkways.
+    //
+    // So with this set the cursor is the point being walked TO, and it moves
+    // past a point only once the character has come within `arrivedYards` of
+    // it. That is the rule the comment on RouteLegStep calls the one that was
+    // got wrong first, and it is wrong there for a reason that does not hold
+    // here: there the aim was fifty points down the road and a sixty yard step
+    // stepped over a point five yards wide. Here the aim IS the point (one
+    // ahead at most, see maxPointsAhead), so a step toward it ends on it.
+    // A character that strays off the corridor is sent back to the point it has
+    // not reached rather than forward to whichever point it happens to be
+    // nearest, which on a route that doubles back is a point it never walked to.
+    bool advanceOnArrival{false};
 };
 
 // WHICH POINT TO AIM AT THIS POLL, AND THE TWO RULES THAT ARE THE WHOLE OF IT.
@@ -12609,6 +12633,43 @@ struct RouteLegLimits
 // false, which every caller already handles as "aim at the errand".
 RouteAim RouteLegStep(RouteCursor& cursor, std::vector<RoutePoint> const& route,
                       float x, float y, RouteLegLimits const& limits);
+
+// DOES THE PATH A MEASURED CORRIDOR LEG WAS GIVEN STAY ON THAT LEG? (#759)
+//
+// A corridor's points are each a corner of the shortest walk over the shipped
+// navmesh, so the walk between two of them is near enough a straight line.
+// The navmesh is still asked for each leg, and in a layered city its answer
+// can be a different walk altogether: up onto a walkway and round, which
+// still ends on the point and so passes every test NavmeshRoutes asks. This is
+// the reading of that answer. `from` and `to` are the leg's two ends (the
+// character itself stands in for `from` on the hop to the first point), and
+// `path` is the walk the navmesh gave, starting at the character's feet.
+//
+// The path STRAYS when any point of it lies more than `widthYards` off the
+// straight line from `from` to `to`, measured on the plane. The worst point is
+// named, with how far off the line and how far above the higher end of the leg
+// it stands, and the path's own length is given beside the leg's, so the log
+// line that reports it says where the walk went and not only that it went.
+// Nonsense limits, an empty path, or a leg with no length is `judged` false.
+struct CorridorLegPathLimits
+{
+    float widthYards{0.f};
+};
+
+struct CorridorLegPathReading
+{
+    bool judged{false};
+    bool strays{false};
+    std::uint32_t worstIndex{0};
+    float worstOffYards{0.f};
+    float worstAboveYards{0.f};
+    float pathYards{0.f};
+    float legYards{0.f};
+};
+
+CorridorLegPathReading JudgeCorridorLegPath(RoutePoint const& from, RoutePoint const& to,
+                                            std::vector<RoutePoint> const& path,
+                                            CorridorLegPathLimits const& limits);
 
 // INSIDE THE NAVMESH'S REACH BY DISTANCE IS NOT INSIDE IT BY WALKING (#592).
 //
