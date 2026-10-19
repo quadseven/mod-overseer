@@ -74433,11 +74433,13 @@ private:
         // Filled by every path, so no row ever ends without saying what it
         // decided. `reason` is the machine-readable half - the bridge counts
         // these - and the returned `detail` is the human half.
-        auto describe = [&](char const* outcome, char const* reason, int32 takerStatus)
+        auto describe = [&](char const* outcome, char const* reason, int32 takerStatus,
+                            bool retryable = true)
         {
             std::ostringstream o;
             o << "{\"outcome\":" << J(outcome)
               << ",\"reason\":" << J(reason)
+              << ",\"retryable\":" << (retryable ? "true" : "false")
               << ",\"from\":" << J(holder->GetName())
               << ",\"to\":" << J(takerName)
               << ",\"quest_id\":" << questId
@@ -74483,8 +74485,11 @@ private:
         // silently sharing something nobody is carrying.
         if (!holder->CanShareQuest(questId))
         {
-            describe("refused", "holder cannot share it (not held, or not flagged sharable)",
-                     int32(taker->GetQuestStatus(questId)));
+            bool const holderHasQuest =
+                holder->GetQuestStatus(questId) != QUEST_STATUS_NONE;
+            char const* reason = holderHasQuest ? "quest is not sharable"
+                                                : "holder does not carry the quest";
+            describe("refused", reason, int32(taker->GetQuestStatus(questId)), false);
             return "holder is not carrying that quest or it is not sharable";
         }
 
