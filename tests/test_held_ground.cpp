@@ -23,6 +23,7 @@ int main()
     check("lethal ground with ready hearth", facts, HeldGroundStep::Hearth);
     facts.hearthReady = false;
     facts.safeSpotKnown = true;
+    facts.safeSpotYards = 240.0f;
     check("lethal ground with safe spot", facts, HeldGroundStep::WalkToSafety);
     facts.groundTopLevel = 37;
     check("ground below lethal margin", facts, HeldGroundStep::Hold);

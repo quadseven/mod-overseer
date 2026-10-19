@@ -21884,8 +21884,64 @@ private:
         return _lethalLegHeld.count(name) != 0;
     }
 
+    // WHICH FAR-HELD MEMBERS HAVE BEEN TOLD ABOUT THEIR GROUND (#744), so the
+    // walk to safe ground and the hold that cannot find any are each said once
+    // per hold rather than every party poll. Erased by EndFarHold.
+    std::set<std::string> _heldGroundSaid;
+    std::set<std::string> _heldGroundWalkSaid;
+
+    // The nearest graveyard on this map a member of its level can stand at, by
+    // the same test the stuck-revival ladder uses (SafeGraveyardNear), or null.
+    GraveyardStruct const* SafeHeldGroundFor(Player* p, std::string const& name)
+    {
+        GraveyardStruct const* nearest = sGraveyard->GetClosestGraveyard(p, p->GetTeamId());
+        if (!nearest || nearest->Map != p->GetMapId())
+            return nullptr;
+        uint32 const mapId = p->GetMapId();
+        float const x = p->GetPositionX();
+        float const y = p->GetPositionY();
+        std::string refused;
+        return SafeGraveyardNear(p, nearest, mapId, x, y, p->GetPositionZ(),
+                                 GraveyardEvidenceFor(name, mapId, x, y,
+                                                      KillerEntryAt(name, mapId, x, y)),
+                                 refused);
+    }
+
+    // A FAR-HELD MEMBER ON LETHAL GROUND, ITS STONE NOT READY, WALKS TO SAFE
+    // GROUND (#744). Issued under the far hold only, right after the poll's
+    // re-assertion, the way the mail walk steps a held character: the step is
+    // whatever GroundedStep proves toward the graveyard, and the sweep is told
+    // the walk is deliberate until the next poll steps again. Once within
+    // HELD_GROUND_ARRIVED_YARDS DecideHeldGround answers Hold, and the member is
+    // held there like any other. False when there is no step to take, and the
+    // caller holds it where it stands as before.
+    static constexpr uint32 HELD_GROUND_POINT_ID = 0;
+    bool WalkHeldToSafeGround(Player* p, std::string const& name, GraveyardStruct const& grave)
+    {
+        if (!HeldWaitingForLeader(name))
+            return false;
+        WorldPosition const want(grave.Map, grave.x, grave.y, grave.z);
+        WorldPosition step;
+        if (!GroundedStep(p, want, step))
+            return false;
+        if (!p->IsStandState())
+            p->SetStandState(UNIT_STAND_STATE_STAND);
+        p->GetMotionMaster()->MovePoint(HELD_GROUND_POINT_ID, step.GetPositionX(),
+                                        step.GetPositionY(), step.GetPositionZ());
+        LetHeldCharacterWalk(name, PARTY_POLL_MS / 1000 + 5);
+        if (_heldGroundWalkSaid.insert(name).second)
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' (level {}) is held on ground well above its level with its "
+                     "hearthstone not ready - it walks {:.0f} yards to the graveyard at '{}' and "
+                     "is held there rather than wait to be killed (#744)",
+                     name, p->GetLevel(), p->GetExactDist2d(grave.x, grave.y), grave.name);
+        return true;
+    }
+
     void EndFarHold(std::string const& name, char const* why)
     {
+        _heldGroundSaid.erase(name);
+        _heldGroundWalkSaid.erase(name);
         _lethalLegHeld.erase(name);
         if (!_catchUpHeldFar.erase(name))
             return;
@@ -22909,7 +22965,11 @@ private:
                 // above it dies there instead, again after every revive (Ugga,
                 // Tanaris, five deaths in 44 minutes, every one `driven by idle`).
                 // Such a member takes its own hearthstone through the #697 hearth
-                // above, on the next poll, and the hold ends when it lands.
+                // above, on the next poll, and the hold ends when it lands. With
+                // the stone not ready it walks to the nearest graveyard it can
+                // survive and is held there (WalkHeldToSafeGround, below).
+                GraveyardStruct const* safeGrave = nullptr;
+                bool walkToSafety = false;
                 if (lethal == _lethalLegHeld.end() || !lethal->second.hearth)
                 {
                     OverseerDecisions::HeldGroundFacts ground;
@@ -22923,8 +22983,29 @@ private:
                     uint32 const stone = HearthstoneSpellOf(p);
                     ground.hearthReady = stone && !p->HasSpellCooldown(stone) &&
                                          !HearthPendingFor(name);
+                    if (OverseerDecisions::HeldGroundNeedsSafeSpot(ground))
+                    {
+                        safeGrave = SafeHeldGroundFor(p, name);
+                        if (safeGrave)
+                        {
+                            ground.safeSpotKnown = true;
+                            ground.safeSpotTopLevel =
+                                HostileSpawnsNear(p, safeGrave->Map, safeGrave->x, safeGrave->y,
+                                                  REVIVAL_AGGRO_RADIUS, 0).level;
+                            ground.safeSpotYards = p->GetExactDist2d(safeGrave->x, safeGrave->y);
+                        }
+                    }
                     OverseerDecisions::HeldGroundVerdict const verdict =
                         OverseerDecisions::DecideHeldGround(ground);
+                    walkToSafety = safeGrave &&
+                                   verdict.step == OverseerDecisions::HeldGroundStep::WalkToSafety;
+                    if (OverseerDecisions::HeldGroundNeedsSafeSpot(ground) && !walkToSafety &&
+                        _heldGroundSaid.insert(name).second)
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' (level {}) is held on ground where spawns reach "
+                                 "level {}, its hearthstone is not ready, and it stays held - {} "
+                                 "(#744)",
+                                 name, ground.memberLevel, ground.groundTopLevel, verdict.reason);
                     if (verdict.step == OverseerDecisions::HeldGroundStep::Hearth)
                     {
                         LethalLegHold& held = _lethalLegHeld[name];
@@ -22944,6 +23025,14 @@ private:
                         CATCH_UP_FAR_HOLD_SECONDS))
                 {
                     HoldFarFromLeader(p, name);
+                    if (walkToSafety && WalkHeldToSafeGround(p, name, *safeGrave))
+                    {
+                        _catchUpRefused[name] =
+                            std::string("it is walking to the graveyard at '") + safeGrave->name +
+                            "' because the ground it was held on is well above its level, and "
+                            "its leader comes back for it there";
+                        return;
+                    }
                     _catchUpRefused[name] =
                         lethal != _lethalLegHeld.end()
                             ? std::string("it is held where it stands because ") +
