@@ -325,6 +325,60 @@ void RealTerrainUnderAnArchIsUntouched()
     }
 }
 
+// 'Oz' at Bloodhoof Village, 2026-10-19 11:26:25 on the dev realm: feet on the
+// raw terrain (z -9.4 over terrain z -9.425), the ring flat because the town
+// floor is levelled, a polygon at its feet, and the surface probe from sixty
+// yards up finding nothing but that same terrain (-9.424545). Nothing is over
+// it. The rule called it the plane, released its errand, refused its aim and
+// asked for its hearthstone, and the next errand walked it back into town.
+TerrainReading LevelledTownFloor()
+{
+    TerrainReading r = OnThePlane();
+    r.mapId = 1;
+    r.x = -2301.2f;
+    r.y = -346.0f;
+    r.z = -9.4f;
+    r.terrainZ = -9.425f;
+    r.surfaceAboveZ = -9.424545f;
+    r.surfaceValid = true;
+    return r;
+}
+
+void ALevelledTownUnderOpenSkyIsNotThePlane()
+{
+    Check("Bloodhoof's floor with open sky over it is not the plane (#188)",
+          OnTheHiddenPlane(LevelledTownFloor(), LIVE), false);
+    Check("and it is not proven below the world for the other drives",
+          ProvenBelowTheWorld(LevelledTownFloor(), LIVE), false);
+
+    // An awning a few yards up (Gadgetzan, 01:49:43: surface 8.6 yards over
+    // the feet) is still under the gap every below-the-world rule asks for.
+    TerrainReading awning = LevelledTownFloor();
+    awning.surfaceAboveZ = awning.z + 8.6f;
+    Check("an awning under the gap is not the plane",
+          OnTheHiddenPlane(awning, LIVE), false);
+
+    // A city floor a gap or more over the feet is the measured case, and it
+    // still is.
+    TerrainReading covered = LevelledTownFloor();
+    covered.surfaceAboveZ = covered.z + LIVE.minimumGap;
+    Check("cover at the gap is still the plane",
+          OnTheHiddenPlane(covered, LIVE), true);
+
+    // Walking round the town for a quarter of an hour is never a return, a
+    // lift or a give-up, and the town floor is recorded as ground.
+    TerrainRecoveryState state;
+    for (int t = 0; t < 900; t += 5)
+    {
+        TerrainRecoveryVerdict const v =
+            TerrainRecoveryStep(state, LevelledTownFloor(), LIVE, 1000 + t);
+        CheckRemedy("a town floor under open sky is left alone", v.remedy,
+                    TerrainRemedy::Nothing);
+    }
+    Check("and it is ground a later return may use", state.plane.ground.valid,
+          true);
+}
+
 }  // namespace
 
 int main()
@@ -338,6 +392,7 @@ int main()
     GroundOnAnotherMapOrLongAgoIsNotUsed();
     TheBoundIsTwoThenLoudThenQuiet();
     RealTerrainUnderAnArchIsUntouched();
+    ALevelledTownUnderOpenSkyIsNotThePlane();
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);

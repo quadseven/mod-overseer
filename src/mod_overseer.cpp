@@ -28200,8 +28200,6 @@ private:
                         ring, terrain, TERRAIN_PLANE_FLAT_TOLERANCE_YARDS);
                 }
             }
-            bool const onThePlane = OverseerDecisions::OnTheHiddenPlane(
-                reading, TERRAIN_RECOVERY_LIMITS);
             // THE ORDINARY REACH FIRST, ALWAYS, and the deep one only where it
             // came back empty in the band. Written this way round rather than
             // as a widened probe for everybody so that not one reading outside
@@ -28212,6 +28210,12 @@ private:
             if (!reading.surfaceValid && nearThePlane)
                 reading.surfaceValid = SurfaceAbove(
                     bot, reading.surfaceAboveZ, TERRAIN_RECOVERY_VOID_PROBE_YARDS);
+            // AFTER THE SURFACE PROBE, NOT BEFORE IT (#188): the plane rule
+            // reads the sky over the feet, and a levelled town floor with
+            // nothing over it is not the plane. Asked before the probe, this
+            // saw no surface and kept calling Bloodhoof the plane.
+            bool const onThePlane = OverseerDecisions::OnTheHiddenPlane(
+                reading, TERRAIN_RECOVERY_LIMITS);
             // Most characters see their own footing again and stop here. Ask
             // the pure rule first with the conservative no-navmesh answer so
             // four Detour probes are paid only where the vertical gap itself
