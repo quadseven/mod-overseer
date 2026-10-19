@@ -19515,7 +19515,10 @@ GuildRunVerdict GuildRunNext(GuildRunPoll const& poll)
     {
         bool const fighting = poll.bossInCombat && poll.aliveInside > 0 &&
                               poll.secondsInside < poll.ceilingSeconds + GUILD_RUN_BOSS_EXTENSION_SECONDS;
-        if (!fighting)
+        bool const progressing =
+            poll.bossKilled && poll.secondsSinceKill < GUILD_RUN_PROGRESS_WINDOW_SECONDS &&
+            poll.secondsInside < poll.ceilingSeconds + GUILD_RUN_PROGRESS_EXTENSION_SECONDS;
+        if (!fighting && !progressing)
             return GuildRunVerdict::TimedOut;
     }
     if (poll.aliveInside == 0)
