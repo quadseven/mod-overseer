@@ -3898,6 +3898,92 @@ ProfessionStep NextProfessionStep(std::vector<unsigned> const& wanted,
     return step;
 }
 
+namespace
+{
+
+// True when the family still owes at least one member a fourth bag.
+bool SomebodyNeedsABag(std::vector<CraftingMember> const& family)
+{
+    for (CraftingMember const& member : family)
+        if (member.bags < 4)
+            return true;
+    return false;
+}
+
+// The first member that may craft bags, or the family's size when none can.
+std::size_t FirstTailor(std::vector<CraftingMember> const& family)
+{
+    for (std::size_t i = 0; i < family.size(); ++i)
+        if (family[i].isTailor)
+            return i;
+    return family.size();
+}
+
+// True when `member` can cast `spell` right now: it holds a trade, is below
+// its cap, and knows that recipe.
+bool CanCast(std::vector<CraftingMember> const& family, std::size_t i, uint32_t spell)
+{
+    CraftingMember const& member = family[i];
+    return member.skill != 0 && member.value < member.cap && member.knowsRecipe &&
+           member.nextRecipe == spell;
+}
+
+// True when `member` can skill-up right now: it holds a trade, is below its
+// cap, and knows the recipe it would cast.
+bool CanSkillUp(std::vector<CraftingMember> const& family, std::size_t i)
+{
+    CraftingMember const& member = family[i];
+    return member.skill != 0 && member.value < member.cap && member.knowsRecipe &&
+           member.nextRecipe != 0;
+}
+
+// True when `member` needs a trainer: it holds a trade and is at its cap or
+// does not know the recipe it would cast.
+bool NeedsTrainer(CraftingMember const& member)
+{
+    return member.skill != 0 && (member.value >= member.cap || !member.knowsRecipe);
+}
+
+}  // namespace
+
+CraftQueueStep NextCraftStep(std::vector<CraftingMember> const& family,
+                             FamilyWants const& wants)
+{
+    // 1. Bags for every member first, made by the family's tailor. A member
+    //    below four bags keeps the queue here until the tailor has made them
+    //    all; when there is no tailor, bags are not made at all.
+    if (SomebodyNeedsABag(family))
+    {
+        std::size_t const tailor = FirstTailor(family);
+        if (tailor < family.size())
+            return CraftQueueStep{CraftQueueStepKind::Bag, 0, 0, tailor};
+    }
+
+    // 2. Want-list items or consumables, while a crafter knows one of them.
+    if (!wants.wantList.empty())
+    {
+        for (uint32_t const spell : wants.wantList)
+        {
+            for (std::size_t i = 0; i < family.size(); ++i)
+                if (CanCast(family, i, spell))
+                    return CraftQueueStep{CraftQueueStepKind::Item, family[i].skill, spell, i};
+        }
+    }
+
+    // 3. Skill-ups: a craft below its cap that knows its next recipe.
+    for (std::size_t i = 0; i < family.size(); ++i)
+        if (CanSkillUp(family, i))
+            return CraftQueueStep{CraftQueueStepKind::SkillUp, family[i].skill,
+                                  family[i].nextRecipe, i};
+
+    // 4. Trainer visits: at the cap, or the recipe is not yet known.
+    for (std::size_t i = 0; i < family.size(); ++i)
+        if (NeedsTrainer(family[i]))
+            return CraftQueueStep{CraftQueueStepKind::TrainerVisit, family[i].skill, 0, i};
+
+    return CraftQueueStep{};
+}
+
 FishDriveStep NextFishDriveStep(bool wantsFishing, bool strategyIsOn, bool knowsFishing)
 {
     // RULE 1: A CHARACTER THAT SHOULD NOT BE FISHING NEVER GETS TurnOn,
