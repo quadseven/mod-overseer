@@ -55373,7 +55373,7 @@ private:
         // "<character>\n<verb>" already handed to a bot in THIS poll. Local to
         // the poll on purpose: the trigger slot is only contended between
         // deliveries that share one drain of the queue.
-        std::set<std::string> spoken;
+        std::vector<std::string> spoken;
 
         do
         {
@@ -55402,52 +55402,33 @@ private:
             char const* status = "error";
             std::string detail;
 
-            // Bot orders only. 'chat', 'gm', 'probe', 'give', 'trade',
-            // 'share', 'job', 'sell', 'bank', 'auction', 'bind', 'hearth',
-            // 'summon', 'conjure', 'cast', 'guild' and 'mail' do not go through
-            // PlayerbotAI::HandleCommand and share no
-            // trigger, so nothing they do can be overwritten by the row
-            // after them.
-            if (kind != "chat" && kind != "gm" && kind != "probe" && kind != "give"
-                && kind != "trade" && kind != "share" && kind != "quest" && kind != "job"
-                && kind != "sell"
-                && kind != "repair" && kind != "buy"
-                && kind != "bank" && kind != "auction" && kind != "bind"
-                && kind != "hearth" && kind != "conjure" && kind != "cast"
-                && kind != "summon"
-                && kind != "guild"
-                && kind != "naturalize"
-                && kind != "mail")
+            // Bot orders only: which kinds share a ChatCommandTrigger, and so
+            // which rows wait, is OverseerDecisions::HoldForSharedTrigger
+            // (#230, #278).
+            if (OverseerDecisions::HoldForSharedTrigger(spoken, kind, targetName, command))
             {
-                // The verb is the first word - `nc`, `co`, `d`. What the rest
-                // of the line says does not matter here; two commands with the
-                // same verb reach the same ChatCommandTrigger whatever their
-                // arguments are.
                 std::string const verb = command.substr(0, command.find(' '));
-                if (!spoken.insert(targetName + "\n" + verb).second)
-                {
-                    // Left PENDING, not claimed and not failed. The sender is
-                    // still waiting and will get its answer 2s from now.
-                    LOG_DEBUG("module.overseer",
-                              "overseer: holding command {} ('{}' for '{}') until next poll; "
-                              "'{}' already sent this poll and they share a trigger",
-                              id, command, targetName, verb);
-                    // ...AND IT GIVES UP ITS PLACE IN THE QUEUE
-                    // (mod-overseer#230). The SELECT above is ordered by
-                    // `updated_at`, so a row held here without a touch keeps the
-                    // head it is holding and is selected and held again on every
-                    // poll for as long as its character has other rows sharing
-                    // that verb - the same head-of-line block that wedged this
-                    // queue, merely bounded. One small write sends it behind
-                    // whatever can actually run now, and it is still pending,
-                    // still unclaimed and still unanswered, exactly as before.
-                    CharacterDatabase.Execute(
-                        "UPDATE overseer_command SET updated_at = NOW() "
-                        "WHERE id = {} AND status = 'pending'",
-                        id);
-                    ++held;
-                    continue;
-                }
+                // Left PENDING, not claimed and not failed. The sender is
+                // still waiting and will get its answer 2s from now.
+                LOG_DEBUG("module.overseer",
+                          "overseer: holding command {} ('{}' for '{}') until next poll; "
+                          "'{}' already sent this poll and they share a trigger",
+                          id, command, targetName, verb);
+                // ...AND IT GIVES UP ITS PLACE IN THE QUEUE
+                // (mod-overseer#230). The SELECT above is ordered by
+                // `updated_at`, so a row held here without a touch keeps the
+                // head it is holding and is selected and held again on every
+                // poll for as long as its character has other rows sharing
+                // that verb - the same head-of-line block that wedged this
+                // queue, merely bounded. One small write sends it behind
+                // whatever can actually run now, and it is still pending,
+                // still unclaimed and still unanswered, exactly as before.
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_command SET updated_at = NOW() "
+                    "WHERE id = {} AND status = 'pending'",
+                    id);
+                ++held;
+                continue;
             }
 
             // CLAIM BEFORE RUNNING, synchronously.

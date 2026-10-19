@@ -41,9 +41,8 @@
 
 #include <cstdio>
 #include <cstdlib>
-#include <fstream>
-#include <iterator>
 #include <string>
+#include <vector>
 
 using OverseerDecisions::ClaimIsAbandoned;
 using OverseerDecisions::CommandQueueSay;
@@ -51,6 +50,8 @@ using OverseerDecisions::CommandQueueSnapshot;
 using OverseerDecisions::CommandQueueVoice;
 using OverseerDecisions::CommandQueueVoiceLimits;
 using OverseerDecisions::CommandQueueVoiceState;
+using OverseerDecisions::HoldForSharedTrigger;
+using OverseerDecisions::KindSharesChatTrigger;
 
 namespace
 {
@@ -107,18 +108,41 @@ void Check(char const* what, bool got, bool want)
     ++failures;
 }
 
+// THE PER-POLL SHARED-TRIGGER HOLD (#230), AND WHAT IT MUST NOT HOLD (#278).
+// Two whispered bot orders with the same verb for one character in one poll
+// share a ChatCommandTrigger, so the second waits for the next poll. A `repair`
+// or `buy` row never reaches that trigger (the drain calls the core's own
+// handlers), so two of them in one poll are both attempted at once.
 void DirectEconomyRowsBypassWhisperDedupe()
 {
-    std::ifstream source("src/mod_overseer.cpp");
-    if (!source)
-    {
-        Check("the adapter source is readable", false, true);
-        return;
-    }
-    std::string const text((std::istreambuf_iterator<char>(source)),
-                           std::istreambuf_iterator<char>());
-    std::size_t const list = text.find("kind != \"repair\" && kind != \"buy\"");
-    Check("repair and buy are excluded from chat dedupe", list != std::string::npos, true);
+    // Two `repair all` rows for one character: `all` takes no arguments, so
+    // the first word is always the same, and this collided on every poll.
+    std::vector<std::string> poll;
+    Check("the first repair all row is attempted",
+          HoldForSharedTrigger(poll, "repair", "Brann", "all"), false);
+    Check("and a second repair all row for the same character is attempted too",
+          HoldForSharedTrigger(poll, "repair", "Brann", "all"), false);
+
+    // Two `buy` rows naming the same item entry for one character.
+    Check("the first buy row is attempted",
+          HoldForSharedTrigger(poll, "buy", "Brann", "entry:159 count:5"), false);
+    Check("and a second buy of the same entry for the same character is attempted too",
+          HoldForSharedTrigger(poll, "buy", "Brann", "entry:159 count:5"), false);
+
+    // The hold still does its own job: a whispered order sharing its verb with
+    // one already sent this poll waits, for that character only.
+    Check("the first bot order is attempted",
+          HoldForSharedTrigger(poll, "bot", "Brann", "nc +loot"), false);
+    Check("a second bot order with the same verb is held to the next poll",
+          HoldForSharedTrigger(poll, "bot", "Brann", "nc -loot"), true);
+    Check("the same verb for a different character is not held",
+          HoldForSharedTrigger(poll, "bot", "Magni", "nc -loot"), false);
+    Check("a different verb for the same character is not held",
+          HoldForSharedTrigger(poll, "bot", "Brann", "co +dps"), false);
+
+    Check("repair does not share the chat trigger", KindSharesChatTrigger("repair"), false);
+    Check("buy does not share the chat trigger", KindSharesChatTrigger("buy"), false);
+    Check("a bot order does share it", KindSharesChatTrigger("bot"), true);
 }
 
 // The poll #230 was measured on: 337 rows waiting, twenty of them in the

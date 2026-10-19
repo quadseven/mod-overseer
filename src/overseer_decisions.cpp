@@ -4000,6 +4000,36 @@ bool ClaimIsAbandoned(std::string const& claimedBy, std::string const& runToken,
     return true;
 }
 
+bool KindSharesChatTrigger(std::string const& kind)
+{
+    // Bot orders only. Each of these is dispatched to its own handler before
+    // PlayerbotAI::HandleCommand is ever reached, so nothing it does can be
+    // overwritten by the row after it.
+    static char const* const OWN_HANDLER[] = {
+        "chat",   "gm",     "probe",  "give",       "trade", "share",  "quest",
+        "job",    "sell",   "repair", "buy",        "bank",  "auction", "bind",
+        "hearth", "conjure", "cast",  "summon",     "guild", "naturalize", "mail",
+    };
+    for (char const* own : OWN_HANDLER)
+        if (kind == own)
+            return false;
+    return true;
+}
+
+bool HoldForSharedTrigger(std::vector<std::string>& sentThisPoll, std::string const& kind,
+                          std::string const& targetName, std::string const& command)
+{
+    if (!KindSharesChatTrigger(kind))
+        return false;
+    // What the rest of the line says does not matter: two commands with the
+    // same verb reach the same trigger whatever their arguments are.
+    std::string const key = targetName + "\n" + command.substr(0, command.find(' '));
+    if (std::find(sentThisPoll.begin(), sentThisPoll.end(), key) != sentThisPoll.end())
+        return true;
+    sentThisPoll.push_back(key);
+    return false;
+}
+
 CommandQueueVoice CommandQueueSay(CommandQueueVoiceState& state,
                                   CommandQueueSnapshot const& snapshot, time_t now,
                                   CommandQueueVoiceLimits const& limits)

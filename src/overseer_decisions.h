@@ -5218,6 +5218,23 @@ CommandQueueVoice CommandQueueSay(CommandQueueVoiceState& state,
                                   CommandQueueSnapshot const& snapshot, time_t now,
                                   CommandQueueVoiceLimits const& limits);
 
+// THE PER-POLL SHARED-TRIGGER HOLD (#230). A whispered bot order goes through
+// PlayerbotAI::HandleCommand, and two orders with the same verb (the first word:
+// `nc`, `co`, `d`) for one character share a ChatCommandTrigger, so the second
+// would overwrite the first inside one poll. That second row waits for the next.
+//
+// Every other kind is dispatched to its own handler and shares no trigger, so
+// it is never held. `repair` and `buy` call the core's repair and buy handlers
+// directly; leaving them off this list held a second `repair all` for the same
+// character on every poll (#278).
+bool KindSharesChatTrigger(std::string const& kind);
+
+// True when this row must wait for the next poll. `sentThisPoll` is local to one
+// drain of the queue and records "<character>\n<verb>" for every row that went
+// ahead; a row that is not held is recorded.
+bool HoldForSharedTrigger(std::vector<std::string>& sentThisPoll, std::string const& kind,
+                          std::string const& targetName, std::string const& command);
+
 // ------------------------------------------------------------- gear (#145) --
 //
 // WHAT AN ITEM IS WORTH TO ONE CHARACTER, AND WHETHER IT MAY WEAR IT AT ALL.
