@@ -27206,15 +27206,45 @@ private:
 
             // A tank at range cannot land the melee actions its combat engine
             // keeps trying. Pursuit lets auto attacks supply rage even when
-            // the victim is a caster that never walks in.
+            // the victim is a caster that never walks in (#1049).
+            //
+            // ONLY WHERE NOTHING ELSE OWNS THE TANK'S FEET (#1055). This used
+            // to chase on every poll with no gate, so inside a dungeon it
+            // turned the tank back mid-way through mod-dungeon-clear's
+            // LOS-break drag, the one maneuver that keeps it out of melee
+            // reach on purpose. TankMayPursue says where it may act; see its
+            // comment for the instance map, the holds, mounted and dead.
+            if (!bot->IsInCombat())
+                _tankPursuitSaid.erase(name);
             Unit* combatVictim = bot->GetVictim();
             if (!combatVictim)
                 combatVictim = bot->GetSelectedUnit();
-            if (combatVictim && bot->IsValidAttackTarget(combatVictim) &&
-                OverseerDecisions::WarriorNeedsMeleePursuit(
-                    bot->getClass(), StrategyPresent(botAI, StrategyItem{"tank", true}),
-                    bot->IsInCombat(), bot->IsWithinMeleeRange(combatVictim)))
-                bot->GetMotionMaster()->MoveChase(combatVictim);
+            if (combatVictim && bot->IsValidAttackTarget(combatVictim))
+            {
+                OverseerDecisions::TankPursuitFacts pursuit;
+                pursuit.classId = bot->getClass();
+                pursuit.tanks = StrategyPresent(botAI, StrategyItem{"tank", true});
+                pursuit.inCombat = bot->IsInCombat();
+                pursuit.inMeleeRange = bot->IsWithinMeleeRange(combatVictim);
+                Map* pursuitMap = bot->GetMap();
+                pursuit.onInstanceMap = !pursuitMap || pursuitMap->Instanceable();
+                pursuit.heldStill = HeldStill(name) || HeldAfterRevival(name);
+                pursuit.mounted = bot->IsMounted() || bot->IsInFlight();
+                pursuit.alive = bot->IsAlive();
+                if (OverseerDecisions::TankMayPursue(pursuit))
+                {
+                    // Once per fight, not once per poll: the set is cleared
+                    // above on the first poll that finds it out of combat.
+                    if (_tankPursuitSaid.insert(name).second)
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' tanks out of melee reach of '{}' "
+                                 "({:.1f} yards) in the open world - chasing it so "
+                                 "its auto attacks land (#1049, gated by #1055)",
+                                 name, combatVictim->GetName(),
+                                 bot->GetDistance(combatVictim));
+                    bot->GetMotionMaster()->MoveChase(combatVictim);
+                }
+            }
 
             bool const aimed = questAims.count(name) != 0 || travelAims.count(name) != 0;
 
@@ -75607,6 +75637,10 @@ private:
     uint32 _gearTimer = 0;
     uint32 _councilTimer = 0;
     uint32 _engagementTimer = 0;
+    // Tanks whose open-world pursuit (#1049) has been logged this fight, so
+    // DriveEngagementSafety says it once per fight rather than every poll.
+    // Erased on the first poll that finds the character out of combat (#1055).
+    std::set<std::string> _tankPursuitSaid;
     uint32 _terrainRecoveryTimer = 0;
     // GATHERING/BARRIER coordinator poll (mod-overseer#88). Its own timer,
     // not piggybacked on QUEST_POLL_MS or ENGAGEMENT_POLL_MS: this drive is

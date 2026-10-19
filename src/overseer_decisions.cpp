@@ -17436,6 +17436,14 @@ bool WarriorNeedsMeleePursuit(uint8_t classId, bool tanks, bool inCombat,
     return classId == 1 && tanks && inCombat && !inMeleeRange;
 }
 
+bool TankMayPursue(TankPursuitFacts const& facts)
+{
+    if (facts.onInstanceMap || facts.heldStill || facts.mounted || !facts.alive)
+        return false;
+    return WarriorNeedsMeleePursuit(facts.classId, facts.tanks, facts.inCombat,
+                                    facts.inMeleeRange);
+}
+
 GearVerdict GearShieldPair(GearVerdict const& oneHand, GearVerdict const& shield)
 {
     GearVerdict pair;
