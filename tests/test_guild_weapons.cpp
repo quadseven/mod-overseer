@@ -144,6 +144,7 @@ int main()
     sick.sick = true;
     sick.memberLevel = 12;
     sick.groundTopLevel = 10;
+    sick.boundOnMemberMap = true;
     Check(DecideRevivedSickGround(sick) == RevivedSickGroundStep::Stay,
           "a family member on safe ground carries on");
     sick.restWhileSick = true;

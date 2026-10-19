@@ -20,6 +20,7 @@ int main()
     facts.memberLevel = 35;
     facts.groundTopLevel = 40;
     facts.hearthReady = true;
+    facts.boundOnMemberMap = true;
     check("lethal ground with ready hearth", facts, HeldGroundStep::Hearth);
     facts.hearthReady = false;
     facts.safeSpotKnown = true;
@@ -38,6 +39,7 @@ int main()
     sick.memberLevel = 17;
     sick.groundTopLevel = 80;
     sick.hearthReady = true;
+    sick.boundOnMemberMap = true;
     sick.resting = true;
     if (DecideRevivedSickGround(sick) != RevivedSickGroundStep::Stay)
     {
