@@ -41,6 +41,7 @@ int main()
     facts.groundTopLevel = 34;
     facts.levelGap = 3;
     facts.hearthReady = false;
+    facts.boundOnMemberMap = true;
     expect("lethal ground, stone not ready, needs a safe spot",
            HeldGroundNeedsSafeSpot(facts), true);
 

@@ -8362,9 +8362,16 @@ static bool HeldGroundLethal(uint32_t memberLevel, uint32_t topLevel, uint32_t l
     return topLevel && topLevel >= memberLevel + levelGap;
 }
 
+// A ready stone bound on the map the member stands on (#274): one bound on
+// another map would put it on another continent from its family.
+static bool HeldGroundHearthUsable(HeldGroundFacts const& facts)
+{
+    return facts.hearthReady && facts.boundOnMemberMap;
+}
+
 bool HeldGroundNeedsSafeSpot(HeldGroundFacts const& facts)
 {
-    return !facts.resting && !facts.hearthReady &&
+    return !facts.resting && !HeldGroundHearthUsable(facts) &&
            HeldGroundLethal(facts.memberLevel, facts.groundTopLevel, facts.levelGap);
 }
 
@@ -8374,7 +8381,7 @@ HeldGroundVerdict DecideHeldGround(HeldGroundFacts const& facts)
         return {HeldGroundStep::Hold, "an inn or a city is never lethal ground"};
     if (!HeldGroundLethal(facts.memberLevel, facts.groundTopLevel, facts.levelGap))
         return {HeldGroundStep::Hold, "ground is below the #697 lethal margin"};
-    if (facts.hearthReady)
+    if (HeldGroundHearthUsable(facts))
         return {HeldGroundStep::Hearth, "lethal ground and hearthstone ready"};
     // A GRAVEYARD IS ONLY SAFE GROUND IF ITS OWN SPAWNS ARE BELOW THE SAME
     // MARGIN: a walk to one as lethal as where it stands trades a death here
@@ -8384,7 +8391,10 @@ HeldGroundVerdict DecideHeldGround(HeldGroundFacts const& facts)
         return {HeldGroundStep::Hold, "lethal ground, and the nearest graveyard is lethal too"};
     if (facts.safeSpotKnown && facts.safeSpotYards > HELD_GROUND_ARRIVED_YARDS)
         return {HeldGroundStep::WalkToSafety,
-                "lethal ground, hearthstone not ready, and a graveyard it can survive"};
+                facts.hearthReady
+                    ? "lethal ground, hearthstone bound on another map, and a graveyard it "
+                      "can survive"
+                    : "lethal ground, hearthstone not ready, and a graveyard it can survive"};
     if (facts.safeSpotKnown)
         return {HeldGroundStep::Hold, "already at the graveyard it can survive"};
     return {HeldGroundStep::Hold, "lethal ground but no safe move is known"};
@@ -8404,8 +8414,10 @@ RevivedSickGroundStep DecideRevivedSickGround(RevivedSickGroundFacts const& fact
         return RevivedSickGroundStep::HoldOutOfCombat;
     if (!facts.sick || facts.resting || !lethal)
         return RevivedSickGroundStep::Stay;
-    return facts.hearthReady ? RevivedSickGroundStep::Hearth
-                             : RevivedSickGroundStep::HoldOutOfCombat;
+    // A stone bound on another map is no way out of here: it is a hearth to
+    // another continent (#274), so it is held out of combat as if not ready.
+    return facts.hearthReady && facts.boundOnMemberMap ? RevivedSickGroundStep::Hearth
+                                                       : RevivedSickGroundStep::HoldOutOfCombat;
 }
 
 bool TownCounterWalkAllowed(bool isTownCounter, float distanceYards)

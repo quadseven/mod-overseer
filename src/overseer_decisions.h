@@ -10040,8 +10040,19 @@ struct HeldGroundFacts
     uint32_t groundTopLevel{0};
     uint32_t levelGap{3};
     bool hearthReady{false};
+    // ITS HEARTHSTONE IS BOUND ON THE MAP IT STANDS ON (#274). A held member
+    // is always on its leader's map (the cross-map case is answered before the
+    // far hold), so a bind on another map is a hearth to another continent
+    // from its family. Measured on wow-dev 2026-10-19: Grog (43), held far
+    // from Grug on level 48 and then level 54 ground on map 1, hearthed at
+    // 08:48 and again at 13:28 to its bind on map 0, and each time the family
+    // stayed split for the half hour or more the boat back took. A stone bound
+    // elsewhere is not a hearth this rule may take: the member walks to a
+    // graveyard it can survive instead, or is held. False until the adapter
+    // reads the bind, so an unread bind never sends anyone across an ocean.
+    bool boundOnMemberMap{false};
     // THE NEAREST GRAVEYARD IT CAN STAND AT, read when the hearth is not ready
-    // (#744). On wow-dev 2026-10-18 21:47:49 two level 31 members were held
+    // or is bound on another map (#744, #274). On wow-dev 2026-10-18 21:47:49 two level 31 members were held
     // on Desolace ground that spawns level 34, their stones not ready, and the
     // verdict was a silent Hold: one died 3s later and the other 12s later,
     // both `driven by idle`. WalkToSafety had no caller, because nothing ever
@@ -10061,8 +10072,8 @@ struct HeldGroundFacts
 constexpr float HELD_GROUND_ARRIVED_YARDS = 20.0f;
 
 // The ground it is held on is lethal (the #697 margin, outside an inn or a
-// city) and its hearthstone is not ready, so the only move left is a walk to
-// safe ground. The adapter asks this before it reads a graveyard, so the
+// city) and its hearthstone is not ready or is bound on another map, so the
+// only move left is a walk to safe ground. The adapter asks this before it reads a graveyard, so the
 // graveyard and the death rows behind it are read only for a member that
 // needs one.
 bool HeldGroundNeedsSafeSpot(HeldGroundFacts const& facts);
@@ -20979,6 +20990,13 @@ struct RevivedSickGroundFacts
     uint32_t groundTopLevel{0};
     uint32_t levelGap{3};
     bool hearthReady{false};
+    // ITS HEARTHSTONE IS BOUND ON THE MAP IT STANDS ON (#274). A stone bound
+    // on another map is a hearth to another continent: Grog revived sick on
+    // map 1 at wow-dev 2026-10-19 08:48:11, this rule said hearth, and the
+    // cast landed it on map 0 while its leader stood on map 1. Without a bind
+    // on this map a sick member on lethal ground is held out of combat, as it
+    // is when the stone is not ready. False until the adapter reads the bind.
+    bool boundOnMemberMap{false};
     // In an inn or a city (the core's resting flag): under guards, never lethal.
     bool resting{false};
     // A natural guild member rests out its sickness wherever it stands: at
