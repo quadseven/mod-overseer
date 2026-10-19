@@ -50,8 +50,10 @@ int main()
 
     std::string const adoption = Between(source, "if (coord.phase == DungeonRunPhase::Idle)",
                                          "// HOW MANY RUNS ARE LEFT");
-    Check("finder groups are excluded from the family party",
-          source.find("group->isLFGGroup()") != std::string::npos &&
+    // #1045: the family's own finder group is its party; a guild run's
+    // group is what is excluded (test_family_finder_party.cpp).
+    Check("guild run groups are excluded from the family party",
+          source.find("facts.heldByGuildRun = NamedByAGuildRun(") != std::string::npos &&
               source.find("FamilyPartyMembers(") != std::string::npos);
     Check("outside roster members are not considered for adoption",
           adoption.find("for (std::string const& member : familyParty)") != std::string::npos);
@@ -61,7 +63,7 @@ int main()
     std::string const clientGate = Between(source, "bool hasInsideMember = false;",
                                            "OverseerDecisions::LeaderClientGate const leaderClientGate");
     Check("only family party members can trigger the client loss gate",
-          clientGate.find("InItsFamilyParty(candidate, family)") != std::string::npos);
+          clientGate.find("InTheFamilyRunParty(candidate, family)") != std::string::npos);
 
     std::string const census = Between(source, "DungeonRunPhase::StagedInside and",
                                       "// THE RUN JOINS ITS CAMPAIGN");

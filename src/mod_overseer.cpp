@@ -39733,7 +39733,9 @@ private:
 
     // Does `p` stand in its own family's party: a group the core does not own
     // (no battleground, battlefield or finder group), led by a member of the
-    // same family? A lent member leaves only that one for a guild run.
+    // same family? A lent member leaves only that one for a guild run. The
+    // family's dungeon run asks InTheFamilyRunParty instead, which counts the
+    // family's own finder group (#1045).
     static bool InItsFamilyParty(Player* p, std::string const& family)
     {
         Group* const group = p ? p->GetGroup() : nullptr;
@@ -39743,8 +39745,50 @@ private:
         return OnRoster(leader) && FamilyOfCharacter(leader) == family;
     }
 
+    // Is `name` one of a guild run's: a live run, a run waiting to be adopted
+    // after a restart, or a stray a restart left behind?
+    bool NamedByAGuildRun(std::string const& name) const
+    {
+        if (InAGuildRun(name))
+            return true;
+        for (GuildRunAdoption const& adoption : _guildRunAdoptions)
+            if (name == adoption.tank || name == adoption.request.healer ||
+                std::find(adoption.request.damage.begin(), adoption.request.damage.end(),
+                          name) != adoption.request.damage.end())
+                return true;
+        for (GuildRunStray const& stray : _guildRunStrays)
+            if (std::find(stray.names.begin(), stray.names.end(), name) != stray.names.end())
+                return true;
+        return false;
+    }
+
+    // Does `p` stand in its family's party for the family's dungeon run
+    // (OverseerDecisions::CountsInFamilyParty, #1045)? Unlike InItsFamilyParty
+    // a finder group counts: a run the dungeon finder took the family into
+    // leaves it in one. A group a guild run holds does not (#1021).
+    bool InTheFamilyRunParty(Player* p, std::string const& family) const
+    {
+        Group* const group = p ? p->GetGroup() : nullptr;
+        OverseerDecisions::FamilyPartyFacts facts;
+        facts.inGroup = group != nullptr;
+        if (group)
+        {
+            std::string const leader = group->GetLeaderName();
+            uint64 const guid = group->GetGUID().GetRawValue();
+            facts.coreOwnedGroup = group->isBGGroup() || group->isBFGroup();
+            facts.finderGroup = group->isLFGGroup();
+            facts.leaderOfFamily = OnRoster(leader) && FamilyOfCharacter(leader) == family;
+            facts.heldByGuildRun = NamedByAGuildRun(p->GetName()) || NamedByAGuildRun(leader);
+            for (GuildRun const& run : _guildRuns)
+                if (run.groupGuid && run.groupGuid == guid)
+                    facts.heldByGuildRun = true;
+        }
+        return OverseerDecisions::CountsInFamilyParty(facts);
+    }
+
     // The coordinator owns the family's party, not every roster character who
-    // happens to stand on the same dungeon map (notably a finder group).
+    // happens to stand on the same dungeon map (notably a guild finder run's
+    // group). The family's own finder group is its party.
     std::vector<std::string> FamilyPartyMembers(
         std::vector<std::string> const& members, std::string const& family) const
     {
@@ -39753,7 +39797,7 @@ private:
         for (std::string const& name : members)
         {
             Player* const member = ObjectAccessor::FindPlayerByName(name);
-            if (InItsFamilyParty(member, family))
+            if (InTheFamilyRunParty(member, family))
                 party.push_back(name);
         }
         return party;
@@ -49112,7 +49156,7 @@ private:
         for (std::string const& member : members)
         {
             Player* const candidate = ObjectAccessor::FindPlayerByName(member);
-            if (!candidate || !InItsFamilyParty(candidate, family) || !InDungeonRun(candidate))
+            if (!candidate || !InTheFamilyRunParty(candidate, family) || !InDungeonRun(candidate))
                 continue;
             hasInsideMember = true;
             if (!AuthorizedDcIssuer(candidate))
@@ -49378,7 +49422,7 @@ private:
             // coordinator returns before it can reach EXIT.
             Player* currentLeader = ObjectAccessor::FindPlayerByName(leaderName);
             std::vector<std::string> const familyParty = FamilyPartyMembers(members, family);
-            Player* activeInside = currentLeader && InItsFamilyParty(currentLeader, family) &&
+            Player* activeInside = currentLeader && InTheFamilyRunParty(currentLeader, family) &&
                                            InDungeonRun(currentLeader)
                                        ? currentLeader
                                        : nullptr;

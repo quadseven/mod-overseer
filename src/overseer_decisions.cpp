@@ -22546,4 +22546,10 @@ bool HealerStandsDown(HealerStandDownFacts const& facts)
     return facts.inRun && facts.livingResurrector && facts.deadSeconds < facts.windowSeconds;
 }
 
+bool CountsInFamilyParty(FamilyPartyFacts const& facts)
+{
+    return facts.inGroup && !facts.coreOwnedGroup && facts.leaderOfFamily &&
+           !facts.heldByGuildRun;
+}
+
 }  // namespace OverseerDecisions
