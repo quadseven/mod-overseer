@@ -9434,6 +9434,12 @@ CrossingPrice PriceCrossings(std::vector<CrossingOffer> const& offers,
 //      its continent instead ends the crossing.
 //   5. DEAD, FIGHTING, OR A HEARTH IN FLIGHT: wait. The ghost run, the fight
 //      and the cast each own the character until they end.
+//   5b. A PARTY PORTAL TO THE LEADER'S MAP STANDS WITHIN REACH: walk to it and
+//      click it (#410). The leader crossed by a `use-portal` row and left the
+//      rest beside the mage's portal; one click carries each of them, where the
+//      rules below would hearth a follower the wrong way or walk it off to a
+//      boat while the portal expires. The destination is the portal spell's own
+//      target position (PickPortalTo), so a portal anywhere else is ignored.
 //   6. BOUND ON THE LEADER'S MAP WITH THE STONE READY: hearth. Ahead of the
 //      boat because it is one cast against a walk, a wait and a ride, and
 //      ahead of a crossing already walking to its berth for the same reason.
@@ -9455,6 +9461,7 @@ enum class StrandedWay : std::uint8_t
     Sail,
     WaitForStone,
     Refuse,
+    Portal,
 };
 
 char const* StrandedWayName(StrandedWay way);
@@ -9495,6 +9502,9 @@ struct StrandedFacts
     // Carried, off cooldown, and with casts left to try this episode.
     bool stoneReady{false};
     bool hearthInFlight{false};
+    // A party portal this member may click stands within reach on its map, and
+    // the spell it casts sends the clicker to `leaderMap` (PickPortalTo, #410).
+    bool portalToLeaderMap{false};
     // A transport whose crew is not hostile to this character, with a level
     // surveyed berth at both ends, joins the two maps (PriceCrossings picked
     // one).
@@ -16101,6 +16111,109 @@ constexpr char const* BadTargetName = "a character name is letters only";
 // bind, sell, repair and hearth tables make: a refusal this table has never
 // heard of is more likely a new transient than a new permanent.
 TownRetry CastRefusalRetry(std::string const& detail);
+
+// ------------------------------------- clicking the mage's portal (#410) --
+//
+// A CAST ROW MAKES THE PORTAL AND NOTHING WALKS THROUGH IT. #409 left the mage's
+// Portal: Stormwind standing there with its guid, type and spell reported, and
+// an operator driving the clicks by hand. A mage portal is gameobject type 22
+// (GAMEOBJECT_TYPE_SPELLCASTER): clicking it casts its Data0 spell on the
+// clicker, and GameObject::Use refuses a party-only one to anybody who is not
+// its owner or in the owner's group. So the clicker has to be one of the party,
+// standing within the object's interaction distance, and the object has to have
+// a charge left (Data1, zero for unlimited).
+//
+// `use-portal` on kind='quest', routed on its first word beside
+// `use-gameobject`, so no ENUM migration. It names nothing but an optional
+// object guid; the character is the row's. With no guid it takes the nearest
+// party-owned type 22 object this character may use.
+//
+// THE ORDER IS LEADER FIRST (the decision on #410). A follower that crosses
+// before its leader is hearthed straight back by DecideStrandedWay's rule 6.
+// The leader crosses by a row, and the members it leaves behind are taken over
+// by the stranded drive's Portal rule (DecideStrandedWay), which walks each one
+// to the same portal and clicks it while the portal lasts. So a row for a
+// follower while its leader still stands on the portal's map is refused `later`.
+constexpr char const* USE_PORTAL_VERB = "use-portal";
+constexpr std::uint32_t SPELLCASTER_OBJECT_TYPE = 22;
+
+// First word is `use-portal`. A malformed row still reaches the parser.
+bool IsPortalUseRow(std::string const& command);
+
+struct PortalUseRequest
+{
+    bool ok{false};
+    char const* error{""};
+    // The object's guid counter, as a cast row reports it; 0 for "the nearest".
+    std::uint32_t objectGuid{0};
+};
+
+// `use-portal` or `use-portal <guid>`, the guid a non-zero decimal number.
+PortalUseRequest ParsePortalUseRequest(std::string const& command);
+
+// The refusals this verb adds to the CastRefusal ones it shares (session,
+// world, bot AI, dead, combat, flight, trade, transport, casting). No quote
+// characters: they go into an UPDATE.
+namespace PortalUseRefusal
+{
+constexpr char const* Malformed = "a use-portal row takes an optional object guid and nothing else";
+constexpr char const* NoSuchObject = "no portal stands within reach";
+constexpr char const* NotInParty = "the character is not in the portal owner's party";
+constexpr char const* NoCharges = "the portal has no charges left";
+constexpr char const* LeaderFirst = "the party leader crosses first";
+constexpr char const* AlreadyRunning = "a use-portal row is already running for that character";
+constexpr char const* GroundRefused = "the ground between the character and the portal does not hold";
+constexpr char const* NotReached = "the character did not reach the portal in time";
+}  // namespace PortalUseRefusal
+
+// Its own refusals first, then CastRefusalRetry for the shared ones.
+TownRetry PortalUseRefusalRetry(std::string const& detail);
+
+// ONE GAME OBJECT IN REACH, AS FACTS. The adapter reads every one in its sweep;
+// this file decides which may be clicked.
+struct PortalCandidate
+{
+    std::uint32_t guid{0};
+    std::uint32_t type{0};
+    bool ownerIsSelf{false};
+    // The owner is in this character's group: GameObject::Use's own party test.
+    bool ownerInParty{false};
+    std::uint32_t charges{0};  // Data1; 0 is unlimited
+    std::uint32_t uses{0};     // GameObject::GetUseCount
+    float yards{-1.f};
+    // Where the spell it casts sends the clicker: the teleport effect's own
+    // spell_target_position. Unknown for a spell that moves nobody.
+    bool destinationKnown{false};
+    std::uint32_t destinationMap{0};
+};
+
+// "" when this character may click it, else the PortalUseRefusal that says why
+// not: not a spellcaster object, not the party's, or spent.
+char const* PortalCandidateWall(PortalCandidate const& candidate);
+
+// THE DEFAULT PICK, AND THE NAMED ONE. With `wantGuid` 0, the nearest candidate
+// with no wall; with a guid, that candidate if its wall is clear. -1 when
+// nothing qualifies, and `wall` then says why (the named object's own wall, or
+// for the default pick the most specific wall any spellcaster object had).
+int PickPortal(std::vector<PortalCandidate> const& candidates, std::uint32_t wantGuid,
+               char const*& wall);
+
+// THE STRANDED RULE'S PICK: the nearest candidate with no wall whose spell sends
+// the clicker to `map`. A portal that leads anywhere else is not this one.
+int PickPortalTo(std::vector<PortalCandidate> const& candidates, std::uint32_t map);
+
+// THE ORDER GATE. True means refuse `later`: the character is in a group it
+// does not lead, and that group's leader can be read and still stands on the
+// portal's map. A leader that cannot be read is not waited on.
+struct PortalOrderFacts
+{
+    bool grouped{false};
+    bool leadsGroup{false};
+    bool leaderReadable{false};
+    std::uint32_t leaderMap{0};
+    std::uint32_t portalMap{0};
+};
+bool PortalLeaderCrossesFirst(PortalOrderFacts const& facts);
 
 // ------------------------------------------ learning a recipe from an item --
 //

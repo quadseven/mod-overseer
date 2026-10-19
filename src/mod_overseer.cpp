@@ -10416,6 +10416,8 @@ private:
         for (CastCheck const& check : _pendingCasts)
             if (check.targetName == name)
                 return true;
+        if (PortalUseUnderWay(name))
+            return true;
         for (SummonCheck const& check : _pendingSummons)
             if (check.summonerName == name || check.ev.helper == name
                 || check.helperName == name || check.ev.heldHelper == name)
@@ -44379,6 +44381,20 @@ private:
                            _strandedHearthTries[name] < OverseerDecisions::EXIT_HEARTH_ATTEMPTS;
         facts.hearthInFlight = HearthPendingFor(name);
 
+        // A PARTY PORTAL TO THE LEADER'S MAP (#410): the leader crossed by a
+        // `use-portal` row and left this member beside the mage's portal. Read
+        // from the portal spell's own destination, so a portal anywhere else is
+        // not this one (PickPortalTo).
+        std::vector<GameObject*> portals;
+        std::vector<OverseerDecisions::PortalCandidate> portalFacts;
+        int portalPick = -1;
+        if (split && facts.readable && !facts.aboard && facts.memberMap != facts.leaderMap)
+        {
+            ReadPortals(p, portals, portalFacts);
+            portalPick = OverseerDecisions::PickPortalTo(portalFacts, facts.leaderMap);
+            facts.portalToLeaderMap = portalPick >= 0;
+        }
+
         // PRICED ONLY WHEN IT CAN MATTER, and never while a refusal stands.
         auto const refused = _loneCrossingRefused.find(name);
         bool const standingDown =
@@ -44487,6 +44503,32 @@ private:
                     case OverseerDecisions::ExitHearthStep::NotInside:
                         break;
                 }
+                return true;
+            }
+
+            case OverseerDecisions::StrandedWay::Portal:
+            {
+                // WALK TO IT AND CLICK IT, by the `use-portal` row's own check
+                // with no row behind it (id 0): the command poll walks it there,
+                // clicks, and reads the crossing back.
+                EndLoneCrossing(name, "a party portal takes it to its leader instead");
+                if (PortalUseUnderWay(name))
+                    return true;
+                PortalUseCheck click;
+                click.request = "stranded";
+                char const* const wall =
+                    BeginPortalUse(p, portals[std::size_t(portalPick)],
+                                   portalFacts[std::size_t(portalPick)], click);
+                if (*wall)
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' could not take the party portal to its leader's "
+                             "map {}: {}",
+                             name, facts.leaderMap, wall);
+                else if (fresh)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is on map {} and its leader '{}' on map {} - {} "
+                             "(#410)",
+                             name, facts.memberMap, leader->GetName(), facts.leaderMap, why);
                 return true;
             }
 
@@ -55439,6 +55481,10 @@ private:
         // rows it can before it hands out new work.
         ResolveCastChecks(sincePollMs);
 
+        // ...and the portal clicks, which walk to the mage's portal, click it,
+        // and read the crossing back the way a cast's teleport is read (#410).
+        ResolvePortalUses(sincePollMs);
+
         // ...and the learns, which wait out spell 483's own three second cast
         // and then ask Player::HasSpell whether the recipe arrived. Beside the
         // casts because it is the same kind of row - a cast this module drove
@@ -55700,6 +55746,11 @@ private:
                 detail = DoTrade(player, targetArg, command, status, rowResult);
             else if (kind == "share")
                 detail = DoShare(player, targetArg, command, status, rowResult);
+            else if (kind == "quest" && OverseerDecisions::IsPortalUseRow(command))
+                // CLICK THE PARTY'S PORTAL (#410): walk to the mage's portal,
+                // click it, and read the crossing back. Routed on its first word
+                // beside `use-gameobject`, so no ENUM migration is needed.
+                detail = DoPortalUse(player, command, status, rowResult, id);
             else if (kind == "quest" && OverseerDecisions::IsQuestUseRow(command))
                 // A QUEST OBJECTIVE THAT NEEDS A USE: an item used at a creature,
                 // or a gameobject clicked. Routed on the first word beside
@@ -67879,6 +67930,410 @@ private:
         }
 
         _pendingCasts.swap(stillCasting);
+    }
+
+    // ================================ `use-portal`: click the party's portal ==
+    //
+    // NOTHING CLICKED THE PORTAL THE MAGE NOW MAKES (#410). A `cast` row makes a
+    // Portal: Stormwind and reports it; nobody walked through it. Every piece of
+    // the click was already here, and this ties them together rather than
+    // copying any of them:
+    //
+    //   * the object: ReadPortals sweeps the type 22 (GAMEOBJECT_TYPE_SPELLCASTER)
+    //     objects in reach the way FindObjectThisCastMade sweeps one cast's, and
+    //     OverseerDecisions::PickPortal chooses among them with GameObject::Use's
+    //     own tests (the owner or the owner's group, a charge left);
+    //   * the walk: WalkTowardTheStone, the meeting stone's grounded-step walk
+    //     with its LetHeldCharacterWalk suppression, under the same hold;
+    //   * the click: DriveGameObjectUse, whose handler re-checks the interaction
+    //     distance itself (AtTheStone asks the same line first);
+    //   * the read-back: CastPlaceChanged through ReadTeleportFlight, as `hearth`
+    //     and `cast` read a teleport, with FindPlayerByName asked with
+    //     checkInWorld false because a map change takes the character out of the
+    //     world while it crosses.
+    //
+    // LEADER FIRST (the decision on #410). A row for a follower while its leader
+    // still stands on the portal's map is refused `later`; the followers cross by
+    // the stranded drive's Portal rule (DriveStrandedMember), which parks the
+    // same check with no row behind it.
+    static constexpr char const* PORTAL_HOLD_VERB = "portal";
+
+    struct PortalSweepCheck
+    {
+        bool operator()(GameObject* go) const
+        {
+            GameObjectTemplate const* info = go->GetGOInfo();
+            return info && info->type == GAMEOBJECT_TYPE_SPELLCASTER;
+        }
+    };
+
+    // Where a spell sends whoever it is cast on: its teleport effect's own
+    // spell_target_position row. False for a spell that moves nobody, so a
+    // portal whose destination cannot be read is never taken for one that leads
+    // to the leader.
+    static bool PortalDestination(uint32 spellId, uint32& map)
+    {
+        SpellInfo const* spell = sSpellMgr->GetSpellInfo(spellId);
+        if (!spell)
+            return false;
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+        {
+            uint32 const effect = spell->Effects[i].Effect;
+            if (effect != SPELL_EFFECT_TELEPORT_UNITS &&
+                effect != SPELL_EFFECT_TELEPORT_UNITS_FACE_CASTER)
+                continue;
+            if (SpellTargetPosition const* to =
+                    sSpellMgr->GetSpellTargetPosition(spellId, SpellEffIndex(i)))
+            {
+                map = to->target_mapId;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Every spellcaster object within CAST_OBJECT_SWEEP_YARDS of `who`, as the
+    // facts PickPortal and PickPortalTo decide on, index for index.
+    static void ReadPortals(Player* who, std::vector<GameObject*>& objects,
+                            std::vector<OverseerDecisions::PortalCandidate>& out)
+    {
+        objects.clear();
+        out.clear();
+        if (!who || !who->IsInWorld())
+            return;
+        std::list<GameObject*> found;
+        PortalSweepCheck check;
+        Acore::GameObjectListSearcher<PortalSweepCheck> searcher(who, found, check);
+        Cell::VisitObjects(who, searcher, CAST_OBJECT_SWEEP_YARDS);
+        Group* group = who->GetGroup();
+        for (GameObject* go : found)
+        {
+            GameObjectTemplate const* info = go->GetGOInfo();
+            if (!info)
+                continue;
+            OverseerDecisions::PortalCandidate c;
+            c.guid = go->GetGUID().GetCounter();
+            c.type = uint32(info->type);
+            ObjectGuid const owner = go->GetOwnerGUID();
+            c.ownerIsSelf = !owner.IsEmpty() && owner == who->GetGUID();
+            c.ownerInParty = !owner.IsEmpty() && group && group->IsMember(owner);
+            c.charges = info->GetCharges();
+            c.uses = go->GetUseCount();
+            c.yards = who->GetDistance(go);
+            c.destinationKnown = PortalDestination(info->spellcaster.spellId, c.destinationMap);
+            objects.push_back(go);
+            out.push_back(c);
+        }
+    }
+
+    // ONE CLICK UNDER WAY: walking to the portal, or clicked and waiting to read
+    // the crossing back. `id` 0 is the stranded drive's, with no row to write.
+    struct PortalUseCheck
+    {
+        uint32 id{0};
+        std::string targetName;
+        std::string request;
+        ObjectGuid portal;
+        uint32 objectGuid{0};
+        uint32 objectEntry{0};
+        uint32 castsSpell{0};
+        bool destinationKnown{false};
+        uint32 destinationMap{0};
+        float startYards{-1.f};
+        bool walked{false};
+        bool clicked{false};
+        uint32 approachMs{0};
+        uint32 waitedMs{0};  // since the click
+        CastHoldReport hold;
+        OverseerDecisions::HomeBind from;
+        OverseerDecisions::HomeBind now;
+    };
+
+    // World thread only, beside _pendingCasts and bounded the same way: one per
+    // character, each ended by its approach ceiling or its read-back window.
+    std::vector<PortalUseCheck> _pendingPortalUses;
+
+    bool PortalUseUnderWay(std::string const& name) const
+    {
+        for (PortalUseCheck const& check : _pendingPortalUses)
+            if (check.targetName == name)
+                return true;
+        return false;
+    }
+
+    static std::string PortalUseJson(PortalUseCheck const& ev, char const* outcome,
+                                     char const* reason)
+    {
+        std::ostringstream o;
+        o << "{\"outcome\":" << J(outcome) << ",\"reason\":" << J(reason) << ",\"retry\":"
+          << J(*reason ? OverseerDecisions::TownRetryWord(
+                             OverseerDecisions::PortalUseRefusalRetry(reason))
+                       : "")
+          << ",\"character\":" << J(ev.targetName) << ",\"object\":";
+        if (ev.objectGuid)
+        {
+            o << "{\"guid\":" << ev.objectGuid << ",\"entry\":" << ev.objectEntry
+              << ",\"casts_spell\":" << ev.castsSpell << ",\"destination_map\":";
+            if (ev.destinationKnown)
+                o << ev.destinationMap;
+            else
+                o << "null";
+            o << ",\"yards\":" << ev.startYards << "}";
+        }
+        else
+            o << "null";
+        o << ",\"walked\":" << (ev.walked ? "true" : "false")
+          << ",\"clicked\":" << (ev.clicked ? "true" : "false")
+          << ",\"approach_ms\":" << ev.approachMs << ",\"waited_ms\":" << ev.waitedMs
+          << ",\"hold_applied\":" << (ev.hold.applied ? "true" : "false") << ",\"from\":";
+        CastPlace(o, ev.from);
+        o << ",\"now\":";
+        CastPlace(o, ev.now);
+        o << ",\"request\":" << J(ev.request) << "}";
+        return o.str();
+    }
+
+    // HOLD, THEN WALK OR CLICK, THEN PARK. Shared by the row and the stranded
+    // drive. "" when parked, else the refusal.
+    char const* BeginPortalUse(Player* who, GameObject* portal,
+                               OverseerDecisions::PortalCandidate const& picked,
+                               PortalUseCheck& ev)
+    {
+        ev.targetName = who->GetName();
+        ev.portal = portal->GetGUID();
+        ev.objectGuid = picked.guid;
+        ev.objectEntry = portal->GetEntry();
+        if (GameObjectTemplate const* info = portal->GetGOInfo())
+            ev.castsSpell = info->spellcaster.spellId;
+        ev.destinationKnown = picked.destinationKnown;
+        ev.destinationMap = picked.destinationMap;
+        ev.startYards = picked.yards;
+
+        HoldStillAndReport(who, ev.targetName, PORTAL_HOLD_VERB, ev.hold);
+        if (AtTheStone(who, portal))
+        {
+            ev.from = ReadStandingPlace(who);
+            DriveGameObjectUse(who->GetSession(), ev.portal);
+            ev.clicked = true;
+        }
+        else if (!WalkTowardTheStone(who, portal))
+        {
+            ReleaseHold(ev.targetName, who, "the walk to the portal found no ground",
+                        PORTAL_HOLD_VERB);
+            return OverseerDecisions::PortalUseRefusal::GroundRefused;
+        }
+        else
+            ev.walked = true;
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' {} portal {} (entry {}, spell {}, to map {}) {} yards away",
+                 ev.targetName, ev.clicked ? "clicked" : "walks to", ev.objectGuid,
+                 ev.objectEntry, ev.castsSpell,
+                 ev.destinationKnown ? std::to_string(ev.destinationMap) : std::string("unknown"),
+                 ev.startYards);
+        _pendingPortalUses.push_back(ev);
+        return "";
+    }
+
+    char const* DoPortalUse(Player* who, std::string const& command, char const*& status,
+                            std::string& out, uint32 id)
+    {
+        namespace Cast = OverseerDecisions::CastRefusal;
+        namespace Refusal = OverseerDecisions::PortalUseRefusal;
+
+        PortalUseCheck ev;
+        ev.id = id;
+        ev.targetName = who->GetName();
+        ev.request = command;
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            out = PortalUseJson(ev, "refused", reason);
+            return reason;
+        };
+
+        OverseerDecisions::PortalUseRequest const request =
+            OverseerDecisions::ParsePortalUseRequest(command);
+        if (!request.ok)
+            return refuse(request.error);
+        if (PortalUseUnderWay(ev.targetName))
+            return refuse(Refusal::AlreadyRunning);
+
+        // THE REFUSALS `cast` ALREADY HAS, in its order.
+        WorldSession* session = who->GetSession();
+        if (!session)
+            return refuse(Cast::NoSession);
+        if (!who->IsInWorld())
+            return refuse(Cast::NotInWorld);
+        if (!GET_PLAYERBOT_AI(who))
+            return refuse(Cast::NoBotAI);
+        if (who->m_mover != who)
+            return refuse(Cast::NotOwnMover);
+        if (!who->IsAlive())
+            return refuse(Cast::Dead);
+        if (who->IsInFlight())
+            return refuse(Cast::InFlight);
+        if (who->IsInCombat())
+            return refuse(Cast::InCombat);
+        if (who->HasUnitState(UNIT_STATE_STUNNED))
+            return refuse(Cast::Stunned);
+        if (SessionIsLoggingOut(session))
+            return refuse(Cast::LoggingOut);
+        if (who->GetTradeData())
+            return refuse(Cast::Trading);
+        if (who->GetTransport())
+            return refuse(Cast::OnTransport);
+        if (who->IsNonMeleeSpellCast(false))
+            return refuse(Cast::AlreadyCasting);
+
+        std::vector<GameObject*> objects;
+        std::vector<OverseerDecisions::PortalCandidate> candidates;
+        ReadPortals(who, objects, candidates);
+        char const* wall = "";
+        int const pick = OverseerDecisions::PickPortal(candidates, request.objectGuid, wall);
+        if (pick < 0)
+            return refuse(wall);
+        GameObject* const portal = objects[std::size_t(pick)];
+
+        // LEADER FIRST: see OverseerDecisions::PortalLeaderCrossesFirst.
+        OverseerDecisions::PortalOrderFacts order;
+        order.portalMap = portal->GetMapId();
+        if (Group* group = who->GetGroup())
+        {
+            order.grouped = true;
+            order.leadsGroup = group->GetLeaderGUID() == who->GetGUID();
+            if (Player* leader = ObjectAccessor::FindConnectedPlayer(group->GetLeaderGUID()))
+            {
+                order.leaderReadable = true;
+                order.leaderMap = leader->GetMapId();
+            }
+        }
+        if (OverseerDecisions::PortalLeaderCrossesFirst(order))
+            return refuse(Refusal::LeaderFirst);
+
+        char const* const begun = BeginPortalUse(who, portal, candidates[std::size_t(pick)], ev);
+        if (*begun)
+            return refuse(begun);
+
+        status = "verifying";
+        out = PortalUseJson(ev, ev.clicked ? "clicked" : "walking", "");
+        return "";
+    }
+
+    void EndPortalUse(PortalUseCheck const& check, Player* bot, char const* status,
+                      char const* outcome, char const* detail)
+    {
+        ReleaseHold(check.targetName, bot, "the portal click ended", PORTAL_HOLD_VERB);
+        LOG_INFO("module.overseer",
+                 "overseer: portal click {} for '{}' ended {}: map {} to map {}{}{}", check.id,
+                 check.targetName, outcome, check.from.mapId, check.now.mapId,
+                 *detail ? " - " : "", detail);
+        if (!check.id)
+            return;
+        CharacterDatabase.Execute(
+            "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
+            "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+            status, Esc(detail), EscLong(PortalUseJson(check, outcome, detail)), check.id,
+            g_runToken);
+    }
+
+    // WHERE A CLICK IS WALKED, DRIVEN AND ANSWERED, on the command poll beside
+    // ResolveCastChecks.
+    void ResolvePortalUses(uint32 elapsedMs)
+    {
+        using OverseerDecisions::CastOutcome;
+        using OverseerDecisions::CastPlaceChanged;
+        using OverseerDecisions::CastReadBack;
+        using OverseerDecisions::JudgeCast;
+        using OverseerDecisions::ReadTeleportFlight;
+        using OverseerDecisions::TeleportFlight;
+        namespace Cast = OverseerDecisions::CastRefusal;
+        namespace Refusal = OverseerDecisions::PortalUseRefusal;
+
+        std::vector<PortalUseCheck> still;
+        still.reserve(_pendingPortalUses.size());
+        for (PortalUseCheck& check : _pendingPortalUses)
+        {
+            Player* bot = ObjectAccessor::FindPlayerByName(check.targetName, false);
+
+            // ---- the walk, and the click when it arrives ----------------------
+            if (!check.clicked)
+            {
+                check.approachMs += elapsedMs;
+                GameObject* portal = bot && bot->IsInWorld()
+                                         ? ObjectAccessor::GetGameObject(*bot, check.portal)
+                                         : nullptr;
+                char const* wall = "";
+                if (!bot || !bot->IsInWorld())
+                    wall = Cast::NotInWorld;
+                else if (!portal)
+                    wall = Refusal::NoSuchObject;
+                else if (!bot->IsAlive())
+                    wall = Cast::Dead;
+                else if (bot->IsInCombat())
+                    wall = Cast::InCombat;
+                else if (AtTheStone(bot, portal))
+                {
+                    check.from = ReadStandingPlace(bot);
+                    DriveGameObjectUse(bot->GetSession(), check.portal);
+                    check.clicked = true;
+                    still.push_back(check);
+                    continue;
+                }
+                else if (check.approachMs >= SUMMON_APPROACH_CEILING_MS)
+                    wall = Refusal::NotReached;
+                else if (!WalkTowardTheStone(bot, portal))
+                    wall = Refusal::GroundRefused;
+                else
+                {
+                    still.push_back(check);
+                    continue;
+                }
+                EndPortalUse(check, bot, "error", "refused", wall);
+                continue;
+            }
+
+            // ---- the crossing ------------------------------------------------
+            check.waitedMs += elapsedMs;
+            TeleportFlight const flight =
+                ReadTeleportFlight(bot != nullptr, bot && bot->IsInWorld(),
+                                   bot && bot->IsBeingTeleported(), check.waitedMs,
+                                   CAST_FLOOR_MS + HEARTH_SETTLE_CEILING_MS);
+            if (flight == TeleportFlight::Gone)
+            {
+                EndPortalUse(check, bot, "error", "unreadable",
+                             "left the world before the crossing could be read back");
+                continue;
+            }
+            if (check.waitedMs < CAST_FLOOR_MS || flight == TeleportFlight::InFlight)
+            {
+                still.push_back(check);
+                continue;
+            }
+
+            CastReadBack read;
+            read.casterReadable = bot != nullptr;
+            read.teleportExpected = true;
+            if (bot)
+            {
+                check.now = ReadStandingPlace(bot);
+                read.placeChanged = CastPlaceChanged(check.from, check.now, CAST_MOVED_YARDS);
+            }
+            switch (JudgeCast(read))
+            {
+                case CastOutcome::Moved:
+                    EndPortalUse(check, bot, "applied", "crossed", "");
+                    break;
+                case CastOutcome::Nothing:
+                    EndPortalUse(check, bot, "unchanged", "nothing",
+                                 "the portal was clicked and the character never crossed");
+                    break;
+                default:
+                    EndPortalUse(check, bot, "error", "unreadable",
+                                 "the character could not be read back after the click");
+                    break;
+            }
+        }
+        _pendingPortalUses.swap(still);
     }
 
     // --------------------------------------------------------------- learn --

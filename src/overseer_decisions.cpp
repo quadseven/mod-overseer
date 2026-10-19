@@ -7880,6 +7880,7 @@ char const* StrandedWayName(StrandedWay way)
         case StrandedWay::Sail:         return "sail";
         case StrandedWay::WaitForStone: return "wait for the stone";
         case StrandedWay::Refuse:       return "refuse";
+        case StrandedWay::Portal:       return "portal";
     }
     return "wait";
 }
@@ -7924,6 +7925,8 @@ StrandedWay DecideStrandedWay(StrandedFacts const& f)
                                                       : StrandedWay::NotStranded;
     if (!f.alive || f.inCombat || f.hearthInFlight)
         return StrandedWay::Wait;
+    if (f.portalToLeaderMap)
+        return StrandedWay::Portal;
     if (f.boundOnLeaderMap && f.carriesStone && f.stoneReady)
         return StrandedWay::Hearth;
     if (f.berthWalkGaveUp && f.boundOnMemberMap && f.carriesStone && f.stoneReady)
@@ -8027,6 +8030,10 @@ std::string StrandedWayExplanation(StrandedFacts const& f, StrandedWay way)
             return "a transport its faction may ride joins map " + here + " and map " + there +
                    ", so it walks to the berth, boards when the transport docks, rides, and "
                    "walks off" + door;
+        case StrandedWay::Portal:
+            return "a party portal beside it on map " + here + " sends whoever clicks it to "
+                   "map " + there + ", its leader's, so it walks to the portal and clicks it" +
+                   door;
         case StrandedWay::WaitForStone:
             return "no transport its faction may ride joins map " + here + " and map " + there +
                    ", and its hearthstone, bound on map " + there + ", is cooling down" + door;
@@ -13263,6 +13270,129 @@ bool LearnKeyed(std::string const& word, char const* key, uint32_t& value)
     return true;
 }
 }  // namespace
+
+// ------------------------------------- clicking the mage's portal (#410) --
+
+bool IsPortalUseRow(std::string const& command)
+{
+    std::vector<std::string> const words = LearnWords(command);
+    return !words.empty() && words[0] == USE_PORTAL_VERB;
+}
+
+PortalUseRequest ParsePortalUseRequest(std::string const& command)
+{
+    PortalUseRequest request;
+    request.error = PortalUseRefusal::Malformed;
+    std::vector<std::string> const words = LearnWords(command);
+    if (words.empty() || words[0] != USE_PORTAL_VERB || words.size() > 2)
+        return request;
+    if (words.size() == 2)
+    {
+        std::string const& id = words[1];
+        if (id.empty() || id.size() > 10)
+            return request;
+        std::uint64_t value = 0;
+        for (char c : id)
+        {
+            if (c < '0' || c > '9')
+                return request;
+            value = value * 10 + std::uint64_t(c - '0');
+        }
+        if (value == 0 || value > 0xFFFFFFFFull)
+            return request;
+        request.objectGuid = std::uint32_t(value);
+    }
+    request.ok = true;
+    request.error = "";
+    return request;
+}
+
+TownRetry PortalUseRefusalRetry(std::string const& detail)
+{
+    // The row itself, or an object that is not the party's.
+    if (detail == PortalUseRefusal::Malformed || detail == PortalUseRefusal::NotInParty)
+        return TownRetry::Never;
+    // This portal is the wall; another one, or another place, may answer.
+    if (detail == PortalUseRefusal::NoSuchObject || detail == PortalUseRefusal::NoCharges ||
+        detail == PortalUseRefusal::GroundRefused || detail == PortalUseRefusal::NotReached)
+        return TownRetry::Elsewhere;
+    // The leader crossing first and a running row both end by themselves.
+    if (detail == PortalUseRefusal::LeaderFirst || detail == PortalUseRefusal::AlreadyRunning)
+        return TownRetry::Later;
+    return CastRefusalRetry(detail);
+}
+
+char const* PortalCandidateWall(PortalCandidate const& c)
+{
+    if (c.type != SPELLCASTER_OBJECT_TYPE)
+        return PortalUseRefusal::NoSuchObject;
+    if (!c.ownerIsSelf && !c.ownerInParty)
+        return PortalUseRefusal::NotInParty;
+    if (c.charges != 0 && c.uses >= c.charges)
+        return PortalUseRefusal::NoCharges;
+    return "";
+}
+
+int PickPortal(std::vector<PortalCandidate> const& candidates, std::uint32_t wantGuid,
+               char const*& wall)
+{
+    wall = PortalUseRefusal::NoSuchObject;
+    if (wantGuid)
+    {
+        for (std::size_t i = 0; i < candidates.size(); ++i)
+        {
+            if (candidates[i].guid != wantGuid)
+                continue;
+            wall = PortalCandidateWall(candidates[i]);
+            return *wall ? -1 : static_cast<int>(i);
+        }
+        return -1;
+    }
+
+    int best = -1;
+    // The most specific wall a spellcaster object had: one the party owns but
+    // has spent says more than one somebody else owns.
+    bool sawForeign = false;
+    bool sawSpent = false;
+    for (std::size_t i = 0; i < candidates.size(); ++i)
+    {
+        char const* const why = PortalCandidateWall(candidates[i]);
+        if (why == PortalUseRefusal::NotInParty)
+            sawForeign = true;
+        else if (why == PortalUseRefusal::NoCharges)
+            sawSpent = true;
+        if (*why)
+            continue;
+        if (best < 0 || candidates[i].yards < candidates[std::size_t(best)].yards)
+            best = static_cast<int>(i);
+    }
+    if (best >= 0)
+        wall = "";
+    else if (sawSpent)
+        wall = PortalUseRefusal::NoCharges;
+    else if (sawForeign)
+        wall = PortalUseRefusal::NotInParty;
+    return best;
+}
+
+int PickPortalTo(std::vector<PortalCandidate> const& candidates, std::uint32_t map)
+{
+    int best = -1;
+    for (std::size_t i = 0; i < candidates.size(); ++i)
+    {
+        PortalCandidate const& c = candidates[i];
+        if (*PortalCandidateWall(c) || !c.destinationKnown || c.destinationMap != map)
+            continue;
+        if (best < 0 || c.yards < candidates[std::size_t(best)].yards)
+            best = static_cast<int>(i);
+    }
+    return best;
+}
+
+bool PortalLeaderCrossesFirst(PortalOrderFacts const& f)
+{
+    return f.grouped && !f.leadsGroup && f.leaderReadable && f.leaderMap == f.portalMap;
+}
 
 bool IsLearnRow(std::string const& command)
 {
