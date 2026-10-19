@@ -48978,11 +48978,21 @@ private:
             if (coord.turnedInQuestIds.count(questId))
                 continue;
             DungeonQuestEnder ender;
+            // NO ENDER OUTSIDE IS SKIPPED, NOT WAITED ON (#1015). An item
+            // objective resolves to this map when any mob here drops it, so a
+            // quest from another continent can join the goal with its ender
+            // nowhere on the outside map. Returning false here held EXIT for
+            // ever - the caller stamps last_progress_at on every poll, so no
+            // watchdog could end the run either. The quest stays complete in
+            // the holders' logs for the ordinary hand-in to take, it is not
+            // named among the quests turned in, and it is said once.
             if (!FindDungeonQuestEnder(questId, outsideMap, ender))
             {
-                LOG_ERROR("module.overseer", "overseer: dungeon run {} quest {} has no ender on map {}",
-                          coord.runId, questId, outsideMap);
-                return false;
+                LOG_WARN("module.overseer", "overseer: dungeon run {} quest {} has no ender on map {}; "
+                         "it is left for the ordinary hand-in and does not hold EXIT",
+                         coord.runId, questId, outsideMap);
+                coord.turnedInQuestIds.insert(questId);
+                continue;
             }
             Player* holder = ObjectAccessor::FindPlayerByName(*names.begin());
             if (!holder || holder->GetMapId() != ender.map)
@@ -51372,7 +51382,9 @@ private:
                                 coord.questGoalFinished
                                     ? ("map " + std::to_string(portal->insideMapId) +
                                        " quest objectives completed and the party turned in quests " +
-                                       coord.questsTurnedIn + " together after EXIT")
+                                       (coord.questsTurnedIn.empty() ? std::string("none")
+                                                                     : coord.questsTurnedIn) +
+                                       " together after EXIT")
                                 : coord.provedComplete
                                     ? ("every encounter map " +
                                        std::to_string(portal->insideMapId) +
