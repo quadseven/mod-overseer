@@ -25041,6 +25041,32 @@ RebuffDecision DecideRebuff(RebuffFacts const& facts);
 
 char const* RebuffStepWord(RebuffStep step);
 
+// WHO IS IN THE FAMILY'S PARTY for its dungeon run: the census, IDLE adoption,
+// the inside-member client gate and the bag reading (quadseven/mod-overseer
+// #1045). #1025 kept a family member lent to a guild finder run out of the
+// family's run (#1021) by dropping every finder group, but a run the dungeon
+// finder takes the family into leaves the family in a finder group of its own
+// (Overseer.DungeonFinder.Default), so the next census counted nobody inside
+// and the run ended 'emptied' with the family still in the dungeon. A finder
+// group is therefore not by itself someone else's: what keeps a member out is
+// a group that is not led by the family, a battleground or battlefield group,
+// or a group a guild run holds (a live run, one waiting to be adopted after a
+// restart, or a stray a restart left behind).
+struct FamilyPartyFacts
+{
+    bool inGroup{false};
+    // A battleground or battlefield group: the core's, never the family's.
+    bool coreOwnedGroup{false};
+    // A dungeon finder group. Read, and on purpose decides nothing alone.
+    bool finderGroup{false};
+    // The group's leader is a roster character of the same family.
+    bool leaderOfFamily{false};
+    // The member or the group's leader is one of a guild run's, or the group
+    // is a guild run's group.
+    bool heldByGuildRun{false};
+};
+bool CountsInFamilyParty(FamilyPartyFacts const& facts);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
