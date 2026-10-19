@@ -22597,6 +22597,12 @@ bool HealerStandsDown(HealerStandDownFacts const& facts)
     return facts.inRun && facts.livingResurrector && facts.deadSeconds < facts.windowSeconds;
 }
 
+bool LadderWaitsForCorpseRun(SickCorpseRunFacts const& facts)
+{
+    return facts.corpseRunChosen && facts.sick && facts.corpseRunSeconds >= 0 &&
+           facts.corpseRunSeconds < facts.allowanceSeconds;
+}
+
 bool CountsInFamilyParty(FamilyPartyFacts const& facts)
 {
     return facts.inGroup && !facts.coreOwnedGroup && facts.leaderOfFamily &&
