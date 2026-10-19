@@ -45,6 +45,7 @@ using OverseerDecisions::RespecStepWord;
 using OverseerDecisions::RespecTook;
 using OverseerDecisions::TankStrategyChange;
 using OverseerDecisions::TankStrategyFacts;
+using OverseerDecisions::WarriorNeedsMeleePursuit;
 using OverseerDecisions::ReadTravelClaim;
 using OverseerDecisions::TravelClaim;
 using OverseerDecisions::TravelClaimFacts;
@@ -231,6 +232,20 @@ void TheTankStrategiesFollowTheTalents()
     CheckText("a roster tree that does not tank gets nothing", TankStrategyChange(facts), "");
 }
 
+void AnEmptyRageTankClosesOnARangedCaster()
+{
+    Check("a fighting warrior tank outside melee with no rage pursues",
+          WarriorNeedsMeleePursuit(1, true, true, false));
+    Check("the tank stops forcing pursuit once in melee",
+          !WarriorNeedsMeleePursuit(1, true, true, true));
+    Check("an idle tank does not start a fight",
+          !WarriorNeedsMeleePursuit(1, true, false, false));
+    Check("a warrior without the tank strategy keeps its combat engine",
+          !WarriorNeedsMeleePursuit(1, false, true, false));
+    Check("other classes keep their combat engine",
+          !WarriorNeedsMeleePursuit(2, true, true, false));
+}
+
 GearVerdict Worn(float score, GearConfidence confidence = GearConfidence::Exact)
 {
     GearVerdict verdict;
@@ -310,6 +325,7 @@ int main()
     TheTreesAreCountedTheWayThePlayerbotCountsThem();
     AResetIsReadOffTheCharacter();
     TheTankStrategiesFollowTheTalents();
+    AnEmptyRageTankClosesOnARangedCaster();
     ATankWeighsAOneHanderAndAShieldAgainstItsTwoHander();
     TheResetWalkPassesAnEmptyColumnWithALearnPending();
 

@@ -17374,6 +17374,12 @@ std::string TankStrategyChange(TankStrategyFacts const& facts)
     return change;
 }
 
+bool WarriorNeedsMeleePursuit(uint8_t classId, bool tanks, bool inCombat,
+                              bool inMeleeRange)
+{
+    return classId == 1 && tanks && inCombat && !inMeleeRange;
+}
+
 GearVerdict GearShieldPair(GearVerdict const& oneHand, GearVerdict const& shield)
 {
     GearVerdict pair;
