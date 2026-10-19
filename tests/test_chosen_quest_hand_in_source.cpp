@@ -58,13 +58,15 @@ int main()
         return Fail("DriveChosenQuest must hand a COMPLETE quest in when the decision says so");
 
     // The readiness is the quest errand's own turn-in check, so a drive hand-in
-    // refuses exactly what an operator's `turnin quest:<id>` would refuse.
+    // refuses exactly what an operator's `turnin quest:<id>` would refuse, and
+    // it asks whether the reward the turn-in will take fits (#973).
     std::string const ready = Body(text, "bool ChosenQuestHandInReady(");
     if (ready.empty())
         return Fail("cannot find ChosenQuestHandInReady");
     for (char const* fed : {"OverseerDecisions::QuestErrandRefusal(",
                             "QuestErrandVerb::TurnIn",
-                            "CanRewardQuest(quest, 0, false)"})
+                            "ChooseQuestRewardFor(bot, quest)",
+                            "CanRewardQuest(quest, reward.index, false)"})
         if (ready.find(fed) == std::string::npos)
         {
             std::cerr << "ChosenQuestHandInReady must use: " << fed << "\n";
@@ -76,7 +78,7 @@ int main()
     std::string const give = Body(text, "bool HandInChosenQuest(");
     if (give.empty())
         return Fail("cannot find HandInChosenQuest");
-    std::size_t const reward = give.find("->RewardQuest(");
+    std::size_t const reward = give.find("RewardQuestChosen(");
     std::size_t const readBack = give.find("GetQuestRewardStatus(", reward);
     if (reward == std::string::npos || readBack == std::string::npos)
         return Fail("HandInChosenQuest must reward the quest and read the reward back");

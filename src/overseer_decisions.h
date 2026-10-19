@@ -5872,6 +5872,98 @@ struct GearContender
 
 std::string GearNeedWinner(std::vector<GearContender> const& contenders);
 
+// ---------------------------------------- the open world seeks upgrades (#973) --
+//
+// THE SAME SCORE, OUTSIDE THE INSTANCE. A dungeon's drops have been judged by
+// GearScore since #145; three other ways gear reaches a family were not. A
+// quest that offered a choice of reward was refused by every turn-in this
+// module makes ("nobody here would choose") and left to upstream, which takes
+// whichever choice its own weights like. A vendor's stock was never looked at.
+// And bags, the practical limit of a thirty-run loop, were bought by nobody.
+// What sits in the bags is already the gear drive's: SweepGear puts on every
+// certain upgrade it carries on its five second poll.
+
+// One sibling's answer to one reward choice: GearCompare against what that
+// sibling wears in the slot, and UpgradePercent of the gain.
+struct QuestRewardSibling
+{
+    std::string name;
+    GearComparison comparison{GearComparison::NotBetter};
+    int percent{0};
+};
+
+// One of a quest's reward choices (quest_template RewardChoiceItemID), scored.
+struct QuestRewardOption
+{
+    unsigned entry{0};
+    // GearCompare against what the HOLDER wears in the slot it would go into.
+    // A choice the holder cannot wear, or that is not gear, is NotBetter and
+    // not wearable.
+    GearComparison holder{GearComparison::NotBetter};
+    bool holderWearable{false};
+    float holderScore{0.f};
+    // Every other family member the choice was scored for.
+    std::vector<QuestRewardSibling> siblings;
+    // item_template SellPrice: what a choice nobody wears is worth.
+    unsigned sellPrice{0};
+};
+
+enum class QuestRewardWhy
+{
+    None,            // no choices at all
+    HolderUpgrade,   // the highest-scoring choice that upgrades the holder
+    SiblingUpgrade,  // none upgrades the holder; the largest sibling upgrade
+    HolderBest,      // nobody is upgraded; the holder's best wearable score
+    SellPrice,       // nothing is wearable; the best sale price
+};
+
+struct QuestRewardPick
+{
+    int index{-1};
+    QuestRewardWhy why{QuestRewardWhy::None};
+    // The sibling a SiblingUpgrade is for, so the hand-over (#14) knows whom.
+    std::string recipient;
+};
+
+// Which choice the holder takes at the turn-in. Ties keep the earlier choice,
+// so the answer never depends on anything but the quest's own order.
+QuestRewardPick ChooseQuestReward(std::vector<QuestRewardOption> const& options);
+
+// The quest_reward event's detail: "reward <entry>, <why>".
+std::string QuestRewardDetail(QuestRewardOption const& chosen, QuestRewardPick const& pick);
+
+// One bag a vendor in reach sells for gold.
+struct BagOffer
+{
+    unsigned entry{0};
+    int slots{0};            // item_template ContainerSlots
+    std::uint64_t price{0};  // copper, after the reputation discount
+    bool inStock{true};
+};
+
+// BAGS COME BEFORE ANY OTHER DISCRETIONARY SPEND. A bag is bought only into an
+// empty bag slot, and it is the largest one the purse covers (the cheaper of
+// two the same size). -1 when no bag slot is empty or nothing is affordable.
+int ChooseBagPurchase(std::vector<BagOffer> const& offers, int emptyBagSlots,
+                      std::uint64_t money);
+
+// One weapon or piece of armour a vendor in reach sells for gold, scored for
+// the buyer against what it wears in the slot it would go into.
+struct VendorUpgradeOffer
+{
+    unsigned entry{0};
+    GearComparison comparison{GearComparison::NotBetter};
+    float gain{0.f};
+    std::uint64_t price{0};
+    bool inStock{true};
+};
+
+// The certain upgrade with the largest gain HALF the purse covers, and only
+// once every bag slot holds a bag. The other half is the next repair: a vendor
+// piece is discretionary and a broken one is not. -1 for nothing.
+int ChooseVendorUpgrade(std::vector<VendorUpgradeOffer> const& offers, int emptyBagSlots,
+                        std::uint64_t money);
+
 // ------------------------------------------------------ the loot council --
 //
 // LOOT GOES TO WHOEVER IT UPGRADES MOST, THE WAY A GUILD HANDS IT OUT. Measured
@@ -6080,9 +6172,10 @@ std::string LootCandidatesJson(std::vector<LootCandidate> const& candidates);
 // must be a live creature whose quest-starter (or ender) relation names the
 // quest, within SPAWN_WALK_ARRIVE_YARDS of the character: the radius the walk
 // that brought it to the giver counts as arrived (it was the travel errand's 12,
-// which refused a character a spawn walk had delivered at 18.8 yards). A quest that offers a choice of reward is refused rather
-// than chosen for, since no choice here would be a player's. The outcome is
-// read back from the character's log, never assumed from the call.
+// which refused a character a spawn walk had delivered at 18.8 yards). A quest
+// that offers a choice of reward takes the one ChooseQuestReward names (#973).
+// The outcome is read back from the character's log, never assumed from the
+// call.
 
 enum class QuestErrandVerb
 {
@@ -6147,9 +6240,9 @@ struct QuestErrandFacts
     // Take: CanTakeQuest, SatisfyQuestStatus and CanAddQuest together.
     bool eligible{false};
     bool logHasRoom{false};
-    // Turn in: CanRewardQuest.
+    // Turn in: CanRewardQuest, asked with the reward the turn-in will take
+    // when the quest offers a choice (ChooseQuestReward, #973).
     bool rewardable{false};
-    bool rewardChoice{false};
 };
 
 // Why this row must not run, as the reason the row records, or empty when it

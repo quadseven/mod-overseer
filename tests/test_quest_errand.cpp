@@ -127,10 +127,6 @@ void HandingInTheFragment()
     f.status = 3;
     Expect(QuestErrandRefusal(turnin, f) == "not complete", "no fragment yet");
     f.status = 1;
-    f.rewardChoice = true;
-    Expect(QuestErrandRefusal(turnin, f).find("choice of reward") != std::string::npos,
-           "a choice of reward is not made for anybody");
-    f.rewardChoice = false;
     f.rewardable = false;
     Expect(QuestErrandRefusal(turnin, f) == "the core will not reward it now",
            "the core's own refusal stands");
@@ -216,9 +212,7 @@ void WhichRefusalsAreAWait()
            "the walls that move are a wait");
     Expect(!QuestErrandRefusalRetryable("no such quest") &&
                !QuestErrandRefusalRetryable("already turned in") &&
-               !QuestErrandRefusalRetryable("malformed request: want take, turnin or abandon quest:<id>") &&
-               !QuestErrandRefusalRetryable(
-                   "it offers a choice of reward, and nobody here would choose"),
+               !QuestErrandRefusalRetryable("malformed request: want take, turnin or abandon quest:<id>"),
            "the walls the same row hits for ever are a stop");
     // Every refusal the decision can return for a turn-in at a creature that
     // is merely too far is still the same string as before #19, so a sender
@@ -242,7 +236,7 @@ void TheAdapterSeams()
                module.find("GetCreatureQuestInvolvedRelationMap()") != std::string::npos,
            "the giver and taker come from the world's own quest relations");
     Expect(module.find("player->AddQuestAndCheckCompletion(quest, giver);") != std::string::npos &&
-               module.find("player->RewardQuest(quest, 0, giver);") != std::string::npos,
+               module.find("RewardQuestChosen(player, quest, reward, giver);") != std::string::npos,
            "the core's own calls take and hand in");
     Expect(module.find("GetGOQuestRelationMap()") != std::string::npos &&
                module.find("GetGOQuestInvolvedRelationMap()") != std::string::npos,

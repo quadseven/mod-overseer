@@ -4975,6 +4975,56 @@ void RememberKiller(Player* killed, std::string const& killerType,
     }
 }
 
+// THE REWARD A TURN-IN CHOSE (#973). Player::RewardQuest calls
+// OnPlayerCompleteQuest from its last line without saying which choice it paid
+// out, so a turn-in this module makes notes its choice here first and the hook
+// takes it into the quest_reward row's detail. The turn-in forgets the note
+// after RewardQuest returns, so one the core never paid out cannot be read by
+// a later turn-in of the same quest. Key: (character guid, quest id).
+std::mutex g_rewardChoiceMutex;
+std::map<std::pair<uint64, uint32>, std::string> g_rewardChoice;
+
+void NoteRewardChoice(Player* player, uint32 questId, std::string const& detail)
+{
+    std::lock_guard<std::mutex> guard(g_rewardChoiceMutex);
+    g_rewardChoice[{player->GetGUID().GetRawValue(), questId}] = detail;
+}
+
+// The noted detail, removed; empty when this turn-in noted none.
+std::string TakeRewardChoice(Player* player, uint32 questId)
+{
+    std::lock_guard<std::mutex> guard(g_rewardChoiceMutex);
+    auto const it = g_rewardChoice.find({player->GetGUID().GetRawValue(), questId});
+    if (it == g_rewardChoice.end())
+        return "";
+    std::string const detail = it->second;
+    g_rewardChoice.erase(it);
+    return detail;
+}
+
+// What a turn-in takes: the RewardQuest index of the choice, 0 for a quest
+// with no choice, and the quest_reward detail that names it.
+struct QuestRewardChosen
+{
+    uint32 index{0};
+    std::string detail;
+};
+
+// Hand the quest in taking `reward`, with the choice noted for the
+// quest_reward row the core's own hook writes.
+void RewardQuestChosen(Player* player, Quest const* quest, QuestRewardChosen const& reward,
+                       WorldObject* giver)
+{
+    if (!reward.detail.empty())
+    {
+        LOG_INFO("module.overseer", "overseer: '{}' turns in quest {} ({}) taking {}",
+                 player->GetName(), quest->GetQuestId(), quest->GetTitle(), reward.detail);
+        NoteRewardChoice(player, quest->GetQuestId(), reward.detail);
+    }
+    player->RewardQuest(quest, reward.index, giver);
+    TakeRewardChoice(player, quest->GetQuestId());
+}
+
 // One recorded death, queued for the world thread to write. NOT a repeat of
 // overseer_event's 'death' kind: that row is an hourly-bucketed COUNT with no
 // room for a killer, a health trend, or an aim - answering "is this still
@@ -7449,12 +7499,14 @@ public:
         return true;
     }
 
-    // Handed in and paid out.
+    // Handed in and paid out. The detail names the reward a turn-in this module
+    // made chose (#973), and is empty for one it did not make.
     void OnPlayerCompleteQuest(Player* player, Quest const* quest) override
     {
         if (!player || !quest)
             return;
-        RecordEvent(player, "quest_reward", quest->GetQuestId(), quest->GetTitle(), "");
+        RecordEvent(player, "quest_reward", quest->GetQuestId(), quest->GetTitle(),
+                    TakeRewardChoice(player, quest->GetQuestId()));
     }
 
     void OnPlayerEquip(Player* player, Item* item, uint8 /*bag*/, uint8 slot,
@@ -14215,19 +14267,20 @@ private:
         // the lease and the walk back to the giver started again. Quest 90 was
         // carried COMPLETE for half an hour that way.
         WorldObject* taker = nullptr;
+        QuestRewardChosen reward;
         OverseerDecisions::ChosenQuestFacts facts;
         facts.status = static_cast<int>(status);
         facts.working = working == questId;
         facts.aimChanged = aimChanged;
         facts.handInReady = status == QUEST_STATUS_COMPLETE &&
-                            ChosenQuestHandInReady(name, bot, quest, taker);
+                            ChosenQuestHandInReady(name, bot, quest, taker, reward);
 
         switch (OverseerDecisions::ChosenQuestStepFor(facts))
         {
             case OverseerDecisions::ChosenQuestStep::NotHeld:
                 return false;  // refused above already; kept for the switch
             case OverseerDecisions::ChosenQuestStep::HandIn:
-                return HandInChosenQuest(name, bot, quest, taker);
+                return HandInChosenQuest(name, bot, quest, taker, reward);
             case OverseerDecisions::ChosenQuestStep::Leave:
                 return true;
             case OverseerDecisions::ChosenQuestStep::Reissue:
@@ -14262,14 +14315,15 @@ private:
     // (#180)? The same facts and the same refusal as an operator's
     // `turnin quest:<id>` row (QuestErrandRefusal), so the drive never hands in
     // something that row would refuse - with one difference: `rewardable` asks
-    // CanRewardQuest(quest, 0, false), which also checks the reward items fit
-    // in the bags, because a reward the core cannot store is dropped on the
-    // floor by RewardQuest. A taker not yet in reach is the ordinary case on
+    // CanRewardQuest(quest, reward, false), which also checks the reward items
+    // fit in the bags, because a reward the core cannot store is dropped on the
+    // floor by RewardQuest. `reward` is the choice ChooseQuestRewardFor names
+    // (#973), taken once the taker is in reach. A taker not yet in reach is the ordinary case on
     // the walk back and is not logged; any other refusal is said once per
     // character and quest, because the character is standing at the taker and
     // still cannot hand in, which is the stall the operator has to see.
     bool ChosenQuestHandInReady(std::string const& name, Player* bot, Quest const* quest,
-                                WorldObject*& taker)
+                                WorldObject*& taker, QuestRewardChosen& reward)
     {
         uint32 const questId = quest->GetQuestId();
         taker = nullptr;
@@ -14293,8 +14347,9 @@ private:
         facts.giverInReach = taker != nullptr;
         facts.rewarded = bot->GetQuestRewardStatus(questId);  // Player.h:1491
         facts.status = static_cast<int>(bot->GetQuestStatus(questId));
-        facts.rewardChoice = quest->GetRewChoiceItemsCount() > 0;
-        facts.rewardable = bot->CanRewardQuest(quest, 0, false);
+        if (taker)
+            reward = ChooseQuestRewardFor(bot, quest);
+        facts.rewardable = bot->CanRewardQuest(quest, reward.index, false);
         std::string const refusal = OverseerDecisions::QuestErrandRefusal(errand, facts);
         if (refusal.empty())
             return true;
@@ -14313,10 +14368,10 @@ private:
     // true either way - the aim stays in force, and the next poll's primary
     // release (GetQuestRewardStatus) is what lets it go.
     bool HandInChosenQuest(std::string const& name, Player* bot, Quest const* quest,
-                           WorldObject* taker)
+                           WorldObject* taker, QuestRewardChosen const& reward)
     {
         uint32 const questId = quest->GetQuestId();
-        bot->RewardQuest(quest, 0, taker);
+        RewardQuestChosen(bot, quest, reward, taker);
         if (!bot->GetQuestRewardStatus(questId))  // Player.h:1491
         {
             LOG_WARN("module.overseer",
@@ -18468,7 +18523,7 @@ private:
     // needs out of the roster table. Read on its own, on the same terms as
     // LoadJobs and LoadProfessionPlans: a schema without the column is the same
     // answer as a roster that has chosen no tree.
-    std::map<std::string, uint8> LoadGearSpecs()
+    static std::map<std::string, uint8> LoadGearSpecs()
     {
         std::map<std::string, uint8> specs;
         QueryResult result = CharacterDatabase.Query(
@@ -18481,6 +18536,176 @@ private:
             specs[fields[0].Get<std::string>()] = fields[1].Get<uint8>();
         } while (result->NextRow());
         return specs;
+    }
+
+    // -------------------------------- the open world seeks upgrades (#973) --
+    //
+    // See OverseerDecisions::ChooseQuestReward and its siblings for the rules.
+    // This half reads the world: a template nobody holds yet is judged against
+    // what a character wears by the gear drive's own rule, so a reward or a
+    // vendor piece taken here is one SweepGear then puts on.
+
+    // A character's GearWearer, with the roster's talent tree when it has one.
+    static OverseerDecisions::GearWearer GearWearerNamed(
+        Player* bot, std::map<std::string, uint8> const& specs)
+    {
+        auto const spec = specs.find(bot->GetName());
+        return GearWearerFor(bot, spec == specs.end() ? uint8(0) : spec->second);
+    }
+
+    // A piece for the off hand cannot go on behind a two-hander; see the
+    // matching test in SweepGear.
+    static bool OffHandBehindTwoHander(Player* bot, uint8 slot)
+    {
+        if (slot != EQUIPMENT_SLOT_OFFHAND)
+            return false;
+        Item* const mainHand = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+        ItemTemplate const* mainProto = mainHand ? mainHand->GetTemplate() : nullptr;
+        return mainProto && mainProto->InventoryType == INVTYPE_2HWEAPON;
+    }
+
+    // What a piece going into `slot` has to beat, measured as SweepGear
+    // measures it: a two-hander against both hands (#14), a ring or a trinket
+    // against the worse of its pair.
+    static OverseerDecisions::GearIncumbentScore GearTemplateIncumbent(
+        Player* bot, OverseerDecisions::GearWearer const& who, ItemTemplate const* proto,
+        uint8 slot)
+    {
+        OverseerDecisions::GearIncumbentScore const worn = GearWornIncumbent(bot, who, slot);
+        if (proto->InventoryType == INVTYPE_2HWEAPON && slot == EQUIPMENT_SLOT_MAINHAND)
+            return OverseerDecisions::GearIncumbentPair(
+                worn, GearWornIncumbent(bot, who, EQUIPMENT_SLOT_OFFHAND));
+        if (slot != EQUIPMENT_SLOT_FINGER1 && slot != EQUIPMENT_SLOT_TRINKET1)
+            return worn;
+        OverseerDecisions::GearIncumbentScore const second =
+            GearWornIncumbent(bot, who, static_cast<uint8>(slot + 1));
+        return second.score < worn.score ? second : worn;
+    }
+
+    struct GearTemplateJudgement
+    {
+        OverseerDecisions::GearVerdict verdict;
+        OverseerDecisions::GearComparison comparison{OverseerDecisions::GearComparison::NotBetter};
+        float gain{0.f};
+    };
+
+    // An item template, scored for one character against what it wears where
+    // the core would put it. A template with a random property has not rolled
+    // yet, so its score is a floor (#340). Anything that is not a weapon or a
+    // piece of armour, or has nowhere to go, is NotBetter and not wearable.
+    static GearTemplateJudgement JudgeGearTemplate(Player* bot,
+                                                   OverseerDecisions::GearWearer const& who,
+                                                   ItemTemplate const* proto)
+    {
+        GearTemplateJudgement judged;
+        if (proto->Class != ITEM_CLASS_WEAPON && proto->Class != ITEM_CLASS_ARMOR)
+            return judged;
+        if (proto->InventoryType == INVTYPE_NON_EQUIP)
+            return judged;
+        uint8 const slot = bot->FindEquipSlot(proto, NULL_SLOT, true);
+        if (slot == NULL_SLOT || slot >= EQUIPMENT_SLOT_END)
+            return judged;
+        OverseerDecisions::GearResolvedProperty unrolled;
+        unrolled.unresolved = proto->RandomProperty != 0 || proto->RandomSuffix != 0;
+        judged.verdict = GearScoreFor(bot, who, proto, unrolled);
+        if (!judged.verdict.wearable || OffHandBehindTwoHander(bot, slot))
+            return judged;
+        OverseerDecisions::GearIncumbentScore const incumbent =
+            GearTemplateIncumbent(bot, who, proto, slot);
+        judged.comparison = OverseerDecisions::GearCompare(judged.verdict, incumbent);
+        judged.gain = judged.verdict.score - incumbent.score;
+        return judged;
+    }
+
+    // The other members of `bot`'s family that are in the world, each with its
+    // GearWearer. Empty for a character on no family's roster.
+    static std::vector<std::pair<Player*, OverseerDecisions::GearWearer>> FamilySiblingsOf(
+        Player* bot, std::map<std::string, uint8> const& specs)
+    {
+        std::vector<std::pair<Player*, OverseerDecisions::GearWearer>> siblings;
+        std::string const name = bot->GetName();
+        for (OverseerDecisions::FamilyRoster const& roster : LoadFamilyRosters())
+        {
+            bool const mine = std::any_of(roster.members.begin(), roster.members.end(),
+                                          [&](OverseerDecisions::FamilyMember const& m)
+                                          { return m.name == name; });
+            if (!mine)
+                continue;
+            for (OverseerDecisions::FamilyMember const& member : roster.members)
+            {
+                if (member.name == name)
+                    continue;
+                // SteerableAI, as DriveGear: a bare name lookup can hand back
+                // a Player that is not safe to touch.
+                Player* const sibling = ObjectAccessor::FindPlayerByName(member.name);
+                if (SteerableAI(sibling))
+                    siblings.emplace_back(sibling, GearWearerNamed(sibling, specs));
+            }
+        }
+        return siblings;
+    }
+
+    // One reward choice, scored for the holder and, when the item can still
+    // change hands once it is received, for every sibling: a reward that binds
+    // on pickup can never reach the sibling it would upgrade (#14 refuses a
+    // soulbound item), so it is scored for the holder alone.
+    static OverseerDecisions::QuestRewardOption QuestRewardOptionFor(
+        Player* bot, OverseerDecisions::GearWearer const& holder,
+        std::vector<std::pair<Player*, OverseerDecisions::GearWearer>> const& siblings,
+        ItemTemplate const* proto)
+    {
+        OverseerDecisions::QuestRewardOption option;
+        option.entry = proto->ItemId;
+        option.sellPrice = proto->SellPrice;
+        GearTemplateJudgement const mine = JudgeGearTemplate(bot, holder, proto);
+        option.holder = mine.comparison;
+        option.holderWearable = mine.verdict.wearable;
+        option.holderScore = mine.verdict.score;
+        if (proto->Bonding == BIND_WHEN_PICKED_UP || proto->Bonding == BIND_QUEST_ITEM)
+            return option;
+        for (auto const& sibling : siblings)
+        {
+            GearTemplateJudgement const theirs =
+                JudgeGearTemplate(sibling.first, sibling.second, proto);
+            OverseerDecisions::LootCandidate share;
+            share.gain = theirs.gain;
+            share.score = theirs.verdict.score;
+            option.siblings.push_back(OverseerDecisions::QuestRewardSibling{
+                sibling.second.name, theirs.comparison, OverseerDecisions::UpgradePercent(share)});
+        }
+        return option;
+    }
+
+    // WHICH OF A QUEST'S REWARDS THE HOLDER TAKES (#973). Index 0 and no
+    // detail for a quest that offers no choice, which is what RewardQuest was
+    // always handed.
+    static QuestRewardChosen ChooseQuestRewardFor(Player* bot, Quest const* quest)
+    {
+        QuestRewardChosen chosen;
+        if (quest->GetRewChoiceItemsCount() == 0)
+            return chosen;
+        std::map<std::string, uint8> const specs = LoadGearSpecs();
+        OverseerDecisions::GearWearer const holder = GearWearerNamed(bot, specs);
+        auto const siblings = FamilySiblingsOf(bot, specs);
+
+        std::vector<OverseerDecisions::QuestRewardOption> options;
+        std::vector<uint32> indexes;
+        for (uint32 i = 0; i < QUEST_REWARD_CHOICES_COUNT; ++i)
+        {
+            uint32 const entry = quest->RewardChoiceItemId[i];
+            ItemTemplate const* proto = entry ? sObjectMgr->GetItemTemplate(entry) : nullptr;
+            if (!proto)
+                continue;
+            options.push_back(QuestRewardOptionFor(bot, holder, siblings, proto));
+            indexes.push_back(i);
+        }
+        OverseerDecisions::QuestRewardPick const pick = OverseerDecisions::ChooseQuestReward(options);
+        if (pick.index < 0)
+            return chosen;
+        std::size_t const at = static_cast<std::size_t>(pick.index);
+        chosen.index = indexes[at];
+        chosen.detail = OverseerDecisions::QuestRewardDetail(options[at], pick);
+        return chosen;
     }
 
     void DriveGear()
@@ -46180,6 +46405,163 @@ private:
         return !trip.settled.count(name);
     }
 
+    // ------------------------------------------ bags, then an upgrade (#973) --
+    //
+    // WHAT A MEMBER BUYS FOR ITSELF AT THE COUNTER. Once the counter's own
+    // business is done - the repair paid, the sale landed - a member fills its
+    // empty bag slots with the largest bags it can afford, and then, with every
+    // slot holding a bag, buys the vendor piece that upgrades it most
+    // (OverseerDecisions::ChooseBagPurchase, ChooseVendorUpgrade). Both go
+    // through DoBuy, so the core's purchase and the read-back are the ones
+    // every buy row gets, and the piece is put on by SweepGear like anything
+    // else in the bags.
+
+    struct VendorGoldLine
+    {
+        ItemTemplate const* proto{nullptr};
+        uint32 price{0};
+        bool inStock{true};
+    };
+
+    // Every line `vendor` sells for gold alone that this character may use,
+    // priced as DoBuy prices one purchase.
+    static void AddVendorGoldLines(Player* bot, Creature* vendor,
+                                   std::vector<VendorGoldLine>& lines)
+    {
+        VendorItemData const* items = vendor->GetVendorItems();
+        if (!items)
+            return;
+        float const discount = bot->GetReputationPriceDiscount(vendor);
+        uint32 const lineCount = items->GetItemCount();
+        for (uint32 i = 0; i < lineCount; ++i)
+        {
+            VendorItem const* line = items->GetItem(i);
+            ItemTemplate const* proto = line ? sObjectMgr->GetItemTemplate(line->item) : nullptr;
+            if (!proto || line->ExtendedCost || bot->CanUseItem(proto) != EQUIP_ERR_OK)
+                continue;
+            VendorGoldLine gold;
+            gold.proto = proto;
+            gold.price = uint32(std::floor(uint32(proto->BuyPrice) * discount));
+            gold.inStock = line->maxcount == 0 || vendor->GetVendorItemCurrentCount(line) > 0;
+            lines.push_back(gold);
+        }
+    }
+
+    // The gold lines of every vendor in reach, by DoBuy's own sweep and gate,
+    // so a line read here is one DoBuy can find again.
+    static std::vector<VendorGoldLine> VendorGoldLinesFor(Player* bot)
+    {
+        float const SWEEP_YARDS = 30.f;
+        std::list<Creature*> nearby;
+        VendorNearbyCheck check{bot, SWEEP_YARDS};
+        Acore::CreatureListSearcher<VendorNearbyCheck> searcher(bot, nearby, check);
+        Cell::VisitObjects(bot, searcher, SWEEP_YARDS);
+
+        std::vector<VendorGoldLine> lines;
+        for (Creature* vendor : nearby)
+            if (bot->GetNPCIfCanInteractWith(vendor->GetGUID(), UNIT_NPC_FLAG_VENDOR))
+                AddVendorGoldLines(bot, vendor, lines);
+        return lines;
+    }
+
+    // One purchase through DoBuy, capped at the price read here. True when it
+    // read back as bought; a refusal is said and is false.
+    static bool BuyForSelf(std::string const& name, Player* bot, uint32 entry, uint32 price)
+    {
+        char const* status = "error";
+        std::string evidence;
+        std::string const command =
+            "entry:" + std::to_string(entry) + " max:" + std::to_string(price);
+        // Guarded rather than trusted, as RepairAtTheCounter guards DoRepair.
+        char const* const answer = DoBuy(bot, command, status, evidence);
+        std::string const refusal = answer ? answer : "";
+        if (refusal.empty())
+            return true;
+        LOG_INFO("module.overseer", "overseer: '{}' did not buy item {} at the counter - {}",
+                 name, entry, refusal);
+        return false;
+    }
+
+    // Put a bag just bought into an empty bag slot the way a player drags it
+    // there (CanWearContainer, then SwapItem), and read the slot back.
+    static bool WearBoughtBag(std::string const& name, Player* bot, uint32 entry)
+    {
+        for (Item* item : GearCarried(bot))
+        {
+            uint16 pos = 0;
+            if (item->GetEntry() != entry || CanWearContainer(bot, item, pos) != EQUIP_ERR_OK)
+                continue;
+            uint16 const src = static_cast<uint16>(
+                (static_cast<uint16>(item->GetBagSlot()) << 8) | item->GetSlot());
+            bot->SwapItem(src, pos);
+            Item* const worn = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, uint8(pos & 0xFF));
+            if (worn && worn->GetEntry() == entry)
+                return true;
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' bought bag {} and the server refused to put it in an "
+                     "empty bag slot, so it stays in the bags",
+                     name, entry);
+            return false;
+        }
+        return false;
+    }
+
+    // Fill the empty bag slots, the largest affordable bag first. Bounded by
+    // the four slots, so a bag that will not go on cannot loop.
+    static void BuyBagsAtTheCounter(std::string const& name, Player* bot,
+                                    std::vector<VendorGoldLine> const& lines)
+    {
+        std::vector<OverseerDecisions::BagOffer> offers;
+        for (VendorGoldLine const& line : lines)
+            if (line.proto->Class == ITEM_CLASS_CONTAINER &&
+                line.proto->SubClass == ITEM_SUBCLASS_CONTAINER && line.proto->ContainerSlots > 0)
+                offers.push_back(OverseerDecisions::BagOffer{
+                    line.proto->ItemId, int(line.proto->ContainerSlots), line.price, line.inStock});
+        for (uint8 slot = INVENTORY_SLOT_BAG_START; slot < INVENTORY_SLOT_BAG_END; ++slot)
+        {
+            int const pick = OverseerDecisions::ChooseBagPurchase(
+                offers, CountFreeBagSlots(bot), bot->GetMoney());
+            if (pick < 0)
+                return;
+            OverseerDecisions::BagOffer const& bag = offers[static_cast<std::size_t>(pick)];
+            if (!BuyForSelf(name, bot, bag.entry, uint32(bag.price)) ||
+                !WearBoughtBag(name, bot, bag.entry))
+                return;
+        }
+    }
+
+    // The vendor piece that upgrades this member most, once every bag slot
+    // holds a bag.
+    static void BuyUpgradeAtTheCounter(std::string const& name, Player* bot,
+                                       std::vector<VendorGoldLine> const& lines)
+    {
+        OverseerDecisions::GearWearer const who = GearWearerNamed(bot, LoadGearSpecs());
+        std::vector<OverseerDecisions::VendorUpgradeOffer> offers;
+        for (VendorGoldLine const& line : lines)
+        {
+            GearTemplateJudgement const judged = JudgeGearTemplate(bot, who, line.proto);
+            offers.push_back(OverseerDecisions::VendorUpgradeOffer{
+                line.proto->ItemId, judged.comparison, judged.gain, line.price, line.inStock});
+        }
+        int const pick = OverseerDecisions::ChooseVendorUpgrade(
+            offers, CountFreeBagSlots(bot), bot->GetMoney());
+        if (pick < 0)
+            return;
+        OverseerDecisions::VendorUpgradeOffer const& piece = offers[static_cast<std::size_t>(pick)];
+        if (BuyForSelf(name, bot, piece.entry, uint32(piece.price)))
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' bought item {} at the counter, an upgrade of {:.1f} over "
+                     "what it wears there",
+                     name, piece.entry, piece.gain);
+    }
+
+    static void ShopAtTheCounter(std::string const& name, Player* bot)
+    {
+        std::vector<VendorGoldLine> const lines = VendorGoldLinesFor(bot);
+        BuyBagsAtTheCounter(name, bot, lines);
+        BuyUpgradeAtTheCounter(name, bot, lines);
+    }
+
     // EVERY FAMILY WITH A LEADER TAKES ITS OWN TRIP (#555), from its own state,
     // and one family's run or trip never ends or holds another's.
     void DriveTownTrip()
@@ -46479,6 +46861,10 @@ private:
                         trip.role == OverseerDecisions::CounterRole::Repairer
                             ? RepairAtTheCounter(trip, name, bot)
                             : VisitTheCounter(trip, name, bot);
+                    // Once, as the counter is finished with this member, so
+                    // the repair is paid and the sale has landed first (#973).
+                    if (finished)
+                        ShopAtTheCounter(name, bot);
                     if (!finished)
                     {
                         ++outstanding;
@@ -49306,13 +49692,14 @@ private:
                     OverseerDecisions::SPAWN_WALK_ARRIVE_YARDS ||
                 !player->CanSeeOrDetect(giver))
                 return false;
-            if (!player->CanRewardQuest(quest, false))
+            QuestRewardChosen const reward = ChooseQuestRewardFor(player, quest);
+            if (!player->CanRewardQuest(quest, reward.index, false))
             {
                 LOG_WARN("module.overseer", "overseer: dungeon run {} quest {} for '{}' is not rewardable (status {})",
                          runId, questId, name, static_cast<int>(player->GetQuestStatus(questId)));
                 return false;
             }
-            player->RewardQuest(quest, 0, giver);
+            RewardQuestChosen(player, quest, reward, giver);
             if (!player->GetQuestRewardStatus(questId))
             {
                 LOG_WARN("module.overseer", "overseer: dungeon run {} quest {} for '{}' was not rewarded",
@@ -53689,8 +54076,8 @@ private:
         facts.giverInReach = true;
         facts.rewarded = bot->GetQuestRewardStatus(questId);
         facts.status = static_cast<int>(bot->GetQuestStatus(questId));
-        facts.rewardChoice = quest->GetRewChoiceItemsCount() > 0;
-        facts.rewardable = bot->CanRewardQuest(quest, 0, false);
+        QuestRewardChosen const reward = ChooseQuestRewardFor(bot, quest);
+        facts.rewardable = bot->CanRewardQuest(quest, reward.index, false);
         std::string const refusal = OverseerDecisions::QuestErrandRefusal(errand, facts);
         if (!refusal.empty())
         {
@@ -53700,7 +54087,7 @@ private:
                      bot->GetName(), npc->GetEntry(), questId, quest->GetTitle(), refusal);
             return;
         }
-        bot->RewardQuest(quest, 0, npc);
+        RewardQuestChosen(bot, quest, reward, npc);
         if (!bot->GetQuestRewardStatus(questId))
         {
             LOG_WARN("module.overseer",
@@ -74719,6 +75106,7 @@ private:
         // creature in reach wins, then an object in reach (#19); with neither,
         // `holder` still says which kind the world names, or that it names none.
         WorldObject* giver = nullptr;
+        QuestRewardChosen reward;
         if (quest && errand.verb != OverseerDecisions::QuestErrandVerb::None)
         {
             if (!abandon)
@@ -74746,10 +75134,10 @@ private:
                                  player->SatisfyQuestStatus(quest, false) &&
                                  player->CanAddQuest(quest, false);
             }
-            else
+            else if (!abandon)
             {
-                facts.rewardChoice = quest->GetRewChoiceItemsCount() > 0;
-                facts.rewardable = player->CanRewardQuest(quest, false);
+                reward = ChooseQuestRewardFor(player, quest);
+                facts.rewardable = player->CanRewardQuest(quest, reward.index, false);
             }
         }
 
@@ -74825,7 +75213,7 @@ private:
         }
         else
         {
-            player->RewardQuest(quest, 0, giver);
+            RewardQuestChosen(player, quest, reward, giver);
             if (!player->GetQuestRewardStatus(errand.questId))
             {
                 describe("error", "the quest was not rewarded");

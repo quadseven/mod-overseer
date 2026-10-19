@@ -336,7 +336,7 @@ void TheTrainersQuests()
         Body(source, "    static void TakeClassQuestAtTrainer(", "    static void DoTrainerQuests(");
     Check("a hand-in asks the quest errand's own refusal and reads the reward back",
           Has(handIn, "OverseerDecisions::QuestErrandRefusal(errand, facts)") &&
-              Has(handIn, "bot->RewardQuest(quest, 0, npc);") &&
+              Has(handIn, "RewardQuestChosen(bot, quest, reward, npc);") &&
               Has(handIn, "bot->GetQuestRewardStatus(questId)"));
     Check("a take is a class quest, asks the same refusal and reads the log back",
           Has(take, "OverseerDecisions::TrainerVisitTakesQuest(quest->GetRequiredClasses(), "
