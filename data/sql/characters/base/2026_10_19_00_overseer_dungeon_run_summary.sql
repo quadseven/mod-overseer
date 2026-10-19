@@ -36,6 +36,12 @@
 -- this file and fails if the two differ, so the post-run screen and the
 -- recording timeline highlight the same events.
 --
+-- ONE COLLATION ON EACH SIDE OF A NAME COMPARISON. overseer_dungeon_run was
+-- created with the server's default utf8mb4 collation and overseer_event with
+-- utf8mb4_unicode_ci; comparing two columns of different collations is an
+-- 'Illegal mix of collations' error, so the run's side is converted to the
+-- event table's collation explicitly.
+--
 -- IDEMPOTENT. CREATE OR REPLACE VIEW and CREATE TABLE IF NOT EXISTS, so a
 -- re-applied file (the updater hashes comments too) changes nothing.
 
@@ -58,8 +64,9 @@ SELECT
     e.`last_seen`    AS `last_seen`
 FROM `overseer_dungeon_run` r
 JOIN `overseer_event` e
-  ON (e.`character_name` = r.`leader_name`
-      OR FIND_IN_SET(e.`character_name`, r.`members`) > 0)
+  ON (e.`character_name` = CONVERT(r.`leader_name` USING utf8mb4) COLLATE utf8mb4_unicode_ci
+      OR FIND_IN_SET(e.`character_name`,
+                     CONVERT(r.`members` USING utf8mb4) COLLATE utf8mb4_unicode_ci) > 0)
  AND e.`last_seen` >= r.`started_at`
  AND e.`first_seen` <= COALESCE(r.`ended_at`, CURRENT_TIMESTAMP)
 WHERE e.kind IN ('loot_won', 'boss_kill', 'death', 'level_up', 'quest_reward', 'item_equip', 'achievement');
@@ -97,7 +104,8 @@ SELECT
 FROM `overseer_dungeon_run` r
 JOIN `overseer_run_damage` d
   ON d.`map_id` = r.`map_id`
- AND (d.`character_name` = r.`leader_name`
-      OR FIND_IN_SET(d.`character_name`, r.`members`) > 0)
+ AND (d.`character_name` = CONVERT(r.`leader_name` USING utf8mb4) COLLATE utf8mb4_unicode_ci
+      OR FIND_IN_SET(d.`character_name`,
+                     CONVERT(r.`members` USING utf8mb4) COLLATE utf8mb4_unicode_ci) > 0)
  AND d.`last_seen` >= r.`started_at`
  AND d.`first_seen` <= COALESCE(r.`ended_at`, CURRENT_TIMESTAMP);
