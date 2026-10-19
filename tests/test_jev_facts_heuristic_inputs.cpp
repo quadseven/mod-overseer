@@ -186,6 +186,15 @@ void TestTheStallLineCarriesTheStagingGeometry()
     CheckHas("no negative clock", StagingStallFactsLine(s, Gap(1400.f, 0.f), -5, 600),
              "staging clock 0s of 600s");
 
+    // The same reading is worded the way ApproachWhere words it, sign and all
+    // (ApproachGap: subject minus point, positive is above).
+    for (float vertical : {35.f, -20.f, 0.f})
+    {
+        ApproachGap const gap = Gap(1400.f, vertical);
+        CheckHas("matches ApproachWhere", StagingStallFactsLine(s, gap, 0, 600),
+                 "leader " + ApproachWhere(gap) + ";");
+    }
+
     StagingStallFacts unmeasured = BaseStall();
     unmeasured.leaderYards = -1.f;
     ApproachGap none;

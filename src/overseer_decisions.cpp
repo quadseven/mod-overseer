@@ -2996,6 +2996,9 @@ std::string StagingStallFactsLine(StagingStallFacts const& facts, ApproachGap co
     if (facts.leaderYards >= 0.f && FiniteReading(facts.leaderYards))
     {
         where = std::to_string(static_cast<int>(facts.leaderYards)) + "y out";
+        // ApproachGap's sign: SUBJECT MINUS POINT, positive is the leader
+        // ABOVE the point. Worded exactly as ApproachWhere words it, and the
+        // test pins the two lines against each other.
         int const vertical =
             gap.measured && FiniteReading(gap.verticalYards) ? static_cast<int>(gap.verticalYards) : 0;
         if (vertical > 0)
