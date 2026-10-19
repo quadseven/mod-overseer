@@ -237,8 +237,7 @@ void TheAdapterSeams()
     Expect(module.find("else if (kind == \"quest\")\n                detail = DoQuest(") !=
                std::string::npos,
            "kind='quest' is dispatched");
-    Expect(module.find("kind != \"quest\"") != std::string::npos,
-           "a quest row never shares a chat trigger");
+    Expect(!KindSharesChatTrigger("quest"), "a quest row never shares a chat trigger");
     Expect(module.find("GetCreatureQuestRelationMap()") != std::string::npos &&
                module.find("GetCreatureQuestInvolvedRelationMap()") != std::string::npos,
            "the giver and taker come from the world's own quest relations");
