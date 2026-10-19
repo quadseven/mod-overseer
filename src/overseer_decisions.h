@@ -22302,6 +22302,12 @@ struct GuildRunPoll
     // IsEncounterInProgress). Past the ceiling it buys the run
     // GUILD_RUN_BOSS_EXTENSION_SECONDS, once.
     bool bossInCombat{false};
+    // The run's kill clock (GuildRunKillAfter): whether a boss has died this
+    // stay, and how long ago the last one did. Past the ceiling a recent kill
+    // keeps the run going (GUILD_RUN_PROGRESS_WINDOW_SECONDS).
+    // `secondsSinceKill` is read only when `bossKilled` is true.
+    bool bossKilled{false};
+    unsigned secondsSinceKill{0};
     unsigned emptySeconds{GUILD_RUN_EMPTY_SECONDS};
     // THE CORPSE RUN (GUILD_RUN_RECOVERY_SECONDS). Ghosts of the run whose
     // corpse is on the dungeon's map, standing outside it.
@@ -22437,6 +22443,16 @@ unsigned GuildRunCeilingForMap(std::uint32_t mapId, bool finderEndsDungeon,
 // the extension is measured from the ceiling, so a run past ceiling plus
 // extension is timed out whatever is in combat.
 constexpr unsigned GUILD_RUN_BOSS_EXTENSION_SECONDS = 10 * 60;
+
+// A RUN STILL KILLING BOSSES IS NOT ENDED BY THE CLOCK. Two Deadmines runs on
+// 2026-10-19 were timed out at 7200 s two minutes after a kill: one at 5 of 7
+// heading to Captain Greenskin, the other at 6 of 7 a minute after it set out
+// for Edwin VanCleef, its last boss (wow-overseer#835). Past the ceiling, a run
+// whose last boss died less than GUILD_RUN_PROGRESS_WINDOW_SECONDS ago goes on,
+// up to GUILD_RUN_PROGRESS_EXTENSION_SECONDS past the ceiling, measured from
+// the ceiling so a run that keeps killing still ends.
+constexpr unsigned GUILD_RUN_PROGRESS_WINDOW_SECONDS = 30 * 60;
+constexpr unsigned GUILD_RUN_PROGRESS_EXTENSION_SECONDS = 60 * 60;
 
 // THE DUNGEON BRAIN IS ASKED AGAIN, NOT ONLY ONCE. A guild run is armed once
 // per stay (`dc on`), and the dungeon module can disable itself afterwards (a

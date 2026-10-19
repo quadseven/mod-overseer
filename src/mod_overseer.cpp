@@ -41124,6 +41124,10 @@ private:
             run.bossesBest = kills.best;
             run.lastKillAt = kills.lastKillAt;
             run.nextBoss = NextEncounterName(run.mapId, poll.expectedMask, poll.creditedMask);
+            poll.bossKilled = run.lastKillAt != 0;
+            poll.secondsSinceKill = run.lastKillAt && now >= run.lastKillAt
+                                        ? static_cast<unsigned>(now - run.lastKillAt)
+                                        : 0;
             poll.ceilingSeconds = OverseerDecisions::GuildRunCeilingForMap(
                 run.mapId, run.finderEndsDungeon, run.bossesTotal);
             {
