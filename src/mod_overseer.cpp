@@ -27115,6 +27115,18 @@ private:
             if (!botAI)
                 continue;
 
+            // A tank at range cannot land the melee actions its combat engine
+            // keeps trying. Pursuit lets auto attacks supply rage even when
+            // the victim is a caster that never walks in.
+            Unit* combatVictim = bot->GetVictim();
+            if (!combatVictim)
+                combatVictim = bot->GetSelectedUnit();
+            if (combatVictim && bot->IsValidAttackTarget(combatVictim) &&
+                OverseerDecisions::WarriorNeedsMeleePursuit(
+                    bot->getClass(), StrategyPresent(botAI, StrategyItem{"tank", true}),
+                    bot->IsInCombat(), bot->IsWithinMeleeRange(combatVictim)))
+                bot->GetMotionMaster()->MoveChase(combatVictim);
+
             bool const aimed = questAims.count(name) != 0 || travelAims.count(name) != 0;
 
             // Accompanied means another roster member is in the SAME group

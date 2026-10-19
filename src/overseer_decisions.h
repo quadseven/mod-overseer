@@ -20087,6 +20087,11 @@ struct TankStrategyFacts
 
 std::string TankStrategyChange(TankStrategyFacts const& facts);
 
+// A warrior tank cannot land a melee action while its victim stays beyond
+// melee reach. Close the gap so auto attacks can also generate rage.
+bool WarriorNeedsMeleePursuit(uint8_t classId, bool tanks, bool inCombat,
+                              bool inMeleeRange);
+
 // A TANK HOLDING A TWO-HANDER IS MEASURED THE OTHER WAY ROUND. The sweep scores
 // a two-hander against the PAIR it would replace (#14), and it scores a shield
 // only when the main hand is free for one. So a tank already holding a
