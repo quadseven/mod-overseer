@@ -8262,18 +8262,38 @@ char const* LoneLegReasonWord(LoneLegReason why)
     return "unknown";
 }
 
+// THE SAME THREE-LEVEL MARGIN AS #697'S LONE-LEG TEST. Unknown ground (0) is
+// not evidence that a stationary hold is lethal.
+static bool HeldGroundLethal(uint32_t memberLevel, uint32_t topLevel, uint32_t levelGap)
+{
+    return topLevel && topLevel >= memberLevel + levelGap;
+}
+
+bool HeldGroundNeedsSafeSpot(HeldGroundFacts const& facts)
+{
+    return !facts.resting && !facts.hearthReady &&
+           HeldGroundLethal(facts.memberLevel, facts.groundTopLevel, facts.levelGap);
+}
+
 HeldGroundVerdict DecideHeldGround(HeldGroundFacts const& facts)
 {
-    // THE SAME THREE-LEVEL MARGIN AS #697'S LONE-LEG TEST. Unknown ground is
-    // not evidence that a stationary hold is lethal.
     if (facts.resting)
         return {HeldGroundStep::Hold, "an inn or a city is never lethal ground"};
-    if (!facts.groundTopLevel || facts.groundTopLevel < facts.memberLevel + facts.levelGap)
+    if (!HeldGroundLethal(facts.memberLevel, facts.groundTopLevel, facts.levelGap))
         return {HeldGroundStep::Hold, "ground is below the #697 lethal margin"};
     if (facts.hearthReady)
         return {HeldGroundStep::Hearth, "lethal ground and hearthstone ready"};
+    // A GRAVEYARD IS ONLY SAFE GROUND IF ITS OWN SPAWNS ARE BELOW THE SAME
+    // MARGIN: a walk to one as lethal as where it stands trades a death here
+    // for a death there, plus the walk.
+    if (facts.safeSpotKnown &&
+        HeldGroundLethal(facts.memberLevel, facts.safeSpotTopLevel, facts.levelGap))
+        return {HeldGroundStep::Hold, "lethal ground, and the nearest graveyard is lethal too"};
+    if (facts.safeSpotKnown && facts.safeSpotYards > HELD_GROUND_ARRIVED_YARDS)
+        return {HeldGroundStep::WalkToSafety,
+                "lethal ground, hearthstone not ready, and a graveyard it can survive"};
     if (facts.safeSpotKnown)
-        return {HeldGroundStep::WalkToSafety, "lethal ground and safe spot known"};
+        return {HeldGroundStep::Hold, "already at the graveyard it can survive"};
     return {HeldGroundStep::Hold, "lethal ground but no safe move is known"};
 }
 
