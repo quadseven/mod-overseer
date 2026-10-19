@@ -20807,6 +20807,32 @@ struct HealerStandDownFacts
 };
 bool HealerStandsDown(HealerStandDownFacts const& facts);
 
+// A SICK GHOST'S CORPSE RUN IS NOT CUT SHORT BY THE LADDER (mod-overseer#746).
+//
+// DecideGhostRecovery's rule 2a answers CorpseRun for a member that still
+// carries Resurrection Sickness, so the spirit healer does not stack a second
+// dose. But a CorpseRun verdict hands the poll on to the stuck-revival ladder,
+// and the ladder takes the spirit healer once the ghost is
+// STUCK_REVIVAL_DEAD_SECONDS (45 s) old. A corpse run takes longer than that
+// whenever the ghost first waited for its corpse to clear, or the core's corpse
+// reclaim delay has grown with repeat deaths (up to two minutes). On wow-dev
+// 2026-10-18/19, 7 of the 20 spirit-healer revivals the ladder gave the family
+// in 17 hours came 0 to 49 s after the ghost recovery had said "corpse_run - it
+// still carries Resurrection Sickness"; one member died five times in seven
+// minutes around one Feralas graveyard that way, sick each time.
+//
+// So while the corpse run chosen for a sick ghost is younger than its
+// allowance, the ladder stands down. Past the allowance the ladder takes it as
+// before: a corpse run that never lands is still a stuck ghost.
+struct SickCorpseRunFacts
+{
+    bool corpseRunChosen{false};  // DecideGhostRecovery answered CorpseRun this poll
+    bool sick{false};             // the `sick` fact that verdict was given
+    int64_t corpseRunSeconds{0};  // since the corpse run was first chosen for this death
+    int64_t allowanceSeconds{0};  // GhostHealerWalkSeconds over the ghost-to-corpse yards
+};
+bool LadderWaitsForCorpseRun(SickCorpseRunFacts const& facts);
+
 // WHEN RESURRECTION SICKNESS ENDS. `remainingMs` is what the core's aura (spell
 // 15007) has left at `now`, read the moment the spirit healer revives the
 // character; 0 or less when it carries none (below the sickness level). The

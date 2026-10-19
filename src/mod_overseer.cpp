@@ -29543,6 +29543,12 @@ private:
         // the safety test; only healers standing at it count.
         bool healerRerouted{false};
         int64 healerWalkSeconds{GHOST_HEALER_WALK_SECONDS};
+        // When the corpse run was first chosen for this death, and how long it
+        // is given before the ladder may take the ghost while it is sick
+        // (OverseerDecisions::LadderWaitsForCorpseRun, mod-overseer#746).
+        int64 corpseRunSince{0};
+        int64 corpseRunAllowance{0};
+        bool corpseRunWaitSaid{false};
         bool saidAny{false};
         OverseerDecisions::GhostRecovery said{OverseerDecisions::GhostRecovery::CorpseRun};
         std::vector<std::string> leased;  // dead-engine strategies taken off
@@ -30709,8 +30715,36 @@ private:
         switch (choice)
         {
             case OverseerDecisions::GhostRecovery::CorpseRun:
+            {
                 ReturnCorpseRun(botAI, st);
-                return false;
+                // A SICK GHOST'S CORPSE RUN IS NOT CUT SHORT BY THE LADDER
+                // (mod-overseer#746). The ladder below takes the spirit
+                // healer 45 s into the death, which stacked the very sickness
+                // this corpse run was chosen to avoid.
+                if (!st.corpseRunSince)
+                {
+                    st.corpseRunSince = now;
+                    st.corpseRunAllowance = OverseerDecisions::GhostHealerWalkSeconds(
+                        bot->GetExactDist2d(st.corpseX, st.corpseY), GHOST_HEALER_WALK_SECONDS);
+                }
+                OverseerDecisions::SickCorpseRunFacts run;
+                run.corpseRunChosen = true;
+                run.sick = facts.sick;
+                run.corpseRunSeconds = now - st.corpseRunSince;
+                run.allowanceSeconds = st.corpseRunAllowance;
+                bool const waits = ladder && OverseerDecisions::LadderWaitsForCorpseRun(run);
+                if (waits && !st.corpseRunWaitSaid)
+                {
+                    st.corpseRunWaitSaid = true;
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' still carries Resurrection Sickness, so the "
+                             "stuck-revival ladder stands down for up to {}s while its corpse "
+                             "run lands, rather than stack a second dose at the spirit healer "
+                             "(#746)",
+                             name, st.corpseRunAllowance);
+                }
+                return waits;
+            }
             case OverseerDecisions::GhostRecovery::Wait:
                 LeaseCorpseRun(bot, botAI, st, false);
                 return true;
