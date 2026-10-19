@@ -13039,6 +13039,107 @@ GroundDanger ScoreGroundDanger(std::vector<DangerSpawn> const& spawns,
                                std::vector<std::uint32_t> const& partyLevels,
                                DangerLimits const& limits);
 
+// ------------------- which hostiles make a leg worth going round (#502) --
+//
+// THE SWEEP ABOVE COULD NOT SEE WHAT KILLED A LEVEL 60 WALKER. Since #326 a leg
+// was marked guarded only by the other side's people, and only at the `??`
+// gap (the walker's level plus CON_COLOR_UNKNOWN_LEVEL_DIFF). A neutral
+// hostile is nobody's town, so a level 59 to 60 elite beast standing on a leg
+// was never marked, never priced, and killed a level 60 character in real
+// combat (Frostmaul Preserver, entry 7429, rank 1).
+//
+// Decided 2026-10-19 on #502, option C:
+//
+//   * B, ON BY DEFAULT. A neutral hostile of rank 1 or 2 (elite or rare elite)
+//     that is not grey to the walker marks the leg, and is priced at the
+//     existing con-band weights by ScoreGroundDanger. Narrow on purpose: the
+//     same widening to every non-grey neutral hostile marked 22 to 24 percent
+//     of walk legs at level 60, almost all of them wildlife.
+//   * A, OFF BY DEFAULT. Grey density for a lone walker, below.
+//
+// The OTHER SIDE keeps exactly the rule it had: marked at the `??` gap, priced
+// at any level. A creature that is neither the other side nor a neutral elite
+// is the walk's ordinary business and is neither marked nor priced.
+
+// ONE HOSTILE SPAWN, AS THE GUARDED-GROUND SWEEP SEES IT. The adapter has
+// already asked the core whether it is hostile, standing and fightable.
+struct GuardedGroundSpawn
+{
+    // `creature_template.maxlevel`, the field the sweep has always read.
+    std::uint32_t level{0};
+    // `creature_template.rank`: 0 normal, 1 elite, 2 rare elite, 3 boss,
+    // 4 rare. Only 1 and 2 are the elites B means; a rare (4) is a normal
+    // creature with a longer respawn.
+    std::uint32_t rank{0};
+    // The spawn's faction carries a player side the walker's does not: the
+    // adapter's IsTheOtherSidesGround.
+    bool otherSide{false};
+};
+
+struct GuardedGroundRule
+{
+    // `Overseer.Route.NeutralElites`. On by default (#502 option B).
+    bool neutralElites{true};
+};
+
+// Whether this spawn MARKS a leg as guarded for a walker of `walkerLevel`: the
+// boolean sweep that decides whether the second search runs at all.
+bool SpawnMarksGuardedGround(GuardedGroundSpawn const& spawn, std::uint32_t walkerLevel,
+                             GuardedGroundRule const& rule);
+
+// Whether this spawn is handed to ScoreGroundDanger to PRICE a leg that is
+// already marked. The same population as the mark with no level floor, because
+// the scorer's own con bands decide what a level is worth and a floor would
+// make one level under it free and one level over it total.
+bool SpawnPricedOnGuardedGround(GuardedGroundSpawn const& spawn, GuardedGroundRule const& rule);
+
+// ----------------------------------- A: grey density for a lone walker --
+//
+// WHAT B CANNOT SEE. The death that opened #502 was a level 60 character in a
+// hive of level 47 to 50 insects: 36 spawns within 120 yards of one survey
+// node, every one of them grey, and grey is free in ScoreGroundDanger on
+// purpose (#400). One grey mob is nothing; a lone walker pulling five at once
+// is a corpse.
+//
+// THE RULE. With `Overseer.Route.LoneGreyDensity` at N > 0 and a walker with no
+// group, a leg is guarded when at least N hostile spawns, grey ones included,
+// stand within their own detection range plus `reachPadYards` of either node of
+// that leg. It is priced at the YELLOW weight (1): each counted spawn costs the
+// yards of the leg that lie inside that same reach. Zero is off and is the
+// default, so no plan changes until the replay has measured what N costs.
+struct LoneGreyDensityRule
+{
+    // `Overseer.Route.LoneGreyDensity`. 0 is off.
+    std::uint32_t threshold{0};
+    // Added to each spawn's own detection range. Five, as decided on #502.
+    float reachPadYards{5.f};
+};
+
+struct LoneGreyDensity
+{
+    // The rule fired: enough spawns stood within reach of a node.
+    bool guarded{false};
+    // How many spawns stood within reach of a node, counted whether or not the
+    // rule fired, so a log line can say how close a leg came.
+    std::uint32_t spawns{0};
+    // Yards of the leg inside some counted spawn's reach, summed over spawns.
+    float exposedYards{0.f};
+    // The price, in yards of detour. Zero unless `guarded`.
+    float detourYards{0.f};
+};
+
+// `spawns` is every hostile spawn near the leg, at any level and any faction.
+// `fromNode` and `toNode` are the leg's two survey nodes and `path` is the
+// leg's own waypoints between them; the ground priced is the nodes and the
+// waypoints, in that order, so a spawn standing on a node is always on it.
+// `limits` supplies yardsPerExposedYard and the maxDetourYards ceiling;
+// nonsense limits price nothing, the same refusal ScoreGroundDanger makes.
+LoneGreyDensity ScoreLoneGreyDensity(std::vector<DangerSpawn> const& spawns,
+                                     RoutePoint const& fromNode, RoutePoint const& toNode,
+                                     std::vector<RoutePoint> const& path,
+                                     bool walkerHasGroup, LoneGreyDensityRule const& rule,
+                                     DangerLimits const& limits);
+
 // ------------------ a staging walk that is measured rather than routed (#342) --
 //
 // THE ROUTE PLANNER ABOVE IS RIGHT ABOUT ITS GRAPH AND WRONG ABOUT THE WORLD,

@@ -20170,6 +20170,69 @@ private:
         return levels;
     }
 
+    // WHICH OF THE ROUTE'S SAMPLED POINTS STAND ON GUARDED GROUND (#326, #502).
+    //
+    // HostileSpawnsNearEach's question with the population decided in the pure
+    // layer: OverseerDecisions::SpawnMarksGuardedGround says which hostile
+    // spawn marks a leg for a walker of this level. That is the other side's
+    // people at the `??` gap, as it has been since #326, and since #502 also a
+    // neutral elite or rare elite that is not grey to the walker. The other
+    // callers of HostileSpawnsNearEach ask about towns and keep its
+    // other-side-only reading; this is the one sweep a route is marked by.
+    //
+    // `out[i]` is non-zero in `level` when some marking spawn stands within
+    // `radius` of `points[i]`. One pass over the spawn table, template first,
+    // for the same reason HostileSpawnsNearEach is shaped that way.
+    static void GuardedGroundNearEach(Player* bot, uint32 mapId,
+                                      std::vector<std::pair<float, float>> const& points,
+                                      float radius,
+                                      OverseerDecisions::GuardedGroundRule const& rule,
+                                      std::vector<NearbyThreat>& out)
+    {
+        out.assign(points.size(), NearbyThreat{});
+        FactionTemplateEntry const* mine = bot ? bot->GetFactionTemplateEntry() : nullptr;
+        if (!mine || points.empty())
+            return;
+
+        uint32 const walkerLevel = bot->GetLevel();
+        float const r2 = radius * radius;
+        for (auto const& spawn : sObjectMgr->GetAllCreatureData())
+        {
+            CreatureData const& data = spawn.second;
+            if (!CreatureSpawnStandsNow(spawn.first))
+                continue;
+            if (data.mapid != mapId)
+                continue;
+            CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(data.id);
+            if (!tmpl || !CanBeFought(data, tmpl))
+                continue;
+            FactionTemplateEntry const* theirs = sFactionTemplateStore.LookupEntry(tmpl->faction);
+            if (!theirs || !theirs->IsHostileTo(*mine))
+                continue;
+            OverseerDecisions::GuardedGroundSpawn candidate;
+            candidate.level = tmpl->maxlevel;
+            candidate.rank = tmpl->rank;
+            candidate.otherSide = IsTheOtherSidesGround(*theirs, *mine);
+            if (!OverseerDecisions::SpawnMarksGuardedGround(candidate, walkerLevel, rule))
+                continue;
+
+            for (std::size_t i = 0; i < points.size(); ++i)
+            {
+                float const dx = data.posX - points[i].first;
+                float const dy = data.posY - points[i].second;
+                if (dx * dx + dy * dy > r2)
+                    continue;
+                NearbyThreat& threat = out[i];
+                ++threat.count;
+                if (tmpl->maxlevel > threat.level)
+                {
+                    threat.level = tmpl->maxlevel;
+                    threat.name = tmpl->Name;
+                }
+            }
+        }
+    }
+
     // EVERY SPAWN THAT COULD PULL ON THIS ROUTE, WITH NO LEVEL FLOOR (#400).
     //
     // The sweep beside this one, HostileSpawnsNearEach, answers "is this the
@@ -20190,9 +20253,18 @@ private:
     // some waypoint can therefore be up to half a sample spacing further from
     // the nearest sample, so anything under 60 would silently drop spawns the
     // scorer would have counted. See TRAVEL_DANGER_GATHER_YARDS.
+    //
+    // WHICH SPAWNS, AND IT IS THE SAME POPULATION THE MARK USED (#502). With
+    // `everyHostile` false, a spawn is collected when
+    // OverseerDecisions::SpawnPricedOnGuardedGround says so: the other side's
+    // people, and the neutral elites `Overseer.Route.NeutralElites` adds. With
+    // it true, every hostile spawn is collected at any level and any faction,
+    // which is what the lone walker's grey density rule counts.
     static void DangerSpawnsNear(Player* bot, uint32 mapId,
                                  std::vector<std::pair<float, float>> const& points,
                                  float radius,
+                                 OverseerDecisions::GuardedGroundRule const& rule,
+                                 bool everyHostile,
                                  std::vector<OverseerDecisions::DangerSpawn>& out)
     {
         out.clear();
@@ -20214,12 +20286,19 @@ private:
             if (!theirs || !theirs->IsHostileTo(*mine))
                 continue;
             // The same narrowing the boolean sweep uses, and for the same
-            // reason: this prices a TOWN, and a wild beast hostile to everybody
-            // is the walk's ordinary business rather than the other side's
-            // people. Keeping the two readings on the same population is what
-            // stops a leg being marked by one question and priced by another.
-            if (!IsTheOtherSidesGround(*theirs, *mine))
-                continue;
+            // reason: an ordinary wild beast hostile to everybody is the walk's
+            // business rather than guarded ground. Keeping the two readings on
+            // the same population is what stops a leg being marked by one
+            // question and priced by another.
+            if (!everyHostile)
+            {
+                OverseerDecisions::GuardedGroundSpawn candidate;
+                candidate.level = tmpl->maxlevel;
+                candidate.rank = tmpl->rank;
+                candidate.otherSide = IsTheOtherSidesGround(*theirs, *mine);
+                if (!OverseerDecisions::SpawnPricedOnGuardedGround(candidate, rule))
+                    continue;
+            }
 
             bool reaches = false;
             for (auto const& point : points)
@@ -20327,16 +20406,80 @@ private:
         if (legs.empty())
             return false;
 
+        // WHICH HOSTILES COUNT (#502). Read per measurement rather than cached,
+        // like every other Overseer.* option here, so a reload takes effect on
+        // the next unmeasured leg.
+        OverseerDecisions::GuardedGroundRule groundRule;
+        groundRule.neutralElites =
+            sConfigMgr->GetOption<bool>("Overseer.Route.NeutralElites", true);
+        OverseerDecisions::LoneGreyDensityRule densityRule;
+        densityRule.threshold =
+            sConfigMgr->GetOption<uint32>("Overseer.Route.LoneGreyDensity", 0);
+        // A LONE WALKER IS ONE WITH NO GROUP, which is what a catch-up walk is
+        // by construction. The A rule is never asked of a party. Like the level
+        // floor and the party's levels before it, the answer is kept on the
+        // survey for the process (measuredLegs), so the first walker to measure
+        // a leg decides it; that limit predates this rule and is why A ships
+        // off until the replay has measured it.
+        bool const walkerHasGroup = bot->GetGroup() != nullptr;
+
         std::vector<bool> guarded(legs.size(), false);
         if (!points.empty())
         {
             std::vector<NearbyThreat> ground;
-            HostileSpawnsNearEach(bot, mapId, points, GRAVEYARD_THREAT_RADIUS,
-                                  bot->GetLevel() + CON_COLOR_UNKNOWN_LEVEL_DIFF - 1,
-                                  true, ground);
+            GuardedGroundNearEach(bot, mapId, points, GRAVEYARD_THREAT_RADIUS, groundRule,
+                                  ground);
             for (std::size_t p = 0; p < ground.size(); ++p)
                 if (ground[p].level)
                     guarded[legOfPoint[p]] = true;
+        }
+
+        // The realm's own aggro multiplier, so a route matches the world the
+        // characters are actually walking in. sWorld->getRate is what
+        // Creature::GetAggroRange itself reads (Creature.cpp:3406).
+        OverseerDecisions::DangerLimits dangerLimits;
+        dangerLimits.aggroRate = sWorld->getRate(RATE_CREATURE_AGGRO);
+
+        // A: GREY DENSITY AT THE LEG'S NODES, FOR A LONE WALKER (#502). Off at
+        // the default of 0, and then this costs nothing: no sweep, no node
+        // list, no change to any plan. When on, one more pass over the spawn
+        // table collects every hostile within TRAVEL_DANGER_GATHER_YARDS of a
+        // node, which covers a detection range up to 75 yards plus the 5 yard
+        // pad; the pure rule then counts and prices each leg.
+        std::vector<OverseerDecisions::LoneGreyDensity> density(legs.size());
+        if (densityRule.threshold > 0 && !walkerHasGroup)
+        {
+            std::vector<std::pair<float, float>> nodePoints;
+            for (auto const& leg : legs)
+                for (uint32 id : {leg.first, leg.second})
+                {
+                    auto const node = byId.find(id);
+                    if (node != byId.end())
+                        nodePoints.emplace_back(node->second->x, node->second->y);
+                }
+            std::vector<OverseerDecisions::DangerSpawn> around;
+            DangerSpawnsNear(bot, mapId, nodePoints, TRAVEL_DANGER_GATHER_YARDS, groundRule,
+                             true, around);
+            for (std::size_t i = 0; i < legs.size(); ++i)
+            {
+                auto const from = byId.find(legs[i].first);
+                auto const to = byId.find(legs[i].second);
+                if (from == byId.end() || to == byId.end())
+                    continue;
+                OverseerDecisions::RoutePoint fromNode;
+                fromNode.x = from->second->x;
+                fromNode.y = from->second->y;
+                fromNode.z = from->second->z;
+                OverseerDecisions::RoutePoint toNode;
+                toNode.x = to->second->x;
+                toNode.y = to->second->y;
+                toNode.z = to->second->z;
+                density[i] = OverseerDecisions::ScoreLoneGreyDensity(
+                    around, fromNode, toNode, legPoints[i], walkerHasGroup, densityRule,
+                    dangerLimits);
+                if (density[i].guarded)
+                    guarded[i] = true;
+            }
         }
 
         // AND WHAT THE GUARDED ONES ARE WORTH AVOIDING (#400).
@@ -20349,13 +20492,8 @@ private:
         bool const anythingGuarded =
             std::find(guarded.begin(), guarded.end(), true) != guarded.end();
         if (anythingGuarded)
-            DangerSpawnsNear(bot, mapId, points, TRAVEL_DANGER_GATHER_YARDS, dangerous);
-
-        // The realm's own aggro multiplier, so a route matches the world the
-        // characters are actually walking in. sWorld->getRate is what
-        // Creature::GetAggroRange itself reads (Creature.cpp:3406).
-        OverseerDecisions::DangerLimits dangerLimits;
-        dangerLimits.aggroRate = sWorld->getRate(RATE_CREATURE_AGGRO);
+            DangerSpawnsNear(bot, mapId, points, TRAVEL_DANGER_GATHER_YARDS, groundRule,
+                             false, dangerous);
 
         bool learnedSomethingGuarded = false;
         for (std::size_t i = 0; i < legs.size(); ++i)
@@ -20367,7 +20505,10 @@ private:
             OverseerDecisions::GroundDanger const danger =
                 OverseerDecisions::ScoreGroundDanger(dangerous, legPoints[i],
                                                      partyLevels, dangerLimits);
-            MarkLegGuarded(survey, legs[i].first, legs[i].second, danger.detourYards);
+            // THE LARGER OF THE TWO PRICES, not their sum: a neutral elite on
+            // a node is counted by both rules, and one creature is one fight.
+            float const worth = std::max(danger.detourYards, density[i].detourYards);
+            MarkLegGuarded(survey, legs[i].first, legs[i].second, worth);
             learnedSomethingGuarded = true;
             // SAID PER LEG AND ONLY FOR A LEG THAT COST SOMETHING, because this
             // is where the number a route is about to be decided on is actually
@@ -20378,13 +20519,24 @@ private:
             if (danger.detourYards > 0.f)
                 LOG_INFO("module.overseer",
                          "overseer: the leg {} to {} is priced at {:.0f} yards of detour - "
-                         "{} spawn(s) of the other side reach it, worst level {} which is "
-                         "{} to this party, {:.0f} yards of it inside somebody's aggro "
-                         "radius and the nearest {:.0f} yards off (#400)",
+                         "{} guarding spawn(s) (the other side, or a neutral elite) reach "
+                         "it, worst level {} which is {} to this party, {:.0f} yards of it "
+                         "inside somebody's aggro radius and the nearest {:.0f} yards off "
+                         "(#400, #502)",
                          legs[i].first, legs[i].second, danger.detourYards,
                          danger.spawns, danger.worstLevel,
                          OverseerDecisions::ConBandName(danger.worstBand),
                          danger.exposedYards, danger.closestYards);
+            if (density[i].guarded)
+                LOG_INFO("module.overseer",
+                         "overseer: the leg {} to {} is priced at {:.0f} yards of detour "
+                         "for a lone walker - {} hostile spawn(s), grey ones included, "
+                         "stand within their own detection range plus {:.0f} yards of a "
+                         "node on it, and Overseer.Route.LoneGreyDensity asks for {}; "
+                         "{:.0f} yards of it inside that reach, at the yellow weight (#502)",
+                         legs[i].first, legs[i].second, density[i].detourYards,
+                         density[i].spawns, densityRule.reachPadYards,
+                         densityRule.threshold, density[i].exposedYards);
         }
         return learnedSomethingGuarded;
     }

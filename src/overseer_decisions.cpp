@@ -10671,6 +10671,87 @@ GroundDanger ScoreGroundDanger(std::vector<DangerSpawn> const& spawns,
     return out;
 }
 
+bool SpawnMarksGuardedGround(GuardedGroundSpawn const& spawn, std::uint32_t walkerLevel,
+                             GuardedGroundRule const& rule)
+{
+    // The other side, at the `??` gap: the #326 rule unchanged. Skull begins at
+    // the walker's level plus 10, which is the old `maxlevel <= level + 10 - 1`
+    // floor read the other way round.
+    if (spawn.otherSide)
+        return ConBandOf(walkerLevel, spawn.level) == ConBand::Skull;
+    // B: a neutral elite or rare elite the walker has not outgrown.
+    if (rule.neutralElites && (spawn.rank == 1 || spawn.rank == 2))
+        return ConBandOf(walkerLevel, spawn.level) != ConBand::Grey;
+    return false;
+}
+
+bool SpawnPricedOnGuardedGround(GuardedGroundSpawn const& spawn, GuardedGroundRule const& rule)
+{
+    if (spawn.otherSide)
+        return true;
+    return rule.neutralElites && (spawn.rank == 1 || spawn.rank == 2);
+}
+
+LoneGreyDensity ScoreLoneGreyDensity(std::vector<DangerSpawn> const& spawns,
+                                     RoutePoint const& fromNode, RoutePoint const& toNode,
+                                     std::vector<RoutePoint> const& path,
+                                     bool walkerHasGroup, LoneGreyDensityRule const& rule,
+                                     DangerLimits const& limits)
+{
+    LoneGreyDensity out;
+    // Off, or a party: a group's members share the pulls, which is what the
+    // rule is about, and the decision was to ask it of a lone walker only.
+    if (rule.threshold == 0 || walkerHasGroup)
+        return out;
+    if (!(rule.reachPadYards >= 0.f) || !(limits.yardsPerExposedYard >= 0.f) ||
+        !(limits.maxDetourYards >= 0.f))
+        return out;
+
+    // The ground of the leg: its two nodes and the waypoints between them.
+    std::vector<RoutePoint> ground;
+    ground.reserve(path.size() + 2);
+    ground.push_back(fromNode);
+    ground.insert(ground.end(), path.begin(), path.end());
+    ground.push_back(toNode);
+
+    float exposed = 0.f;
+    for (DangerSpawn const& spawn : spawns)
+    {
+        if (!SpawnCanAggro(spawn))
+            continue;
+        float const range = spawn.detectionRange > 0.f ? spawn.detectionRange : 0.f;
+        float const reach = range + rule.reachPadYards;
+        bool nearNode = false;
+        for (RoutePoint const* node : {&fromNode, &toNode})
+        {
+            float const dx = spawn.x - node->x;
+            float const dy = spawn.y - node->y;
+            if (dx * dx + dy * dy <= reach * reach)
+            {
+                nearNode = true;
+                break;
+            }
+        }
+        if (!nearNode)
+            continue;
+        ++out.spawns;
+        for (std::size_t i = 0; i + 1 < ground.size(); ++i)
+            exposed += SegmentInsideCircle(ground[i], ground[i + 1], spawn.x, spawn.y, reach);
+    }
+
+    if (out.spawns < rule.threshold)
+        return out;
+    out.guarded = true;
+    out.exposedYards = exposed;
+    // THE YELLOW WEIGHT, as decided: one yard inside a counted spawn's reach is
+    // worth one yard of walking round, the even-level price ScoreGroundDanger
+    // already uses.
+    out.detourYards = exposed * ConBandWeight(ConBand::Yellow) * limits.yardsPerExposedYard;
+    if (out.detourYards > limits.maxDetourYards)
+        out.detourYards = limits.maxDetourYards;
+    return out;
+}
+
 FlightLoanStep ReadFlightLoan(bool lent, bool sawFlying, bool inFlight, time_t since,
                               time_t now, time_t boardLimit)
 {
