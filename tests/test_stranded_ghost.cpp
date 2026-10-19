@@ -34,6 +34,8 @@
 #include <sstream>
 #include <string>
 
+using OverseerDecisions::GuildFinderRequest;
+using OverseerDecisions::GuildFinderSeatsName;
 using OverseerDecisions::StrandedGhostFacts;
 using OverseerDecisions::StrandedGhostNext;
 using OverseerDecisions::StrandedGhostStep;
@@ -111,6 +113,42 @@ void AGroupNoRunOwnsDoesNotHoldTheGhost()
 
     f.grouped = false;
     Expect("out of the group the instance is not the run's to take it back into", f,
+           StrandedGhostStep::SpiritHealer);
+}
+
+// mod-overseer#1046, found by the roll-63 pre-roll review: after a restart a
+// guild run waits up to 15 minutes to be adopted, known only by its tank and
+// its row's request, and in that wait runTakesBack read only the live runs. A
+// member that had released outside walked to the spirit healer, and a run that
+// had wiped was then released with nobody of it back inside. Every seat of the
+// waiting run counts, and nobody else does.
+void AWaitingAdoptionTakesItsGhostsBack()
+{
+    GuildFinderRequest request;
+    request.healer = "Healer";
+    request.damage = {"Damage", "Hunter", "Mage"};
+    request.pugs = {"Mage"};
+    Check("the waiting run's tank is seated", GuildFinderSeatsName("Tank", request, "Tank"));
+    Check("so is its healer", GuildFinderSeatsName("Tank", request, "Healer"));
+    Check("and each damage dealer", GuildFinderSeatsName("Tank", request, "Damage") &&
+                                        GuildFinderSeatsName("Tank", request, "Hunter"));
+    Check("a pug among them too", GuildFinderSeatsName("Tank", request, "Mage"));
+    Check("names compare without case", GuildFinderSeatsName("Tank", request, "hEALER") &&
+                                             GuildFinderSeatsName("tank", request, "TANK"));
+    Check("a name the run does not seat is not taken back",
+          !GuildFinderSeatsName("Tank", request, "Stranger"));
+    Check("an empty request seats only its tank",
+          !GuildFinderSeatsName("Tank", GuildFinderRequest{}, "Healer"));
+
+    // The decision it feeds: a grouped ghost the waiting run seats is left to
+    // that run, and one no run, adoption or run-back takes (the #1023 case)
+    // still takes the spirit healer.
+    StrandedGhostFacts f = TheTankOutsideTheDeadmines();
+    f.grouped = true;
+    f.runTakesBack = GuildFinderSeatsName("Tank", request, "Hunter");
+    Expect("a ghost a waiting adoption seats is left to the run", f, StrandedGhostStep::Leave);
+    f.runTakesBack = GuildFinderSeatsName("Tank", request, "Stranger");
+    Expect("a grouped ghost no run or adoption seats still takes the spirit healer", f,
            StrandedGhostStep::SpiritHealer);
 }
 
@@ -199,8 +237,22 @@ void TheAdapterIsWired()
         "bot->GetCorpseLocation();");
     has("the decision is the pure one", "OverseerDecisions::StrandedGhostNext(facts)");
     has("the group is a fact", "facts.grouped = bot->GetGroup() != nullptr;");
-    has("so is a run that may take it back",
-        "facts.runTakesBack = InAGuildRun(name) || RaidRunBackWalks(name, now);");
+    has("so is a run that may take it back, a waiting adoption among them (#1046)",
+        "facts.runTakesBack =\n"
+        "            InAGuildRun(name) || InAWaitingGuildRun(name) || RaidRunBackWalks(name, now);");
+
+    std::size_t const waiting = source.find("    bool InAWaitingGuildRun(std::string const& name) const");
+    Check("the waiting adoptions are read by name", waiting != std::string::npos);
+    if (waiting != std::string::npos)
+    {
+        std::string const reader = source.substr(waiting, 400);
+        Check("over every run waiting to be adopted",
+              reader.find("for (GuildRunAdoption const& adoption : _guildRunAdoptions)") !=
+                  std::string::npos);
+        Check("by every seat of its request",
+              reader.find("OverseerDecisions::GuildFinderSeatsName(adoption.tank, "
+                          "adoption.request, name)") != std::string::npos);
+    }
     has("the spirit healer is walked to as for any ghost",
         "WalkGhostToSpiritHealer(bot, botAI, name, st, /*ladder*/ false, now);");
     has("the deploy proof is said", "overseer: stranded ghost '{}'");
@@ -225,6 +277,7 @@ int main()
 {
     TheMeasuredGhostsTakeTheSpiritHealer();
     AGroupNoRunOwnsDoesNotHoldTheGhost();
+    AWaitingAdoptionTakesItsGhostsBack();
     EverythingElseIsLeftAlone();
     TheWordsAreFixed();
     TheAdapterIsWired();

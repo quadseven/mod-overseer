@@ -19071,6 +19071,18 @@ bool GuildFinderIsPug(GuildFinderRequest const& request, std::string const& name
     return false;
 }
 
+bool GuildFinderSeatsName(std::string const& tank, GuildFinderRequest const& request,
+                          std::string const& name)
+{
+    std::string const lower = LowerName(name);
+    if (LowerName(tank) == lower || LowerName(request.healer) == lower)
+        return true;
+    for (std::string const& damage : request.damage)
+        if (LowerName(damage) == lower)
+            return true;
+    return false;
+}
+
 GuildFinderKinship GuildFinderKinOf(GuildFinderKin const& kin)
 {
     if (kin.anchorGuildId == 0)

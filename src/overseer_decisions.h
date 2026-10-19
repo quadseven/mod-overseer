@@ -21066,7 +21066,9 @@ struct StrandedGhostFacts
     // In a group.
     bool grouped{false};
     // A run still under way may take it back to its corpse: a guild run lists
-    // it (its corpse run walks the run's ghosts to the door), or the raid
+    // it (its corpse run walks the run's ghosts to the door), a guild run a
+    // restarted worldserver is still waiting to adopt seats it (adopted, that
+    // run walks it back like any other; mod-overseer#1046), or the raid
     // run-back is walking it inside its window (RaidGhostMayBeWalked).
     bool runTakesBack{false};
 };
@@ -22149,6 +22151,14 @@ struct GuildFinderRequest
 // Is `name` one of the request's pugs (names compare without case, as the
 // core's own lookups do).
 bool GuildFinderIsPug(GuildFinderRequest const& request, std::string const& name);
+
+// Is `name` one of the five a request seats: its tank, healer or a damage
+// dealer (names compare without case, as GuildFinderIsPug's do). A run a
+// restarted worldserver is waiting to adopt is known only by its tank and its
+// row's request, so this is how its members are told apart before it is a run
+// again (mod-overseer#1046).
+bool GuildFinderSeatsName(std::string const& tank, GuildFinderRequest const& request,
+                          std::string const& name);
 
 // THE GUILD AND THE SIDE. Every member but a pug is in the anchor's guild; a
 // pug is on the anchor's side. The anchor is the first of the five who is not

@@ -29719,9 +29719,12 @@ private:
         facts.standingInstanceable = bot->GetMap()->Instanceable();
         facts.grouped = bot->GetGroup() != nullptr;
         // A group alone is not a run (wow-overseer#1093): only a guild run
-        // that lists it, or the raid run-back inside its window, takes a
-        // grouped ghost back in. Any other group leaves it at the graveyard.
-        facts.runTakesBack = InAGuildRun(name) || RaidRunBackWalks(name, now);
+        // that lists it, a guild run waiting to be adopted after a restart
+        // that seats it (mod-overseer#1046), or the raid run-back inside its
+        // window, takes a grouped ghost back in. Any other group leaves it at
+        // the graveyard.
+        facts.runTakesBack =
+            InAGuildRun(name) || InAWaitingGuildRun(name) || RaidRunBackWalks(name, now);
         if (OverseerDecisions::StrandedGhostNext(facts) !=
             OverseerDecisions::StrandedGhostStep::SpiritHealer)
         {
@@ -39821,6 +39824,17 @@ private:
         std::map<std::string, std::time_t> loginAskedAt;
     };
     std::vector<GuildRunAdoption> _guildRunAdoptions;
+
+    // Is `name` one of the five of a run still waiting to be adopted after a
+    // restart (mod-overseer#1046)? Until GuildRunAdoptNext adopts or releases
+    // it, the run is not in _guildRuns, so InAGuildRun does not see it.
+    bool InAWaitingGuildRun(std::string const& name) const
+    {
+        for (GuildRunAdoption const& adoption : _guildRunAdoptions)
+            if (OverseerDecisions::GuildFinderSeatsName(adoption.tank, adoption.request, name))
+                return true;
+        return false;
+    }
 
     static uint32 EquippedItemLevel(Player* p)
     {
