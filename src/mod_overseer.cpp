@@ -2591,6 +2591,14 @@ constexpr float DUNGEON_BARRIER_RADIUS_YARDS = 10.0f;
 // the 303 yards through a wall that #752 routes to the entry.
 constexpr float DUNGEON_CORRIDOR_JOIN_YARDS = TRAVEL_STEP_YARDS;
 
+// HOW FAR OFF A MEASURED CORRIDOR LEG THE PATH GIVEN FOR IT MAY RUN BEFORE THE
+// LOG SAYS SO (#759). Each corridor point is a corner of the shortest walk over
+// the shipped navmesh, so the walk between two of them is close to the straight
+// line. Thirty yards is half the widest leg the Ragefire corridor has (66) and
+// a tenth of the 230 yards the leader was measured off every point of it on the upper
+// walkways, so the line is quiet on the corridor and loud off it.
+constexpr float DUNGEON_CORRIDOR_LEG_WIDTH_YARDS = 30.0f;
+
 // AND THE OTHER TWO DIMENSIONS OF IT (#217). The radius above is a circle drawn
 // on a map, and for the whole of this module's life it was the entire content
 // of "at the staging point" - which is why a character ten yards out and a
@@ -6017,6 +6025,14 @@ public:
         // OverseerDecisions::RouteMarkAdvanced for why a cursor alone is not
         // enough.
         std::uint64_t routeSerial{0};
+        // WHICH ROUTE POINT THIS POLL'S LEG AIMS AT, or -1 when the leg is the
+        // errand itself (#759). Set by RouteLeg and read by the corridor leg's
+        // path report, which has to name the waypoint the character was given.
+        long routeAimIndex{-1};
+        // The leg whose stray path was last reported, as plan and point, so
+        // one bad leg says so once and not on every poll it is walked.
+        std::uint64_t strayReportedSerial{0};
+        long strayReportedIndex{-1};
     };
 
     // Never zero, which RouteMark reserves for "no route". World thread only,
@@ -21014,7 +21030,12 @@ private:
         limits.lookaheadYards = TRAVEL_ROUTE_LOOKAHEAD_YARDS;
         limits.arrivedYards = TRAVEL_ROUTE_ARRIVED_YARDS;
         if (state.routeIsMeasured)
+        {
             limits.maxPointsAhead = 1;
+            // And its cursor moves on arrival, so the leader is never sent
+            // past a point it has not reached (#759).
+            limits.advanceOnArrival = true;
+        }
         return limits;
     }
 
@@ -21176,6 +21197,7 @@ private:
         // BECAUSE the line past it does not work, so it wants one point at a
         // time (#344). One route carries one set of limits, and a glued route
         // would have to be walked under the wrong ones for half its length.
+        state.routeAimIndex = -1;
         for (unsigned pass = 0; pass < 2; ++pass)
         {
             PlanRouteOnce(bot, want, state, name, target);
@@ -21260,9 +21282,88 @@ private:
                 }
                 return want;
             }
+            state.routeAimIndex = static_cast<long>(aim.index);
             return WorldPosition(want.GetMapId(), aim.x, aim.y, aim.z);
         }
         return want;
+    }
+
+    // THE PATH A MEASURED CORRIDOR LEG WAS GIVEN, READ AND SAID WHEN IT LEAVES
+    // THE LEG (#759). The leader at Ragefire joined the corridor at point 3,
+    // 0 yards away, and was next seen 230 yards off every point of it on
+    // Orgrimmar's upper walkways, and nothing in the log said which point he
+    // had been sent to or what walk the navmesh had offered for it. This asks
+    // the navmesh for the same point the mover was handed and reads the walk
+    // with OverseerDecisions::JudgeCorridorLegPath; a walk that runs more than
+    // DUNGEON_CORRIDOR_LEG_WIDTH_YARDS off the leg is logged with the waypoint,
+    // where the character stands, and the worst point of the path. The path
+    // starts at the character's feet, so a character already off the leg is
+    // reported by the same line. Said once per leg of a plan. It reports and
+    // changes nothing about the walk.
+    static void ReportCorridorLegPath(Player* bot, TravelAimBook::TravelState& state,
+                                      WorldPosition const& aimAt, std::string const& name,
+                                      std::string const& target)
+    {
+        if (!state.routeIsMeasured || state.routeAimIndex < 0 ||
+            static_cast<std::size_t>(state.routeAimIndex) >= state.route.size())
+            return;
+        if (state.strayReportedSerial == state.routeSerial &&
+            state.strayReportedIndex == state.routeAimIndex)
+            return;
+        std::size_t const index = static_cast<std::size_t>(state.routeAimIndex);
+        OverseerDecisions::RoutePoint const& to = state.route[index];
+        OverseerDecisions::RoutePoint from;
+        if (index > 0)
+            from = state.route[index - 1];
+        else
+        {
+            from.x = bot->GetPositionX();
+            from.y = bot->GetPositionY();
+            from.z = bot->GetPositionZ();
+        }
+
+        PathGenerator path(bot);   // PathGenerator.h:61
+        path.CalculatePath(aimAt.GetPositionX(), aimAt.GetPositionY(), aimAt.GetPositionZ());
+        std::vector<OverseerDecisions::RoutePoint> points;
+        points.reserve(path.GetPath().size() + 1);
+        OverseerDecisions::RoutePoint feet;
+        feet.x = bot->GetPositionX();
+        feet.y = bot->GetPositionY();
+        feet.z = bot->GetPositionZ();
+        points.push_back(feet);
+        for (G3D::Vector3 const& point : path.GetPath())
+        {
+            OverseerDecisions::RoutePoint p;
+            p.x = point.x;
+            p.y = point.y;
+            p.z = point.z;
+            points.push_back(p);
+        }
+        OverseerDecisions::CorridorLegPathLimits limits;
+        limits.widthYards = DUNGEON_CORRIDOR_LEG_WIDTH_YARDS;
+        OverseerDecisions::CorridorLegPathReading const reading =
+            OverseerDecisions::JudgeCorridorLegPath(from, to, points, limits);
+        if (!reading.judged || !reading.strays)
+            return;
+        state.strayReportedSerial = state.routeSerial;
+        state.strayReportedIndex = state.routeAimIndex;
+        OverseerDecisions::RoutePoint const& worst = points[reading.worstIndex];
+        LOG_WARN("module.overseer",
+                 "overseer: '{}' walking the measured corridor to '{}' is given route point "
+                 "{} of {} at ({:.1f}, {:.1f}, {:.1f}), a {:.0f} yard leg from ({:.1f}, {:.1f}, "
+                 "{:.1f}), and the walk it is given leaves that leg. It stands at ({:.1f}, "
+                 "{:.1f}, {:.1f}) and is handed ({:.1f}, {:.1f}, {:.1f}); the navmesh path to "
+                 "that is {} points and {:.0f} yards (path type {}), and its worst point {} is "
+                 "({:.1f}, {:.1f}, {:.1f}), {:.0f} yards off the leg and {:.0f} yards above its "
+                 "higher end, where {:.0f} is allowed (#759)",
+                 name, target, static_cast<uint32>(index),
+                 static_cast<uint32>(state.route.size()), to.x, to.y, to.z, reading.legYards,
+                 from.x, from.y, from.z, feet.x, feet.y, feet.z, aimAt.GetPositionX(),
+                 aimAt.GetPositionY(), aimAt.GetPositionZ(),
+                 static_cast<uint32>(path.GetPath().size()), reading.pathYards,
+                 static_cast<uint32>(path.GetPathType()), reading.worstIndex, worst.x, worst.y,
+                 worst.z, reading.worstOffYards, reading.worstAboveYards,
+                 DUNGEON_CORRIDOR_LEG_WIDTH_YARDS);
     }
 
     // The point to hand the mover THIS POLL for a character wanted at `want`.
@@ -26663,6 +26764,10 @@ private:
             // was in, so the bound above counts CONSECUTIVE refusals and never
             // a total (#312).
             OverseerDecisions::FootingHeld(state.footing);
+            // And a measured corridor leg whose walk leaves the leg says
+            // which point and which walk (#759).
+            if (!entry)
+                ReportCorridorLegPath(bot, state, aimAt, name, target);
 
             // IS THE WALK THIS POLL WOULD ISSUE ALREADY RUNNING? Three
             // readings, taken here and weighed by OverseerDecisions::

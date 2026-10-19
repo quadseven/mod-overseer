@@ -10915,6 +10915,26 @@ RouteAim RouteLegStep(RouteCursor& cursor, std::vector<RoutePoint> const& route,
         return aim;
     }
 
+    // A MEASURED CORRIDOR MOVES ON ARRIVAL (#759). See
+    // RouteLegLimits::advanceOnArrival. The cursor is the point being walked
+    // to; every point the character already stands on is passed, and the aim is
+    // the first one it does not. The last point is never passed here, because
+    // arriving on it is the test above.
+    if (limits.advanceOnArrival)
+    {
+        std::uint32_t target = cursor.at;
+        while (target + 1 < route.size() &&
+               PlaneDistance(route[target].x, route[target].y, x, y) <= limits.arrivedYards)
+            ++target;
+        cursor.at = target;
+        aim.hasAim = true;
+        aim.index = target;
+        aim.x = route[target].x;
+        aim.y = route[target].y;
+        aim.z = route[target].z;
+        return aim;
+    }
+
     // FORWARD ONLY. The scan starts where the cursor already is and never looks
     // behind it, so a route cannot be walked backwards however the stepper
     // wanders.
@@ -10964,6 +10984,49 @@ RouteAim RouteLegStep(RouteCursor& cursor, std::vector<RoutePoint> const& route,
     return aim;
 }
 
+
+CorridorLegPathReading JudgeCorridorLegPath(RoutePoint const& from, RoutePoint const& to,
+                                            std::vector<RoutePoint> const& path,
+                                            CorridorLegPathLimits const& limits)
+{
+    CorridorLegPathReading reading;
+    if (path.empty() || !(limits.widthYards > 0.f))
+        return reading;
+    double const lx = static_cast<double>(to.x) - static_cast<double>(from.x);
+    double const ly = static_cast<double>(to.y) - static_cast<double>(from.y);
+    double const lengthSquared = lx * lx + ly * ly;
+    if (!(lengthSquared > 0.0))
+        return reading;
+    reading.judged = true;
+    reading.legYards = PlaneDistance(from.x, from.y, to.x, to.y);
+    float const higherEnd = from.z > to.z ? from.z : to.z;
+    for (std::size_t i = 0; i < path.size(); ++i)
+    {
+        RoutePoint const& p = path[i];
+        if (i > 0)
+            reading.pathYards += PlaneDistance(path[i - 1].x, path[i - 1].y, p.x, p.y);
+        // The nearest point of the leg, clamped to its two ends, so a point
+        // beyond either end is measured to that end and not to the line drawn
+        // on past it.
+        double t = ((static_cast<double>(p.x) - from.x) * lx +
+                    (static_cast<double>(p.y) - from.y) * ly) / lengthSquared;
+        if (t < 0.0)
+            t = 0.0;
+        else if (t > 1.0)
+            t = 1.0;
+        float const nx = static_cast<float>(from.x + t * lx);
+        float const ny = static_cast<float>(from.y + t * ly);
+        float const off = PlaneDistance(p.x, p.y, nx, ny);
+        if (i == 0 || off > reading.worstOffYards)
+        {
+            reading.worstIndex = static_cast<std::uint32_t>(i);
+            reading.worstOffYards = off;
+            reading.worstAboveYards = p.z - higherEnd;
+        }
+    }
+    reading.strays = reading.worstOffYards > limits.widthYards;
+    return reading;
+}
 
 bool SurveyedRouteWorthPlanning(float fromAimYards, bool navmeshReachesAim,
                                 float minYards)
