@@ -2807,6 +2807,54 @@ RunRecovery RunRecoveryHeuristic(RunFailureFacts const& facts)
                                     : RUN_RECOVERY_LADDER[facts.tried.size() % 4]);
 }
 
+std::string RunRecoveryFactsLine(RunFailureFacts const& facts)
+{
+    // Moved here from the module (it was a static there) so a test can pin
+    // it against the heuristic. The first clauses are the old line, unchanged;
+    // the ladder clauses after "tried" are what it did not carry before.
+    std::ostringstream line;
+    line << "leader ";
+    if (facts.leaderYardsFromStaging >= 0.f)
+        line << static_cast<unsigned>(facts.leaderYardsFromStaging) << "y from the staging point";
+    else
+        line << "not measured against the staging point";
+    line << "; farthest member ";
+    if (facts.farthestMemberYards >= 0.f)
+        line << static_cast<unsigned>(facts.farthestMemberYards) << "y from the leader";
+    else
+        line << "not measured";
+    line << "; " << facts.membersApart << " on another map or copy";
+    line << "; bags " << (facts.bagsFull ? "full" : "ok");
+    line << "; clients " << (facts.everyoneSteerable ? "all steerable" : "one or more missing");
+    line << "; staging errand taken back " << facts.stagingRearms << " times";
+    line << "; tried";
+    if (facts.tried.empty())
+        line << " nothing yet";
+    for (RunRecovery r : facts.tried)
+        line << ' ' << RunRecoveryWord(r);
+    line << "; "
+         << (facts.memberHeldOffLethalLeg ? "a member is held off a lethal leg"
+                                          : "no member held off a lethal leg");
+    line << "; hearth regroup " << (facts.hearthRegroupReady ? "ready" : "not ready");
+    line << "; attempt " << facts.streak << " in a row failed";
+    if (facts.summonAfter > 0)
+        line << ", summon rung opens at " << facts.summonAfter;
+    else
+        line << ", summon rung off";
+    line << "; meeting stone " << (facts.summonReady ? "usable" : "not usable")
+         << ", summoner " << (facts.summonerReady ? "ready" : "not ready");
+    line << "; dungeon finder " << (facts.dungeonFinderReady ? "ready" : "not ready");
+    if (facts.finderIsDefault)
+        line << " (the realm's default way in)";
+    if (!facts.hearthRegroupNote.empty())
+        line << "; " << facts.hearthRegroupNote;
+    if (!facts.summonNote.empty())
+        line << "; " << facts.summonNote;
+    if (!facts.dungeonFinderNote.empty())
+        line << "; " << facts.dungeonFinderNote;
+    return line.str();
+}
+
 std::string RunRecoveryHeuristicWhy(RunFailureFacts const& facts, RunRecovery chosen)
 {
     std::string why;
@@ -2935,6 +2983,35 @@ StagingStall StagingStallHeuristic(StagingStallFacts const& facts)
     if (facts.endedFromOutside)
         return StagingStall::RunYields;
     return StagingStall::KeepRearming;
+}
+
+std::string StagingStallFactsLine(StagingStallFacts const& facts, ApproachGap const& gap,
+                                  long stagingSeconds, unsigned backstopSeconds)
+{
+    // The same clauses the module wrote inline before, in the same words,
+    // except that the leader's distance is read from `facts` (what the
+    // heuristic read) and only the vertical offset from `gap`, and that an
+    // ending from inside the module is said rather than left out.
+    std::string where = "no reading";
+    if (facts.leaderYards >= 0.f && FiniteReading(facts.leaderYards))
+    {
+        where = std::to_string(static_cast<int>(facts.leaderYards)) + "y out";
+        // ApproachGap's sign: SUBJECT MINUS POINT, positive is the leader
+        // ABOVE the point. Worded exactly as ApproachWhere words it, and the
+        // test pins the two lines against each other.
+        int const vertical =
+            gap.measured && FiniteReading(gap.verticalYards) ? static_cast<int>(gap.verticalYards) : 0;
+        if (vertical > 0)
+            where += " and " + std::to_string(vertical) + "y above it";
+        else if (vertical < 0)
+            where += " and " + std::to_string(-vertical) + "y below it";
+    }
+    return "rearms " + std::to_string(facts.rearms) + "; last ended by " +
+           (facts.lastEndedBy.empty() ? std::string("nothing on record") : facts.lastEndedBy) +
+           (facts.endedFromOutside ? " (outside this module)" : " (inside this module)") +
+           "; leader " + where + "; staging clock " +
+           std::to_string(stagingSeconds < 0 ? 0 : stagingSeconds) + "s of " +
+           std::to_string(backstopSeconds) + "s";
 }
 
 bool TerrainRemedyEndsTheErrand(TerrainRemedy remedy, bool onTheGround)

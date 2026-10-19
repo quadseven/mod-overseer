@@ -37696,37 +37696,6 @@ private:
                r == OverseerDecisions::RunRecovery::DungeonFinder;
     }
 
-    static std::string RecoveryFactsLine(OverseerDecisions::RunFailureFacts const& facts)
-    {
-        std::ostringstream line;
-        line << "leader ";
-        if (facts.leaderYardsFromStaging >= 0.f)
-            line << static_cast<uint32>(facts.leaderYardsFromStaging) << "y from the staging point";
-        else
-            line << "not measured against the staging point";
-        line << "; farthest member ";
-        if (facts.farthestMemberYards >= 0.f)
-            line << static_cast<uint32>(facts.farthestMemberYards) << "y from the leader";
-        else
-            line << "not measured";
-        line << "; " << facts.membersApart << " on another map or copy";
-        line << "; bags " << (facts.bagsFull ? "full" : "ok");
-        line << "; clients " << (facts.everyoneSteerable ? "all steerable" : "one or more missing");
-        line << "; staging errand taken back " << facts.stagingRearms << " times";
-        line << "; tried";
-        if (facts.tried.empty())
-            line << " nothing yet";
-        for (OverseerDecisions::RunRecovery r : facts.tried)
-            line << ' ' << OverseerDecisions::RunRecoveryWord(r);
-        if (!facts.hearthRegroupNote.empty())
-            line << "; " << facts.hearthRegroupNote;
-        if (!facts.summonNote.empty())
-            line << "; " << facts.summonNote;
-        if (!facts.dungeonFinderNote.empty())
-            line << "; " << facts.dungeonFinderNote;
-        return line.str();
-    }
-
     // INTO RECOVERING. `coord` already carries the next attempt's identity
     // (portal, staging point, campaign, run number, cap); this adds the
     // recovery and writes the request the bridge answers.
@@ -37762,7 +37731,7 @@ private:
                              " in " + std::to_string(coord.recoveryWaitSeconds) +
                              "s unless Jev chooses another";
 
-        std::string const factsLine = RecoveryFactsLine(facts);
+        std::string const factsLine = OverseerDecisions::RunRecoveryFactsLine(facts);
         if (resumed)
         {
             coord.recoveryNote = "attempt " + std::to_string(attempt) +
@@ -51081,20 +51050,16 @@ private:
                         coord.stallHeuristic = OverseerDecisions::StagingStallHeuristic(stall);
                         coord.stallAskedAt = std::time(nullptr);
                         coord.stallAskRearms = coord.stagingRearms;
-                        std::ostringstream facts;
-                        facts << "rearms " << stall.rearms << "; last ended by "
-                              << (ended.why.empty() ? std::string("nothing on record") : ended.why)
-                              << (ended.outside ? " (outside this module)" : "")
-                              << "; leader " << OverseerDecisions::ApproachWhere(gap)
-                              << "; staging clock "
-                              << (coord.stagingSince ? std::time(nullptr) - coord.stagingSince : 0)
-                              << "s of " << DUNGEON_STAGING_BACKSTOP_SECONDS << "s";
+                        std::string const factsLine = OverseerDecisions::StagingStallFactsLine(
+                            stall, gap,
+                            coord.stagingSince ? static_cast<long>(std::time(nullptr) - coord.stagingSince) : 0L,
+                            static_cast<unsigned>(DUNGEON_STAGING_BACKSTOP_SECONDS));
                         WriteRecoveryRequest(
                             FamilyOfCoordinator(coord), leaderName, coord.campaignId,
                             coord.runNumber, "staging_stall", coord.stagingRearms,
                             "the leader's staging errand was taken back " +
                                 std::to_string(coord.stagingRearms) + " times",
-                            facts.str(), OverseerDecisions::StagingStallOptions(),
+                            factsLine, OverseerDecisions::StagingStallOptions(),
                             OverseerDecisions::StagingStallWord(coord.stallHeuristic),
                             "the heuristic reads who ended the errand and how far out he is");
                         LOG_WARN("module.overseer",

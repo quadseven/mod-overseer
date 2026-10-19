@@ -3620,6 +3620,16 @@ bool RunRecoveryApplicable(RunRecovery recovery, RunFailureFacts const& facts);
 // request row.
 std::string RunRecoveryHeuristicWhy(RunFailureFacts const& facts, RunRecovery chosen);
 
+// THE FACTS LINE THE BRIDGE ASKS JEV WITH, for one failure. It carries every
+// field RunRecoveryHeuristic reads (outcome and reason ride in the request
+// row's failure column, "outcome: reason"), so Jev never chooses on fewer
+// facts than the heuristic it is compared with. Measured over 24 hours on the
+// dev realm: Jev was acted on in 36% of run_recovery calls, mostly answering
+// with low confidence where the heuristic read an input the line did not
+// carry (a member held off a lethal leg, the ladder's streak and rungs). A new
+// input to the heuristic belongs in this line too; the test for it says so.
+std::string RunRecoveryFactsLine(RunFailureFacts const& facts);
+
 // THE BACKOFF. The wait before attempt `attempt` (1-based: the first failure
 // in a row is attempt 1) is `base` doubled per earlier failure, capped at
 // `cap`. Never zero, so a failure can never re-open a run in the same poll.
@@ -3688,6 +3698,15 @@ struct StagingStallFacts
 };
 
 StagingStall StagingStallHeuristic(StagingStallFacts const& facts);
+
+// THE STAGING STALL FACTS LINE for the bridge's question: every input
+// StagingStallHeuristic reads (the re-arm count, what ended the errand and
+// whether that came from outside the module, the leader's distance) plus the
+// staging geometry around it: the vertical offset `gap` measures and how long
+// the staging clock has run of its backstop. `gap` is the same reading
+// `facts.leaderYards` was taken from.
+std::string StagingStallFactsLine(StagingStallFacts const& facts, ApproachGap const& gap,
+                                  long stagingSeconds, unsigned backstopSeconds);
 
 // DOES A TERRAIN RECOVERY VERDICT END THE CHARACTER'S TRAVEL ERRAND?
 //
