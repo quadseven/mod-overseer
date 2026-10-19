@@ -4981,6 +4981,75 @@ ProfessionStep NextProfessionStep(std::vector<unsigned> const& wanted,
                                   std::vector<ProfessionHolding> const& held,
                                   unsigned maxPrimary);
 
+// ------------------------------------------------------- job='craft' queue --
+//
+// THE CRAFTING QUEUE, IN THE ORDER THE TICKET NAMES IT: bags for every
+// member first, then want-list items or consumables, then skill-ups. A
+// crafter at its skill cap, or one that does not yet know the recipe it
+// would cast, is sent to a trainer instead of being asked to craft.
+//
+// Every type here is free of AzerothCore and mod-playerbots types, so a
+// unit test can build a family and assert on the next errand without a
+// world, a bot, or a database.
+
+// One family member's crafting state, as the Python planner measured it.
+struct CraftingMember
+{
+    // The crafting trade this member holds (0 when it holds none).
+    uint32_t skill{0};
+    // Its current skill value, and the bracket cap that ends it.
+    uint32_t value{0};
+    uint32_t cap{0};
+    // True when this member knows the recipe named by nextRecipe.
+    bool knowsRecipe{false};
+    // The recipe (spell id) this member can cast next, 0 when none chosen.
+    uint32_t nextRecipe{0};
+    // How many bags this member holds (0..4).
+    uint8_t bags{0};
+    // True when this member is the family's tailor and may craft bags.
+    bool isTailor{false};
+};
+
+// What the family still wants, beyond bags, in the order the planner ranks it.
+struct FamilyWants
+{
+    // Recipe spell ids the family wants an item from (gear, consumables).
+    std::vector<uint32_t> wantList;
+};
+
+enum class CraftQueueStepKind
+{
+    // THE QUEUE IS DRAINED: every member holds four bags, the want list is
+    // covered, every crafting trade is below its cap and knows its recipe,
+    // and nobody needs a trainer.
+    Nothing,
+
+    // Craft a bag. Only a tailor may, and the bag goes to a member that
+    // still holds fewer than four.
+    Bag,
+
+    // Craft `spellId`, a want-list item or consumable, by `member`.
+    Item,
+
+    // Craft `spellId` by `member` to raise its `skill` toward `cap`.
+    SkillUp,
+
+    // `member` needs a trainer: its skill is at cap or its recipe unknown.
+    TrainerVisit,
+};
+
+struct CraftQueueStep
+{
+    CraftQueueStepKind kind{CraftQueueStepKind::Nothing};
+    uint32_t skill{0};       // the trade exercised
+    uint32_t spellId{0};     // the recipe to cast, 0 for Bag and TrainerVisit
+    std::size_t member{0};   // the family index that acts (the crafter)
+};
+
+// The next craft errand for the family, and Nothing when the queue is drained.
+CraftQueueStep NextCraftStep(std::vector<CraftingMember> const& family,
+                             FamilyWants const& wants);
+
 // ------------------------------------------------------------ job='fish' --
 //
 // Fishing does not fit ProfessionStep's shape at all: no primary-profession
