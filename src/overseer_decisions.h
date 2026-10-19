@@ -20147,6 +20147,39 @@ std::string TankStrategyChange(TankStrategyFacts const& facts);
 bool WarriorNeedsMeleePursuit(uint8_t classId, bool tanks, bool inCombat,
                               bool inMeleeRange);
 
+// WHERE THE PURSUIT MAY ACT (#1055). WarriorNeedsMeleePursuit answers whether
+// the tank is out of reach; this answers whether closing that gap is the
+// engagement drive's business at all. It is not, in three places:
+//
+// - On an instance map. mod-dungeon-clear is armed on geography (the arming
+//   drive issues `dc on` to anyone standing on a dungeon map, finder and
+//   guild runs included), and its LOS-break pull drags a caster pack 25 to 60
+//   yards to a camp out of line of sight with the tank out of melee reach on
+//   purpose. A MoveChase mid-drag turns the tank back onto the caster, and the
+//   drag's DcMoveTo dedupes on destination, so it never recovers. The map is
+//   the fact rather than an open run row for the same reason InDungeonRun
+//   gives: a character inside without a row is still the dungeon module's.
+// - Under any overseer hold (the far hold, a staging or inn hold, the hold
+//   after a revival). A hold pins the character in place, and a chase is a
+//   walk away from the pin.
+// - Mounted or dead. A mounted warrior auto attacks nothing and a dead one has
+//   nothing to chase with.
+//
+// Everywhere else the answer is WarriorNeedsMeleePursuit's (#1049).
+struct TankPursuitFacts
+{
+    uint8_t classId{0};
+    bool tanks{false};          // "tank" is in the combat engine
+    bool inCombat{false};
+    bool inMeleeRange{false};   // of its victim, or its selection with none
+    bool onInstanceMap{false};  // Map::Instanceable (dungeon, raid, battleground)
+    bool heldStill{false};      // any overseer hold, revival hold included
+    bool mounted{false};
+    bool alive{true};
+};
+
+bool TankMayPursue(TankPursuitFacts const& facts);
+
 // A TANK HOLDING A TWO-HANDER IS MEASURED THE OTHER WAY ROUND. The sweep scores
 // a two-hander against the PAIR it would replace (#14), and it scores a shield
 // only when the main hand is free for one. So a tank already holding a
