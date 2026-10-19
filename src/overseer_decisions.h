@@ -955,6 +955,23 @@ struct TerrainRecoveryLimits
 // yes was logged as "the detector being wrong" while the leader rode two
 // thousand yards under Stormwind and the sea beside it. The question is not
 // whether there is ground but which.
+//
+// AND A MEASURED OPEN SKY IS NOT UNDER ANYTHING (#188). Real ground can be
+// as flat as the placeholder: a town floor the map's artists levelled reads
+// one height to three decimals for 25 yards round, exactly like the plane. On
+// the dev realm on 2026-10-18 and 10-19 this rung logged 106 lines, at
+// Bloodhoof Village (terrain z -9.425), along the Barrens road (z 91.7 to
+// 95.9), at Gadgetzan (z 8.5) and at a camp at z 34.9 among others, up to 16
+// per family in 40 minutes, and 50 of the 53 "IS UNDER THE WORLD" lines read
+// a surface over the feet equal to the terrain itself: nothing over the
+// character at all.
+// Every one released an errand, refused its travel aim and asked for the
+// hearthstone, and the next errand walked the family straight back into the
+// town. So where the surface overhead was measured and is less than
+// `minimumGap` above the feet - the same gap every other below-the-world
+// rule asks for - the character is standing on top of the world, and this
+// answers no. A surface that could not be measured leaves the answer to the
+// three terrain readings alone, as before.
 bool OnTheHiddenPlane(TerrainReading const& reading,
                       TerrainRecoveryLimits const& limits);
 

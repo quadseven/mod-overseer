@@ -668,7 +668,13 @@ bool OnTheHiddenPlane(TerrainReading const& reading,
         !reading.terrainValid || !reading.planeFlat)
         return false;
     float const d = reading.z - reading.terrainZ;
-    return (d < 0.f ? -d : d) <= limits.planeReach;
+    if ((d < 0.f ? -d : d) > limits.planeReach)
+        return false;
+    // Open sky, measured: a levelled town floor, not the plane (#188).
+    if (reading.surfaceValid &&
+        reading.surfaceAboveZ - reading.z < limits.minimumGap)
+        return false;
+    return true;
 }
 
 bool ProvenBelowTheWorld(TerrainReading const& reading,
