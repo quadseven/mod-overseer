@@ -238,6 +238,11 @@ void TheAdapterSeams()
     Expect(module.find("player->AddQuestAndCheckCompletion(quest, giver);") != std::string::npos &&
                module.find("RewardQuestChosen(player, quest, reward, giver);") != std::string::npos,
            "the core's own calls take and hand in");
+    std::size_t const chosen = module.find("void RewardQuestChosen(");
+    Expect(chosen != std::string::npos &&
+               module.find("player->RewardQuest(quest, reward.index, giver);", chosen) !=
+                   std::string::npos,
+           "the chosen hand-in is the core's own reward, taking the chosen index");
     Expect(module.find("GetGOQuestRelationMap()") != std::string::npos &&
                module.find("GetGOQuestInvolvedRelationMap()") != std::string::npos,
            "an object giver and taker come from the world's own relations too (#19)");
