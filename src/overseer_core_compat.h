@@ -130,6 +130,17 @@ decltype(auto) RandomClassSpecIndex(Config& config)
         return (config.RandomClassSpecIndex);
 }
 
+// --- Playerbots config key names (mod-playerbots #2854, mod-overseer #1068) --
+// The same rename moved every config key from AiPlayerbot.<Name> to
+// Playerbots.<Name>, and the newer mod-playerbots reads only the new spelling:
+// a realm overlay that still sets the old one is ignored. Key names are
+// strings, invisible to the compiler, so the member rename above is how this
+// header tells which spelling the linked mod-playerbots (and every patch on
+// it) reads. True when it reads Playerbots.<Name>. The adapter turns it into a
+// key with OverseerDecisions::PlayerbotsConfigKey, never a literal.
+template <typename Config>
+inline constexpr bool PlayerbotsKeysRenamed = !requires(Config const& config) { config.spellDistance; };
+
 // --- Every packet a session sends, client or bot ----------------------------
 // Old core: PlayerbotScript::OnPlayerbotPacketSent(Player*, WorldPacket const*).
 // New core: ServerScript::OnPacketSent(WorldSession*, WorldPacket const&).

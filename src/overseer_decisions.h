@@ -23525,10 +23525,31 @@ char const* NaturalizeModeWord(NaturalizeMode mode);
 char const* NaturalizePartWord(unsigned part);
 
 // A comma list of names from the config (`Overseer.Natural.Guilds`,
-// `AiPlayerbot.NaturalGuild`). Ends trimmed, empty entries dropped; the match
+// `Playerbots.NaturalGuild`). Ends trimmed, empty entries dropped; the match
 // ignores case, as the core's guild lookup by name does.
 std::vector<std::string> ParseNameList(std::string const& csv);
 bool NameListHas(std::vector<std::string> const& list, std::string const& name);
+
+// A MOD-PLAYERBOTS KEY IS SPELLED THE WAY THE LINKED MOD-PLAYERBOTS SPELLS IT
+// (#1068). mod-playerbots #2854 renamed every AiPlayerbot.<Name> key to
+// Playerbots.<Name>, and after it the old spelling is not read at all. So the
+// adapter reads exactly the key the factory reads - `keysRenamed` comes from
+// OverseerCompat::PlayerbotsKeysRenamed - and never the other one: reading the
+// other spelling as a fallback would believe a gate the factory ignores.
+std::string PlayerbotsConfigKey(bool keysRenamed, char const* name);
+
+// What one mod-playerbots option read says. `value` is the value under the key
+// the linked mod-playerbots reads. `otherSpellingOnly` is true when that is
+// empty and the other spelling is set: a realm overlay written for the other
+// generation of mod-playerbots, which the factory ignores too, so the value
+// stays empty and the adapter says so rather than staying quiet.
+struct PlayerbotsOptionRead
+{
+    std::string value;
+    bool otherSpellingOnly{false};
+};
+PlayerbotsOptionRead ReadPlayerbotsOption(std::string const& readKeyValue,
+                                          std::string const& otherSpellingValue);
 
 // What the adapter reads before it touches anything. The character need not be
 // online for any of it.
@@ -23543,7 +23564,7 @@ struct NaturalizeFacts
     unsigned openAuctions{0};        // auctions it owns
     unsigned openBids{0};            // auctions it holds the high bid on
     unsigned codMail{0};             // COD mail waiting in its inbox
-    bool playerbotsGateCovers{false};// AiPlayerbot.NaturalGuild names its guild
+    bool playerbotsGateCovers{false};// Playerbots.NaturalGuild (AiPlayerbot. before #2854) names its guild
     bool trainFactoryOn{true};       // retired Overseer.Train.Factory; the adapter says false
     unsigned partsAlreadyDone{0};    // ledger bits already recorded for it
     unsigned level{0};               // its level now
@@ -23578,8 +23599,10 @@ enum class NaturalizeRefusal : std::uint8_t
 NaturalizeRefusal NaturalizeVerdictFor(NaturalizeRequest const& request, NaturalizeFacts const& facts,
                                        bool asDryRun);
 
-// Literals for the row's detail; none carries a quote character.
-char const* NaturalizeRefusalSaid(NaturalizeRefusal refusal);
+// Literals for the row's detail; none carries a quote character. The
+// playerbots gate names the key the adapter actually read, which is
+// PlayerbotsConfigKey(playerbotsKeysRenamed, "NaturalGuild") (#1068).
+char const* NaturalizeRefusalSaid(NaturalizeRefusal refusal, bool playerbotsKeysRenamed);
 
 // THE RESET, PART BY PART. The adapter walks RESET_PARTS and asks each one
 // what to do; the dry run lists the same table, so the report and the action
