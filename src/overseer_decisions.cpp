@@ -3094,6 +3094,29 @@ bool DungeonQuestTurnInReady(std::vector<float> const& memberYards, size_t party
                        [](float yards) { return yards <= 30.f; });
 }
 
+DungeonTurnInStep DungeonTurnInStepFor(DungeonTurnInHolder const& holder)
+{
+    if (!holder.inWorld)
+        return DungeonTurnInStep::Wait;
+    if (holder.rewarded)
+        return DungeonTurnInStep::Done;
+    if (!holder.atEnder || !holder.rewardable)
+        return DungeonTurnInStep::Wait;
+    return holder.rewardFits ? DungeonTurnInStep::Reward : DungeonTurnInStep::LeaveNoRoom;
+}
+
+char const* DungeonTurnInStepWord(DungeonTurnInStep step)
+{
+    switch (step)
+    {
+        case DungeonTurnInStep::Done: return "done";
+        case DungeonTurnInStep::Wait: return "wait";
+        case DungeonTurnInStep::Reward: return "reward";
+        case DungeonTurnInStep::LeaveNoRoom: return "leave-no-room";
+    }
+    return "unknown";
+}
+
 uint32_t EventGatedEncounterMask(uint32_t mapId)
 {
     // Bits from DungeonEncounter.dbc for each map, read off the dev realm's
@@ -5049,8 +5072,26 @@ std::string QuestRewardDetail(QuestRewardOption const& chosen, QuestRewardPick c
     return "reward " + std::to_string(chosen.entry) + ", " + why;
 }
 
+std::uint64_t CounterBagBudget(std::uint64_t purseAtCounter)
+{
+    return purseAtCounter / 2;
+}
+
+std::string CounterBuyDetail(CounterBuyWhy why, std::uint64_t copperSpent,
+                             std::uint64_t purseBefore, int bagSlots, float gain)
+{
+    std::ostringstream o;
+    if (why == CounterBuyWhy::Bag)
+        o << "a " << bagSlots << "-slot bag for an empty bag slot";
+    else
+        o << "an upgrade of " << std::fixed << std::setprecision(1) << gain
+          << " over what it wears";
+    o << ", " << copperSpent << " copper of a " << purseBefore << " copper purse";
+    return o.str();
+}
+
 int ChooseBagPurchase(std::vector<BagOffer> const& offers, int emptyBagSlots,
-                      std::uint64_t money)
+                      std::uint64_t budget)
 {
     if (emptyBagSlots <= 0)
         return -1;
@@ -5058,7 +5099,7 @@ int ChooseBagPurchase(std::vector<BagOffer> const& offers, int emptyBagSlots,
     for (std::size_t i = 0; i < offers.size(); ++i)
     {
         BagOffer const& offer = offers[i];
-        if (!offer.inStock || offer.slots <= 0 || offer.price > money)
+        if (!offer.inStock || offer.slots <= 0 || offer.price > budget)
             continue;
         BagOffer const* held = best < 0 ? nullptr : &offers[static_cast<std::size_t>(best)];
         if (!held || offer.slots > held->slots ||

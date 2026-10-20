@@ -3384,6 +3384,41 @@ struct DungeonQuestObjective
 bool DungeonQuestGoalReady(std::vector<DungeonQuestObjective> const& objectives);
 bool DungeonQuestTurnInReady(std::vector<float> const& memberYards, size_t partySize);
 
+// ONE HOLDER AT THE DUNGEON QUEST'S ENDER, AFTER EXIT (#1067).
+//
+// The turn-in asks CanRewardQuest with the chosen reward, which also asks
+// whether the reward items fit in the bags (#1062). A holder whose bags cannot
+// take them failed that on every poll, the turn-in held EXIT, the caller
+// stamped last_progress_at, and the town trip that would have emptied the
+// bags refuses while a run holds - the same "held EXIT for ever" #1015 fixed
+// for a quest with no ender. Bots come out of a dungeon with full bags, so
+// this is the likely case, not a corner.
+//
+// So a holder whose quest is rewardable but whose reward does not fit is LEFT,
+// not waited on: the quest stays complete in its log for the ordinary hand-in
+// (which waits for room, and the town trip makes room once the run is over),
+// it is said once, and it does not hold EXIT. It is not handed in with the
+// reward dropped either: RewardQuest drops an item that does not fit.
+enum class DungeonTurnInStep : std::uint8_t
+{
+    Done,         // already rewarded
+    Wait,         // not in the world, not at the ender, or not rewardable: hold EXIT
+    Reward,       // hand it in now
+    LeaveNoRoom,  // rewardable, but the reward does not fit: leave it, do not hold EXIT
+};
+
+struct DungeonTurnInHolder
+{
+    bool inWorld{false};
+    bool rewarded{false};      // GetQuestRewardStatus
+    bool atEnder{false};       // in reach of the ender and able to see it
+    bool rewardable{false};    // CanRewardQuest(quest, false): status, not bags
+    bool rewardFits{false};    // CanRewardQuest(quest, reward, false): the items fit too
+};
+
+DungeonTurnInStep DungeonTurnInStepFor(DungeonTurnInHolder const& holder);
+char const* DungeonTurnInStepWord(DungeonTurnInStep step);
+
 // HOW MANY OF THE NEWEST ATTEMPTS IN A ROW NEVER GOT INSIDE, counting back from
 // the newest and stopping at the first that did.
 //
@@ -6011,10 +6046,29 @@ struct BagOffer
 };
 
 // BAGS COME BEFORE ANY OTHER DISCRETIONARY SPEND. A bag is bought only into an
-// empty bag slot, and it is the largest one the purse covers (the cheaper of
+// empty bag slot, and it is the largest one `budget` covers (the cheaper of
 // two the same size). -1 when no bag slot is empty or nothing is affordable.
+// `budget` is what is left of CounterBagBudget for this visit, never the purse.
 int ChooseBagPurchase(std::vector<BagOffer> const& offers, int emptyBagSlots,
-                      std::uint64_t money);
+                      std::uint64_t budget);
+
+// WHAT A VISIT TO THE COUNTER MAY SPEND ON BAGS (#1067): half the purse the
+// member brought to it, shared by every bag bought on that visit. The other
+// half is the next repair, the same line ChooseVendorUpgrade draws: a bag is
+// discretionary and a broken weapon is not. Up to four bags bought one at a
+// time against the whole purse could spend all of it.
+std::uint64_t CounterBagBudget(std::uint64_t purseAtCounter);
+
+// What a member bought for itself at the counter, for its `counter_buy` event
+// (#1067), the way a repair, a respec and a recipe each get their own row:
+// the gold ledger says copper moved, this says what for.
+enum class CounterBuyWhy : std::uint8_t
+{
+    Bag,      // into an empty bag slot
+    Upgrade,  // a vendor piece that upgrades what it wears
+};
+std::string CounterBuyDetail(CounterBuyWhy why, std::uint64_t copperSpent,
+                             std::uint64_t purseBefore, int bagSlots, float gain);
 
 // One weapon or piece of armour a vendor in reach sells for gold, scored for
 // the buyer against what it wears in the slot it would go into.

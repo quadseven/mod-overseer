@@ -72,7 +72,7 @@ int main()
     std::string const shop = Body(text, "static void ShopAtTheCounter(");
     Expect(shop, "ShopAtTheCounter", "BuyBagsAtTheCounter(");
     Expect(shop, "ShopAtTheCounter", "BuyUpgradeAtTheCounter(");
-    Expect(Body(text, "static void BuyBagsAtTheCounter("), "BuyBagsAtTheCounter",
+    Expect(Body(text, "static uint32 BuyBagsAtTheCounter("), "BuyBagsAtTheCounter",
            "OverseerDecisions::ChooseBagPurchase(");
     Expect(Body(text, "static void BuyUpgradeAtTheCounter("), "BuyUpgradeAtTheCounter",
            "OverseerDecisions::ChooseVendorUpgrade(");

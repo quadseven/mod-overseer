@@ -33438,6 +33438,9 @@ private:
         bool questGoalFinished{false};
         std::string questsTurnedIn;
         std::set<uint32> turnedInQuestIds;
+        // (quest, holder) the turn-in left for the ordinary hand-in because
+        // the holder's bags could not take the reward (#1067). Said once each.
+        std::set<std::pair<uint32, std::string>> turnInLeftNoRoom;
         DungeonRunPhase phase{DungeonRunPhase::Idle};
         time_t leaderClientOpenSince{0};
         time_t leaderClientLostSince{0};
@@ -46577,21 +46580,34 @@ private:
     }
 
     // One purchase through DoBuy, capped at the price read here. True when it
-    // read back as bought; a refusal is said and is false.
-    static bool BuyForSelf(std::string const& name, Player* bot, uint32 entry, uint32 price)
+    // read back as bought; a refusal is said and is false. A purchase is
+    // recorded as a `counter_buy` event saying what it was for (#1067), the
+    // way a repair or a respec is, with the copper read off the purse.
+    static bool BuyForSelf(std::string const& name, Player* bot, uint32 entry, uint32 price,
+                           OverseerDecisions::CounterBuyWhy why, int bagSlots, float gain,
+                           uint64& spent)
     {
+        spent = 0;
         char const* status = "error";
         std::string evidence;
         std::string const command =
             "entry:" + std::to_string(entry) + " max:" + std::to_string(price);
+        uint64 const purseBefore = bot->GetMoney();
         // Guarded rather than trusted, as RepairAtTheCounter guards DoRepair.
         char const* const answer = DoBuy(bot, command, status, evidence);
         std::string const refusal = answer ? answer : "";
-        if (refusal.empty())
-            return true;
-        LOG_INFO("module.overseer", "overseer: '{}' did not buy item {} at the counter - {}",
-                 name, entry, refusal);
-        return false;
+        if (!refusal.empty())
+        {
+            LOG_INFO("module.overseer", "overseer: '{}' did not buy item {} at the counter - {}",
+                     name, entry, refusal);
+            return false;
+        }
+        uint64 const purseAfter = bot->GetMoney();
+        spent = purseBefore > purseAfter ? purseBefore - purseAfter : 0;
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(entry);
+        RecordEvent(bot, "counter_buy", entry, proto ? proto->Name1 : "",
+                    OverseerDecisions::CounterBuyDetail(why, spent, purseBefore, bagSlots, gain));
+        return true;
     }
 
     // Put a bag just bought into an empty bag slot the way a player drags it
@@ -46618,10 +46634,12 @@ private:
         return false;
     }
 
-    // Fill the empty bag slots, the largest affordable bag first. Bounded by
-    // the four slots, so a bag that will not go on cannot loop.
-    static void BuyBagsAtTheCounter(std::string const& name, Player* bot,
-                                    std::vector<VendorGoldLine> const& lines)
+    // Fill the empty bag slots, the largest affordable bag first, out of one
+    // budget for the visit: CounterBagBudget, half the purse brought to the
+    // counter (#1067). Bounded by the four slots, so a bag that will not go
+    // on cannot loop. Returns how many bags were bought.
+    static uint32 BuyBagsAtTheCounter(std::string const& name, Player* bot,
+                                      std::vector<VendorGoldLine> const& lines)
     {
         std::vector<OverseerDecisions::BagOffer> offers;
         for (VendorGoldLine const& line : lines)
@@ -46629,17 +46647,25 @@ private:
                 line.proto->SubClass == ITEM_SUBCLASS_CONTAINER && line.proto->ContainerSlots > 0)
                 offers.push_back(OverseerDecisions::BagOffer{
                     line.proto->ItemId, int(line.proto->ContainerSlots), line.price, line.inStock});
+        uint64 budget = OverseerDecisions::CounterBagBudget(bot->GetMoney());
+        uint32 bought = 0;
         for (uint8 slot = INVENTORY_SLOT_BAG_START; slot < INVENTORY_SLOT_BAG_END; ++slot)
         {
             int const pick = OverseerDecisions::ChooseBagPurchase(
-                offers, CountFreeBagSlots(bot), bot->GetMoney());
+                offers, CountFreeBagSlots(bot), budget);
             if (pick < 0)
-                return;
+                break;
             OverseerDecisions::BagOffer const& bag = offers[static_cast<std::size_t>(pick)];
-            if (!BuyForSelf(name, bot, bag.entry, uint32(bag.price)) ||
-                !WearBoughtBag(name, bot, bag.entry))
-                return;
+            uint64 spent = 0;
+            if (!BuyForSelf(name, bot, bag.entry, uint32(bag.price),
+                            OverseerDecisions::CounterBuyWhy::Bag, bag.slots, 0.f, spent))
+                break;
+            ++bought;
+            budget -= std::min(budget, spent);
+            if (!WearBoughtBag(name, bot, bag.entry))
+                break;
         }
+        return bought;
     }
 
     // The vendor piece that upgrades this member most, once every bag slot
@@ -46660,17 +46686,23 @@ private:
         if (pick < 0)
             return;
         OverseerDecisions::VendorUpgradeOffer const& piece = offers[static_cast<std::size_t>(pick)];
-        if (BuyForSelf(name, bot, piece.entry, uint32(piece.price)))
+        uint64 spent = 0;
+        if (BuyForSelf(name, bot, piece.entry, uint32(piece.price),
+                       OverseerDecisions::CounterBuyWhy::Upgrade, 0, piece.gain, spent))
             LOG_INFO("module.overseer",
                      "overseer: '{}' bought item {} at the counter, an upgrade of {:.1f} over "
                      "what it wears there",
                      name, piece.entry, piece.gain);
     }
 
+    // ONE DISCRETIONARY SPEND PER VISIT (#1067). A visit that bought a bag
+    // has had its half of the purse; the vendor piece waits for the next
+    // visit, so the half kept for the next repair is never spent here.
     static void ShopAtTheCounter(std::string const& name, Player* bot)
     {
         std::vector<VendorGoldLine> const lines = VendorGoldLinesFor(bot);
-        BuyBagsAtTheCounter(name, bot, lines);
+        if (BuyBagsAtTheCounter(name, bot, lines) > 0)
+            return;
         BuyUpgradeAtTheCounter(name, bot, lines);
     }
 
@@ -49786,29 +49818,61 @@ private:
         return giver && OverseerDecisions::DungeonQuestTurnInReady(yards, members.size());
     }
 
+    // True when every holder is settled: rewarded, or left for the ordinary
+    // hand-in because its bags cannot take the reward (#1067). `leftNoRoom`
+    // is the run's record of who was left, so each is said once and counted.
     static bool RewardDungeonQuestHolders(uint32 runId, uint32 questId,
                                           std::set<std::string> const& names,
-                                          WorldObject* giver)
+                                          WorldObject* giver,
+                                          std::set<std::pair<uint32, std::string>>& leftNoRoom)
     {
+        using OverseerDecisions::DungeonTurnInStep;
         Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
         if (!quest)
             return false;
         for (std::string const& name : names)
         {
             Player* player = ObjectAccessor::FindPlayerByName(name);
-            if (!player)
-                return false;
-            if (player->GetQuestRewardStatus(questId))
-                continue;
-            if (player->GetExactDist(giver) >
-                    OverseerDecisions::SPAWN_WALK_ARRIVE_YARDS ||
-                !player->CanSeeOrDetect(giver))
-                return false;
-            QuestRewardChosen const reward = ChooseQuestRewardFor(player, quest);
-            if (!player->CanRewardQuest(quest, reward.index, false))
+            OverseerDecisions::DungeonTurnInHolder holder;
+            holder.inWorld = player != nullptr;
+            QuestRewardChosen reward;
+            if (player)
             {
-                LOG_WARN("module.overseer", "overseer: dungeon run {} quest {} for '{}' is not rewardable (status {})",
-                         runId, questId, name, static_cast<int>(player->GetQuestStatus(questId)));
+                holder.rewarded = player->GetQuestRewardStatus(questId);
+                holder.atEnder = player->GetExactDist(giver) <=
+                                     OverseerDecisions::SPAWN_WALK_ARRIVE_YARDS &&
+                                 player->CanSeeOrDetect(giver);
+                if (!holder.rewarded && holder.atEnder)
+                {
+                    // The two-argument form asks the quest's own state; the
+                    // three-argument form asks that too and then whether the
+                    // chosen and fixed reward items fit in the bags.
+                    reward = ChooseQuestRewardFor(player, quest);
+                    holder.rewardable = player->CanRewardQuest(quest, false);
+                    holder.rewardFits =
+                        holder.rewardable && player->CanRewardQuest(quest, reward.index, false);
+                }
+            }
+            DungeonTurnInStep const step = OverseerDecisions::DungeonTurnInStepFor(holder);
+            if (step == DungeonTurnInStep::Done)
+                continue;
+            if (step == DungeonTurnInStep::LeaveNoRoom)
+            {
+                // NOT WAITED ON (#1067): the bags will not empty while the run
+                // holds the town trip, so waiting here held EXIT for ever.
+                if (leftNoRoom.insert({questId, name}).second)
+                    LOG_WARN("module.overseer",
+                             "overseer: dungeon run {} quest {} for '{}': its bags cannot take "
+                             "the reward, so it is left complete for the ordinary hand-in and "
+                             "does not hold EXIT",
+                             runId, questId, name);
+                continue;
+            }
+            if (step == DungeonTurnInStep::Wait)
+            {
+                if (holder.inWorld && holder.atEnder && !holder.rewardable)
+                    LOG_WARN("module.overseer", "overseer: dungeon run {} quest {} for '{}' is not rewardable (status {})",
+                             runId, questId, name, static_cast<int>(player->GetQuestStatus(questId)));
                 return false;
             }
             RewardQuestChosen(player, quest, reward, giver);
@@ -49857,14 +49921,23 @@ private:
                 ? static_cast<WorldObject*>(holder->FindNearestGameObject(ender.entry, 30.f))
                 : static_cast<WorldObject*>(holder->FindNearestCreature(ender.entry, 30.f));
             if (!GatherAtDungeonQuestEnder(ender, members, giver) ||
-                !RewardDungeonQuestHolders(coord.runId, questId, names, giver))
+                !RewardDungeonQuestHolders(coord.runId, questId, names, giver,
+                                           coord.turnInLeftNoRoom))
                 return false;
             coord.turnedInQuestIds.insert(questId);
+            std::size_t left = 0;
+            for (std::string const& name : names)
+                left += coord.turnInLeftNoRoom.count({questId, name});
+            // A quest every holder was left with was not turned in, so it is
+            // not named among the quests turned in, as with no ender (#1015).
+            if (left == names.size())
+                continue;
             if (!coord.questsTurnedIn.empty())
                 coord.questsTurnedIn += ',';
             coord.questsTurnedIn += std::to_string(questId);
-            LOG_INFO("module.overseer", "overseer: dungeon run {} turned in quest {} with all {} members within 30 yards",
-                     coord.runId, questId, members.size());
+            LOG_INFO("module.overseer", "overseer: dungeon run {} turned in quest {} with all {} members within 30 yards"
+                     " ({} of {} holder(s) left it for the ordinary hand-in, bags full)",
+                     coord.runId, questId, members.size(), left, names.size());
         }
         return true;
     }
