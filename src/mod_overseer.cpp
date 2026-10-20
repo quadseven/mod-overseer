@@ -3525,6 +3525,10 @@ std::map<ObjectGuid::LowType, MeterSeat> g_meterSeats;
 std::map<std::string, std::vector<std::string>> g_meterFamilies;
 std::map<std::string, std::string> g_meterLeaders;
 std::map<std::string, OverseerDecisions::MeterBook> g_meterBooks;
+// THE RUN'S DAMAGE (#971, OverseerDecisions::RunDamageNote). Fed by the same
+// hooks under the same lock, drained into overseer_run_damage by FlushEvents.
+OverseerDecisions::RunDamageBook g_runDamageBook;
+uint64 g_droppedRunDamage = 0;
 
 std::mutex g_chatMutex;
 std::vector<PendingLine> g_chatQueue;
@@ -4069,22 +4073,91 @@ void NoteStoredItem(Player const* player, Item const* item, uint32 count)
     if (!player)
         return;
     ItemTemplate const* proto = item ? item->GetTemplate() : nullptr;
+    // The entry is kept for every store (#971): the run's loot table lists a
+    // grey too, and the loot hook may only learn its entry from here.
     OverseerDecisions::NoteStoredItem(
         t_lootStoreNote, player->GetGUID().GetRawValue(), item ? item->GetGUID().GetCounter() : 0,
-        count, IsItemStoryCandidate(proto));
+        count, IsItemStoryCandidate(proto), item ? item->GetEntry() : 0);
 }
 
 // The looted item as the looter's bags hold it now, or null. `handed` is the
 // hook's own pointer and is only ever compared with null, never read: the
 // guid comes from the note and the Item from Player::GetItemByGuid, so an item
-// another script destroyed is simply not found.
-Item* TakeLootedItem(Player* looter, Item const* handed, uint32 count)
+// another script destroyed is simply not found. `noted` is what the note said
+// about the store, for the run's loot table, whatever the answer.
+Item* TakeLootedItem(Player* looter, Item const* handed, uint32 count,
+                     OverseerDecisions::LootedItem& noted)
 {
-    uint32 const itemGuid = OverseerDecisions::TakeLootedItemGuid(
+    noted = OverseerDecisions::TakeLootedItemNote(
         t_lootStoreNote, looter ? looter->GetGUID().GetRawValue() : 0, count);
-    if (!looter || !handed || !itemGuid)
+    if (!looter || !handed || !noted.storyGuid)
         return nullptr;
-    return looter->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(itemGuid));
+    return looter->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(noted.storyGuid));
+}
+
+// A WIN INSIDE A DUNGEON, ANY QUALITY (#971): the run's loot table. Named from
+// the store note and the template store, never from the item, which another
+// script may already have destroyed (#572). The guid rides in the event key so
+// two of one item are two rows. The source is named only after the gate, so a
+// loot anywhere else on the world costs two field reads and nothing more.
+std::string LootSourceName(Player const* looter, ObjectGuid source);
+
+void RecordLootWon(Player* looter, OverseerDecisions::LootedItem const& noted, uint32 count,
+                   char const* via, ObjectGuid sourceGuid)
+{
+    if (!looter || !noted.entry)
+        return;
+    Map const* map = looter->FindMap();
+    bool const inDungeon = map && map->IsDungeon();
+    if (!inDungeon)
+        return;
+    if (!OverseerDecisions::ShouldRecordLootWon(OnRoster(looter->GetName()), inDungeon,
+                                                noted.entry))
+        return;
+    std::string const source = LootSourceName(looter, sourceGuid);
+    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(noted.entry);
+    EventExtra extra;
+    extra.subjectQuality = proto ? proto->Quality : 0;
+    extra.subjectItemLevel = proto ? proto->ItemLevel : 0;
+    extra.itemGuid = noted.guid;
+    extra.via = via;
+    extra.source = source;
+    OverseerDecisions::FitItemStoryColumn(extra.source);
+    QueueEvent(looter, "loot_won", noted.entry, proto ? proto->Name1 : "",
+               OverseerDecisions::LootWonDetail(via, count, source), extra);
+}
+
+// A BOSS'S DEATH, TOLD APART FROM ANY OTHER CREATURE'S (#971). The core's own
+// encounter list for the map is asked first, the same DungeonEncounter.dbc rows
+// that credit the run's encounter mask (MapEncounterMask), then the template's
+// dungeon-boss flag. Both are static data, safe to read on a map thread.
+void RecordBossKill(Player* killer, Creature* killed)
+{
+    if (!killer || !killed || !OnRoster(killer->GetName()))
+        return;
+    Map const* map = killed->FindMap();
+    bool const inDungeon = map && map->IsDungeon();
+    if (!inDungeon)
+        return;
+    std::string encounterName;
+    bool credited = false;
+    if (DungeonEncounterList const* encounters =
+            sObjectMgr->GetDungeonEncounterList(map->GetId(), map->GetDifficulty()))
+        for (DungeonEncounter const* encounter : *encounters)
+            if (encounter && encounter->creditType == ENCOUNTER_CREDIT_KILL_CREATURE &&
+                encounter->creditEntry == killed->GetEntry())
+            {
+                credited = true;
+                if (encounter->dbcEntry && encounter->dbcEntry->encounterName[0])
+                    encounterName = encounter->dbcEntry->encounterName[0];
+                break;
+            }
+    OverseerDecisions::BossKillBasis const basis =
+        OverseerDecisions::ClassifyBossKill(inDungeon, credited, killed->IsDungeonBoss());
+    if (basis == OverseerDecisions::BossKillBasis::None)
+        return;
+    QueueEvent(killer, "boss_kill", killed->GetEntry(), killed->GetName(),
+               OverseerDecisions::BossKillDetail(basis, encounterName), EventExtra());
 }
 
 // GetGuildId is a field on the Player, so this reads no guild object and takes
@@ -7416,6 +7489,8 @@ public:
         // is in a raid on master loot.
         PLAYERHOOK_ON_CREATURE_KILL,
         PLAYERHOOK_ON_CREATURE_KILLED_BY_PET,
+        // #971: an achievement earned, for the run summary.
+        PLAYERHOOK_ON_ACHI_COMPLETE,
     }) {}
 
     // NINETEEN ARRAY READS, ONCE (#372). Player::GetItemByPos on
@@ -7604,12 +7679,15 @@ public:
     void OnPlayerLootItem(Player* player, Item* item, uint32 count,
                           ObjectGuid lootGuid) override
     {
-        Item* live = TakeLootedItem(player, item, count);
+        OverseerDecisions::LootedItem noted;
+        Item* live = TakeLootedItem(player, item, count, noted);
         // A guild finder run's tally counts every loot, notable or not; only
         // the entry of a notable one is read, off the item found alive.
         uint32 const notableEntry = NotableLootEntry(live);
         NoteGuildRunLoot(player, count, notableEntry);
         NoteHuntLoot(player, count, notableEntry);
+        // The run's loot table (#971), before the story's notable test.
+        RecordLootWon(player, noted, count, OverseerDecisions::ItemVia::Loot, lootGuid);
         if (!live)
             return;
         RecordItemLoot(player, live, OverseerDecisions::ItemVia::Loot,
@@ -7632,8 +7710,16 @@ public:
         // because the council hands out greens as well, and before the item
         // pointer is trusted: only the name and the roll's own guid are read
         // here, plus the item's guid when the store hook found it alive.
-        Item* live = TakeLootedItem(player, item, count);
+        OverseerDecisions::LootedItem noted;
+        Item* live = TakeLootedItem(player, item, count, noted);
         NoteGuildRunLoot(player, count, NotableLootEntry(live));
+        {
+            Loot* won = roll ? roll->getLoot() : nullptr;
+            RecordLootWon(player, noted, count,
+                          voteType == NEED ? OverseerDecisions::ItemVia::Need
+                                           : OverseerDecisions::ItemVia::Greed,
+                          won ? won->sourceWorldObjectGUID : ObjectGuid::Empty);
+        }
         if (player && roll)
         {
             std::lock_guard<std::mutex> guard(g_councilMutex);
@@ -7659,12 +7745,24 @@ public:
     {
         NoteHuntKill(killer, killed);
         NoteCouncilKill(killer, killed);
+        RecordBossKill(killer, killed);
     }
 
     void OnPlayerCreatureKilledByPet(Player* owner, Creature* killed) override
     {
         NoteHuntKill(owner, killed);
         NoteCouncilKill(owner, killed);
+        RecordBossKill(owner, killed);
+    }
+
+    // An achievement earned (#971), so a run's summary can list it. The core
+    // calls this from AchievementMgr::CompletedAchievement once per earning.
+    void OnPlayerAchievementComplete(Player* player, AchievementEntry const* achievement) override
+    {
+        if (!player || !achievement)
+            return;
+        char const* name = achievement->name[0];
+        RecordEvent(player, "achievement", achievement->ID, name ? name : "", "");
     }
 
     // Who landed the killing blow, captured while `killer` is still a live
@@ -8033,6 +8131,7 @@ public:
                  g_wornSeedCount.load(), g_wornUnknownEquipCount.load());
         FlushChat();
         FlushEvents();
+        FlushRunDamage();
         FlushDeaths();
         FlushLevels();
         LOG_INFO("module.overseer",
@@ -8346,6 +8445,7 @@ public:
         {
             _eventTimer = 0;
             FlushEvents();
+            FlushRunDamage();
         }
         if (_deathTimer >= DEATH_FLUSH_MS)
         {
@@ -8390,6 +8490,15 @@ public:
                 CharacterDatabase.Execute(
                     "DELETE FROM overseer_dungeon_run_event "
                     "WHERE created_at < NOW() - INTERVAL {} DAY",
+                    OverseerDecisions::RUN_TIMELINE_RETENTION_DAYS);
+            // The run damage lines (#971), on last_seen: a copy nobody has hit
+            // anything in for the timeline's fortnight is a finished run. Only
+            // once a flush has found the table, so a database without it is
+            // never sent a statement it would refuse.
+            if (_runDamageColumns == SchemaColumns::Present)
+                CharacterDatabase.Execute(
+                    "DELETE FROM overseer_run_damage "
+                    "WHERE last_seen < NOW() - INTERVAL {} DAY",
                     OverseerDecisions::RUN_TIMELINE_RETENTION_DAYS);
         }
         // EVERY TICK, AND ON NO TIMER AT ALL (#358). A hold that is only
@@ -54926,6 +55035,47 @@ private:
         CharacterDatabase.Execute(ss.str().c_str());
     }
 
+    // THE RUN'S DAMAGE, ADDED TO WHAT IS THERE (#971). The meter hooks keep a
+    // running total per character per dungeon copy; this drains it on the
+    // event timer as one additive upsert, so a flush boundary never loses or
+    // doubles a hit. A database without overseer_run_damage keeps nothing and
+    // says so once, the rest of the module unaffected.
+    SchemaColumns _runDamageColumns{SchemaColumns::Unknown};
+
+    void FlushRunDamage()
+    {
+        OverseerDecisions::RunDamageBook batch;
+        uint64 dropped = 0;
+        {
+            std::lock_guard<std::mutex> guard(g_meterMutex);
+            if (g_runDamageBook.empty() && !g_droppedRunDamage)
+                return;
+            batch.swap(g_runDamageBook);
+            dropped = g_droppedRunDamage;
+            g_droppedRunDamage = 0;
+        }
+        if (dropped)
+            LOG_WARN("module.overseer",
+                     "overseer: dropped {} run damage amounts (book full)", dropped);
+        if (batch.empty())
+            return;
+
+        if (_runDamageColumns == SchemaColumns::Unknown)
+        {
+            bool const present = SchemaHasColumns(
+                "overseer_run_damage", "'character_name','instance_id','damage','taken'", 4);
+            _runDamageColumns = present ? SchemaColumns::Present : SchemaColumns::Absent;
+            if (!present)
+                LOG_WARN("module.overseer",
+                         "overseer: overseer_run_damage is missing "
+                         "(2026_10_19_00_overseer_dungeon_run_summary.sql has not been "
+                         "applied), so no run keeps its damage figures");
+        }
+        if (_runDamageColumns != SchemaColumns::Present)
+            return;
+        CharacterDatabase.Execute(OverseerDecisions::RunDamageUpsertSql(batch).c_str());
+    }
+
     // Does overseer_event have the four #567 columns? Asked once per process,
     // the way CampaignColumnsPresent asks, and for the same reason: the answer
     // cannot change under a running worldserver without a db-import that would
@@ -77246,6 +77396,14 @@ private:
             return;
         OverseerDecisions::MeterRecord(g_meterBooks[seat->second.family], seat->second.name, kind,
                                        amount, now);
+        // The run's running total (#971): only a roster member gets this far,
+        // and only a hit inside a dungeon copy belongs to a run.
+        Map const* map = player->FindMap();
+        uint32 const instanceId = player->GetInstanceId();
+        if (OverseerDecisions::RunDamageCounts(map && map->IsDungeon(), instanceId) &&
+            !OverseerDecisions::RunDamageNote(g_runDamageBook, seat->second.name,
+                                              player->GetMapId(), instanceId, kind, amount))
+            ++g_droppedRunDamage;
     }
 };
 

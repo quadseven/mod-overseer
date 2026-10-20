@@ -19133,12 +19133,33 @@ struct LootStoreNote
     std::uint64_t looter{0};
     std::uint32_t itemGuid{0};   // 0: the last store was not a story candidate
     std::uint32_t count{0};
+    // EVERY STORE'S OWN GUID AND ENTRY, whatever its quality (#971). A run's
+    // loot table lists the grey another script destroys as well, so the loot
+    // hook needs the entry without reading the item; these two are written
+    // while the item is certainly alive and are never used to find it again.
+    std::uint32_t storedGuid{0};
+    std::uint32_t itemEntry{0};
 };
 
 // Every store overwrites the note, a store of something not notable with guid
 // 0, so no note can outlive the store it describes into a later loot.
+// `itemEntry` is the stored item's template entry, kept for any quality.
 void NoteStoredItem(LootStoreNote& note, std::uint64_t looter, std::uint32_t itemGuid,
-                    std::uint32_t count, bool notable);
+                    std::uint32_t count, bool notable, std::uint32_t itemEntry = 0);
+
+// What one loot hook may know about the item it follows. `storyGuid` is the
+// guid it may look up in the looter's bags (a story candidate only); `guid`
+// and `entry` name the item for the run's loot table and are never looked up.
+// All zero when the store was for somebody else or a different count.
+struct LootedItem
+{
+    std::uint32_t storyGuid{0};
+    std::uint32_t guid{0};
+    std::uint32_t entry{0};
+};
+
+// Consumes the note whatever it answers.
+LootedItem TakeLootedItemNote(LootStoreNote& note, std::uint64_t looter, std::uint32_t count);
 
 // The guid a loot hook for `looter` may look up, or 0 when the store it
 // follows was not a notable item, was for somebody else, or stored a
@@ -25494,6 +25515,93 @@ struct FamilyPartyFacts
     bool heldByGuildRun{false};
 };
 bool CountsInFamilyParty(FamilyPartyFacts const& facts);
+
+// ============================================ the dungeon run record (#971) ==
+//
+// A RUN ALREADY HAS A ROW; THIS IS WHAT IT LEAVES FOR ITS SUMMARY.
+// overseer_dungeon_run holds the leader, the members, the map, when it started
+// and ended and how. What a post-run summary needs on top is a loot table,
+// the bosses, the achievements and a damage figure, and none of them was
+// written: item_loot covers rare and wearable items only, a boss dying looked
+// like any creature dying, and no damage left the in-memory family meter.
+// The summary itself is a query, not a store: the view in
+// 2026_10_19_00_overseer_dungeon_run_summary.sql joins each run's window over
+// overseer_event, and the damage view joins it over overseer_run_damage.
+
+// The kinds a run's summary and the live recording timeline both highlight.
+// The summary view lists exactly these (test_dungeon_run_record.cpp reads the
+// migration and compares), so a reader of either sees the same events.
+std::vector<std::string> const& RunHighlightKinds();
+bool IsRunHighlightKind(std::string const& kind);
+
+// loot_won: every item a roster character wins inside a dungeon or raid, any
+// quality, by loot or by roll, equipped or not. `itemEntry` 0 is a store the
+// note could not name, which is never written as a guess.
+bool ShouldRecordLootWon(bool onRoster, bool inDungeon, std::uint32_t itemEntry);
+
+// "loot x1 from Edwin VanCleef", "need x3". `via` is an ItemVia word. Cut to
+// fit overseer_event.detail.
+std::string LootWonDetail(std::string const& via, std::uint32_t count,
+                          std::string const& source);
+
+// boss_kill: how a kill was known to be a boss's. The core's own encounter
+// list (DungeonEncounter.dbc, a kill-creature credit for this creature on this
+// map) is asked first because it is the same list that credits the run's
+// encounter mask; the dungeon-boss flag on the creature template covers a
+// boss the list does not name. Nothing outside a dungeon or raid map is a
+// run's boss.
+enum class BossKillBasis
+{
+    None,
+    Encounter,
+    BossFlag,
+};
+
+BossKillBasis ClassifyBossKill(bool inDungeon, bool encounterCredit, bool dungeonBossFlag);
+
+// "encounter Mr. Smite", or "dungeon boss flag".
+std::string BossKillDetail(BossKillBasis basis, std::string const& encounterName);
+
+// PER-RUN DAMAGE, PER CHARACTER, WITHOUT A COMBAT LOG. The family meter's
+// hooks already see every hit a roster character lands, heals or takes; the
+// meter keeps one fight in memory and forgets it. This book keeps a running
+// total per character per dungeon copy (map plus instance id, so two runs of
+// one dungeon are two lines) and the event flush drains it into
+// overseer_run_damage as an additive upsert. A run's window and members then
+// pick its lines out; nothing per hit is ever written.
+struct RunDamageKey
+{
+    std::string name;
+    std::uint32_t mapId{0};
+    std::uint32_t instanceId{0};
+
+    bool operator<(RunDamageKey const& other) const
+    {
+        if (name != other.name)
+            return name < other.name;
+        if (mapId != other.mapId)
+            return mapId < other.mapId;
+        return instanceId < other.instanceId;
+    }
+};
+
+using RunDamageBook = std::map<RunDamageKey, MeterTotals>;
+
+// A full book takes no new line until the next flush drains it. The roster is
+// a few families of five, so this is far above one flush's worth.
+constexpr std::size_t RUN_DAMAGE_MAX_KEYS = 256;
+
+// Only a hit inside a dungeon copy belongs to a run.
+bool RunDamageCounts(bool inDungeon, std::uint32_t instanceId);
+
+// Adds `amount` to the character's line. False when the book is full and the
+// line is new, which drops this amount and nothing else.
+bool RunDamageNote(RunDamageBook& book, std::string const& name, std::uint32_t mapId,
+                   std::uint32_t instanceId, MeterKind kind, std::uint32_t amount);
+
+// One INSERT ... ON DUPLICATE KEY UPDATE that adds the batch to the table's
+// totals, or "" for an empty batch.
+std::string RunDamageUpsertSql(RunDamageBook const& batch);
 
 }  // namespace OverseerDecisions
 

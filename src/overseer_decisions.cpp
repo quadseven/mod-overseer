@@ -17470,22 +17470,31 @@ char const* ErrandRoadStepWord(ErrandRoadStep step)
 }
 
 void NoteStoredItem(LootStoreNote& note, std::uint64_t looter, std::uint32_t itemGuid,
-                    std::uint32_t count, bool notable)
+                    std::uint32_t count, bool notable, std::uint32_t itemEntry)
 {
     note.looter = looter;
     note.itemGuid = notable ? itemGuid : 0;
     note.count = count;
+    note.storedGuid = itemGuid;
+    note.itemEntry = itemEntry;
+}
+
+LootedItem TakeLootedItemNote(LootStoreNote& note, std::uint64_t looter, std::uint32_t count)
+{
+    LootStoreNote const taken = note;
+    note = LootStoreNote{};
+    if (looter == 0 || taken.looter != looter || taken.count != count)
+        return LootedItem{};
+    LootedItem item;
+    item.storyGuid = taken.itemGuid;
+    item.guid = taken.storedGuid;
+    item.entry = taken.itemEntry;
+    return item;
 }
 
 std::uint32_t TakeLootedItemGuid(LootStoreNote& note, std::uint64_t looter, std::uint32_t count)
 {
-    LootStoreNote const taken = note;
-    note = LootStoreNote{};
-    if (taken.itemGuid == 0 || looter == 0)
-        return 0;
-    if (taken.looter != looter || taken.count != count)
-        return 0;
-    return taken.itemGuid;
+    return TakeLootedItemNote(note, looter, count).storyGuid;
 }
 
 std::string RunTimelineDetail(std::string const& text, std::size_t max)
@@ -22991,6 +23000,139 @@ bool CountsInFamilyParty(FamilyPartyFacts const& facts)
 {
     return facts.inGroup && !facts.coreOwnedGroup && facts.leaderOfFamily &&
            !facts.heldByGuildRun;
+}
+
+// ------------------------------------------- the dungeon run record (#971) --
+
+std::vector<std::string> const& RunHighlightKinds()
+{
+    // Deaths, levels, quest turn-ins, gear and achievements are what #971's
+    // summary attaches; loot_won and boss_kill are the two kinds it added.
+    // quest_accept and quest_complete are left out: a summary lists the quest
+    // handed in, not every step towards it.
+    static std::vector<std::string> const kinds{
+        "loot_won", "boss_kill", "death", "level_up", "quest_reward", "item_equip",
+        "achievement",
+    };
+    return kinds;
+}
+
+bool IsRunHighlightKind(std::string const& kind)
+{
+    std::vector<std::string> const& kinds = RunHighlightKinds();
+    return std::find(kinds.begin(), kinds.end(), kind) != kinds.end();
+}
+
+bool ShouldRecordLootWon(bool onRoster, bool inDungeon, std::uint32_t itemEntry)
+{
+    return onRoster && inDungeon && itemEntry != 0;
+}
+
+std::string LootWonDetail(std::string const& via, std::uint32_t count, std::string const& source)
+{
+    std::string out = via + " x" + std::to_string(count);
+    if (!source.empty())
+        out += " from " + source;
+    FitItemStoryColumn(out);
+    return out;
+}
+
+BossKillBasis ClassifyBossKill(bool inDungeon, bool encounterCredit, bool dungeonBossFlag)
+{
+    if (!inDungeon)
+        return BossKillBasis::None;
+    if (encounterCredit)
+        return BossKillBasis::Encounter;
+    if (dungeonBossFlag)
+        return BossKillBasis::BossFlag;
+    return BossKillBasis::None;
+}
+
+std::string BossKillDetail(BossKillBasis basis, std::string const& encounterName)
+{
+    switch (basis)
+    {
+        case BossKillBasis::Encounter:
+        {
+            std::string out = encounterName.empty() ? std::string("encounter")
+                                                    : "encounter " + encounterName;
+            FitItemStoryColumn(out);
+            return out;
+        }
+        case BossKillBasis::BossFlag:
+            return "dungeon boss flag";
+        case BossKillBasis::None:
+            break;
+    }
+    return std::string();
+}
+
+bool RunDamageCounts(bool inDungeon, std::uint32_t instanceId)
+{
+    return inDungeon && instanceId != 0;
+}
+
+bool RunDamageNote(RunDamageBook& book, std::string const& name, std::uint32_t mapId,
+                   std::uint32_t instanceId, MeterKind kind, std::uint32_t amount)
+{
+    RunDamageKey const key{name, mapId, instanceId};
+    auto it = book.find(key);
+    if (it == book.end())
+    {
+        if (book.size() >= RUN_DAMAGE_MAX_KEYS)
+            return false;
+        it = book.emplace(key, MeterTotals{}).first;
+    }
+    switch (kind)
+    {
+        case MeterKind::Damage:  it->second.damage += amount; break;
+        case MeterKind::Healing: it->second.healing += amount; break;
+        case MeterKind::Taken:   it->second.taken += amount; break;
+    }
+    return true;
+}
+
+namespace
+{
+// A character name inside single quotes. Roster names are letters only; this
+// is the guard for the day one is not.
+std::string RunDamageQuoted(std::string const& text)
+{
+    std::string out = "'";
+    for (char c : text)
+    {
+        if (c == '\\' || c == '\'')
+            out += '\\';
+        out += c;
+    }
+    out += '\'';
+    return out;
+}
+}  // namespace
+
+std::string RunDamageUpsertSql(RunDamageBook const& batch)
+{
+    if (batch.empty())
+        return std::string();
+    std::ostringstream ss;
+    ss << "INSERT INTO overseer_run_damage "
+          "(character_name, map_id, instance_id, damage, healing, taken) VALUES ";
+    bool first = true;
+    for (auto const& line : batch)
+    {
+        if (!first)
+            ss << ',';
+        first = false;
+        ss << '(' << RunDamageQuoted(line.first.name) << ',' << line.first.mapId << ','
+           << line.first.instanceId << ',' << line.second.damage << ','
+           << line.second.healing << ',' << line.second.taken << ')';
+    }
+    // VALUES() rather than a row alias, for the reason FlushEvents gives: the
+    // alias form is a syntax error before MySQL 8.0.19.
+    ss << " ON DUPLICATE KEY UPDATE damage = damage + VALUES(damage), "
+          "healing = healing + VALUES(healing), taken = taken + VALUES(taken), "
+          "last_seen = CURRENT_TIMESTAMP";
+    return ss.str();
 }
 
 }  // namespace OverseerDecisions
