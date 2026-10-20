@@ -21225,6 +21225,23 @@ struct RevivedSickGroundFacts
 };
 RevivedSickGroundStep DecideRevivedSickGround(RevivedSickGroundFacts const& facts);
 
+// A SICK REVIVAL'S OWN DEATHS ARE COUNTED ONCE PER REVIVAL, AND A DEATH ENDS
+// THE REVIVAL (#746). Resurrection Sickness outlives a death (the ghost
+// recovery reads it on a ghost), so the drive's state for one sickness lives
+// through every death inside its ten minutes, and the count read at the first
+// revival stood for all of them. On wow-dev 2026-10-20 Og (40) revived sick at
+// the Badlands NE spirit healer at 12:34:53 with 0 deaths there, then died to
+// Starving Buzzards (37) at that graveyard about every two minutes until
+// 13:30: the count stayed 0, the death loop rule above never fired, and every
+// revival stayed. A death clears the read, so the next revival counts again;
+// the last count stands until that read answers.
+struct RevivedSickDeaths
+{
+    bool read{false};
+    unsigned here{0};
+};
+void NoteRevivedSickDeath(RevivedSickDeaths& counted);
+
 struct GhostRecoveryLimits
 {
     unsigned repeatDeaths{2};

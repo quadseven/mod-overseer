@@ -29239,6 +29239,7 @@ private:
                 DriveRevivedSickness(bot, botAI, name);
                 continue;
             }
+            NoteRevivedSickDeath(name);
 
             // AN OFFER ON THE TABLE IS ANSWERED BEFORE ANYTHING STEPS OVER IT.
             //
@@ -29722,9 +29723,10 @@ private:
         bool hasDecision{false};
         OverseerDecisions::RevivedSickGroundStep lastDecision{
             OverseerDecisions::RevivedSickGroundStep::Stay};
-        // Its own deaths around where it revived, read once per revival.
-        bool deathsRead{false};
-        unsigned deathsHere{0};
+        // Its own deaths around where it revived, read once per revival: a
+        // death clears the read (NoteRevivedSickDeath), since the sickness and
+        // this state outlive it.
+        OverseerDecisions::RevivedSickDeaths deaths;
         std::vector<std::string> removedCombat;
         bool addedFlee{false};
     };
@@ -29761,7 +29763,7 @@ private:
         // A stone bound on another map is a hearth to another continent (#274).
         facts.boundOnMemberMap = bot->m_homebindMapId == bot->GetMapId();
         facts.restWhileSick = restWhileSick;
-        if (!state.deathsRead)
+        if (!state.deaths.read)
         {
             // The ghost recovery's own count, around where it stands now: a
             // spirit healer revives it beside the deaths that sent it there.
@@ -29775,11 +29777,11 @@ private:
                 // Read once it answers. A COUNT always returns its one row, so
                 // no row is a failed read, and the next poll asks again rather
                 // than trusting a zero for the whole revival.
-                state.deathsHere = static_cast<unsigned>(row->Fetch()[0].Get<uint64>());
-                state.deathsRead = true;
+                state.deaths.here = static_cast<unsigned>(row->Fetch()[0].Get<uint64>());
+                state.deaths.read = true;
             }
         }
-        facts.deathsHere = state.deathsHere;
+        facts.deathsHere = state.deaths.here;
         facts.repeatDeaths = GHOST_RECOVERY_LIMITS.repeatDeaths;
         auto const step = OverseerDecisions::DecideRevivedSickGround(facts);
 
@@ -29824,6 +29826,15 @@ private:
             botAI->ChangeStrategy("+flee", BOT_STATE_COMBAT);
             state.addedFlee = true;
         }
+    }
+
+    // A death ends the revival its sickness count was read for (#746). Called
+    // from the dead branch of each drive that calls DriveRevivedSickness.
+    void NoteRevivedSickDeath(std::string const& name)
+    {
+        auto const it = _revivedSickness.find(name);
+        if (it != _revivedSickness.end())
+            OverseerDecisions::NoteRevivedSickDeath(it->second.deaths);
     }
 
     void ReleaseRevivedSickness(Player* bot, PlayerbotAI* botAI, std::string const& name,
@@ -30144,6 +30155,7 @@ private:
                 DriveRevivedSickness(bot, botAI, name, /*restWhileSick*/ true);
                 continue;
             }
+            NoteRevivedSickDeath(name);
 
             // GetCorpse() is map-scoped: null both before the release and for
             // a ghost whose corpse lies on another map. The first is the dead
