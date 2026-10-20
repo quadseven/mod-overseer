@@ -55576,6 +55576,11 @@ private:
         std::string command;
         uint32 entry{0};
         uint32 waitedMs{0};
+        // A container is read back by the item itself in a bag position
+        // (19-22), which the equipment scan below never reaches; by guid, so
+        // a bag of the same entry already worn does not read as this one.
+        bool container{false};
+        ObjectGuid guid;
     };
     std::vector<EquipCheck> _pendingEquipChecks;
 
@@ -55939,6 +55944,37 @@ private:
                       "overseer: UPGRADE_USAGE_BAD_EQUIP disagrees with mod-playerbots' ItemUsage");
 
         ItemTemplate const* proto = item->GetTemplate();
+
+        // A BAG IS JUDGED BY ITS SLOTS (wow-overseer#1014). EquipAction swaps
+        // a container into GetSmallestBagSlot's position, not into the slot
+        // FindEquipSlot names, and the scorer below gives every bag 0, so the
+        // gear verdict compared two zeros against an "empty slot" that was
+        // not the position the verb fills. See BagEquipVerdict.
+        if (proto->Class == ITEM_CLASS_CONTAINER)
+        {
+            std::vector<OverseerDecisions::BagPosition> positions;
+            for (uint8 pos = INVENTORY_SLOT_BAG_START; pos < INVENTORY_SLOT_BAG_END; ++pos)
+            {
+                OverseerDecisions::BagPosition position;
+                if (Item* worn = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, pos))
+                {
+                    position.name = worn->GetTemplate()->Name1;
+                    position.slots = worn->GetTemplate()->ContainerSlots;
+                }
+                positions.push_back(position);
+            }
+            OverseerDecisions::EquipVerdict const bagOutcome =
+                OverseerDecisions::BagEquipVerdict(proto->Name1, proto->ContainerSlots, positions);
+            if (bagOutcome.whisper)
+                return false;
+            status = bagOutcome.row.status;
+            detail = bagOutcome.row.detail;
+            LOG_WARN("module.overseer",
+                     "overseer: bag equip for '{}' refused before the whisper - {}",
+                     targetName, detail);
+            return true;
+        }
+
         int32 const randomProperty = item->GetItemRandomPropertyId();
         std::string param = std::to_string(proto->ItemId);
         if (randomProperty != 0)
@@ -55966,8 +56002,10 @@ private:
             calculator.SetPvpSpec(true);
         float const itemScore = calculator.CalculateItem(proto->ItemId, randomProperty);
 
+        // Up to the bag positions: a quiver's slot is one of them, and below
+        // EQUIPMENT_SLOT_END it read as an empty slot whatever was worn there.
         uint8 const slot = botAI->FindEquipSlot(proto, NULL_SLOT, true);
-        Item* worn = slot < EQUIPMENT_SLOT_END
+        Item* worn = slot < INVENTORY_SLOT_BAG_END
             ? bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot) : nullptr;
         std::string const wornName = worn ? worn->GetTemplate()->Name1 : "";
         float const wornScore = worn
@@ -56004,9 +56042,16 @@ private:
                 continue;
             }
             bool worn = false;
-            for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
-                if (Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
-                    worn = worn || item->GetEntry() == check.entry;
+            if (check.container)
+            {
+                for (uint8 slot = INVENTORY_SLOT_BAG_START; slot < INVENTORY_SLOT_BAG_END; ++slot)
+                    if (Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                        worn = worn || item->GetGUID() == check.guid;
+            }
+            else
+                for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+                    if (Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                        worn = worn || item->GetEntry() == check.entry;
             if (!worn && check.waitedMs < VERIFY_GRACE_MS)
             {
                 waiting.push_back(check);
@@ -56557,9 +56602,17 @@ private:
                 // The core would take it, the bot's own upgrade pass would
                 // not (#927): ended `unchanged` here, never whispered.
                 bool equipWithheld = false;
+                // The carried bag the verb will move, for the read-back.
+                bool equipContainer = false;
+                ObjectGuid equipGuid;
                 if (equip)
                 {
                     Item* item = player->GetItemByEntry(equipCommand.entry);
+                    if (item)
+                    {
+                        equipContainer = item->GetTemplate()->Class == ITEM_CLASS_CONTAINER;
+                        equipGuid = item->GetGUID();
+                    }
                     if (!item)
                     {
                         detail = "not carried";
@@ -56619,6 +56672,8 @@ private:
                     equipCheck.targetName = targetName;
                     equipCheck.command = command;
                     equipCheck.entry = equipCommand.entry;
+                    equipCheck.container = equipContainer;
+                    equipCheck.guid = equipGuid;
                     _pendingEquipChecks.push_back(equipCheck);
                     status = "verifying";
                 }

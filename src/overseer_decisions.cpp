@@ -103,6 +103,38 @@ EquipVerdict EquipUpgradeVerdict(uint32_t usage, std::string const& item, float 
     return {false, {"unchanged", detail.str()}};
 }
 
+std::size_t BagEquipPosition(std::vector<BagPosition> const& positions)
+{
+    // EquipAction::GetSmallestBagSlot: the first empty position returns at
+    // once; among worn bags a later one replaces the candidate unless it is
+    // strictly bigger, so equal smallest bags resolve to the last of them.
+    std::size_t chosen = positions.size();
+    for (std::size_t i = 0; i < positions.size(); ++i)
+    {
+        if (positions[i].name.empty())
+            return i;
+        if (chosen < positions.size() && positions[chosen].slots < positions[i].slots)
+            continue;
+        chosen = i;
+    }
+    return chosen;
+}
+
+EquipVerdict BagEquipVerdict(std::string const& bag, uint32_t bagSlots,
+                             std::vector<BagPosition> const& positions)
+{
+    std::size_t const at = BagEquipPosition(positions);
+    if (at >= positions.size())
+        return {false, {"unchanged", "the bot has no bag position for " + bag}};
+    BagPosition const& worn = positions[at];
+    if (worn.name.empty() || bagSlots > worn.slots)
+        return {true, {"verifying", ""}};
+    std::ostringstream detail;
+    detail << "the bot keeps " << worn.name << " (" << worn.slots << " slots) in bag position "
+           << (at + 1) << ": " << bag << " holds " << bagSlots << " slots, not more";
+    return {false, {"unchanged", detail.str()}};
+}
+
 LeaderClientGate DungeonLeaderClientGate(bool socketOpen, std::time_t openSince,
                                          std::time_t now, std::time_t settleSeconds)
 {
