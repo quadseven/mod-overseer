@@ -53210,6 +53210,19 @@ private:
                  OverseerDecisions::ApproachShapeOf(gap, DUNGEON_APPROACH_LIMITS) !=
                      OverseerDecisions::ApproachShape::Arrived))
             {
+                // A MEMBER HELD FOR BEING TOO FAR TO WALK IS LET GO FIRST
+                // (#739). That hold waits for the leader to come back for it,
+                // and a leader on this run never does: the run walked him here
+                // and now walks the family to him. Left in place, the hold took
+                // the mover back every poll and the member stood where it was
+                // until the hold ran out, while this barrier counted down its
+                // twelve minutes. Measured live: three barriers closed in one
+                // morning with members held 4,000 to 17,000 yards out, each
+                // flying toward the door the poll its hold expired. The
+                // takeover in EscortToward covers a catch-up WALK; a far-held
+                // member has no walk left to take over, only this hold. The
+                // hearth regroup ends it the same way before its own walk.
+                EndFarHold(name, "its dungeon run walks it to the staging point");
                 EscortToward(name, legAim.aim, "BARRIER", EscortPurpose::Assemble);
                 if (coord.legAim[name] != legAim.aim)
                 {
