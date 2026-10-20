@@ -111,6 +111,36 @@ struct EquipVerdict
 EquipVerdict EquipUpgradeVerdict(uint32_t usage, std::string const& item, float itemScore,
                                  std::string const& worn, float wornScore);
 
+// A BAG IS JUDGED BY ITS SLOTS, NEVER BY THE GEAR SCORE (wow-overseer#1014).
+// The gear scorer gives every bag 0, and the upgrade verdict's own bag check
+// (ItemUsageValue::GetSmallestBagSize) starts its scan at the SECOND bag
+// position, so a small bag worn in the first position is invisible to it and a
+// bigger bag reads as no upgrade. Measured on the dev realm: Zrog's ask to put
+// on Blue Leather Bag in place of Small Brown Pouch was refused every hour as
+// "an empty slot (score 0.00) over Blue Leather Bag (score 0.00)".
+//
+// So a container is judged here, against the position the equip verb really
+// fills. mod-playerbots' EquipAction swaps a container into the position
+// EquipAction::GetSmallestBagSlot returns: the first empty position in
+// ascending order, else the LAST of the equally smallest worn bags.
+// `positions` is the bot's bag positions in that order; an empty name is an
+// empty position.
+struct BagPosition
+{
+    std::string name;
+    uint32_t slots{0};
+};
+
+// The index into `positions` the equip verb fills, or positions.size() when
+// there is no position at all.
+std::size_t BagEquipPosition(std::vector<BagPosition> const& positions);
+
+// Whispered when the target position is empty or the bag is strictly bigger
+// than the bag worn there; otherwise ended `unchanged`, naming both bags and
+// both slot counts.
+EquipVerdict BagEquipVerdict(std::string const& bag, uint32_t bagSlots,
+                             std::vector<BagPosition> const& positions);
+
 // A DUNGEON RUN'S LEADER MUST HOLD A CLIENT (#735). Only a client-attached
 // leader can issue the dungeon-clear, so ENTER and CLEARING wait until the
 // leader's socket has stayed open for the settle window (a measured flap ran
