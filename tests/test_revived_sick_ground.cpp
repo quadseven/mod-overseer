@@ -59,5 +59,37 @@ int main()
     loop.restWhileSick = true;
     loop.hearthReady = true;
     check("a guild member in a death loop hearths too", loop, RevivedSickGroundStep::Hearth);
+
+    // Og on wow-dev 2026-10-20: revived sick at the Badlands NE spirit healer
+    // at 12:34:53 with 0 deaths there, then died to Starving Buzzards (37) at
+    // that graveyard about every two minutes until 13:30. Its sickness outlived
+    // each death, so the count read at the first revival stood at 0 for every
+    // later one and each revival stayed. A death must clear the read.
+    RevivedSickDeaths og;
+    og.read = true;
+    NoteRevivedSickDeath(og);
+    if (og.read)
+    {
+        std::printf("FAIL a death leaves the sick revival's death count read\n");
+        ++failures;
+    }
+    RevivedSickDeaths kept;
+    kept.read = true;
+    kept.here = 4;
+    NoteRevivedSickDeath(kept);
+    if (kept.here != 4)
+    {
+        std::printf("FAIL a death drops the last count before the next read answers\n");
+        ++failures;
+    }
+    RevivedSickGroundFacts badlands;
+    badlands.sick = true;
+    badlands.memberLevel = 40;
+    badlands.groundTopLevel = 0;
+    badlands.repeatDeaths = 2;
+    badlands.deathsHere = 3;
+    badlands.boundOnMemberMap = true;
+    check("the count read again after its deaths holds it out of combat", badlands,
+          RevivedSickGroundStep::HoldOutOfCombat);
     return failures ? 1 : 0;
 }

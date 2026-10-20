@@ -8627,6 +8627,11 @@ RevivedSickGroundStep DecideRevivedSickGround(RevivedSickGroundFacts const& fact
                                                        : RevivedSickGroundStep::HoldOutOfCombat;
 }
 
+void NoteRevivedSickDeath(RevivedSickDeaths& counted)
+{
+    counted.read = false;
+}
+
 bool TownCounterWalkAllowed(bool isTownCounter, float distanceYards)
 {
     return !isTownCounter || distanceYards <= TOWN_COUNTER_MAX_WALK_YARDS;
