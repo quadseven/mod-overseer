@@ -11142,6 +11142,11 @@ AuctionRequest ParseAuctionRequest(std::string const& command);
 // other hour count is 0 here and a named refusal in the row.
 uint32_t AuctionDurationMinutes(uint32_t hours);
 
+// A purchase may use only this member's configured share of money above the
+// reserve, and can never spend below that reserve.
+bool AuctionBudgetAllows(uint32_t money, uint32_t reserve, uint32_t sharePercent,
+                         uint32_t price);
+
 // THE BID RULE, in the order HandleAuctionPlaceBid applies it
 // (AuctionHouseHandler.cpp:487-497). The core says nothing on any of these -
 // it simply returns - so this is the only place a bot learns which one it hit.
