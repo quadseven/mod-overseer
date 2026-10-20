@@ -22067,6 +22067,13 @@ private:
         // only while `rejoin`; see DUNGEON_REJOIN_BACKSTOP_SECONDS for why a
         // walk that claims this lease has to bring its own clock.
         time_t rejoinSince{0};
+        // THE MAP OF THE RUN THAT ASKED FOR THE WALK (mod-overseer#153), which
+        // is where the family this walk rejoins actually is. Meaningful only
+        // while `rejoin`. Asked of the group's leader instead, a split where
+        // the leader is outside with the walkers read as already rejoined on
+        // the first sweep - see OverseerDecisions::RejoinWalkFacts.
+        bool rejoinRunMapKnown{false};
+        uint32 rejoinRunMap{0};
         // ...AND THE FIFTH OWNER (#274). True: a stranded member's walk to the
         // berth of its own boat home, marked by DriveLoneCrossings on the
         // coordinator's five second clock and swept by that drive when it stops
@@ -22606,6 +22613,8 @@ private:
             escort.homeSince = 0;
             escort.rejoin = false;
             escort.rejoinSince = 0;
+            escort.rejoinRunMapKnown = false;
+            escort.rejoinRunMap = 0;
             LOG_INFO("module.overseer",
                      "overseer: dungeon run {} takes over '{}' from its {} - "
                      "the run's staging point is where the leader is going anyway",
@@ -24499,8 +24508,12 @@ private:
     // reason: the coordinator asks again on every poll of the hold, and
     // TravelAimBook::Claim refuses to disturb a walk it is holding the memory
     // for.
+    //
+    // `runMap` is the instance map the run is staged in: the walk is over when
+    // the member is on it, not when it stands beside the group's leader, who
+    // may be outside with it (mod-overseer#153).
     void RejoinToward(std::string const& name, std::string const& aim,
-                      float arriveYards)
+                      float arriveYards, uint32 runMap)
     {
         DungeonEscort& escort = _dungeonEscorts[name];
         // A WALK ANOTHER OWNER HOLDS IS NOT TURNED ROUND, on the terms
@@ -24525,6 +24538,8 @@ private:
         escort.arriveYards = arriveYards;
         if (!escort.rejoinSince)
             escort.rejoinSince = std::time(nullptr);
+        escort.rejoinRunMapKnown = true;
+        escort.rejoinRunMap = runMap;
 
         _travelAims.Claim(name, aim, OverseerDecisions::TravelOwner::WalkBackIn);
         if (escort.aim == aim)
@@ -24569,18 +24584,39 @@ private:
             if (SteerableAI(member))
             {
                 facts.seen = true;
-                // THE GROUP'S LEADER, NOT THE ROSTER'S, and asked of the member
-                // whose walk this is rather than of a roster query, for the
-                // reason KeepRosterFollowing gives about the two disagreeing for
-                // a poll every time leadership drifts. A leader this poll cannot
-                // find leaves `withTheFamily` false, which KEEPS the walk running
-                // on its clock rather than ending it on a reading nobody took.
+                // GetMapId  Position.h:281  uint32 GetMapId() const
+                facts.memberMap = member->GetMapId();
+                // THE RUN'S MAP FIRST (mod-overseer#153). The family this walk
+                // rejoins is the part of the party inside the run that asked
+                // for it, so "rejoined" is being on that map - or nobody of the
+                // group being left on it, which is the party coming back out.
+                facts.runMapKnown = it->second.rejoinRunMapKnown;
+                facts.runMap = it->second.rejoinRunMap;
                 Group* const group = member->GetGroup();
+                if (group && facts.runMapKnown)
+                    // GetFirstMember  Group.h:252  GroupReference* GetFirstMember()
+                    for (GroupReference* ref = group->GetFirstMember(); ref;
+                         ref = ref->next())
+                    {
+                        Player* const other = ref->GetSource();
+                        if (other && other != member && other->IsInWorld() &&
+                            other->GetMapId() == facts.runMap)
+                        {
+                            facts.partyOnRunMap = true;
+                            break;
+                        }
+                    }
+                // THE GROUP'S LEADER, NOT THE ROSTER'S, as the fallback when no
+                // run map is known, and asked of the member whose walk this is
+                // rather than of a roster query, for the reason
+                // KeepRosterFollowing gives about the two disagreeing for a poll
+                // every time leadership drifts. A leader this poll cannot find,
+                // or a leader who is this member, never reads as rejoined.
                 Player* const leader =
                     group ? ObjectAccessor::FindPlayer(group->GetLeaderGUID()) : nullptr;
-                // GetMapId  Position.h:281  uint32 GetMapId() const
-                facts.withTheFamily =
-                    leader && leader->GetMapId() == member->GetMapId();
+                facts.leaderSeen = leader != nullptr;
+                facts.leaderIsMember = leader == member;
+                facts.leaderMap = leader ? leader->GetMapId() : 0;
             }
             facts.walkingForSeconds =
                 it->second.rejoinSince
@@ -36988,7 +37024,7 @@ private:
         // instance on its own, which is the trickle this module refuses
         // everywhere else.
         for (std::string const& name : stranded.walk)
-            RejoinToward(name, doorAim, arriveWithin);
+            RejoinToward(name, doorAim, arriveWithin, portal.insideMapId);
 
         // KNOCKED FOR ONLY THE LIVING, matched back out of the census by name
         // because five names is a list rather than a set - the same matching
@@ -44917,7 +44953,7 @@ private:
                     OverseerDecisions::TravelAimAtPosition(door->map, door->x, door->y, height.z);
                 if (aim.empty())
                     return false;
-                RejoinToward(name, aim, arriveWithin);
+                RejoinToward(name, aim, arriveWithin, goal.insideMap);
                 return true;
             }
             case OverseerDecisions::DoorRejoinStep::Knock:

@@ -2709,10 +2709,31 @@ char const* RejoinWalkName(RejoinWalk verdict);
 struct RejoinWalkFacts
 {
     bool seen = false;
-    // This member and the group's leader are on the same map this poll. False
-    // when the leader cannot be found either, which keeps the walk running on
-    // its clock rather than ending it on a reading nobody actually took.
-    bool withTheFamily = false;
+    // WHERE "THE FAMILY" IS, WHICH IS WHERE THE RUN IS (mod-overseer#153). The
+    // walk is asked for by a run staged INSIDE a dungeon, so the family it
+    // rejoins is the part of the party already in there, not the group's
+    // leader. Measured on BFD, campaign 88: one of five inside map 48, the
+    // other four - the group leader among them - walked back to the door on
+    // Kalimdor. Asked against the leader, every walker read as back with its
+    // family on the first sweep, the lease ended about 27 seconds in, the run
+    // re-aimed it, and that went round 217 times each over two hours.
+    //
+    // So: on the run's map is rejoined, and so is nobody of the party being
+    // left on it (the party came back out to where the walker stands, so the
+    // split is over). `partyOnRunMap` counts the member's group other than the
+    // member itself.
+    std::uint32_t memberMap = 0;
+    bool runMapKnown = false;
+    std::uint32_t runMap = 0;
+    bool partyOnRunMap = false;
+    // THE FALLBACK, asked only when no run map is known: the member and the
+    // group's leader on the same map. Never when the leader IS the member -
+    // comparing a map with itself proves nothing - and never when the leader
+    // cannot be found, which keeps the walk running on its clock rather than
+    // ending it on a reading nobody actually took.
+    bool leaderSeen = false;
+    bool leaderIsMember = false;
+    std::uint32_t leaderMap = 0;
     // How long this walk has been running, and how long it may. A backstop of
     // zero or less is not a clock and never gives up, stated rather than
     // implied: a zero read as a deadline would end every walk on its first

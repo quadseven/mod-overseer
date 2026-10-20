@@ -282,13 +282,22 @@ void CheckVerdict(char const* what, RejoinWalk got, RejoinWalk want)
     ++failures;
 }
 
+// The maps of the measured split: the door stands on Kalimdor and the run is
+// staged inside Blackfathom Deeps.
+constexpr std::uint32_t OUTSIDE_MAP = 1;
+constexpr std::uint32_t RUN_MAP = 48;
+
 // A member still on the wrong side of the door, walking, `walkingFor` seconds
-// into its lease.
+// into its lease: outside, with the run that sent it staged inside and somebody
+// of its party in there.
 RejoinWalkFacts StillWalking(std::int64_t walkingFor)
 {
     RejoinWalkFacts facts;
     facts.seen = true;
-    facts.withTheFamily = false;
+    facts.memberMap = OUTSIDE_MAP;
+    facts.runMapKnown = true;
+    facts.runMap = RUN_MAP;
+    facts.partyOnRunMap = true;
     facts.walkingForSeconds = walkingFor;
     facts.backstopSeconds = BACKSTOP_SECONDS;
     return facts;
@@ -328,15 +337,76 @@ void ArrivingEndsItWhateverTheClockSays()
     // backstop and still got there worked. Reporting that as a give-up would put
     // a line in the log saying a walk failed on the poll it succeeded.
     RejoinWalkFacts arrived = StillWalking(30 * 60);
-    arrived.withTheFamily = true;
+    arrived.memberMap = RUN_MAP;
     CheckVerdict("back with the family outranks the clock",
                  ReadRejoinWalk(arrived), RejoinWalk::BackWithTheFamily);
     CheckBool("and it is an ending", RejoinWalkEnds(ReadRejoinWalk(arrived)), true);
 
     RejoinWalkFacts early = StillWalking(8);
-    early.withTheFamily = true;
+    early.memberMap = RUN_MAP;
     CheckVerdict("and it does not need the clock's permission",
                  ReadRejoinWalk(early), RejoinWalk::BackWithTheFamily);
+}
+
+void TheFamilyIsWhereTheRunIsNotWhereTheLeaderStands()
+{
+    // THE MEASURED LOOP (BFD, campaign 88). One of five was inside map 48 and
+    // the other four, the group's leader among them, were walked back to the
+    // door on Kalimdor. The sweep asked "is this member on its group leader's
+    // map", and the leader was outside with them, so every walker read as back
+    // with its family on the first sweep after the aim: the lease ended about
+    // 27 seconds in, the run re-aimed it, and that repeated 217 times each over
+    // two hours. The family the walk exists to rejoin is the one in the run,
+    // and the run is inside.
+    RejoinWalkFacts outside = StillWalking(27);
+    outside.leaderSeen = true;
+    outside.leaderIsMember = false;
+    outside.leaderMap = OUTSIDE_MAP;
+    CheckVerdict("outside beside an outside leader, run staged inside, keeps walking",
+                 ReadRejoinWalk(outside), RejoinWalk::Keep);
+
+    // The group leader walking HIMSELF back is the same reading with the
+    // comparison made against his own map, which can only ever agree.
+    RejoinWalkFacts self = outside;
+    self.leaderIsMember = true;
+    CheckVerdict("and so does the group leader walking himself back",
+                 ReadRejoinWalk(self), RejoinWalk::Keep);
+
+    // Through the door is the end of it, wherever the leader stands.
+    RejoinWalkFacts through = outside;
+    through.memberMap = RUN_MAP;
+    CheckVerdict("on the run's map is back with the family",
+                 ReadRejoinWalk(through), RejoinWalk::BackWithTheFamily);
+
+    // AND THE PARTY COMING BACK OUT STILL ENDS IT, which is the other half of
+    // what "back with the family" always meant: nobody of the party is inside
+    // any more, so there is no split left to end and nothing behind the door
+    // to walk to.
+    RejoinWalkFacts emptied = outside;
+    emptied.partyOnRunMap = false;
+    CheckVerdict("nobody of the party left inside ends the walk",
+                 ReadRejoinWalk(emptied), RejoinWalk::BackWithTheFamily);
+
+    // WITH NO RUN MAP KNOWN the group leader is still the reading, but never a
+    // leader who is the walker himself: comparing a member's map to its own
+    // proves nothing.
+    RejoinWalkFacts unknown = outside;
+    unknown.runMapKnown = false;
+    unknown.runMap = 0;
+    CheckVerdict("no run map: beside a leader who is somebody else has rejoined",
+                 ReadRejoinWalk(unknown), RejoinWalk::BackWithTheFamily);
+    RejoinWalkFacts unknownSelf = unknown;
+    unknownSelf.leaderIsMember = true;
+    CheckVerdict("no run map: the leader beside himself has not",
+                 ReadRejoinWalk(unknownSelf), RejoinWalk::Keep);
+    RejoinWalkFacts unknownApart = unknown;
+    unknownApart.leaderMap = RUN_MAP;
+    CheckVerdict("no run map: a leader on another map keeps the walk going",
+                 ReadRejoinWalk(unknownApart), RejoinWalk::Keep);
+    RejoinWalkFacts unknownUnseen = unknown;
+    unknownUnseen.leaderSeen = false;
+    CheckVerdict("no run map and no leader found keeps the walk on its clock",
+                 ReadRejoinWalk(unknownUnseen), RejoinWalk::Keep);
 }
 
 void ALeaseWithNobodyToHoldItEnds()
@@ -346,7 +416,9 @@ void ALeaseWithNobodyToHoldItEnds()
     // does not resolve has no map to compare and no strategy to hand back.
     RejoinWalkFacts gone;
     gone.seen = false;
-    gone.withTheFamily = true;
+    gone.memberMap = RUN_MAP;
+    gone.runMapKnown = true;
+    gone.runMap = RUN_MAP;
     gone.walkingForSeconds = 8;
     gone.backstopSeconds = BACKSTOP_SECONDS;
     CheckVerdict("a member nobody can see ends the lease",
@@ -396,6 +468,7 @@ int main()
     TheDoorHasToBeReachableBeforeAnybodyIsAimedAtIt();
     TheWalkOutlivesTheRunThatAskedForIt();
     ArrivingEndsItWhateverTheClockSays();
+    TheFamilyIsWhereTheRunIsNotWhereTheLeaderStands();
     ALeaseWithNobodyToHoldItEnds();
     TheClockIsAClockAndNotAnAccident();
     return failures ? 1 : 0;
