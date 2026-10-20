@@ -166,7 +166,7 @@ void TheAdapterIsWired()
     has("the tree's premade build spends the points",
         "PlayerbotFactory::InitTalentsBySpecNo(bot, static_cast<int>(ev.specIndex), false);");
     has("the premade is the one the config maps the tree to",
-        "sPlayerbotAIConfig.randomClassSpecIndex[bot->getClass()][tree]");
+        "OverseerCompat::RandomClassSpecIndex(sPlayerbotAIConfig)[bot->getClass()][tree]");
     has("the bot plays its new tree", "botAI->ResetStrategies(false);");
     has("only a trainer of the walker's class serves a talents walk",
         "if (ev.talentTab >= 0)\n            return TrainerServesClassOf(entry, who);");
