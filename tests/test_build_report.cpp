@@ -107,6 +107,7 @@ std::map<std::string, std::string> FullEnv()
         {OverseerDecisions::ENV_PIN_OLLAMA_CHAT, "8ba5e791f0a84ee04636f0b19b62d3c4aff3dce1"},
         {OverseerDecisions::ENV_PIN_DUNGEON_CLEAR, "0ed117bb67148091b37541e19c1ae8e19a5260d3"},
         {OverseerDecisions::ENV_PIN_AH_BOT, "f685832994c825f90aa5a3dc0e1620aa568e875b"},
+        {OverseerDecisions::ENV_PIN_OVERSEER, "dbf7a87e8f897ebc6f377f870a12fcf1baac9889"},
     };
 }
 
@@ -230,6 +231,11 @@ void TestReport()
               "a declared upstream is recorded verbatim");
     CheckText(SourceOf(facts, "mod-ah-bot-plus"), OverseerDecisions::SOURCE_DECLARED,
               "every upstream SHA is declared");
+    CheckText(ValueOf(facts, "mod-overseer"),
+              "dbf7a87e8f897ebc6f377f870a12fcf1baac9889",
+              "the module's own commit is recorded, not only its version");
+    CheckText(SourceOf(facts, "mod-overseer"), OverseerDecisions::SOURCE_DECLARED,
+              "the module commit is declared by the deployment");
     CheckText(ValueOf(facts, "pins"), OverseerDecisions::PINS_MATCH,
               "pins that describe this binary are recorded as matching");
     CheckText(SourceOf(facts, "pins"), OverseerDecisions::SOURCE_DERIVED,
@@ -253,6 +259,7 @@ void TestReportWithNothingDeclared()
     Check(!Has(facts, "realm"), "an undeclared realm name is a gap, not an empty string");
     Check(!Has(facts, "mod-playerbots"), "an undeclared upstream is a gap");
     Check(!Has(facts, "core_pin"), "an undeclared core pin is a gap");
+    Check(!Has(facts, "mod-overseer"), "an undeclared module commit is a gap");
 
     // THE TWO THAT ARE ALWAYS THERE. Their absence and their unknown mean
     // different things to a reader - no row at all means this realm has never

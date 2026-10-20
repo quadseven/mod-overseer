@@ -1311,6 +1311,9 @@ std::vector<BuildFact> BuildReport(std::string const& coreVersion,
     AppendDeclared(facts, "mod-ollama-chat", Declared(env, ENV_PIN_OLLAMA_CHAT));
     AppendDeclared(facts, "mod-dungeon-clear", Declared(env, ENV_PIN_DUNGEON_CLEAR));
     AppendDeclared(facts, "mod-ah-bot-plus", Declared(env, ENV_PIN_AH_BOT));
+    // The module's own commit, declared like the upstreams and held to the same
+    // verdict: `module` above is a version that does not change per build.
+    AppendDeclared(facts, "mod-overseer", Declared(env, ENV_PIN_OVERSEER));
 
     facts.push_back(BuildFact{"pins",
                               PinsVerdict(coreVersion, Declared(env, ENV_PIN_CORE)),

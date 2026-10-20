@@ -2077,6 +2077,11 @@ constexpr char ENV_PIN_PLAYERBOTS[]     = "OVERSEER_PIN_PLAYERBOTS";
 constexpr char ENV_PIN_OLLAMA_CHAT[]    = "OVERSEER_PIN_OLLAMA_CHAT";
 constexpr char ENV_PIN_DUNGEON_CLEAR[]  = "OVERSEER_PIN_DUNGEON_CLEAR";
 constexpr char ENV_PIN_AH_BOT[]         = "OVERSEER_PIN_AH_BOT";
+// THIS MODULE'S OWN COMMIT, which the binary cannot tell either: `module` is
+// the VERSION file, 0.1.0 since the first release, so a page that printed only
+// it read "module 0.1.0" for every build. The deployment already sets this
+// one beside the other pins; it was simply never read.
+constexpr char ENV_PIN_OVERSEER[]       = "OVERSEER_PIN_OVERSEER";
 
 // The three answers to "is this the live world". THERE ARE THREE ON PURPOSE,
 // and the third is the whole safety argument.
