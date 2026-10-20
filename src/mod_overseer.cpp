@@ -50379,6 +50379,7 @@ private:
                 // everything downstream. RESETTING now derives a point when it
                 // inherited none, and DungeonStagingAim refuses to build an aim
                 // out of one that was never resolved.
+
                 // A CLEARED INSTANCE IS LEFT, NOT STAGED INTO (#165). The census
                 // alone cannot tell a member who went in early from one LEFT
                 // BEHIND after the run finished, and the second is the one that
