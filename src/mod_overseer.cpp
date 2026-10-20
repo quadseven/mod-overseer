@@ -7427,31 +7427,10 @@ public:
  * so the return is a bare `return true` on its own line and should stay that
  * way.
  *
- * SPELL CAST FAILURES ARE ABSENT, AND THAT IS THE POINT OF THIS COMMENT.
- * They are the reason this table was asked for: "Must have a Axe equipped"
- * repeated every ten seconds for hours and had to be read off a screenshot,
- * because the server computed the refusal and wrote it down nowhere. There is
- * no hook at the pinned SHA that can see it. AllSpellScript::OnSpellCheckCast
- * (AllSpellScript.h:57) is the ONLY hook in the entire core taking a
- * SpellCastResult - verified by grepping ScriptMgr.h, which declares exactly
- * one (ScriptMgr.h:650) - and Spell::CheckCast calls it at the very top with
- * `res` initialised to SPELL_CAST_OK immediately beforehand
- * (Spell.cpp:5673-5678). It is an input: a chance for a script to REFUSE a
- * cast. The real reason is computed in the six hundred lines after it and goes
- * straight to Spell::SendCastResult (Spell.cpp:3546 from prepare, 3854 from
- * cast) with no script call in between. AllSpellScript::CanPrepare is no help
- * either - Spell.cpp:3465, sixty-five lines BEFORE the CheckCast whose result
- * it would need. Nor does the module side hold it: mod-playerbots at
- * 8d9f6aa6bc6d45f9ae0ee0675b9b1f8aa6937312 keeps no last-cast-result anywhere
- * in PlayerbotAI.h.
- *
- * Recording it therefore needs a core patch adding a hook at SendCastResult -
- * which production/docker/azerothcore-playerbots/patches/ now makes possible,
- * and which is deliberately NOT bundled here. A patch that touches ScriptMgr,
- * AllSpellScript and Spell.cpp is exactly the kind of change that discovers it
- * was wrong ninety minutes into a compile on main. The kind string 'cast_fail'
- * is reserved in the migration so the reporting layer can be built against it
- * now and the column meanings cannot drift when it lands.
+ * SPELL CAST FAILURES. The pinned core computes the final failure in
+ * Spell::SendCastResult. patches/azerothcore-wotlk/0001-send-cast-result-hook.patch
+ * exposes it through AllSpellScript; OverseerCastFailureScript below records
+ * only roster failures through this table's hourly coalescing queue.
  */
 class OverseerEventScript : public PlayerScript
 {
@@ -77685,6 +77664,26 @@ public:
     OverseerDatabaseScript() : LogoutOnlineScript("OverseerDatabaseScript") {}
 };
 
+class OverseerCastFailureScript : public AllSpellScript
+{
+public:
+    OverseerCastFailureScript()
+        : AllSpellScript("OverseerCastFailureScript", {ALLSPELLHOOK_ON_CAST_RESULT}) {}
+
+    void OnSpellCastResult(Player* caster, uint32 spellId, SpellCastResult result,
+                           WorldObject* /*target*/) override
+    {
+        if (!caster || result == SPELL_CAST_OK || !OnRoster(caster->GetName()))
+            return;
+
+        SpellInfo const* spell = sSpellMgr->GetSpellInfo(spellId);
+        OverseerDecisions::OverseerEventFields fields = OverseerDecisions::CastFailFields(
+            spellId, spell ? spell->SpellName[LOCALE_enUS] : "",
+            std::string(EnumUtils::ToConstant(result)));
+        RecordEvent(caster, fields.kind, fields.subjectId, fields.subjectName, fields.detail);
+    }
+};
+
 void Addmod_overseerScripts()
 {
     // Install the crash trace before constructing scripts or starting module work.
@@ -77696,6 +77695,7 @@ void Addmod_overseerScripts()
     new OverseerWorldScript();
     new OverseerChatScript();
     new OverseerEventScript();
+    new OverseerCastFailureScript();
     new OverseerDoorScript();
     new OverseerChestScript();
     new OverseerFinderScript();

@@ -9,8 +9,7 @@ touching the mod-playerbots source itself.
 
 ## Where this came from
 
-Extracted 2026-08-27 from [quadseven/infra](https://github.com/quadseven/infra)
-(`production/docker/azerothcore-playerbots/mod-overseer/`), with full commit
+Extracted 2026-08-27 from its original deployment tree, with full commit
 history preserved via `git subtree split`, so it can be built and versioned the
 same way the other AzerothCore modules already are — a standalone repo, pinned
 by commit SHA, cloned into `modules/` at build time. It was always structured
@@ -81,12 +80,20 @@ proof it works) before trusting it in whatever the module ends up steering.
 
 ## A real build dependency, not just source
 
-This module compiles against a handful of small patches to `mod-playerbots`
-that live in `patches/mod-playerbots/` here — copied from `quadseven/infra`
-(the private repo this module was extracted from), not fetched from it at
-build time. `apply-patches.sh` applies them the same way infra's own build
-does. `patches/README.md` explains the mechanics; the short version is that
-`0005-wander-npc-can-be-aimed.patch` is the one this module's own source
+This module compiles against small patches to the pinned core and
+`mod-playerbots` that live under `patches/` here. `apply-patches.sh` applies
+them at build time. `patches/README.md` explains the mechanics. In particular,
+`azerothcore-wotlk/0001-send-cast-result-hook.patch` supplies the cast failure
+hook consumed by this module. Query recent failures with:
+
+```sql
+SELECT character_name, subject_id, subject_name, detail, occurrences
+FROM overseer_event
+WHERE kind = 'cast_fail' AND detail = 'SPELL_FAILED_EQUIPPED_ITEM_CLASS'
+ORDER BY last_seen DESC LIMIT 50;
+```
+
+For `mod-playerbots`, `0005-wander-npc-can-be-aimed.patch` is the patch this module's own source
 actually calls into (`NewRpgInfo::WanderNpc::npcEntry`,
 `ChangeToWanderNpc(entry, pos)`) — upstream mod-playerbots has neither. If you
 bump the pinned `mod-playerbots` SHA and a patch stops applying, that is
@@ -97,8 +104,7 @@ rebase it — see `patches/README.md`.
 
 `main` requires a pull request — direct pushes are rejected (deletion and
 force-push are blocked too). This is enforced by a GitHub Repository Ruleset,
-codified in `quadseven/infra`'s `pulumi/github/repos.py` (the `mod-overseer`
-entry), not by anything in this repo.
+managed outside this repository.
 
 ### Failed dungeon exits
 

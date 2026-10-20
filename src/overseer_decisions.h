@@ -19167,6 +19167,10 @@ struct OverseerEventFields
     std::string source;
 };
 
+// The core supplies the SpellCastResult constant; this table stores it verbatim.
+OverseerEventFields CastFailFields(std::uint32_t spellId, std::string const& spellName,
+                                  std::string const& resultName);
+
 OverseerEventFields VendorBuyFields(std::uint32_t itemEntry, std::string const& itemName,
                                    std::uint32_t count, std::uint32_t copper);
 OverseerEventFields VendorSaleFields(std::uint32_t itemEntry, std::string const& itemName,
