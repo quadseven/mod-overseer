@@ -22256,8 +22256,8 @@ private:
         LetHeldCharacterWalk(name, PARTY_POLL_MS / 1000 + 5);
         if (_heldGroundWalkSaid.insert(name).second)
             LOG_WARN("module.overseer",
-                     "overseer: '{}' (level {}) is held on ground well above its level with its "
-                     "hearthstone not ready - it walks {:.0f} yards to the graveyard at '{}' and "
+                     "overseer: '{}' (level {}) is held on ground well above its level with no "
+                     "hearth it can take now - it walks {:.0f} yards to the graveyard at '{}' and "
                      "is held there rather than wait to be killed (#744)",
                      name, p->GetLevel(), p->GetExactDist2d(grave.x, grave.y), grave.name);
         return true;
@@ -23274,8 +23274,9 @@ private:
                         else
                             LOG_WARN("module.overseer",
                                      "overseer: '{}' could not hearth to its family ({}) - it "
-                                     "stays held where it stands and its leader goes back for "
-                                     "it (#697)",
+                                     "is not cast again on this hold, the ground it is held on "
+                                     "is judged again (#744), and its leader goes back for it "
+                                     "(#697)",
                                      name, refusal);
                     }
                     else if (lethal->second.hearthCast && !HearthPendingFor(name))
@@ -23293,9 +23294,21 @@ private:
                 // above, on the next poll, and the hold ends when it lands. With
                 // the stone not ready it walks to the nearest graveyard it can
                 // survive and is held there (WalkHeldToSafeGround, below).
+                //
+                // A HEARTH THAT WAS REFUSED IS NOT THE END OF IT. The cast
+                // above is tried once per hold; when it is refused the ground is
+                // judged again on this same poll with that stone counted out, so
+                // the member walks to safe ground instead of standing on the
+                // ground it was meant to leave. Measured on wow-dev 2026-10-19:
+                // ten refused hearths ("in combat" six times, "moving" four),
+                // and each member was held still with no further move until the
+                // 900s ceiling. Zrog died 9s after its refusal, Ugga 33s.
+                bool const hearthRefused = lethal != _lethalLegHeld.end() &&
+                                           lethal->second.hearthTried &&
+                                           !lethal->second.hearthCast;
                 GraveyardStruct const* safeGrave = nullptr;
                 bool walkToSafety = false;
-                if (lethal == _lethalLegHeld.end() || !lethal->second.hearth)
+                if (lethal == _lethalLegHeld.end() || !lethal->second.hearth || hearthRefused)
                 {
                     OverseerDecisions::HeldGroundFacts ground;
                     ground.memberLevel = p->GetLevel();
@@ -23307,10 +23320,12 @@ private:
                     ground.levelGap = LONE_LEG_LIMITS.levelGap;
                     uint32 const stone = HearthstoneSpellOf(p);
                     ground.hearthReady = stone && !p->HasSpellCooldown(stone) &&
-                                         !HearthPendingFor(name);
+                                         !HearthPendingFor(name) && !hearthRefused;
                     // A stone bound on another map is a hearth to another
                     // continent from the family (#274), never a way off here.
                     ground.boundOnMemberMap = p->m_homebindMapId == p->GetMapId();
+                    // Nor is one in combat: DoHearth refuses that cast.
+                    ground.inCombat = p->IsInCombat();
                     if (OverseerDecisions::HeldGroundNeedsSafeSpot(ground))
                     {
                         safeGrave = SafeHeldGroundFor(p, name);
@@ -23334,10 +23349,13 @@ private:
                                  "level {}, its hearthstone {}, and it stays held - {} "
                                  "(#744)",
                                  name, ground.memberLevel, ground.groundTopLevel,
-                                 ground.hearthReady
+                                 !ground.hearthReady
+                                     ? (hearthRefused ? "was refused on this hold"
+                                                      : "is not ready")
+                                 : !ground.boundOnMemberMap
                                      ? "is bound on another map, and a hearth there would "
                                        "leave it on another continent from its family (#274)"
-                                     : "is not ready",
+                                     : "cannot be used in combat",
                                  verdict.reason);
                     if (verdict.step == OverseerDecisions::HeldGroundStep::Hearth)
                     {

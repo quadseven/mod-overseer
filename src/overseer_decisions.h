@@ -10233,8 +10233,15 @@ struct HeldGroundFacts
     // graveyard it can survive instead, or is held. False until the adapter
     // reads the bind, so an unread bind never sends anyone across an ocean.
     bool boundOnMemberMap{false};
-    // THE NEAREST GRAVEYARD IT CAN STAND AT, read when the hearth is not ready
-    // or is bound on another map (#744, #274). On wow-dev 2026-10-18 21:47:49 two level 31 members were held
+    // IT IS IN COMBAT, AND THE HEARTHSTONE IS NOT USED IN COMBAT (#744). The
+    // cast is refused (SPELL_ATTR0_NOT_IN_COMBAT_ONLY_PEACEFUL). Measured on
+    // wow-dev 2026-10-19: Zrog (31), held on level 48 ground, was answered
+    // hearth at 14:26:51, refused "character is in combat" at 14:27:21 and
+    // killed at 14:27:30 still held. A ready stone in combat is no way off
+    // here: the member walks to a graveyard it can survive instead, or is held.
+    bool inCombat{false};
+    // THE NEAREST GRAVEYARD IT CAN STAND AT, read when the hearth is not ready,
+    // is bound on another map or cannot be used in combat (#744, #274). On wow-dev 2026-10-18 21:47:49 two level 31 members were held
     // on Desolace ground that spawns level 34, their stones not ready, and the
     // verdict was a silent Hold: one died 3s later and the other 12s later,
     // both `driven by idle`. WalkToSafety had no caller, because nothing ever
@@ -10254,8 +10261,8 @@ struct HeldGroundFacts
 constexpr float HELD_GROUND_ARRIVED_YARDS = 20.0f;
 
 // The ground it is held on is lethal (the #697 margin, outside an inn or a
-// city) and its hearthstone is not ready or is bound on another map, so the
-// only move left is a walk to safe ground. The adapter asks this before it reads a graveyard, so the
+// city) and its hearthstone is not ready, is bound on another map or cannot be
+// used because it is in combat, so the only move left is a walk to safe ground. The adapter asks this before it reads a graveyard, so the
 // graveyard and the death rows behind it are read only for a member that
 // needs one.
 bool HeldGroundNeedsSafeSpot(HeldGroundFacts const& facts);
