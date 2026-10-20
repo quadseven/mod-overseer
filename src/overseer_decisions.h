@@ -5668,6 +5668,89 @@ struct GearResolvedProperty
 GearResolvedProperty GearReadRandomProperty(std::vector<GearEnchantEffect> const& effects,
                                             bool everyEnchantmentRead);
 
+// ----------------------------------- what an on-equip spell is worth (#221) --
+//
+// THE SAME FREEZE, ONE LAYER DOWN. Once random properties were read (#340), the
+// sweep still put nothing on for a family whose bags held measurably better
+// pieces. Measured on the dev realm on the current build: zero "puts on" lines
+// for the family against dozens of "cannot be settled", and for the father
+// every one of them is a slot whose WORN piece carries a spell. He wears
+// Southsea Head Bucket, whose "Increases defense rating by 6" is a spell on the
+// item and not a stat line, so the helm is a Floor and nothing - not the 442
+// plate helm in his bags - can ever be proved to beat it. The rule that refuses
+// to beat a floor is right; the floor is what is wrong. At this level most rares
+// carry their rating, attack power, spell power or mana regeneration as an
+// on-equip aura rather than as a stat, so the first one worn froze its slot.
+//
+// WHAT IS READ. A spell the core casts ON EQUIP whose every effect applies an
+// aura the core turns into the same number an item stat would: a rating, a
+// primary stat, attack power, spell power, mana per five, shield block value.
+// Those become GearStats and are priced by the ordinary weights. Anything else
+// on the item - a "Use:" or "Chance on hit:" spell, an aura this file cannot
+// translate, a spell nobody could look up, an amount that rolls - is real
+// worth the score does not see, so the answer stays a floor, exactly as it
+// does for a random property.
+//
+// THE PAIRS ARE THE CORE'S OWN. ITEM_MOD_ATTACK_POWER adds to melee AND ranged
+// attack power (Player::_ApplyItemBonuses), and an equip spell says the same
+// thing as two auras of the same size; ITEM_MOD_SPELL_POWER adds to damage in
+// every magic school AND to healing (Player::ApplySpellPowerBonus), and an
+// equip spell says it as a damage-done aura over the magic schools plus a
+// healing-done aura. Each pair is one stat. Read as two, a hunter would be
+// paid twice for the same attack power.
+
+// One effect off one spell, as SpellEffectInfo carries it. Plain ints, so this
+// file still includes no core header.
+struct GearSpellEffect
+{
+    // SpellEffects. Only SPELL_EFFECT_APPLY_AURA, 6, can be priced; zero is an
+    // unused effect slot and says nothing.
+    int effect{0};
+    // AuraType, for an aura.
+    int aura{0};
+    // The aura's argument: the stat, the combat-rating mask, the school mask
+    // or the power type, depending on the aura.
+    int misc{0};
+    // What the aura adds, as the core would compute it with no caster.
+    int amount{0};
+    // False when that amount is not fixed - it rolls, or it grows with level -
+    // so the one number above is not the item's.
+    bool fixedAmount{true};
+};
+
+// One spell on one item.
+struct GearItemSpell
+{
+    // ItemSpelltriggerType. Only ITEM_SPELLTRIGGER_ON_EQUIP, 1, is a standing
+    // bonus; "Use:" and "Chance on hit:" are not.
+    int trigger{0};
+    // False when the item names a spell the world does not have.
+    bool found{true};
+    std::vector<GearSpellEffect> effects;
+};
+
+// The core's own ids (ItemTemplate.h, SharedDefines.h, SpellAuraDefines.h),
+// named here for the same reason every other core id in this file is.
+constexpr int ITEM_SPELL_ON_EQUIP = 1;
+constexpr int SPELL_EFFECT_AURA = 6;
+constexpr int AURA_MOD_DAMAGE_DONE = 13;
+constexpr int AURA_MOD_STAT = 29;
+constexpr int AURA_MOD_POWER_REGEN = 85;
+constexpr int AURA_MOD_ATTACK_POWER = 99;
+constexpr int AURA_MOD_RANGED_ATTACK_POWER = 124;
+constexpr int AURA_MOD_HEALING_DONE = 135;
+constexpr int AURA_MOD_SHIELD_BLOCKVALUE = 158;
+constexpr int AURA_MOD_RATING = 189;
+
+// Fold every spell an item carries into stats, the way GearReadRandomProperty
+// folds a property. `unresolved` is true when any part of any spell was left
+// unpriced, and goes into GearItem::hasEffect.
+//
+// THE STATS COME BACK EVEN WHEN SOMETHING IS UNRESOLVED, for the reason
+// GearReadRandomProperty gives: the readable half priced in is a higher floor.
+// AN EMPTY LIST IS NOT UNRESOLVED: an item with no spell has nothing unread.
+GearResolvedProperty GearReadItemSpells(std::vector<GearItemSpell> const& spells);
+
 // HOW MUCH OF THE ITEM THE NUMBER COVERS (#221).
 //
 // `judged` below is a boolean, and a boolean threw away the one distinction

@@ -4585,6 +4585,187 @@ GearResolvedProperty GearReadRandomProperty(std::vector<GearEnchantEffect> const
     return resolved;
 }
 
+namespace
+{
+
+// A combat-rating mask as SPELL_AURA_MOD_RATING carries it, against the
+// ItemModType the core applies as exactly that set of ratings
+// (Player::_ApplyItemBonuses). Bit n is CombatRating n. A mask that is not
+// exactly one of these is no stat line the core has, so it is not priced.
+int GearStatForRatingMask(int mask)
+{
+    auto const bit = [](int rating) { return 1 << rating; };
+    struct Pair
+    {
+        int mask;
+        int stat;
+    };
+    Pair const pairs[] = {
+        {bit(1), MOD_DEFENSE_RATING},
+        {bit(2), MOD_DODGE_RATING},
+        {bit(3), MOD_PARRY_RATING},
+        {bit(4), MOD_BLOCK_RATING},
+        {bit(5), MOD_HIT_MELEE_RATING},
+        {bit(6), MOD_HIT_RANGED_RATING},
+        {bit(7), MOD_HIT_SPELL_RATING},
+        {bit(8), MOD_CRIT_MELEE_RATING},
+        {bit(9), MOD_CRIT_RANGED_RATING},
+        {bit(10), MOD_CRIT_SPELL_RATING},
+        {bit(17), MOD_HASTE_MELEE_RATING},
+        {bit(18), MOD_HASTE_RANGED_RATING},
+        {bit(19), MOD_HASTE_SPELL_RATING},
+        {bit(5) | bit(6) | bit(7), MOD_HIT_RATING},
+        {bit(8) | bit(9) | bit(10), MOD_CRIT_RATING},
+        {bit(14) | bit(15) | bit(16), MOD_RESILIENCE_RATING},
+        {bit(17) | bit(18) | bit(19), MOD_HASTE_RATING},
+        {bit(23), MOD_EXPERTISE_RATING},
+        {bit(24), MOD_ARMOR_PENETRATION_RATING},
+    };
+    for (Pair const& pair : pairs)
+        if (pair.mask == mask)
+            return pair.stat;
+    return -1;
+}
+
+// SPELL_AURA_MOD_STAT's argument, Stats in SharedDefines.h: strength,
+// agility, stamina, intellect, spirit. -1 is every one of them.
+int GearStatForPrimary(int stat)
+{
+    switch (stat)
+    {
+        case 0: return MOD_STRENGTH;
+        case 1: return MOD_AGILITY;
+        case 2: return MOD_STAMINA;
+        case 3: return MOD_INTELLECT;
+        case 4: return MOD_SPIRIT;
+        default: return -1;
+    }
+}
+
+// The magic schools, SPELL_SCHOOL_MASK_MAGIC: holy through arcane, physical
+// left out. ApplySpellPowerBonus adds to exactly these.
+constexpr int SCHOOL_MASK_MAGIC = 0x7E;
+constexpr int POWER_TYPE_MANA = 0;
+
+// One equip spell's effects, folded into `resolved`. Returns false when any
+// part of it is not a stat line the core has.
+bool GearReadOneEquipSpell(std::vector<GearSpellEffect> const& effects,
+                           GearResolvedProperty& resolved)
+{
+    bool whole = true;
+    int meleePower = 0;
+    int rangedPower = 0;
+    int spellDamage = 0;
+    int healing = 0;
+    auto const add = [&resolved](int type, int value)
+    {
+        GearStat stat;
+        stat.type = type;
+        stat.value = value;
+        resolved.stats.push_back(stat);
+    };
+
+    for (GearSpellEffect const& effect : effects)
+    {
+        if (!effect.effect)
+            continue;
+        if (effect.effect != SPELL_EFFECT_AURA || !effect.fixedAmount)
+        {
+            whole = false;
+            continue;
+        }
+        switch (effect.aura)
+        {
+            case AURA_MOD_RATING:
+            {
+                int const stat = GearStatForRatingMask(effect.misc);
+                if (stat < 0)
+                    whole = false;
+                else
+                    add(stat, effect.amount);
+                break;
+            }
+            case AURA_MOD_STAT:
+                if (effect.misc == -1)
+                {
+                    for (int primary = 0; primary < 5; ++primary)
+                        add(GearStatForPrimary(primary), effect.amount);
+                }
+                else if (GearStatForPrimary(effect.misc) < 0)
+                    whole = false;
+                else
+                    add(GearStatForPrimary(effect.misc), effect.amount);
+                break;
+            case AURA_MOD_POWER_REGEN:
+                if (effect.misc == POWER_TYPE_MANA)
+                    add(MOD_MANA_REGENERATION, effect.amount);
+                else
+                    whole = false;
+                break;
+            case AURA_MOD_SHIELD_BLOCKVALUE:
+                add(MOD_BLOCK_VALUE, effect.amount);
+                break;
+            case AURA_MOD_ATTACK_POWER:
+                meleePower += effect.amount;
+                break;
+            case AURA_MOD_RANGED_ATTACK_POWER:
+                rangedPower += effect.amount;
+                break;
+            case AURA_MOD_DAMAGE_DONE:
+                if (effect.misc == SCHOOL_MASK_MAGIC)
+                    spellDamage += effect.amount;
+                else
+                    whole = false;
+                break;
+            case AURA_MOD_HEALING_DONE:
+                healing += effect.amount;
+                break;
+            default:
+                whole = false;
+                break;
+        }
+    }
+
+    // ATTACK POWER: the pair is ITEM_MOD_ATTACK_POWER, ranged alone is
+    // ITEM_MOD_RANGED_ATTACK_POWER, and melee alone is no stat the core has.
+    if (meleePower && meleePower == rangedPower)
+        add(MOD_ATTACK_POWER, meleePower);
+    else if (!meleePower && rangedPower)
+        add(MOD_RANGED_ATTACK_POWER, rangedPower);
+    else if (meleePower || rangedPower)
+        whole = false;
+
+    // SPELL POWER: magic damage and healing of one size is ITEM_MOD_SPELL_POWER.
+    // Either alone, or the two of different sizes, is not.
+    if (spellDamage && spellDamage == healing)
+        add(MOD_SPELL_POWER, spellDamage);
+    else if (spellDamage || healing)
+        whole = false;
+
+    return whole;
+}
+
+}  // namespace
+
+GearResolvedProperty GearReadItemSpells(std::vector<GearItemSpell> const& spells)
+{
+    GearResolvedProperty resolved;
+    for (GearItemSpell const& spell : spells)
+    {
+        // "Use:" and "Chance on hit:" are worth something and are not a
+        // standing bonus, so nothing here prices them and the answer stays a
+        // floor. A spell nobody could look up is the same answer.
+        if (spell.trigger != ITEM_SPELL_ON_EQUIP || !spell.found)
+        {
+            resolved.unresolved = true;
+            continue;
+        }
+        if (!GearReadOneEquipSpell(spell.effects, resolved))
+            resolved.unresolved = true;
+    }
+    return resolved;
+}
+
 // The core's own word for a weapon subclass. ItemTemplate.h:344-364, in its own
 // order, including the two the core itself only calls "exotic" and the one it
 // spells `obsolete`. NOTHING DECIDES ON THIS - it exists so a refusal reads as
