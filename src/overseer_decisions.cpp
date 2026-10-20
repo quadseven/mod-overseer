@@ -8561,10 +8561,23 @@ static bool HeldGroundLethal(uint32_t memberLevel, uint32_t topLevel, uint32_t l
 }
 
 // A ready stone bound on the map the member stands on (#274): one bound on
-// another map would put it on another continent from its family.
+// another map would put it on another continent from its family. And not in
+// combat (#744): the cast is refused there, and the member stood waiting on it.
 static bool HeldGroundHearthUsable(HeldGroundFacts const& facts)
 {
-    return facts.hearthReady && facts.boundOnMemberMap;
+    return facts.hearthReady && facts.boundOnMemberMap && !facts.inCombat;
+}
+
+// Why the stone is no way off, for the WalkToSafety reason.
+static char const* HeldGroundWalkReason(HeldGroundFacts const& facts)
+{
+    if (!facts.hearthReady)
+        return "lethal ground, hearthstone not ready, and a graveyard it can survive";
+    if (!facts.boundOnMemberMap)
+        return "lethal ground, hearthstone bound on another map, and a graveyard it can "
+               "survive";
+    return "lethal ground, in combat so the hearthstone cannot be used, and a graveyard it "
+           "can survive";
 }
 
 bool HeldGroundNeedsSafeSpot(HeldGroundFacts const& facts)
@@ -8588,11 +8601,7 @@ HeldGroundVerdict DecideHeldGround(HeldGroundFacts const& facts)
         HeldGroundLethal(facts.memberLevel, facts.safeSpotTopLevel, facts.levelGap))
         return {HeldGroundStep::Hold, "lethal ground, and the nearest graveyard is lethal too"};
     if (facts.safeSpotKnown && facts.safeSpotYards > HELD_GROUND_ARRIVED_YARDS)
-        return {HeldGroundStep::WalkToSafety,
-                facts.hearthReady
-                    ? "lethal ground, hearthstone bound on another map, and a graveyard it "
-                      "can survive"
-                    : "lethal ground, hearthstone not ready, and a graveyard it can survive"};
+        return {HeldGroundStep::WalkToSafety, HeldGroundWalkReason(facts)};
     if (facts.safeSpotKnown)
         return {HeldGroundStep::Hold, "already at the graveyard it can survive"};
     return {HeldGroundStep::Hold, "lethal ground but no safe move is known"};
