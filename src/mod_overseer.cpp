@@ -349,6 +349,13 @@
 #include <variant>
 #include <vector>
 
+// Which spelling the linked mod-playerbots reads its config keys in:
+// Playerbots.<Name> after mod-playerbots #2854, AiPlayerbot.<Name> before it
+// (#1068). Every mod-playerbots key this file reads is built from it by
+// OverseerDecisions::PlayerbotsConfigKey, never written as a literal.
+static constexpr bool PLAYERBOTS_KEYS_RENAMED =
+    OverseerCompat::PlayerbotsKeysRenamed<PlayerbotAIConfig>;
+
 namespace
 {
 // Whether a session is on its way out. The core renamed the member it asks
@@ -62084,10 +62091,34 @@ private:
     // the call exists only in a patched mod-playerbots and this module also
     // builds against an unpatched one. Quiet when the key is absent: most
     // worlds do not have it.
+    //
+    // SPELLED THE WAY THE LINKED MOD-PLAYERBOTS SPELLS IT (#1068): the patch
+    // reads Playerbots.NaturalGuild after mod-playerbots #2854 and
+    // AiPlayerbot.NaturalGuild before it, and ignores the other spelling. A
+    // realm overlay that sets only the other spelling leaves the factory's
+    // gate empty, so this reads empty too, and says so once, loudly, because
+    // the operator has to move the overlay.
+    static std::string PlayerbotsNaturalGuildKey()
+    {
+        return OverseerDecisions::PlayerbotsConfigKey(PLAYERBOTS_KEYS_RENAMED, "NaturalGuild");
+    }
+
     static std::vector<std::string> PlayerbotsNaturalGuilds()
     {
-        return OverseerDecisions::ParseNameList(
-            sConfigMgr->GetOption<std::string>("AiPlayerbot.NaturalGuild", "", false));
+        std::string const key = PlayerbotsNaturalGuildKey();
+        std::string const other =
+            OverseerDecisions::PlayerbotsConfigKey(!PLAYERBOTS_KEYS_RENAMED, "NaturalGuild");
+        OverseerDecisions::PlayerbotsOptionRead const read = OverseerDecisions::ReadPlayerbotsOption(
+            sConfigMgr->GetOption<std::string>(key, "", false),
+            sConfigMgr->GetOption<std::string>(other, "", false));
+        static std::atomic<bool> otherSpellingSaid{false};
+        if (read.otherSpellingOnly && !otherSpellingSaid.exchange(true))
+            LOG_ERROR("module.overseer",
+                      "overseer: {} is set but this mod-playerbots reads {}, which is empty, so "
+                      "the factory's natural-guild gate is off and every naturalize reset is "
+                      "refused. Move the realm overlay to {}",
+                      other, key, key);
+        return OverseerDecisions::ParseNameList(read.value);
     }
 
     bool NaturalizeHolds(std::string const& name) const
@@ -62192,7 +62223,7 @@ private:
         if (refusal == NaturalizeRefusal::BadRequest)
             return refuse(request.error);
         if (refusal != NaturalizeRefusal::None)
-            return refuse(NaturalizeRefusalSaid(refusal));
+            return refuse(NaturalizeRefusalSaid(refusal, PLAYERBOTS_KEYS_RENAMED));
 
         for (NaturalizeCheck const& pending : _pendingNaturalizes)
             if (pending.guid == guid)
@@ -62302,7 +62333,7 @@ private:
             NaturalizeRefusal const refusal = NaturalizeVerdictFor(check.request, facts, check.request.dryRun);
             if (refusal != NaturalizeRefusal::None)
             {
-                char const* said = NaturalizeRefusalSaid(refusal);
+                char const* said = NaturalizeRefusalSaid(refusal, PLAYERBOTS_KEYS_RENAMED);
                 FinishNaturalize(check, "error", said,
                                  "{\"outcome\":\"refused\",\"reason\":" + J(said) + ",\"character\":" +
                                      J(check.name) + "}");
@@ -62762,7 +62793,7 @@ private:
         {
             NaturalizeRefusal const would = NaturalizeVerdictFor(request, facts, false);
             o << ",\"a_real_run_would\":"
-              << J(would == NaturalizeRefusal::None ? "proceed" : NaturalizeRefusalSaid(would));
+              << J(would == NaturalizeRefusal::None ? "proceed" : NaturalizeRefusalSaid(would, PLAYERBOTS_KEYS_RENAMED));
         }
 
         bool changed = false;

@@ -238,7 +238,7 @@ void TestVerdict()
     Check("the death knight is refused a level 1 reset",
           NaturalizeVerdictFor(reset, f, true) == NaturalizeRefusal::DeathKnight);
     Check("...and told the mode that fits it",
-          std::strstr(NaturalizeRefusalSaid(NaturalizeRefusal::DeathKnight), "reset-level-55") != nullptr);
+          std::strstr(NaturalizeRefusalSaid(NaturalizeRefusal::DeathKnight, true), "reset-level-55") != nullptr);
 
     // reset-level-55: the operator's 2026-09-26 decision for the guild's death
     // knight. The same gates as a level 1 reset, for a death knight only.
@@ -248,7 +248,7 @@ void TestVerdict()
     Check("a class that starts at 1 is refused a 55 reset, dry run too",
           NaturalizeVerdictFor(dk, GuildBot(), true) == NaturalizeRefusal::NotDeathKnight);
     Check("...and told the mode that fits it",
-          std::strstr(NaturalizeRefusalSaid(NaturalizeRefusal::NotDeathKnight), "reset-level-1") != nullptr);
+          std::strstr(NaturalizeRefusalSaid(NaturalizeRefusal::NotDeathKnight, true), "reset-level-1") != nullptr);
     NaturalizeFacts dkFamily = FamilyMember();
     dkFamily.deathKnight = true;
     Check("a family death knight is never reset",
@@ -347,13 +347,14 @@ void TestVerdict()
     f.partsAlreadyDone = NATURALIZE_PART_LOWER;
     Check("a second lowering is refused", NaturalizeVerdictFor(lower, f, false) == NaturalizeRefusal::AlreadyDone);
 
-    Check("every refusal has words", std::strlen(NaturalizeRefusalSaid(NaturalizeRefusal::DeathKnight)) > 0 &&
-                                         std::strlen(NaturalizeRefusalSaid(NaturalizeRefusal::AlreadyDone)) > 0);
+    Check("every refusal has words", std::strlen(NaturalizeRefusalSaid(NaturalizeRefusal::DeathKnight, true)) > 0 &&
+                                         std::strlen(NaturalizeRefusalSaid(NaturalizeRefusal::AlreadyDone, true)) > 0);
     Check("no refusal literal carries a quote",
           [] {
               for (int i = 0; i <= static_cast<int>(NaturalizeRefusal::AlreadyDone); ++i)
-                  if (std::strchr(NaturalizeRefusalSaid(static_cast<NaturalizeRefusal>(i)), '\''))
-                      return false;
+                  for (bool renamed : {false, true})
+                      if (std::strchr(NaturalizeRefusalSaid(static_cast<NaturalizeRefusal>(i), renamed), '\''))
+                          return false;
               return true;
           }());
 }

@@ -20517,6 +20517,21 @@ bool NameListHas(std::vector<std::string> const& list, std::string const& name)
     return false;
 }
 
+std::string PlayerbotsConfigKey(bool keysRenamed, char const* name)
+{
+    return std::string(keysRenamed ? "Playerbots." : "AiPlayerbot.") + (name ? name : "");
+}
+
+PlayerbotsOptionRead ReadPlayerbotsOption(std::string const& readKeyValue,
+                                          std::string const& otherSpellingValue)
+{
+    PlayerbotsOptionRead read;
+    read.value = readKeyValue;
+    read.otherSpellingOnly =
+        TrimAscii(readKeyValue).empty() && !TrimAscii(otherSpellingValue).empty();
+    return read;
+}
+
 NaturalizeRefusal NaturalizeVerdictFor(NaturalizeRequest const& request, NaturalizeFacts const& facts,
                                        bool asDryRun)
 {
@@ -20560,7 +20575,7 @@ NaturalizeRefusal NaturalizeVerdictFor(NaturalizeRequest const& request, Natural
     return NaturalizeRefusal::None;
 }
 
-char const* NaturalizeRefusalSaid(NaturalizeRefusal refusal)
+char const* NaturalizeRefusalSaid(NaturalizeRefusal refusal, bool playerbotsKeysRenamed)
 {
     switch (refusal)
     {
@@ -20587,7 +20602,9 @@ char const* NaturalizeRefusalSaid(NaturalizeRefusal refusal)
         case NaturalizeRefusal::CodMail:
             return "a COD mail is waiting, which only its sender can take back";
         case NaturalizeRefusal::PlayerbotsGateOff:
-            return "AiPlayerbot.NaturalGuild does not name its guild, so the factory would re-kit it";
+            return playerbotsKeysRenamed
+                ? "Playerbots.NaturalGuild does not name its guild, so the factory would re-kit it"
+                : "AiPlayerbot.NaturalGuild does not name its guild, so the factory would re-kit it";
         case NaturalizeRefusal::TrainFactoryOn:
             return "Overseer.Train.Factory is on, so TrainRoster would re-teach it on the next level";
         case NaturalizeRefusal::LevelNotLower:

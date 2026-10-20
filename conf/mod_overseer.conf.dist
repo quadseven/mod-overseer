@@ -597,8 +597,11 @@
 #        Description: The guilds, by name, comma separated, whose characters a
 #                     naturalize row may touch. Anyone outside them is refused.
 #                     A reset also refuses unless mod-playerbots'
-#                     AiPlayerbot.NaturalGuild names the guild, because the bot
+#                     Playerbots.NaturalGuild names the guild, because the bot
 #                     factory would re-kit a level 1 bot on its next randomize.
+#                     A mod-playerbots from before its key rename (#2854)
+#                     reads AiPlayerbot.NaturalGuild instead; the module reads
+#                     whichever spelling the linked mod-playerbots reads.
 #
 #        Example:     Overseer.Natural.Guilds = "My Guild,Other Guild"
 #        Default:     "" (empty - nobody)
