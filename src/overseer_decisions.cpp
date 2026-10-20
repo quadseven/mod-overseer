@@ -19897,6 +19897,24 @@ char const* GuildFinderFamilySeatWord(GuildFinderFamilySeat seat)
     return "is a family member";
 }
 
+GuildRunStallStep GuildRunStallNext(GuildRunStallFacts const& facts)
+{
+    // Nobody to skip for, or a stillness the overseer asked for itself.
+    if (!facts.armed || facts.held)
+        return GuildRunStallStep::Nothing;
+    // A fight holds the ladder until the run has gone the busy ceiling with
+    // neither a credit nor the yards.
+    if (facts.fighting && facts.secondsStill < GUILD_RUN_STALL_BUSY_SECONDS)
+        return GuildRunStallStep::Nothing;
+    bool const still = facts.secondsStill >= (facts.brainStalled ? GUILD_RUN_STALL_SECONDS
+                                                                 : GUILD_RUN_QUIET_SECONDS);
+    bool const pacing = facts.brainStalled && facts.secondsSinceCredit >= GUILD_RUN_CREDITLESS_SECONDS;
+    if (!still && !pacing)
+        return GuildRunStallStep::Nothing;
+    return facts.skips < GUILD_RUN_MAX_SKIPS && !facts.skipRefused ? GuildRunStallStep::Skip
+                                                                   : GuildRunStallStep::End;
+}
+
 GuildRunRearmStep GuildRunRearmNext(GuildRunRearmFacts const& facts)
 {
     if (!facts.armed || facts.aliveInside == 0 || facts.regrouping || !facts.tankAlive)
@@ -20353,6 +20371,7 @@ char const* GuildRunVerdictWord(GuildRunVerdict verdict)
         case GuildRunVerdict::Wiped:     return "wiped";
         case GuildRunVerdict::Abandoned: return "abandoned";
         case GuildRunVerdict::TimedOut:  return "timed out";
+        case GuildRunVerdict::Stalled:   return "stalled";
     }
     return "unknown";
 }

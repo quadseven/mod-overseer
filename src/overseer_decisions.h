@@ -22995,6 +22995,7 @@ enum class GuildRunVerdict : std::uint8_t
     Wiped,      // everybody inside died and nobody was back within the recovery window
     Abandoned,  // nobody inside, the group is gone, or a role stays unavailable
     TimedOut,   // inside past the ceiling
+    Stalled,    // the stall ladder's skips did not move it (GuildRunStallNext, #1086)
 };
 
 // ONE POLL of a group that has been inside. Cleared is asked first: a group
@@ -23006,7 +23007,7 @@ enum class GuildRunVerdict : std::uint8_t
 // or after `recoverySeconds` when the seat is coming back (`rolesComingBack`).
 GuildRunVerdict GuildRunNext(GuildRunPoll const& poll);
 
-// "running", "cleared", "wiped", "abandoned", "timed out".
+// "running", "cleared", "wiped", "abandoned", "timed out", "stalled".
 char const* GuildRunVerdictWord(GuildRunVerdict verdict);
 
 // WHERE A GUILD RUN STALLED, IN WORDS. A run row used to say only "inside for
@@ -23161,6 +23162,74 @@ enum class GuildRunRearmStep : std::uint8_t
 };
 
 GuildRunRearmStep GuildRunRearmNext(GuildRunRearmFacts const& facts);
+
+// A GUILD RUN SKIPS WHAT THE DUNGEON BRAIN CANNOT REACH, THEN ENDS (#1086).
+// The family coordinator and the raid coordinator each walk a CLEARING stall
+// ladder (`dc skip` a bounded number of times, then leave); a guild finder run
+// had none, so a run stopped at a door or event the brain cannot open waited
+// out GUILD_RUN_CEILING_SECONDS and GUILD_RUN_PROGRESS_EXTENSION_SECONDS. On
+// the dev realm (2026-10-20, 12:00-18:00Z) four of 21 guild runs ended that
+// way, 30 to 67 minutes after their last kill: a Deadmines run at the Iron
+// Clad Door, Blackfathom Deeps short of Gelihast, Gnomeregan at Thermaplugg's
+// door, Shadowfang Keep before Nandos. Each time the brain said it was stalled
+// and asked for `dc skip`, and nothing sent one.
+//
+// THE WINDOWS. A brain that says it is stalled (its stall reason is set) is
+// believed after GUILD_RUN_STALL_SECONDS, the family watchdog's own window
+// (DUNGEON_CLEAR_STALL_SECONDS). A brain that says nothing gets
+// GUILD_RUN_QUIET_SECONDS: a guild group rests between pulls under its own
+// hold, so standing still out of combat that long is not a rest. And a
+// stalled brain that keeps walking (to a door and back, "Opening the door to
+// Gilnid" fifteen times) is skipped once nothing has been credited for
+// GUILD_RUN_CREDITLESS_SECONDS, about the healthy quarter hour a boss.
+//
+// Two skips, then the run ends as Stalled, so its five go free about a
+// quarter hour after the brain first stalls rather than two hours later.
+constexpr unsigned GUILD_RUN_STALL_SECONDS = 5 * 60;
+constexpr unsigned GUILD_RUN_QUIET_SECONDS = 15 * 60;
+constexpr unsigned GUILD_RUN_CREDITLESS_SECONDS = 20 * 60;
+constexpr unsigned GUILD_RUN_MAX_SKIPS = 2;
+// Combat holds the ladder, but not for ever (the family's #382): a member
+// whose combat flag never clears must not hold a run that has neither moved
+// nor credited a boss for this long.
+constexpr unsigned GUILD_RUN_STALL_BUSY_SECONDS = 15 * 60;
+// Yards the tank must cover from its last mark to count as moving, the same
+// thirty the family's CLEARING ratchet uses.
+constexpr float GUILD_RUN_STALL_YARDS = 30.f;
+
+struct GuildRunStallFacts
+{
+    // The brain is armed for this run and its tank is alive inside: there is
+    // somebody to skip for, and somebody the skip is sent to.
+    bool armed{false};
+    // The overseer holds the brain (a rest or a regroup), or a corpse run is
+    // under way: standing still is asked for.
+    bool held{false};
+    // A member alive inside is in combat, or a boss encounter is under way.
+    bool fighting{false};
+    // The brain's own stall reason is set (it asked for `dc skip`).
+    bool brainStalled{false};
+    // Since the last boss credit, tank movement of GUILD_RUN_STALL_YARDS, hold
+    // or skip.
+    unsigned secondsStill{0};
+    // Since the last boss credit or skip, movement or not.
+    unsigned secondsSinceCredit{0};
+    // Skips sent since the run last credited a boss. Movement alone does not
+    // reset it: a brain that paces at a door it cannot open moves.
+    unsigned skips{0};
+    // The last skip was refused: the brain has switched itself off with
+    // nothing left it can reach, so no later skip can move it.
+    bool skipRefused{false};
+};
+
+enum class GuildRunStallStep : std::uint8_t
+{
+    Nothing,  // progressing, busy, held, or not stalled long enough
+    Skip,     // send `dc skip` from the tank
+    End,      // the skips did not move it: end the run as Stalled
+};
+
+GuildRunStallStep GuildRunStallNext(GuildRunStallFacts const& facts);
 
 // THE GROUP GOES BACK IN TOGETHER, AND RESTS BEFORE IT PULLS. Measured on the
 // dev realm from the corpse run's deploy to 2026-10-10 00:00 (New York): 17
