@@ -2481,6 +2481,12 @@ FamilyGroupPlan PlanFamilyGroup(std::vector<FamilyGroupSeat> const& seats)
                 }
     }
 
+    // A HEAD WHO LEADS A GROUP THE CORE OWNS IS STILL HIS OWN MASTER (#792).
+    // The family's group is never that group, so KeepRosterFollowing never
+    // sees him, and a headless head has no `self` from a client login.
+    if (head && head->groupIsForeign && head->leadsItsGroup)
+        plan.headLeadsCoreGroup = head->name;
+
     for (FamilyGroupSeat const& seat : seats)
     {
         if (!seat.present)

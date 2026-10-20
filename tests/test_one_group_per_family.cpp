@@ -126,6 +126,45 @@ void AGroupTheCoreOwnsIsLeftAlone()
     Check("and not moved", Is(plan.join, {"Grog"}));
 }
 
+void AHeadLeadingACoreGroupIsKeptItsOwnMaster()
+{
+    // #792, measured on the dev realm 2026-10-20: a worldserver restart put
+    // the whole family back in the finder group under 'Zug', the head came in
+    // headless, and every seat was in a group the core owns. Nothing was
+    // formed or joined, so KeepRosterFollowing never ran, the head was never
+    // made his own master, and no groupmate passed IsSelfBot: the dungeon
+    // brain stayed OFF until a client came for him five minutes later.
+    std::vector<FamilyGroupSeat> const finder = {
+        Seat("Zug", true, 5, true, true, true), Seat("Oz", false, 5, false, true, true),
+        Seat("Zork", false, 5, false, true, true)};
+    FamilyGroupPlan const plan = PlanFamilyGroup(finder);
+    Check("nothing is formed for a family all in a finder group",
+          plan.targetGroupId == 0 && plan.founder.empty());
+    Check("the head leading the finder group is named",
+          plan.headLeadsCoreGroup == "Zug");
+
+    // The head in a core group with the family's own party beside it.
+    std::vector<FamilyGroupSeat> const beside = {
+        Seat("Grug", true, 5, true, true, true), Seat("Bork", false, 3, true),
+        Seat("Grog", false, 0)};
+    Check("named while the rest form their own party",
+          PlanFamilyGroup(beside).headLeadsCoreGroup == "Grug");
+
+    // Not named: a head who does not lead the core group (a stranger leads
+    // it), a head away, and a head in the family's own party, whom
+    // KeepRosterFollowing already keeps his own master.
+    std::vector<FamilyGroupSeat> const ledByOther = {
+        Seat("Grug", true, 5, false, true, true), Seat("Bork", false, 5, false, true, true)};
+    Check("not when somebody else leads the core group",
+          PlanFamilyGroup(ledByOther).headLeadsCoreGroup.empty());
+    std::vector<FamilyGroupSeat> const away = {
+        Seat("Grug", true, 5, true, false, true), Seat("Bork", false, 5, false, true, true)};
+    Check("not when the head is away", PlanFamilyGroup(away).headLeadsCoreGroup.empty());
+    std::vector<FamilyGroupSeat> const own = {
+        Seat("Grug", true, 3, true), Seat("Bork", false, 3)};
+    Check("not in the family's own party", PlanFamilyGroup(own).headLeadsCoreGroup.empty());
+}
+
 void AWholeFamilyNeedsNoMoves()
 {
     std::vector<FamilyGroupSeat> const seats = {
@@ -199,6 +238,7 @@ int main()
     WithoutTheHeadTheBiggestGroupWins();
     NoGroupAtAllIsFormedUnderTheHead();
     AGroupTheCoreOwnsIsLeftAlone();
+    AHeadLeadingACoreGroupIsKeptItsOwnMaster();
     AWholeFamilyNeedsNoMoves();
     TheBreachSaysWhatIsWrong();
     AnotherCopyIsNotInside();
