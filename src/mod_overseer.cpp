@@ -17981,6 +17981,42 @@ private:
         return OverseerDecisions::GearReadRandomProperty(effects, everyEnchantmentRead);
     }
 
+    // The spells an item template carries, as plain numbers for
+    // OverseerDecisions::GearReadItemSpells (#221). An amount is what
+    // SpellEffectInfo::CalcValue gives with no caster - BasePoints, plus one
+    // for a DieSides of one - and is marked not fixed when it rolls or grows
+    // with level, because then that number is not the item's.
+    static std::vector<OverseerDecisions::GearItemSpell> GearItemSpellsOf(ItemTemplate const* proto)
+    {
+        std::vector<OverseerDecisions::GearItemSpell> spells;
+        for (uint32 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+        {
+            if (proto->Spells[i].SpellId <= 0)
+                continue;
+            OverseerDecisions::GearItemSpell spell;
+            spell.trigger = static_cast<int>(proto->Spells[i].SpellTrigger);
+            SpellInfo const* info =
+                sSpellMgr->GetSpellInfo(static_cast<uint32>(proto->Spells[i].SpellId));
+            spell.found = info != nullptr;
+            if (info)
+            {
+                for (SpellEffectInfo const& effect : info->GetEffects())
+                {
+                    OverseerDecisions::GearSpellEffect read;
+                    read.effect = static_cast<int>(effect.Effect);
+                    read.aura = static_cast<int>(effect.ApplyAuraName);
+                    read.misc = static_cast<int>(effect.MiscValue);
+                    read.fixedAmount = (effect.DieSides == 0 || effect.DieSides == 1) &&
+                                       effect.RealPointsPerLevel == 0.f;
+                    read.amount = static_cast<int>(effect.CalcValue());
+                    spell.effects.push_back(read);
+                }
+            }
+            spells.push_back(spell);
+        }
+        return spells;
+    }
+
     // An item template flattened into the plain facts the scorer reads. The
     // scorer includes no core header, so this is where a core type stops.
     static OverseerDecisions::GearItem GearItemFor(
@@ -18016,9 +18052,16 @@ private:
             item.dps = damage * 1000.f / static_cast<float>(proto->Delay);
         }
 
-        for (uint32 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
-            if (proto->Spells[i].SpellId > 0)
-                item.hasEffect = true;
+        // AN EQUIP SPELL THAT IS A STAT IS A STAT (#221). Most rares at this
+        // level carry their rating, attack power or spell power as an on-equip
+        // aura rather than a stat line; read as "an effect", every one of them
+        // made its slot a Floor that nothing could be proved to beat. What is
+        // left unread after GearReadItemSpells is what `hasEffect` means.
+        OverseerDecisions::GearResolvedProperty const equip =
+            OverseerDecisions::GearReadItemSpells(GearItemSpellsOf(proto));
+        for (OverseerDecisions::GearStat const& stat : equip.stats)
+            item.stats.push_back(stat);
+        item.hasEffect = equip.unresolved;
 
         // A ROLLED STAT IS A STAT, and nothing about one is different for
         // having arrived on the item by a roll rather than in its template -
