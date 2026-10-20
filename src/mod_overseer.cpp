@@ -9482,6 +9482,17 @@ private:
             return nullptr;
         };
 
+        // THE HEAD LEADING A GROUP THE CORE OWNS IS STILL ITS OWN MASTER (#792).
+        // Measured on the dev realm 2026-10-20: a worldserver restart put the
+        // whole family back in its finder group, the head came in headless,
+        // and nothing below formed or joined anything, so KeepRosterFollowing
+        // never ran. A client head is a selfbot from `self` at login; a
+        // headless one was not, no groupmate passed IsSelfBot, and the dungeon
+        // brain stayed OFF until a client came for him. Asked before the
+        // early return below, which is exactly that case.
+        if (!plan.headLeadsCoreGroup.empty())
+            KeepLeaderItsOwnMaster(findPresent(plan.headLeadsCoreGroup));
+
         // Said when the split changes, not on every poll that finds it. A
         // leave the core refuses would otherwise print this every few
         // seconds for as long as it keeps refusing.
@@ -11407,6 +11418,36 @@ private:
         return inReach;
     }
 
+    // Make a leader its own master, so it passes IsSelfBot and the dungeon
+    // module accepts its `dc` commands. KeepRosterFollowing's leader block
+    // says why (#135); KeepFamilyGrouped also asks it for a head who leads a
+    // group the core owns, which that block never sees (#792). A character
+    // with no PlayerbotAI, or whose master is a person, is left alone.
+    static void KeepLeaderItsOwnMaster(Player* leader)
+    {
+        PlayerbotAI* leaderAI = leader ? GET_PLAYERBOT_AI(leader) : nullptr;
+        if (!leaderAI || leaderAI->GetMaster() == leader || IsRealPlayer(leaderAI->GetMaster()))
+            return;
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' leads, so it is its own master - the tank must "
+                 "pass IsSelfBot to issue the dungeon-clear command",
+                 leader->GetName());
+        leaderAI->SetMaster(leader);
+
+        // READ BACK THROUGH THE EXACT PREDICATE THE DUNGEON MODULE USES, not
+        // through GetMaster(): IsSelfBot goes through GET_PLAYERBOT_AI(leader)
+        // afresh, so this also catches the AI held here not being the one
+        // registered for the character. If it fires, no `dc` command from the
+        // leader will ever be accepted, and the log should say so before
+        // DriveDungeonClear finds nobody.
+        if (!IsSelfBot(leader))
+            LOG_ERROR("module.overseer",
+                      "overseer: '{}' was made its own master and still does not "
+                      "pass IsSelfBot - the dungeon module will refuse every "
+                      "command it issues",
+                      leader->GetName());
+    }
+
     // Give the followers somebody to follow (infra#2818).
     //
     // WHY `follow` HAS NEVER MOVED ANYBODY. It is on all five and it is not
@@ -11722,28 +11763,7 @@ private:
         // logs those out, and this drive only ever runs over `present`.
         if (PlayerbotAI* leaderAI = GET_PLAYERBOT_AI(leader))
         {
-            if (leaderAI->GetMaster() != leader && !IsRealPlayer(leaderAI->GetMaster()))
-            {
-                LOG_INFO("module.overseer",
-                         "overseer: '{}' leads, so it is its own master - the tank must "
-                         "pass IsSelfBot to issue the dungeon-clear command",
-                         leader->GetName());
-                leaderAI->SetMaster(leader);
-
-                // READ BACK THROUGH THE EXACT PREDICATE THE DUNGEON MODULE
-                // USES, not through GetMaster(): IsSelfBot goes through
-                // GET_PLAYERBOT_AI(leader) afresh, so this also catches the
-                // AI this block holds not being the one registered for the
-                // character. If it fires, no `dc` command from the leader
-                // will ever be accepted, and the log should say so before
-                // DriveDungeonClear finds nobody.
-                if (!IsSelfBot(leader))
-                    LOG_ERROR("module.overseer",
-                              "overseer: '{}' was made its own master and still does not "
-                              "pass IsSelfBot - the dungeon module will refuse every "
-                              "command it issues",
-                              leader->GetName());
-            }
+            KeepLeaderItsOwnMaster(leader);
 
             // AND THE LEADER MUST ACTUALLY CARRY `new rpg`, BECAUSE NOTHING
             // ELSE IN THE WORLD EVER GRANTS IT TO THIS FAMILY.

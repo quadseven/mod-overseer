@@ -182,8 +182,10 @@ LeaderClientLossAction DungeonLeaderClientLoss(bool socketOpen, bool partyIssuer
 // head plays headless (Overseer.HeadlessRoster, #549) entered its dungeon and
 // could never clear it: the brain stayed OFF, the run was held for a client
 // that does not exist by design, and it ended `client_lost`, every run. A
-// headless roster leader is already kept its own master by KeepRosterFollowing,
-// so the socket test was the only thing refusing it.
+// headless roster leader is kept its own master by KeepRosterFollowing over
+// the family's group, and by PlanFamilyGroup's headLeadsCoreGroup when the
+// family sits in a group the core owns, so the socket test was the only thing
+// refusing it.
 //
 // The seat is held by an open client socket, or by a headless bot that is in
 // the world and NAMED on the headless roster. Only the list counts, not
@@ -3316,6 +3318,14 @@ struct FamilyGroupPlan
     std::vector<std::string> join;
     // Present members in a group the core owns, left where they are.
     std::vector<std::string> untouched;
+    // The head, when he is present and leads a group the core owns; empty
+    // otherwise (#792). KeepRosterFollowing makes a leader its own master only
+    // over the family's group, and a client gets the same from `self` at
+    // login, but a headless head logged in while the family sits in a finder
+    // group gets neither: nothing is formed or joined, so no groupmate passes
+    // IsSelfBot and the dungeon brain stays OFF. The adapter makes this head
+    // his own master the way KeepRosterFollowing does.
+    std::string headLeadsCoreGroup;
 };
 
 FamilyGroupPlan PlanFamilyGroup(std::vector<FamilyGroupSeat> const& seats);
