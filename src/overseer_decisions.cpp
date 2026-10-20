@@ -9384,6 +9384,16 @@ uint32_t AuctionDurationMinutes(uint32_t hours)
     }
 }
 
+bool AuctionBudgetAllows(uint32_t money, uint32_t reserve, uint32_t sharePercent,
+                        uint32_t price)
+{
+    if (money <= reserve || sharePercent == 0 || sharePercent > 100 || price == 0)
+        return false;
+    uint32_t const remainder = money - reserve;
+    uint64_t const share = static_cast<uint64_t>(remainder) * sharePercent / 100;
+    return price <= remainder && price <= share;
+}
+
 AuctionBidVerdict AuctionBidAcceptable(uint32_t price, uint32_t startBid,
                                        uint32_t currentBid, uint32_t buyout,
                                        uint32_t outbidStep)

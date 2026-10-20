@@ -42,6 +42,7 @@
 using OverseerDecisions::AuctionBidAcceptable;
 using OverseerDecisions::AuctionBidCost;
 using OverseerDecisions::AuctionBidVerdict;
+using OverseerDecisions::AuctionBudgetAllows;
 using OverseerDecisions::AuctionDurationMinutes;
 using OverseerDecisions::AuctionRefusalRetryable;
 using OverseerDecisions::AuctionRequest;
@@ -335,6 +336,9 @@ void WhichRefusalsMove()
 
 int main()
 {
+    Check("budget keeps reserve", AuctionBudgetAllows(10000, 3000, 50, 2500), true);
+    Check("budget caps purchase at share", AuctionBudgetAllows(10000, 3000, 50, 4000), false);
+    Check("budget rejects reserve breach", AuctionBudgetAllows(4000, 3000, 50, 1500), false);
     AListParsesEveryField();
     FieldsMayComeInAnyOrder();
     ABuyTakesOnlyTheAuction();
