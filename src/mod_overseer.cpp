@@ -50379,14 +50379,56 @@ private:
                 // everything downstream. RESETTING now derives a point when it
                 // inherited none, and DungeonStagingAim refuses to build an aim
                 // out of one that was never resolved.
+                // A CLEARED INSTANCE IS LEFT, NOT STAGED INTO (#165). The census
+                // alone cannot tell a member who went in early from one LEFT
+                // BEHIND after the run finished, and the second is the one that
+                // looped: four members walked back at a door into an instance
+                // with nothing left in it, 'split_failed' after 15 minutes, and
+                // adopted again. See DungeonRunAdoptAt. The mask is read off the
+                // member found inside, whose bind names the copy it is standing
+                // in, and map 36 is left out for the reason the CLEARING check
+                // leaves it out: Deadmines is judged by its quest goal there.
+                OverseerDecisions::DungeonCompletion const adoptedCompletion =
+                    inside->insideMapId == 36
+                        ? OverseerDecisions::DungeonCompletion::Unknowable
+                        : OverseerDecisions::DungeonRunCompletion(
+                              ExpectedEncounterMask(inside->insideMapId, activeInside),
+                              CompletedEncounters(activeInside));
+                OverseerDecisions::DungeonRunAdoptPhase const adoptAt =
+                    OverseerDecisions::DungeonRunAdoptAt(
+                        OverseerDecisions::DungeonRunAllThrough(adoptedStates),
+                        adoptedCompletion);
+
                 coord = DungeonRunCoordinatorState();
-                coord.phase = OverseerDecisions::DungeonRunAllThrough(adoptedStates)
-                                  ? DungeonRunPhase::Clearing
-                                  : DungeonRunPhase::StagedInside;
+                switch (adoptAt)
+                {
+                    case OverseerDecisions::DungeonRunAdoptPhase::Exiting:
+                        coord.phase = DungeonRunPhase::Exiting;
+                        break;
+                    case OverseerDecisions::DungeonRunAdoptPhase::Clearing:
+                        coord.phase = DungeonRunPhase::Clearing;
+                        break;
+                    case OverseerDecisions::DungeonRunAdoptPhase::StagedInside:
+                        coord.phase = DungeonRunPhase::StagedInside;
+                        break;
+                }
                 coord.wentIn = adoptedInside;
                 coord.portalKeyword = inside->keyword;
                 if (coord.phase == DungeonRunPhase::Clearing)
                     coord.awaitingSince = std::time(nullptr);
+                if (coord.phase == DungeonRunPhase::Exiting)
+                {
+                    // THE SAME PROOF THE CLEARING CHECK WOULD HAVE TAKEN from
+                    // the same mask one poll later, had the whole party been
+                    // inside to get it there - so the run ends 'complete' and
+                    // its campaign moves on, rather than running the cleared
+                    // instance again.
+                    coord.provedComplete = true;
+                    coord.crossing.best = 0.f;
+                    coord.crossing.since = std::time(nullptr);
+                    coord.loggedCrossingAim = false;
+                    coord.loggedCrossingWaiting = false;
+                }
 
                 // AND THE CAMPAIGN THE ADOPTED RUN BELONGS TO, READ OFF ITS ROW
                 // (#144). The coordinator's campaign numbers are in-process and
@@ -50481,10 +50523,19 @@ private:
                          "campaign {}). The coordinator will not call the run CLEARING "
                          "until the census says every member is through",
                          leaderName, inside->insideMapId,
-                         coord.phase == DungeonRunPhase::Clearing ? "CLEARING"
-                                                                  : "STAGED_INSIDE",
+                         coord.phase == DungeonRunPhase::Exiting    ? "EXIT"
+                         : coord.phase == DungeonRunPhase::Clearing ? "CLEARING"
+                                                                    : "STAGED_INSIDE",
                          adoptedInside, static_cast<uint32>(members.size()),
                          coord.runNumber, coord.campaignId);
+                if (adoptAt == OverseerDecisions::DungeonRunAdoptPhase::Exiting)
+                    LOG_WARN("module.overseer",
+                             "overseer: the instance '{}' was found in on map {} is "
+                             "already cleared - every encounter is credited - so the "
+                             "adopted run goes straight to EXIT for the {} inside, and "
+                             "nobody outside is walked back in to a dungeon with nothing "
+                             "left in it (#165)",
+                             activeInside->GetName(), inside->insideMapId, adoptedInside);
                 return;
             }
 
