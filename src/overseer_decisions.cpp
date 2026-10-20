@@ -17474,6 +17474,13 @@ int64_t GhostHealerWalkSeconds(float yards, int64_t baseSeconds)
     return walk > baseSeconds ? walk : baseSeconds;
 }
 
+bool GhostHealerWalkRenews(float startYards, float nowYards, unsigned renewals)
+{
+    if (renewals >= GHOST_HEALER_WALK_RENEWALS || startYards < 0.f || nowYards < 0.f)
+        return false;
+    return startYards - nowYards >= GHOST_HEALER_WALK_PROGRESS_YARDS;
+}
+
 GuildDeathSpotStep GuildLeavesDeathSpot(unsigned deathsHere, unsigned repeatDeaths,
                                         bool hearthReady, bool inCombat, bool outmatchedHere)
 {

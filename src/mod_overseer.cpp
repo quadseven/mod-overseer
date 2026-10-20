@@ -30073,6 +30073,12 @@ private:
         // the safety test; only healers standing at it count.
         bool healerRerouted{false};
         int64 healerWalkSeconds{GHOST_HEALER_WALK_SECONDS};
+        // How far the ghost stood from the healer's graveyard when the current
+        // allowance began (-1 before the walk), and how often a walk still
+        // closing on it was renewed (OverseerDecisions::GhostHealerWalkRenews,
+        // wow-overseer#744).
+        float healerWalkFromYards{-1.f};
+        unsigned healerWalkRenewals{0};
         // When the corpse run was first chosen for this death, and how long it
         // is given before the ladder may take the ghost while it is sick
         // (OverseerDecisions::LadderWaitsForCorpseRun, mod-overseer#746).
@@ -31335,6 +31341,31 @@ private:
         }
         if (st.healerWalkSpent)
             return false;
+        float const healerYards = bot->GetExactDist2d(st.healerGrave->x, st.healerGrave->y);
+        if (st.healerWalkFromYards < 0.f)
+            st.healerWalkFromYards = healerYards;
+        if (now - st.healerSince > st.healerWalkSeconds &&
+            OverseerDecisions::GhostHealerWalkRenews(st.healerWalkFromYards, healerYards,
+                                                     st.healerWalkRenewals))
+        {
+            // Still closing on the healer: the road is longer than the
+            // straight line the allowance was read from. Walking it back to
+            // the corpse it was chosen to avoid is what looped (#744).
+            ++st.healerWalkRenewals;
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is still walking to the spirit healer at '{}' after {}s - "
+                     "{:.0f} yards closer, {:.0f} to go - and is given {}s more instead of "
+                     "going back to its corpse (renewal {} of {}, #744)",
+                     name, st.healerGrave->name, now - st.healerSince,
+                     st.healerWalkFromYards - healerYards, healerYards,
+                     OverseerDecisions::GhostHealerWalkSeconds(healerYards,
+                                                               GHOST_HEALER_WALK_SECONDS),
+                     st.healerWalkRenewals, OverseerDecisions::GHOST_HEALER_WALK_RENEWALS);
+            st.healerSince = now;
+            st.healerWalkSeconds =
+                OverseerDecisions::GhostHealerWalkSeconds(healerYards, GHOST_HEALER_WALK_SECONDS);
+            st.healerWalkFromYards = healerYards;
+        }
         if (now - st.healerSince > st.healerWalkSeconds)
         {
             st.healerWalkSpent = true;
@@ -31343,8 +31374,10 @@ private:
                 ReturnCorpseRun(botAI, st);
                 LOG_WARN("module.overseer",
                          "overseer: '{}' chose the spirit healer at '{}' {}s ago and never "
-                         "stood at one - the corpse run goes back to the dead engine",
-                         name, st.healerGrave->name, now - st.healerSince);
+                         "stood at one ({:.0f} yards short, {} renewal(s)) - the corpse run "
+                         "goes back to the dead engine",
+                         name, st.healerGrave->name, now - st.healerSince, healerYards,
+                         st.healerWalkRenewals);
                 return false;
             }
             LeaseCorpseRun(bot, botAI, st, false);

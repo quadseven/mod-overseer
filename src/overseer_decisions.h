@@ -21599,6 +21599,21 @@ SpiritReviveSite SpiritReviveSiteFor(bool rerouted, bool healerServesChosenGrave
 // released beside its healer; a rerouted one walks across the zone.
 int64_t GhostHealerWalkSeconds(float yards, int64_t baseSeconds);
 
+// A GHOST STILL CLOSING ON ITS SPIRIT HEALER IS GIVEN MORE TIME, NOT SENT BACK
+// TO ITS CORPSE (wow-overseer#744). GhostHealerWalkSeconds reads the straight
+// line, and the road can be far longer: a ghost rerouted across Searing Gorge
+// to Thorium Point, about 600 yards, ran out of its 130 s every time on the
+// dev realm, and the corpse run then walked it back among the creatures that
+// had just killed it, up to 10 deaths in half an hour. True when the ghost is
+// now at least GHOST_HEALER_WALK_PROGRESS_YARDS closer to the healer's
+// graveyard than when this allowance began (`startYards`, `nowYards`; below 0
+// when unknown) and the walk has been renewed fewer than
+// GHOST_HEALER_WALK_RENEWALS times. A ghost that got no closer cannot walk the
+// path, and falls back as before.
+constexpr unsigned GHOST_HEALER_WALK_RENEWALS = 3;
+constexpr float GHOST_HEALER_WALK_PROGRESS_YARDS = 20.0f;
+bool GhostHealerWalkRenews(float startYards, float nowYards, unsigned renewals);
+
 // A GUILD MEMBER THAT HAS DIED TWICE AT ONE SPOT LEAVES IT ONCE ALIVE. Every
 // recovery path brought guild members back to the same mobs: the corpse run,
 // the spirit healer at a graveyard beside the killer, the walk back from the
