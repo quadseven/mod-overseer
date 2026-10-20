@@ -1979,7 +1979,16 @@ RejoinWalk ReadRejoinWalk(RejoinWalkFacts const& facts)
     // rejoined the family has succeeded however long it took, and reporting
     // that as a give-up would put a false line in the log about a walk that
     // worked.
-    if (facts.withTheFamily)
+    //
+    // "The family" is the run's map when one is known, and the group's leader
+    // only when it is not. See RejoinWalkFacts for the loop the leader-only
+    // reading made.
+    bool const withTheFamily =
+        facts.runMapKnown
+            ? (facts.memberMap == facts.runMap || !facts.partyOnRunMap)
+            : (facts.leaderSeen && !facts.leaderIsMember &&
+               facts.leaderMap == facts.memberMap);
+    if (withTheFamily)
         return RejoinWalk::BackWithTheFamily;
     // A backstop of zero or less is not a clock. See RejoinWalkFacts.
     if (facts.backstopSeconds > 0 && facts.walkingForSeconds >= facts.backstopSeconds)
