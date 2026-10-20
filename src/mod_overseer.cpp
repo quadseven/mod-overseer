@@ -54768,7 +54768,8 @@ private:
                                  OverseerDecisions::ENV_PIN_PLAYERBOTS,
                                  OverseerDecisions::ENV_PIN_OLLAMA_CHAT,
                                  OverseerDecisions::ENV_PIN_DUNGEON_CLEAR,
-                                 OverseerDecisions::ENV_PIN_AH_BOT})
+                                 OverseerDecisions::ENV_PIN_AH_BOT,
+                                 OverseerDecisions::ENV_PIN_OVERSEER})
         {
             if (char const* value = std::getenv(name))
                 env[name] = value;
