@@ -3905,6 +3905,33 @@ enum class DungeonCompletion : uint8_t
 // difficulty this run is not on says nothing about this run.
 DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completedMask);
 
+// WHERE AN ADOPTED RUN STARTS, AND A CLEARED INSTANCE IS LEFT RATHER THAN
+// STAGED INTO (#165). Adoption used to ask only whether the whole roster was
+// inside: yes started CLEARING, no started STAGED_INSIDE and walked everybody
+// outside back to the door. That is the right answer for an early entrant into
+// a fresh instance, and the wrong one for a member LEFT BEHIND in a cleared
+// one. Measured 2026-10-20: a Blackfathom run credited every encounter (mask
+// 239 of 239), the walk out and then the hearth both failed for one member,
+// and every adoption after that - two of them after the next restart alone -
+// walked the other four back at a door into an instance with nothing left in
+// it, closed 'split_failed' after 15 minutes and adopted it again. A census
+// that did complete would only have handed CLEARING an instance it had
+// already finished.
+//
+// So the instance's own completion is asked first, from the same mask the
+// CLEARING check reads, and a cleared instance goes to EXIT whoever is inside.
+// Unknowable is NOT complete, for the reason DungeonRunCompletion gives: a map
+// that credits nothing would otherwise be walked out of the moment anybody was
+// found in it.
+enum class DungeonRunAdoptPhase : uint8_t
+{
+    StagedInside,  // part of the roster is inside a run that still has work
+    Clearing,      // all of it is inside a run that still has work
+    Exiting,       // the instance is cleared: walk whoever is inside out
+};
+
+DungeonRunAdoptPhase DungeonRunAdoptAt(bool allThrough, DungeonCompletion completion);
+
 // Select the encounters this run must credit. Independent-wing maps require a
 // non-empty, verified wing mask; otherwise completion remains unknowable.
 // The encounter bits a run cannot be expected to credit, because the boss

@@ -3107,6 +3107,15 @@ DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completed
                                                           : DungeonCompletion::NotYet;
 }
 
+DungeonRunAdoptPhase DungeonRunAdoptAt(bool allThrough, DungeonCompletion completion)
+{
+    // THE INSTANCE BEFORE THE CENSUS (#165). Whoever is or is not inside, there
+    // is nothing left in a cleared instance to stage for or to clear.
+    if (completion == DungeonCompletion::Complete)
+        return DungeonRunAdoptPhase::Exiting;
+    return allThrough ? DungeonRunAdoptPhase::Clearing : DungeonRunAdoptPhase::StagedInside;
+}
+
 bool DungeonQuestGoalReady(std::vector<DungeonQuestObjective> const& objectives)
 {
     bool hasGoal = false;
