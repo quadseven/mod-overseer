@@ -35235,6 +35235,23 @@ private:
         return value ? value->Get() : 0;
     }
 
+    // THE DUNGEON BRAIN'S OWN WORD THAT IT IS STUCK (#1086): the stall reason
+    // mod-dungeon-clear sets when it asks for `dc skip` ("Can't reach X: the
+    // route dead-ends short of it", "I can't progress the event at Y on my
+    // own"), and clears on a skip, an arming or progress. Empty when it is not
+    // stalled, or when the module is not loaded.
+    static std::string DungeonBrainStallReason(Player* member)
+    {
+        PlayerbotAI* ai = member ? GET_PLAYERBOT_AI(member) : nullptr;
+        AiObjectContext* context = ai ? ai->GetAiObjectContext() : nullptr;
+        if (!context)
+            return std::string();
+
+        Value<std::string&>* const value =
+            context->GetValue<std::string&>("dungeon clear stall reason");
+        return value ? std::string(value->Get()) : std::string();
+    }
+
     // Every bit the map's DungeonEncounter.dbc rows credit at normal
     // difficulty, 0 for a map that credits none.
     static uint32 MapEncounterMask(uint32 mapId)
@@ -40353,6 +40370,19 @@ private:
         std::time_t regroupSince{0};
         std::time_t restSince{0};
         std::time_t restRearmAt{0};
+        // THE STALL LADDER (OverseerDecisions::GuildRunStallNext, #1086): the
+        // tank's last mark, when the run last credited a boss, covered the
+        // yards, was held or skipped (`stillSince`), when it last credited a
+        // boss or skipped (`creditSince`), the kill clock as last read, and
+        // the skips since the last credit.
+        bool stallMarked{false};
+        float stallX{0.f};
+        float stallY{0.f};
+        std::time_t stillSince{0};
+        std::time_t creditSince{0};
+        std::time_t creditSeen{0};
+        unsigned stallSkips{0};
+        bool stallSkipRefused{false};
     };
     std::vector<GuildRun> _guildRuns;
 
@@ -41535,6 +41565,133 @@ private:
             IssueGuildRunHold(run, true, now);
     }
 
+    // ONE POLL OF THE STALL LADDER (OverseerDecisions::GuildRunStallNext,
+    // #1086), on a run the verdict left running. Sends `dc skip` from the tank
+    // on Skip; true on End, when the caller ends the run as stalled and `why`
+    // says what was tried.
+    bool StepGuildRunStall(GuildRun& run, OverseerDecisions::GuildRunPoll const& poll,
+                           bool regrouping, std::time_t now, std::string& why)
+    {
+        Player* const tank = ObjectAccessor::FindPlayerByName(run.tank);
+        bool const tankInside = GuildRunAliveInside(run, tank);
+        if (!run.stillSince)
+            run.stillSince = now;
+        if (!run.creditSince)
+            run.creditSince = now;
+
+        // A NEW KILL IS PROGRESS: both clocks and the skips start again, so a
+        // later obstacle gets the whole ladder of its own.
+        if (run.lastKillAt != run.creditSeen)
+        {
+            run.creditSeen = run.lastKillAt;
+            run.stillSince = now;
+            run.creditSince = now;
+            run.stallSkips = 0;
+            run.stallSkipRefused = false;
+        }
+
+        OverseerDecisions::GuildRunStallFacts facts;
+        facts.armed = run.dcAccepted && tankInside;
+        facts.held = run.brainHeld || regrouping;
+        facts.fighting = poll.bossInCombat;
+        for (std::string const& name : run.names)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            if (GuildRunAliveInside(run, p) && p->IsInCombat())
+                facts.fighting = true;
+        }
+
+        // THE YARDS, off the tank, the way the family's CLEARING ratchet reads
+        // them: distance from the last mark, and the mark moves only when it
+        // is passed. A tank that is not alive inside, or a brain that is held,
+        // is not standing still on its own, so the clock is kept at now.
+        if (!facts.armed || facts.held)
+        {
+            run.stallMarked = false;
+            run.stillSince = now;
+        }
+        else if (!run.stallMarked ||
+                 tank->GetExactDist2d(run.stallX, run.stallY) >=
+                     OverseerDecisions::GUILD_RUN_STALL_YARDS)
+        {
+            run.stallMarked = true;
+            run.stallX = tank->GetPositionX();
+            run.stallY = tank->GetPositionY();
+            run.stillSince = now;
+        }
+
+        std::string const brainSays = tankInside ? DungeonBrainStallReason(tank) : std::string();
+        facts.brainStalled = !brainSays.empty();
+        facts.secondsStill = now >= run.stillSince ? static_cast<unsigned>(now - run.stillSince) : 0;
+        facts.secondsSinceCredit =
+            now >= run.creditSince ? static_cast<unsigned>(now - run.creditSince) : 0;
+        facts.skips = run.stallSkips;
+        facts.skipRefused = run.stallSkipRefused;
+
+        OverseerDecisions::GuildRunStallStep const step = OverseerDecisions::GuildRunStallNext(facts);
+        if (step == OverseerDecisions::GuildRunStallStep::Nothing)
+            return false;
+
+        std::string const stall = OverseerDecisions::GuildRunStallWords(
+            run.nextBoss, run.lastKillAt != 0,
+            run.lastKillAt && now >= run.lastKillAt ? static_cast<unsigned>(now - run.lastKillAt) : 0);
+        std::string const seen =
+            facts.brainStalled
+                ? "the dungeon brain says: " + brainSays
+                : "no boss credit and '" + run.tank + "' has not moved " +
+                      std::to_string(static_cast<uint32>(OverseerDecisions::GUILD_RUN_STALL_YARDS)) +
+                      "y for " + std::to_string(facts.secondsStill / 60) + " min";
+
+        if (step == OverseerDecisions::GuildRunStallStep::End)
+        {
+            why = run.stallSkipRefused
+                      ? "the dungeon brain refused 'dc skip' after " +
+                            std::to_string(run.stallSkips) + " and can reach nothing more; " + stall
+                      : std::to_string(run.stallSkips) + " 'dc skip's did not move it (" + seen +
+                            "); " + stall;
+            LOG_WARN("module.overseer",
+                     "overseer: guild finder run {} - stalled after {} 'dc skip's ({}); ending it "
+                     "so its members go free",
+                     run.id, run.stallSkips, seen);
+            return true;
+        }
+
+        // SKIP. Sent from the tank to every member alive inside, as `dc on`
+        // and `dc pause` are: the brain's elected leader acts on it and a
+        // follower answers true at once (DcSkipAction), so one refusal is the
+        // leader's. The tank is the issuer every other verb of this run uses
+        // and the brain accepts.
+        Player* const issuer = tank;
+        bool any = false;
+        bool all = true;
+        for (std::string const& name : run.names)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            PlayerbotAI* const ai = GuildRunAliveInside(run, p) ? GET_PLAYERBOT_AI(p) : nullptr;
+            if (!ai)
+                continue;
+            any = true;
+            if (!ai->DoSpecificAction("dc skip", Event("dc", "", issuer), true))
+                all = false;
+        }
+        if (!any)
+            return false;
+        ++run.stallSkips;
+        run.stallSkipRefused = !all;
+        // Each rung gets a whole window to work in before the next.
+        run.stillSince = now;
+        run.creditSince = now;
+        run.stallMarked = false;
+        // The deploy proof: "guild finder run N - dc skip" is said nowhere else.
+        LOG_WARN("module.overseer",
+                 "overseer: guild finder run {} - dc skip {} of {} from '{}' ({}; {}): {}", run.id,
+                 run.stallSkips, OverseerDecisions::GUILD_RUN_MAX_SKIPS, issuer->GetName(), seen,
+                 stall,
+                 all ? "accepted"
+                     : "REFUSED - the dungeon module's log says why under playerbots.dungeonclear");
+        return false;
+    }
+
     bool DriveGuildRun(GuildRun& run, std::time_t now)
     {
         Player* const tank = ObjectAccessor::FindPlayerByName(run.tank);
@@ -41895,6 +42052,19 @@ private:
                 }
                 EndGuildRun(run, OverseerDecisions::GuildRunVerdictWord(verdict), why, now);
                 return true;
+            }
+            // THE STALL LADDER (#1086): `dc skip` what the brain cannot reach,
+            // and end the run as stalled when skipping does not move it.
+            {
+                std::string why;
+                if (StepGuildRunStall(run, poll, regrouping, now, why))
+                {
+                    EndGuildRun(run,
+                                OverseerDecisions::GuildRunVerdictWord(
+                                    OverseerDecisions::GuildRunVerdict::Stalled),
+                                why, now);
+                    return true;
+                }
             }
             if (now - run.heartbeatAt >= 60)
             {
