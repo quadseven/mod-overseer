@@ -19,11 +19,10 @@ APPLIES TO
      ALLSPELLHOOK_ON_SPELL_CHECK_CAST,
 +    ALLSPELLHOOK_ON_CAST_RESULT,
      ALLSPELLHOOK_CAN_PREPARE,
-@@ -50,3 +51,4 @@ public:
+@@ -50,2 +51,3 @@ public:
      // Calculate max duration in applying aura
-     virtual void OnCalcMaxDuration(Aura const* /*aura*/, int32& /*maxDuration*/) { }
 +    virtual void OnSpellCastResult(Player* /*caster*/, uint32 /*spellId*/, SpellCastResult /*result*/, WorldObject* /*target*/) { }
-     virtual void OnSpellCheckCast(Spell* /*spell*/, bool /*strict*/, SpellCastResult& /*res*/) { }
+     virtual void OnCalcMaxDuration(Aura const* /*aura*/, int32& /*maxDuration*/) { }
 --- a/src/server/game/Scripting/ScriptDefines/AllSpellScript.cpp
 +++ b/src/server/game/Scripting/ScriptDefines/AllSpellScript.cpp
 @@ -24,4 +24,8 @@ void ScriptMgr::OnSpellCheckCast(Spell* spell, bool strict, SpellCastResult& res)
