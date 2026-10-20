@@ -164,8 +164,7 @@ Apprentice on either.
 ## The Python side (design only - not implemented in this pass)
 
 **Why design-only.** This module's Python counterpart
-(`production/scripts/wow-overseer/`) lives in `quadseven/infra`, a repository
-other agents were actively working in concurrently while this pass ran. The
+is maintained in a separate deployment repository. The
 standing-errand mechanics below reuse patterns already proven in that
 codebase (`professions.py`'s `_write_trade_errand`), so this is not a
 from-scratch design - it is naming the same shape for a new column, sized so

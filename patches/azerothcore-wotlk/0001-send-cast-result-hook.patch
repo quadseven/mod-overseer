@@ -1,0 +1,52 @@
+WHY THIS PATCH EXISTS
+    Spell::SendCastResult has the final failure reason after CheckCast, while
+    AllSpellScript::OnSpellCheckCast sees only an input to validation. Expose
+    the failed result, spell id and explicit target to scripts so mod-overseer
+    can record roster cast failures without a client. Refs mod-overseer#968.
+
+WHAT WOULD LET THIS PATCH BE DELETED
+    An upstream hook at SendCastResult with the same information. Replace this
+    patch when an upstream PR is merged; no upstream PR exists yet.
+
+APPLIES TO
+    mod-playerbots/azerothcore-wotlk @ 7f12e89ee5f467a50e62eba1d525eac7dc953d03
+    Spell::SendCastResult and the AllSpellScript dispatcher.
+
+--- a/src/server/game/Scripting/ScriptDefines/AllSpellScript.h
++++ b/src/server/game/Scripting/ScriptDefines/AllSpellScript.h
+@@ -22,3 +22,4 @@ enum AllSpellHook
+     ALLSPELLHOOK_ON_CALC_MAX_DURATION,
+     ALLSPELLHOOK_ON_SPELL_CHECK_CAST,
++    ALLSPELLHOOK_ON_CAST_RESULT,
+     ALLSPELLHOOK_CAN_PREPARE,
+@@ -50,2 +51,3 @@ public:
+     // Calculate max duration in applying aura
++    virtual void OnSpellCastResult(Player* /*caster*/, uint32 /*spellId*/, SpellCastResult /*result*/, WorldObject* /*target*/) { }
+     virtual void OnCalcMaxDuration(Aura const* /*aura*/, int32& /*maxDuration*/) { }
+--- a/src/server/game/Scripting/ScriptDefines/AllSpellScript.cpp
++++ b/src/server/game/Scripting/ScriptDefines/AllSpellScript.cpp
+@@ -24,4 +24,8 @@ void ScriptMgr::OnSpellCheckCast(Spell* spell, bool strict, SpellCastResult& res)
++void ScriptMgr::OnSpellCastResult(Player* caster, uint32 spellId, SpellCastResult result, WorldObject* target)
++{
++    CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_ON_CAST_RESULT, script->OnSpellCastResult(caster, spellId, result, target));
++}
+ void ScriptMgr::OnSpellCheckCast(Spell* spell, bool strict, SpellCastResult& res)
+ {
+     CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_ON_SPELL_CHECK_CAST, script->OnSpellCheckCast(spell, strict, res));
+ }
+--- a/src/server/game/Scripting/ScriptMgr.h
++++ b/src/server/game/Scripting/ScriptMgr.h
+@@ -615,3 +615,4 @@ public: /* SpellSC */
+     void OnCalcMaxDuration(Aura const* aura, int32& maxDuration);
+     void OnSpellCheckCast(Spell* spell, bool strict, SpellCastResult& res);
++    void OnSpellCastResult(Player* caster, uint32 spellId, SpellCastResult result, WorldObject* target);
+     bool CanPrepare(Spell* spell, SpellCastTargets const* targets, AuraEffect const* triggeredByAura);
+--- a/src/server/game/Spells/Spell.cpp
++++ b/src/server/game/Spells/Spell.cpp
+@@ -4441,4 +4441,6 @@ void Spell::SendCastResult(SpellCastResult result)
+     if (!unitCaster->IsPlayer() || unitCaster->IsCharmed())
+         return;
+ 
++    sScriptMgr->OnSpellCastResult(unitCaster->ToPlayer(), m_spellInfo->Id, result, m_targets.GetObjectTarget());
++
+     if (unitCaster->ToPlayer()->GetSession()->PlayerLoading())  // don't send cast results at loading time

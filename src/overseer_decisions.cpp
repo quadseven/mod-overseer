@@ -16381,6 +16381,19 @@ bool ShouldRecordGoldChange(int amount)
     return amount != 0;
 }
 
+OverseerEventFields CastFailFields(std::uint32_t spellId, std::string const& spellName,
+                                  std::string const& resultName)
+{
+    OverseerEventFields fields;
+    fields.kind = "cast_fail";
+    fields.subjectId = spellId;
+    fields.subjectName = spellName;
+    fields.detail = resultName;
+    FitItemStoryColumn(fields.subjectName);
+    FitItemStoryColumn(fields.detail);
+    return fields;
+}
+
 OverseerEventFields VendorBuyFields(std::uint32_t itemEntry, std::string const& itemName,
                                    std::uint32_t count, std::uint32_t copper)
 {
