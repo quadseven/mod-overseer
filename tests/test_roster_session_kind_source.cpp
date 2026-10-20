@@ -53,7 +53,7 @@ int main()
 
     for (char const* fed : {"sessionFacts.clientAttached = ClientAttached(player)",
                             "sessionFacts.hasSession = session != nullptr",
-                            "sessionFacts.isBotSession = session && session->IsBot()",
+                            "sessionFacts.isBotSession = session && OverseerCompat::SessionIsHeadless(*session)",
                             "sessionFacts.alreadyKicked = session && session->IsKicked()"})
         if (sweep.find(fed) == std::string::npos)
         {
@@ -75,6 +75,7 @@ int main()
     // No inline copy of the sort is left behind to drift from the tested one.
     if (sweep.find("if (ClientAttached(player))") != std::string::npos ||
         sweep.find("if (session->IsBot())") != std::string::npos ||
+        sweep.find("if (OverseerCompat::SessionIsHeadless(*session))") != std::string::npos ||
         sweep.find("if (session->IsKicked())") != std::string::npos)
         return Fail("KeepRosterAttended must not keep its own inline copy of the session sort");
 

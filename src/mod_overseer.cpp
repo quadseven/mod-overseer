@@ -316,6 +316,9 @@
 // see overseer_decisions.h for why that was worth a file.
 #include "overseer_decisions.h"
 #include "overseer_crash.h"
+// The core and mod-playerbots APIs that differ between the pins build.yml
+// compiles against and the upstream heads (wow-overseer#826).
+#include "overseer_core_compat.h"
 
 #include <algorithm>
 #include <atomic>
@@ -8461,7 +8464,7 @@ private:
     // TWO WAYS A ROSTER CHARACTER CAN BE IN THE WORLD WITH NO SOCKET, and each
     // gets the eviction its own session kind understands:
     //
-    //   1. A HEADLESS BOT (session->IsBot()): somebody spawned it - an older
+    //   1. A HEADLESS BOT (SessionIsHeadless): somebody spawned it - an older
     //      image of this module, a `.bot add`, anything. It is logged out
     //      through the holder that owns it, the way the secure-login script
     //      does: the master's PlayerbotMgr if it has a master with one, else
@@ -8560,7 +8563,7 @@ private:
             return false;
         bool const attached = ClientAttached(player);
         WorldSession const* session = player->GetSession();
-        bool const isBot = session && session->IsBot();
+        bool const isBot = session && OverseerCompat::SessionIsHeadless(*session);
         if (OverseerDecisions::RosterCharacterIsSteerable(
                 attached, player->IsInWorld(), isBot,
                 player->GetName(), RosterRequiresAClient(), HeadlessRosterCache()))
@@ -8774,7 +8777,7 @@ private:
             OverseerDecisions::RosterSessionFacts sessionFacts;
             sessionFacts.clientAttached = ClientAttached(player);
             sessionFacts.hasSession = session != nullptr;
-            sessionFacts.isBotSession = session && session->IsBot();
+            sessionFacts.isBotSession = session && OverseerCompat::SessionIsHeadless(*session);
             sessionFacts.alreadyKicked = session && session->IsKicked();
             OverseerDecisions::RosterSessionKind const kind =
                 OverseerDecisions::ClassifyRosterSession(sessionFacts);
@@ -21746,7 +21749,7 @@ private:
         float const span = std::sqrt(dx * dx + dy * dy);
         if (span < 1.0f)
             return true;
-        float const t = std::min(1.0f, sPlayerbotAIConfig.spellDistance / span);
+        float const t = std::min(1.0f, OverseerCompat::SpellDistance(sPlayerbotAIConfig) / span);
         float footing = 0.f;
         float const toX = p->GetPositionX() + dx * t;
         float const toY = p->GetPositionY() + dy * t;
@@ -27746,7 +27749,7 @@ private:
     {
         WorldSession const* session = player && player->IsInWorld() ? player->GetSession() : nullptr;
         bool const headless = session && OverseerDecisions::HeadlessLeaderSteerable(
-                                             player->IsInWorld(), session->IsBot(),
+                                             player->IsInWorld(), OverseerCompat::SessionIsHeadless(*session),
                                              player->GetName(), HeadlessRosterCache());
         return OverseerDecisions::DungeonLeaderHoldsTheSeat(ClientAttached(player), headless);
     }
@@ -30029,8 +30032,8 @@ private:
             // A family stand-in is the family's while it stands in (2026-10-05),
             // and the family's run, not the guild's drives, directs it.
             bool const familyDirects = OnRoster(name) || IsStandinGuest(name);
-            if (!OverseerDecisions::GuildGhostDriven(familyDirects, session && session->IsBot(),
-                                                    ClientAttached(bot) && !(session && session->IsBot()),
+            if (!OverseerDecisions::GuildGhostDriven(familyDirects, session && OverseerCompat::SessionIsHeadless(*session),
+                                                    ClientAttached(bot) && !(session && OverseerCompat::SessionIsHeadless(*session)),
                                                     botAI != nullptr))
                 continue;
 
@@ -30398,8 +30401,8 @@ private:
             // A family stand-in is the family's while it stands in (2026-10-05),
             // and the family's run, not the guild's drives, directs it.
             bool const familyDirects = OnRoster(name) || IsStandinGuest(name);
-            if (!OverseerDecisions::GuildGhostDriven(familyDirects, session && session->IsBot(),
-                                                    ClientAttached(bot) && !(session && session->IsBot()),
+            if (!OverseerDecisions::GuildGhostDriven(familyDirects, session && OverseerCompat::SessionIsHeadless(*session),
+                                                    ClientAttached(bot) && !(session && OverseerCompat::SessionIsHeadless(*session)),
                                                     botAI != nullptr))
                 continue;
             if (!bot->IsAlive() || bot->IsInCombat() || bot->GetGroup() || bot->IsInFlight() ||
@@ -56772,7 +56775,7 @@ private:
             }
             bool const zoneHasGeneral = general && zone && !zoneName.empty() &&
                                         player->CanJoinConstantChannelInZone(general, zone);
-            switch (OverseerDecisions::PickPublicChannel(lfg && player->IsInChannel(lfg),
+            switch (OverseerDecisions::PickPublicChannel(lfg && OverseerCompat::PlayerOnChannel(*player, lfg),
                                                          zoneHasGeneral))
             {
                 case OverseerDecisions::PublicChannel::LookingForGroup:
@@ -61424,7 +61427,7 @@ private:
             candidates[i].randomBotAccount =
                 name != accountName.end() &&
                 OverseerDecisions::AccountNameHasPrefix(
-                    name->second, sPlayerbotAIConfig.randomBotAccountPrefix);
+                    name->second, OverseerCompat::RandomBotAccountPrefix(sPlayerbotAIConfig));
         }
 
         // THE SECOND QUERY IS BOUND BY THE FIRST QUERY'S ANSWER, NOT BY ITS
@@ -61985,7 +61988,7 @@ private:
         if (live)
         {
             WorldSession* session = live->GetSession();
-            if (!session || !session->IsBot())
+            if (!session || !OverseerCompat::SessionIsHeadless(*session))
                 return refuse("in the world with a session this module cannot log out cleanly; retry in a minute");
             LOG_INFO("module.overseer",
                      "overseer: naturalize {} for '{}' ({}{}) - logging the headless bot out cleanly first",
@@ -62168,7 +62171,7 @@ private:
         std::string account;
         if (!accountId || !AccountMgr::GetName(accountId, account))
             return false;
-        return OverseerDecisions::AccountNameHasPrefix(account, sPlayerbotAIConfig.randomBotAccountPrefix);
+        return OverseerDecisions::AccountNameHasPrefix(account, OverseerCompat::RandomBotAccountPrefix(sPlayerbotAIConfig));
     }
 
     static OverseerDecisions::RetireFacts ReadRetireFacts(ObjectGuid guid, std::string const& name, Player* live)
@@ -62236,7 +62239,7 @@ private:
         if (plan == RetirePlan::EvictThenSettle)
         {
             WorldSession* session = live->GetSession();
-            if (!session || !session->IsBot())
+            if (!session || !OverseerCompat::SessionIsHeadless(*session))
             {
                 out = RetireRefused(targetName, "in the world with a session this module cannot log out cleanly");
                 return "in the world with a session this module cannot log out cleanly";
@@ -62306,7 +62309,7 @@ private:
                 // A headless bot settled in the world goes out again; anything
                 // else (between worlds, a client) is waited on to the ceiling.
                 if (live && live->IsInWorld() && !live->IsBeingTeleported() && !ClientAttached(live) &&
-                    live->GetSession() && live->GetSession()->IsBot())
+                    live->GetSession() && OverseerCompat::SessionIsHeadless(*live->GetSession()))
                 {
                     LOG_INFO("module.overseer", "overseer: retire {} for '{}' - it came back in; logging it out again",
                              check.id, check.name);
@@ -65624,7 +65627,7 @@ private:
         facts.inDungeonRun = InDungeonRun(who);
         char const* const refusal = RenameRefusal(facts);
         WorldSession* const session = who->GetSession();
-        bool const isBot = session && session->IsBot();
+        bool const isBot = session && OverseerCompat::SessionIsHeadless(*session);
         RenamePlan const plan =
             OverseerDecisions::RenamePlanFor(refusal != nullptr, isBot, who->IsInWorld(), wasOffline);
         if (plan == RenamePlan::Refuse)
@@ -73498,7 +73501,7 @@ private:
         }
         if (took)
         {
-            ev.specIndex = sPlayerbotAIConfig.randomClassSpecIndex[bot->getClass()][tree];
+            ev.specIndex = OverseerCompat::RandomClassSpecIndex(sPlayerbotAIConfig)[bot->getClass()][tree];
             // natural-only: spends the free points it has after a talent wipe paid for at a
             // trainer; no point is granted.
             PlayerbotFactory::InitTalentsBySpecNo(bot, static_cast<int>(ev.specIndex), false);
@@ -77162,34 +77165,38 @@ private:
 // THE DUNGEON FINDER'S WORDS TO A FAMILY MEMBER (RunRecovery::DungeonFinder).
 //
 // WorldSession::SendPacket hands every packet to this hook before it looks for
-// a socket (WorldSession.cpp, OnPlayerbotPacketSent), so a bot's packets reach
-// it as well as a client's. Only the two the finder rung needs are read, and
-// only for characters it is watching; everything else leaves on the opcode
+// a socket (WorldSession.cpp, OnPlayerbotPacketSent on the older core,
+// OnPacketSent on the newer; overseer_core_compat.h picks), so a bot's packets
+// reach it as well as a client's. Only the two the finder rung needs are read,
+// and only for characters it is watching; everything else leaves on the opcode
 // test. The layouts are the core's own writers: SendLfgUpdateProposal writes
 // the dungeon entry (uint32), the proposal state (uint8) and the proposal id
 // (uint32), and SendLfgJoinResult the result and the state (two uint32).
-class OverseerFinderScript : public PlayerbotScript
+struct OverseerFinderPackets
 {
-public:
-    OverseerFinderScript() : PlayerbotScript("OverseerFinderScript") {}
-
-    void OnPlayerbotPacketSent(Player* player, WorldPacket const* packet) override
+    static void OnPacketSent(Player* player, WorldPacket const& packet)
     {
-        if (!player || !packet)
+        if (!player)
             return;
-        uint16 const opcode = packet->GetOpcode();
+        uint16 const opcode = packet.GetOpcode();
         if (opcode != SMSG_LFG_PROPOSAL_UPDATE && opcode != SMSG_LFG_JOIN_RESULT)
             return;
         std::string const name = player->GetName();
         if (!OverseerWorldScript::IsFinderWatched(name))
             return;
-        if (opcode == SMSG_LFG_PROPOSAL_UPDATE && packet->size() >= 9)
-            OverseerWorldScript::NoteFinderProposal(name, packet->read<uint32>(5),
-                                                    packet->read<uint8>(4));
-        else if (opcode == SMSG_LFG_JOIN_RESULT && packet->size() >= 8)
-            OverseerWorldScript::NoteFinderJoinResult(name, packet->read<uint32>(0),
-                                                      packet->read<uint32>(4));
+        if (opcode == SMSG_LFG_PROPOSAL_UPDATE && packet.size() >= 9)
+            OverseerWorldScript::NoteFinderProposal(name, packet.read<uint32>(5),
+                                                    packet.read<uint8>(4));
+        else if (opcode == SMSG_LFG_JOIN_RESULT && packet.size() >= 8)
+            OverseerWorldScript::NoteFinderJoinResult(name, packet.read<uint32>(0),
+                                                      packet.read<uint32>(4));
     }
+};
+
+class OverseerFinderScript : public OverseerCompat::PacketSentScript<OverseerFinderPackets>
+{
+public:
+    OverseerFinderScript() : PacketSentScript("OverseerFinderScript") {}
 };
 
 // THE FAMILY METER'S EARS. OnDamage and OnHeal fire for every hit and heal in
@@ -77312,18 +77319,15 @@ private:
 // and 2 to 7 of the guild members at any moment. The hook runs before the
 // leaving player is removed from the world, so the count skips it
 // rather than counting it. A lone session keeps the core's statement unchanged.
-class OverseerDatabaseScript : public DatabaseScript
+// How the core is told to clear one character instead of the account differs
+// between the pinned cores; overseer_core_compat.h (LogoutOnlineScript) does
+// that part, and this answers whether to.
+struct OverseerLogoutOnline
 {
-public:
-    OverseerDatabaseScript() : DatabaseScript("OverseerDatabaseScript", {
-        DATABASEHOOK_ON_DATABASE_SELECT_INDEX_LOGOUT,
-    }) {}
-
-    void OnDatabaseSelectIndexLogout(Player* player, uint32& statementIndex,
-                                     uint32& statementParam) override
+    static bool OnLogout(Player* player)
     {
         if (!player || !player->GetSession())
-            return;
+            return false;
         WorldSession const* leaving = player->GetSession();
         uint32 const accountId = leaving->GetAccountId();
         uint32 others = 0;
@@ -77336,27 +77340,31 @@ public:
                 ++others;
         }
 
-        if (OverseerDecisions::LogoutOfflineScope(others) ==
-            OverseerDecisions::LogoutScope::CharacterOnly)
-        {
-            statementIndex = CHAR_UPD_CHAR_OFFLINE;
-            statementParam = player->GetGUID().GetCounter();
+        bool const characterOnly = OverseerDecisions::LogoutOfflineScope(others) ==
+                                   OverseerDecisions::LogoutScope::CharacterOnly;
+        if (characterOnly)
             ++g_characterOnlyLogouts;
-        }
 
         // The module had no logout hook, so a guild member's real departure
         // left no line at all.
         if (!InNaturalGuild(player))
-            return;
+            return characterOnly;
         Guild const* guild = sGuildMgr->GetGuildById(player->GetGuildId());
-        char const* cause = sWorld->IsShuttingDown() ? "server shutdown"
-                            : leaving->IsBot()       ? "bot session"
-                                                     : "player client";
+        char const* cause = sWorld->IsShuttingDown()                       ? "server shutdown"
+                            : OverseerCompat::SessionIsHeadless(*leaving) ? "bot session"
+                                                                           : "player client";
         LOG_INFO("module.overseer",
                  "overseer: guild member '{}' ({}) left the world: {}; {} other character(s) "
                  "on its account stay in the world",
                  player->GetName(), guild ? guild->GetName() : std::string(), cause, others);
+        return characterOnly;
     }
+};
+
+class OverseerDatabaseScript : public OverseerCompat::LogoutOnlineScript<OverseerLogoutOnline>
+{
+public:
+    OverseerDatabaseScript() : LogoutOnlineScript("OverseerDatabaseScript") {}
 };
 
 void Addmod_overseerScripts()

@@ -561,7 +561,7 @@ void TheAdapterIsWired()
     has("the door's own wing, not the map's first",
         "OverseerDecisions::ChooseFinderDungeon(candidates, landingX, landingY, why);");
     has("the proposal id is read off the core's packet",
-        "OverseerWorldScript::NoteFinderProposal(name, packet->read<uint32>(5),");
+        "OverseerWorldScript::NoteFinderProposal(name, packet.read<uint32>(5),");
     has("a finder group is let go before the reset", "group->Disband();");
     has("the reset asks it", "if (LeaveTheFinderGroup(leaderName, coord.runNumber, portal->insideMapId))");
     has("the family inside is staged inside", "next.phase = DungeonRunPhase::StagedInside;");

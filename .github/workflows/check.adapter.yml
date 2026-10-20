@@ -133,6 +133,17 @@ name: The adapter compiles
 # of it, asserting it found a 40-character hex SHA for each. If that file's env
 # block is ever reformatted this job fails loudly on the next pull request rather
 # than quietly compiling against nothing.
+#
+# TWO LEGS: THE PINS AND THE UPSTREAM HEADS (wow-overseer#826). The `pins` leg
+# is everything above, unchanged, and keeps the check name `adapter`. The
+# `heads` leg compiles the same file against the core and mod-playerbots heads
+# the next roll moves to (infra#5655), so the adapter is proved against both
+# BEFORE the pins move, instead of the roll discovering the breakage. Its pins
+# are read out of build.yml the same way, from the HEADS_* entries, and the two
+# patches that stopped applying at those heads are taken from patches-heads/,
+# which replaces the same-named files in patches/ for that leg only. The leg is
+# not a required check; a red one means the adapter no longer builds against
+# the next roll's heads, which is exactly what it exists to say.
 
 on:
   pull_request:
@@ -152,6 +163,17 @@ concurrency:
 
 jobs:
   adapter:
+    # The pins leg keeps the bare name, so its check run reads `adapter` as it
+    # always has.
+    name: ${{ matrix.leg == 'pins' && 'adapter' || format('adapter ({0})', matrix.leg) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: pins
+            prefix: ''
+          - leg: heads
+            prefix: HEADS_
     runs-on: ubuntu-latest
     # Measured at 82 to 121 seconds. The cap is fifteen times that so a hung
     # configure or a stalled apt mirror costs one job rather than six hours of
@@ -170,6 +192,7 @@ jobs:
       contents: read
     env:
       SELF_TEST: ${{ github.event.inputs.self_test == 'true' }}
+      PIN_PREFIX: ${{ matrix.prefix }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -188,10 +211,11 @@ jobs:
             grep -oE "^[[:space:]]+$1:[[:space:]]+https://[^[:space:]]+" "$wf" \
               | head -1 | awk '{print $2}'
           }
-          CORE_SHA="$(get_sha CORE_SHA)"
-          MODULE_SHA="$(get_sha MODULE_SHA)"
-          CORE_REPO="$(get_url CORE_REPO)"
-          MODULE_REPO="$(get_url MODULE_REPO)"
+          # PIN_PREFIX is empty for the pins leg and HEADS_ for the heads leg.
+          CORE_SHA="$(get_sha "${PIN_PREFIX}CORE_SHA")"
+          MODULE_SHA="$(get_sha "${PIN_PREFIX}MODULE_SHA")"
+          CORE_REPO="$(get_url "${PIN_PREFIX}CORE_REPO")"
+          MODULE_REPO="$(get_url "${PIN_PREFIX}MODULE_REPO")"
           for pair in "CORE_SHA=$CORE_SHA" "MODULE_SHA=$MODULE_SHA" \
                       "CORE_REPO=$CORE_REPO" "MODULE_REPO=$MODULE_REPO"; do
             name="${pair%%=*}"
@@ -290,7 +314,23 @@ jobs:
         # because the exec bit does not survive every path this file takes to get
         # here - see build.yml's note on losing 20 minutes to exit 126.
         working-directory: mod-overseer
-        run: bash apply-patches.sh "$GITHUB_WORKSPACE/acore"
+        run: |
+          set -euo pipefail
+          # The heads leg: the ported copies in patches-heads/ replace the
+          # same-named files, in this job's checkout only. Each must replace a
+          # file that exists, so a renamed patch cannot end up applied twice.
+          if [ "${{ matrix.leg }}" = heads ]; then
+            for ported in patches-heads/mod-playerbots/*.patch; do
+              target="patches/mod-playerbots/$(basename "$ported")"
+              test -f "$target" || {
+                echo "::error::$ported has no same-named file in patches/mod-playerbots to replace"
+                exit 1
+              }
+              cp "$ported" "$target"
+              echo "heads leg: $target <- $ported"
+            done
+          fi
+          bash apply-patches.sh "$GITHUB_WORKSPACE/acore"
 
       - name: Break the adapter on purpose
         # Only ever reachable from a manual dispatch with self_test: true, and it
@@ -395,7 +435,7 @@ jobs:
           echo "== compile took ${elapsed}s, exit $status"
 
           {
-            echo "### The adapter compiles"
+            echo "### The adapter compiles (${{ matrix.leg }})"
             echo
             echo "- pins: core \`$CORE_SHA\`, mod-playerbots \`$MODULE_SHA\`"
             echo "- one translation unit, \`-fsyntax-only\`, ${elapsed}s"
