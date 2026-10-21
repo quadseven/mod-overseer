@@ -35449,6 +35449,22 @@ private:
         return value ? std::string(value->Get()) : std::string();
     }
 
+    // THE DUNGEON BRAIN'S OWN WORD FOR SWITCHING ITSELF OFF (#1089): the text
+    // mod-dungeon-clear logs after "dungeon clear disabled:" ("Dungeon clear
+    // stopped: the party never became ready after 180s (Waiting on Uzza (low
+    // mana))"). Empty when it gave none, or when the module is not loaded.
+    static std::string DungeonBrainStopReason(Player* member)
+    {
+        PlayerbotAI* ai = member ? GET_PLAYERBOT_AI(member) : nullptr;
+        AiObjectContext* context = ai ? ai->GetAiObjectContext() : nullptr;
+        if (!context)
+            return std::string();
+
+        Value<std::string&>* const value =
+            context->GetValue<std::string&>("dungeon clear last stop reason");
+        return value ? std::string(value->Get()) : std::string();
+    }
+
     // Every bit the map's DungeonEncounter.dbc rows credit at normal
     // difficulty, 0 for a map that credits none.
     static uint32 MapEncounterMask(uint32 mapId)
@@ -35863,6 +35879,9 @@ private:
         // second - and `stalledReason` is what makes the row that EXIT closes
         // say what actually happened instead of 'left'.
         //
+        // A SWITCHED-OFF MODULE SAYS WHY IT STOPPED (#1089), in its own words,
+        // so the row names the cause and not the exit that cleaned it up.
+        //
         // AND THE REASON CARRIES THE STUCK FLAG WHEN THERE WAS ONE (#382). The
         // row is what an operator reads afterwards, and "one member had been in
         // combat the whole time" is the difference between a dungeon this party
@@ -35870,9 +35889,10 @@ private:
         // run; only one of them is worth chasing upstream.
         coord.stalledReason =
             coord.clearSkipRefused
-                ? "the dungeon module refused 'dc skip' " + std::to_string(coord.clearSkips) +
+                ? OverseerDecisions::DungeonModuleStopWords(DungeonBrainStopReason(leader)) +
+                      "; it refused 'dc skip' " + std::to_string(coord.clearSkips) +
                       " inside map " + std::to_string(insideMapId) +
-                      ": it had switched itself off with nothing left it could reach"
+                      " with nothing left it could reach"
                 : "the run stopped progressing inside map " + std::to_string(insideMapId) +
                       ": no boss credit and no movement for " +
                       std::to_string((DUNGEON_CLEAR_SKIPS + 1) * DUNGEON_CLEAR_STALL_SECONDS /
@@ -50756,7 +50776,10 @@ private:
                                             : OverseerDecisions::DungeonRunExitOutcome(
                                                   coord.provedComplete,
                                                   !coord.stalledReason.empty(), coord.evacuated),
-                                        "the failed exit recovered by hearth; every member is outside",
+                                        coord.stalledReason.empty()
+                                            ? std::string("the failed exit recovered by hearth; "
+                                                          "every member is outside")
+                                            : coord.stalledReason,
                                         IsDungeonJob(leaderJob), &members);
                         return;
                     }
