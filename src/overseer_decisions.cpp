@@ -22293,6 +22293,27 @@ std::vector<std::string> RunParty(std::vector<std::string> const& members,
     return party;
 }
 
+bool SitsOutOfRuns(FamilyStandin const* standin, std::string const& name)
+{
+    return standin && standin->Active() && !name.empty() && standin->outName == name;
+}
+
+bool MayOpenRunFor(bool sittingOut)
+{
+    return !sittingOut;
+}
+
+std::string SitOutRunEndedReason(std::string const& leader)
+{
+    return "leader '" + leader + "' is sitting out for a stand-in, so the run is closed and "
+           "the member is walked out of the instance";
+}
+
+char const* SitOutRunOutcome()
+{
+    return "sat_out";
+}
+
 StandinBook ChooseStandins(std::vector<FamilyStandin> const& rows,
                            std::vector<FamilyRoster> const& rosters)
 {

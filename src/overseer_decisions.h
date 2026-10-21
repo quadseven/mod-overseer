@@ -25053,6 +25053,29 @@ StandinRefusal CheckStandin(std::vector<std::string> const& members, std::string
 std::vector<std::string> RunParty(std::vector<std::string> const& members,
                                   std::string const& leader, FamilyStandin const* standin);
 
+// A MEMBER SITTING OUT IS NOT IN THE FAMILY'S DUNGEON (#1092). On 2026-10-20 a
+// member sent off to craft stayed inside the dungeon the family had been in,
+// the arming drive saw a roster character on an instance map and opened a run
+// with it as the solo leader, and that run never ended: the member's presence
+// was the run's heartbeat, and nothing walked it out. The sit-out reason (a
+// craft) waits on the member being outside, so the run it held open was the
+// thing blocking it. These three say who is sitting out, whether the arming
+// drive may open a run for it, and how a run it leads is worded when it ends.
+//
+// True when `standin` is an active row naming `name` as the member who sits
+// out. A null or empty row sits nobody out.
+bool SitsOutOfRuns(FamilyStandin const* standin, std::string const& name);
+
+// May the arming drive open or touch a dungeon run on behalf of this character.
+// Never for the member sitting out: it is not the family's party any more.
+bool MayOpenRunFor(bool sittingOut);
+
+// The ended_reason of an open run whose leader sits out, naming the sit-out.
+std::string SitOutRunEndedReason(std::string const& leader);
+
+// The outcome word that run is recorded with. Fits the column (16 characters).
+char const* SitOutRunOutcome();
+
 struct StandinRefused
 {
     FamilyStandin row;

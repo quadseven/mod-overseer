@@ -8334,6 +8334,10 @@ public:
             // the trip hands the party straight back instead of steering it for
             // one poll alongside the coordinator.
             DriveTownTrip();
+            // THE MEMBER SITTING OUT LEAVES THE INSTANCE (#1092), on this clock
+            // for the reason DriveTownTrip is: its escort is swept at the top
+            // of the coordinator's poll.
+            DriveSittingOutLeave();
             // A STRANDED MEMBER'S OWN BOAT HOME (#274), on this clock for the
             // reason the family crossing is on it: a stop is a minute long, and
             // the party's thirty second poll could miss it. After the
@@ -28416,6 +28420,19 @@ private:
             //
             // Opening also stays here rather than below: by the time anything
             // is steering, the thing that owns the steering already exists.
+            // A MEMBER SITTING OUT OPENS NO RUN AND KEEPS NONE ALIVE (#1092).
+            // It is inside a dungeon its family is not holding, so a run
+            // opened for it is a solo run nothing ever ends: it is its own
+            // heartbeat. ABOVE the open, so the row is never written, and the
+            // brain is stood down because a refused `dc on` ("No tank bot found
+            // in your group") every poll is all it would otherwise get.
+            if (!OverseerDecisions::MayOpenRunFor(SittingOutOfRuns(name)))
+            {
+                EndRunLedByMemberSittingOut(name, bot->GetMapId());
+                StandDownDungeonBrain(name, bot, botAI);
+                continue;
+            }
+
             uint32 const runId = OpenOrTouchRun(name, bot->GetMapId());
             if (!runId)
             {
@@ -49547,6 +49564,86 @@ private:
             return nullptr;
         auto const it = _frozenStandins.find(head);
         return it == _frozenStandins.end() || !it->second.Active() ? nullptr : &it->second;
+    }
+
+    // IS THIS CHARACTER THE MEMBER A FROZEN STAND-IN SENDS TO SIT OUT (#1092).
+    // Asked by name, because the arming drive and the walk out see characters
+    // and not families. The member is not in the family's dungeon party any
+    // more, whatever its roster row still says.
+    bool SittingOutOfRuns(std::string const& name) const
+    {
+        for (auto const& entry : _frozenStandins)
+            if (OverseerDecisions::SitsOutOfRuns(&entry.second, name))
+                return true;
+        return false;
+    }
+
+    // WALK THE MEMBER SITTING OUT OUT OF THE INSTANCE (#1092), on the run
+    // coordinator's clock: an escort is swept by the coordinator's first
+    // statement every poll unless something re-marks it, so a walk started on
+    // any slower clock would be ended five seconds after it began. The member
+    // leaves by the exit door the way a run's evacuation does (the same escort,
+    // the same knock), because the reason it sits out (a craft) cannot run
+    // inside a dungeon. A map with no door in the portal table is left alone.
+    void DriveSittingOutLeave()
+    {
+        for (auto const& entry : _frozenStandins)
+        {
+            OverseerDecisions::FamilyStandin const& standin = entry.second;
+            if (!OverseerDecisions::SitsOutOfRuns(&standin, standin.outName))
+                continue;
+            Player* const out = ObjectAccessor::FindPlayerByName(standin.outName);
+            if (!out || !out->IsInWorld() || !out->IsAlive())
+                continue;
+            Map* const map = out->GetMap();
+            if (!map || !map->IsDungeon())
+                continue;
+            DungeonPortal const* const portal =
+                FindDungeonPortalByInsideMap(out->GetMapId(), std::string());
+            if (!portal)
+                continue;
+            AreaTrigger const* const door = sObjectMgr->GetAreaTrigger(portal->exitTriggerId);
+            if (!door)
+                continue;
+            std::string& said = _standinSaid["sit-out-leave:" + standin.outName];
+            if (said != portal->keyword)
+            {
+                said = portal->keyword;
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' sits out of the family of '{}' and is inside map {} - "
+                         "walked out through areatrigger {} so that {} can start",
+                         standin.outName, standin.family, out->GetMapId(),
+                         portal->exitTriggerId,
+                         standin.reason.empty() ? std::string("what it sits out for")
+                                                : standin.reason);
+            }
+            std::ostringstream aim;
+            aim << "trigger:" << portal->exitTriggerId;
+            EscortToward(standin.outName, aim.str(), "SIT-OUT", EscortPurpose::LeaveInstance);
+            uint32 through = 0;
+            std::vector<OverseerDecisions::DungeonRunEntryState> const states =
+                DungeonRunCensus({standin.outName}, door, portal->outsideMapId, through,
+                                 std::string(), true);
+            DungeonRunKnock(states, standin.outName, portal->exitTriggerId);
+        }
+    }
+
+    // CLOSE THE RUN THE MEMBER SITTING OUT LEADS (#1092). Before this, the
+    // arming drive opened a run for whichever roster character it saw inside
+    // first, the sit-out member's presence was that run's heartbeat, and the
+    // run stayed active for twelve hours with nobody else in it.
+    void EndRunLedByMemberSittingOut(std::string const& name, uint32 mapId)
+    {
+        QueryResult run = CharacterDatabase.Query(
+            "SELECT id FROM overseer_dungeon_run WHERE state = 'active' AND map_id = {} "
+            "AND leader_name = '{}' LIMIT 1", mapId, Esc(name));
+        if (!run)
+            return;
+        uint32 const runId = run->Fetch()[0].Get<uint32>();
+        std::string const reason = OverseerDecisions::SitOutRunEndedReason(name);
+        CloseRun(runId, OverseerDecisions::SitOutRunOutcome(), reason);
+        LOG_INFO("module.overseer", "overseer: dungeon run {} on map {} ended - {}",
+                 runId, mapId, reason);
     }
 
     // The family as the home bind drives it: the roster without the member
