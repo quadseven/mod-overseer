@@ -468,6 +468,31 @@ constexpr uint32 LEFTOVER_SWEEP_POLLS = 4;
 // segfaulted twice today.
 constexpr uint32 ENGAGEMENT_POLL_MS = 8000;
 
+// THE DANGER MEMORY (#151). `overseer_death` is read back on every engagement
+// poll and scored by OverseerDecisions::ScoreZoneDanger and
+// ScoreCreatureDanger. A zone with DANGER_ZONE_THRESHOLD deaths in a day to
+// creatures DANGER_ZONE_LEVEL_GAP or more above the party is routed around; a
+// creature entry with DANGER_CREATURE_THRESHOLD deaths in an hour is not pulled
+// again this session until the member is DANGER_PULL_LIFT_LEVELS above the
+// level those deaths were at. The pull guard polls every second for the reason
+// the terrain recovery does: a pull is a walk of a few seconds, and the
+// engagement poll's eight would let most of them land.
+constexpr std::time_t DANGER_ZONE_WINDOW_SECONDS = 24 * 3600;
+constexpr uint32 DANGER_ZONE_LEVEL_GAP = 8;
+constexpr unsigned DANGER_ZONE_THRESHOLD = 3;
+constexpr std::time_t DANGER_CREATURE_WINDOW_SECONDS = 3600;
+constexpr unsigned DANGER_CREATURE_THRESHOLD = 2;
+constexpr uint32 DANGER_PULL_LIFT_LEVELS = 3;
+constexpr uint32 PULL_GUARD_POLL_MS = 1000;
+// What a leg into a dangerous zone is priced at, in yards of detour: more than
+// any walk on a continent, so the planner goes round whenever a way round
+// exists at all (see RouteLink::detourWorthYards).
+constexpr float DANGER_ZONE_DETOUR_YARDS = 100000.f;
+// How many times a route is planned again with what the last plan crossed of
+// the dangerous zone priced out, the way TRAVEL_ROUTE_GUARDED_PASSES bounds the
+// guarded-ground passes.
+constexpr unsigned DANGER_ZONE_PASSES = 4;
+
 // HOW QUICKLY A LIVING CHARACTER BELOW THE WALKABLE WORLD IS BROUGHT BACK.
 // The Deadmines exit dropped two characters more than five hundred yards in
 // six seconds (#174), so the eight-second revival cadence is too slow for this
@@ -8144,6 +8169,7 @@ public:
         _councilTimer += diff;
         _eventTimer += diff;
         _engagementTimer += diff;
+        _pullGuardTimer += diff;
         _terrainRecoveryTimer += diff;
         _deathTimer += diff;
         _dungeonRunTimer += diff;
@@ -8380,6 +8406,9 @@ public:
         if (_engagementTimer >= ENGAGEMENT_POLL_MS)
         {
             _engagementTimer = 0;
+            // The deaths read back first, so this poll and the pull guard after
+            // it see the latest of them (#151).
+            RefreshDangerMemory();
             DriveEngagementSafety();
             // Same cadence, deliberately - see DriveStuckRevival's own WHY
             // block. Reuses this timer rather than adding a new one; there is
@@ -8396,6 +8425,13 @@ public:
                 DriveDungeonClear();
                 WriteDcOnTimeline(before, DcOnMarks());
             }
+        }
+        // After the engagement poll, so an entry booked on it is refused on
+        // this same tick. See DrivePullGuard.
+        if (_pullGuardTimer >= PULL_GUARD_POLL_MS)
+        {
+            _pullGuardTimer = 0;
+            DrivePullGuard();
         }
         // AFTER DriveTravel, on purpose. Both can run in the same tick, and
         // when they do the order that helps is travel first: a character that
@@ -20390,7 +20426,93 @@ private:
         // else and is thrown away rather than reused.
         std::set<std::uint64_t> measuredLegs;
         uint32 forOurMask{0};
+        // THE ZONE EACH NODE STANDS IN (#151), asked of the map the first time
+        // a plan crosses the node and kept for the process: a zone is a fact
+        // about the ground, not about anybody's side, so it outlives forOurMask.
+        std::map<uint32, uint32> nodeZone;
     };
+
+    // WHAT THE DEATHS HAVE TAUGHT (#151). World thread only, like the survey:
+    // RefreshDangerMemory runs from the engagement poll, and travel, the pull
+    // guard and the `danger` probe all run from OnUpdate.
+    struct DangerMemory
+    {
+        // The last DANGER_ZONE_WINDOW_SECONDS of creature kills, killer level
+        // filled from the creature template.
+        std::vector<OverseerDecisions::DeathRecord> deaths;
+        // The database's clock when they were read, so the windows are measured
+        // on the same clock as created_at.
+        std::time_t readAt{0};
+        // The entries nobody pulls for the rest of this process.
+        OverseerDecisions::PullSuppressionBook pulls;
+    };
+
+    static DangerMemory& Danger()
+    {
+        static DangerMemory memory;
+        return memory;
+    }
+
+    // Read the day's creature kills back and book every entry that killed a
+    // member DANGER_CREATURE_THRESHOLD times in the last hour. A null result is
+    // an empty day: zone danger falls to nothing, and the book keeps what it
+    // already holds, because a refusal is for the session.
+    static void RefreshDangerMemory()
+    {
+        DangerMemory& memory = Danger();
+        memory.deaths.clear();
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT character_name, level, zone, killer_type, killer_entry, "
+            "CAST(UNIX_TIMESTAMP(created_at) AS SIGNED), CAST(UNIX_TIMESTAMP() AS SIGNED) "
+            "FROM overseer_death WHERE killer_type = 'creature' "
+            "AND created_at >= NOW() - INTERVAL {} SECOND",
+            static_cast<uint32>(DANGER_ZONE_WINDOW_SECONDS));
+        if (!result)
+            return;
+        do
+        {
+            Field* fields = result->Fetch();
+            OverseerDecisions::DeathRecord d;
+            d.characterName = fields[0].Get<std::string>();
+            d.level = fields[1].Get<uint32>();
+            d.zone = fields[2].Get<uint32>();
+            d.killerType = fields[3].Get<std::string>();
+            d.killerEntry = fields[4].Get<uint32>();
+            d.createdAt = static_cast<std::time_t>(fields[5].Get<int64>());
+            memory.readAt = static_cast<std::time_t>(fields[6].Get<int64>());
+            if (CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(d.killerEntry))
+                d.killerLevel = tmpl->maxlevel;
+            memory.deaths.push_back(d);
+        } while (result->NextRow());
+
+        std::vector<OverseerDecisions::CreatureDanger> const creatures =
+            OverseerDecisions::ScoreCreatureDanger(memory.deaths, memory.readAt,
+                                                   DANGER_CREATURE_WINDOW_SECONDS);
+        for (uint32 entry : OverseerDecisions::NotePullSuppressions(
+                 memory.pulls, creatures, DANGER_CREATURE_THRESHOLD))
+        {
+            CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(entry);
+            LOG_INFO("module.overseer",
+                     "overseer: creature {} ('{}') has killed a member {} times in the last "
+                     "hour, at level {} - no member pulls it for the rest of this session "
+                     "until {} levels above that; fighting back is unchanged (#151)",
+                     entry, tmpl ? tmpl->Name : std::string("?"), memory.pulls.at(entry).deaths,
+                     memory.pulls.at(entry).level, DANGER_PULL_LIFT_LEVELS);
+        }
+    }
+
+    // The zones scored for this character's party: against its lowest level,
+    // the one ScoreGroundDanger prices the road against too.
+    static std::vector<OverseerDecisions::ZoneDanger> ZoneDangerFor(Player* bot,
+                                                                    uint32& partyLevel)
+    {
+        std::vector<std::uint32_t> const levels = PartyLevelsFor(bot);
+        partyLevel = levels.empty() ? 0 : *std::min_element(levels.begin(), levels.end());
+        DangerMemory const& memory = Danger();
+        return OverseerDecisions::ScoreZoneDanger(memory.deaths, memory.readAt, partyLevel,
+                                                  DANGER_ZONE_WINDOW_SECONDS,
+                                                  DANGER_ZONE_LEVEL_GAP);
+    }
 
     // World thread only - DriveTravel runs from OnUpdate - so unguarded, in the
     // same way TravelAimBook is.
@@ -20933,6 +21055,129 @@ private:
         return learnedSomethingGuarded;
     }
 
+    // The zone a survey node stands in, from the map's own area data, asked once
+    // per node for the process. 0 for a node not on this map.
+    static uint32 NodeZoneOf(Player* bot, TravelSurvey& survey,
+                             std::map<uint32, OverseerDecisions::RouteNode const*> const& byId,
+                             uint32 id)
+    {
+        auto const known = survey.nodeZone.find(id);
+        if (known != survey.nodeZone.end())
+            return known->second;
+        auto const node = byId.find(id);
+        Map* map = bot->GetMap();
+        if (node == byId.end() || !map)
+            return 0;
+        uint32 const zone = map->GetZoneId(bot->GetPhaseMask(), node->second->x,
+                                           node->second->y, node->second->z);
+        survey.nodeZone.emplace(id, zone);
+        return zone;
+    }
+
+    // The zones a plan's nodes stand in, in route order, and then the aim's own:
+    // a route ends at its aim whatever its last node is, so a plan that stops
+    // short of a dangerous zone the aim stands in has not gone round it.
+    static std::vector<uint32_t> PlanZones(Player* bot, TravelSurvey& survey,
+                                           std::map<uint32, OverseerDecisions::RouteNode const*> const& byId,
+                                           OverseerDecisions::RoutePlan const& plan, uint32 aimZone)
+    {
+        std::vector<uint32_t> zones;
+        if (plan.verdict != OverseerDecisions::RoutePlanVerdict::Planned)
+            return zones;
+        for (uint32 id : plan.nodes)
+            zones.push_back(NodeZoneOf(bot, survey, byId, id));
+        zones.push_back(aimZone);
+        return zones;
+    }
+
+    // Plan again, up to DANGER_ZONE_PASSES times, with every leg the last plan
+    // walked into `zone` priced at DANGER_ZONE_DETOUR_YARDS on a copy of the
+    // links. `detour` comes in as the plan that entered the zone and goes out as
+    // the last re-plan; the zones of that re-plan are returned, empty when the
+    // survey had no plan to give.
+    static std::vector<uint32_t> PlanAroundZone(
+        Player* bot, TravelSurvey& survey,
+        std::map<uint32, OverseerDecisions::RouteNode const*> const& byId, uint32 zone,
+        uint32 aimZone, float fromX, float fromY, float aimX, float aimY,
+        OverseerDecisions::RoutePlanLimits const& limits, OverseerDecisions::RoutePlan& detour)
+    {
+        std::vector<OverseerDecisions::RouteLink> priced = survey.links;
+        std::vector<uint32_t> detourZones;
+        for (unsigned pass = 0; pass < DANGER_ZONE_PASSES; ++pass)
+        {
+            std::set<uint32> inZone;
+            for (uint32 id : detour.nodes)
+                if (NodeZoneOf(bot, survey, byId, id) == zone)
+                    inZone.insert(id);
+            if (inZone.empty())
+                break;
+            for (OverseerDecisions::RouteLink& link : priced)
+                if (inZone.count(link.from) || inZone.count(link.to))
+                {
+                    link.guardedGround = true;
+                    link.detourWorthYards =
+                        std::max(link.detourWorthYards, DANGER_ZONE_DETOUR_YARDS);
+                }
+            detour = OverseerDecisions::PlanFootRoute(survey.nodes, priced, bot->GetMapId(),
+                                                      fromX, fromY, aimX, aimY, limits);
+            detourZones = PlanZones(bot, survey, byId, detour, aimZone);
+        }
+        return detourZones;
+    }
+
+    // ROUTED AROUND A ZONE THE DEATHS SAY IS LETHAL (#151).
+    //
+    // The same shape as the guarded-ground passes above: plan, read what the
+    // plan crosses, plan again knowing more. Every leg the last plan walked into
+    // the first dangerous zone on it is priced at DANGER_ZONE_DETOUR_YARDS on a
+    // copy of the links, so the survey itself never carries a price the deaths
+    // will have forgotten tomorrow, and only the nodes some plan crossed are
+    // ever asked their zone. OverseerDecisions::AvoidDangerousRoute decides
+    // whether the last re-plan is a way round, and the travel log names the zone
+    // either way: avoided, or entered because no route avoids it.
+    static OverseerDecisions::RoutePlan AvoidDangerousZones(
+        Player* bot, TravelSurvey& survey,
+        std::map<uint32, OverseerDecisions::RouteNode const*> const& byId,
+        OverseerDecisions::RoutePlan const& plan, float fromX, float fromY, float aimX,
+        float aimY, float aimZ, OverseerDecisions::RoutePlanLimits const& limits,
+        std::string const& name, std::string const& target)
+    {
+        uint32 partyLevel = 0;
+        std::vector<OverseerDecisions::ZoneDanger> const danger = ZoneDangerFor(bot, partyLevel);
+        if (danger.empty())
+            return plan;
+        Map* map = bot->GetMap();
+        uint32 const aimZone = map ? map->GetZoneId(bot->GetPhaseMask(), aimX, aimY, aimZ) : 0;
+        std::vector<uint32_t> const planned = PlanZones(bot, survey, byId, plan, aimZone);
+        uint32 const zone =
+            OverseerDecisions::FirstDangerousZone(planned, danger, DANGER_ZONE_THRESHOLD);
+        if (zone == 0)
+            return plan;
+
+        // The aim in the zone is a route no plan avoids, so none is asked for.
+        OverseerDecisions::RoutePlan detour = plan;
+        std::vector<uint32_t> detourZones;
+        if (aimZone != zone)
+            detourZones = PlanAroundZone(bot, survey, byId, zone, aimZone, fromX, fromY, aimX,
+                                         aimY, limits, detour);
+
+        OverseerDecisions::TravelAvoidance const verdict = OverseerDecisions::AvoidDangerousRoute(
+            planned, detourZones, danger, DANGER_ZONE_THRESHOLD);
+        std::string const line = OverseerDecisions::ZoneAvoidanceLine(name, target, verdict, danger);
+        if (!verdict.avoid)
+        {
+            LOG_WARN("module.overseer", "{} (party level {})", line, partyLevel);
+            return plan;
+        }
+        LOG_INFO("module.overseer", "{} (party level {})", line, partyLevel);
+        // The line above says why this route goes round. PlanRoute's #326 and
+        // #400 lines are about the other side's guards, and the zone's own price
+        // in these two fields would have them say this detour was bought by one.
+        detour.wentRound = false;
+        detour.detourBudgetYards = 0.f;
+        return detour;
+    }
+
     // A MEASURED STAGING CORRIDOR IS WALKED INSTEAD OF A ROUTE (#342).
     //
     // Asked BEFORE the survey is read, and that order is the whole of it. The
@@ -21434,6 +21679,12 @@ private:
                 break;
             ++pass;
         }
+
+        // AND ROUND ANY ZONE THE DEATHS SAY IS LETHAL (#151), asked of the plan
+        // the guarded-ground passes settled on. See AvoidDangerousZones.
+        if (plan.verdict == OverseerDecisions::RoutePlanVerdict::Planned)
+            plan = AvoidDangerousZones(bot, survey, byId, plan, planFromX, planFromY, aimX,
+                                       aimY, aimZ, limits, name, target);
 
         // THE JOINED ROAD IS THE WHOLE ROUTE when nothing is worth planning
         // past its end, or when the plan from its end did not hold up.
@@ -27695,6 +27946,87 @@ private:
         }
 
         EndTravelPoll(stillAimed);
+    }
+
+    // -------------------------------------------- no pull at a known killer --
+    //
+    // A CREATURE THAT KILLED A MEMBER TWICE IS NOT PULLED AGAIN (#151). The
+    // entries are booked by RefreshDangerMemory; this asks, once a second, what
+    // each roster member is about to fight. The fight a bot is choosing is the
+    // one its own pull and grind actions put in its "current target" value, and
+    // the one it has already swung at is its victim. When that creature is a
+    // booked entry, is not yet fighting anyone, and the member is still within
+    // DANGER_PULL_LIFT_LEVELS of the level the deaths were at, the attack is
+    // stopped and both targets cleared. A creature that is already fighting is
+    // left alone: that is a fight it started, and fighting back is unchanged.
+    //
+    // A POLL, NOT A HOOK ON PullAction, for the reason DriveEngagementSafety
+    // gives below: nothing here adds a branch to the AI tick every bot runs.
+    // The cost is up to a second of walking before the pull is called off,
+    // which is shorter than the walk to a pull.
+    void DrivePullGuard()
+    {
+        OverseerDecisions::PullSuppressionBook const& book = Danger().pulls;
+        if (book.empty())
+            return;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name FROM overseer_roster WHERE enabled = 1");
+        if (!result)
+            return;
+        do
+        {
+            std::string const name = result->Fetch()[0].Get<std::string>();
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            PlayerbotAI* botAI = SteerableAI(bot);
+            if (!botAI)
+                continue;
+            Creature* target = ChosenFightOf(bot, botAI);
+            if (!target)
+                continue;
+            OverseerDecisions::PullFacts facts;
+            facts.entry = target->GetEntry();
+            facts.memberLevel = bot->GetLevel();
+            facts.targetInCombat = target->IsInCombat();
+            if (OverseerDecisions::RefuseVoluntaryPull(book, facts, DANGER_PULL_LIFT_LEVELS))
+                RefusePull(name, bot, botAI, target);
+        } while (result->NextRow());
+    }
+
+    // The creature this bot is choosing to fight: the target its combat engine
+    // picked, else the one it is swinging at. Null when it is neither a
+    // creature nor anything.
+    static Creature* ChosenFightOf(Player* bot, PlayerbotAI* botAI)
+    {
+        Unit* chosen = nullptr;
+        if (AiObjectContext* context = botAI->GetAiObjectContext())
+            if (Value<Unit*>* current = context->GetValue<Unit*>("current target"))
+                chosen = current->Get();
+        if (!chosen)
+            chosen = bot->GetVictim();
+        return chosen ? chosen->ToCreature() : nullptr;
+    }
+
+    // Stop the attack and clear both targets, and say so once per creature.
+    void RefusePull(std::string const& name, Player* bot, PlayerbotAI* botAI, Creature* target)
+    {
+        bot->AttackStop();
+        if (AiObjectContext* context = botAI->GetAiObjectContext())
+            if (Value<Unit*>* current = context->GetValue<Unit*>("current target"))
+                current->Set(nullptr);
+        if (WorldSession* session = bot->GetSession())
+            DriveSelection(session, ObjectGuid::Empty);
+        uint64 const guid = target->GetGUID().GetRawValue();
+        auto const said = _pullRefusedSaid.find(name);
+        if (said != _pullRefusedSaid.end() && said->second == guid)
+            return;
+        _pullRefusedSaid[name] = guid;
+        OverseerDecisions::CreatureDanger const& booked = Danger().pulls.at(target->GetEntry());
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' (level {}) does not pull '{}' (creature {}) - that entry "
+                 "killed a member {} times in an hour this session at level {}, and the pull "
+                 "comes back at level {} (#151)",
+                 name, bot->GetLevel(), target->GetName(), target->GetEntry(), booked.deaths,
+                 booked.level, booked.level + DANGER_PULL_LIFT_LEVELS);
     }
 
     // ---------------------------------------------------------- engagement --
@@ -58231,6 +58563,22 @@ private:
             target ? target->GetName() : std::string(), top);
     }
 
+    // THE DANGER LIST FOR THE FAMILY PAGE (#151): every zone this character's
+    // party would be routed around and every entry no member pulls, scored the
+    // way travel and the pull guard score them, from the same memory. The
+    // creature side is the session's book, not the last hour, so the page lists
+    // exactly what DrivePullGuard refuses; mutates nothing.
+    static std::string ProbeDanger(Player* bot)
+    {
+        uint32 partyLevel = 0;
+        std::vector<OverseerDecisions::ZoneDanger> const zones = ZoneDangerFor(bot, partyLevel);
+        std::vector<OverseerDecisions::CreatureDanger> creatures;
+        for (auto const& booked : Danger().pulls)
+            creatures.push_back(booked.second);
+        return OverseerDecisions::DangerProbeJson(zones, creatures, DANGER_ZONE_THRESHOLD,
+                                                  DANGER_CREATURE_THRESHOLD, partyLevel);
+    }
+
     static char const* DoProbe(Player* bot, std::string const& what, char const*& status,
                                std::string& out)
     {
@@ -58250,8 +58598,10 @@ private:
             out = ProbeAuras(bot);
         else if (what == "meter")
             out = ProbeMeter(bot);
+        else if (what == "danger")
+            out = ProbeDanger(bot);
         else
-            return "unknown probe (state|spells|talents|strategies|gear|bags|auras|meter)";
+            return "unknown probe (state|spells|talents|strategies|gear|bags|auras|meter|danger)";
 
         status = "delivered";
         return "";
@@ -76993,6 +77343,7 @@ private:
         std::vector<uint64> lootTried;  // corpse guids already looted or given up on
         uint32 approachPolls{0};
         uint32 pulls{0};
+        bool pullRefusedSaid{false};  // the danger memory refused a pull (#151)
         bool tookNewRpgOff{false};
         bool putLootOn{false};
         char const* lastStep{""};
@@ -77143,6 +77494,32 @@ private:
         session->HandleAttackSwingOpcode(raw);
         if (!who->IsWithinMeleeRange(target))
             who->GetMotionMaster()->MoveChase(target);
+    }
+
+    // A hunt is a pull like any other to the danger memory (#151): an entry
+    // DrivePullGuard would call a pull off at is not swung at here either, so
+    // the two never undo each other. The hunt keeps running on its own clock
+    // and is said once.
+    static void HuntPullUnlessRefused(HuntState& hunt, Player* who, Creature* target)
+    {
+        OverseerDecisions::PullFacts facts;
+        facts.entry = target->GetEntry();
+        facts.memberLevel = who->GetLevel();
+        facts.targetInCombat = target->IsInCombat();
+        if (!OverseerDecisions::RefuseVoluntaryPull(Danger().pulls, facts,
+                                                    DANGER_PULL_LIFT_LEVELS))
+        {
+            HuntPull(who, target);
+            ++hunt.pulls;
+            return;
+        }
+        if (hunt.pullRefusedSaid)
+            return;
+        hunt.pullRefusedSaid = true;
+        LOG_INFO("module.overseer",
+                 "overseer: hunt {} for '{}' does not pull creature {} - that entry "
+                 "killed a member {} times in an hour this session (#151)",
+                 hunt.id, hunt.character, hunt.entry, Danger().pulls.at(facts.entry).deaths);
     }
 
     // THE CORPSE, LOOTED THE WAY A CLIENT DOES: open the window (CMSG_LOOT), take
@@ -77355,10 +77732,7 @@ private:
                                                           corpse->GetPositionZ());
                 }
                 if (step == D::HuntStep::Pull && target)
-                {
-                    HuntPull(who, target);
-                    ++hunt.pulls;
-                }
+                    HuntPullUnlessRefused(hunt, who, target);
             }
 
             if (now - hunt.wroteAt >= static_cast<std::time_t>(HUNT_HEARTBEAT_SECONDS))
@@ -77602,6 +77976,11 @@ private:
     // DriveEngagementSafety says it once per fight rather than every poll.
     // Erased on the first poll that finds the character out of combat (#1055).
     std::set<std::string> _tankPursuitSaid;
+    // The pull guard (#151): its own one-second clock, and the creature each
+    // member was last refused, so RefusePull says it once per creature rather
+    // than every poll. One entry per member, overwritten.
+    uint32 _pullGuardTimer = 0;
+    std::map<std::string, uint64> _pullRefusedSaid;
     uint32 _terrainRecoveryTimer = 0;
     // GATHERING/BARRIER coordinator poll (mod-overseer#88). Its own timer,
     // not piggybacked on QUEST_POLL_MS or ENGAGEMENT_POLL_MS: this drive is

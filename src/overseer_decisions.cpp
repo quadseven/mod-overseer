@@ -23684,6 +23684,7 @@ std::vector<CreatureDanger> ScoreCreatureDanger(std::vector<DeathRecord> const& 
         CreatureDanger& c = byEntry[d.killerEntry];
         c.entry = d.killerEntry;
         ++c.deaths;
+        c.level = std::max(c.level, d.level);
     }
     std::vector<CreatureDanger> out;
     out.reserve(byEntry.size());
@@ -23751,6 +23752,130 @@ std::string DangerListText(std::vector<ZoneDanger> const& zones,
     for (CreatureDanger const& c : creatures)
         if (CreaturePullIsSuppressed(c, creatureThreshold))
             ss << "creature " << c.entry << ": " << c.deaths << " deaths, not pulled\n";
+    return ss.str();
+}
+
+std::vector<uint32_t> NotePullSuppressions(PullSuppressionBook& book,
+                                           std::vector<CreatureDanger> const& creatures,
+                                           unsigned threshold)
+{
+    std::vector<uint32_t> added;
+    for (CreatureDanger const& c : creatures)
+    {
+        if (!CreaturePullIsSuppressed(c, threshold))
+            continue;
+        auto const booked = book.find(c.entry);
+        if (booked == book.end())
+        {
+            book[c.entry] = c;
+            added.push_back(c.entry);
+            continue;
+        }
+        booked->second.deaths = std::max(booked->second.deaths, c.deaths);
+        booked->second.level = std::max(booked->second.level, c.level);
+    }
+    return added;
+}
+
+bool RefuseVoluntaryPull(PullSuppressionBook const& book, PullFacts const& facts,
+                         uint32_t liftLevels)
+{
+    if (facts.targetInCombat)
+        return false;
+    auto const booked = book.find(facts.entry);
+    if (booked == book.end())
+        return false;
+    return facts.memberLevel < booked->second.level + liftLevels;
+}
+
+uint32_t FirstDangerousZone(std::vector<uint32_t> const& routeZones,
+                            std::vector<ZoneDanger> const& danger, unsigned threshold)
+{
+    for (uint32_t zone : routeZones)
+        if (ZoneScoreIsAbove(danger, zone, threshold))
+            return zone;
+    return 0;
+}
+
+TravelAvoidance AvoidDangerousRoute(std::vector<uint32_t> const& plannedZones,
+                                    std::vector<uint32_t> const& detourZones,
+                                    std::vector<ZoneDanger> const& danger,
+                                    unsigned threshold)
+{
+    uint32_t const aimed = FirstDangerousZone(plannedZones, danger, threshold);
+    if (aimed == 0)
+        return TravelAvoidance{};
+    // The re-plan stands for the zone it is worst in: the aimed zone itself when
+    // it still enters it or there is no re-plan, any other dangerous zone it
+    // enters, or else one of its own safe zones.
+    bool const stillEnters = detourZones.empty() ||
+        std::find(detourZones.begin(), detourZones.end(), aimed) != detourZones.end();
+    uint32_t alternative = stillEnters ? aimed : FirstDangerousZone(detourZones, danger, threshold);
+    if (alternative == 0)
+        alternative = detourZones.front();
+    return AvoidDangerousZone({{aimed, true}, {alternative, false}}, danger, threshold);
+}
+
+namespace
+{
+ZoneDanger ZoneDangerOf(std::vector<ZoneDanger> const& danger, uint32_t zone)
+{
+    for (ZoneDanger const& z : danger)
+        if (z.zone == zone)
+            return z;
+    return ZoneDanger{};
+}
+}  // namespace
+
+std::string ZoneAvoidanceLine(std::string const& name, std::string const& target,
+                              TravelAvoidance const& verdict,
+                              std::vector<ZoneDanger> const& danger)
+{
+    if (!verdict.avoid && !verdict.noAlternative)
+        return "";
+    ZoneDanger const z = ZoneDangerOf(danger, verdict.avoidedZone);
+    std::ostringstream why;
+    why << std::fixed << std::setprecision(2) << "score " << z.score << ", "
+        << z.lethalDeaths << " of " << z.deaths
+        << " deaths there in the window to creatures far above the party";
+    std::ostringstream ss;
+    if (verdict.avoid)
+        ss << "overseer: '" << name << "' is routed around zone " << verdict.avoidedZone
+           << " on its way to '" << target << "' - " << why.str() << " (#151)";
+    else
+        ss << "overseer: '" << name << "' has no route to '" << target
+           << "' that avoids zone " << verdict.avoidedZone << " - " << why.str()
+           << " - so it walks the planned route through it (#151)";
+    return ss.str();
+}
+
+std::string DangerProbeJson(std::vector<ZoneDanger> const& zones,
+                            std::vector<CreatureDanger> const& creatures,
+                            unsigned zoneThreshold, unsigned creatureThreshold,
+                            uint32_t partyLevel)
+{
+    std::ostringstream ss;
+    ss << std::fixed << std::setprecision(2) << "{\"party_level\":" << partyLevel
+       << ",\"zone_threshold\":" << zoneThreshold
+       << ",\"creature_threshold\":" << creatureThreshold << ",\"zones\":[";
+    char const* sep = "";
+    for (ZoneDanger const& z : zones)
+        if (ZoneIsTooDangerous(z, zoneThreshold))
+        {
+            ss << sep << "{\"zone\":" << z.zone << ",\"score\":" << z.score
+               << ",\"deaths\":" << z.deaths << ",\"lethal\":" << z.lethalDeaths << '}';
+            sep = ",";
+        }
+    ss << "],\"creatures\":[";
+    sep = "";
+    for (CreatureDanger const& c : creatures)
+        if (CreaturePullIsSuppressed(c, creatureThreshold))
+        {
+            ss << sep << "{\"entry\":" << c.entry << ",\"deaths\":" << c.deaths << '}';
+            sep = ",";
+        }
+    ss << "],\"text\":"
+       << JsonString(DangerListText(zones, creatures, zoneThreshold, creatureThreshold)) << '}';
     return ss.str();
 }
 

@@ -20,18 +20,26 @@
 #include <string>
 #include <vector>
 
+using OverseerDecisions::AvoidDangerousRoute;
 using OverseerDecisions::AvoidDangerousZone;
 using OverseerDecisions::CompareDeathRate;
 using OverseerDecisions::CreatureDanger;
 using OverseerDecisions::CreaturePullIsSuppressed;
 using OverseerDecisions::DangerListText;
+using OverseerDecisions::DangerProbeJson;
 using OverseerDecisions::DeathRateComparison;
 using OverseerDecisions::DeathRecord;
+using OverseerDecisions::FirstDangerousZone;
+using OverseerDecisions::NotePullSuppressions;
+using OverseerDecisions::PullFacts;
+using OverseerDecisions::PullSuppressionBook;
+using OverseerDecisions::RefuseVoluntaryPull;
 using OverseerDecisions::ScoreCreatureDanger;
 using OverseerDecisions::ScoreZoneDanger;
 using OverseerDecisions::TravelAvoidance;
 using OverseerDecisions::TravelLeg;
 using OverseerDecisions::ZoneDanger;
+using OverseerDecisions::ZoneAvoidanceLine;
 using OverseerDecisions::ZoneIsTooDangerous;
 
 namespace
@@ -421,6 +429,155 @@ void NoTimeSinceTheChangeHasNoRate()
     CheckDouble("no rate without hours", rate.since.perHour, 0.0, 1e-9);
 }
 
+// AC1, the session half: the creature memory is an hour, the refusal is the
+// session. Two deaths within the hour put the entry in the book at the highest
+// level those deaths were at; the book is what the pull guard asks.
+void TwoDeathsPutTheEntryInTheSessionBook()
+{
+    std::vector<DeathRecord> const deaths = {
+        D(17, 10, "creature", 12345, 25, At(600)),
+        D(18, 10, "creature", 12345, 25, At(1200)),
+        D(18, 10, "creature", 777, 25, At(1200)),  // one death: not booked
+    };
+    std::vector<CreatureDanger> const scored = ScoreCreatureDanger(deaths, NOW, 3600);
+    CheckUInt("the entry carries the highest level its deaths were at", scored[1].level, 18);
+
+    PullSuppressionBook book;
+    std::vector<uint32_t> const added = NotePullSuppressions(book, scored, 2);
+    CheckInt("one entry is newly suppressed", added.size(), 1);
+    CheckUInt("and it is the twice-lethal entry", added.empty() ? 0 : added[0], 12345);
+    CheckInt("the book holds only that entry", book.size(), 1);
+    CheckUInt("at level 18", book[12345].level, 18);
+    CheckUInt("with its two deaths", book[12345].deaths, 2);
+
+    CheckInt("noting the same deaths again adds nothing",
+             NotePullSuppressions(book, scored, 2).size(), 0);
+}
+
+// AC1: once in the book, an hour passing does not lift it. The deaths age out
+// of the scoring window and the entry stays refused for the rest of the session.
+void TheRefusalOutlivesTheHourWindow()
+{
+    PullSuppressionBook book;
+    book[12345] = CreatureDanger{12345, 2, 17};
+    std::vector<CreatureDanger> const later =
+        ScoreCreatureDanger({D(17, 10, "creature", 12345, 25, At(7200))}, NOW, 3600);
+    NotePullSuppressions(book, later, 2);
+    CheckInt("the book still holds the entry", book.count(12345), 1);
+
+    PullFacts facts;
+    facts.entry = 12345;
+    facts.memberLevel = 17;
+    facts.targetInCombat = false;
+    Check("a member at the same level does not start that fight",
+          RefuseVoluntaryPull(book, facts, 3), true);
+}
+
+// Fighting back is unchanged: a creature already in combat is not a pull.
+void FightingBackIsNotRefused()
+{
+    PullSuppressionBook book;
+    book[12345] = CreatureDanger{12345, 2, 17};
+    PullFacts facts;
+    facts.entry = 12345;
+    facts.memberLevel = 17;
+    facts.targetInCombat = true;
+    Check("a creature already fighting is fought back",
+          RefuseVoluntaryPull(book, facts, 3), false);
+}
+
+// The refusal lifts when the member is N levels above the deaths, and an entry
+// that is not in the book is never refused.
+void TheRefusalLiftsNLevelsHigher()
+{
+    PullSuppressionBook book;
+    book[12345] = CreatureDanger{12345, 2, 17};
+    PullFacts facts;
+    facts.entry = 12345;
+    facts.targetInCombat = false;
+    facts.memberLevel = 19;
+    Check("two levels higher is still refused", RefuseVoluntaryPull(book, facts, 3), true);
+    facts.memberLevel = 20;
+    Check("three levels higher may pull again", RefuseVoluntaryPull(book, facts, 3), false);
+    facts.memberLevel = 17;
+    facts.entry = 999;
+    Check("an entry with no deaths is pulled as before",
+          RefuseVoluntaryPull(book, facts, 3), false);
+}
+
+// AC2: the first zone of a planned route at or above the threshold, in route
+// order; 0 when the whole route is safe.
+void TheFirstDangerousZoneOnARouteIsFound()
+{
+    std::vector<ZoneDanger> const danger = {{46, 3, 3, 3.0}, {51, 4, 4, 4.0}};
+    CheckUInt("route order, not score order",
+              FirstDangerousZone({12, 46, 51}, danger, 3), 46);
+    CheckUInt("a safe route has none", FirstDangerousZone({12, 40}, danger, 3), 0);
+}
+
+// AC2: the plan crosses zone 46, the re-plan with zone 46 priced out does not,
+// so the party walks the re-plan and the log names 46.
+void ARouteThroughADangerousZoneIsWalkedAround()
+{
+    std::vector<ZoneDanger> const danger = {{46, 3, 3, 3.0}};
+    TravelAvoidance const verdict = AvoidDangerousRoute({12, 46, 44}, {12, 40, 44}, danger, 3);
+    Check("the re-plan is walked", verdict.avoid, true);
+    CheckUInt("zone 46 is avoided", verdict.avoidedZone, 46);
+    Check("an alternative existed", verdict.noAlternative, false);
+    CheckText("the travel log names the zone",
+              ZoneAvoidanceLine("Ugga", "at:0:1,2,3", verdict, danger),
+              "overseer: 'Ugga' is routed around zone 46 on its way to 'at:0:1,2,3' - "
+              "score 3.00, 3 of 3 deaths there in the window to creatures far above "
+              "the party (#151)");
+}
+
+// AC2: when the re-plan still crosses the zone, or no re-plan exists, there is
+// no other route and the log says so.
+void NoOtherRouteIsSaid()
+{
+    std::vector<ZoneDanger> const danger = {{46, 3, 3, 3.0}};
+    TravelAvoidance const through = AvoidDangerousRoute({12, 46}, {40, 46}, danger, 3);
+    Check("the re-plan still crosses: nothing is avoided", through.avoid, false);
+    Check("and there is no alternative", through.noAlternative, true);
+    CheckUInt("the zone is named", through.avoidedZone, 46);
+    TravelAvoidance const none = AvoidDangerousRoute({12, 46}, {}, danger, 3);
+    Check("no re-plan at all is no alternative too", none.noAlternative, true);
+    CheckText("the travel log says there is no other route",
+              ZoneAvoidanceLine("Ugga", "Thelsamar", through, danger),
+              "overseer: 'Ugga' has no route to 'Thelsamar' that avoids zone 46 - score "
+              "3.00, 3 of 3 deaths there in the window to creatures far above the party - "
+              "so it walks the planned route through it (#151)");
+}
+
+// A safe route asks nothing and says nothing.
+void ASafeRouteSaysNothing()
+{
+    std::vector<ZoneDanger> const danger = {{46, 3, 3, 3.0}};
+    TravelAvoidance const verdict = AvoidDangerousRoute({12, 40}, {}, danger, 3);
+    Check("nothing is avoided", verdict.avoid, false);
+    Check("nothing is missing", verdict.noAlternative, false);
+    CheckText("and no line is written", ZoneAvoidanceLine("Ugga", "x", verdict, danger), "");
+}
+
+// AC5: the `danger` probe the family page reads carries the list text and the
+// thresholds it was cut at, escaped as JSON.
+void TheDangerProbeCarriesTheList()
+{
+    std::vector<ZoneDanger> const zones = {{46, 3, 3, 3.0}};
+    std::vector<CreatureDanger> const creatures = {{12345, 2, 17}};
+    CheckText("the probe json",
+              DangerProbeJson(zones, creatures, 3, 2, 17),
+              "{\"party_level\":17,\"zone_threshold\":3,\"creature_threshold\":2,"
+              "\"zones\":[{\"zone\":46,\"score\":3.00,\"deaths\":3,\"lethal\":3}],"
+              "\"creatures\":[{\"entry\":12345,\"deaths\":2}],"
+              "\"text\":\"zone 46: score 3.00 (3 of 3 deaths to creatures far above the "
+              "party)\\u000acreature 12345: 2 deaths, not pulled\\u000a\"}");
+    CheckText("a quiet probe is empty lists and empty text",
+              DangerProbeJson({}, {}, 3, 2, 17),
+              "{\"party_level\":17,\"zone_threshold\":3,\"creature_threshold\":2,"
+              "\"zones\":[],\"creatures\":[],\"text\":\"\"}");
+}
+
 }  // namespace
 
 int main()
@@ -442,6 +599,15 @@ int main()
     AQuietDangerListIsEmpty();
     DeathsPerHourAreComparedAgainstAWeekBaseline();
     NoTimeSinceTheChangeHasNoRate();
+    TwoDeathsPutTheEntryInTheSessionBook();
+    TheRefusalOutlivesTheHourWindow();
+    FightingBackIsNotRefused();
+    TheRefusalLiftsNLevelsHigher();
+    TheFirstDangerousZoneOnARouteIsFound();
+    ARouteThroughADangerousZoneIsWalkedAround();
+    NoOtherRouteIsSaid();
+    ASafeRouteSaysNothing();
+    TheDangerProbeCarriesTheList();
 
     if (failures)
     {

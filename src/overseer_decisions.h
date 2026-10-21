@@ -26157,6 +26157,7 @@ struct CreatureDanger
 {
     uint32_t entry{0};
     unsigned deaths{0};   // deaths to this entry in the window
+    uint32_t level{0};    // the highest character level among those deaths
 };
 
 // Score every creature entry the deaths touch. Only creature kills count and an
@@ -26205,6 +26206,66 @@ TravelAvoidance AvoidDangerousZone(std::vector<TravelLeg> const& legs,
 std::string DangerListText(std::vector<ZoneDanger> const& zones,
                            std::vector<CreatureDanger> const& creatures,
                            unsigned zoneThreshold, unsigned creatureThreshold);
+
+// The creature entries no member pulls for the rest of the session, by entry,
+// each with the most deaths and the highest character level it was scored at.
+// Held by the adapter for the life of the process, so an entry stays refused
+// after its deaths age out of the hour the creature memory is scored over.
+using PullSuppressionBook = std::map<uint32_t, CreatureDanger>;
+
+// Book every entry CreaturePullIsSuppressed names at `threshold`, raising a
+// booked entry's deaths and level when a later scoring is higher. Returns the
+// entries that were not in the book before, so each is said once.
+std::vector<uint32_t> NotePullSuppressions(PullSuppressionBook& book,
+                                           std::vector<CreatureDanger> const& creatures,
+                                           unsigned threshold);
+
+// What the pull guard knows about one member and the creature it is about to
+// fight.
+struct PullFacts
+{
+    uint32_t entry{0};           // the creature's template entry
+    uint32_t memberLevel{0};     // the member's level now
+    bool targetInCombat{false};  // the creature is already fighting someone
+};
+
+// True when the member must not start this fight: the entry is booked and the
+// member is fewer than `liftLevels` above the booked level. A
+// creature already in combat is never refused, because fighting back when
+// attacked is not a pull and is unchanged by this.
+bool RefuseVoluntaryPull(PullSuppressionBook const& book, PullFacts const& facts,
+                         uint32_t liftLevels);
+
+// The first zone in `routeZones` (route order) whose score is at or above
+// `threshold`, or 0 when the whole route is safe.
+uint32_t FirstDangerousZone(std::vector<uint32_t> const& routeZones,
+                            std::vector<ZoneDanger> const& danger, unsigned threshold);
+
+// The travel decision for one planned route. `plannedZones` are the zones the
+// planned route's nodes stand in; `detourZones` the zones of the route planned
+// again with every leg into the first dangerous zone priced out, empty when no
+// such route was found. Built on AvoidDangerousZone: the planned route is the
+// current leg and the re-plan the alternative, so `avoid` means walk the
+// re-plan and `noAlternative` means every route enters the zone named.
+TravelAvoidance AvoidDangerousRoute(std::vector<uint32_t> const& plannedZones,
+                                    std::vector<uint32_t> const& detourZones,
+                                    std::vector<ZoneDanger> const& danger,
+                                    unsigned threshold);
+
+// The travel log line for a verdict: the zone avoided, or that no route avoids
+// it, with the score and deaths behind it. "" when nothing was avoided and
+// nothing was missing.
+std::string ZoneAvoidanceLine(std::string const& name, std::string const& target,
+                              TravelAvoidance const& verdict,
+                              std::vector<ZoneDanger> const& danger);
+
+// The `danger` probe the family page reads: the party level the list was cut
+// at, both thresholds, every zone and creature on DangerListText's list as
+// fields, and the list text itself.
+std::string DangerProbeJson(std::vector<ZoneDanger> const& zones,
+                            std::vector<CreatureDanger> const& creatures,
+                            unsigned zoneThreshold, unsigned creatureThreshold,
+                            uint32_t partyLevel);
 
 // Deaths over a span of hours.
 struct DeathRate
