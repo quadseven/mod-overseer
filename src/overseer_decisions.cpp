@@ -23738,4 +23738,69 @@ TravelAvoidance AvoidDangerousZone(std::vector<TravelLeg> const& legs,
     return verdict;
 }
 
+// ----------------------------------- the post-run dungeon report (#152) --
+
+DungeonRunReport BuildDungeonRunReport(DungeonRunFacts const& run,
+                                       std::vector<DungeonRunEventRow> const& events)
+{
+    DungeonRunReport report;
+    report.run = run;
+
+    // Sort a local copy so the same input always renders the same report:
+    // by character, then by first_seen, then by kind.
+    std::vector<DungeonRunEventRow> ordered = events;
+    std::sort(ordered.begin(), ordered.end(),
+              [](DungeonRunEventRow const& a, DungeonRunEventRow const& b) {
+                  if (a.character_name != b.character_name)
+                      return a.character_name < b.character_name;
+                  if (a.first_seen != b.first_seen)
+                      return a.first_seen < b.first_seen;
+                  return a.kind < b.kind;
+              });
+
+    for (DungeonRunEventRow const& row : ordered)
+    {
+        DungeonRunReportLine line;
+        line.character_name = row.character_name;
+        line.kind = row.kind;
+        line.subject_name = row.subject_name;
+        line.detail = row.detail;
+        line.occurrences = row.occurrences;
+        report.lines.push_back(std::move(line));
+    }
+
+    // Render the text.
+    std::ostringstream ss;
+    ss << "Dungeon run " << run.run_id << ": led by " << run.leader_name
+       << ", map " << run.map_id << ", outcome " << run.outcome << "\n";
+    if (!run.started_at.empty())
+        ss << "  started " << run.started_at;
+    if (!run.ended_at.empty())
+        ss << ", ended " << run.ended_at;
+    ss << "\n";
+
+    std::string currentCharacter;
+    for (DungeonRunReportLine const& line : report.lines)
+    {
+        if (line.character_name != currentCharacter)
+        {
+            if (!currentCharacter.empty())
+                ss << "\n";
+            currentCharacter = line.character_name;
+            ss << line.character_name << ":\n";
+        }
+        ss << "  " << line.kind;
+        if (!line.subject_name.empty())
+            ss << " " << line.subject_name;
+        if (!line.detail.empty())
+            ss << ": " << line.detail;
+        if (line.occurrences > 1)
+            ss << " (" << line.occurrences << "x)";
+        ss << "\n";
+    }
+
+    report.text = ss.str();
+    return report;
+}
+
 }  // namespace OverseerDecisions
