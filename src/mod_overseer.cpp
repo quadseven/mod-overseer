@@ -32226,6 +32226,15 @@ private:
             // stop's 1500 yards; the finder's own exit (areatrigger 503)
             // already lands the family in this city.
             {"stockades", 0, 101, 34, 503, 0.f, 0.f, 0.f, {}, -8867.8f, 673.7f, 98.0f},
+            // areatrigger.sql: (1466,0,-7176.63,-937.667,170.206,13,0,0,0,0)
+            // areatrigger_teleport.sql: (1466,'Blackrock Depths Entrance',230,456.929,34.0923,-68.0896,...)
+            // areatrigger.sql: (1472,230,456.969,48.368,-65.2753,12,0,0,0,0)
+            // areatrigger_teleport.sql: (1472,'Blackrock Dephts - Searing Gorge Instance',0,-7179.63,-923.667,166.416,...)
+            // Kargath is the nearest Horde inn with a walkable approach from
+            // the door; this family is Horde, so its campaign anchor belongs
+            // there rather than at a nearer Alliance-only inn.
+            {"blackrock-depths", 0, 1466, 230, 1472, 0.f, 0.f, 0.f, {},
+             -6678.9f, -1198.4f, 240.1f},
             // WAILING CAVERNS, AND THE FIRST ROW IN THIS TABLE WHOSE OUTSIDE
             // MAP IS NOT 0. The four numbers are read out of the pinned core's
             // own base world DB the same way every row above them is, and are
