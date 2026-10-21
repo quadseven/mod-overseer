@@ -26108,6 +26108,60 @@ bool RunDamageNote(RunDamageBook& book, std::string const& name, std::uint32_t m
 // totals, or "" for an empty batch.
 std::string RunDamageUpsertSql(RunDamageBook const& batch);
 
+// ----------------------------------- the post-run dungeon report (#152) --
+
+// One row as the summary view returns it, before any formatting. The view is
+// `overseer_dungeon_run_summary`, and both Discord and the family page read
+// from it, so a report built from these rows is the same report everywhere.
+struct DungeonRunEventRow
+{
+    std::string character_name;
+    std::string kind;           // loot_won, boss_kill, death, level_up, quest_reward, item_equip, achievement
+    std::uint32_t subject_id{0};
+    std::string subject_name;
+    std::string detail;
+    std::uint32_t occurrences{0};
+    std::string first_seen;
+    std::string last_seen;
+};
+
+// The run's identity, from the run row.
+struct DungeonRunFacts
+{
+    std::uint32_t run_id{0};
+    std::string leader_name;
+    std::uint32_t map_id{0};
+    std::string state;
+    std::string outcome;
+    std::string started_at;
+    std::string ended_at;
+};
+
+// One formatted line of the report, in the order a reader wants it.
+struct DungeonRunReportLine
+{
+    std::string character_name;
+    std::string kind;
+    std::string subject_name;
+    std::string detail;
+    std::uint32_t occurrences{0};
+};
+
+// The whole report, decided without a world or a database.
+struct DungeonRunReport
+{
+    DungeonRunFacts run;
+    std::vector<DungeonRunReportLine> lines;
+    std::string text;   // the rendered report, ready to write
+};
+
+// Render the run's events into one report, grouping by character and ordering
+// highlights the way the summary lists them. `events` are the summary view's
+// rows for this run, already filtered to this run_id. Returns the report with
+// `text` filled in; the adapter writes `text` to the report table.
+DungeonRunReport BuildDungeonRunReport(DungeonRunFacts const& run,
+                                       std::vector<DungeonRunEventRow> const& events);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
