@@ -4424,11 +4424,35 @@ GuildRunLootTally TakeGuildRunLoot(std::vector<uint64> const& guids)
     return total;
 }
 
+// Can `who` take `proto` apart: its live Enchanting against the drop's own
+// requirement (OverseerDecisions::CanDisenchantDrop).
+static bool CanDisenchant(Player const* who, ItemTemplate const* proto)
+{
+    return who && OverseerDecisions::CanDisenchantDrop(
+                      proto->DisenchantID, proto->RequiredDisenchantSkill,
+                      static_cast<uint32>(who->GetSkillValue(SKILL_ENCHANTING)));
+}
+
+// What a drop the council gives nobody can become (#160): the realm's setting
+// and whether an Enchanter is among the voters.
+static OverseerDecisions::LootDisenchantFacts DisenchantFactsFor(Player const* bot, Roll const* roll,
+                                                                 ItemTemplate const* proto)
+{
+    OverseerDecisions::LootDisenchantFacts facts;
+    facts.realmAllows = OverseerCompat::LootRollDisenchant(sPlayerbotAIConfig);
+    facts.voterCanDisenchant = CanDisenchant(bot, proto);
+    for (auto const& [voter, cast] : roll->playerVote)
+        if (cast != NOT_VALID && CanDisenchant(ObjectAccessor::FindPlayer(voter), proto))
+            facts.enchanterRolling = true;
+    return facts;
+}
+
 // THE STEER (patches/mod-playerbots/0015). Asked by LootRollAction before its
 // own rule, on a map thread, for every open roll this bot has not voted on.
 // Only a roster character in a party (not a raid, which runs master loot)
 // voting on a weapon or a piece of armour is the council's; everything else
-// returns false and keeps the upstream vote.
+// returns false and keeps the upstream vote. A drop the council gives nobody
+// is the Enchanter's to disenchant when DisenchantFactsFor allows it.
 bool CouncilSteerRoll(Player* bot, Roll const* roll, RollVote& vote)
 {
     if (!bot || !roll)
@@ -4443,6 +4467,7 @@ bool CouncilSteerRoll(Player* bot, Roll const* roll, RollVote& vote)
 
     uint64 const key = roll->itemGUID.GetRawValue();
     time_t const now = std::time(nullptr);
+    OverseerDecisions::LootDisenchantFacts const disenchant = DisenchantFactsFor(bot, roll, proto);
     std::lock_guard<std::mutex> guard(g_councilMutex);
     if (g_councilRoster.find(bot->GetGUID().GetRawValue()) == g_councilRoster.end())
         return false;
@@ -4467,13 +4492,14 @@ bool CouncilSteerRoll(Player* bot, Roll const* roll, RollVote& vote)
     bool const decided = verdict != g_councilVerdicts.end();
     switch (OverseerDecisions::LootCouncilVoteFor(
         decided, decided ? verdict->second : std::string(), bot->GetName(),
-        static_cast<long>(now - noted->second.firstSeen)))
+        static_cast<long>(now - noted->second.firstSeen), disenchant))
     {
         case OverseerDecisions::LootCouncilVote::Hold: vote = NOT_EMITED_YET; return true;
         case OverseerDecisions::LootCouncilVote::Need: vote = NEED; return true;
         case OverseerDecisions::LootCouncilVote::Greed: vote = GREED; return true;
         case OverseerDecisions::LootCouncilVote::Pass: vote = PASS; return true;
         case OverseerDecisions::LootCouncilVote::Upstream: return false;
+        case OverseerDecisions::LootCouncilVote::Disenchant: vote = DISENCHANT; return true;
     }
     return false;
 }
@@ -4899,6 +4925,11 @@ void RememberStandDown(std::string const& name, uint16 mask)
 }
 std::mutex g_recoveryMutex;
 std::map<std::string, RecoveryMark> g_recoveryMarks;  // key: lowercased name
+// THE TIMES REMEDIES WERE APPLIED FOR EACH CHARACTER, oldest first, capped so
+// a long outage does not grow without bound. Feeds the recoveries-per-hour
+// health metric the page shows (OverseerWorldScript::RecoveriesPerHour).
+// World thread only, like g_recoveryMarks beside it, and lost on a restart.
+std::map<std::string, std::deque<time_t>> g_recoveryTimes;
 
 struct PendingKill
 {
@@ -5003,6 +5034,11 @@ void RememberRecovery(std::string const& name, uint8 prevRung, uint8 rung)
     m.prevRung = prevRung;
     m.rung = rung;
     m.at = std::time(nullptr);
+    // Keep the remedy times so the recoveries-per-hour metric can be computed.
+    std::deque<time_t>& times = g_recoveryTimes[LowerName(name)];
+    times.push_back(m.at);
+    while (times.size() > 4096)
+        times.pop_front();
 }
 
 // Called from DriveQuests, world thread only - see that function.
@@ -5149,6 +5185,7 @@ struct PendingDeath
     int32 lastSeenSeconds = -1;    // age of the sample below, -1 = none
     float lastX = 0.f, lastY = 0.f, lastZ = 0.f;
     float yardsFallen = -1.f;      // -1 = unsampled, 0 = it did not fall
+    bool fallStartedBelowSurface = false;
     bool fallStartSeen = false;
     uint16 fallStartMap = 0;
     float fallStartX = 0.f, fallStartY = 0.f, fallStartZ = 0.f;
@@ -5556,6 +5593,28 @@ void RecordDeath(Player* player)
             d.lastY = it->second.y;
             d.lastZ = it->second.z;
             d.yardsFallen = OverseerDecisions::YardsFallen(true, it->second.z, d.z);
+            // Sample the terrain/VMAP surface at the previous position. A
+            // character already below it was in an ongoing void fall before
+            // this poll-to-death slice began.
+            if (Map* map = player->GetMap())
+            {
+                float const probeZ = it->second.z +
+                                     TERRAIN_RECOVERY_VOID_PROBE_YARDS;
+                float const surface = map->GetHeight(
+                    player->GetPhaseMask(), it->second.x, it->second.y, probeZ,
+                    true, TERRAIN_RECOVERY_VOID_PROBE_YARDS);
+                if (surface > INVALID_HEIGHT && it->second.z < surface)
+                {
+                    d.fallStartedBelowSurface = true;
+                    d.fallStartSeen = true;
+                    d.fallStartMap = it->second.mapId;
+                    d.fallStartX = it->second.x;
+                    d.fallStartY = it->second.y;
+                    d.fallStartZ = it->second.z;
+                    d.fallStartMovement = OverseerDecisions::MoveGeneratorName(
+                        it->second.movement);
+                }
+            }
             if (d.yardsFallen > 10.f)
             {
                 auto const ring = g_fallSamples.find(lower);
@@ -5566,7 +5625,7 @@ void RecordDeath(Player* player)
                         trace.push_back({sample.mapId, sample.x, sample.y, sample.z,
                                          sample.movement});
                     auto const start = OverseerDecisions::FindFallStart(trace, d.mapId, d.z, 10.f);
-                    if (start.found)
+                    if (start.found && !d.fallStartedBelowSurface)
                     {
                         d.fallStartSeen = true;
                         d.fallStartMap = start.sample.mapId;
@@ -16763,10 +16822,8 @@ private:
         if (!entry)
             return;   // an `at:`/`trigger:` aim names no creature to check
 
-        if (bot->HasSkill(SKILL_FISHING))
-            return;   // nothing to teach - the ordinary, silent case on every visit after the first
-
-        if (!LoadLearnFishingFlag(name))
+        bool const alreadyHasSkill = bot->HasSkill(SKILL_FISHING);
+        if (!alreadyHasSkill && !LoadLearnFishingFlag(name))
             return;   // nobody asked this character to learn Fishing
 
         // Same radius TrainOnArrival and DiscoverFlightPointOnArrival both
@@ -16782,11 +16839,13 @@ private:
 
         uint32 const spellId = TrainerSpellForFishing(trainer, bot);
         if (!spellId)
-            return;   // this trainer does not teach Fishing - no-op, not an error
+            return;   // no eligible Fishing tier here yet, or this trainer does not teach it
 
         LOG_INFO("module.overseer",
                  "overseer: '{}' is buying Fishing from '{}' (creature {}, spell {})",
                  name, npc->GetName(), entry, spellId);
+
+        uint32 const maxBefore = static_cast<uint32>(bot->GetPureMaxSkillValue(SKILL_FISHING));
 
         // natural-only: bought at a trainer in reach, which takes its price (TeachSpell).
         trainer->TeachSpell(npc, bot, spellId);  // Trainer.h:73
@@ -16795,24 +16854,31 @@ private:
         // a CLIENT (Trainer.cpp) - a packet no bot has anybody to show it to.
         // "delivered is not worked": the only way to know Fishing was learned
         // is to ask the character.
-        if (!bot->HasSkill(SKILL_FISHING))
+        bool const succeeded = alreadyHasSkill
+            ? static_cast<uint32>(bot->GetPureMaxSkillValue(SKILL_FISHING)) > maxBefore
+            : bot->HasSkill(SKILL_FISHING);
+        if (!succeeded)
         {
             LOG_WARN("module.overseer",
-                     "overseer: '{}' was not taught Fishing by '{}'. TeachSpell reports "
+                     "overseer: '{}' was not taught or raised Fishing by '{}'. TeachSpell reports "
                      "its reason only to a client, so the likely one is money - it holds "
-                     "{} copper. Leaving learn_fishing standing for the next poll",
+                     "{} copper. Leaving the request available for the next poll",
                      name, npc->GetName(), bot->GetMoney());
             return;
         }
 
         LOG_INFO("module.overseer",
-                 "overseer: '{}' LEARNED Fishing at {}/{} from '{}' - taught by a trainer "
+                 "overseer: '{}' {} Fishing at {}/{} from '{}' - taught by a trainer "
                  "it happened to reach, not granted out of thin air",
-                 name, static_cast<uint32>(bot->GetPureSkillValue(SKILL_FISHING)),
+                 name, alreadyHasSkill ? "RAISED THE CAP ON" : "LEARNED",
+                 static_cast<uint32>(bot->GetPureSkillValue(SKILL_FISHING)),
                  static_cast<uint32>(bot->GetPureMaxSkillValue(SKILL_FISHING)), npc->GetName());
         RecordEvent(bot, "learn", SKILL_FISHING, "Fishing",
-                    "learned Fishing from a trainer it happened to reach");
-        ClearLearnFishingFlag(name);
+                    alreadyHasSkill
+                        ? "raised the Fishing cap at a trainer it happened to reach"
+                        : "learned Fishing from a trainer it happened to reach");
+        if (!alreadyHasSkill)
+            ClearLearnFishingFlag(name);
     }
 
     // FLIGHT POINT DISCOVERY ON ARRIVAL (#68). Discovering a flight point is
@@ -56406,7 +56472,7 @@ private:
             {
                 if (d.hitSampled)
                     ss << ',' << d.manaAtDeath << ',' << d.maxManaAtDeath << ','
-                       << d.enemiesEngaged << ",'" << Esc(d.targetedBy) << "'";
+                       << d.enemiesEngaged              << ",'" << Esc(d.targetedBy) << "'";
                 else
                     ss << ",NULL,NULL,NULL,NULL";
             }
@@ -56447,14 +56513,18 @@ private:
         OverseerDecisions::FallAccount const account =
             OverseerDecisions::AccountForFall(
                 batch.back().yardsFallen, 0.f, 1.f, batch.back().z,
-                OverseerDecisions::VOID_PLANE_Z);
+                OverseerDecisions::VOID_PLANE_Z,
+                batch.back().fallStartedBelowSurface);
         LOG_INFO("module.overseer",
                  "overseer: recorded {} death(s), most recently '{}' at level {} "
-                 "in zone {} (killer: {} '{}'; driven by {}, movement '{}', "
+                 "in zone {} at map {} position ({:.1f}, {:.1f}, {:.1f}) "
+                 "(killer: {} '{}'; driven by {}, movement '{}', "
                  "fell {:.1f} yards which is {}, in combat {}; fall guard {}, "
                  "and {})",
                  batch.size(), batch.back().characterName,
                  static_cast<uint32>(batch.back().level), batch.back().zoneId,
+                 static_cast<uint32>(batch.back().mapId), batch.back().x,
+                 batch.back().y, batch.back().z,
                  batch.back().killerType, batch.back().killerName,
                  batch.back().driver, batch.back().movement,
                  batch.back().yardsFallen,
@@ -58144,6 +58214,7 @@ private:
         o << ",\"class\":" << uint32(bot->getClass());
         o << ",\"alive\":" << (bot->IsAlive() ? "true" : "false");
         o << ",\"health\":" << bot->GetHealth() << ",\"max_health\":" << bot->GetMaxHealth();
+        o << ",\"recoveries_per_hour\":" << RecentRecoveriesPerHour();
         o << ",\"power\":" << bot->GetPower(bot->getPowerType());
         o << ",\"max_power\":" << bot->GetMaxPower(bot->getPowerType());
         o << ",\"in_combat\":" << (bot->IsInCombat() ? "true" : "false");
@@ -58169,6 +58240,19 @@ private:
         o << ",\"has_bot_ai\":" << (GET_PLAYERBOT_AI(bot) ? "true" : "false");
         o << "}";
         return o.str();
+    }
+
+    static std::size_t RecentRecoveriesPerHour()
+    {
+        time_t const now = std::time(nullptr);
+        std::size_t count = 0;
+        std::lock_guard<std::mutex> guard(g_recoveryMutex);
+        for (auto const& entry : g_recoveryTimes)
+        {
+            std::vector<time_t> times(entry.second.begin(), entry.second.end());
+            count += OverseerDecisions::RecoveriesPerHour(times, now);
+        }
+        return count;
     }
 
     static std::string ProbeSpells(Player* bot)

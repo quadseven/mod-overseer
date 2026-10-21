@@ -59,6 +59,14 @@ never seen `conf/mod_overseer.conf.dist` behaves exactly as one that copied it
 unedited. Copy it to `mod_overseer.conf` in your worldserver's module config
 directory and uncomment a line only to disagree with a default.
 
+One setting the module reads belongs to mod-playerbots, not to this file:
+`AiPlayerbot.LootRollDisenchant` (`Playerbots.LootRollDisenchant` after the
+playerbots config rename). Set it to 1 in the playerbots config and a weapon or
+armour drop the loot council gives nobody is disenchanted by the family's
+Enchanter, while everybody else passes so the materials land in that
+character's bags. Left at its default of 0, everybody greeds such a drop as
+before.
+
 **The core does not fall back to a `.conf.dist`.** If the copy is not made, the
 worldserver logs a missing-file line at startup and the module runs on its
 compiled defaults — harmless in effect, but none of the settings are then
