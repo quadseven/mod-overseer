@@ -4898,6 +4898,11 @@ void RememberStandDown(std::string const& name, uint16 mask)
 }
 std::mutex g_recoveryMutex;
 std::map<std::string, RecoveryMark> g_recoveryMarks;  // key: lowercased name
+// THE TIMES REMEDIES WERE APPLIED FOR EACH CHARACTER, oldest first, capped so
+// a long outage does not grow without bound. Feeds the recoveries-per-hour
+// health metric the page shows (OverseerWorldScript::RecoveriesPerHour).
+// World thread only, like g_recoveryMarks beside it, and lost on a restart.
+std::map<std::string, std::deque<time_t>> g_recoveryTimes;
 
 struct PendingKill
 {
@@ -5002,6 +5007,11 @@ void RememberRecovery(std::string const& name, uint8 prevRung, uint8 rung)
     m.prevRung = prevRung;
     m.rung = rung;
     m.at = std::time(nullptr);
+    // Keep the remedy times so the recoveries-per-hour metric can be computed.
+    std::deque<time_t>& times = g_recoveryTimes[LowerName(name)];
+    times.push_back(m.at);
+    while (times.size() > 4096)
+        times.pop_front();
 }
 
 // Called from DriveQuests, world thread only - see that function.
@@ -56103,13 +56113,14 @@ private:
             {
                 if (d.hitSampled)
                     ss << ',' << d.manaAtDeath << ',' << d.maxManaAtDeath << ','
-                       << d.enemiesEngaged << ",'" << Esc(d.targetedBy) << "'";
+                       << d.enemiesEngaged              << ",'" << Esc(d.targetedBy) << "'";
                 else
                     ss << ",NULL,NULL,NULL,NULL";
             }
             ss << ')';
         }
         CharacterDatabase.Execute(ss.str().c_str());
+    }
 
         // The driver and the drop are on the line as well as in the row: a
         // death nobody can attribute is the thing #188 is about, and a log a
