@@ -4898,6 +4898,11 @@ void RememberStandDown(std::string const& name, uint16 mask)
 }
 std::mutex g_recoveryMutex;
 std::map<std::string, RecoveryMark> g_recoveryMarks;  // key: lowercased name
+// THE TIMES REMEDIES WERE APPLIED FOR EACH CHARACTER, oldest first, capped so
+// a long outage does not grow without bound. Feeds the recoveries-per-hour
+// health metric the page shows (OverseerWorldScript::RecoveriesPerHour).
+// World thread only, like g_recoveryMarks beside it, and lost on a restart.
+std::map<std::string, std::deque<time_t>> g_recoveryTimes;
 
 struct PendingKill
 {
@@ -5002,6 +5007,11 @@ void RememberRecovery(std::string const& name, uint8 prevRung, uint8 rung)
     m.prevRung = prevRung;
     m.rung = rung;
     m.at = std::time(nullptr);
+    // Keep the remedy times so the recoveries-per-hour metric can be computed.
+    std::deque<time_t>& times = g_recoveryTimes[LowerName(name)];
+    times.push_back(m.at);
+    while (times.size() > 4096)
+        times.pop_front();
 }
 
 // Called from DriveQuests, world thread only - see that function.
@@ -56227,7 +56237,7 @@ private:
             {
                 if (d.hitSampled)
                     ss << ',' << d.manaAtDeath << ',' << d.maxManaAtDeath << ','
-                       << d.enemiesEngaged << ",'" << Esc(d.targetedBy) << "'";
+                       << d.enemiesEngaged              << ",'" << Esc(d.targetedBy) << "'";
                 else
                     ss << ",NULL,NULL,NULL,NULL";
             }
@@ -56272,11 +56282,14 @@ private:
                 batch.back().fallStartedBelowSurface);
         LOG_INFO("module.overseer",
                  "overseer: recorded {} death(s), most recently '{}' at level {} "
-                 "in zone {} (killer: {} '{}'; driven by {}, movement '{}', "
+                 "in zone {} at map {} position ({:.1f}, {:.1f}, {:.1f}) "
+                 "(killer: {} '{}'; driven by {}, movement '{}', "
                  "fell {:.1f} yards which is {}, in combat {}; fall guard {}, "
                  "and {})",
                  batch.size(), batch.back().characterName,
                  static_cast<uint32>(batch.back().level), batch.back().zoneId,
+                 static_cast<uint32>(batch.back().mapId), batch.back().x,
+                 batch.back().y, batch.back().z,
                  batch.back().killerType, batch.back().killerName,
                  batch.back().driver, batch.back().movement,
                  batch.back().yardsFallen,
@@ -57964,6 +57977,7 @@ private:
         o << ",\"class\":" << uint32(bot->getClass());
         o << ",\"alive\":" << (bot->IsAlive() ? "true" : "false");
         o << ",\"health\":" << bot->GetHealth() << ",\"max_health\":" << bot->GetMaxHealth();
+        o << ",\"recoveries_per_hour\":" << RecentRecoveriesPerHour();
         o << ",\"power\":" << bot->GetPower(bot->getPowerType());
         o << ",\"max_power\":" << bot->GetMaxPower(bot->getPowerType());
         o << ",\"in_combat\":" << (bot->IsInCombat() ? "true" : "false");
@@ -57989,6 +58003,19 @@ private:
         o << ",\"has_bot_ai\":" << (GET_PLAYERBOT_AI(bot) ? "true" : "false");
         o << "}";
         return o.str();
+    }
+
+    static std::size_t RecentRecoveriesPerHour()
+    {
+        time_t const now = std::time(nullptr);
+        std::size_t count = 0;
+        std::lock_guard<std::mutex> guard(g_recoveryMutex);
+        for (auto const& entry : g_recoveryTimes)
+        {
+            std::vector<time_t> times(entry.second.begin(), entry.second.end());
+            count += OverseerDecisions::RecoveriesPerHour(times, now);
+        }
+        return count;
     }
 
     static std::string ProbeSpells(Player* bot)

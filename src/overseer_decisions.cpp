@@ -23690,4 +23690,19 @@ DungeonRunReport BuildDungeonRunReport(DungeonRunFacts const& run,
     return report;
 }
 
+std::size_t RecoveriesPerHour(std::vector<time_t> const& remedyTimes,
+                              time_t now, time_t windowSeconds)
+{
+    if (windowSeconds <= 0)
+        return 0;
+    // Half-open interval (now - windowSeconds, now]: a remedy exactly at the
+    // start of the window does not count, one exactly at now does.
+    time_t const cutoff = now - windowSeconds;
+    std::size_t count = 0;
+    for (time_t const t : remedyTimes)
+        if (t > cutoff && t <= now)
+            ++count;
+    return count;
+}
+
 }  // namespace OverseerDecisions

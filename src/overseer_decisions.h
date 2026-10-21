@@ -26166,6 +26166,13 @@ struct DungeonRunReport
 DungeonRunReport BuildDungeonRunReport(DungeonRunFacts const& run,
                                        std::vector<DungeonRunEventRow> const& events);
 
+// RECOVERIES PER HOUR — a health metric. Counts remedy applications whose
+// timestamp falls in the half-open interval (now - windowSeconds, now].
+// `remedyTimes` holds the times remedies were applied, oldest first. A rising
+// count means the cause is getting worse while the symptom stays hidden.
+std::size_t RecoveriesPerHour(std::vector<time_t> const& remedyTimes,
+                              time_t now, time_t windowSeconds = 3600);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
