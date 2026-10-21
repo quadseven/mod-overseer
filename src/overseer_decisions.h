@@ -3146,6 +3146,17 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
                                                   unsigned maximumSkips,
                                                   bool skipRefused = false);
 
+// WHY THE MODULE STOPPED, NOT HOW THE EXIT WAS CLEANED UP (#1089). A run that
+// stalls after the dungeon module switched itself off used to record only that
+// a `dc skip` was refused, and then the exit's own wording ("the failed exit
+// recovered by hearth"), so a health finding built from the row named the
+// cleanup as the cause. `raw` is the module's last stop text, as it says it
+// ("Dungeon clear stopped: the party never became ready after 180s (Waiting on
+// Uzza (low mana))"); the answer leads with "dungeon clear stopped:" and gives
+// the member it waited on as ", waiting on Uzza (low mana)". A stop with no
+// text is "dungeon clear switched itself off; no reason given".
+std::string DungeonModuleStopWords(std::string const& raw);
+
 // ------------------------------ how long busy may mean anything (#382) --
 //
 // `partyBusy` above is the input that outranks everything, and until #382
