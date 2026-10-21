@@ -16424,11 +16424,19 @@ private:
 
     bool ResolveDisenchantLoot(Player* bot, WorldSession* session, ObjectGuid itemGuid)
     {
-        if (!session || bot->GetLootGUID() != itemGuid)
+        if (!session)
+            return false;
+        if (bot->GetLootGUID() != itemGuid)
             return false;
         Item* item = bot->GetItemByGuid(itemGuid);
         if (!item)
+        {
+            WorldPacket release(CMSG_LOOT_RELEASE, 8);
+            release << itemGuid;
+            release.rpos(0);
+            session->HandleLootReleaseOpcode(release);
             return false;
+        }
         Loot& loot = item->loot;
         std::map<uint32, uint32> before;
         for (LootItem const& lootItem : loot.items)
@@ -16460,13 +16468,13 @@ private:
 
     void DriveDisenchant()
     {
-        for (auto const& [name, itemGuid] : LoadDisenchantErrands())
+        for (auto const& [name, requestedItemGuid] : LoadDisenchantErrands())
         {
             Player* bot = ObjectAccessor::FindPlayerByName(name);
             if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->IsInCombat() ||
                 bot->isMoving())
                 continue;
-            Item* item = bot->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(itemGuid));
+            Item* item = bot->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(requestedItemGuid));
             if (!item || !item->GetTemplate()->DisenchantID)
             {
                 CharacterDatabase.Execute(
