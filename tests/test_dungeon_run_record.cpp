@@ -304,6 +304,19 @@ void TheSummaryViewListsExactlyTheVocabulary()
     }
 }
 
+void CompletedRunsKeepTheirPortalKeyword()
+{
+    std::string const sql =
+        ReadFile("data/sql/characters/base/2026_10_21_00_overseer_dungeon_run_portal.sql");
+    std::string const source = ReadFile("src/mod_overseer.cpp");
+    Check("portal keyword migration adds the run column",
+          Has(sql, "ADD COLUMN `portal_keyword`"));
+    Check("completed run accounting writes the selected portal keyword",
+          Has(source, "SET portal_keyword = '{}'") &&
+              Has(source, "portal.keyword") &&
+              Has(source, "std::string(outcome) == \"complete\""));
+}
+
 }  // namespace
 
 int main()
@@ -322,6 +335,7 @@ int main()
     TheFlushIsOneAdditiveUpsert();
     TheHighlightVocabularyCoversTheRun();
     TheSummaryViewListsExactlyTheVocabulary();
+    CompletedRunsKeepTheirPortalKeyword();
 
     if (failures)
     {

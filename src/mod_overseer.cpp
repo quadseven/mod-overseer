@@ -42809,6 +42809,12 @@ private:
                                             portal, outcome, reason)
                       : OverseerDecisions::RunFailureFacts();
         AlignRunLeader(runId, leaderName);
+        if (runId && std::string(outcome) == "complete" && RunAccountingPresent() &&
+            SchemaHasColumns("overseer_dungeon_run", "'portal_keyword'", 1))
+            CharacterDatabase.Execute(
+                "UPDATE overseer_dungeon_run SET portal_keyword = '{}' "
+                "WHERE id = {} AND state = 'active'",
+                Esc(portal.keyword), runId);
         CloseRun(runId, outcome, reason);
         WriteRunEnded(coord, leaderName, runId, outcome, reason);
 
