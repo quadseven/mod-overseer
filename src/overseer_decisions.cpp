@@ -8379,6 +8379,126 @@ CrossingPrice PriceCrossings(std::vector<CrossingOffer> const& offers,
     return price;
 }
 
+CrossMapBerthResult ReadCrossMapBerth(CrossMapBerthFacts const& facts)
+{
+    CrossMapBerthResult result;
+
+    // Find transports that serve both origin and destination maps
+    struct Candidate
+    {
+        TransportBerthInfo const* transport;
+        CrossMapStop const* fromStop;
+        CrossMapStop const* toStop;
+        float toBerthYards;
+        float landingToGoalYards;
+        float rideSeconds;
+        float periodSeconds;
+    };
+    std::vector<Candidate> candidates;
+
+    for (TransportBerthInfo const& transport : facts.transports)
+    {
+        if (!transport.mapsUsed.count(facts.originMap) ||
+            !transport.mapsUsed.count(facts.destinationMap))
+            continue;
+
+        // Find the stop on the origin map (where leader is)
+        CrossMapStop const* fromStop = nullptr;
+        for (CrossMapStop const& stop : transport.stops)
+        {
+            if (stop.mapId == facts.originMap)
+            {
+                fromStop = &stop;
+                break;
+            }
+        }
+        if (!fromStop || !fromStop->berthKnown)
+            continue;
+
+        // Find the stop on the destination map
+        CrossMapStop const* toStop = nullptr;
+        for (CrossMapStop const& stop : transport.stops)
+        {
+            if (stop.mapId == facts.destinationMap)
+            {
+                toStop = &stop;
+                break;
+            }
+        }
+        if (!toStop || !toStop->berthKnown)
+            continue;
+
+        // Calculate distance from leader to berth
+        float const toBerthYards = std::hypot(fromStop->berthX - facts.leaderX,
+                                               fromStop->berthY - facts.leaderY);
+
+        // Landing to goal distance (goal is the dungeon portal, but we don't have it here)
+        // For the pure function, we use 0 as the goal distance since the caller
+        // will add the actual goal distance when pricing.
+        float const landingToGoalYards = 0.f;
+
+        // Ride time
+        std::uint32_t const period = transport.pathTimeMs;
+        float const rideSeconds = period
+            ? float(TransportRideMs(fromStop->departMs, toStop->arriveMs, period)) / 1000.f
+            : -1.f;
+        float const periodSeconds = float(period) / 1000.f;
+
+        if (rideSeconds < 0.f || periodSeconds < 0.f)
+            continue;
+
+        candidates.push_back({&transport, fromStop, toStop, toBerthYards,
+                              landingToGoalYards, rideSeconds, periodSeconds});
+    }
+
+    if (candidates.empty())
+        return result;
+
+    // Price each candidate: walk to berth + walk from landing + ride time + half period wait
+    constexpr float YARDS_PER_SECOND = CROSSING_PRICE_YARDS_PER_SECOND;
+    int bestIdx = -1;
+    float bestYards = std::numeric_limits<float>::max();
+
+    for (std::size_t i = 0; i < candidates.size(); ++i)
+    {
+        Candidate const& c = candidates[i];
+        float const yards = c.toBerthYards + c.landingToGoalYards +
+                            (c.rideSeconds + c.periodSeconds / 2.f) * YARDS_PER_SECOND;
+        if (yards < bestYards)
+        {
+            bestYards = yards;
+            bestIdx = static_cast<int>(i);
+        }
+    }
+
+    if (bestIdx < 0)
+        return result;
+
+    Candidate const& best = candidates[bestIdx];
+    result.transportFound = true;
+    result.transportEntry = best.transport->entry;
+    result.transportName = best.transport->name;
+    result.berthKnown = true;
+    result.berthX = best.fromStop->berthX;
+    result.berthY = best.fromStop->berthY;
+    result.berthZ = best.fromStop->berthZ;
+
+    // Check if berth is guarded using same logic as JudgePlaceDanger
+    PlaceDangerFacts dangerFacts;
+    dangerFacts.memberLevel = facts.memberLevel;
+    dangerFacts.threatLevelGap = facts.threatLevelGap;
+    dangerFacts.hostiles = facts.hostilesAtBerth;
+    dangerFacts.deathsNear = 0;
+    dangerFacts.repeatDeaths = 2;
+    dangerFacts.killerEntry = 0;
+
+    PlaceDanger const danger = JudgePlaceDanger(dangerFacts);
+    result.berthGuarded = danger.threats > 0;
+    result.berthGuardLevel = danger.strongest;
+
+    return result;
+}
+
 char const* StrandedWayName(StrandedWay way)
 {
     switch (way)

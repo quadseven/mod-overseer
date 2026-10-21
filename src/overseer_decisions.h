@@ -51,6 +51,7 @@
 #include <cstdio>
 #include <ctime>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -9804,6 +9805,97 @@ struct CrossingPrice
 
 CrossingPrice PriceCrossings(std::vector<CrossingOffer> const& offers,
                              CrossingPriceLimits const& limits);
+
+// A crew member on a transport, as read from spawn data. Used to assess
+// whether the crew is hostile to the crossing party.
+struct CrossingCrewMember
+{
+    std::uint32_t faction{0};
+    float x{0.f};  // offsets on the transport, as its spawn rows hold them
+    float y{0.f};
+    float z{0.f};
+};
+
+// Constant used for pricing crossings: walk speed in yards per second.
+constexpr float CROSSING_PRICE_YARDS_PER_SECOND = 7.0f;
+
+// Forward declaration for cross-map berth reading.
+struct PlaceHostile;
+
+// --------------------------------------- cross-map berth reading (#274) --
+//
+// THE ADAPTER READS THE TRANSPORT CATALOGUE AND THE WORLD'S SPAWN DATA, then
+// asks this pure function which transport to use and whether its berth is safe.
+// The berth comes from the transport's stop frame (KeyFrame::IsStopFrame(),
+// Node->actionFlag == 2) via the survey's PickBerth, never derived or guessed.
+// The hostile sweep uses the same radius and level logic as JudgePlaceDanger.
+struct CrossMapStop
+{
+    std::uint32_t mapId{0};
+    std::uint32_t arriveMs{0};
+    std::uint32_t departMs{0};
+    bool berthKnown{false};
+    float berthX{0.f};
+    float berthY{0.f};
+    float berthZ{0.f};
+    std::vector<BerthCandidate> levelBerths;
+};
+
+struct TransportBerthInfo
+{
+    std::uint32_t entry{0};
+    std::string name;
+    std::uint32_t pathTimeMs{0};
+    std::set<std::uint32_t> mapsUsed;
+    std::vector<CrossMapStop> stops;
+    std::vector<CrossingCrewMember> crew;
+};
+
+struct CrossMapBerthFacts
+{
+    CrossMapBerthFacts() = default;
+
+    CrossMapBerthFacts(std::vector<TransportBerthInfo> const& t,
+                     std::uint32_t originMap,
+                     std::uint32_t destinationMap,
+                     float leaderX,
+                     float leaderY,
+                     std::vector<PlaceHostile> const& hostilesAtBerth,
+                     std::uint32_t memberLevel,
+                     std::uint32_t threatLevelGap)
+        : transports(t)
+        , originMap(originMap)
+        , destinationMap(destinationMap)
+        , leaderX(leaderX)
+        , leaderY(leaderY)
+        , hostilesAtBerth(hostilesAtBerth)
+        , memberLevel(memberLevel)
+        , threatLevelGap(threatLevelGap)
+    {}
+    std::vector<TransportBerthInfo> const& transports;
+    std::uint32_t originMap{0};
+    std::uint32_t destinationMap{0};
+    float leaderX{0.f};
+    float leaderY{0.f};
+    std::vector<PlaceHostile> const& hostilesAtBerth;
+    std::uint32_t memberLevel{0};
+    std::uint32_t threatLevelGap{0};
+};
+
+struct CrossMapBerthResult
+{
+    bool transportFound{false};
+    bool berthKnown{false};
+    float berthX{0.f};
+    float berthY{0.f};
+    float berthZ{0.f};
+    bool berthGuarded{false};
+    std::uint32_t berthGuardLevel{0};
+    std::uint32_t transportEntry{0};
+    std::string transportName;
+};
+
+CrossMapBerthResult ReadCrossMapBerth(CrossMapBerthFacts const& facts);
 
 // ------------------------ a member stranded on another continent (#274) --
 //
