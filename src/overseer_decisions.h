@@ -20317,6 +20317,23 @@ bool MayCraftNow(std::string const& job, bool inDungeonRun, bool alive, bool inC
 // character off a taxi would cancel an errand nobody asked to cancel.
 bool CraftDismountsFirst(bool mounted, bool inFlight);
 
+// A DISENCHANT REQUEST NAMES ITS ITEM AS `item:<guid>`: digits only, nonzero,
+// and no wider than 32 bits. ObjectGuid::LowType is uint32 on the pinned core,
+// so a wider value would be truncated by ObjectGuid::Create into some other
+// item, and std::strtoull alone accepts a leading space or '-' and wraps the
+// minus. Writes the GUID to `low` and returns true; leaves `low` untouched
+// and returns false for anything else.
+bool ParseDisenchantItemGuid(std::string const& command, std::uint32_t& low);
+
+// A STANDING ITEM-TARGET ERRAND ENDS ON WHAT THE WORLD READS BACK, NEVER ON
+// THE CAST RESULT. A refused cast and an accepted one still inside its cast
+// time read back the same - nothing changed - and both leave the errand
+// standing for the next poll, the discipline DriveCraft holds. A disenchant
+// is done once a reagent landed in the bags or the item is gone; an enchant
+// once the item's permanent enchant slot reads back nonzero.
+bool DisenchantErrandDone(bool reagentGained, bool itemConsumed);
+bool EnchantErrandDone(std::uint32_t permanentEnchantId);
+
 // THE SPELL THAT CONJURES A RECIPE'S SPELL FOCUS WHERE THE CRAFTER STANDS, or
 // 0 when no such spell exists and the focus is a world object somebody must be
 // walked to. Keyed on SpellInfo::RequiresSpellFocus (SpellFocusObject.dbc) so

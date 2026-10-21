@@ -327,7 +327,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cerrno>
 #include <ctime>
 #include <deque>
 // std::exception, for the one catch in this file. Pulled in
@@ -16416,24 +16415,16 @@ private:
     static char const* DoDisenchant(Player* bot, std::string const& command,
                                     char const*& status, std::string& result)
     {
-        constexpr char PREFIX[] = "item:";
-        if (command.compare(0, sizeof(PREFIX) - 1, PREFIX) != 0)
+        // The GUID is parsed to a bounded uint32 before anything else sees it,
+        // so the UPDATE below formats an integer, never command text.
+        uint32 low = 0;
+        if (!OverseerDecisions::ParseDisenchantItemGuid(command, low))
         {
             status = "error";
-            result = "{\"outcome\":\"refused\",\"reason\":\"expected item:<guid>\"}";
+            result = "{\"outcome\":\"refused\",\"reason\":\"expected item:<guid>, a nonzero 32-bit item GUID\"}";
             return "malformed disenchant request";
         }
-        std::string const value = command.substr(sizeof(PREFIX) - 1);
-        char* end = nullptr;
-        errno = 0;
-        unsigned long long const raw = std::strtoull(value.c_str(), &end, 10);
-        if (errno || end == value.c_str() || *end || raw == 0)
-        {
-            status = "error";
-            result = "{\"outcome\":\"refused\",\"reason\":\"invalid item GUID\"}";
-            return "invalid item GUID";
-        }
-        Item* item = bot->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(raw));
+        Item* item = bot->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(low));
         if (!item || !item->GetTemplate()->DisenchantID)
         {
             status = "error";
@@ -16442,15 +16433,17 @@ private:
         }
         CharacterDatabase.Execute(
             "UPDATE overseer_roster SET disenchant_guid = {} WHERE name = '{}' AND enabled = 1",
-            raw, Esc(bot->GetName()));
+            low, Esc(bot->GetName()));
         status = "delivered";
-        result = "{\"outcome\":\"accepted\",\"item_guid\":" + std::to_string(raw) + "}";
+        result = "{\"outcome\":\"accepted\",\"item_guid\":" + std::to_string(low) + "}";
         return "standing disenchant errand recorded";
     }
 
-    std::map<std::string, uint64> LoadDisenchantErrands()
+    // Both errand maps live for one poll and hold at most one entry per
+    // enabled roster row, the same lifetime as DriveCraft's LoadCraftErrands.
+    std::map<std::string, uint32> LoadDisenchantErrands()
     {
-        std::map<std::string, uint64> errands;
+        std::map<std::string, uint32> errands;
         QueryResult result = CharacterDatabase.Query(
             "SELECT name, disenchant_guid FROM overseer_roster "
             "WHERE enabled = 1 AND disenchant_guid <> 0");
@@ -16459,7 +16452,7 @@ private:
         do
         {
             Field* fields = result->Fetch();
-            errands[fields[0].Get<std::string>()] = fields[1].Get<uint64>();
+            errands[fields[0].Get<std::string>()] = fields[1].Get<uint32>();
         } while (result->NextRow());
         return errands;
     }
@@ -16481,22 +16474,55 @@ private:
         return errands;
     }
 
-    bool ResolveDisenchantLoot(Player* bot, WorldSession* session, ObjectGuid itemGuid)
+    // May an item-target errand act on this character this poll? Present,
+    // alive, out of combat and standing still - a cast with a cast time is
+    // interrupted by any of the others.
+    static bool ItemErrandMayRun(Player* bot)
     {
-        if (!session)
-            return false;
-        if (bot->GetLootGUID() != itemGuid)
-            return false;
+        return bot && bot->IsInWorld() && bot->IsAlive() && !bot->IsInCombat() &&
+               !bot->isMoving();
+    }
+
+    // DriveCraft's cheap reagent pre-filter: short of a reagent is the
+    // ordinary way the errand waits, not an error worth a refused cast.
+    static bool HasSpellReagents(Player* bot, SpellInfo const* info)
+    {
+        for (uint32 index = 0; index < MAX_SPELL_REAGENTS; ++index)
+            if (info->Reagent[index] > 0 &&
+                !bot->HasItemCount(static_cast<uint32>(info->Reagent[index]),
+                                   static_cast<uint32>(info->ReagentCount[index])))
+                return false;
+        return true;
+    }
+
+    static void ReleaseLoot(WorldSession* session, ObjectGuid lootGuid)
+    {
+        WorldPacket release(CMSG_LOOT_RELEASE, 8);
+        release << lootGuid;
+        release.rpos(0);
+        session->HandleLootReleaseOpcode(release);
+    }
+
+    // Takes every slot of the LOOT_DISENCHANTING window open on `itemGuid`,
+    // releases it, and reads the bags back. The two returns before the take
+    // loop leave no window of this item open: with no session there is no
+    // handler to release through, and a loot GUID naming anything else means
+    // this item's window is not the one open. A vanished item's window is
+    // released. The handlers report failure to a client a bot does not have
+    // and throw nothing for a packet built here, so the read-back is the
+    // check, and a window that yields nothing is logged.
+    void ResolveDisenchantLoot(Player* bot, WorldSession* session, ObjectGuid itemGuid)
+    {
+        if (!session || bot->GetLootGUID() != itemGuid)
+            return;
         Item* item = bot->GetItemByGuid(itemGuid);
         if (!item)
         {
-            WorldPacket release(CMSG_LOOT_RELEASE, 8);
-            release << itemGuid;
-            release.rpos(0);
-            session->HandleLootReleaseOpcode(release);
-            return false;
+            ReleaseLoot(session, itemGuid);
+            return;
         }
         Loot& loot = item->loot;
+        // One entry per distinct item in this one window, gone with the call.
         std::map<uint32, uint32> before;
         for (LootItem const& lootItem : loot.items)
             before.emplace(lootItem.itemid, bot->GetItemCount(lootItem.itemid));
@@ -16510,38 +16536,44 @@ private:
             take.rpos(0);
             session->HandleAutostoreLootItemOpcode(take);
         }
-        WorldPacket release(CMSG_LOOT_RELEASE, 8);
-        release << itemGuid;
-        release.rpos(0);
-        session->HandleLootReleaseOpcode(release);
+        ReleaseLoot(session, itemGuid);
         bool gained = false;
         for (auto const& [entry, count] : before)
             gained = gained || bot->GetItemCount(entry) > count;
         bool const consumed = bot->GetItemByGuid(itemGuid) == nullptr;
-        if (gained || consumed)
+        if (OverseerDecisions::DisenchantErrandDone(gained, consumed))
+        {
+            // Execute queues the write on the async DB worker; the world
+            // thread does not wait on it.
             CharacterDatabase.Execute(
                 "UPDATE overseer_roster SET disenchant_guid = 0 WHERE name = '{}'",
                 Esc(bot->GetName()));
-        return true;
+            return;
+        }
+        LOG_WARN("module.overseer",
+                 "overseer: '{}' took and released the disenchant loot of item {} ({} "
+                 "slots) and nothing landed in the bags - leaving the errand standing "
+                 "for the next poll", bot->GetName(), itemGuid.GetCounter(), slots);
     }
 
     void DriveDisenchant()
     {
+        constexpr uint32 DISENCHANT_SPELL = 13262;
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(DISENCHANT_SPELL);
         for (auto const& [name, requestedItemGuid] : LoadDisenchantErrands())
         {
             Player* bot = ObjectAccessor::FindPlayerByName(name);
-            if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->IsInCombat() ||
-                bot->isMoving())
+            if (!ItemErrandMayRun(bot))
                 continue;
             Item* item = bot->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(requestedItemGuid));
             if (!item || !item->GetTemplate()->DisenchantID)
             {
+                // Execute queues the write on the async DB worker.
                 CharacterDatabase.Execute(
                     "UPDATE overseer_roster SET disenchant_guid = 0 WHERE name = '{}'", Esc(name));
                 continue;
             }
-            constexpr uint32 DISENCHANT_SPELL = 13262;
-            if (!bot->HasSpell(DISENCHANT_SPELL))
+            if (!info || !bot->HasSpell(DISENCHANT_SPELL))
                 continue;
             WorldSession* session = bot->GetSession();
             if (!session)
@@ -16559,9 +16591,17 @@ private:
             targets.SetItemTarget(item);
             // natural-only: cast the disenchant spell the character knows,
             // untriggered, against this owned item and its normal loot flow.
-            SpellCastResult const cast = bot->CastSpell(targets, DISENCHANT_SPELL, false);
+            SpellCastResult const cast = bot->CastSpell(targets, info, nullptr, TRIGGERED_NONE);
             if (cast != SPELL_CAST_OK)
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' was refused disenchanting item {} (SpellCastResult "
+                         "{}) - leaving the errand standing for the next poll",
+                         name, requestedItemGuid, static_cast<uint32>(cast));
                 continue;
+            }
+            // The cast has a cast time, so the window usually opens on a
+            // later poll and is resolved by the branch above.
             ResolveDisenchantLoot(bot, session, itemGuid);
         }
     }
@@ -16573,8 +16613,7 @@ private:
             uint32 const spellId = errand.first;
             uint8 const slot = errand.second;
             Player* bot = ObjectAccessor::FindPlayerByName(name);
-            if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->IsInCombat() ||
-                bot->isMoving())
+            if (!ItemErrandMayRun(bot))
                 continue;
             SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
             if (!info || !bot->HasSpell(spellId) || slot >= EQUIPMENT_SLOT_END)
@@ -16582,40 +16621,39 @@ private:
             Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
             if (!item)
                 continue;
-            if (item->GetEnchantmentId(PERM_ENCHANTMENT_SLOT))
+            if (OverseerDecisions::EnchantErrandDone(item->GetEnchantmentId(PERM_ENCHANTMENT_SLOT)))
             {
+                // Execute queues the write on the async DB worker.
                 CharacterDatabase.Execute(
                     "UPDATE overseer_roster SET enchant_spell = 0 WHERE name = '{}'", Esc(name));
                 continue;
             }
-            ObjectGuid const itemGuid = item->GetGUID();
-            bool shortOfReagents = false;
-            for (uint32 index = 0; index < MAX_SPELL_REAGENTS; ++index)
-                if (info->Reagent[index] > 0 &&
-                    !bot->HasItemCount(static_cast<uint32>(info->Reagent[index]),
-                                       static_cast<uint32>(info->ReagentCount[index])))
-                {
-                    shortOfReagents = true;
-                    break;
-                }
-            if (shortOfReagents)
+            if (!HasSpellReagents(bot, info))
                 continue;
+            ObjectGuid const itemGuid = item->GetGUID();
             SpellCastTargets targets;
             targets.SetItemTarget(item);
             // natural-only: the known enchant spell uses its declared
             // reagents and the normal item-target CheckCast path.
-            SpellCastResult const result = bot->CastSpell(targets, spellId, false);
+            SpellCastResult const result = bot->CastSpell(targets, info, nullptr, TRIGGERED_NONE);
             Item* const readBack = bot->GetItemByGuid(itemGuid);
-            if (result == SPELL_CAST_OK && readBack &&
-                readBack->GetEnchantmentId(PERM_ENCHANTMENT_SLOT))
+            if (OverseerDecisions::EnchantErrandDone(
+                    readBack ? readBack->GetEnchantmentId(PERM_ENCHANTMENT_SLOT) : 0))
             {
                 RecordEvent(bot, "craft", spellId, info->SpellName[LOCALE_enUS],
                             "applied a permanent enchant to an owned item");
                 CharacterDatabase.Execute(
                     "UPDATE overseer_roster SET enchant_spell = 0 WHERE name = '{}'", Esc(name));
+                continue;
             }
-            // A transient refusal leaves the standing errand set for the next
-            // poll; successful item read-back clears it above.
+            // A refusal, or a cast still inside its cast time, leaves the
+            // standing errand set; the read-back above ends it on a later poll.
+            if (result != SPELL_CAST_OK)
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' was refused enchant '{}' ({}) on slot {} "
+                         "(SpellCastResult {}) - leaving the errand standing for the next poll",
+                         name, info->SpellName[LOCALE_enUS], spellId, uint32(slot),
+                         static_cast<uint32>(result));
         }
     }
 

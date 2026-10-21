@@ -17567,6 +17567,37 @@ bool CraftDismountsFirst(bool mounted, bool inFlight)
     return mounted && !inFlight;
 }
 
+bool ParseDisenchantItemGuid(std::string const& command, std::uint32_t& low)
+{
+    std::string const prefix = "item:";
+    if (command.compare(0, prefix.size(), prefix) != 0 || command.size() == prefix.size())
+        return false;
+    std::uint64_t value = 0;
+    for (std::size_t i = prefix.size(); i < command.size(); ++i)
+    {
+        char const c = command[i];
+        if (c < '0' || c > '9')
+            return false;
+        value = value * 10 + static_cast<std::uint64_t>(c - '0');
+        if (value > 0xFFFFFFFFull)
+            return false;
+    }
+    if (value == 0)
+        return false;
+    low = static_cast<std::uint32_t>(value);
+    return true;
+}
+
+bool DisenchantErrandDone(bool reagentGained, bool itemConsumed)
+{
+    return reagentGained || itemConsumed;
+}
+
+bool EnchantErrandDone(std::uint32_t permanentEnchantId)
+{
+    return permanentEnchantId != 0;
+}
+
 unsigned FocusLighterSpell(unsigned requiresSpellFocus)
 {
     return requiresSpellFocus == SPELL_FOCUS_COOKING_FIRE ? SPELL_BASIC_CAMPFIRE : 0;

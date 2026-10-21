@@ -1,7 +1,7 @@
 -- Standing item-target errands for disenchanting and permanent enchanting.
 ALTER TABLE `overseer_roster`
-    ADD COLUMN `disenchant_guid` BIGINT UNSIGNED NOT NULL DEFAULT 0
-        COMMENT 'Owned item GUID for the standing disenchant errand; 0 means none',
+    ADD COLUMN `disenchant_guid` INT UNSIGNED NOT NULL DEFAULT 0
+        COMMENT 'Owned item low GUID (32-bit, as ObjectGuid::LowType) for the standing disenchant errand; 0 means none',
     ADD COLUMN `enchant_spell` SMALLINT UNSIGNED NOT NULL DEFAULT 0
         COMMENT 'Permanent enchant spell for the standing enchant errand; 0 means none',
     ADD COLUMN `enchant_slot` TINYINT UNSIGNED NOT NULL DEFAULT 0

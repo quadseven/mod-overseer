@@ -174,14 +174,18 @@ Instead, this is honestly **two new drives**:
 
 - **`DriveEnchant`**: `enchant_spell` and `enchant_slot` hold the standing
   errand. It checks the known spell and reagents, targets the equipped item
-  with `SpellCastTargets`, and reads the permanent enchant slot back before
-  recording success. Refusal leaves the errand standing.
-- **`DriveDisenchant`**: `disenchant_guid` holds the owned item GUID. It casts
-  spell 13262 with an item target, then uses the bot session's loot packet
-  handlers to take the `LOOT_DISENCHANTING` slots and release the window.
-  Inventory counts are read back before a reagent gain is recorded. Invalid
-  targets are cleared; a transient cast refusal leaves the errand standing.
-  The `disenchant` command kind accepts `item:<guid>` to set this errand.
+  with `SpellCastTargets` through the `SpellInfo`-taking `Unit::CastSpell`
+  overload, and reads the permanent enchant slot back before recording
+  success (`OverseerDecisions::EnchantErrandDone`). Refusal leaves the errand
+  standing.
+- **`DriveDisenchant`**: `disenchant_guid` holds the owned item's 32-bit low
+  GUID. It casts spell 13262 with an item target, then uses the bot session's
+  loot packet handlers to take the `LOOT_DISENCHANTING` slots and release the
+  window. Inventory counts are read back before the errand ends
+  (`OverseerDecisions::DisenchantErrandDone`). Invalid targets are cleared; a
+  transient cast refusal leaves the errand standing. The `disenchant` command
+  kind accepts `item:<guid>`, digits only, nonzero and at most 32 bits
+  (`OverseerDecisions::ParseDisenchantItemGuid`), to set this errand.
 
 ## What a small, safe first slice would still need
 
