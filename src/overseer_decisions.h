@@ -6438,15 +6438,45 @@ LootCouncilPick LootCouncilHeuristic(std::vector<LootCandidate> const& candidate
 // What one member votes on an open group-loot roll the council is deciding.
 enum class LootCouncilVote
 {
-    Hold,      // not decided yet; cast nothing this time
-    Need,      // the council's recipient
-    Greed,     // the council named nobody: everybody greeds
-    Pass,      // somebody else's
-    Upstream,  // too late for the council; the upstream rule votes
+    Hold,        // not decided yet; cast nothing this time
+    Need,        // the council's recipient
+    Greed,       // the council named nobody and nobody can disenchant it: everybody greeds
+    Pass,        // somebody else's, or the Enchanter's to disenchant
+    Upstream,    // too late for the council; the upstream rule votes
+    Disenchant,  // the council named nobody and this voter is the Enchanter (#160)
 };
 
+// WHETHER A DROP THE COUNCIL GIVES NOBODY CAN BE TAKEN APART INSTEAD (#160).
+// The council's vote is cast before upstream's own rule, so a council Greed
+// on an unwearable weapon or armour piece meant no setting could ever turn it
+// into a Disenchant: the family won the item and vendored it. The core counts
+// Disenchant in the same tier as Greed and the highest roll among both wins
+// (Group::CountTheRoll), so the materials reach the Enchanter only when the
+// others pass.
+//
+// THE ROLL'S VOTE MASK IS NOT ASKED. The core sets its Disenchant flag from
+// Group::m_maxEnchantingLevel, which is taken when a member joins and is not
+// raised when a skill rises later, so it lags a character that learns
+// Enchanting while grouped. CountRollVote does not read the mask either, and
+// upstream's own LootRollAction casts DISENCHANT without it. The voters' live
+// skill is the same question asked of the present.
+struct LootDisenchantFacts
+{
+    bool realmAllows{false};         // AiPlayerbot.LootRollDisenchant is on
+    bool enchanterRolling{false};    // a member voting on this roll can take it apart
+    bool voterCanDisenchant{false};  // this voter can (CanDisenchantDrop)
+};
+
+// A drop with disenchant loot (`disenchantId` non-zero) needs at least
+// `requiredSkill` Enchanting to take apart; ItemTemplate gives -1 for an item
+// that cannot be disenchanted at all. `enchanting` is the character's skill.
+bool CanDisenchantDrop(uint32_t disenchantId, int32_t requiredSkill, uint32_t enchanting);
+
+// When the council named nobody, the Enchanter disenchants and everybody else
+// passes, if `disenchant` allows it; otherwise everybody greeds.
 LootCouncilVote LootCouncilVoteFor(bool decided, std::string const& recipient,
-                                   std::string const& voter, long openSeconds);
+                                   std::string const& voter, long openSeconds,
+                                   LootDisenchantFacts const& disenchant);
 
 // A live item mandate takes precedence on bind-on-pickup group rolls. Every
 // other member passes, including when the mandate has an invalid recipient.
@@ -26346,6 +26376,13 @@ struct DungeonRunReport
 // `text` filled in; the adapter writes `text` to the report table.
 DungeonRunReport BuildDungeonRunReport(DungeonRunFacts const& run,
                                        std::vector<DungeonRunEventRow> const& events);
+
+// RECOVERIES PER HOUR — a health metric. Counts remedy applications whose
+// timestamp falls in the half-open interval (now - windowSeconds, now].
+// `remedyTimes` holds the times remedies were applied, oldest first. A rising
+// count means the cause is getting worse while the symptom stays hidden.
+std::size_t RecoveriesPerHour(std::vector<time_t> const& remedyTimes,
+                              time_t now, time_t windowSeconds = 3600);
 
 }  // namespace OverseerDecisions
 

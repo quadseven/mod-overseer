@@ -92,6 +92,8 @@ int main()
              "sPlayerbotAIConfig.RandomBotAccountPrefix",
              "sPlayerbotAIConfig.randomClassSpecIndex",
              "sPlayerbotAIConfig.RandomClassSpecIndex",
+             "sPlayerbotAIConfig.lootRollDisenchant",
+             "sPlayerbotAIConfig.LootRollDisenchant",
          })
         Check(adapter.find(gone) == std::string::npos,
               std::string("the adapter must reach this through overseer_core_compat.h, not "
@@ -104,6 +106,7 @@ int main()
              "requires { config.spellDistance; }",
              "requires { config.randomBotAccountPrefix; }",
              "requires { config.randomClassSpecIndex; }",
+             "requires { config.lootRollDisenchant; }",
              "concept HasServerPacketSentHook",
              "concept HasCanMarkAccountOfflineHook",
          })
