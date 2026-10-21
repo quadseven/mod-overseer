@@ -21,8 +21,11 @@
 #include <vector>
 
 using OverseerDecisions::AvoidDangerousZone;
+using OverseerDecisions::CompareDeathRate;
 using OverseerDecisions::CreatureDanger;
 using OverseerDecisions::CreaturePullIsSuppressed;
+using OverseerDecisions::DangerListText;
+using OverseerDecisions::DeathRateComparison;
 using OverseerDecisions::DeathRecord;
 using OverseerDecisions::ScoreCreatureDanger;
 using OverseerDecisions::ScoreZoneDanger;
@@ -58,6 +61,14 @@ void CheckUInt(char const* what, unsigned got, unsigned want)
     if (got == want)
         return;
     std::printf("FAIL %s: got %u, wanted %u\n", what, got, want);
+    ++failures;
+}
+
+void CheckText(char const* what, std::string const& got, std::string const& want)
+{
+    if (got == want)
+        return;
+    std::printf("FAIL %s:\n  got    [%s]\n  wanted [%s]\n", what, got.c_str(), want.c_str());
     ++failures;
 }
 
@@ -339,6 +350,77 @@ void ASafeAimedZoneIsNotAvoided()
     Check("there is no no-alternative state", verdict.noAlternative, false);
 }
 
+// The family page shows the danger list: every zone at or above the threshold
+// by score, then every creature entry whose pulls are suppressed. A zone or an
+// entry below its threshold is not on the list.
+void TheDangerListNamesZonesAndCreaturesAboveThreshold()
+{
+    std::vector<ZoneDanger> const zones = {
+        {51, 4, 4, 4.0},
+        {46, 3, 3, 3.0},
+        {10, 2, 1, 1.0},  // below the threshold of three
+    };
+    std::vector<CreatureDanger> const creatures = {
+        {12345, 2},
+        {777, 1},  // one death does not suppress the pull
+    };
+
+    CheckText("the danger list for the family page",
+              DangerListText(zones, creatures, 3, 2),
+              "zone 51: score 4.00 (4 of 4 deaths to creatures far above the party)\n"
+              "zone 46: score 3.00 (3 of 3 deaths to creatures far above the party)\n"
+              "creature 12345: 2 deaths, not pulled\n");
+}
+
+// Nothing above threshold renders as empty, so the page shows its own empty
+// state instead of a stale or invented list.
+void AQuietDangerListIsEmpty()
+{
+    std::vector<ZoneDanger> const zones = {{10, 1, 1, 1.0}};
+    std::vector<CreatureDanger> const creatures = {{777, 1}};
+
+    CheckText("nothing is dangerous", DangerListText(zones, creatures, 3, 2), "");
+}
+
+// AC4: deaths per hour, the week before the change against the time since,
+// reported as numbers. The baseline is the seven days before the change; a
+// death older than that, or with no timestamp, is in neither window.
+void DeathsPerHourAreComparedAgainstAWeekBaseline()
+{
+    std::time_t const changeAt = NOW - 24 * 3600;  // the change went live a day ago
+    std::vector<DeathRecord> deaths;
+    for (int i = 0; i < 84; ++i)  // 84 deaths over the week before: 0.5 per hour
+        deaths.push_back(D(17, 46, "creature", 100, 25, changeAt - 1 - i * 7200));
+    for (int i = 0; i < 6; ++i)  // 6 deaths in the day since: 0.25 per hour
+        deaths.push_back(D(17, 10, "environment", 0, 0, changeAt + i * 3600));
+    deaths.push_back(D(17, 46, "creature", 100, 25, changeAt - 8 * 86400));  // too old
+    deaths.push_back(D(17, 46, "creature", 100, 25, 0));                     // no timestamp
+
+    DeathRateComparison const rate = CompareDeathRate(deaths, changeAt, NOW);
+
+    CheckUInt("baseline deaths", rate.baseline.deaths, 84);
+    CheckDouble("baseline hours", rate.baseline.hours, 168.0, 1e-9);
+    CheckDouble("baseline per hour", rate.baseline.perHour, 0.5, 1e-9);
+    CheckUInt("deaths since the change", rate.since.deaths, 6);
+    CheckDouble("hours since the change", rate.since.hours, 24.0, 1e-9);
+    CheckDouble("per hour since the change", rate.since.perHour, 0.25, 1e-9);
+    CheckText("the rate is reported as numbers", rate.text,
+              "deaths per hour: baseline 0.50 (84 in 168.0 h), "
+              "since the change 0.25 (6 in 24.0 h)");
+}
+
+// Asked at the moment of the change there is no time since it, so its rate is
+// zero rather than a division by zero.
+void NoTimeSinceTheChangeHasNoRate()
+{
+    std::vector<DeathRecord> const deaths = {D(17, 46, "creature", 100, 25, NOW)};
+    DeathRateComparison const rate = CompareDeathRate(deaths, NOW, NOW);
+
+    CheckUInt("the death at the change counts as since", rate.since.deaths, 1);
+    CheckDouble("no hours since", rate.since.hours, 0.0, 1e-9);
+    CheckDouble("no rate without hours", rate.since.perHour, 0.0, 1e-9);
+}
+
 }  // namespace
 
 int main()
@@ -356,6 +438,10 @@ int main()
     ADangerousAimedZoneIsAvoidedWhenAnAlternativeExists();
     NoSafeRouteMeansNoAlternative();
     ASafeAimedZoneIsNotAvoided();
+    TheDangerListNamesZonesAndCreaturesAboveThreshold();
+    AQuietDangerListIsEmpty();
+    DeathsPerHourAreComparedAgainstAWeekBaseline();
+    NoTimeSinceTheChangeHasNoRate();
 
     if (failures)
     {

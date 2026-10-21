@@ -23738,6 +23738,62 @@ TravelAvoidance AvoidDangerousZone(std::vector<TravelLeg> const& legs,
     return verdict;
 }
 
+std::string DangerListText(std::vector<ZoneDanger> const& zones,
+                           std::vector<CreatureDanger> const& creatures,
+                           unsigned zoneThreshold, unsigned creatureThreshold)
+{
+    std::ostringstream ss;
+    ss << std::fixed << std::setprecision(2);
+    for (ZoneDanger const& z : zones)
+        if (ZoneIsTooDangerous(z, zoneThreshold))
+            ss << "zone " << z.zone << ": score " << z.score << " (" << z.lethalDeaths
+               << " of " << z.deaths << " deaths to creatures far above the party)\n";
+    for (CreatureDanger const& c : creatures)
+        if (CreaturePullIsSuppressed(c, creatureThreshold))
+            ss << "creature " << c.entry << ": " << c.deaths << " deaths, not pulled\n";
+    return ss.str();
+}
+
+namespace
+{
+DeathRate RateOver(unsigned deaths, std::time_t seconds)
+{
+    DeathRate rate;
+    rate.deaths = deaths;
+    rate.hours = static_cast<double>(seconds) / 3600.0;
+    rate.perHour = rate.hours > 0.0 ? static_cast<double>(deaths) / rate.hours : 0.0;
+    return rate;
+}
+}  // namespace
+
+DeathRateComparison CompareDeathRate(std::vector<DeathRecord> const& deaths,
+                                     std::time_t changeAt, std::time_t now)
+{
+    std::time_t const week = 7 * 86400;
+    unsigned before = 0;
+    unsigned after = 0;
+    for (DeathRecord const& d : deaths)
+    {
+        if (d.createdAt == 0)
+            continue;
+        if (d.createdAt >= changeAt - week && d.createdAt < changeAt)
+            ++before;
+        else if (d.createdAt >= changeAt && d.createdAt <= now)
+            ++after;
+    }
+    DeathRateComparison out;
+    out.baseline = RateOver(before, week);
+    out.since = RateOver(after, now > changeAt ? now - changeAt : 0);
+    std::ostringstream ss;
+    ss << std::fixed << "deaths per hour: baseline " << std::setprecision(2)
+       << out.baseline.perHour << " (" << out.baseline.deaths << " in "
+       << std::setprecision(1) << out.baseline.hours << " h), since the change "
+       << std::setprecision(2) << out.since.perHour << " (" << out.since.deaths << " in "
+       << std::setprecision(1) << out.since.hours << " h)";
+    out.text = ss.str();
+    return out;
+}
+
 // ----------------------------------- the post-run dungeon report (#152) --
 
 DungeonRunReport BuildDungeonRunReport(DungeonRunFacts const& run,

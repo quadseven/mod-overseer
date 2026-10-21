@@ -26197,6 +26197,37 @@ TravelAvoidance AvoidDangerousZone(std::vector<TravelLeg> const& legs,
                                    std::vector<ZoneDanger> const& danger,
                                    unsigned threshold);
 
+// The danger list the family page shows, one line per entry: every zone at or
+// above `zoneThreshold` in the order given (ScoreZoneDanger sorts by score),
+// then every creature entry whose pulls CreaturePullIsSuppressed at
+// `creatureThreshold`. "" when nothing is dangerous, so the page shows its own
+// empty state.
+std::string DangerListText(std::vector<ZoneDanger> const& zones,
+                           std::vector<CreatureDanger> const& creatures,
+                           unsigned zoneThreshold, unsigned creatureThreshold);
+
+// Deaths over a span of hours.
+struct DeathRate
+{
+    unsigned deaths{0};
+    double hours{0.0};
+    double perHour{0.0};   // 0 when the span has no hours
+};
+
+// Deaths per hour in the week before a change against the time since it.
+struct DeathRateComparison
+{
+    DeathRate baseline;   // the seven days before `changeAt`
+    DeathRate since;      // from `changeAt` up to `now`, both included
+    std::string text;     // both rates as numbers, for the report
+};
+
+// Count every `overseer_death` row by when it happened: the seven days before
+// `changeAt` are the baseline and `changeAt` to `now` is the time since. A row
+// with no timestamp, or outside both spans, is in neither.
+DeathRateComparison CompareDeathRate(std::vector<DeathRecord> const& deaths,
+                                     std::time_t changeAt, std::time_t now);
+
 // ----------------------------------- the post-run dungeon report (#152) --
 
 // One row as the summary view returns it, before any formatting. The view is
