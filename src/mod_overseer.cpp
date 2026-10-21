@@ -4423,11 +4423,35 @@ GuildRunLootTally TakeGuildRunLoot(std::vector<uint64> const& guids)
     return total;
 }
 
+// Can `who` take `proto` apart: its live Enchanting against the drop's own
+// requirement (OverseerDecisions::CanDisenchantDrop).
+static bool CanDisenchant(Player const* who, ItemTemplate const* proto)
+{
+    return who && OverseerDecisions::CanDisenchantDrop(
+                      proto->DisenchantID, proto->RequiredDisenchantSkill,
+                      static_cast<uint32>(who->GetSkillValue(SKILL_ENCHANTING)));
+}
+
+// What a drop the council gives nobody can become (#160): the realm's setting
+// and whether an Enchanter is among the voters.
+static OverseerDecisions::LootDisenchantFacts DisenchantFactsFor(Player const* bot, Roll const* roll,
+                                                                 ItemTemplate const* proto)
+{
+    OverseerDecisions::LootDisenchantFacts facts;
+    facts.realmAllows = OverseerCompat::LootRollDisenchant(sPlayerbotAIConfig);
+    facts.voterCanDisenchant = CanDisenchant(bot, proto);
+    for (auto const& [voter, cast] : roll->playerVote)
+        if (cast != NOT_VALID && CanDisenchant(ObjectAccessor::FindPlayer(voter), proto))
+            facts.enchanterRolling = true;
+    return facts;
+}
+
 // THE STEER (patches/mod-playerbots/0015). Asked by LootRollAction before its
 // own rule, on a map thread, for every open roll this bot has not voted on.
 // Only a roster character in a party (not a raid, which runs master loot)
 // voting on a weapon or a piece of armour is the council's; everything else
-// returns false and keeps the upstream vote.
+// returns false and keeps the upstream vote. A drop the council gives nobody
+// is the Enchanter's to disenchant when DisenchantFactsFor allows it.
 bool CouncilSteerRoll(Player* bot, Roll const* roll, RollVote& vote)
 {
     if (!bot || !roll)
@@ -4442,6 +4466,7 @@ bool CouncilSteerRoll(Player* bot, Roll const* roll, RollVote& vote)
 
     uint64 const key = roll->itemGUID.GetRawValue();
     time_t const now = std::time(nullptr);
+    OverseerDecisions::LootDisenchantFacts const disenchant = DisenchantFactsFor(bot, roll, proto);
     std::lock_guard<std::mutex> guard(g_councilMutex);
     if (g_councilRoster.find(bot->GetGUID().GetRawValue()) == g_councilRoster.end())
         return false;
@@ -4466,13 +4491,14 @@ bool CouncilSteerRoll(Player* bot, Roll const* roll, RollVote& vote)
     bool const decided = verdict != g_councilVerdicts.end();
     switch (OverseerDecisions::LootCouncilVoteFor(
         decided, decided ? verdict->second : std::string(), bot->GetName(),
-        static_cast<long>(now - noted->second.firstSeen)))
+        static_cast<long>(now - noted->second.firstSeen), disenchant))
     {
         case OverseerDecisions::LootCouncilVote::Hold: vote = NOT_EMITED_YET; return true;
         case OverseerDecisions::LootCouncilVote::Need: vote = NEED; return true;
         case OverseerDecisions::LootCouncilVote::Greed: vote = GREED; return true;
         case OverseerDecisions::LootCouncilVote::Pass: vote = PASS; return true;
         case OverseerDecisions::LootCouncilVote::Upstream: return false;
+        case OverseerDecisions::LootCouncilVote::Disenchant: vote = DISENCHANT; return true;
     }
     return false;
 }

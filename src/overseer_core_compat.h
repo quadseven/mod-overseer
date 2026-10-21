@@ -130,6 +130,15 @@ decltype(auto) RandomClassSpecIndex(Config& config)
         return (config.RandomClassSpecIndex);
 }
 
+template <typename Config>
+decltype(auto) LootRollDisenchant(Config& config)
+{
+    if constexpr (requires { config.lootRollDisenchant; })
+        return (config.lootRollDisenchant);
+    else
+        return (config.LootRollDisenchant);
+}
+
 // --- Playerbots config key names (mod-playerbots #2854, mod-overseer #1068) --
 // The same rename moved every config key from AiPlayerbot.<Name> to
 // Playerbots.<Name>, and the newer mod-playerbots reads only the new spelling:
