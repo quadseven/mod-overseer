@@ -443,6 +443,12 @@ constexpr uint32 CRAFT_POLL_MS = 20000;
 // every twenty seconds" rather than each on its own unexplained number.
 constexpr uint32 FISH_POLL_MS = 20000;
 
+// How often a standing lockpick errand (job='lockpick') is polled. Same cadence
+// as craft and fishing: one indexed SELECT against a column most characters
+// have zeroed, and a character at the wrong level or without the spell should
+// not wait longer than a minute for the planner to have corrected the row.
+constexpr uint32 LOCKPICK_POLL_MS = 20000;
+
 // How often a character sent to an NPC is pointed at it again (infra#2783).
 // RPG_WANDER_NPC self-expires to IDLE after statusWanderNpcDuration, which is
 // FIVE minutes (NewRpgAction.h:65, checked at NewRpgAction.cpp:278) - six times
@@ -8161,6 +8167,7 @@ public:
         _questTimer += diff;
         _craftTimer += diff;
         _fishTimer += diff;
+        _lockpickTimer += diff;
         _travelTimer += diff;
         _professionTimer += diff;
         _gearTimer += diff;
@@ -8328,6 +8335,15 @@ public:
         {
             _fishTimer = 0;
             DriveFish();
+        }
+        // Same ordering convention as DriveCraft and DriveFish above, and the
+        // same reason it is safe: a character is job='quest' XOR job='craft'
+        // XOR job='fish' XOR job='lockpick', never two at once, so this is
+        // legibility, not a correctness requirement.
+        if (_lockpickTimer >= LOCKPICK_POLL_MS)
+        {
+            _lockpickTimer = 0;
+            DriveLockpick();
         }
         // BEFORE DriveTravel, so a staging aim this poll writes onto the
         // leader's travel_npc is picked up by DriveTravel the SAME tick
@@ -77512,6 +77528,7 @@ private:
     uint32 _questTimer = 0;
     uint32 _craftTimer = 0;
     uint32 _fishTimer = 0;
+    uint32 _lockpickTimer = 0;
     // WHEN A DEAD CHARACTER WAS FIRST SEEN STILL WAITING TO RELEASE, by name.
     //
     // There is no ghost clock for this state - a corpse, and therefore a ghost
