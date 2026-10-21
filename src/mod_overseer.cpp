@@ -34253,6 +34253,15 @@ private:
         // rather than once per coordinator.
         bool loggedAboveTheDoor{false};
 
+        // QUARANTINE AFTER FAILED APPROACH (#396). When FailApproach closes
+        // an attempt because the leader is above the corridor and not descending,
+        // the position is recorded here. The next IDLE poll refuses to re-open a
+        // run while the leader is still at or near that position. Cleared when
+        // the leader reaches a walkable approach (ApproachShape != Overhead).
+        bool quarantined{false};
+        float quarantineX{0.f}, quarantineY{0.f}, quarantineZ{0.f};
+        time_t quarantineSince{0};
+
         // --- the trip that follows this run (#391) ---------------------
         //
         // WHEN THE LEG STARTED, so it can be given up on. Stamped by
@@ -37898,10 +37907,18 @@ private:
     // in IDLE refuses to re-open at all while the leader is still above the
     // door. The campaign's own cap bounds the repeat, exactly as it does for
     // every other closing reason.
+    //
+    // QUARANTINE AFTER FAILED APPROACH (#396). When this closes an attempt
+    // because the leader is above the corridor and not descending, the position
+    // is recorded in the coordinator's quarantine state. The next IDLE poll
+    // refuses to re-open a run while the leader is still at or near that
+    // position. Cleared when the leader reaches a walkable approach
+    // (ApproachShape != Overhead).
     void FailApproach(DungeonRunCoordinatorState& coord, std::string const& leaderName,
                       std::vector<std::string> const& members,
                       DungeonPortal const& portal, char const* phase,
-                      std::string const& blockers, bool stillWanted)
+                      std::string const& blockers, bool stillWanted,
+                      float leaderX, float leaderY, float leaderZ)
     {
         LOG_ERROR("module.overseer",
                   "overseer: dungeon run {} of campaign {} cannot be staged in {} - {} "
@@ -37913,6 +37930,19 @@ private:
                   "edge",
                   coord.runNumber, coord.campaignId, phase, blockers, portal.keyword,
                   static_cast<uint32>(DUNGEON_STAGING_BACKSTOP_SECONDS / 60));
+
+        // Set quarantine state with the refused position (#396)
+        coord.quarantined = true;
+        coord.quarantineX = leaderX;
+        coord.quarantineY = leaderY;
+        coord.quarantineZ = leaderZ;
+        coord.quarantineSince = time(nullptr);
+
+        LOG_WARN("module.overseer",
+                 "overseer: dungeon run {} of campaign {} QUARANTINED at `{} {} {}` - "
+                 "leader was above the staging point and not descending",
+                 coord.runNumber, coord.campaignId, leaderX, leaderY, leaderZ);
+
         EndRunAndDecide(coord, leaderName, portal,
                         coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId),
                         "staging_failed",
@@ -42918,6 +42948,14 @@ private:
         float const stageY = coord.stageY;
         float const stageZ = coord.stageZ;
 
+        // QUARANTINE AFTER FAILED APPROACH (#396). Preserve quarantine state
+        // across the coordinator reset so the next IDLE poll can check it.
+        bool const wasQuarantined = coord.quarantined;
+        float const quarantineX = coord.quarantineX;
+        float const quarantineY = coord.quarantineY;
+        float const quarantineZ = coord.quarantineZ;
+        time_t const quarantineSince = coord.quarantineSince;
+
         // THE BAGS OUTRANK THE COUNT TOO, AND FOR A SHARPER REASON THAN THE
         // OPERATOR DOES (#429). Re-arming here sets REPAIRING, and a campaign
         // that re-arms never returns to IDLE - which is the only phase
@@ -42992,6 +43030,15 @@ private:
         }
 
         coord = DungeonRunCoordinatorState();
+        // QUARANTINE AFTER FAILED APPROACH (#396). Restore quarantine state
+        // so the next IDLE poll can check it and refuse to re-open while the
+        // leader is still at or near the refused position.
+        coord.quarantined = wasQuarantined;
+        coord.quarantineX = quarantineX;
+        coord.quarantineY = quarantineY;
+        coord.quarantineZ = quarantineZ;
+        coord.quarantineSince = quarantineSince;
+
         // THE NEXT RUN DOES NOT OPEN ON BROKEN GEAR (#391). This used to set
         // RESETTING directly, and that one assignment is why a hundred-run
         // campaign has never repaired: a run that goes again never returns to
@@ -51643,6 +51690,40 @@ private:
             // before the run exists is exactly the drift #220 is about.
             if (!finderWay)
             {
+                // QUARANTINE AFTER FAILED APPROACH (#396). If the coordinator
+                // has a quarantine position from a previous failed approach,
+                // check if the leader is still at or near that position. If so,
+                // refuse to open a new run. The quarantine is cleared when the
+                // leader reaches a walkable approach (ApproachShape != Overhead).
+                if (coord.quarantined)
+                {
+                    float const dx = leader->GetPositionX() - coord.quarantineX;
+                    float const dy = leader->GetPositionY() - coord.quarantineY;
+                    float const dz = leader->GetPositionZ() - coord.quarantineZ;
+                    float const distSq = dx * dx + dy * dy + dz * dz;
+                    // Consider "at or near" as within 10 yards of the quarantined position
+                    if (distSq <= 100.0f) // 10^2 = 100
+                    {
+                        LOG_WARN("module.overseer",
+                                 "overseer: dungeon run QUARANTINED - leader '{}' at `{} {} {}` "
+                                 "is still near the refused position `{} {} {}`. "
+                                 "Run will not open until leader moves to a walkable approach.",
+                                 leaderName,
+                                 leader->GetPositionX(), leader->GetPositionY(), leader->GetPositionZ(),
+                                 coord.quarantineX, coord.quarantineY, coord.quarantineZ);
+                        return;
+                    }
+                    else
+                    {
+                        // Leader has moved away from quarantined position, clear quarantine
+                        coord.quarantined = false;
+                        coord.quarantineX = 0.f;
+                        coord.quarantineY = 0.f;
+                        coord.quarantineZ = 0.f;
+                        coord.quarantineSince = 0;
+                    }
+                }
+
                 OverseerDecisions::ApproachRouteState scratch;
                 DungeonApproachAim const first = DungeonApproachAimFor(
                     *portal, scratch, leader, stageX, stageY, stageZ);
@@ -51672,6 +51753,17 @@ private:
                     return;
                 }
                 coord.loggedAboveTheDoor = false;
+
+                // QUARANTINE AFTER FAILED APPROACH (#396). Clear quarantine
+                // when the approach is walkable (not Overhead).
+                if (coord.quarantined)
+                {
+                    coord.quarantined = false;
+                    coord.quarantineX = 0.f;
+                    coord.quarantineY = 0.f;
+                    coord.quarantineZ = 0.f;
+                    coord.quarantineSince = 0;
+                }
             }
 
             // THERE IS NO `loggedCampaignOver = false` BETWEEN THE TWO STOP
@@ -52807,7 +52899,8 @@ private:
                                             "corridor"
                                           : "") +
                                      ")",
-                                 IsDungeonJob(leaderJob));
+                                 IsDungeonJob(leaderJob),
+                                 leader->GetPositionX(), leader->GetPositionY(), leader->GetPositionZ());
                 return;
             }
 
@@ -53991,7 +54084,8 @@ private:
                                       ? ", walking to the start of the approach corridor"
                                       : "") +
                                  ")",
-                             IsDungeonJob(leaderJob));
+                             IsDungeonJob(leaderJob),
+                             member->GetPositionX(), member->GetPositionY(), member->GetPositionZ());
                 return;
             }
 
