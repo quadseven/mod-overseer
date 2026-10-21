@@ -5630,15 +5630,25 @@ LootCouncilPick LootCouncilHeuristic(std::vector<LootCandidate> const& candidate
     return pick;
 }
 
+bool CanDisenchantDrop(uint32_t disenchantId, int32_t requiredSkill, uint32_t enchanting)
+{
+    if (!disenchantId || requiredSkill < 0 || !enchanting)
+        return false;
+    return enchanting >= static_cast<uint32_t>(requiredSkill);
+}
+
 LootCouncilVote LootCouncilVoteFor(bool decided, std::string const& recipient,
-                                   std::string const& voter, long openSeconds)
+                                   std::string const& voter, long openSeconds,
+                                   LootDisenchantFacts const& disenchant)
 {
     if (!decided)
         return openSeconds >= LOOT_COUNCIL_ROLL_LAST_SECONDS ? LootCouncilVote::Upstream
                                                               : LootCouncilVote::Hold;
-    if (recipient.empty())
+    if (!recipient.empty())
+        return recipient == voter ? LootCouncilVote::Need : LootCouncilVote::Pass;
+    if (!disenchant.realmAllows || !disenchant.enchanterRolling)
         return LootCouncilVote::Greed;
-    return recipient == voter ? LootCouncilVote::Need : LootCouncilVote::Pass;
+    return disenchant.voterCanDisenchant ? LootCouncilVote::Disenchant : LootCouncilVote::Pass;
 }
 
 LootCouncilVote MandatedLootVote(bool active, bool bindOnPickup,
