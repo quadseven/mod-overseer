@@ -16,7 +16,14 @@
 
 #include "overseer_decisions.h"
 
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <regex>
+#include <sstream>
+#include <string>
+#include <vector>
 
 using OverseerDecisions::AreaTriggerShape;
 using OverseerDecisions::DungeonStagingHeight;
@@ -111,6 +118,59 @@ void CheckPoint(char const* what, StagingPoint const& got, float wantX, float wa
                 double(got.x), double(got.y), double(got.z), double(wantX),
                 double(wantY), double(wantZ));
     ++failures;
+}
+
+std::string ReadSource()
+{
+    std::ifstream source("src/mod_overseer.cpp");
+    std::stringstream text;
+    text << source.rdbuf();
+    return text.str();
+}
+
+// How many rows of the portal table open with this keyword.
+int RowsNamed(std::string const& all, std::string const& keyword)
+{
+    std::string const opening = "{\"" + keyword + "\",";
+    int count = 0;
+    for (std::size_t at = all.find(opening); at != std::string::npos;
+         at = all.find(opening, at + 1))
+        ++count;
+    return count;
+}
+
+// Every float literal of the row that opens with `opening`, in order, with
+// comments stripped: the approach start, any corridor points, then the home.
+std::vector<float> RowFloats(std::string const& all, std::string const& opening)
+{
+    std::vector<float> values;
+    std::size_t const start = all.find(opening);
+    if (start == std::string::npos)
+        return values;
+
+    std::string body;
+    int depth = 0;
+    for (std::size_t i = start; i < all.size(); ++i)
+    {
+        if (all.compare(i, 2, "//") == 0)
+        {
+            i = all.find('\n', i);
+            if (i == std::string::npos)
+                break;
+            continue;
+        }
+        body.push_back(all[i]);
+        if (all[i] == '{')
+            ++depth;
+        else if (all[i] == '}' && --depth == 0)
+            break;
+    }
+
+    std::regex const number(R"((-?\d+\.\d*)f)");
+    for (auto it = std::sregex_iterator(body.begin(), body.end(), number);
+         it != std::sregex_iterator(); ++it)
+        values.push_back(std::strtof((*it)[1].str().c_str(), nullptr));
+    return values;
 }
 
 // THE THREE PORTALS THAT WORKED BEFORE THIS CHANGE, AND MUST STILL. Their
@@ -500,6 +560,40 @@ void EveryRefusalSaysSomething()
         CheckBool(Name(verdict), !StagingPointRefusal(verdict).empty(), true);
 }
 
+// BLACKROCK DEPTHS IS ONE ROW, AND IT NAMES THE KARGATH INN AS ITS HOME (#510).
+// Two rows with one keyword let whichever the lookup finds first win silently,
+// so the count is pinned. The home is Innkeeper Shul'kar's spawn as the row
+// quotes it, and the approach is the table's own "walk straight at the door"
+// zeros, which the row's comment says why it keeps.
+void TheBlackrockDepthsRowNamesItsInn()
+{
+    std::string const all = ReadSource();
+    CheckBool("blackrock-depths is one row", RowsNamed(all, "blackrock-depths") == 1, true);
+
+    std::vector<float> const values =
+        RowFloats(all, "{\"blackrock-depths\", 0, 1466, 230, 1472,");
+    if (values.size() != 6)
+    {
+        std::printf("FAIL blackrock-depths row: %zu floats, wanted an approach and a home\n",
+                    values.size());
+        ++failures;
+        return;
+    }
+    CheckBool("blackrock-depths walks straight at its door",
+              values[0] == 0.f && values[1] == 0.f && values[2] == 0.f, true);
+
+    // creature 9356, guid 6889, from the world database.
+    float const innX = -6650.01f;
+    float const innY = -2149.09f;
+    float const innZ = 245.434f;
+    CheckBool("blackrock-depths names a home",
+              StagingPointUsable(values[3], values[4], values[5]), true);
+    CheckBool("blackrock-depths binds at Innkeeper Shul'kar",
+              std::hypot(values[3] - innX, values[4] - innY) < 1.f &&
+                  std::fabs(values[5] - innZ) < 1.f,
+              true);
+}
+
 }  // namespace
 
 int main()
@@ -515,5 +609,6 @@ int main()
     AGroundHeightFarFromTheDoorIsDisbelieved();
     TheFallbackHeightIsCheckedAgainstTheDoor();
     EveryRefusalSaysSomething();
+    TheBlackrockDepthsRowNamesItsInn();
     return failures ? 1 : 0;
 }
