@@ -36,9 +36,9 @@ DungeonPortal const* FindDungeonPortal(std::string const&){return &portal;}
 bool IsDungeonJob(std::string const&){return true;}
 namespace OverseerDecisions { const char* DungeonRunExitOutcome(bool complete,bool stalled,bool evacuated){return evacuated?"evacuated":complete?"complete":stalled?"stalled":"left";} }
 std::map<std::string,ExitHearthEpisode> _exitHearths;
-DungeonRunCoordinatorState coord; int finalized=0; std::string outcome;
+DungeonRunCoordinatorState coord; int finalized=0; std::string outcome, endedReason;
 bool DriveExitHearths(std::string const&,std::string const&,std::vector<std::string> const&,ExitHearthEpisode&,const char*){return true;}
-void EndRunAndDecide(DungeonRunCoordinatorState& c,std::string const&,DungeonPortal const&,unsigned id,const char* o,std::string const&,bool,std::vector<std::string> const*){assert(id==7); assert(c.campaignId==9001 && c.runNumber==1 && c.runsWanted==50 && c.capKnown); finalized++; outcome=o;}
+void EndRunAndDecide(DungeonRunCoordinatorState& c,std::string const&,DungeonPortal const&,unsigned id,const char* o,std::string const& r,bool,std::vector<std::string> const*){endedReason=r; assert(id==7); assert(c.campaignId==9001 && c.runNumber==1 && c.runsWanted==50 && c.capKnown); finalized++; outcome=o;}
 void Poll(Player* activeInside){std::string family="Leader",leaderName="Leader",leaderJob="dungeon:ragefire"; std::vector<std::string> members{"Leader","Member"};
 '''
 suffix=r'''
@@ -48,6 +48,10 @@ _exitHearths["Leader"]=e;Poll(nullptr);assert(finalized==1 && outcome=="complete
 _exitHearths["Leader"]=e;seen["Member"]=&inside;Poll(&inside);assert(finalized==1 && _exitHearths.size()==1);
 seen.erase("Member");Poll(nullptr);assert(finalized==1 && _exitHearths.size()==1);
 seen["Member"]=&outside;_exitHearths["Leader"].run.provedComplete=false;_exitHearths["Leader"].run.stalledReason="lost progress";Poll(nullptr);assert(finalized==2 && outcome=="stalled");
+assert(endedReason=="lost progress");
+_exitHearths["Leader"]=e;_exitHearths["Leader"].run.provedComplete=false;_exitHearths["Leader"].run.stalledReason="dungeon clear stopped: the party never became ready after 180s, waiting on Uzza (low mana)";Poll(nullptr);assert(finalized==3 && outcome=="stalled");
+assert(endedReason.rfind("dungeon clear stopped:",0)==0 && endedReason.find("waiting on Uzza (low mana)")!=std::string::npos && endedReason.rfind("the failed exit",0)!=0);
+_exitHearths["Leader"]=e;Poll(nullptr);assert(finalized==4 && endedReason=="the failed exit recovered by hearth; every member is outside");
 }
 '''
 with tempfile.TemporaryDirectory() as directory:
@@ -59,4 +63,4 @@ with tempfile.TemporaryDirectory() as directory:
     subprocess.run(["g++", "-std=c++17", str(source), "-o", str(binary)],
                    check=True, timeout=30)
     subprocess.run([str(binary)], check=True, timeout=5)
-print("PASS: completed, stalled, still-inside, unseen, and once-only finalization")
+print("PASS: completed, stalled, still-inside, unseen, and once-only finalization, and the module's stop reason leading a stalled run's ended_reason")

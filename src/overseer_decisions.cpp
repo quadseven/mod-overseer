@@ -2303,6 +2303,27 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
                                                 : DungeonClearStallAction::Extract;
 }
 
+std::string DungeonModuleStopWords(std::string const& raw)
+{
+    static std::string const prefix = "Dungeon clear stopped:";
+    static std::string const waitMarker = " (Waiting on ";
+    static char const* const blanks = " \t\r\n";
+
+    std::string text = raw.compare(0, prefix.size(), prefix) == 0 ? raw.substr(prefix.size()) : raw;
+    std::size_t const first = text.find_first_not_of(blanks);
+    if (first == std::string::npos)
+        return "dungeon clear switched itself off; no reason given";
+    text = text.substr(first, text.find_last_not_of(blanks) - first + 1);
+
+    // The module closes a wait with its own ")", so the member keeps the
+    // parenthesis of its reason: "Uzza (low mana)".
+    std::size_t const wait = text.rfind(waitMarker);
+    if (wait != std::string::npos && wait > 0 && text.back() == ')')
+        text = text.substr(0, wait) + ", waiting on " +
+               text.substr(wait + waitMarker.size(), text.size() - wait - waitMarker.size() - 1);
+    return "dungeon clear stopped: " + text;
+}
+
 bool DungeonClearBusyStillHolds(bool anyBusy, time_t advancedAt, time_t now,
                                 time_t ceilingSeconds)
 {
