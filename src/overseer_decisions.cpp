@@ -6942,8 +6942,11 @@ float LethalFallYards(float safeFallYards, float rate)
 }
 
 FallAccount AccountForFall(float recordedYardsFallen, float safeFallYards,
-                           float rate, float deathZ, float voidPlaneZ)
+                           float rate, float deathZ, float voidPlaneZ,
+                           bool startedBelowSurface)
 {
+    if (startedBelowSurface)
+        return FallAccount::VoidFall;
     // THE PLANE FIRST, BEFORE THE UNSAMPLED MARKER EVEN. A body below the kill
     // plane is the one answer that does not need the distance to be true, and
     // 9 of the 59 measured void deaths carried no sample at all - calling
@@ -6980,6 +6983,9 @@ char const* FallAccountName(FallAccount account)
         // The reader this sentence is for is the one about to go and look at
         // the fall guard again.
         case FallAccount::VoidPlane:
+            return "not a fall at all: it crossed the void plane and the core "
+                   "killed it outright";
+        case FallAccount::VoidFall:
             return "not a fall at all: it crossed the void plane and the core "
                    "killed it outright";
     }

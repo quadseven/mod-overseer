@@ -218,6 +218,15 @@ void TheAdapterIsWired()
                                        "// ONE MOVEMENT OWNER PER FAMILY LEADER");
     Check("the death takes its hits",
           record.find("TakeDeathHits(player->GetGUID().GetCounter())") != std::string::npos);
+    Check("the prior position is checked against its local surface",
+          record.find("TERRAIN_RECOVERY_VOID_PROBE_YARDS") != std::string::npos &&
+              record.find("it->second.x, it->second.y, probeZ") != std::string::npos &&
+              record.find("it->second.z < surface") != std::string::npos);
+    Check("a void fall keeps its starting sample in the death row",
+          record.find("d.fallStartedBelowSurface = true;") != std::string::npos &&
+              record.find("d.fallStartZ = it->second.z;") != std::string::npos &&
+              source.find("fall_start_map, fall_start_x, fall_start_y, fall_start_z") !=
+                  std::string::npos);
     Check("and the row is filled from them",
           record.find("d.healthAtDeath = hits.healthBefore;") != std::string::npos &&
               record.find("d.manaAtDeath = hits.manaBefore;") != std::string::npos &&
