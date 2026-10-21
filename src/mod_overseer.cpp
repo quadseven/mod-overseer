@@ -5148,6 +5148,7 @@ struct PendingDeath
     int32 lastSeenSeconds = -1;    // age of the sample below, -1 = none
     float lastX = 0.f, lastY = 0.f, lastZ = 0.f;
     float yardsFallen = -1.f;      // -1 = unsampled, 0 = it did not fall
+    bool fallStartedBelowSurface = false;
     bool fallStartSeen = false;
     uint16 fallStartMap = 0;
     float fallStartX = 0.f, fallStartY = 0.f, fallStartZ = 0.f;
@@ -5555,6 +5556,28 @@ void RecordDeath(Player* player)
             d.lastY = it->second.y;
             d.lastZ = it->second.z;
             d.yardsFallen = OverseerDecisions::YardsFallen(true, it->second.z, d.z);
+            // Sample the terrain/VMAP surface at the previous position. A
+            // character already below it was in an ongoing void fall before
+            // this poll-to-death slice began.
+            if (Map* map = player->GetMap())
+            {
+                float const probeZ = it->second.z +
+                                     TERRAIN_RECOVERY_VOID_PROBE_YARDS;
+                float const surface = map->GetHeight(
+                    player->GetPhaseMask(), it->second.x, it->second.y, probeZ,
+                    true, TERRAIN_RECOVERY_VOID_PROBE_YARDS);
+                if (surface > INVALID_HEIGHT && it->second.z < surface)
+                {
+                    d.fallStartedBelowSurface = true;
+                    d.fallStartSeen = true;
+                    d.fallStartMap = it->second.mapId;
+                    d.fallStartX = it->second.x;
+                    d.fallStartY = it->second.y;
+                    d.fallStartZ = it->second.z;
+                    d.fallStartMovement = OverseerDecisions::MoveGeneratorName(
+                        it->second.movement);
+                }
+            }
             if (d.yardsFallen > 10.f)
             {
                 auto const ring = g_fallSamples.find(lower);
@@ -5565,7 +5588,7 @@ void RecordDeath(Player* player)
                         trace.push_back({sample.mapId, sample.x, sample.y, sample.z,
                                          sample.movement});
                     auto const start = OverseerDecisions::FindFallStart(trace, d.mapId, d.z, 10.f);
-                    if (start.found)
+                    if (start.found && !d.fallStartedBelowSurface)
                     {
                         d.fallStartSeen = true;
                         d.fallStartMap = start.sample.mapId;
@@ -56245,7 +56268,8 @@ private:
         OverseerDecisions::FallAccount const account =
             OverseerDecisions::AccountForFall(
                 batch.back().yardsFallen, 0.f, 1.f, batch.back().z,
-                OverseerDecisions::VOID_PLANE_Z);
+                OverseerDecisions::VOID_PLANE_Z,
+                batch.back().fallStartedBelowSurface);
         LOG_INFO("module.overseer",
                  "overseer: recorded {} death(s), most recently '{}' at level {} "
                  "in zone {} (killer: {} '{}'; driven by {}, movement '{}', "

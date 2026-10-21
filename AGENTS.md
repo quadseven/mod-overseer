@@ -249,6 +249,45 @@ A character can sit at full health, in combat, not dying and not moving, with a
 valid travel errand it never executes. Removing the strategies that make it pick
 fights is what unsticks it; the errand then runs.
 
+### A rejoin is proved by one log line, and the log is short
+
+A member that dies inside a dungeon and is released to a graveyard outside is
+walked back in under its own power. The proof that it worked is one line in the
+worldserver log:
+
+    stranded outside map <map> - <n> went back in this poll
+
+It is printed only when a member actually changed map, so it is a measurement
+and not a postmark, on the same terms as "delivered is not done" above. The
+three lines around it are the whole recipe, in the order they appear:
+
+- `dungeon run <n> is short a member and is WALKING IT BACK to areatrigger <id>`
+  - once per run, the moment the census finds somebody outside. This is the
+  hint that there is anything to look for.
+- `'<name>' walked into area trigger <id> and is now on map <map>` - the member
+  standing in the door, put through by the knock.
+- `dungeon run <n> knocked on areatrigger <id> for the <k> stranded outside map
+  <map> - <j> went back in this poll` - the proof line, and the census is that
+  much nearer complete.
+- `dungeon run STAGED_INSIDE satisfied - all <n> roster members are on map
+  <map> together` - the census reached whole, and the run moved on to CLEARING.
+
+**THE WINDOW IS THE HARD PART.** The node the dev realm's worldserver runs on
+rotates its log, and on 2026-10-18 the readable window was about eighty
+minutes (15:52 to 17:14 UTC). A check that finds nothing has only covered that
+window, and it is worth saying which one it covered. What the check has found
+so far: that window had no such line - the one family run in it ended
+`client_lost` after seven minutes, with no member death inside it - and the
+window of 2026-10-20 13:24 to 15:22 UTC had the walk running and never
+finishing, because the lease ended when the member stood beside its group
+leader rather than when it reached the run's map. That second one is what
+#1087 fixed, and what `tests/test_dungeon_rejoin.cpp` pins; the wiring the
+walk depends on is pinned by `tests/test_dungeon_rejoin_source.cpp`.
+
+So the check needs a member to die inside a run while somebody is watching. It
+cannot be scheduled from here: the log is on the realm and the realm is not
+reachable from a repository checkout.
+
 ### The pin and the submodule move together
 
 The deployment repo pins this module by SHA and also carries a submodule at the
