@@ -26108,6 +26108,95 @@ bool RunDamageNote(RunDamageBook& book, std::string const& name, std::uint32_t m
 // totals, or "" for an empty batch.
 std::string RunDamageUpsertSql(RunDamageBook const& batch);
 
+// --------------------------------------- deaths teach the module danger --
+//
+// `overseer_death` holds one row per death with the killer, the zone and the
+// character's level; nothing read it back. This is the memory that does: score
+// each zone and each creature entry from the deaths in a window, with a score
+// that decays as the party levels, so travel routing can avoid lethal zones and
+// creature pulls can skip recently deadly entries. The adapter fills DeathRecord
+// from the table; this layer only scores it and never touches a database.
+
+// One row of `overseer_death`, as the memory reads it.
+struct DeathRecord
+{
+    std::string characterName;
+    uint32_t level{0};          // the character's level when it died
+    uint32_t zone{0};           // the zone it died in
+    std::string killerType;     // "creature", "player" or "environment"
+    uint32_t killerEntry{0};    // the creature template entry, 0 unless a creature
+    uint32_t killerLevel{0};    // the killer's level, 0 when not known
+    std::time_t createdAt{0};   // seconds since the epoch
+};
+
+// Per-zone danger, aggregated from the deaths in a window.
+struct ZoneDanger
+{
+    uint32_t zone{0};
+    unsigned deaths{0};           // creature-killer deaths in the window
+    unsigned lethalDeaths{0};     // of those, to creatures `levelGap` above the party
+    double score{0.0};            // the decayed danger score
+};
+
+// Score every zone the deaths touch. A death counts when its killer is a
+// creature whose level is `levelGap` or more above the party, and it lies
+// inside `windowSeconds` of `now`. Each such death adds a point decayed by how
+// far the party has levelled since it died: a death at character level L
+// contributes 1 / (1 + max(0, partyLevel - L)), so a death that was lethal to
+// a level 17 party fades as the party reaches level 30. Zones with no deaths
+// are not listed. Sorted by score, highest first.
+std::vector<ZoneDanger> ScoreZoneDanger(std::vector<DeathRecord> const& deaths,
+                                        std::time_t now, uint32_t partyLevel,
+                                        std::time_t windowSeconds, uint32_t levelGap);
+
+// True when a zone's score is at or above the threshold: do not route through it.
+bool ZoneIsTooDangerous(ZoneDanger const& zone, unsigned threshold);
+
+// Per-creature danger, aggregated from the deaths in a window.
+struct CreatureDanger
+{
+    uint32_t entry{0};
+    unsigned deaths{0};   // deaths to this entry in the window
+};
+
+// Score every creature entry the deaths touch. Only creature kills count and an
+// entry with no deaths in the window is not listed. Sorted by entry.
+std::vector<CreatureDanger> ScoreCreatureDanger(std::vector<DeathRecord> const& deaths,
+                                                std::time_t now,
+                                                std::time_t windowSeconds);
+
+// True when this entry has killed a party member `threshold` times in the
+// window: do not pull it voluntarily. Fighting back when attacked is not a
+// pull and is unchanged by this.
+bool CreaturePullIsSuppressed(CreatureDanger const& creature, unsigned threshold);
+
+// A route offered to the party, each leg naming the zone it enters; one leg is
+// the current (already aimed) choice and the rest are alternatives to the same
+// destination.
+struct TravelLeg
+{
+    uint32_t zone{0};
+    bool current{false};  // the leg the errand already aims at
+};
+
+// The avoidance verdict for a route: steer away from the current leg's zone
+// when a safe alternative exists, or report that every route enters a zone
+// above threshold and name it.
+struct TravelAvoidance
+{
+    bool avoid{false};          // steer away from the current leg's zone
+    uint32_t avoidedZone{0};    // the zone being avoided, 0 when none
+    bool noAlternative{false};  // every route enters a too-dangerous zone
+};
+
+// Given a route's legs and the scored zone danger, decide whether to route
+// around the current leg's zone. When another leg reaches the destination
+// through a safe zone, avoid the current one; when every route enters a
+// too-dangerous zone, say so and name the zone the party would have to enter.
+TravelAvoidance AvoidDangerousZone(std::vector<TravelLeg> const& legs,
+                                   std::vector<ZoneDanger> const& danger,
+                                   unsigned threshold);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
