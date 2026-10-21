@@ -32434,11 +32434,13 @@ private:
             // areatrigger_teleport, and is quoted in the same shape as the rows
             // above so a future reader can check it without a running world.
             //
-            // NONE OF THEM CARRIES A CORRIDOR OR A HOME, and that is the rule
-            // the `wailing` row is written on rather than an omission: a
-            // corridor or an inn that has not been measured against the
-            // navmesh must not be invented, and three zeros are this table's
-            // way of saying "walk straight at the door". Where the walk to a
+            // NONE OF THEM CARRIES A CORRIDOR, AND ONLY `blackrock-depths`
+            // CARRIES A HOME, which is an innkeeper's spawn read from the world
+            // database and quoted beside it (#510). That is the rule the
+            // `wailing` row is written on rather than an omission: a corridor
+            // or an inn that has not been measured must not be invented, and
+            // three zeros are this table's way of saying "walk straight at the
+            // door". Where the walk to a
             // door is known to need more than that, the row says so. A run the
             // default route cannot stage is refused by the staging check and
             // says why; it is not walked at a guessed point.
@@ -32573,7 +32575,47 @@ private:
             // areatrigger_teleport.sql: (1466,'Blackrock Depths Entrance',230,456.929,34.0923,-68.0896,4.71239)
             // areatrigger.sql: (1472,230,456.969,48.368,-65.2753,12,0,0,0,0)
             // areatrigger_teleport.sql: (1472,'Blackrock Dephts - Searing Gorge Instance',0,-7179.63,-923.667,166.416,1.84097)
-            {"blackrock-depths", 0, 1466, 230, 1472, 0.f, 0.f, 0.f},
+            //
+            // THE TOWN THIS CAMPAIGN BINDS IN IS KARGATH, AND IT IS CHOSEN BY
+            // FACTION FIRST (#510). The family sent here is the level 60 one,
+            // which is on Kalimdor: the Horde family, whose town is Orgrimmar
+            // (`ragefire`), not the Alliance one, whose town is Stormwind
+            // (`stockades`). An Alliance party sent to this door would be walked
+            // into a Horde town to bind, so the job writer must not send one. The
+            // innkeepers on map 0 within 3000 yards of trigger 1466, by straight
+            // line from the door:
+            //
+            //     9356  Innkeeper Shul'kar    1321 yards  Horde, Kargath
+            //     1247  Innkeeper Belm        1627 yards  Alliance, Kharanos
+            //     6740  Innkeeper Allison     2336 yards  Alliance, Stormwind
+            //     5111  Innkeeper Firebrew    2337 yards  Alliance, Ironforge
+            //     6727  Innkeeper Brianna     2383 yards  Alliance, Lakeshire
+            //      295  Innkeeper Farley      2477 yards  Alliance, Goldshire
+            //     6734  Innkeeper Hearthstove 2717 yards  Alliance, Thelsamar
+            //
+            // Shul'kar is the only one a Horde member can bind at, since
+            // Player::GetNPCIfCanInteractWith refuses the rest, and is also the
+            // nearest. Read from the world database:
+            //
+            // creature.sql: (6889,9356,0,0,0,0,0,1,1,1,-6650.01,-2149.09,245.434,3.9968,...)
+            // creature_template.sql: (9356,...,'Innkeeper Shul\'kar','Innkeeper',NULL,1290,30,30,0,29,66179,...)
+            //
+            // and faction 29 is Orgrimmar's. Those are straight-line yards. The
+            // walk from Kargath to this door has not been measured.
+            //
+            // AND THE APPROACH STAYS AT THREE ZEROS, ON PURPOSE. No corridor
+            // from the mountain's outer entrance down to this ledge has been
+            // measured against the navmesh, and the rule this block opens with
+            // says one must not be invented. The zeros are safe for the same
+            // reason they are on every other row here: the derived staging
+            // point is ground-probed before anybody walks at it, and a party
+            // the default route leaves above that point, no longer descending,
+            // is closed as `staging_failed` with the reason (FailApproach).
+            // Nobody is walked at a guessed point and the refusal is not
+            // silent. If that is how runs here end, the cure is a measured
+            // corridor like `ragefire`'s, not a guessed one.
+            {"blackrock-depths", 0, 1466, 230, 1472, 0.f, 0.f, 0.f, {},
+             -6650.0f, -2149.1f, 245.43f},
             // LOWER BLACKROCK SPIRE, on map 0 on the top ledge of the mountain,
             // with level 53 to 59 Blackrock orcs 32 yards from the door. Door
             // minimum level 45. The instance has a second way out, areatrigger
@@ -42817,6 +42859,12 @@ private:
                                             portal, outcome, reason)
                       : OverseerDecisions::RunFailureFacts();
         AlignRunLeader(runId, leaderName);
+        if (runId && std::string(outcome) == "complete" && RunAccountingPresent() &&
+            SchemaHasColumns("overseer_dungeon_run", "'portal_keyword'", 1))
+            CharacterDatabase.Execute(
+                "UPDATE overseer_dungeon_run SET portal_keyword = '{}' "
+                "WHERE id = {} AND state = 'active'",
+                Esc(portal.keyword), runId);
         CloseRun(runId, outcome, reason);
         WriteRunEnded(coord, leaderName, runId, outcome, reason);
 
