@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 using OverseerDecisions::AccountForFall;
 using OverseerDecisions::FALL_DAMAGE_MIN_YARDS;
@@ -144,6 +145,22 @@ void AVoidDeathIsNotAFallHoweverFarTheColumnSaysItFell()
        FallAccount::EnoughToKill);
 }
 
+void ADropStartingBelowTheSurfaceIsAVoidFall()
+{
+    Is("a drop that began below the measured surface",
+       AccountForFall(30.1f, 0.f, 1.f, -520.f, VOID_PLANE_Z, true),
+       FallAccount::VoidFall);
+    if (std::string(FallAccountName(FallAccount::VoidFall)) !=
+        "not a fall at all: it crossed the void plane and the core killed it outright")
+    {
+        std::printf("FAIL void fall wording does not identify the core's void-plane kill\n");
+        ++failures;
+    }
+    Is("a real fall that crossed below the surface",
+       AccountForFall(150.4f, 0.f, 1.f, -520.f, VOID_PLANE_Z, false),
+       FallAccount::VoidPlane);
+}
+
 // The plane beats the unsampled marker, and it has to: 9 of the 59 measured
 // void deaths carried no sample at all, and "unsampled" would have hidden the
 // only fact about them that matters.
@@ -186,6 +203,7 @@ int main()
     TheIncidentRowsCannotAccountForTheDeaths();
     UnsampledIsNotNoDrop();
     AVoidDeathIsNotAFallHoweverFarTheColumnSaysItFell();
+    ADropStartingBelowTheSurfaceIsAVoidFall();
     ThePlaneIsAnAnswerEvenWithNoSample();
     NotAskingAboutThePlaneChangesNothing();
     ThePlaneIsTheCoresOwnConstant();

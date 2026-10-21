@@ -7740,7 +7740,10 @@ enum class FallAccount
     // its own x and y, because the column is a delta across one sample gap and
     // the descent began long before that gap. "fell 136.9 yards which is
     // enough to kill it" was true of neither half.
-    VoidPlane
+    VoidPlane,
+    // The sampled start was already below the local terrain surface. The
+    // distance since that sample is only one slice of an ongoing void fall.
+    VoidFall
 };
 
 // `voidPlaneZ` IS ASKED FOR, NOT ASSUMED, and a value at or above zero means
@@ -7754,7 +7757,8 @@ enum class FallAccount
 // did not happen with a distance that is not it.
 FallAccount AccountForFall(float recordedYardsFallen, float safeFallYards = 0.f,
                            float rate = 1.f, float deathZ = 0.f,
-                           float voidPlaneZ = 0.f);
+                           float voidPlaneZ = 0.f,
+                           bool startedBelowSurface = false);
 char const* FallAccountName(FallAccount account);
 
 // ------------------------------------------------- a revival and a party --
