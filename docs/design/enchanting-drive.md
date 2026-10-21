@@ -170,28 +170,18 @@ is the same "second source of truth" mistake this codebase's own
 `DriveCraft` comment explicitly avoided for `CheckCast` (`mod_overseer.cpp`
 ~line 10837).
 
-Instead, this is honestly **two new drives**, both out of scope for this
-pass:
+Instead, this is honestly **two new drives**:
 
-- **`DriveEnchant`**: a new roster column (e.g. `enchant_spell` +
-  `enchant_target_slot`, or an item GUID once one is picked), a new
-  item-target cast path built on `SpellCastTargets`/the targets-taking
-  `CastSpell` overload, applied against an owned, currently-unenchanted (or
-  worse-enchanted) item in the named equipment slot. This part is smaller
-  than disenchanting - no loot-window problem, `CheckCast` still does the
-  "does this item already have a better enchant" refusal for us - but it is
-  still a different call shape than `DriveCraft`'s existing body, verified
-  above against `Unit.h`.
-- **`DriveDisenchant`** (blocked on the `overseer_command.kind` migration and
-  a `disposition.py` allocation rule): casts the disenchant spell against a
-  chosen owned green/blue, **and** resolves the resulting `LOOT_DISENCHANTING`
-  window server-side with no client - which needs its own verification pass
-  against AzerothCore's loot-release/auto-store code path before anyone
-  writes it, exactly the kind of "verify the exact 3.3.5a signature against
-  a real core checkout before writing this" caution `mod-overseer#437`
-  already flagged for the unrelated `Guild` API. This is the part of
-  Enchanting that is genuinely novel work, not a re-shape of an existing
-  drive.
+- **`DriveEnchant`**: `enchant_spell` and `enchant_slot` hold the standing
+  errand. It checks the known spell and reagents, targets the equipped item
+  with `SpellCastTargets`, and reads the permanent enchant slot back before
+  recording success. Refusal leaves the errand standing.
+- **`DriveDisenchant`**: `disenchant_guid` holds the owned item GUID. It casts
+  spell 13262 with an item target, then uses the bot session's loot packet
+  handlers to take the `LOOT_DISENCHANTING` slots and release the window.
+  Inventory counts are read back before a reagent gain is recorded. Invalid
+  targets are cleared; a transient cast refusal leaves the errand standing.
+  The `disenchant` command kind accepts `item:<guid>` to set this errand.
 
 ## What a small, safe first slice would still need
 
@@ -209,40 +199,29 @@ false precondition - observable, not a bug, but not a real first slice
 either.
 
 **The actual smallest real slice is `DriveDisenchant` first**, because it is
-the one both halves depend on and it is where all three blockers above
-(migration, loot-window mechanism, `disposition.py` allocation rule) live.
-That is exactly the shape of engineering effort - schema change + a genuinely
-unverified core interaction + a cross-cutting policy decision competing with
-a shipping feature - this project's own precedent (`mod-overseer#436`, the
-guild-bank design-only pass) treats as "design doc + follow-up issue," not
-"implement this session."
+the one both halves depend on. The current migration adds the command kind
+while retaining the full enum union, and the drive resolves loot through the
+session handlers already used for other loot windows in this module. The
+upstream disposition rule remains separate because it is not present in this
+repository and its dust-versus-gold threshold requires measured planner data.
 
 ## What this explicitly defers
 
-- Both `DriveEnchant` and `DriveDisenchant` C++ implementation - filed as a
-  follow-up issue, gated on someone with real build access, same shape
-  `mod-overseer#440` already used for `DriveCraft` itself.
-- The `overseer_command.kind` enum migration and its own review (a schema
-  change belongs in its own PR, not bundled into a drive).
 - The `disposition.py` disenchant-vs-vendor allocation rule - a real,
   measurable trade-off (dust supply vs. the vendor gold pipeline currently
-  writing thousands of rows) that deserves its own numbers before a default
-  is picked, not a guess made inside this doc.
+  writing rows) that deserves its own measured numbers before a default is
+  picked. This repository does not contain `disposition.py` or its planner.
 - Rockbiter Weapon-style `SPELL_EFFECT_ENCHANT_ITEM_TEMPORARY` recipes (the
   guide's leveling path is entirely permanent enchants; temporary enchants
   are a PvP/consumable use case outside this family's current needs) and
   `SPELL_EFFECT_ENCHANT_ITEM_PRISMATIC` (socketing) - out of scope, not
   reached by anything in the leveling guide.
 
-## Why nothing was implemented in this pass
+## Verification limits
 
-Same reasoning as `mod-overseer#436` and `#439` before it: the C++ half of
-either new drive needs a full AzerothCore + mod-playerbots build to compile
-or verify (not available standalone in this session), and `DriveDisenchant`
-specifically needs verification of a mechanism - server-side loot-window
-resolution with no client - that nothing in this codebase or
-`mod-playerbots` has ever done, per the `gh search code` results above.
-Writing either drive without that verification would be exactly the
-"plausible-looking but unverified" failure mode this project's own history
-warns against. This doc, and the follow-up issue, are the honest deliverable
-for this pass.
+The decision tests can verify the migration and source contract, but this
+checkout does not include the pinned AzerothCore build tree or a live character
+database. The item-target cast signatures and inventory read-backs therefore
+still need the adapter build and live acceptance checks. The upstream
+disposition rule also remains unimplemented until its planner and measured
+bracket data are available.
