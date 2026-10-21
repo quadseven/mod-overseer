@@ -16554,10 +16554,8 @@ private:
         if (!entry)
             return;   // an `at:`/`trigger:` aim names no creature to check
 
-        if (bot->HasSkill(SKILL_FISHING))
-            return;   // nothing to teach - the ordinary, silent case on every visit after the first
-
-        if (!LoadLearnFishingFlag(name))
+        bool const alreadyHasSkill = bot->HasSkill(SKILL_FISHING);
+        if (!alreadyHasSkill && !LoadLearnFishingFlag(name))
             return;   // nobody asked this character to learn Fishing
 
         // Same radius TrainOnArrival and DiscoverFlightPointOnArrival both
@@ -16573,11 +16571,13 @@ private:
 
         uint32 const spellId = TrainerSpellForFishing(trainer, bot);
         if (!spellId)
-            return;   // this trainer does not teach Fishing - no-op, not an error
+            return;   // no eligible Fishing tier here yet, or this trainer does not teach it
 
         LOG_INFO("module.overseer",
                  "overseer: '{}' is buying Fishing from '{}' (creature {}, spell {})",
                  name, npc->GetName(), entry, spellId);
+
+        uint32 const maxBefore = static_cast<uint32>(bot->GetPureMaxSkillValue(SKILL_FISHING));
 
         // natural-only: bought at a trainer in reach, which takes its price (TeachSpell).
         trainer->TeachSpell(npc, bot, spellId);  // Trainer.h:73
@@ -16586,24 +16586,31 @@ private:
         // a CLIENT (Trainer.cpp) - a packet no bot has anybody to show it to.
         // "delivered is not worked": the only way to know Fishing was learned
         // is to ask the character.
-        if (!bot->HasSkill(SKILL_FISHING))
+        bool const succeeded = alreadyHasSkill
+            ? static_cast<uint32>(bot->GetPureMaxSkillValue(SKILL_FISHING)) > maxBefore
+            : bot->HasSkill(SKILL_FISHING);
+        if (!succeeded)
         {
             LOG_WARN("module.overseer",
-                     "overseer: '{}' was not taught Fishing by '{}'. TeachSpell reports "
+                     "overseer: '{}' was not taught or raised Fishing by '{}'. TeachSpell reports "
                      "its reason only to a client, so the likely one is money - it holds "
-                     "{} copper. Leaving learn_fishing standing for the next poll",
+                     "{} copper. Leaving the request available for the next poll",
                      name, npc->GetName(), bot->GetMoney());
             return;
         }
 
         LOG_INFO("module.overseer",
-                 "overseer: '{}' LEARNED Fishing at {}/{} from '{}' - taught by a trainer "
+                 "overseer: '{}' {} Fishing at {}/{} from '{}' - taught by a trainer "
                  "it happened to reach, not granted out of thin air",
-                 name, static_cast<uint32>(bot->GetPureSkillValue(SKILL_FISHING)),
+                 name, alreadyHasSkill ? "RAISED THE CAP ON" : "LEARNED",
+                 static_cast<uint32>(bot->GetPureSkillValue(SKILL_FISHING)),
                  static_cast<uint32>(bot->GetPureMaxSkillValue(SKILL_FISHING)), npc->GetName());
         RecordEvent(bot, "learn", SKILL_FISHING, "Fishing",
-                    "learned Fishing from a trainer it happened to reach");
-        ClearLearnFishingFlag(name);
+                    alreadyHasSkill
+                        ? "raised the Fishing cap at a trainer it happened to reach"
+                        : "learned Fishing from a trainer it happened to reach");
+        if (!alreadyHasSkill)
+            ClearLearnFishingFlag(name);
     }
 
     // FLIGHT POINT DISCOVERY ON ARRIVAL (#68). Discovering a flight point is
