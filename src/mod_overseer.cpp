@@ -443,6 +443,12 @@ constexpr uint32 CRAFT_POLL_MS = 20000;
 // every twenty seconds" rather than each on its own unexplained number.
 constexpr uint32 FISH_POLL_MS = 20000;
 
+// How often a standing lockpick errand (job='lockpick') is polled. Same cadence
+// as craft and fishing: one indexed SELECT against a column most characters
+// have zeroed, and a character at the wrong level or without the spell should
+// not wait longer than a minute for the planner to have corrected the row.
+constexpr uint32 LOCKPICK_POLL_MS = 20000;
+
 // How often a character sent to an NPC is pointed at it again (infra#2783).
 // RPG_WANDER_NPC self-expires to IDLE after statusWanderNpcDuration, which is
 // FIVE minutes (NewRpgAction.h:65, checked at NewRpgAction.cpp:278) - six times
@@ -8197,6 +8203,7 @@ public:
         _questTimer += diff;
         _craftTimer += diff;
         _fishTimer += diff;
+        _lockpickTimer += diff;
         _travelTimer += diff;
         _professionTimer += diff;
         _gearTimer += diff;
@@ -8366,6 +8373,15 @@ public:
         {
             _fishTimer = 0;
             DriveFish();
+        }
+        // Same ordering convention as DriveCraft and DriveFish above, and the
+        // same reason it is safe: a character is job='quest' XOR job='craft'
+        // XOR job='fish' XOR job='lockpick', never two at once, so this is
+        // legibility, not a correctness requirement.
+        if (_lockpickTimer >= LOCKPICK_POLL_MS)
+        {
+            _lockpickTimer = 0;
+            DriveLockpick();
         }
         // BEFORE DriveTravel, so a staging aim this poll writes onto the
         // leader's travel_npc is picked up by DriveTravel the SAME tick
@@ -16136,6 +16152,32 @@ private:
             "UPDATE overseer_roster SET craft_spell = 0 WHERE name = '{}'", Esc(name));
     }
 
+    // Every enabled character whose `job` is 'lockpick' and whose `lockpick`
+    // column is non-zero, by name. Zero (the schema default) means no standing
+    // errand, so the WHERE clause is the whole filter. Read on its own, same
+    // discipline as LoadCraftErrands: a schema without the `lockpick` column
+    // fails the SELECT whole and DriveLockpick is a no-op, not a crash.
+    std::vector<std::string> LoadLockpickErrands()
+    {
+        std::vector<std::string> errands;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name FROM overseer_roster "
+            "WHERE enabled = 1 AND lockpick <> 0");
+        if (!result)
+            return errands;
+        do
+        {
+            errands.push_back(result->Fetch()[0].Get<std::string>());
+        } while (result->NextRow());
+        return errands;
+    }
+
+    void ClearLockpickErrand(std::string const& name)
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_roster SET lockpick = 0 WHERE name = '{}'", Esc(name));
+    }
+
     // Casts ONE standing recipe spell against the bot's own inventory,
     // repeatedly, for every enabled character whose `job` is 'craft' and
     // whose `craft_spell` names a recipe. See docs/design/profession-
@@ -16763,6 +16805,173 @@ private:
                              name);
                     continue;
             }
+        }
+    }
+
+    // ------------------------------------- job='lockpick' (mod-overseer#445) --
+
+    // How close the bot must be to a lockbox before it casts Pick Lock at it.
+    static constexpr float LOCKPICK_REACH_YARDS = 8.0f;
+
+    // Point id the bot's motion master uses while walking to a lockbox.
+    static constexpr uint32 LOCKPICK_APPROACH_POINT_ID = 100u;
+
+    // How long the hold tolerates a lockpick approach walk, in milliseconds.
+    static constexpr uint32 LOCKPICK_WALK_CEILING_MS = 30000u;
+
+    // Sweep radius for a live lockbox in the bot's zone, in yards.
+    static constexpr float LOCKPICK_SWEEP_YARDS = 200.0f;
+
+    // The predicate the zone sweep runs over each gameobject: a spawned,
+    // matching-entry lockbox in the bot's own map and zone.
+    struct LockboxNearbyCheck
+    {
+        Player const* from;
+        float range;
+        bool operator()(GameObject* go) const
+        {
+            if (!go || !go->isSpawned())
+                return false;
+            if (!OverseerDecisions::IsLockpickTargetEntry(go->GetEntry()))
+                return false;
+            return from->IsWithinDistInMap(go, range) &&
+                   go->GetZoneId() == from->GetZoneId();
+        }
+    };
+
+    // The nearest live lockbox in `bot`'s zone, or nullptr when there is none
+    // to train on this poll. The "one skill-up per object per respawn" gate
+    // lives in the core (Spell::EffectOpenLock adds the object to the player's
+    // skillup list on success); the cast and the skill read-back below decide
+    // whether this object actually trained, and a spent object is simply not
+    // chosen again while its respawn holds.
+    static GameObject* FindNearestLockpickTarget(Player* bot)
+    {
+        std::list<GameObject*> found;
+        LockboxNearbyCheck check{bot, LOCKPICK_SWEEP_YARDS};
+        Acore::GameObjectListSearcher<LockboxNearbyCheck> searcher(bot, found, check);
+        Cell::VisitObjects(bot, searcher, LOCKPICK_SWEEP_YARDS);
+        GameObject* nearest = nullptr;
+        float nearestYards = std::numeric_limits<float>::max();
+        for (GameObject* go : found)
+        {
+            float const d = bot->GetDistance(go);
+            if (d < nearestYards)
+            {
+                nearestYards = d;
+                nearest = go;
+            }
+        }
+        return nearest;
+    }
+
+    // Polls every standing lockpick errand (job='lockpick', lockpick=1): finds
+    // the nearest live matching gameobject in the bot's zone, walks to it with
+    // the same grounded-step machinery DriveTravel uses, casts Pick Lock
+    // (spell 1804, driven through DriveChestOpen's CMSG_CAST_SPELL +
+    // TARGET_FLAG_GAMEOBJECT packet) when in reach, and reads
+    // GetSkillValue(SKILL_LOCKPICKING) back to confirm a real skill-up instead
+    // of trusting the cast result.
+    //
+    // The errand is left standing on every refusal - no target in zone, out of
+    // reach, mid-walk, in combat, or no skill-up - so it is retried next poll
+    // and cleared only when skill reads at the level cap (5 * level), matching
+    // DriveCraft's "leave the errand standing on a transient refusal"
+    // discipline.
+    void DriveLockpick()
+    {
+        std::map<std::string, std::string> const jobs = LoadJobs();
+        std::vector<std::string> const errands = LoadLockpickErrands();
+        if (errands.empty())
+            return;
+
+        for (std::string const& name : errands)
+        {
+            auto const jobIt = jobs.find(name);
+            if (jobIt == jobs.end() || jobIt->second != "lockpick")
+                continue;
+
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            if (!bot || !bot->IsInWorld())
+                continue;   // same "read on its own" discipline as every other drive
+            if (InDungeonRun(bot))
+                continue;   // a lockbox is a world object, not a dungeon errand
+            if (!bot->IsAlive() || bot->getClass() != CLASS_ROGUE || !bot->HasSpell(1804))
+                continue;
+
+            // Max achievable skill at a level is 5 * level; at the cap there is
+            // nothing left to train, so clear the errand.
+            uint32 const level = bot->GetLevel();
+            if (OverseerDecisions::ShouldClearLockpickErrand(bot->GetPureMaxSkillValue(SKILL_LOCKPICKING), level))
+            {
+                ClearLockpickErrand(name);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' Lockpicking reads at the level cap {}/{}, "
+                         "clearing the standing lockpick errand",
+                         name, static_cast<uint32>(bot->GetSkillValue(SKILL_LOCKPICKING)),
+                         static_cast<uint32>(5u * level));
+                continue;
+            }
+
+            GameObject* target = FindNearestLockpickTarget(bot);
+            bool const hasTarget = (target != nullptr);
+            float const dist = hasTarget ? bot->GetDistance(target) : std::numeric_limits<float>::max();
+            bool const inReach = hasTarget && dist <= LOCKPICK_REACH_YARDS;
+
+            switch (OverseerDecisions::DecideLockpickErrand(hasTarget, inReach,
+                                                            bot->IsInCombat(), bot->isMoving()))
+            {
+                case OverseerDecisions::LockpickErrandStep::Stand:
+                    // Out of reach: walk toward the chest, one grounded step per
+                    // poll, reusing the same step machinery DriveTravel uses. The
+                    // errand stands while the walk is in flight.
+                    if (hasTarget && !inReach)
+                    {
+                        WorldPosition const want(target->GetMapId(), target->GetPositionX(),
+                                                 target->GetPositionY(), target->GetPositionZ());
+                        WorldPosition step;
+                        if (GroundedStep(bot, want, step))
+                        {
+                            bot->GetMotionMaster()->MovePoint(LOCKPICK_APPROACH_POINT_ID,
+                                                              step.GetPositionX(), step.GetPositionY(),
+                                                              step.GetPositionZ());
+                            LetHeldCharacterWalk(name, LOCKPICK_WALK_CEILING_MS / 1000);
+                        }
+                    }
+                    continue;   // errand stands: retried next poll
+                case OverseerDecisions::LockpickErrandStep::Cast:
+                    break;      // in reach, not fighting, not moving: cast below
+            }
+
+            WorldSession* const session = bot->GetSession();
+            if (!session)
+                continue;
+
+            // "delivered is not done": trust the skill read-back, not the cast.
+            uint32 const before = bot->GetSkillValue(SKILL_LOCKPICKING);
+            DriveChestOpen(session, 1804, target->GetGUID());
+            uint32 const after = bot->GetSkillValue(SKILL_LOCKPICKING);
+            if (after > before)
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' cast Pick Lock at {} ({}) and Lockpicking "
+                         "rose {}/{} - real skill-up at a world lockbox",
+                         name, target->GetName(), static_cast<uint32>(target->GetEntry()),
+                         static_cast<uint32>(before), static_cast<uint32>(after));
+                RecordEvent(bot, "lockpick", 1804, "Pick Lock",
+                            "skill rose at a world lockbox");
+            }
+            else
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' cast Pick Lock at {} ({}) and Lockpicking "
+                         "did not rise ({}/{}); leaving the errand standing",
+                         name, target->GetName(), static_cast<uint32>(target->GetEntry()),
+                         static_cast<uint32>(before), static_cast<uint32>(after));
+            }
+            // The errand stands: the chest is spent this respawn, the attempt
+            // failed, or the skill did not rise; the next poll picks the nearest
+            // live lockbox and tries again.
         }
     }
 
@@ -77821,6 +78030,7 @@ private:
     uint32 _questTimer = 0;
     uint32 _craftTimer = 0;
     uint32 _fishTimer = 0;
+    uint32 _lockpickTimer = 0;
     // WHEN A DEAD CHARACTER WAS FIRST SEEN STILL WAITING TO RELEASE, by name.
     //
     // There is no ghost clock for this state - a corpse, and therefore a ghost

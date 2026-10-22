@@ -26220,6 +26220,27 @@ DungeonRunReport BuildDungeonRunReport(DungeonRunFacts const& run,
 std::size_t RecoveriesPerHour(std::vector<time_t> const& remedyTimes,
                               time_t now, time_t windowSeconds = 3600);
 
+// Whether `entry` is one of the live lockbox entries DriveLockpick trains on
+// (the 1-100 open-world bracket, entries from the pinned world database).
+bool IsLockpickTargetEntry(std::uint32_t entry);
+
+// Whether a standing lockpick errand should be cleared because Lockpicking has
+// reached the level cap: the max achievable skill at a level is 5 * level.
+bool ShouldClearLockpickErrand(std::uint32_t skill, std::uint32_t level);
+
+// The decision for one standing lockpick errand on one poll, once the
+// level-cap clear has been handled separately. Stand leaves the errand
+// standing (retried next poll); Cast means in reach, not fighting, not moving:
+// cast Pick Lock.
+enum class LockpickErrandStep : std::uint8_t
+{
+    Stand,
+    Cast,
+};
+
+LockpickErrandStep DecideLockpickErrand(bool hasTarget, bool inReach,
+                                        bool inCombat, bool moving);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

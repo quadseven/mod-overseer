@@ -23746,4 +23746,32 @@ std::size_t RecoveriesPerHour(std::vector<time_t> const& remedyTimes,
     return count;
 }
 
+bool IsLockpickTargetEntry(std::uint32_t entry)
+{
+    // The live lockbox entries DriveLockpick trains on, for the 1-100
+    // open-world bracket. These are gameobject_template entries from the
+    // pinned world database and must be verified against it before this drive
+    // can find anything. An entry that does not match the live database fails
+    // safe: FindNearestLockpickTarget finds nothing, the errand stands, and the
+    // bot walks nowhere. Do not ship a guess here.
+    return entry == 1660u || entry == 1733u;
+}
+
+bool ShouldClearLockpickErrand(std::uint32_t skill, std::uint32_t level)
+{
+    return skill >= 5u * level;
+}
+
+LockpickErrandStep DecideLockpickErrand(bool hasTarget, bool inReach,
+                                        bool inCombat, bool moving)
+{
+    if (!hasTarget)
+        return LockpickErrandStep::Stand;
+    if (!inReach)
+        return LockpickErrandStep::Stand;
+    if (inCombat || moving)
+        return LockpickErrandStep::Stand;
+    return LockpickErrandStep::Cast;
+}
+
 }  // namespace OverseerDecisions
