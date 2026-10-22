@@ -83,6 +83,18 @@ int main()
     if (reward == std::string::npos || readBack == std::string::npos)
         return Fail("HandInChosenQuest must reward the quest and read the reward back");
 
+    // The drive must observe that same rewarded state and release the aim
+    // before another poll can reassert the completed errand.
+    std::size_t const driveQuests = text.find("void DriveQuests(");
+    if (driveQuests == std::string::npos)
+        return Fail("cannot find DriveQuests");
+    std::size_t const rewardedAim = text.find("GetQuestRewardStatus(aim)", driveQuests);
+    std::size_t const clearAim = text.find("ClearAim(name)", rewardedAim);
+    std::size_t const driveChosen = text.find("DriveChosenQuest(", rewardedAim);
+    if (rewardedAim == std::string::npos || clearAim == std::string::npos ||
+        driveChosen == std::string::npos || clearAim > driveChosen)
+        return Fail("DriveQuests must release a rewarded aim before driving it again");
+
     // No inline copy of the old steady-lease guard is left to bypass the step.
     if (drive.find("if (working == questId && !aimChanged)") != std::string::npos)
         return Fail("DriveChosenQuest must not keep the old inline lease guard");

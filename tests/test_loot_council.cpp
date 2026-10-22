@@ -273,20 +273,64 @@ void TanksThenHealersThenTheRest()
 
 void VotesOnAnOpenRoll()
 {
-    Expect(LootCouncilVoteFor(false, "", "Og", 3) == LootCouncilVote::Hold,
+    LootDisenchantFacts const none;
+    Expect(LootCouncilVoteFor(false, "", "Og", 3, none) == LootCouncilVote::Hold,
            "an undecided roll holds the vote");
-    Expect(LootCouncilVoteFor(false, "", "Og", LOOT_COUNCIL_ROLL_LAST_SECONDS) ==
+    Expect(LootCouncilVoteFor(false, "", "Og", LOOT_COUNCIL_ROLL_LAST_SECONDS, none) ==
                LootCouncilVote::Upstream,
            "an undecided roll near its deadline goes to the upstream vote");
-    Expect(LootCouncilVoteFor(true, "Og", "Og", 5) == LootCouncilVote::Need,
+    Expect(LootCouncilVoteFor(true, "Og", "Og", 5, none) == LootCouncilVote::Need,
            "the recipient needs");
-    Expect(LootCouncilVoteFor(true, "Og", "Grug", 5) == LootCouncilVote::Pass,
+    Expect(LootCouncilVoteFor(true, "Og", "Grug", 5, none) == LootCouncilVote::Pass,
            "everybody else passes");
-    Expect(LootCouncilVoteFor(true, "", "Grug", 5) == LootCouncilVote::Greed,
+    Expect(LootCouncilVoteFor(true, "", "Grug", 5, none) == LootCouncilVote::Greed,
            "nobody named: everybody greeds");
     Expect(LOOT_COUNCIL_ROLL_WAIT_SECONDS < LOOT_COUNCIL_ROLL_LAST_SECONDS &&
                LOOT_COUNCIL_ROLL_LAST_SECONDS < 60,
            "the heuristic decides before the upstream vote, and both before the roll ends");
+}
+
+// #160: a drop the council gives nobody is disenchanted by the family's
+// Enchanter, and only when the realm allows it and an Enchanter is rolling.
+void AnUnwantedDropGoesToTheEnchanter()
+{
+    LootDisenchantFacts open;
+    open.realmAllows = true;
+    open.enchanterRolling = true;
+
+    LootDisenchantFacts enchanter = open;
+    enchanter.voterCanDisenchant = true;
+    Expect(LootCouncilVoteFor(true, "", "Og", 5, enchanter) == LootCouncilVote::Disenchant,
+           "nobody named and an Enchanter can take it apart: the Enchanter disenchants");
+    Expect(LootCouncilVoteFor(true, "", "Grug", 5, open) == LootCouncilVote::Pass,
+           "and everybody else passes, so the materials reach the Enchanter");
+
+    Expect(LootCouncilVoteFor(true, "Ugga", "Og", 5, enchanter) == LootCouncilVote::Pass,
+           "a drop the council gave somebody is never disenchanted");
+    Expect(LootCouncilVoteFor(true, "Og", "Og", 5, enchanter) == LootCouncilVote::Need,
+           "the Enchanter needs a drop the council gave it");
+    Expect(LootCouncilVoteFor(false, "", "Og", 3, enchanter) == LootCouncilVote::Hold,
+           "an undecided roll still holds");
+
+    LootDisenchantFacts realmOff = enchanter;
+    realmOff.realmAllows = false;
+    Expect(LootCouncilVoteFor(true, "", "Og", 5, realmOff) == LootCouncilVote::Greed,
+           "with AiPlayerbot.LootRollDisenchant off, everybody greeds as before");
+
+    LootDisenchantFacts noEnchanter = open;
+    noEnchanter.enchanterRolling = false;
+    Expect(LootCouncilVoteFor(true, "", "Grug", 5, noEnchanter) == LootCouncilVote::Greed,
+           "with no Enchanter voting on the roll nobody passes it away");
+}
+
+void WhoCanDisenchantADrop()
+{
+    Expect(CanDisenchantDrop(41, 1, 1), "skill 1 takes apart a drop that asks for 1");
+    Expect(CanDisenchantDrop(41, 25, 30), "more skill than asked is enough");
+    Expect(!CanDisenchantDrop(41, 25, 24), "less skill than asked is not");
+    Expect(!CanDisenchantDrop(0, 1, 300), "a drop with no disenchant loot cannot be taken apart");
+    Expect(!CanDisenchantDrop(41, -1, 300), "a required skill of -1 means not disenchantable");
+    Expect(!CanDisenchantDrop(41, 0, 0), "a character without Enchanting cannot");
 }
 
 void MandatedBindOnPickupRollsAreExclusive()
@@ -393,6 +437,19 @@ void TheAdapterSeams()
     Expect(module.find("void AnswerOpenRolls(std::vector<GearMember> const& members)") !=
                std::string::npos,
            "the open-roll reaction is kept");
+    Expect(module.find("case OverseerDecisions::LootCouncilVote::Disenchant: vote = DISENCHANT;") !=
+               std::string::npos,
+           "the steer casts the council's Disenchant as the core's DISENCHANT vote");
+    Expect(module.find("OverseerCompat::LootRollDisenchant(sPlayerbotAIConfig)") !=
+               std::string::npos,
+           "the realm's AiPlayerbot.LootRollDisenchant gates the Disenchant vote");
+    Expect(module.find("SKILL_ENCHANTING") != std::string::npos,
+           "the voters' live Enchanting decides who can take a drop apart");
+    Expect(module.find("OverseerDecisions::CanDisenchantDrop(") != std::string::npos,
+           "who can take a drop apart is the decision's arithmetic");
+    std::string const compat = Read("src/overseer_core_compat.h");
+    Expect(compat.find("requires { config.lootRollDisenchant; }") != std::string::npos,
+           "the compat header detects the setting's spelling");
     Expect(module.find("c.rolePiece = OverseerDecisions::GearPieceForRole(") !=
                std::string::npos,
            "each candidate is told whether the drop is a piece for its role");
@@ -440,6 +497,8 @@ int main()
     TheMainTankIsGearedFirst();
     TanksThenHealersThenTheRest();
     VotesOnAnOpenRoll();
+    AnUnwantedDropGoesToTheEnchanter();
+    WhoCanDisenchantADrop();
     MandatedBindOnPickupRollsAreExclusive();
     SeatRoles();
     KeysAndJson();

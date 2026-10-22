@@ -129,37 +129,38 @@ present - there was no gap left to fill there.
 
 ## What this defers, and why it is safe to defer
 
-Apprentice Fishing (skill 1-75) is the whole of what ships here: "learn from
-any Fishing trainer, then cast at whatever water mod-playerbots' own
-`FindWaterRadial` finds within its default search window" needs nothing past
-what is already built. Everything past Apprentice is a real, separate scope:
+Apprentice Fishing (skill 1-75) shipped first. Subsequent trainer tiers now
+also run when a character that already has Fishing reaches a trainer. The
+arrival handler reads `GetPureMaxSkillValue(SKILL_FISHING)` before and after
+`TeachSpell`; it only records a tier-up when the cap actually increases. A
+character's existing Fishing skill is sufficient to opt into this check, so
+the one-shot `learn_fishing` flag remains only for initial acquisition. This
+fixes the earlier unconditional `HasSkill` return, which made the purported
+rank re-check unreachable. Journeyman and Expert have not been proven live in
+this checkout: the validation environment has no running world or trainer
+visit, so a live claim remains open.
 
-- **Journeyman (75) and Expert (150)** both gate on visiting a trainer again
-  once the skill value crosses the current cap - mechanically identical to
-  what `TrainFishingOnArrival` already does (it re-checks
-  `TrainerSpellForFishing` every time, which already returns the next tier
-  once `CanTeachSpell`'s own rank-chain check says the character qualifies),
-  so this is very likely **already covered** by what shipped here. It has
-  not been proven live against a real trainer visit past Apprentice in this
-  pass, which is the honest reason it is called out rather than claimed.
-- **Artisan (225) requires buying a specific book from a specific vendor**
-  (not a trainer purchase at all - an item that teaches a spell on use), which
-  `Trainer::TeachSpell` cannot reach. This needs its own small mechanism:
-  locate the vendor, confirm the bot can afford and carry the item, buy it,
-  use it, read back `GetPureMaxSkillValue(SKILL_FISHING)` the same way
-  `TrainOnArrival` already does for a tier-up. Genuinely new code, not a
-  variant of anything above.
-- **Master/"Nat Pagle, Angler Extreme" (300, historically the Artisan-tier
-  quest in this content era) is quest-driven**, not a purchase at all - it
-  needs `DriveQuests`' own machinery (quest acceptance, objective tracking,
-  turn-in) pointed at a specific quest chain, which is a different drive
-  entirely and well outside what a fishing-specific change should carry.
+The ticket's Artisan-book premise does not match the Classic data documented
+for this module. Item 16083, "Expert Fishing - The Bass and You," is the book
+sold by Old Man Heming (creature 2626) and teaches Expert Fishing; it is not an
+Artisan book. Artisan Fishing, available at 225, is unlocked by completing
+"Nat Pagle, Angler Extreme" (quest 6607), which raises the cap to 300. This is
+a direct quest, not a multi-quest prerequisite chain. The purchase/use
+mechanism requested as an Artisan book is therefore not implemented: doing so
+would buy an Expert book and mislabel its effect. A future vendor-book feature
+must be driven by the actual target database's item spell effect, vendor
+stock, cost, and skill-cap read-back.
 
-**Follow-up**: file a `quadseven/mod-overseer` issue scoping the
-Journeyman/Expert verification pass and the Artisan vendor-book mechanism
-separately, referencing infra#2757 (the craft-leveling epic this is a
-sibling of, not a part of) as related context. Do not block shipping
-Apprentice on either.
+The Fishing quest gate is quest 6607. A `DriveQuests` implementation needs to
+ensure the bot can accept it, track its four fish objectives, turn in their
+quest items to Nat Pagle, and confirm the cap rose to 300. This pass does not
+implement that drive or claim live completion. The tier names are content
+labels; "Master" is not the quest's name and quest 6607 is the Artisan unlock
+in the Classic ruleset referenced here.
+
+The remaining follow-up is live validation against the deployed world data.
+If that world differs from the Classic data described above, confirm the
+Fishing book and quest spell effects there before implementing another path.
 
 ## The Python side (design only - not implemented in this pass)
 
