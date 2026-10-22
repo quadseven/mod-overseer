@@ -16205,6 +16205,11 @@ private:
     // is crafted out of thin air - the same "fail closed, not open" shape
     // every other drive in this file holds to.
     //
+    // ANVILS AND THE BLACKSMITH HAMMER (#524): Anvil-gated recipes are out of
+    // scope here, and the planner must not name one. The decisions and the
+    // swap-and-restore design are in docs/design/profession-crafting-drive.md,
+    // section "Anvil, Hammer and reagent-gated Blacksmithing recipes".
+    //
     // A focus the crafter can conjure where it stands is provided instead
     // (OverseerDecisions::FocusLighterSpell, quadseven/mod-overseer#534):
     // every Cooking recipe needs a Cooking Fire, and Basic Campfire (818)

@@ -129,6 +129,81 @@ and `professions.CRAFTING` rather than re-deriving them):
   behind, which covers the majority of early recipes but not all of them;
   worth a second look once v1 lands for the trades that are the exception.
 
+## Anvil, Hammer and reagent-gated Blacksmithing recipes (#524)
+
+Every "worn" Blacksmithing recipe (Runed Copper Belt through Imperial Plate
+Boots) needs a nearby Anvil and an equipped Blacksmith Hammer, and the two
+Green Iron recipes also need Green Dye from a vendor. DriveCraft casts in place
+and the core's `CheckCast` refuses them, so they stay out of the recipe table.
+The three decisions below are what the follow-up work builds against.
+
+### Anvil: Anvil-gated recipes are OUT OF SCOPE for DriveCraft until the Hammer swap lands
+
+Facts, read from the world database: every Anvil is a `GAMEOBJECT_TYPE_SPELL_FOCUS`
+(type 8) with `data1 = 10`, the same value `SpellInfo::RequiresSpellFocus`
+carries. It is a real spawn, not a DBC concept. `BuildTravelIndex` indexes
+creature spawns only, so walking to an Anvil needs a second index of
+GameObject spawns filtered to that type and focus, with the existing same-map
+nearest-candidate ranking on top. The guild-bank walk is not a precedent: it
+walks to a banker creature and searches for the vault after arriving, and
+Anvils have no paired creature.
+
+Decision: the travel half alone unblocks no recipe, because every Anvil recipe
+also needs the Hammer. So Anvil travel is not built on its own. Until both
+halves land the planner must not hand DriveCraft an Anvil-gated spell. A spell
+that slips through still fails closed: `SPELL_FAILED_REQUIRES_SPELL_FOCUS` is
+logged and the errand stands, which is the existing behaviour.
+
+### Hammer: EquippedItemClass is not broad enough, so a temporary swap is the design
+
+Facts: the Blacksmith Hammer (item 5956) is a main-hand weapon of class 2,
+subclass 14 (`ITEM_SUBCLASS_WEAPON_MISC`). The worn recipes' `EquippedItemClass`
+is weapon with a subclass mask for that miscellaneous subclass, not "any
+one-handed weapon", so a character's real weapon never satisfies it. Equipping
+the Hammer necessarily displaces the weapon in hand.
+
+Decision: swap in, craft, swap back. There is no precedent in the module: the
+gear-upgrade drive swaps one way and permanently. The swap needs these rules
+before any code is written:
+
+- Persist what was equipped before the swap (a roster column, like every other
+  standing errand) so a crash mid-swap and a worldserver restart cannot strand
+  the original weapon. On the next poll a stored weapon with the Hammer still
+  in hand means "swap back first", before any new craft.
+- Trigger only under `MayCraftNow`: alive, out of combat, not moving, not in a
+  run. If a character is pulled into combat while holding the Hammer, the swap
+  back takes precedence over the craft errand on the next out-of-combat poll,
+  and the combat strategies are not touched.
+- Require bag space for the displaced weapon before swapping; with none, leave
+  the weapon where it is and the errand standing. Never drop or sell an item to
+  make room.
+- Read the world back after each swap (`GetItemByPos`), not the call's return,
+  as the module does everywhere else a command should change the world.
+- Death, logout or a reassigned job while the Hammer is in hand takes the same
+  swap-back path on the next login poll, since the stored weapon is the only
+  state needed.
+
+Not built in this change: it needs the adapter build to verify, and it unblocks
+nothing without the Anvil half.
+
+### Reagents: craft reagents stay out of scope for town-trip buying
+
+Green Dye is the only vendor-bought craft reagent in the Blacksmithing
+progression, and its only users (Green Iron Leggings and Bracers) are Anvil
+and Hammer gated. Extending the `kind='buy'` errand (food and drink today,
+with money and bag-space checks) for a reagent that no reachable recipe uses
+would be dead code, so craft reagents stay out of scope for town-trip buying
+until those two recipes can run. When they can, the extension reuses the same
+affordability and bag-space checks and adds Green Dye as the first non-food
+item. Reagent buying for v1 remains the family's own gathering, as above.
+
+### Recipe table
+
+The deferred Blacksmithing recipes are not added to `RECIPES` in this change.
+The table lives in the Python planner, not in this repository, and each entry
+needs the two-source check (wowhead.com/wotlk and classicdb.ch) of spell id,
+item id and reagents once the Anvil and Hammer halves exist.
+
 ## Why nothing was implemented in this pass
 
 This module's C++ half (`DriveCraft`) lives in the adapter, which needs a
