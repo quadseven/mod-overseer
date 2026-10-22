@@ -19257,6 +19257,32 @@ std::vector<uint32_t> PlanRecipePurchases(std::vector<TrainerRecipeOffer> offers
     return plan;
 }
 
+uint32_t RecipeToBuyNow(TrainerRecipeOffer const& offer, uint32_t skill,
+                        bool hasSkill, uint32_t skillValue, uint32_t level,
+                        uint64_t purse)
+{
+    // Never a recipe for a trade the character does not hold.
+    if (!hasSkill || skill == 0)
+        return 0;
+    // Only a recipe of this trade.
+    if (offer.skillLine != skill)
+        return 0;
+    // Not already known, and not a rank spell (the rank path owns those).
+    if (offer.known || offer.startsSkill)
+        return 0;
+    // Within the classic cap.
+    if (!OverseerDecisions::Classic::ClassicRecipeAllowed(offer.reqSkillRank))
+        return 0;
+    // The character meets the skill and level the recipe needs.
+    if (offer.reqSkillRank > skillValue || offer.reqLevel > level)
+        return 0;
+    // The price leaves the purse floor.
+    if (purse < RECIPE_PURSE_FLOOR_COPPER ||
+        offer.cost > purse - RECIPE_PURSE_FLOOR_COPPER)
+        return 0;
+    return offer.spellId;
+}
+
 bool TrainingStopHoldsRepairLeg(bool stopOpen, uint32_t heldSeconds)
 {
     return stopOpen && heldSeconds < TRAINING_STOP_MAX_SECONDS;

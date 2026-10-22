@@ -22306,6 +22306,17 @@ std::vector<uint32_t> PlanRecipePurchases(std::vector<TrainerRecipeOffer> offers
                                           bool hasSkill, uint32_t skillValue, uint32_t level,
                                           uint64_t purse);
 
+// The recipe the roster names for the arriving trade: buy it now when it is a
+// recipe of this trade the character holds, is not already known, is not a rank
+// spell, is within the classic cap, needs no more skill or level than the
+// character has, and its price leaves at least the purse floor. Returns the
+// spell id to buy, or 0 when the trainer will not sell it to this character
+// right now (wrong trade, already known, a rank, skill or level too low, too
+// dear, or the purse floor would break).
+uint32_t RecipeToBuyNow(TrainerRecipeOffer const& offer, uint32_t skill,
+                        bool hasSkill, uint32_t skillValue, uint32_t level,
+                        uint64_t purse);
+
 // "walk", "resting" ... for the log line.
 char const* TrainingStopStepWord(TrainingStopStep step);
 

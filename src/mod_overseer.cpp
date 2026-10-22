@@ -15363,6 +15363,12 @@ private:
         uint32 learnSkill = 0;
         uint32 unlearnSkill = 0;
         uint32 unlearnMax = 0;
+        // THE RECIPE THE ROSTER NAMES FOR THE ARRIVING TRADE. One recipe spell
+        // id, or 0 for none. When the character reaches its trade trainer it is
+        // bought through Trainer::TeachSpell (the money is taken) with a
+        // read-back, in addition to the rank the trainer would sell. 0 means no
+        // recipe errand, the same sentinel every aim column uses.
+        uint32 buyRecipe = 0;
     };
 
     // The DBC's own word for a skill line, for the logs. Read rather than
@@ -15714,7 +15720,7 @@ private:
     {
         std::map<std::string, ProfessionPlan> plans;
         QueryResult result = CharacterDatabase.Query(
-            "SELECT name, professions, learn_skill, unlearn_skill, unlearn_max "
+            "SELECT name, professions, learn_skill, unlearn_skill, unlearn_max, buy_recipe "
             "FROM overseer_roster WHERE enabled = 1 AND professions <> ''");
         if (!result)
             return plans;  // nobody assigned, or no such columns - same answer
@@ -15744,6 +15750,7 @@ private:
             plan.learnSkill = fields[2].Get<uint16>();
             plan.unlearnSkill = fields[3].Get<uint16>();
             plan.unlearnMax = fields[4].Get<uint16>();
+            plan.buyRecipe = fields[5].Get<uint16>();
             plans[fields[0].Get<std::string>()] = plan;
         } while (result->NextRow());
         return plans;
@@ -15926,6 +15933,66 @@ private:
         ClearUnlearnRequest(name);
     }
 
+    // The recipe the roster names for this arriving trade, if this trainer
+    // would sell it to this character right now: it is on the trainer's list,
+    // of this trade, and Trainer::CanTeachSpell allows (skill and level met,
+    // not already blocked). Returns the spell id, or 0 when the trainer will
+    // not teach it (wrong trade, wrong trainer, skill or level too low).
+    static uint32 RecipeTheTrainerSells(Trainer::Trainer* trainer, Player* bot,
+                                        uint32 skill, uint32 recipe)
+    {
+        for (Trainer::Spell const& spell : trainer->GetSpells())
+        {
+            if (spell.SpellId != recipe)
+                continue;
+            if (spell.ReqSkillLine != skill || !trainer->CanTeachSpell(bot, &spell))
+                continue;
+            return spell.SpellId;
+        }
+        return 0;
+    }
+
+    // Buy ONE named recipe through the core's Trainer::TeachSpell, which takes
+    // the money, and read it back with HasSpell. Returns true when the
+    // character now holds it. A refusal (the trainer will not teach it now -
+    // skill or level too low, the wrong trainer, or not enough money) is logged
+    // with why and returns false: the errand is released, not retried every
+    // cycle.
+    static bool BuyRecipe(Creature* npc, Trainer::Trainer* trainer, Player* bot,
+                          uint32 skill, uint32 spellId, std::string const& name)
+    {
+        if (bot->HasSpell(spellId))
+            return true;  // already holds it: nothing to buy
+
+        uint64 const purseBefore = bot->GetMoney();
+        // natural-only: bought at the arriving trade's trainer, which takes its
+        // price (TeachSpell); nothing is granted out of thin air and the
+        // read-back below proves the purchase took.
+        trainer->TeachSpell(npc, bot, spellId);  // Trainer.h:73
+        if (bot->HasSpell(spellId))
+        {
+            uint64 const purseAfter = bot->GetMoney();
+            uint64 const paid = purseBefore > purseAfter ? purseBefore - purseAfter : 0;
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+            std::string const recipe =
+                info ? std::string(info->SpellName[LOCALE_enUS]) : std::string();
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' bought recipe '{}' ({}) of {} ({}) from creature {} "
+                     "for {} copper of its own, at the trainer's price, not a grant",
+                     name, recipe, spellId, SkillName(skill), skill,
+                     npc->GetEntry(), paid);
+            RecordEvent(bot, "learn", spellId, recipe,
+                        "bought this recipe from its trade's trainer, at the trainer's price");
+            return true;
+        }
+        LOG_WARN("module.overseer",
+                 "overseer: '{}' was not taught recipe {} ({}) of {} ({}) by '{}'. "
+                 "The trainer will not teach it now - skill or level too low, the wrong "
+                 "trainer, or not enough money (it holds {} copper). Releasing the errand.",
+                 name, spellId, SkillName(skill), skill, npc->GetName(), bot->GetMoney());
+        return false;
+    }
+
     // Learn the assigned trade from the trainer this character is standing at.
     //
     // Returns TRUE when the errand is finished with - learned, already true, or
@@ -16038,12 +16105,40 @@ private:
             return true;
         }
 
+        // The recipe the roster names for this arriving trade, if this trainer
+        // would sell it to this character right now. A named recipe outranks
+        // the auto list: it is the errand's reason for being here.
+        uint32 const recipeSpell = plan.buyRecipe
+            ? RecipeTheTrainerSells(trainer, bot, skill, plan.buyRecipe)
+            : 0;
+
         uint32 const spellId = TrainerSpellForSkill(trainer, bot, skill);
         if (!spellId)
         {
             // NO RANK FOR SALE IS NOT NO ERRAND: a character at its ceiling can
             // still lack the recipes the trainer teaches (Heavy Linen Bandage).
-            // Only when neither is on offer does the errand drop.
+            if (recipeSpell)
+            {
+                if (BuyRecipe(npc, trainer, bot, skill, recipeSpell, name))
+                {
+                    SpellInfo const* info = sSpellMgr->GetSpellInfo(recipeSpell);
+                    std::string const recipe =
+                        info ? std::string(info->SpellName[LOCALE_enUS]) : std::string();
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' bought recipe '{}' ({}) of {} ({}) from '{}' "
+                             "(creature {}); no rank was on offer", name, recipe,
+                             recipeSpell, skillName, skill, npc->GetName(), entry);
+                    RecordEvent(bot, "learn", recipeSpell, recipe,
+                                "bought the recipe this trainer teaches, at the trainer's price");
+                    ClearLearnAim(name);
+                    return true;
+                }
+                // BuyRecipe already named why the trainer will not teach it.
+                ClearLearnAim(name);
+                return true;
+            }
+            // Only when neither a rank nor the named recipe is on offer does
+            // the errand drop.
             if (uint32 const recipes = BuyRecipes(trainer, npc, bot, skill))
             {
                 LOG_INFO("module.overseer",
@@ -16109,6 +16204,18 @@ private:
                     alreadyHasSkill
                         ? "trained the next tier of this skill from a trainer it was sent to"
                         : "learned this profession from a trainer it was sent to");
+        // The recipe the roster names, bought first (it is the errand's reason
+        // for being here). The auto list follows with what the rank left.
+        if (recipeSpell)
+        {
+            if (!BuyRecipe(npc, trainer, bot, skill, recipeSpell, name))
+            {
+                // The trainer will not teach it now: release rather than retry
+                // every cycle. The rank the character just learned stands.
+                ClearLearnAim(name);
+                return true;
+            }
+        }
         // THE RECIPES THE RANK JUST OPENED, bought with what the rank left.
         if (uint32 const recipes = BuyRecipes(trainer, npc, bot, skill))
             RecordEvent(bot, "learn", skill, skillName,
