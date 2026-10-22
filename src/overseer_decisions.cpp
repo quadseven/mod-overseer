@@ -19257,6 +19257,60 @@ std::vector<uint32_t> PlanRecipePurchases(std::vector<TrainerRecipeOffer> offers
     return plan;
 }
 
+NamedRecipeVerdict JudgeNamedRecipe(NamedRecipeFacts const& facts)
+{
+    // THE CHARACTER ALREADY HAS IT. The errand is over, and it is over
+    // whatever this trainer's list says.
+    if (facts.known)
+        return NamedRecipeVerdict::AlreadyKnown;
+    // NOT THIS TRAINER'S RECIPE. Said as such, not as a skill problem.
+    if (!facts.soldHere)
+        return NamedRecipeVerdict::NotSoldHere;
+    // THE CLASSIC CAP. A recipe past it is not a recipe this ruleset has,
+    // whatever the trainer's list carries.
+    if (!Classic::ClassicRecipeAllowed(facts.reqSkillRank))
+        return NamedRecipeVerdict::NotTaught;
+    if (!facts.teachable)
+    {
+        // THE CORE'S ONE BOOL FOLDS SEVERAL REASONS TOGETHER, so the reason
+        // is read out of the facts. The order is the core's own order in
+        // GetDefaultSpellState: the skill in the trade first, then the level.
+        if (facts.skillLine && facts.reqSkillRank > facts.skillValue)
+            return NamedRecipeVerdict::SkillTooLow;
+        if (facts.reqLevel > facts.level)
+            return NamedRecipeVerdict::LevelTooLow;
+        return NamedRecipeVerdict::NotTaught;
+    }
+    // THE PRICE. The purse carries it or it does not, and the sweep's purse
+    // floor does not reach a recipe the roster named by itself.
+    if (facts.cost > facts.purse)
+        return NamedRecipeVerdict::TooDear;
+    return NamedRecipeVerdict::Buy;
+}
+
+char const* NamedRecipeRefusalReason(NamedRecipeVerdict verdict)
+{
+    switch (verdict)
+    {
+        case NamedRecipeVerdict::AlreadyKnown:
+            return "the character already holds this recipe";
+        case NamedRecipeVerdict::NotSoldHere:
+            return "this trainer does not sell this recipe";
+        case NamedRecipeVerdict::SkillTooLow:
+            return "the character's skill in the trade is short of what the recipe needs";
+        case NamedRecipeVerdict::LevelTooLow:
+            return "the character is too low a level for this recipe";
+        case NamedRecipeVerdict::TooDear:
+            return "the purse cannot carry the trainer's price for it";
+        case NamedRecipeVerdict::NotTaught:
+            return "the trainer will not teach this recipe to this character, and no narrower "
+                   "reason is known";
+        case NamedRecipeVerdict::Buy:
+            break;
+    }
+    return "";
+}
+
 bool TrainingStopHoldsRepairLeg(bool stopOpen, uint32_t heldSeconds)
 {
     return stopOpen && heldSeconds < TRAINING_STOP_MAX_SECONDS;

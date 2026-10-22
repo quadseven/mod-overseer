@@ -22306,6 +22306,59 @@ std::vector<uint32_t> PlanRecipePurchases(std::vector<TrainerRecipeOffer> offers
                                           bool hasSkill, uint32_t skillValue, uint32_t level,
                                           uint64_t purse);
 
+// ------------------------------------------ the one recipe the roster names --
+//
+// A roster may name ONE recipe for a character to buy at a profession trainer
+// (overseer_roster.learn_recipe, a spell id). That is a different errand from
+// the sweep above: the sweep walks the trainer's whole list and buys what the
+// character can use and afford, while the named recipe is the one the roster
+// asked for, bought at the one trainer the character was walked to.
+//
+// The decision is the verdict on that one recipe, and the reason it was not
+// bought. The core's Trainer::CanTeachSpell folds half a dozen reasons into
+// one bool - already known, too low a level, the wrong trade, no free primary
+// profession slot - so the reason is read out of the facts instead and said
+// by name: an operator reading "the character cannot learn this one" learns
+// nothing, and an operator reading "the character's skill in the trade is
+// short of what the recipe needs" can act on it.
+//
+// THE PURSE FLOOR ABOVE DOES NOT REACH HERE. The floor is the sweep's rule
+// for a shopping list, so that a visit never leaves a character unable to
+// pay for its next repair. One recipe the roster named, which the purse
+// covers, is bought at the trainer's own price: the character is left without
+// that one recipe, not without its repair money.
+struct NamedRecipeFacts
+{
+    uint32_t spellId{0};
+    bool soldHere{false};      // the trainer's list carries this spell
+    bool known{false};         // the character already holds the spell
+    bool teachable{false};     // Trainer::CanTeachSpell says yes
+    uint32_t skillLine{0};     // Trainer::Spell::ReqSkillLine, the trade it belongs to
+    uint32_t reqSkillRank{0};  // skill value the recipe needs
+    uint32_t skillValue{0};    // skill value the character holds in that trade
+    uint32_t reqLevel{0};      // character level the recipe needs
+    uint32_t level{0};         // character level
+    uint64_t cost{0};          // copper the trainer would charge this character
+    uint64_t purse{0};         // copper the character holds
+};
+
+enum class NamedRecipeVerdict
+{
+    Buy,          // the trainer sells it, the character can learn it, the purse carries it
+    AlreadyKnown, // the character holds it already: the errand is over
+    NotSoldHere,  // this trainer does not sell it
+    SkillTooLow,  // the skill in the trade is short of what the recipe needs
+    LevelTooLow,  // the character is too low a level for it
+    TooDear,      // the purse cannot carry the trainer's price
+    NotTaught     // the core would not teach it, and no narrower reason is known
+};
+
+// The verdict on the one recipe the roster named.
+NamedRecipeVerdict JudgeNamedRecipe(NamedRecipeFacts const& facts);
+
+// Why the recipe was not bought, said by name in the log. Empty for a buy.
+char const* NamedRecipeRefusalReason(NamedRecipeVerdict verdict);
+
 // "walk", "resting" ... for the log line.
 char const* TrainingStopStepWord(TrainingStopStep step);
 
