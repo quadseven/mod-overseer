@@ -16564,16 +16564,16 @@ private:
     // ------------------------------------- job='lockpick' (mod-overseer#445) --
 
     // How close the bot must be to a lockbox before it casts Pick Lock at it.
-    constexpr float LOCKPICK_REACH_YARDS = 8.0f;
+    static constexpr float LOCKPICK_REACH_YARDS = 8.0f;
 
     // Point id the bot's motion master uses while walking to a lockbox.
-    constexpr uint32 LOCKPICK_APPROACH_POINT_ID = 100u;
+    static constexpr uint32 LOCKPICK_APPROACH_POINT_ID = 100u;
 
     // How long the hold tolerates a lockpick approach walk, in milliseconds.
-    constexpr uint32 LOCKPICK_WALK_CEILING_MS = 30000u;
+    static constexpr uint32 LOCKPICK_WALK_CEILING_MS = 30000u;
 
     // Sweep radius for a live lockbox in the bot's zone, in yards.
-    constexpr float LOCKPICK_SWEEP_YARDS = 200.0f;
+    static constexpr float LOCKPICK_SWEEP_YARDS = 200.0f;
 
     // A lockbox this drive trains on, for the 1-100 open-world bracket. The
     // entries are gameobject_template rows from the pinned world database.
