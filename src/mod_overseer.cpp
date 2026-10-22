@@ -16343,11 +16343,27 @@ private:
             {
                 if (info->Reagent[x] <= 0)
                     continue;
-                if (!bot->HasItemCount(static_cast<uint32>(info->Reagent[x]),
-                                       static_cast<uint32>(info->ReagentCount[x])))
+                uint32 const reagentId = static_cast<uint32>(info->Reagent[x]);
+                uint32 const reagentCount = static_cast<uint32>(info->ReagentCount[x]);
+                if (!bot->HasItemCount(reagentId, reagentCount))
                 {
                     shortOfReagents = true;
-                    break;
+
+                    // Write a material-request event for this missing reagent.
+                    // itemGuid is set to the reagent item ID so the event key
+                    // (character_name, kind, subject_id, bucket, itemGuid)
+                    // deduplicates per character, recipe, and reagent combination.
+                    if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(reagentId))
+                    {
+                        std::string detail = "need ";
+                        detail += std::to_string(reagentCount);
+                        detail += "x ";
+                        detail += proto->Name1;
+                        EventExtra extra;
+                        extra.itemGuid = reagentId;
+                        RecordEvent(bot, "material-request", spellId,
+                                    info->SpellName[LOCALE_enUS], detail, extra);
+                    }
                 }
             }
             if (shortOfReagents)
