@@ -19257,6 +19257,7 @@ std::vector<uint32_t> PlanRecipePurchases(std::vector<TrainerRecipeOffer> offers
     return plan;
 }
 
+
 bool ParseVendorManual(std::string const& column, VendorManual& out)
 {
     out = VendorManual();
@@ -19282,7 +19283,11 @@ bool ParseVendorManual(std::string const& column, VendorManual& out)
         out.vendorEntry = static_cast<uint32_t>(vendor);
         return true;
     }
-    catch (...)
+    catch (std::invalid_argument const&)
+    {
+        return false;
+    }
+    catch (std::out_of_range const&)
     {
         return false;
     }
@@ -19312,6 +19317,32 @@ VendorManualVerdict DecideVendorManualPurchase(VendorManual const& manual,
     }
     out.kind = VendorManualVerdict::Kind::Buy;
     return out;
+}
+
+NamedRecipeStep PlanNamedRecipe(bool known, bool onTrainerList, bool canTeach, uint64_t cost,
+                                uint64_t purse)
+{
+    if (known)
+        return NamedRecipeStep::AlreadyHeld;
+    if (!onTrainerList)
+        return NamedRecipeStep::NotSold;
+    if (!canTeach)
+        return NamedRecipeStep::CannotTeach;
+    return cost > purse ? NamedRecipeStep::TooPoor : NamedRecipeStep::Buy;
+}
+
+char const* NamedRecipeStepWord(NamedRecipeStep step)
+{
+    switch (step)
+    {
+        case NamedRecipeStep::AlreadyHeld: return "already_held";
+        case NamedRecipeStep::Buy: return "buy";
+        case NamedRecipeStep::NotSold: return "not_sold";
+        case NamedRecipeStep::CannotTeach: return "cannot_teach";
+        case NamedRecipeStep::TooPoor: return "too_poor";
+    }
+    return "unknown";
+
 }
 
 bool TrainingStopHoldsRepairLeg(bool stopOpen, uint32_t heldSeconds)

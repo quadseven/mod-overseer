@@ -22306,6 +22306,7 @@ std::vector<uint32_t> PlanRecipePurchases(std::vector<TrainerRecipeOffer> offers
                                           bool hasSkill, uint32_t skillValue, uint32_t level,
                                           uint64_t purse);
 
+
 // -------------------------- a recipe manual bought from a vendor -----------
 //
 // Some secondary-trade recipes are taught by a manual item bought from a
@@ -22356,6 +22357,28 @@ struct VendorManualVerdict
 VendorManualVerdict DecideVendorManualPurchase(VendorManual const& manual,
                                                VendorStock const& vendorStock,
                                                uint64_t purse);
+
+// THE ONE RECIPE THE ROSTER NAMES (`craft_spell`), asked at the trainer it was
+// sent to. Held already is done; a spell this trainer does not list is the wrong
+// trainer; one it lists and the core will not teach (skill or level too low, the
+// recipe before it unknown) is refused; one the purse cannot pay is refused.
+// Anything else is bought, at the trainer's price, with no purse floor: the
+// roster asked for this one by name.
+enum class NamedRecipeStep
+{
+    AlreadyHeld,
+    Buy,
+    NotSold,
+    CannotTeach,
+    TooPoor,
+};
+
+NamedRecipeStep PlanNamedRecipe(bool known, bool onTrainerList, bool canTeach, uint64_t cost,
+                                uint64_t purse);
+
+// "not_sold", "too_poor" ... for the log line.
+char const* NamedRecipeStepWord(NamedRecipeStep step);
+
 
 // "walk", "resting" ... for the log line.
 char const* TrainingStopStepWord(TrainingStopStep step);

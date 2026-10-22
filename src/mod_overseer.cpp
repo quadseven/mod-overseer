@@ -15373,6 +15373,10 @@ private:
         uint32 learnSkill = 0;
         uint32 unlearnSkill = 0;
         uint32 unlearnMax = 0;
+        // The trainer recipe the roster names for this trade (`craft_spell`), or
+        // 0. Bought on arrival at the trainer, and never cleared here: the craft
+        // drive still casts it.
+        uint32 recipeSpell = 0;
     };
 
     // The DBC's own word for a skill line, for the logs. Read rather than
@@ -15756,7 +15760,27 @@ private:
             plan.unlearnMax = fields[4].Get<uint16>();
             plans[fields[0].Get<std::string>()] = plan;
         } while (result->NextRow());
+        NameRecipes(plans);
         return plans;
+    }
+
+    // `craft_spell` is read on its own, as LoadCraftErrands reads it: a world
+    // without the column fails this SELECT whole and every plan keeps no recipe,
+    // which is the behaviour before the column was a trainer errand.
+    void NameRecipes(std::map<std::string, ProfessionPlan>& plans)
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, craft_spell FROM overseer_roster "
+            "WHERE enabled = 1 AND professions <> '' AND craft_spell <> 0");
+        if (!result)
+            return;
+        do
+        {
+            Field* fields = result->Fetch();
+            auto const it = plans.find(fields[0].Get<std::string>());
+            if (it != plans.end())
+                it->second.recipeSpell = fields[1].Get<uint16>();
+        } while (result->NextRow());
     }
 
     void ClearLearnAim(std::string const& name)
@@ -15963,12 +15987,10 @@ private:
     // Going under it to the core's own Trainer object makes selection
     // irrelevant: the creature is passed in, because this module already knows
     // which one it sent the character to.
-    bool TrainOnArrival(std::string const& name, Player* bot, uint32 entry,
-                        ProfessionPlan const& plan)
+    bool TrainRankOnArrival(std::string const& name, Player* bot, uint32 entry,
+                            ProfessionPlan const& plan)
     {
         uint32 const skill = plan.learnSkill;
-        if (!skill)
-            return true;   // arriving WAS the whole errand
 
         char const* const skillName = SkillName(skill);
 
@@ -16127,6 +16149,7 @@ private:
         return true;
     }
 
+
     // ----------------------------------- buy a recipe manual from a vendor --
     //
     // Some secondary-trade recipes are taught by a manual item bought from a
@@ -16255,8 +16278,8 @@ private:
         {
             WorldPacket raw(CMSG_BUY_ITEM, 8 + 4 + 4 + 4 + 1);
             raw << vendor->GetGUID();
-            raw << uint32(itemEntry);
             raw << uint32(uint32(slot) + 1);
+            raw << uint32(itemEntry);
             raw << uint32(1);
             raw << uint8(0);
             WorldPackets::Item::BuyItem packet(std::move(raw));
@@ -16402,6 +16425,84 @@ private:
                 continue;
             DriveBuyRecipeManualFor(bot, entry.first, entry.second);
         }
+    }
+
+    // Buy the ONE recipe the roster names, through Trainer::TeachSpell, which
+    // takes the price. Returns true when the errand is finished with - the
+    // recipe is held, or refused for a reason said once and that a retry would
+    // not change - and false while the trainer is simply not in reach yet.
+    //
+    // THE REFUSALS RELEASE THE ERRAND rather than keep the character at the
+    // trainer: a skill too low, the wrong trainer and an empty purse do not
+    // clear in the next poll, and the site that wants the recipe asks again.
+    // The purchase is read back with HasSpell, because TeachSpell returns void
+    // and reports its failure only to a client.
+    bool BuyNamedRecipe(std::string const& name, Player* bot, uint32 entry, uint32 recipe)
+    {
+        Creature* npc = bot->FindNearestCreature(entry, TRAVEL_ARRIVED_YARDS);
+        Trainer::Trainer* trainer = sObjectMgr->GetTrainer(entry);
+        if (!npc || !npc->IsAlive() || !trainer || !trainer->IsTrainerValidForPlayer(bot))
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' cannot buy recipe {} at creature {} yet - it is not there, "
+                     "alive and a trainer this character may use", name, recipe, entry);
+            return false;
+        }
+
+        Trainer::Spell const* offered = nullptr;
+        for (Trainer::Spell const& spell : trainer->GetSpells())
+            if (spell.SpellId == recipe)
+                offered = &spell;
+        float const discount = bot->GetReputationPriceDiscount(npc);
+        uint64 const cost = offered ? static_cast<uint64>(offered->MoneyCost * discount) : 0;
+        OverseerDecisions::NamedRecipeStep const step = OverseerDecisions::PlanNamedRecipe(
+            bot->HasSpell(recipe), offered != nullptr,
+            offered && trainer->CanTeachSpell(bot, offered), cost, bot->GetMoney());
+        if (step == OverseerDecisions::NamedRecipeStep::AlreadyHeld)
+            return true;
+        if (step != OverseerDecisions::NamedRecipeStep::Buy)
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' was refused recipe {} by '{}' (creature {}): {}. It holds "
+                     "{} copper and the price is {}. Releasing the errand",
+                     name, recipe, npc->GetName(), entry,
+                     OverseerDecisions::NamedRecipeStepWord(step), bot->GetMoney(), cost);
+            return true;
+        }
+
+        // natural-only: bought at a trainer in reach, which takes its price (TeachSpell).
+        trainer->TeachSpell(npc, bot, recipe);
+        if (!bot->HasSpell(recipe))
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' was not taught recipe {} by '{}'. TeachSpell reports its "
+                     "reason only to a client. Releasing the errand", name, recipe,
+                     npc->GetName());
+            return true;
+        }
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(recipe);
+        std::string const recipeName =
+            info ? std::string(info->SpellName[LOCALE_enUS]) : std::string();
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' bought the recipe '{}' ({}) the roster names from '{}' "
+                 "(creature {}) for {} copper, at the trainer's price, not a grant",
+                 name, recipeName, recipe, npc->GetName(), entry, cost);
+        RecordEvent(bot, "learn", recipe, recipeName,
+                    "bought the recipe the roster names from its trade's trainer");
+        return true;
+    }
+
+    // The arrival at a trade trainer: the rank the roster aims at, then the
+    // recipe it names. An arrival with a recipe to buy and no rank due is not a
+    // dropped errand - the recipe is the whole of it - and one with neither is
+    // finished by arriving.
+    bool TrainOnArrival(std::string const& name, Player* bot, uint32 entry,
+                        ProfessionPlan const& plan)
+    {
+        if (plan.learnSkill && !TrainRankOnArrival(name, bot, entry, plan))
+            return false;
+        return !plan.recipeSpell || BuyNamedRecipe(name, bot, entry, plan.recipeSpell);
+
     }
 
     // ------------------------------------- job='craft' (infra#440) --------
