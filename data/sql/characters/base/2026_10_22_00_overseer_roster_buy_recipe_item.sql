@@ -1,4 +1,4 @@
--- The buy-recipe errand (mod-overseer#1098). A DriveBuyRecipeManual is the C++
+-- The buy-recipe errand (#1098). A DriveBuyRecipeManual is the C++
 -- verb; this is the ONE column it reads and clears - same shape as `learn_skill`
 -- for the trainer errand.
 --
