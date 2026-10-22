@@ -16575,28 +16575,6 @@ private:
     // Sweep radius for a live lockbox in the bot's zone, in yards.
     static constexpr float LOCKPICK_SWEEP_YARDS = 200.0f;
 
-    // A lockbox this drive trains on, for the 1-100 open-world bracket. The
-    // entries are gameobject_template rows from the pinned world database.
-    struct LockpickTarget
-    {
-        uint32 entry;
-        char const* name;
-    };
-
-    // THESE ENTRIES MUST BE VERIFIED AGAINST THE PINNED WORLD DATABASE before
-    // this drive can find anything (mod-overseer#445 acceptance criterion #1).
-    // An entry that does not match the live database fails safe:
-    // FindNearestLockpickTarget finds nothing, the errand stands, and the bot
-    // walks nowhere. Do not ship a guess here.
-    static std::vector<LockpickTarget> const& LockpickTargets()
-    {
-        static std::vector<LockpickTarget> const targets = {
-            { 1660u, "Buccaneer's Strongbox" },   // The Barrens, ship near Ratchet
-            { 1733u, "Practice Lockbox" },         // Redridge Mountains
-        };
-        return targets;
-    }
-
     // The predicate the zone sweep runs over each gameobject: a spawned,
     // matching-entry lockbox in the bot's own map and zone.
     struct LockboxNearbyCheck
@@ -16607,11 +16585,10 @@ private:
         {
             if (!go || !go->isSpawned())
                 return false;
-            for (LockpickTarget const& t : LockpickTargets())
-                if (go->GetEntry() == t.entry)
-                    return from->IsWithinDistInMap(go, range) &&
-                           go->GetZoneId() == from->GetZoneId();
-            return false;
+            if (!OverseerDecisions::IsLockpickTargetEntry(go->GetEntry()))
+                return false;
+            return from->IsWithinDistInMap(go, range) &&
+                   go->GetZoneId() == from->GetZoneId();
         }
     };
 
@@ -16678,7 +16655,7 @@ private:
             // Max achievable skill at a level is 5 * level; at the cap there is
             // nothing left to train, so clear the errand.
             uint32 const level = bot->GetLevel();
-            if (bot->GetPureMaxSkillValue(SKILL_LOCKPICKING) >= 5u * level)
+            if (OverseerDecisions::ShouldClearLockpickErrand(bot->GetPureMaxSkillValue(SKILL_LOCKPICKING), level))
             {
                 ClearLockpickErrand(name);
                 LOG_INFO("module.overseer",
@@ -16690,32 +16667,34 @@ private:
             }
 
             GameObject* target = FindNearestLockpickTarget(bot);
-            if (!target)
-                continue;   // nothing live in zone this respawn; errand stands
+            bool const hasTarget = (target != nullptr);
+            float const dist = hasTarget ? bot->GetDistance(target) : std::numeric_limits<float>::max();
+            bool const inReach = hasTarget && dist <= LOCKPICK_REACH_YARDS;
 
-            float const dist = bot->GetDistance(target);
-            if (dist > LOCKPICK_REACH_YARDS)
+            switch (OverseerDecisions::DecideLockpickErrand(hasTarget, inReach,
+                                                            bot->IsInCombat(), bot->isMoving()))
             {
-                // Walk toward the chest, one grounded step per poll, reusing the
-                // same step machinery DriveTravel uses. The errand stands while
-                // the walk is in flight.
-                WorldPosition const want(target->GetMapId(), target->GetPositionX(),
-                                         target->GetPositionY(), target->GetPositionZ());
-                WorldPosition step;
-                if (GroundedStep(bot, want, step))
-                {
-                    bot->GetMotionMaster()->MovePoint(LOCKPICK_APPROACH_POINT_ID,
-                                                      step.GetPositionX(), step.GetPositionY(),
-                                                      step.GetPositionZ());
-                    LetHeldCharacterWalk(name, LOCKPICK_WALK_CEILING_MS / 1000);
-                }
-                continue;
+                case OverseerDecisions::LockpickErrandStep::Stand:
+                    // Out of reach: walk toward the chest, one grounded step per
+                    // poll, reusing the same step machinery DriveTravel uses. The
+                    // errand stands while the walk is in flight.
+                    if (hasTarget && !inReach)
+                    {
+                        WorldPosition const want(target->GetMapId(), target->GetPositionX(),
+                                                 target->GetPositionY(), target->GetPositionZ());
+                        WorldPosition step;
+                        if (GroundedStep(bot, want, step))
+                        {
+                            bot->GetMotionMaster()->MovePoint(LOCKPICK_APPROACH_POINT_ID,
+                                                              step.GetPositionX(), step.GetPositionY(),
+                                                              step.GetPositionZ());
+                            LetHeldCharacterWalk(name, LOCKPICK_WALK_CEILING_MS / 1000);
+                        }
+                    }
+                    continue;   // errand stands: retried next poll
+                case OverseerDecisions::LockpickErrandStep::Cast:
+                    break;      // in reach, not fighting, not moving: cast below
             }
-
-            // In reach. A combat or mid-walk character is not asked to cast this
-            // poll; the errand stands and the attempt happens when it is still.
-            if (bot->IsInCombat() || bot->isMoving())
-                continue;
 
             WorldSession* const session = bot->GetSession();
             if (!session)
