@@ -19257,6 +19257,63 @@ std::vector<uint32_t> PlanRecipePurchases(std::vector<TrainerRecipeOffer> offers
     return plan;
 }
 
+bool ParseVendorManual(std::string const& column, VendorManual& out)
+{
+    out = VendorManual();
+    if (column.empty())
+        return false;
+    std::string::size_type const colon = column.find(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 == column.size())
+        return false;
+    std::string const itemText = column.substr(0, colon);
+    std::string const vendorText = column.substr(colon + 1);
+    if (!std::all_of(itemText.begin(), itemText.end(),
+                     [](char ch) { return ch >= '0' && ch <= '9'; }) ||
+        !std::all_of(vendorText.begin(), vendorText.end(),
+                     [](char ch) { return ch >= '0' && ch <= '9'; }))
+        return false;
+    try
+    {
+        unsigned long const item = std::stoul(itemText);
+        unsigned long const vendor = std::stoul(vendorText);
+        if (item == 0 || vendor == 0 || item > UINT32_MAX || vendor > UINT32_MAX)
+            return false;
+        out.itemEntry = static_cast<uint32_t>(item);
+        out.vendorEntry = static_cast<uint32_t>(vendor);
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+VendorManualVerdict DecideVendorManualPurchase(VendorManual const& manual,
+                                               VendorStock const& vendorStock,
+                                               uint64_t purse)
+{
+    VendorManualVerdict out;
+    out.kind = VendorManualVerdict::Kind::NotSold;
+    auto const stocked = vendorStock.find(manual.itemEntry);
+    if (stocked == vendorStock.end())
+    {
+        out.reason = "no vendor on this map sells item " + std::to_string(manual.itemEntry);
+        return out;
+    }
+    uint64_t const price = stocked->second;
+    out.price = price;
+    if (purse < price)
+    {
+        out.kind = VendorManualVerdict::Kind::CannotAfford;
+        out.reason = "character cannot afford item " + std::to_string(manual.itemEntry) +
+                     " at " + std::to_string(price) + " copper (holds " +
+                     std::to_string(purse) + ")";
+        return out;
+    }
+    out.kind = VendorManualVerdict::Kind::Buy;
+    return out;
+}
+
 bool TrainingStopHoldsRepairLeg(bool stopOpen, uint32_t heldSeconds)
 {
     return stopOpen && heldSeconds < TRAINING_STOP_MAX_SECONDS;

@@ -419,6 +419,10 @@ constexpr uint32 PARTY_POLL_MS = 30000;
 // is lost by a character carrying a new level for a minute before it knows what
 // that level taught it.
 constexpr uint32 TRAIN_POLL_MS = 60000;
+// How often a character with a buy_recipe_item errand is polled for the vendor
+// walk and the purchase. Same cadence as quests and craft: one indexed SELECT
+// against a column most characters have zeroed.
+constexpr uint32 BUY_RECIPE_POLL_MS = 20000;
 // How many travel polls a character sent for a talent reset may stand by its
 // trainer outside the interact gate before the walk is called a miss (#626).
 // The walk closes the last few yards in one or two polls when it can at all.
@@ -8204,6 +8208,7 @@ public:
         _craftTimer += diff;
         _fishTimer += diff;
         _lockpickTimer += diff;
+        _buyRecipeTimer += diff;
         _travelTimer += diff;
         _professionTimer += diff;
         _gearTimer += diff;
@@ -8482,6 +8487,11 @@ public:
         {
             _professionTimer = 0;
             DriveProfessions();
+        }
+        if (_buyRecipeTimer >= BUY_RECIPE_POLL_MS)
+        {
+            _buyRecipeTimer = 0;
+            DriveBuyRecipeManual();
         }
         // AFTER the dungeon run coordinator and after the travel drive, on
         // purpose and for a plainer reason than either of those two have: a
@@ -16115,6 +16125,283 @@ private:
                         "bought the recipes this trainer teaches, at the trainer's price");
         ClearLearnAim(name);
         return true;
+    }
+
+    // ----------------------------------- buy a recipe manual from a vendor --
+    //
+    // Some secondary-trade recipes are taught by a manual item bought from a
+    // vendor (Heavy Silk Bandage, Smoked Bear Meat), not by a trainer. The row
+    // names the manual and the vendor in `buy_recipe_item`
+    // ("<itemEntry>:<vendorEntry>"), and this drive walks the character to the
+    // vendor, buys the manual with its own money, uses it from the bag, and
+    // reads back that the spell is now known. A buy the vendor or the money
+    // cannot serve is refused with a line naming why, and the errand is
+    // released rather than retried every cycle.
+
+    // Every enabled character whose `buy_recipe_item` names a manual, by name.
+    // The empty default means no errand, so the WHERE clause is the whole
+    // filter. Read on its own: a worldserver whose db-import has not shipped
+    // the column sees an empty map and this drive is a no-op, not a crash.
+    std::map<std::string, std::string> LoadBuyRecipeErrands()
+    {
+        std::map<std::string, std::string> errands;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, buy_recipe_item FROM overseer_roster "
+            "WHERE enabled = 1 AND buy_recipe_item <> ''");
+        if (!result)
+            return errands;  // nobody has one, or no such column - same answer
+        do
+        {
+            Field* fields = result->Fetch();
+            errands[fields[0].Get<std::string>()] = fields[1].Get<std::string>();
+        } while (result->NextRow());
+        return errands;
+    }
+
+    void ClearBuyRecipeAim(std::string const& name)
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_roster SET buy_recipe_item = '' WHERE name = '{}'", Esc(name));
+    }
+
+    // The vendor's stock as this character sees it: item entry -> copper price
+    // at this vendor, reputation discount applied, the same list
+    // BuyItemFromVendorSlot prices from.
+    OverseerDecisions::VendorStock VendorStockAt(Player* bot, Creature* vendor)
+    {
+        OverseerDecisions::VendorStock stock;
+        if (!vendor)
+            return stock;
+        float const discount = bot->GetReputationPriceDiscount(vendor);
+        if (VendorItemData const* items = vendor->GetVendorItems())
+        {
+            uint32 const lineCount = items->GetItemCount();
+            for (uint32 i = 0; i < lineCount; ++i)
+            {
+                VendorItem const* const line = items->GetItem(i);
+                if (!line)
+                    continue;
+                ItemTemplate const* const proto = sObjectMgr->GetItemTemplate(line->item);
+                if (!proto || proto->BuyPrice == 0 || !line->IsGoldRequired(proto))
+                    continue;
+                uint64_t const price = static_cast<uint64_t>(
+                    std::floor(uint32(proto->BuyPrice) * discount));
+                if (price)
+                    stock.emplace(line->item, price);
+            }
+        }
+        return stock;
+    }
+
+    // The spell the item casts when it is used, and the recipe that spell
+    // teaches (its SPELL_EFFECT_LEARN_SPELL trigger), both read off the item
+    // template.
+    static uint32 ItemUseSpell(ItemTemplate const* proto)
+    {
+        if (!proto)
+            return 0;
+        for (uint32 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+            if (proto->Spells[i].SpellId > 0)
+                return static_cast<uint32>(proto->Spells[i].SpellId);
+        return 0;
+    }
+
+    static uint32 RecipeSpellOfItem(ItemTemplate const* proto)
+    {
+        if (!proto)
+            return 0;
+        for (uint32 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+        {
+            if (proto->Spells[i].SpellId <= 0)
+                continue;
+            SpellInfo const* const info = sSpellMgr->GetSpellInfo(
+                static_cast<uint32>(proto->Spells[i].SpellId));
+            if (!info)
+                continue;
+            for (SpellEffectInfo const& effect : info->GetEffects())
+                if (effect.IsEffect(SPELL_EFFECT_LEARN_SPELL) && effect.TriggerSpell)
+                    return static_cast<uint32>(effect.TriggerSpell);
+        }
+        return 0;
+    }
+
+    // Open the vendor list the way a client does, then buy one manual at the
+    // vendor's real price. Returns whether the character now carries it.
+    bool BuyOneManual(Player* bot, WorldSession* session, Creature* vendor, uint32 itemEntry)
+    {
+        int32 slot = -1;
+        if (VendorItemData const* items = vendor->GetVendorItems())
+        {
+            uint32 const lineCount = items->GetItemCount();
+            for (uint32 i = 0; i < lineCount; ++i)
+            {
+                VendorItem const* const line = items->GetItem(i);
+                if (line && line->item == itemEntry)
+                {
+                    slot = static_cast<int32>(i);
+                    break;
+                }
+            }
+        }
+        if (slot < 0)
+            return false;
+        {
+            WorldPacket raw(CMSG_LIST_INVENTORY, 8);
+            raw << vendor->GetGUID();
+            WorldPackets::Item::ListInventory listing(std::move(raw));
+            listing.Read();
+            session->HandleListInventoryOpcode(listing);
+        }
+        {
+            WorldPacket raw(CMSG_BUY_ITEM, 8 + 4 + 4 + 4 + 1);
+            raw << vendor->GetGUID();
+            raw << uint32(itemEntry);
+            raw << uint32(uint32(slot) + 1);
+            raw << uint32(1);
+            raw << uint8(0);
+            WorldPackets::Item::BuyItem packet(std::move(raw));
+            packet.Read();
+            session->HandleBuyItemOpcode(packet);
+        }
+        return bot->GetItemCount(itemEntry, false) > 0;
+    }
+
+    // Use one manual from the bag, through the core's own CMSG_USE_ITEM
+    // handler, the same path a player's right-click runs.
+    bool UseManual(Player* bot, WorldSession* session, uint32 itemEntry, uint32 useSpell)
+    {
+        if (Item* const manual = bot->GetItemByEntry(itemEntry))
+        {
+            WorldPacket raw(CMSG_USE_ITEM, 1 + 1 + 1 + 4 + 8 + 4 + 1 + 4);
+            raw << uint8(manual->GetBagSlot());
+            raw << uint8(manual->GetSlot());
+            raw << uint8(1);
+            raw << uint32(useSpell);
+            raw << manual->GetGUID();
+            raw << uint32(0);
+            raw << uint8(0);
+            raw << uint32(TARGET_FLAG_NONE);
+            raw.rpos(0);
+            session->HandleUseItemOpcode(raw);
+            return true;
+        }
+        return false;
+    }
+
+    // One character's buy_recipe_item errand, this poll.
+    void DriveBuyRecipeManualFor(Player* bot, std::string const& name,
+                                 std::string const& column)
+    {
+        OverseerDecisions::VendorManual manual;
+        if (!OverseerDecisions::ParseVendorManual(column, manual))
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' names a malformed buy_recipe_item '{}'. Clearing it - "
+                     "a malformed row is refused, not retried", name, column);
+            ClearBuyRecipeAim(name);
+            return;
+        }
+
+        // Walk to the vendor first. DriveTravel owns the column, so write it the
+        // same way it does and let it carry the character there; this drive runs
+        // again on the next poll once the vendor is in reach.
+        Creature* const vendor = bot->FindNearestCreature(manual.vendorEntry, TRAVEL_ARRIVED_YARDS);
+        if (!vendor || !vendor->IsAlive() ||
+            !bot->GetNPCIfCanInteractWith(vendor->GetGUID(), UNIT_NPC_FLAG_VENDOR))
+        {
+            CharacterDatabase.Execute(
+                "UPDATE overseer_roster SET travel_npc = '{}' WHERE name = '{}'",
+                std::to_string(manual.vendorEntry), Esc(name));
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is walking to vendor creature {} to buy manual item {}",
+                     name, manual.vendorEntry, manual.itemEntry);
+            return;
+        }
+
+        // The purchase decision, pure, then a trusted core call, then a read-back
+        // - the same shape TrainOnArrival takes for a trainer.
+        OverseerDecisions::VendorManualVerdict const verdict =
+            OverseerDecisions::DecideVendorManualPurchase(
+                manual, VendorStockAt(bot, vendor), bot->GetMoney());
+        switch (verdict.kind)
+        {
+        case OverseerDecisions::VendorManualVerdict::Kind::NotSold:
+        case OverseerDecisions::VendorManualVerdict::Kind::CannotAfford:
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' cannot buy manual item {} from vendor {} - {}. "
+                     "Clearing the errand", name, manual.itemEntry, manual.vendorEntry,
+                     verdict.reason);
+            ClearBuyRecipeAim(name);
+            return;
+        case OverseerDecisions::VendorManualVerdict::Kind::Buy:
+            break;
+        }
+
+        WorldSession* const session = bot->GetSession();
+        if (!session)
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' has no session; leaving the buy_recipe_item errand "
+                     "standing for the next poll", name);
+            return;
+        }
+
+        ItemTemplate const* const proto = sObjectMgr->GetItemTemplate(manual.itemEntry);
+        uint32 const recipeSpell = RecipeSpellOfItem(proto);
+        uint32 const useSpell = ItemUseSpell(proto);
+        if (!recipeSpell || !useSpell)
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: manual item {} does not teach a recipe. Clearing the errand",
+                     manual.itemEntry);
+            ClearBuyRecipeAim(name);
+            return;
+        }
+
+        if (!BuyOneManual(bot, session, vendor, manual.itemEntry))
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' could not buy manual item {} from vendor {} - the core "
+                     "refused the purchase. Leaving the errand standing", name,
+                     manual.itemEntry, manual.vendorEntry);
+            return;
+        }
+
+        UseManual(bot, session, manual.itemEntry, useSpell);
+
+        if (bot->HasSpell(recipeSpell))
+        {
+            SpellInfo const* const info = sSpellMgr->GetSpellInfo(recipeSpell);
+            std::string const recipe =
+                info ? std::string(info->SpellName[LOCALE_enUS]) : std::string();
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' now knows recipe '{}' ({}) bought from vendor creature {}",
+                     name, recipe, recipeSpell, manual.vendorEntry);
+            RecordEvent(bot, "learn", recipeSpell, recipe,
+                        "bought this recipe manual from a vendor and used it from the bag");
+            ClearBuyRecipeAim(name);
+        }
+        else
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' bought manual item {} but does not know recipe {} yet. "
+                     "Leaving the errand standing for the next poll", name, manual.itemEntry,
+                     recipeSpell);
+        }
+    }
+
+    void DriveBuyRecipeManual()
+    {
+        std::map<std::string, std::string> const errands = LoadBuyRecipeErrands();
+        if (errands.empty())
+            return;
+        for (auto const& entry : errands)
+        {
+            Player* const bot = ObjectAccessor::FindPlayerByName(entry.first);
+            if (!bot || !bot->IsInWorld())
+                continue;
+            DriveBuyRecipeManualFor(bot, entry.first, entry.second);
+        }
     }
 
     // ------------------------------------- job='craft' (infra#440) --------
@@ -77803,6 +78090,8 @@ private:
     uint32 _craftTimer = 0;
     uint32 _fishTimer = 0;
     uint32 _lockpickTimer = 0;
+    // How often a character with a buy_recipe_item errand is polled.
+    uint32 _buyRecipeTimer = 0;
     // WHEN A DEAD CHARACTER WAS FIRST SEEN STILL WAITING TO RELEASE, by name.
     //
     // There is no ghost clock for this state - a corpse, and therefore a ghost

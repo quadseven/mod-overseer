@@ -22306,6 +22306,57 @@ std::vector<uint32_t> PlanRecipePurchases(std::vector<TrainerRecipeOffer> offers
                                           bool hasSkill, uint32_t skillValue, uint32_t level,
                                           uint64_t purse);
 
+// -------------------------- a recipe manual bought from a vendor -----------
+//
+// Some secondary-trade recipes are taught by a manual item bought from a
+// vendor (Heavy Silk Bandage, Smoked Bear Meat), not by a trainer. A roster
+// row names the manual and the vendor in `buy_recipe_item`
+// ("<itemEntry>:<vendorEntry>"), and a drive walks the character there, buys
+// the manual with its own money, and uses it from the bag. This is the decision
+// that answers whether the purchase can be served at all, and names why when it
+// cannot.
+
+// The manual and the vendor, as written in the buy_recipe_item column.
+struct VendorManual
+{
+    uint32_t itemEntry{0};   // item_template entry of the manual
+    uint32_t vendorEntry{0}; // creature_template entry of the vendor
+};
+
+// Parse "<itemEntry>:<vendorEntry>" from the column. False when malformed (one
+// side missing, not a number, or either side zero), so the drive treats a
+// malformed row as a refusal and clears it - never retries it.
+bool ParseVendorManual(std::string const& column, VendorManual& out);
+
+// The price a vendor charges for one stocked item, in copper, as the adapter
+// reads it from the core.
+using VendorPrice = uint64_t;
+
+// The vendor's stock, item entry -> copper price, as the adapter reads it.
+using VendorStock = std::map<uint32_t, VendorPrice>;
+
+// The outcome of asking whether this character can buy this manual here.
+struct VendorManualVerdict
+{
+    enum class Kind
+    {
+        Buy,          // the vendor stocks it and the purse covers it
+        NotSold,      // no vendor in reach stocks this item
+        CannotAfford, // the vendor stocks it but the purse is short
+    };
+    Kind kind{Kind::NotSold};
+    std::string reason;   // named why; empty when kind == Buy
+    VendorPrice price{0}; // copper, meaningful when kind == Buy
+};
+
+// Decide whether the purchase can be served. Pure: the adapter supplies the
+// vendor's stock and the purse. A buy the vendor or the money cannot serve is
+// refused with a line naming why, and the errand is released rather than
+// retried every cycle.
+VendorManualVerdict DecideVendorManualPurchase(VendorManual const& manual,
+                                               VendorStock const& vendorStock,
+                                               uint64_t purse);
+
 // "walk", "resting" ... for the log line.
 char const* TrainingStopStepWord(TrainingStopStep step);
 
