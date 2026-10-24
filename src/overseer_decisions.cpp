@@ -17789,6 +17789,138 @@ bool FarWalkRefusalRetryable(std::string const& reason)
     return reason == F::BotBudgetSpent || reason == F::RealmFull;
 }
 
+std::vector<WalkRefusalRow> const& WalkRefusalCatalogue()
+{
+    namespace M = MailWalkRefusal;
+    namespace E = ErrandWalkRefusal;
+    namespace S = SpawnWalkRefusal;
+    namespace FW = FarWalkRefusal;
+    // Each literal is listed once, under the family that owns it. The last
+    // column marks the few that clear by themselves.
+    static std::vector<WalkRefusalRow> const rows = {
+        {"mailbox", M::Malformed, false, false},
+        {"mailbox", M::NoBotAI, false, false},
+        {"mailbox", M::NotInWorld, false, true},
+        {"mailbox", M::LoggingOut, false, true},
+        {"mailbox", M::Dead, false, false},
+        {"mailbox", M::InFlight, false, true},
+        {"mailbox", M::InCombat, false, true},
+        {"mailbox", M::InInstance, false, false},
+        {"mailbox", M::OnRoster, false, false},
+        {"mailbox", M::Follower, false, false},
+        {"mailbox", M::AlreadyWalking, false, true},
+        {"mailbox", M::HeldByAnother, false, true},
+        {"mailbox", M::NoMailboxOnMap, false, false},
+        {"mailbox", M::MailboxTooFar, false, false},
+        {"mailbox", M::OtherSidesGround, false, false},
+        {"mailbox", M::GroundRefused, false, false},
+        {"mailbox", M::ExpansionContinent, false, false},
+        {"mailbox", M::EnteredCombat, true, true},
+        {"mailbox", M::Died, true, false},
+        {"mailbox", M::LeftWorld, true, true},
+        {"mailbox", M::LeftMap, true, false},
+        {"mailbox", M::TookFlight, true, true},
+        {"mailbox", M::TimedOut, true, false},
+        {"mailbox", M::Stalled, true, false},
+        {"mailbox", M::LethalRoad, true, false},
+        {"errand", E::MalformedTrainer, false, false},
+        {"errand", E::MalformedVendor, false, false},
+        {"errand", E::AlreadyWalking, false, true},
+        {"errand", E::NoTrainerOnMap, false, false},
+        {"errand", E::TrainerTooFar, false, false},
+        {"errand", E::TrainerOtherSide, false, false},
+        {"errand", E::TrainerGround, false, false},
+        {"errand", E::NoVendorOnMap, false, false},
+        {"errand", E::VendorTooFar, false, false},
+        {"errand", E::VendorOtherSide, false, false},
+        {"errand", E::VendorGround, false, false},
+        {"errand", E::TrainerCombat, true, true},
+        {"errand", E::TrainerDied, true, false},
+        {"errand", E::TrainerLeftWorld, true, true},
+        {"errand", E::TrainerLeftMap, true, false},
+        {"errand", E::TrainerFlight, true, true},
+        {"errand", E::TrainerTimedOut, true, false},
+        {"errand", E::TrainerStalled, true, false},
+        {"errand", E::TrainerLethalRoad, true, false},
+        {"errand", E::VendorCombat, true, true},
+        {"errand", E::VendorDied, true, false},
+        {"errand", E::VendorLeftWorld, true, true},
+        {"errand", E::VendorLeftMap, true, false},
+        {"errand", E::VendorFlight, true, true},
+        {"errand", E::VendorTimedOut, true, false},
+        {"errand", E::VendorStalled, true, false},
+        {"errand", E::VendorLethalRoad, true, false},
+        {"errand", E::NothingToLearn, true, false},
+        {"errand", E::TaughtNothing, true, false},
+        {"errand", E::TalentsTooLow, false, false},
+        {"errand", E::TalentsInTree, false, false},
+        {"errand", E::TalentsCannotAfford, false, false},
+        {"errand", E::NoClassTrainerOnMap, false, false},
+        {"errand", E::NoClassSpellTrainerOnMap, false, false},
+        {"spawn", S::MalformedSpawn, false, false},
+        {"spawn", S::NoSuchSpawn, false, false},
+        {"spawn", S::SpawnOtherMap, false, false},
+        {"spawn", S::SpawnOutOfSeason, false, false},
+        {"spawn", S::SpawnTooFar, false, false},
+        {"spawn", S::SpawnOtherSide, false, false},
+        {"spawn", S::SpawnGround, false, false},
+        {"spawn", S::SpawnFirstStepDrop, false, false},
+        {"spawn", S::SpawnCombat, true, true},
+        {"spawn", S::SpawnDied, true, false},
+        {"spawn", S::SpawnLeftWorld, true, true},
+        {"spawn", S::SpawnLeftMap, true, false},
+        {"spawn", S::SpawnFlight, true, true},
+        {"spawn", S::SpawnTimedOut, true, false},
+        {"spawn", S::SpawnStalled, true, false},
+        {"spawn", S::SpawnLethalRoad, true, false},
+        {"far", FW::NotOnAContinent, false, false},
+        {"far", FW::BotBudgetSpent, false, false},
+        {"far", FW::RealmFull, false, false},
+    };
+    return rows;
+}
+
+bool WalkRefusalTransient(std::string const& reason)
+{
+    for (WalkRefusalRow const& row : WalkRefusalCatalogue())
+        if (reason == row.reason)
+            return row.transient;
+    return false;
+}
+
+std::string WalkRefusalFixturesJson()
+{
+    std::string out =
+        "{\n"
+        "  \"about\": \"Generated from OverseerDecisions::WalkRefusalCatalogue. "
+        "Regenerate with: tests/test_walk_refusal_fixtures --write\",\n"
+        "  \"row_keys\": [\"outcome\", \"reason\", \"retryable\", \"transient\", \"goal\", "
+        "\"character\", \"request\", \"map\"],\n"
+        "  \"rows\": [\n";
+    std::vector<WalkRefusalRow> const& rows = WalkRefusalCatalogue();
+    for (std::size_t i = 0; i < rows.size(); ++i)
+    {
+        WalkRefusalRow const& r = rows[i];
+        std::string const reason = r.reason;
+        std::string const family = r.family;
+        // The same expression the adapter writes `retryable` with.
+        bool const retryable = family == "far"
+            ? FarWalkRefusalRetryable(reason)
+            : (family == "mailbox" ? MailWalkRefusalRetryable(reason)
+                                   : ErrandWalkRefusalRetryable(reason))
+                  || FarWalkRefusalRetryable(reason);
+        out += "    {\"family\": \"" + family + "\", \"outcome\": \"";
+        out += r.ending ? "abandoned" : "refused";
+        out += "\", \"reason\": \"" + reason + "\", \"retryable\": ";
+        out += retryable ? "true" : "false";
+        out += ", \"transient\": ";
+        out += r.transient ? "true" : "false";
+        out += i + 1 < rows.size() ? "},\n" : "}\n";
+    }
+    out += "  ]\n}\n";
+    return out;
+}
+
 void PruneFarWalkStarts(std::vector<int64_t>& starts, int64_t now)
 {
     std::vector<int64_t> kept;

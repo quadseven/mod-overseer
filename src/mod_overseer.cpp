@@ -74223,7 +74223,10 @@ private:
                            : D::ErrandWalkRefusalRetryable(reason))
                           || D::FarWalkRefusalRetryable(reason)
                       ? "true"
-                      : "false");
+                      : "false")
+              // The module's own answer to "wait or stop"; the bridge reads
+              // this, not the reason text (#1122).
+              << ",\"transient\":" << (D::WalkRefusalTransient(reason) ? "true" : "false");
         o << ",\"goal\":" << J(D::WalkGoalWord(ev.goal))
           << ",\"character\":" << J(ev.character)
           << ",\"request\":" << J(ev.request)
