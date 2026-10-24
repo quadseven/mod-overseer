@@ -17645,6 +17645,30 @@ bool OutmatchedHere(GuildOutmatchedMark const& mark, int64_t now, uint32_t mapId
     return now - mark.at <= int64_t(windowMinutes) * 60;
 }
 
+HearthOutRetry DecideHearthOutRetry(char const* refusal, bool stillOnDeathMap,
+                                    unsigned tries, unsigned boundTries)
+{
+    if (tries >= boundTries)
+        return HearthOutRetry::GiveUp;
+    // A refusal that nothing this poll can change - no stone, on cooldown,
+    // dead, not in the world - is not waited out. The only refusal this
+    // decision retries is "character is moving": the hold placed by DoHearth
+    // stops the character, and the next poll finds it standing.
+    if (refusal && *refusal && std::string(refusal) != "character is moving")
+        return HearthOutRetry::GiveUp;
+    // The hearth landed but left the character on the death map, or the cast
+    // was refused for movement: hold it still and drive the hearth again.
+    if (stillOnDeathMap || (refusal && *refusal))
+        return HearthOutRetry::Retry;
+    return HearthOutRetry::GiveUp;
+}
+
+bool KeepOutOfDeathZone(bool hearthOutFailed, bool stillInDeathZone,
+                        bool guildMovedIt)
+{
+    return hearthOutFailed && stillInDeathZone && !guildMovedIt;
+}
+
 HeadTradeAnswer AnswerTradeAtHead(bool traderIsKin, uint32_t theyOffer, uint32_t theirCopper,
                                   uint32_t weGive, uint32_t ourCopper, uint32_t openSeconds)
 {

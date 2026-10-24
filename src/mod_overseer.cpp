@@ -78115,6 +78115,10 @@ private:
     std::map<std::string, std::vector<OverseerDecisions::GuildDeathMark>> _guildDeathMarks;
     // The last hearth refusal LeaveGuildDeathSpot logged for a member, by name.
     std::map<std::string, std::string> _guildDeathSpotRefusal;
+    // How many times this episode's hearth-out has been asked of a member, by
+    // name. Bounded so a member whose hearth-out cannot succeed is not asked
+    // every poll for ever; reset when the member leaves the death zone.
+    std::map<std::string, unsigned> _guildDeathSpotTries;
     // DriveGuildTraining: every class trainer spawn by the class it serves, the
     // entry each spot is, the trainer each member was last sent to, and when
     // the drive last ran.
