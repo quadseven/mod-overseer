@@ -18156,6 +18156,12 @@ constexpr float RAID_ASSEMBLE_YARDS = 40.f;
 // wait the raid goes with whoever is there, and the log names who was not.
 constexpr long RAID_FORM_WAIT_SECONDS = 2 * 60;
 constexpr long RAID_ASSEMBLE_WAIT_SECONDS = 15 * 60;
+// A raider still on another continent is on a boat or a zeppelin with a long
+// road behind it, so ASSEMBLE waits this much longer while any raid member in
+// the world stands on a map that is neither the door's outside map nor its
+// inside map (wow-overseer#765). Bounded, so one lost seat cannot hold forty.
+constexpr long RAID_ASSEMBLE_CROSSING_EXTRA_SECONDS = 30 * 60;
+long RaidAssembleWaitSeconds(unsigned awayOnOtherMap);
 constexpr long RAID_ENTER_WAIT_SECONDS = 3 * 60;
 
 // -- inside: HOLD, CLEAR, RECOVER (#640) --------------------------------------
@@ -18245,6 +18251,9 @@ struct RaidRunFacts
     // The same count without the head, taken in the same pass, so ENTER's
     // "everyone else has crossed" never subtracts a head that was not counted.
     unsigned othersAssembled{0};
+    // Raid members in the world on a map that is neither the door's outside
+    // map nor its inside map: they still have a crossing to make (#765).
+    unsigned awayOnOtherMap{0};
     // Raid members on the inside map.
     unsigned inside{0};
     bool headAssembled{false};
@@ -18278,6 +18287,7 @@ struct RaidRunStep
     RaidRunPhase phase{RaidRunPhase::Idle};
     bool form{false};         // convert, invite and seat this poll
     bool aimStaging{false};   // the head walks to the staging point
+    bool aimSeats{false};     // every other raider in the world walks there too (#765)
     bool aimDoor{false};      // the head walks onto the door
     bool knockMembers{false}; // knock every member standing in the door
     bool knockHead{false};    // and the head, who goes last

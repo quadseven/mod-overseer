@@ -31,7 +31,9 @@
 using OverseerDecisions::ChooseRaidStoneSummon;
 using OverseerDecisions::DungeonClearMayArmHere;
 using OverseerDecisions::RAID_ASSEMBLE_WAIT_SECONDS;
+using OverseerDecisions::RAID_ASSEMBLE_CROSSING_EXTRA_SECONDS;
 using OverseerDecisions::RAID_ENTER_WAIT_SECONDS;
+using OverseerDecisions::RaidAssembleWaitSeconds;
 using OverseerDecisions::RAID_FORM_WAIT_SECONDS;
 using OverseerDecisions::RAID_STONE_SUMMON_AFTER_SECONDS;
 using OverseerDecisions::RAID_STONE_SUMMON_TRIES;
@@ -465,6 +467,43 @@ void StragglersAreSummonedOnlyAfterTheWalk()
     Check("and nobody is summoned at ENTER", !all.summonStragglers);
 }
 
+void EveryRaiderIsWalkedToTheDoorAndTheWaitScalesWithTheFarthest()
+{
+    RaidRunFacts facts = Ready();
+    facts.assembled = 20;
+    facts.heldSeconds = 60;
+    RaidRunStep const waiting = StepRaidRun(RaidRunPhase::Assemble, facts);
+    Check("ASSEMBLE walks every raider, not only the head", waiting.aimSeats);
+
+    facts.heldSeconds = 0;
+    facts.raidFormed = true;
+    facts.addable = 0;
+    RaidRunStep const form = StepRaidRun(RaidRunPhase::Form, facts);
+    CheckPhase("a formed raid assembles", form.phase, RaidRunPhase::Assemble);
+    Check("and the raiders are walked from the first poll", form.aimSeats);
+
+    facts.assembled = facts.inWorld;
+    RaidRunStep const enter = StepRaidRun(RaidRunPhase::Assemble, facts);
+    CheckPhase("everyone there enters", enter.phase, RaidRunPhase::Enter);
+    Check("and nobody is walked to a door the raid has gone through", !enter.aimSeats);
+
+    Check("the wait is the base wait with nobody abroad",
+          RaidAssembleWaitSeconds(0) == RAID_ASSEMBLE_WAIT_SECONDS);
+    Check("and longer with a raider still on another continent",
+          RaidAssembleWaitSeconds(3) ==
+              RAID_ASSEMBLE_WAIT_SECONDS + RAID_ASSEMBLE_CROSSING_EXTRA_SECONDS);
+
+    facts.assembled = 20;
+    facts.heldSeconds = RAID_ASSEMBLE_WAIT_SECONDS;
+    facts.awayOnOtherMap = 5;
+    RaidRunStep const abroad = StepRaidRun(RaidRunPhase::Assemble, facts);
+    CheckPhase("the base wait does not end it while a raider crosses", abroad.phase,
+               RaidRunPhase::Assemble);
+    facts.heldSeconds = RaidAssembleWaitSeconds(5);
+    RaidRunStep const gone = StepRaidRun(RaidRunPhase::Assemble, facts);
+    CheckPhase("the scaled wait does", gone.phase, RaidRunPhase::Enter);
+}
+
 void AStragglerIsSummonedByASeatAtTheStone()
 {
     RaidStoneSeat head = AtStone("Grug", 60, 0);
@@ -623,6 +662,7 @@ int main()
     ARaidMapIsNotArmedUntilClearingIsOrdered();
     TheDoorNamesTheMountainsTwoStones();
     StragglersAreSummonedOnlyAfterTheWalk();
+    EveryRaiderIsWalkedToTheDoorAndTheWaitScalesWithTheFarthest();
     AStragglerIsSummonedByASeatAtTheStone();
     TheStonesMinimumIsKeptForBothEnds();
     TheInFlightSummonVerdictIsReadIndependentOfGroup();

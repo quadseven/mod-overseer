@@ -48454,6 +48454,10 @@ private:
         // Seats already given their pre-FORM repair attempt for this order.
         std::set<std::string> repairAttempted;
         std::set<std::string> repairWalkSaid;
+        // Raiders given a walk to the staging point in ASSEMBLE (#765), so the
+        // walk is released when the phase ends and said once per seat.
+        std::set<std::string> seatsWalking;
+        bool enterAwaySaid{false};
         unsigned durabilityBossesDone{std::numeric_limits<unsigned>::max()};
         unsigned repairHoldBossesDone{std::numeric_limits<unsigned>::max()};
         time_t repairHoldSince{0};
@@ -48669,6 +48673,9 @@ private:
     {
         if (!run.head.empty())
             _travelAims.Release(run.head);
+        for (std::string const& name : run.seatsWalking)
+            _travelAims.Release(name, "the raid order ended");
+        run.seatsWalking.clear();
         run.stoneRowSource.clear();
         run.stoneRowTarget.clear();
         run.stoneRowClicker.clear();
@@ -49329,6 +49336,77 @@ private:
         seen = now;
     }
 
+    // EVERY SEATED RAIDER WALKS TO THE DOOR, NOT ONLY THE HEAD (wow-overseer#765).
+    // FormRaidFromSeats puts every seat in the head's raid, and a raider on
+    // the same map follows the head only as far as it can see him; one on
+    // another continent stands idle. During ASSEMBLE each raider in the world
+    // that is not at the staging point is given the same walk the head has,
+    // through the ordinary travel aim (which carries the map, so the travel
+    // drive makes any crossing and far walk on its own legs and with its own
+    // purse). Released when ASSEMBLE ends, so nobody is walked to a door the
+    // raid has already gone through. Nothing here teleports or summons.
+    void DriveRaidSeatWalks(OverseerDecisions::FamilyRoster const& roster, RaidRunState& run,
+                            Group* group, Player* head,
+                            OverseerDecisions::RaidDoor const* door, bool walk)
+    {
+        if (!walk)
+        {
+            std::string away;
+            unsigned stillAway = 0;
+            for (std::string const& name : run.seatsWalking)
+            {
+                _travelAims.Release(name, "the raid left ASSEMBLE");
+                Player* member = ObjectAccessor::FindPlayerByName(name);
+                if (member && member->IsInWorld() &&
+                    !(member->GetMapId() == door->outsideMapId &&
+                      member->GetDistance(door->stageX, door->stageY, door->stageZ) <=
+                          OverseerDecisions::RAID_ASSEMBLE_YARDS) &&
+                    member->GetMapId() != door->insideMapId)
+                {
+                    ++stillAway;
+                    away += (away.empty() ? "" : ", ") + name;
+                }
+            }
+            if (stillAway && !run.enterAwaySaid)
+                LOG_INFO("module.overseer",
+                         "overseer: raid run for family '{}' goes in without {} raider(s) "
+                         "still away from the {} door: {}",
+                         roster.family, stillAway, door->name, away);
+            run.enterAwaySaid = true;
+            run.seatsWalking.clear();
+            return;
+        }
+        run.enterAwaySaid = false;
+        if (!group || !group->isRaidGroup())
+            return;
+        std::string const aim = OverseerDecisions::TravelAimAtPosition(
+            door->outsideMapId, door->stageX, door->stageY, door->stageZ);
+        if (aim.empty())
+            return;
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->GetSource();
+            if (!member || member == head || !member->IsInWorld() || !member->IsAlive())
+                continue;
+            std::string const name = member->GetName();
+            bool const atDoor = member->GetMapId() == door->outsideMapId &&
+                                member->GetDistance(door->stageX, door->stageY, door->stageZ) <=
+                                    OverseerDecisions::RAID_ASSEMBLE_YARDS;
+            if (atDoor || member->GetMapId() == door->insideMapId)
+            {
+                if (run.seatsWalking.erase(name))
+                    _travelAims.Release(name, "the raider reached the staging point");
+                continue;
+            }
+            _travelAims.Claim(name, aim, OverseerDecisions::TravelOwner::Run);
+            if (run.seatsWalking.insert(name).second)
+                LOG_INFO("module.overseer",
+                         "overseer: raid run for family '{}' is walking '{}' to the {} door "
+                         "from map {}",
+                         roster.family, name, door->name, member->GetMapId());
+        }
+    }
+
     void DriveRaidRun()
     {
         using OverseerDecisions::RaidRunPhase;
@@ -49504,6 +49582,8 @@ private:
                         else
                             ++facts.othersAssembled;
                     }
+                    else if (member->GetMapId() != door->outsideMapId)
+                        ++facts.awayOnOtherMap;
                 }
                 if (head && head->IsInWorld() && head->IsAlive() && head->IsSitState())
                     anyBusy = true;
@@ -49910,6 +49990,9 @@ private:
                 // A refusal is said by Claim itself, once per fence.
                 _travelAims.Claim(roster.leader, aim, OverseerDecisions::TravelOwner::Run);
             }
+
+            if (!run.seatsWalking.empty() || step.aimSeats)
+                DriveRaidSeatWalks(roster, run, group, head, door, step.aimSeats);
 
             if (step.knockMembers || step.knockHead)
             {
