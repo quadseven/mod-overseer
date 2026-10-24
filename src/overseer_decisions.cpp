@@ -22874,6 +22874,27 @@ CrossRequest ParseCrossRequest(std::string const& command)
     return out;
 }
 
+bool OnTeldrassilIsland(std::uint32_t mapId, std::uint32_t zoneId)
+{
+    return mapId == TELDRASSIL_MAP && (zoneId == TELDRASSIL_ZONE || zoneId == DARNASSUS_ZONE);
+}
+
+IslandFirstLeg CrossIslandFirst(std::uint32_t mapId, std::uint32_t zoneId,
+                                CrossRequest const& request)
+{
+    IslandFirstLeg out;
+    out.leg = request;
+    if (*request.error || request.ride || request.map == TELDRASSIL_MAP ||
+        !OnTeldrassilIsland(mapId, zoneId))
+        return out;
+    out.first = true;
+    out.leg.map = TELDRASSIL_MAP;
+    out.leg.ride = true;
+    out.leg.x = AUBERDINE_STOP_X;
+    out.leg.y = AUBERDINE_STOP_Y;
+    return out;
+}
+
 char const* CrossGate(CrossFacts const& f)
 {
     namespace R = CrossRefusal;
