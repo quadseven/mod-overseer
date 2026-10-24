@@ -25580,6 +25580,35 @@ struct CrossFacts
     unsigned atOnce{CROSS_AT_ONCE};
 };
 
+// TELDRASSIL IS AN ISLAND (wow-overseer#1401). It stands on map 1 with the rest
+// of Kalimdor, but the only road off it is the Rut'theran to Auberdine boat.
+// A `cross-to-map` row for a member on it was priced against the nearest
+// boat that names the destination map, the Menethil to Auberdine one, whose
+// berth lies across the water: the berth walk left the west shore, swam, and
+// the member drowned about once a minute. So the first leg of such a crossing
+// is the Rut'theran boat, as a same-map ride to the Auberdine stop, and the
+// asked-for map is crossed once the member is ashore there.
+constexpr std::uint32_t TELDRASSIL_MAP = 1;
+constexpr std::uint32_t TELDRASSIL_ZONE = 141;
+constexpr std::uint32_t DARNASSUS_ZONE = 1657;
+// The Auberdine stop, as a point of it (the flight master's, taxinodes node 26).
+constexpr float AUBERDINE_STOP_X = 6341.38f;
+constexpr float AUBERDINE_STOP_Y = 557.68f;
+
+// Whether this map and zone are on the island.
+bool OnTeldrassilIsland(std::uint32_t mapId, std::uint32_t zoneId);
+
+// The ride a `cross-to-map` row must take first: `first` is false for every
+// member off the island, for a ride row, and for a row naming the island's own
+// map, and the rest of the struct is then the request unchanged.
+struct IslandFirstLeg
+{
+    bool first{false};
+    CrossRequest leg;
+};
+IslandFirstLeg CrossIslandFirst(std::uint32_t mapId, std::uint32_t zoneId,
+                                CrossRequest const& request);
+
 // "" when the crossing may start; otherwise a CrossRefusal literal, the first
 // wall in the order the fields above are declared, the realm's cap last.
 char const* CrossGate(CrossFacts const& facts);
