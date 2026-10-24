@@ -20395,6 +20395,38 @@ constexpr char const* RealmFull       = "the realm has as many far walks under w
 // clock; the map does not.
 bool FarWalkRefusalRetryable(std::string const& reason);
 
+// ----------------------- transient or permanent: the field the bridge reads --
+//
+// `retryable` on a walk row is true for walls that merely move with the
+// character (too far, the ground, every ending), which is not the same as
+// "worth asking again soon": the bridge string-matched reasons to tell a wait
+// from a stop. `transient` is that answer, decided here and written on the row
+// beside `retryable` (which stays, for compatibility). True only for a wall
+// that clears by itself within moments: the character is mid-logout, not yet
+// in the world, on a flight path, in combat (before or on the way), or held by
+// a walk or a verb that will end. False for everything else, including a
+// reason this table does not know, so a new refusal is permanent until someone
+// decides otherwise.
+struct WalkRefusalRow
+{
+    char const* family;   // "mailbox", "errand", "spawn" or "far"
+    char const* reason;   // the literal the module writes
+    bool ending;          // true for a walk that started and was abandoned
+    bool transient;
+};
+
+// Every walk refusal and abandonment literal the module can write. A test
+// scrapes the namespaces above and fails when a literal is missing here.
+std::vector<WalkRefusalRow> const& WalkRefusalCatalogue();
+
+// The row's `transient`; false for a reason the catalogue does not hold.
+bool WalkRefusalTransient(std::string const& reason);
+
+// The checked-in fixture, byte for byte: every row shape and reason with its
+// flags. fixtures/walk_refusals.json is this text; a test fails when it is
+// stale. ASCII only, stable order.
+std::string WalkRefusalFixturesJson();
+
 // THE BUDGET GATE. `startsForBot` are the times (seconds) this bot started a far
 // walk, `now` the time now, `underWay` the far walks the realm has running.
 // "" when a far walk may start; otherwise the FarWalkRefusal literal. The realm
