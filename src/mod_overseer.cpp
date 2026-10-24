@@ -15793,7 +15793,7 @@ private:
             for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
             {
                 if (Player* const member = ref->GetSource())
-                    youngest = std::min(youngest, member->GetLevel());
+                    youngest = std::min(youngest, static_cast<uint32_t>(member->GetLevel()));
             }
         }
         return youngest;
@@ -15820,10 +15820,19 @@ private:
         unsigned const suppressedEntries = std::count_if(creatures.begin(), creatures.end(),
             [](OverseerDecisions::CreatureDanger const& c)
             { return OverseerDecisions::CreaturePullIsSuppressed(c, 2u); });
+        std::string dangerousZoneIds;
+        for (OverseerDecisions::ZoneDanger const& zone : zones)
+        {
+            if (!OverseerDecisions::ZoneIsTooDangerous(zone, 3u))
+                continue;
+            if (!dangerousZoneIds.empty())
+                dangerousZoneIds += ",";
+            dangerousZoneIds += std::to_string(zone.zone);
+        }
         LOG_INFO("module.overseer",
                  "overseer: death danger - {} death(s) in the last {}s, {} zone(s) above "
-                 "threshold, {} entry(ies) with two or more kills",
-                 deaths.size(), windowSeconds, dangerousZones, suppressedEntries);
+                 "threshold [{}], {} entry(ies) with two or more kills",
+                 deaths.size(), windowSeconds, dangerousZones, dangerousZoneIds, suppressedEntries);
     }
 
     std::map<std::string, ProfessionPlan> LoadProfessionPlans()
