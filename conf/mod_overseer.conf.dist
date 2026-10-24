@@ -670,3 +670,20 @@
 #        Default:     "Cave,Bonkers"
 #
 #Overseer.Retire.KeepGuilds = "Cave,Bonkers"
+
+########################################
+#
+#    DISCORD ORDERS
+#
+#    Overseer.Order.Bridge
+#        Description: Which Discord bridge's orders this worldserver serves:
+#                     'dev' or 'live'. A bridge runs on its own Discord
+#                     application token and answers only in its own channel,
+#                     and this module reads only the overseer_order_inbox rows
+#                     left by the bridge it names, so a dev order never lands
+#                     in the live world. Empty serves no orders.
+#        Default:     ""
+#
+#Overseer.Order.Bridge = ""
+#
+########################################

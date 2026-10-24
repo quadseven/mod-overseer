@@ -2589,6 +2589,11 @@ constexpr uint32 RUN_COLD_SECONDS = 120;
 // for an errand that is not safety-critical.
 constexpr uint32 DUNGEON_RUN_POLL_MS = 5000;
 
+// How often the inbox of Discord orders is read (mod-overseer#150). An order is
+// a sentence a person is waiting on, so a few seconds; the read is one indexed
+// query that finds nothing almost every time.
+constexpr uint32 ORDER_POLL_MS = 3000;
+
 // How close counts as "at the staging point" for BARRIER, and how close
 // counts as "close enough to each other" for the barrier predicate itself.
 // Ten yards because that is the figure the epic's six independently-converged
@@ -8213,6 +8218,7 @@ public:
         _terrainRecoveryTimer += diff;
         _deathTimer += diff;
         _dungeonRunTimer += diff;
+        _orderTimer += diff;
 
         // Load the watch list before the first poll, not 30s after startup.
         if (!_watchLoaded)
@@ -8387,6 +8393,11 @@ public:
         // DriveEngagementSafety's own placement below documents for why order
         // inside one OnUpdate matters when two drives can run in the same
         // tick.
+        if (_orderTimer >= ORDER_POLL_MS)
+        {
+            _orderTimer = 0;
+            DriveOrders();
+        }
         if (_dungeonRunTimer >= DUNGEON_RUN_POLL_MS)
         {
             _dungeonRunTimer = 0;
@@ -12949,6 +12960,133 @@ private:
     enum class SchemaColumns : uint8 { Unknown, Absent, Present };
     SchemaColumns _runCapColumns{SchemaColumns::Unknown};
     SchemaColumns _runAccountingColumns{SchemaColumns::Unknown};
+
+    // THE DATABASE SIDE OF A DISCORD ORDER (mod-overseer#150). Names are looked
+    // up by substring and ResolveOrderName decides whether that is one id or a
+    // question; a row is written only into a table that has the columns the
+    // plan names, so a database that has not applied the inbox migration
+    // answers "failed" in Discord instead of writing nowhere.
+    struct DatabaseOrderPort : public OverseerDecisions::OrderPort
+    {
+        // Escapes for a quoted literal; `likeText` also escapes the LIKE
+        // wildcards so a typed '%' or '_' matches itself.
+        static std::string Quote(std::string s, size_t maxBytes, bool likeText = false)
+        {
+            TruncateUtf8(s, maxBytes);
+            CharacterDatabase.EscapeString(s);
+            if (!likeText)
+                return s;
+            std::string out;
+            for (char const c : s)
+            {
+                if (c == '%' || c == '_')
+                    out += '\\';
+                out += c;
+            }
+            return out;
+        }
+
+        template <typename Db>
+        static std::vector<OverseerDecisions::OrderCandidate> Candidates(
+            Db& db, char const* sql, std::string const& typed)
+        {
+            std::vector<OverseerDecisions::OrderCandidate> found;
+            if (typed.empty())
+                return found;
+            QueryResult result = db.Query(sql, Quote(typed, 120, true));
+            if (!result)
+                return found;
+            do
+            {
+                Field* f = result->Fetch();
+                found.push_back({f[0].Get<uint32>(), f[1].Get<std::string>()});
+            } while (result->NextRow());
+            return found;
+        }
+
+        OverseerDecisions::OrderLookups Lookup(OverseerDecisions::OrderCall const& call) override
+        {
+            auto arg = [&call](char const* name)
+            {
+                auto it = call.args.find(name);
+                return it == call.args.end() ? std::string() : it->second;
+            };
+            OverseerDecisions::OrderLookups out;
+            out.items = Candidates(WorldDatabase,
+                "SELECT entry, name FROM item_template WHERE name LIKE '%{}%' LIMIT 20", arg("item"));
+            out.maps = Candidates(WorldDatabase,
+                "SELECT ID, MapName_Lang_enUS FROM map_dbc WHERE MapName_Lang_enUS LIKE '%{}%' LIMIT 20",
+                arg("map"));
+            out.members = Candidates(CharacterDatabase,
+                "SELECT c.guid, c.name FROM characters c JOIN overseer_roster r ON r.name = c.name "
+                "WHERE c.name LIKE '%{}%' LIMIT 20", arg("member"));
+            return out;
+        }
+
+        bool WriteRow(OverseerDecisions::OrderRow const& row) override
+        {
+            std::string names, values;
+            for (auto const& column : row.columns)
+            {
+                names += (names.empty() ? "" : ",") + column.first;
+                values += (values.empty() ? "'" : ",'") + Quote(column.second, 255) + "'";
+            }
+            std::string quoted;
+            for (auto const& column : row.columns)
+                quoted += (quoted.empty() ? "'" : ",'") + column.first + "'";
+            if (!SchemaHasColumns(row.table.c_str(), quoted.c_str(), row.columns.size()))
+                return false;
+            CharacterDatabase.DirectExecute("INSERT INTO {} ({}) VALUES ({})", row.table, names, values);
+            return true;
+        }
+
+        uint64 RecordOrder(OverseerDecisions::PendingOrder const& order,
+                           std::string const& rowsWritten) override
+        {
+            if (!SchemaHasColumns("overseer_order", "'bridge','author','text','rows_written'", 4))
+                return 0;
+            CharacterDatabase.DirectExecute(
+                "INSERT INTO overseer_order (bridge, author, text, rows_written) "
+                "VALUES ('{}', '{}', '{}', '{}')", Quote(order.bridge, 16), Quote(order.author, 64),
+                Quote(order.text, 2000), Quote(rowsWritten, 60000));
+            QueryResult id = CharacterDatabase.Query("SELECT LAST_INSERT_ID()");
+            return id ? id->Fetch()[0].Get<uint64>() : 0;
+        }
+    };
+
+    // Reads this module's bridge's pending orders, runs each through
+    // ProcessOrder and leaves the outcome on the inbox row for the bridge to
+    // post in its own channel. Overseer.Order.Bridge names the bridge this
+    // worldserver serves ('dev' or 'live'); empty serves none. A row is marked
+    // before the next poll can read it again (DirectExecute), so an order is
+    // never run twice.
+    void DriveOrders()
+    {
+        std::string const bridge = sConfigMgr->GetOption<std::string>("Overseer.Order.Bridge", "");
+        if (bridge.empty())
+            return;
+        QueryResult pending = CharacterDatabase.Query(
+            "SELECT id, author, text, tool, args FROM overseer_order_inbox "
+            "WHERE bridge = '{}' AND status = 'pending' ORDER BY id LIMIT 5",
+            DatabaseOrderPort::Quote(bridge, 16));
+        if (!pending)
+            return;
+        DatabaseOrderPort port;
+        do
+        {
+            Field* f = pending->Fetch();
+            OverseerDecisions::PendingOrder order{
+                f[0].Get<uint64>(), bridge, f[1].Get<std::string>(), f[2].Get<std::string>(),
+                {f[3].Get<std::string>(), OverseerDecisions::ParseOrderArgs(f[4].Get<std::string>())}};
+            OverseerDecisions::OrderOutcome const outcome = OverseerDecisions::ProcessOrder(order, port);
+            CharacterDatabase.DirectExecute(
+                "UPDATE overseer_order_inbox SET status = '{}', reply = '{}' WHERE id = {}",
+                outcome.status, DatabaseOrderPort::Quote(outcome.reply, 2000), order.id);
+            if (outcome.status == "failed")
+                LOG_WARN("module.overseer", "overseer: order {} from the {} bridge failed: {}",
+                         order.id, bridge, outcome.reply);
+        } while (pending->NextRow());
+    }
 
     // `columns` is a SQL list literal written at this call site and never built
     // from anything a person or a row can influence, which is why it can be
@@ -78207,6 +78345,7 @@ private:
     // is free to change for engagement-safety reasons that have nothing to do
     // with gathering a party.
     uint32 _dungeonRunTimer = 0;
+    uint32 _orderTimer = 0;
 
     // ---------------------------------------------------------------- travel --
     //

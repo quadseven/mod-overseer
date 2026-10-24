@@ -26420,6 +26420,48 @@ OrderPlan PlanOrder(OrderCall const& call, OrderLookups const& lookups);
 // The audit row's rows_written: a JSON array of {"table","key"}.
 std::string FormatRowsWritten(std::vector<OrderRow> const& rows);
 
+// One order the bridge left in overseer_order_inbox: who typed what, and the
+// tool call the LLM made from it (mod-overseer#150). `bridge` is the bridge
+// that took it; a module serves only its own bridge's orders.
+struct PendingOrder
+{
+    std::uint64_t id{0};
+    std::string bridge;
+    std::string author;
+    std::string text;
+    OrderCall call;
+};
+
+// What ProcessOrder needs from the databases. Lookup returns the item, map and
+// member rows matching the names in the call; WriteRow inserts one planned row
+// and says whether it landed; RecordOrder writes the audit row and returns its
+// id, or 0 when it did not land.
+class OrderPort
+{
+public:
+    virtual ~OrderPort() = default;
+    virtual OrderLookups Lookup(OrderCall const& call) = 0;
+    virtual bool WriteRow(OrderRow const& row) = 0;
+    virtual std::uint64_t RecordOrder(PendingOrder const& order, std::string const& rowsWritten) = 0;
+};
+
+// status is "accepted" (rows written and recorded), "asked" (a question, no
+// row) or "failed" (a write did not land). `reply` is what the bridge says in
+// its own Discord channel.
+struct OrderOutcome
+{
+    std::string status;
+    std::string reply;
+};
+
+// Plans the order, writes its rows, records it, and words the reply. A
+// question writes and records nothing.
+OrderOutcome ProcessOrder(PendingOrder const& order, OrderPort& port);
+
+// The inbox's `args` column: one key=value per line, split at the first '='.
+// Lines without one are ignored.
+std::map<std::string, std::string> ParseOrderArgs(std::string const& text);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

@@ -24104,4 +24104,46 @@ std::string FormatRowsWritten(std::vector<OrderRow> const& rows)
     return out + "]";
 }
 
+namespace
+{
+
+OrderOutcome OrderFailure(std::string const& what)
+{
+    return {"failed", "I could not write that order (" + what + "); nothing was recorded."};
+}
+
+}  // namespace
+
+OrderOutcome ProcessOrder(PendingOrder const& order, OrderPort& port)
+{
+    OrderPlan const plan = PlanOrder(order.call, port.Lookup(order.call));
+    if (!plan.accepted)
+        return {"asked", plan.question};
+    for (OrderRow const& row : plan.rows)
+        if (!port.WriteRow(row))
+            return OrderFailure("the " + row.table + " row did not land");
+    std::uint64_t const id = port.RecordOrder(order, FormatRowsWritten(plan.rows));
+    if (id == 0)
+        return OrderFailure("the order record did not land");
+    return {"accepted", FormatOrderReply(id, plan.resolved)};
+}
+
+std::map<std::string, std::string> ParseOrderArgs(std::string const& text)
+{
+    std::map<std::string, std::string> args;
+    std::size_t start = 0;
+    while (start <= text.size())
+    {
+        std::size_t end = text.find('\n', start);
+        if (end == std::string::npos)
+            end = text.size();
+        std::string const line = text.substr(start, end - start);
+        std::size_t const eq = line.find('=');
+        if (eq != std::string::npos && eq > 0)
+            args[line.substr(0, eq)] = line.substr(eq + 1);
+        start = end + 1;
+    }
+    return args;
+}
+
 }  // namespace OverseerDecisions
