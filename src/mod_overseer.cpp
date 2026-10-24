@@ -44904,9 +44904,14 @@ private:
                 holdTheLeader();
                 bool const boardLevel = LevelWithBerth(leader, route);
                 float const fromBerth = leader->GetExactDist2d(route.berthX, route.berthY);
+                // ONCE HE HAS STEPPED THIS STOP he is stepped again, not walked
+                // back to the berth off the deck he is on (#758):
+                // crossingBoardStepSaid is set by the step and cleared when
+                // the reading leaves Board.
                 if (OverseerDecisions::BoardApproachFrom(boardLevel, fromBerth,
                                                          coord.crossingBoardApproaches,
-                                                         CROSSING_BOARD_APPROACH) ==
+                                                         CROSSING_BOARD_APPROACH,
+                                                         coord.crossingBoardStepSaid) ==
                         OverseerDecisions::BoardApproach::CloseOnBerth &&
                     boardLevel)
                 {
@@ -45483,6 +45488,10 @@ private:
         // row started, which fixes the stop it boards at while the transport
         // carries it past the others.
         uint32 boardApproaches{0};
+        // A step aboard was taken while the reading has said Board, so the
+        // next Board poll steps again rather than walking him back off the
+        // deck (#758). Cleared whenever the reading is not Board.
+        bool boardStepped{false};
         bool rideSameMap{false};
         float rideX{0.f};
         float rideY{0.f};
@@ -46214,6 +46223,7 @@ private:
         memo.jobFineSteps = 0;
         memo.jobSaidForeignWalk = false;
         memo.boardApproaches = 0;
+        memo.boardStepped = false;
         memo.rideX = memo.rideY = memo.rideFromX = memo.rideFromY = 0.f;
         _stepOffReleases.erase(name);
     }
@@ -46408,6 +46418,8 @@ private:
         // hold (taken below) must not be refused for it.
         if (memo.jobRow && step.action != OverseerDecisions::CrossingAction::Walk)
             CancelCrossBerthWalk(name, p, "the crossing no longer asks for a walk");
+        if (step.action != OverseerDecisions::CrossingAction::Board)
+            memo.boardStepped = false;
 
         uint8 const said = static_cast<uint8>(step.action);
         bool const fresh = memo.crossingSaid != said;
@@ -46498,9 +46510,11 @@ private:
                 holdIt();
                 // BOUNDED, so a berth nobody can stand within a few yards of
                 // never keeps the boat from being boarded at all.
+                // A WALKER ALREADY STEPPED ABOARD THIS STOP is stepped again,
+                // not walked back off the deck toward the berth (#758).
                 if (OverseerDecisions::BoardApproachFrom(
                         LevelWithBerth(p, route), p->GetExactDist2d(route.berthX, route.berthY),
-                        memo.boardApproaches, CROSSING_BOARD_APPROACH) ==
+                        memo.boardApproaches, CROSSING_BOARD_APPROACH, memo.boardStepped) ==
                     OverseerDecisions::BoardApproach::CloseOnBerth)
                 {
                     ++memo.boardApproaches;
@@ -46527,6 +46541,7 @@ private:
                                                 /*generatePath*/ false,
                                                 /*forceDestination*/ false);
                 LetHeldCharacterWalk(name, CROSSING_STEP_WALK_SECONDS);
+                memo.boardStepped = true;
                 if (fresh)
                     LOG_INFO("module.overseer",
                              "overseer: '{}' steps aboard '{}' at ({:.1f}, {:.1f}, {:.1f}) on "

@@ -9354,9 +9354,25 @@ struct BoardApproachLimits
 // step from it, however many polls that takes, so that case never boards. The
 // distance is bounded by `maxApproaches`. Waiting for the boat (Hold) asks
 // with `approachesSoFar` zero, so the walker is already close when it docks.
+//
+// A STEP ABOARD TAKEN THIS STOP IS NOT UNDONE (#758). The step walks the
+// walker from the berth onto the nearest deck edge the map confirms, and that
+// edge is not always within `fromBerthYards` of the berth: at the Azuremyst
+// dock (map 530) it is 9.2 yards out, at the Kalimdor docks 3.9. The bot AI
+// does not always attach a walker the moment he stands on the deck (a 3.9-yard
+// step missed twice before it sailed), so the next Board poll can find him on
+// the deck edge, not aboard, and more than `fromBerthYards` from the berth.
+// Reading that as "close on the berth" walked him back off the deck with a
+// pathed step: four times in twelve minutes on 2026-10-24 he read 28 yards out
+// fifteen seconds later, the crossing said Walk, and his cross hold was
+// released with the ship still docked. So while `steppedAboardThisStop` holds
+// (the caller clears it when the reading leaves Board), a level walker is
+// stepped aboard again from where he stands. A walker no longer level with the
+// berth (in the water) still closes on it first.
 BoardApproach BoardApproachFrom(bool levelWithBerth, float berthYards,
                                 std::uint32_t approachesSoFar,
-                                BoardApproachLimits const& limits);
+                                BoardApproachLimits const& limits,
+                                bool steppedAboardThisStop = false);
 
 // ------------------- a crossing's hold that no crossing read this poll (#758) --
 //
