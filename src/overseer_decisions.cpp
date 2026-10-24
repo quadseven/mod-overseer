@@ -19412,6 +19412,91 @@ std::string TrainerPurchaseLine(std::string const& member, char const* kind,
            " paid_copper=" + std::to_string(paidCopper);
 }
 
+namespace
+{
+
+// Plain decimal digits that fit a uint32 and are not zero.
+bool ParseEntryDigits(std::string const& text, uint32_t& out)
+{
+    if (text.empty() || text.size() > 10)
+        return false;
+    uint64_t value = 0;
+    for (char ch : text)
+    {
+        if (ch < '0' || ch > '9')
+            return false;
+        value = value * 10 + static_cast<uint64_t>(ch - '0');
+    }
+    if (value == 0 || value > UINT32_MAX)
+        return false;
+    out = static_cast<uint32_t>(value);
+    return true;
+}
+
+}  // namespace
+
+bool ParseRecipeManualErrand(std::string const& column, RecipeManualErrand& out)
+{
+    out = RecipeManualErrand();
+    std::string::size_type const colon = column.find(':');
+    if (colon == std::string::npos)
+        return false;
+    RecipeManualErrand parsed;
+    if (!ParseEntryDigits(column.substr(0, colon), parsed.itemEntry) ||
+        !ParseEntryDigits(column.substr(colon + 1), parsed.vendorEntry))
+        return false;
+    out = parsed;
+    return true;
+}
+
+RecipeManualPlan PlanRecipeManual(RecipeManualFacts const& facts)
+{
+    namespace R = RecipeManualRefusal;
+    if (facts.knowsRecipe)
+        return {RecipeManualStep::Learned, ""};
+    if (!facts.teachesRecipe)
+        return {RecipeManualStep::Refuse, R::NotARecipe};
+    if (facts.learning)
+        return {RecipeManualStep::Wait, ""};
+    if (facts.usesTried >= RECIPE_MANUAL_MAX_USES ||
+        (facts.usesTried > 0 && !facts.carriesManual))
+        return {RecipeManualStep::Refuse, R::UsedAndNotLearned};
+    if (facts.carriesManual)
+        return {RecipeManualStep::Use, ""};
+    if (!facts.vendorNearby)
+        return {RecipeManualStep::Walk, ""};
+    if (!facts.vendorInReach)
+        return {RecipeManualStep::Approach, ""};
+    if (!facts.vendorSells)
+        return {RecipeManualStep::Refuse, R::NotSold};
+    if (facts.price > facts.purse)
+        return {RecipeManualStep::Refuse, R::TooPoor};
+    return {RecipeManualStep::Buy, ""};
+}
+
+bool ManualBuyRefusalReleases(std::string const& detail)
+{
+    return BuyRefusalRetry(detail) == TownRetry::Never ||
+           detail == "vendor does not stock the item" ||
+           detail == "cannot afford the purchase";
+}
+
+bool ManualUseRefusalReleases(std::string const& detail)
+{
+    return LearnRefusalRetry(detail) != TownRetry::Later;
+}
+
+std::string ManualPurchaseLine(std::string const& member, uint32_t itemEntry,
+                               std::string const& itemName, uint32_t vendorEntry,
+                               uint32_t spellId, std::string const& spellName,
+                               uint64_t paidCopper)
+{
+    return "overseer: manual_purchase member='" + member + "' item=" +
+           std::to_string(itemEntry) + " '" + itemName + "' vendor=" +
+           std::to_string(vendorEntry) + " spell=" + std::to_string(spellId) + " '" +
+           spellName + "' paid_copper=" + std::to_string(paidCopper);
+}
+
 char const* NamedRecipeStepWord(NamedRecipeStep step)
 {
     switch (step)
