@@ -53,6 +53,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace OverseerDecisions
@@ -26334,6 +26335,74 @@ enum class LockpickErrandStep : std::uint8_t
 
 LockpickErrandStep DecideLockpickErrand(bool hasTarget, bool inReach,
                                         bool inCombat, bool moving);
+
+// A Discord order names an item, a map or a member in words; the bridge looks
+// the words up and hands the matching rows here (mod-overseer#150).
+struct OrderCandidate
+{
+    std::uint32_t id{0};
+    std::string name;
+};
+
+// accepted is true only for exactly one match; then `id` is it. Otherwise the
+// order writes no row and `question` is what the bridge says in Discord.
+struct OrderResolution
+{
+    bool accepted{false};
+    std::uint32_t id{0};
+    std::string question;
+};
+
+// One name to one id. A case-blind exact match beats a partial one; one match
+// is an id; none or several is a question naming the kind (and the ids, when
+// several) and never a guess.
+OrderResolution ResolveOrderName(std::string const& kind, std::string const& typed,
+                                 std::vector<OrderCandidate> const& matches);
+
+// The Discord reply to an accepted order: the audit row's id and each resolved
+// (kind, value) pair, in the order given.
+std::string FormatOrderReply(std::uint64_t orderId,
+                             std::vector<std::pair<std::string, std::string>> const& resolved);
+
+// One tool call the LLM made, as the bridge hands it over: the tool's name and
+// its string arguments (mod-overseer#150). Tools: start_campaign (map,
+// goal_kind, item, runs), set_aim and farm_target (item), set_level_target
+// (member, level).
+struct OrderCall
+{
+    std::string tool;
+    std::map<std::string, std::string> args;
+};
+
+// What the bridge's lookups returned for the names in the call.
+struct OrderLookups
+{
+    std::vector<OrderCandidate> items;
+    std::vector<OrderCandidate> maps;
+    std::vector<OrderCandidate> members;
+};
+
+struct OrderRow
+{
+    std::string table;
+    std::string key;
+    std::vector<std::pair<std::string, std::string>> columns;
+};
+
+// accepted: `rows` are the only rows the bridge writes and `resolved` is what
+// the reply echoes. Not accepted: `question` is the whole outcome, no row.
+struct OrderPlan
+{
+    bool accepted{false};
+    std::vector<OrderRow> rows;
+    std::vector<std::pair<std::string, std::string>> resolved;
+    std::string question;
+};
+
+OrderPlan PlanOrder(OrderCall const& call, OrderLookups const& lookups);
+
+// The audit row's rows_written: a JSON array of {"table","key"}.
+std::string FormatRowsWritten(std::vector<OrderRow> const& rows);
 
 }  // namespace OverseerDecisions
 

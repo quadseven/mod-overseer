@@ -23940,4 +23940,165 @@ LockpickErrandStep DecideLockpickErrand(bool hasTarget, bool inReach,
     return LockpickErrandStep::Cast;
 }
 
+OrderResolution ResolveOrderName(std::string const& kind, std::string const& typed,
+                                 std::vector<OrderCandidate> const& matches)
+{
+    std::vector<OrderCandidate> pool;
+    std::string const want = LowerAscii(typed);
+    for (OrderCandidate const& match : matches)
+        if (LowerAscii(match.name) == want)
+            pool.push_back(match);
+    if (pool.empty())
+        pool = matches;
+
+    OrderResolution out;
+    if (pool.size() == 1)
+    {
+        out.accepted = true;
+        out.id = pool[0].id;
+        return out;
+    }
+    if (pool.empty())
+    {
+        out.question = "I know no " + kind + " called '" + typed + "'. Which did you mean?";
+        return out;
+    }
+    std::string ids;
+    for (OrderCandidate const& match : pool)
+        ids += (ids.empty() ? "" : ", ") + std::to_string(match.id);
+    out.question = "More than one " + kind + " is called '" + typed + "': " + ids + ". Which one?";
+    return out;
+}
+
+std::string FormatOrderReply(std::uint64_t orderId,
+                             std::vector<std::pair<std::string, std::string>> const& resolved)
+{
+    std::string list;
+    for (auto const& entry : resolved)
+        list += (list.empty() ? "" : ", ") + entry.first + " " + entry.second;
+    return "Order " + std::to_string(orderId) + " written: " + list + ".";
+}
+
+namespace
+{
+
+std::string OrderArg(OrderCall const& call, char const* name)
+{
+    auto it = call.args.find(name);
+    return it == call.args.end() ? std::string() : it->second;
+}
+
+// A whole number in [lo, hi] spelled with digits only, else false.
+bool WholeNumberArg(std::string const& text, unsigned lo, unsigned hi, std::string& out)
+{
+    if (text.empty() || text.size() > 6 ||
+        text.find_first_not_of("0123456789") != std::string::npos)
+        return false;
+    unsigned const n = static_cast<unsigned>(std::stoul(text));
+    if (n < lo || n > hi)
+        return false;
+    out = std::to_string(n);
+    return true;
+}
+
+// Resolves one named argument; on a question, copies it into plan and says so.
+bool ResolveInto(OrderPlan& plan, char const* kind, std::string const& typed,
+                 std::vector<OrderCandidate> const& pool, std::string& value)
+{
+    OrderResolution r = ResolveOrderName(kind, typed, pool);
+    if (!r.accepted)
+    {
+        plan.question = r.question;
+        return false;
+    }
+    value = std::to_string(r.id);
+    if (std::string(kind) == "member")
+        for (OrderCandidate const& c : pool)
+            if (c.id == r.id)
+                value = c.name;
+    plan.resolved.emplace_back(kind, value);
+    return true;
+}
+
+OrderPlan PlanCampaign(OrderCall const& call, OrderLookups const& look)
+{
+    OrderPlan plan;
+    std::string map, item;
+    std::string const kind = OrderArg(call, "goal_kind");
+    if (kind != "item")
+    {
+        plan.question = "A campaign needs a goal I can run: only 'item' is one. What is the goal?";
+        return plan;
+    }
+    std::string runs;
+    if (!ResolveInto(plan, "map", OrderArg(call, "map"), look.maps, map) ||
+        !ResolveInto(plan, "item", OrderArg(call, "item"), look.items, item))
+        return plan;
+    if (!WholeNumberArg(OrderArg(call, "runs"), 1, 1000, runs))
+    {
+        plan.question = "How many runs? Give a whole number from 1 to 1000.";
+        return plan;
+    }
+    plan.rows.push_back({"overseer_dungeon_campaign", "map=" + map + ",goal_item=" + item,
+                         {{"map", map}, {"goal_kind", kind}, {"goal_item", item},
+                          {"runs_wanted", runs}}});
+    plan.accepted = true;
+    return plan;
+}
+
+OrderPlan PlanAim(OrderCall const& call, OrderLookups const& look)
+{
+    OrderPlan plan;
+    std::string item;
+    if (!ResolveInto(plan, "item", OrderArg(call, "item"), look.items, item))
+        return plan;
+    plan.rows.push_back({"overseer_aim", "item=" + item, {{"item", item}}});
+    plan.accepted = true;
+    return plan;
+}
+
+OrderPlan PlanLevelGoal(OrderCall const& call, OrderLookups const& look)
+{
+    OrderPlan plan;
+    std::string member;
+    if (!ResolveInto(plan, "member", OrderArg(call, "member"), look.members, member))
+        return plan;
+    std::string level;
+    if (!WholeNumberArg(OrderArg(call, "level"), 1, 80, level))
+    {
+        plan.question = "What level? Give a whole number from 1 to 80.";
+        return plan;
+    }
+    plan.resolved.emplace_back("level", level);
+    plan.rows.push_back({"overseer_level_goal", "member=" + member,
+                         {{"member", member}, {"level", level}}});
+    plan.accepted = true;
+    return plan;
+}
+
+}  // namespace
+
+OrderPlan PlanOrder(OrderCall const& call, OrderLookups const& lookups)
+{
+    if (call.tool == "start_campaign")
+        return PlanCampaign(call, lookups);
+    if (call.tool == "set_aim" || call.tool == "farm_target")
+        return PlanAim(call, lookups);
+    if (call.tool == "set_level_target")
+        return PlanLevelGoal(call, lookups);
+    OrderPlan plan;
+    plan.question = "I cannot do '" + call.tool + "'. I can start a campaign, set an aim, "
+                    "farm a target or set a level target.";
+    return plan;
+}
+
+std::string FormatRowsWritten(std::vector<OrderRow> const& rows)
+{
+    std::string out = "[";
+    for (OrderRow const& row : rows)
+        out += std::string(out.size() > 1 ? "," : "") + "{\"table\":\"" + row.table +
+               "\",\"key\":\"" + row.key + "\"}";
+    return out + "]";
+}
+
 }  // namespace OverseerDecisions
