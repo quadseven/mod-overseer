@@ -7954,10 +7954,13 @@ char const* BoardApproachName(BoardApproach approach)
 
 BoardApproach BoardApproachFrom(bool levelWithBerth, float berthYards,
                                 std::uint32_t approachesSoFar,
-                                BoardApproachLimits const& limits)
+                                BoardApproachLimits const& limits,
+                                bool steppedAboardThisStop)
 {
     if (!levelWithBerth)
         return BoardApproach::CloseOnBerth;
+    if (steppedAboardThisStop)
+        return BoardApproach::StepAboard;
     if (berthYards > limits.fromBerthYards && approachesSoFar < limits.maxApproaches)
         return BoardApproach::CloseOnBerth;
     return BoardApproach::StepAboard;

@@ -159,11 +159,11 @@ void Wiring()
             std::string const step = Case(body, label);
             bool const asks = step.find("OverseerDecisions::BoardApproachFrom(") !=
                                   std::string::npos &&
-                              step.find("CROSSING_BOARD_APPROACH)") != std::string::npos;
+                              step.find("CROSSING_BOARD_APPROACH") != std::string::npos;
             if (!asks)
             {
                 std::fprintf(stderr, "FAIL: %s %s must close on the berth with "
-                                     "BoardApproachFrom(..., CROSSING_BOARD_APPROACH)\n",
+                                     "BoardApproachFrom(..., CROSSING_BOARD_APPROACH...)\n",
                              drive, label);
                 ++failures;
             }
