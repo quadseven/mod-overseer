@@ -23832,6 +23832,125 @@ std::string RunDamageUpsertSql(RunDamageBook const& batch)
     return ss.str();
 }
 
+namespace
+{
+// True when this zone's score is at or above the threshold. A zone with no
+// score at all is not dangerous: nothing killed the party there in the window.
+bool ZoneScoreIsAbove(std::vector<ZoneDanger> const& danger, uint32_t zone,
+                      unsigned threshold)
+{
+    for (ZoneDanger const& z : danger)
+        if (z.zone == zone)
+            return ZoneIsTooDangerous(z, threshold);
+    return false;
+}
+}  // namespace
+
+std::vector<ZoneDanger> ScoreZoneDanger(std::vector<DeathRecord> const& deaths,
+                                        std::time_t now, uint32_t partyLevel,
+                                        std::time_t windowSeconds, uint32_t levelGap)
+{
+    std::map<uint32_t, ZoneDanger> byZone;
+    for (DeathRecord const& d : deaths)
+    {
+        if (d.createdAt == 0 || now < d.createdAt || now - d.createdAt > windowSeconds)
+            continue;
+        if (d.killerType != "creature" || d.killerEntry == 0)
+            continue;
+        ZoneDanger& z = byZone[d.zone];
+        z.zone = d.zone;
+        ++z.deaths;
+        if (d.killerLevel >= partyLevel + levelGap)
+        {
+            ++z.lethalDeaths;
+            int64_t const outlevelled =
+                static_cast<int64_t>(partyLevel) - static_cast<int64_t>(d.level);
+            double const decay = 1.0 / (1.0 + static_cast<double>(outlevelled > 0 ? outlevelled : 0));
+            z.score += decay;
+        }
+    }
+    std::vector<ZoneDanger> out;
+    out.reserve(byZone.size());
+    for (auto const& kv : byZone)
+        out.push_back(kv.second);
+    std::sort(out.begin(), out.end(),
+              [](ZoneDanger const& a, ZoneDanger const& b) { return a.score > b.score; });
+    return out;
+}
+
+bool ZoneIsTooDangerous(ZoneDanger const& zone, unsigned threshold)
+{
+    return zone.score >= static_cast<double>(threshold);
+}
+
+std::vector<CreatureDanger> ScoreCreatureDanger(std::vector<DeathRecord> const& deaths,
+                                                std::time_t now,
+                                                std::time_t windowSeconds)
+{
+    std::map<uint32_t, CreatureDanger> byEntry;
+    for (DeathRecord const& d : deaths)
+    {
+        if (d.createdAt == 0 || now < d.createdAt || now - d.createdAt > windowSeconds)
+            continue;
+        if (d.killerType != "creature" || d.killerEntry == 0)
+            continue;
+        CreatureDanger& c = byEntry[d.killerEntry];
+        c.entry = d.killerEntry;
+        ++c.deaths;
+    }
+    std::vector<CreatureDanger> out;
+    out.reserve(byEntry.size());
+    for (auto const& kv : byEntry)
+        out.push_back(kv.second);
+    return out;
+}
+
+bool CreaturePullIsSuppressed(CreatureDanger const& creature, unsigned threshold)
+{
+    return creature.deaths >= threshold;
+}
+
+TravelAvoidance AvoidDangerousZone(std::vector<TravelLeg> const& legs,
+                                   std::vector<ZoneDanger> const& danger,
+                                   unsigned threshold)
+{
+    TravelAvoidance verdict;
+
+    TravelLeg const* current = nullptr;
+    for (TravelLeg const& leg : legs)
+        if (leg.current)
+        {
+            current = &leg;
+            break;
+        }
+    if (current == nullptr)
+        return verdict;  // no current leg: nothing to avoid
+
+    if (!ZoneScoreIsAbove(danger, current->zone, threshold))
+        return verdict;  // the aimed zone is safe
+
+    // Another leg reaches the same destination through a safe zone: avoid the
+    // aimed one and name it.
+    for (TravelLeg const& leg : legs)
+    {
+        if (&leg == current)
+            continue;
+        if (!ZoneScoreIsAbove(danger, leg.zone, threshold))
+        {
+            verdict.avoid = true;
+            verdict.avoidedZone = current->zone;
+            verdict.noAlternative = false;
+            return verdict;
+        }
+    }
+
+    // Every route enters a too-dangerous zone: stand down and name the zone.
+    verdict.avoid = false;
+    verdict.avoidedZone = current->zone;
+    verdict.noAlternative = true;
+    return verdict;
+}
+
 // ----------------------------------- the post-run dungeon report (#152) --
 
 DungeonRunReport BuildDungeonRunReport(DungeonRunFacts const& run,

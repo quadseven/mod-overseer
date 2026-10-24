@@ -3315,6 +3315,15 @@ constexpr uint32 DEATH_FLUSH_MS = 3000;
 // there is a cohort's worth of rows to look at.
 constexpr uint32 DEATH_RETENTION_DAYS = 90;
 
+// How far back the death danger memory looks when scoring zones and creature
+// entries from overseer_death. 24 hours matches the zone criterion; creature
+// pulls are scored from the same stream, so the same window serves both.
+constexpr int64 DEATH_DANGER_WINDOW_SECONDS = 86400;
+
+// How many levels above the party a creature must be for a death to count as
+// lethal when scoring a zone. Eight matches the zone criterion.
+constexpr uint32 DEATH_DANGER_LEVEL_GAP = 8;
+
 // HOW LONG AN ANSWERED PROBE IS KEPT. A kind 'probe' row is a read-only
 // question (auras, meter, a tool's probe) whose asker reads the answer back by
 // id within seconds of asking and never reads it again: nothing selects a
@@ -8518,6 +8527,20 @@ public:
             FlushDeaths();
             FlushLevels();
             SweepDeathHits();
+            // Refresh the death danger memory from overseer_death: score the
+            // deaths in the window and log what zones and entries are above
+            // threshold, so travel routing and creature pulls can act on them.
+            for (auto const& entry : ObjectAccessor::GetPlayers())
+            {
+                if (Player* const watcher = entry.second)
+                {
+                    if (watcher->IsInWorld() && OnRoster(watcher->GetName()))
+                    {
+                        ReportDeathDanger(watcher, std::time(nullptr),
+                                          DEATH_DANGER_WINDOW_SECONDS, DEATH_DANGER_LEVEL_GAP);
+                    }
+                }
+            }
         }
         if (_sweepTimer >= CHAT_SWEEP_MS)
         {
@@ -15717,6 +15740,98 @@ private:
             return std::string();
 
         return result->Fetch()[0].Get<std::string>();
+    }
+
+    // Read `overseer_death` for deaths inside `windowSeconds` and turn each
+    // row into a DeathRecord. The table may not exist on a world that has not
+    // run the migration - a null result degrades to an empty vector, which is
+    // the safe direction: nothing is learned and nothing is unlearned.
+    // `killerLevel` comes from creature_template.maxlevel; when a death has no
+    // creature killer the join misses and killerLevel stays 0, which is the
+    // honest "not known" sentinel.
+    std::vector<OverseerDecisions::DeathRecord> ReadDeathRecords(int64 windowSeconds)
+    {
+        if (windowSeconds <= 0)
+            return {};
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT d.level, d.zone, d.killer_type, d.killer_entry, "
+            "COALESCE(ct.maxlevel, 0), UNIX_TIMESTAMP(d.created_at) "
+            "FROM overseer_death d "
+            "LEFT JOIN creature_template ct ON d.killer_entry = ct.entry "
+            "AND d.killer_type = 'creature' "
+            "WHERE d.created_at >= NOW() - INTERVAL {} SECOND",
+            windowSeconds);
+        if (!result)
+            return {};
+        std::vector<OverseerDecisions::DeathRecord> deaths;
+        do
+        {
+            Field const* const f = result->Fetch();
+            OverseerDecisions::DeathRecord d;
+            d.level = static_cast<uint32_t>(f[0].Get<uint32>());
+            d.zone = static_cast<uint32_t>(f[1].Get<uint32>());
+            d.killerType = f[2].Get<std::string>();
+            d.killerEntry = static_cast<uint32_t>(f[3].Get<uint32>());
+            d.killerLevel = static_cast<uint32_t>(f[4].Get<uint32>());
+            d.createdAt = static_cast<std::time_t>(f[5].Get<uint64>());
+            deaths.push_back(d);
+        } while (result->NextRow());
+        return deaths;
+    }
+
+    // The youngest level in `who`'s group, or `who`'s own level when alone.
+    // The zone rule serves the youngest member: the ground that kills a level
+    // 21 healer kills the party's ability to heal, whatever the leader's level.
+    uint32_t YoungestPartyLevel(Player* who)
+    {
+        if (!who)
+            return 0;
+        uint32_t youngest = who->GetLevel();
+        if (Group* const group = who->GetGroup())
+        {
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+            {
+                if (Player* const member = ref->GetSource())
+                    youngest = std::min(youngest, static_cast<uint32_t>(member->GetLevel()));
+            }
+        }
+        return youngest;
+    }
+
+    // Read `overseer_death`, score zone and creature danger from the deaths in
+    // the window, and log what was learned. Called on the death flush timer so
+    // the danger memory is refreshed without a poll of its own.
+    void ReportDeathDanger(Player* who, std::time_t now, int64 windowSeconds, uint32_t levelGap)
+    {
+        if (!who || windowSeconds <= 0)
+            return;
+        uint32_t const partyLevel = YoungestPartyLevel(who);
+        std::vector<OverseerDecisions::DeathRecord> const deaths = ReadDeathRecords(windowSeconds);
+        if (deaths.empty())
+            return;
+        std::vector<OverseerDecisions::ZoneDanger> const zones =
+            OverseerDecisions::ScoreZoneDanger(deaths, now, partyLevel, windowSeconds, levelGap);
+        std::vector<OverseerDecisions::CreatureDanger> const creatures =
+            OverseerDecisions::ScoreCreatureDanger(deaths, now, windowSeconds);
+        unsigned const dangerousZones = std::count_if(zones.begin(), zones.end(),
+            [](OverseerDecisions::ZoneDanger const& z)
+            { return OverseerDecisions::ZoneIsTooDangerous(z, 3u); });
+        unsigned const suppressedEntries = std::count_if(creatures.begin(), creatures.end(),
+            [](OverseerDecisions::CreatureDanger const& c)
+            { return OverseerDecisions::CreaturePullIsSuppressed(c, 2u); });
+        std::string dangerousZoneIds;
+        for (OverseerDecisions::ZoneDanger const& zone : zones)
+        {
+            if (!OverseerDecisions::ZoneIsTooDangerous(zone, 3u))
+                continue;
+            if (!dangerousZoneIds.empty())
+                dangerousZoneIds += ",";
+            dangerousZoneIds += std::to_string(zone.zone);
+        }
+        LOG_INFO("module.overseer",
+                 "overseer: death danger - {} death(s) in the last {}s, {} zone(s) above "
+                 "threshold [{}], {} entry(ies) with two or more kills",
+                 deaths.size(), windowSeconds, dangerousZones, dangerousZoneIds, suppressedEntries);
     }
 
     std::map<std::string, ProfessionPlan> LoadProfessionPlans()
