@@ -23940,4 +23940,43 @@ LockpickErrandStep DecideLockpickErrand(bool hasTarget, bool inReach,
     return LockpickErrandStep::Cast;
 }
 
+OrderResolution ResolveOrderName(std::string const& kind, std::string const& typed,
+                                 std::vector<OrderCandidate> const& matches)
+{
+    std::vector<OrderCandidate> pool;
+    std::string const want = LowerAscii(typed);
+    for (OrderCandidate const& match : matches)
+        if (LowerAscii(match.name) == want)
+            pool.push_back(match);
+    if (pool.empty())
+        pool = matches;
+
+    OrderResolution out;
+    if (pool.size() == 1)
+    {
+        out.accepted = true;
+        out.id = pool[0].id;
+        return out;
+    }
+    if (pool.empty())
+    {
+        out.question = "I know no " + kind + " called '" + typed + "'. Which did you mean?";
+        return out;
+    }
+    std::string ids;
+    for (OrderCandidate const& match : pool)
+        ids += (ids.empty() ? "" : ", ") + std::to_string(match.id);
+    out.question = "More than one " + kind + " is called '" + typed + "': " + ids + ". Which one?";
+    return out;
+}
+
+std::string FormatOrderReply(std::uint64_t orderId,
+                             std::vector<std::pair<std::string, std::string>> const& resolved)
+{
+    std::string list;
+    for (auto const& entry : resolved)
+        list += (list.empty() ? "" : ", ") + entry.first + " " + entry.second;
+    return "Order " + std::to_string(orderId) + " written: " + list + ".";
+}
+
 }  // namespace OverseerDecisions

@@ -53,6 +53,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace OverseerDecisions
@@ -26334,6 +26335,34 @@ enum class LockpickErrandStep : std::uint8_t
 
 LockpickErrandStep DecideLockpickErrand(bool hasTarget, bool inReach,
                                         bool inCombat, bool moving);
+
+// A Discord order names an item, a map or a member in words; the bridge looks
+// the words up and hands the matching rows here (mod-overseer#150).
+struct OrderCandidate
+{
+    std::uint32_t id{0};
+    std::string name;
+};
+
+// accepted is true only for exactly one match; then `id` is it. Otherwise the
+// order writes no row and `question` is what the bridge says in Discord.
+struct OrderResolution
+{
+    bool accepted{false};
+    std::uint32_t id{0};
+    std::string question;
+};
+
+// One name to one id. A case-blind exact match beats a partial one; one match
+// is an id; none or several is a question naming the kind (and the ids, when
+// several) and never a guess.
+OrderResolution ResolveOrderName(std::string const& kind, std::string const& typed,
+                                 std::vector<OrderCandidate> const& matches);
+
+// The Discord reply to an accepted order: the audit row's id and each resolved
+// (kind, value) pair, in the order given.
+std::string FormatOrderReply(std::uint64_t orderId,
+                             std::vector<std::pair<std::string, std::string>> const& resolved);
 
 }  // namespace OverseerDecisions
 
