@@ -8538,7 +8538,6 @@ public:
                     {
                         ReportDeathDanger(watcher, std::time(nullptr),
                                           DEATH_DANGER_WINDOW_SECONDS, DEATH_DANGER_LEVEL_GAP);
-                        break;
                     }
                 }
             }

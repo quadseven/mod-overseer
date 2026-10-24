@@ -166,7 +166,7 @@ void ThreeLethalDeathsInADayRouteTheZoneAround()
 
     CheckInt("zone 46 is scored", scored.size(), 1);
     CheckUInt("three lethal deaths", scored[0].lethalDeaths, 3);
-    CheckUInt("score counts three", scored[0].score, 3);
+    CheckDouble("score counts three", scored[0].score, 3.0, 0.001);
     Check("zone 46 is too dangerous at threshold three",
           ZoneIsTooDangerous(scored[0], 3), true);
 }
