@@ -22327,6 +22327,25 @@ NamedRecipeStep PlanNamedRecipe(bool known, bool onTrainerList, bool canTeach, u
 // "not_sold", "too_poor" ... for the log line.
 char const* NamedRecipeStepWord(NamedRecipeStep step);
 
+// THE PROOF LINE FOR A BOUGHT RANK OR RECIPE (mod-overseer#1124).
+// Written only after the read-back shows the character now holds what it paid
+// for, never when a walk is planned and never on a refusal. One shape for the
+// rank, the recipe bought with it and the recipe the roster names, so a search
+// for "trainer_purchase" finds every purchase and one check pins the wording:
+//
+//   overseer: trainer_purchase member='<name>' kind=<rank|recipe>
+//       skill=<trade> (<id>) spell=<id> '<spell name>' max_skill=<n>
+//       paid_copper=<n>
+//
+// `max_skill` is the character's ceiling in that trade after the sale and
+// `paid_copper` is what the purse lost, so a free grant reads as 0 and cannot
+// pass for a purchase. The refusal words above (not_sold, too_poor ...) are the
+// other half of the same story; docs/training-proof-lines.md lists both.
+std::string TrainerPurchaseLine(std::string const& member, char const* kind,
+                                std::string const& skillName, uint32_t skillId,
+                                uint32_t spellId, std::string const& spellName,
+                                uint32_t maxSkill, uint64_t paidCopper);
+
 // "walk", "resting" ... for the log line.
 char const* TrainingStopStepWord(TrainingStopStep step);
 
