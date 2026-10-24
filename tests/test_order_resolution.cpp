@@ -83,6 +83,17 @@ void AnExactNameBeatsAPartialOne()
     CheckNum("exact id", r.id, 36);
 }
 
+void ALonePartialMatchIsAnIdButNoMatchIsNot()
+{
+    // "run Deadmines" must find the map named "The Deadmines".
+    OrderResolution r = ResolveOrderName("map", "deadmines", {{36, "The Deadmines"}});
+    CheckNum("lone partial writes", r.accepted, 1);
+    CheckNum("lone partial id", r.id, 36);
+
+    r = ResolveOrderName("item", "Sword of Nothing", {});
+    CheckNum("no match still writes nothing", r.accepted, 0);
+}
+
 void TheReplyEchoesEveryResolvedId()
 {
     std::string reply = FormatOrderReply(
@@ -93,6 +104,12 @@ void TheReplyEchoesEveryResolvedId()
 void TheAuditMigrationRecordsWhoWhatAndRows()
 {
     std::ifstream in("data/sql/characters/base/2026_10_24_00_overseer_order.sql");
+    if (!in.is_open())
+    {
+        std::printf("FAIL migration file cannot be opened\n");
+        ++failures;
+        return;
+    }
     std::stringstream ss;
     ss << in.rdbuf();
     std::string sql = ss.str();
@@ -114,6 +131,7 @@ int main()
     AnUnknownNameAsksAndWritesNothing();
     TwoMatchesAskWhichAndNameBothIds();
     AnExactNameBeatsAPartialOne();
+    ALonePartialMatchIsAnIdButNoMatchIsNot();
     TheReplyEchoesEveryResolvedId();
     TheAuditMigrationRecordsWhoWhatAndRows();
     if (failures)
