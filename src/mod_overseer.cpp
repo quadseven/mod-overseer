@@ -324,6 +324,7 @@
 #include <atomic>
 #include <bitset>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -334,6 +335,7 @@
 // compiles only by accident of somebody else's include is a catch
 // that stops compiling when they tidy up.
 #include <exception>
+#include <future>
 #include <iomanip>
 #include <limits>
 #include <list>
@@ -13054,17 +13056,39 @@ private:
         }
     };
 
-    // Reads this module's bridge's pending orders, runs each through
-    // ProcessOrder and leaves the outcome on the inbox row for the bridge to
-    // post in its own channel. Overseer.Order.Bridge names the bridge this
-    // worldserver serves ('dev' or 'live'); empty serves none. A row is marked
-    // before the next poll can read it again (DirectExecute), so an order is
-    // never run twice.
+    // Starts the read of this module's bridge's pending orders. Overseer.Order.Bridge
+    // names the bridge this worldserver serves ('dev' or 'live'); empty serves
+    // none. The reads (an item_template name scan among them) block on the
+    // database, so they run on one worker thread and never on the world
+    // thread; at most one worker is alive, so a slow database skips polls
+    // instead of queueing them, and a worker's failure is logged here.
     void DriveOrders()
     {
+        if (_orderWorker.valid())
+        {
+            if (_orderWorker.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                return;
+            try
+            {
+                _orderWorker.get();
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("module.overseer", "overseer: the order worker stopped: {}", e.what());
+            }
+        }
         std::string const bridge = sConfigMgr->GetOption<std::string>("Overseer.Order.Bridge", "");
         if (bridge.empty())
             return;
+        _orderWorker = std::async(std::launch::async, [bridge] { RunOrders(bridge); });
+    }
+
+    // Runs each pending order through ProcessOrder and leaves the outcome on
+    // the inbox row for the bridge to post in its own channel. It touches only
+    // the databases, never the world. A row is marked before the next poll can
+    // read it again (DirectExecute), so an order is never run twice.
+    static void RunOrders(std::string const& bridge)
+    {
         QueryResult pending = CharacterDatabase.Query(
             "SELECT id, author, text, tool, args FROM overseer_order_inbox "
             "WHERE bridge = '{}' AND status = 'pending' ORDER BY id LIMIT 5",
@@ -78346,6 +78370,7 @@ private:
     // with gathering a party.
     uint32 _dungeonRunTimer = 0;
     uint32 _orderTimer = 0;
+    std::future<void> _orderWorker;
 
     // ---------------------------------------------------------------- travel --
     //
