@@ -23988,6 +23988,19 @@ std::string OrderArg(OrderCall const& call, char const* name)
     return it == call.args.end() ? std::string() : it->second;
 }
 
+// A whole number in [lo, hi] spelled with digits only, else false.
+bool WholeNumberArg(std::string const& text, unsigned lo, unsigned hi, std::string& out)
+{
+    if (text.empty() || text.size() > 6 ||
+        text.find_first_not_of("0123456789") != std::string::npos)
+        return false;
+    unsigned const n = static_cast<unsigned>(std::stoul(text));
+    if (n < lo || n > hi)
+        return false;
+    out = std::to_string(n);
+    return true;
+}
+
 // Resolves one named argument; on a question, copies it into plan and says so.
 bool ResolveInto(OrderPlan& plan, char const* kind, std::string const& typed,
                  std::vector<OrderCandidate> const& pool, std::string& value)
@@ -24017,12 +24030,18 @@ OrderPlan PlanCampaign(OrderCall const& call, OrderLookups const& look)
         plan.question = "A campaign needs a goal I can run: only 'item' is one. What is the goal?";
         return plan;
     }
+    std::string runs;
     if (!ResolveInto(plan, "map", OrderArg(call, "map"), look.maps, map) ||
         !ResolveInto(plan, "item", OrderArg(call, "item"), look.items, item))
         return plan;
+    if (!WholeNumberArg(OrderArg(call, "runs"), 1, 1000, runs))
+    {
+        plan.question = "How many runs? Give a whole number from 1 to 1000.";
+        return plan;
+    }
     plan.rows.push_back({"overseer_dungeon_campaign", "map=" + map + ",goal_item=" + item,
                          {{"map", map}, {"goal_kind", kind}, {"goal_item", item},
-                          {"runs_wanted", OrderArg(call, "runs")}}});
+                          {"runs_wanted", runs}}});
     plan.accepted = true;
     return plan;
 }
@@ -24044,7 +24063,12 @@ OrderPlan PlanLevelGoal(OrderCall const& call, OrderLookups const& look)
     std::string member;
     if (!ResolveInto(plan, "member", OrderArg(call, "member"), look.members, member))
         return plan;
-    std::string const level = OrderArg(call, "level");
+    std::string level;
+    if (!WholeNumberArg(OrderArg(call, "level"), 1, 80, level))
+    {
+        plan.question = "What level? Give a whole number from 1 to 80.";
+        return plan;
+    }
     plan.resolved.emplace_back("level", level);
     plan.rows.push_back({"overseer_level_goal", "member=" + member,
                          {{"member", member}, {"level", level}}});

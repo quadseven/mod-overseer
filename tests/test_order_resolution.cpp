@@ -200,6 +200,29 @@ void AnUnknownItemAsksAndWritesNoRow()
     CheckNum("unknown tool not accepted", plan.accepted, 0);
 }
 
+void ANumberTheModelGotWrongAsksAndWritesNoRow()
+{
+    OrderLookups look;
+    look.maps = {{36, "The Deadmines"}};
+    look.items = {{2873, "Cruel Barb"}};
+    look.members = {{4101, "Bork"}};
+    for (char const* runs : {"", "0", "-3", "30x", "abc", "100000"})
+    {
+        OrderPlan plan = PlanOrder({"start_campaign", {{"map", "Deadmines"}, {"goal_kind", "item"},
+                                                       {"item", "Cruel Barb"}, {"runs", runs}}}, look);
+        CheckNum("bad runs writes no row", plan.rows.size(), 0);
+        CheckStr("bad runs question", plan.question,
+                 "How many runs? Give a whole number from 1 to 1000.");
+    }
+    for (char const* level : {"", "0", "81", "4o", "-1"})
+    {
+        OrderPlan plan = PlanOrder({"set_level_target", {{"member", "Bork"}, {"level", level}}}, look);
+        CheckNum("bad level writes no row", plan.rows.size(), 0);
+        CheckStr("bad level question", plan.question,
+                 "What level? Give a whole number from 1 to 80.");
+    }
+}
+
 void TheRowsWrittenColumnNamesEveryRow()
 {
     OrderLookups look;
@@ -226,6 +249,7 @@ int main()
     FarmWritesAnAim();
     GoLevelWritesALevelGoalForTheMember();
     AnUnknownItemAsksAndWritesNoRow();
+    ANumberTheModelGotWrongAsksAndWritesNoRow();
     TheRowsWrittenColumnNamesEveryRow();
     if (failures)
     {
