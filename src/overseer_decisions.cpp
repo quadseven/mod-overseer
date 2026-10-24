@@ -23979,4 +23979,102 @@ std::string FormatOrderReply(std::uint64_t orderId,
     return "Order " + std::to_string(orderId) + " written: " + list + ".";
 }
 
+namespace
+{
+
+std::string OrderArg(OrderCall const& call, char const* name)
+{
+    auto it = call.args.find(name);
+    return it == call.args.end() ? std::string() : it->second;
+}
+
+// Resolves one named argument; on a question, copies it into plan and says so.
+bool ResolveInto(OrderPlan& plan, char const* kind, std::string const& typed,
+                 std::vector<OrderCandidate> const& pool, std::string& value)
+{
+    OrderResolution r = ResolveOrderName(kind, typed, pool);
+    if (!r.accepted)
+    {
+        plan.question = r.question;
+        return false;
+    }
+    value = std::to_string(r.id);
+    if (std::string(kind) == "member")
+        for (OrderCandidate const& c : pool)
+            if (c.id == r.id)
+                value = c.name;
+    plan.resolved.emplace_back(kind, value);
+    return true;
+}
+
+OrderPlan PlanCampaign(OrderCall const& call, OrderLookups const& look)
+{
+    OrderPlan plan;
+    std::string map, item;
+    std::string const kind = OrderArg(call, "goal_kind");
+    if (kind != "item")
+    {
+        plan.question = "A campaign needs a goal I can run: only 'item' is one. What is the goal?";
+        return plan;
+    }
+    if (!ResolveInto(plan, "map", OrderArg(call, "map"), look.maps, map) ||
+        !ResolveInto(plan, "item", OrderArg(call, "item"), look.items, item))
+        return plan;
+    plan.rows.push_back({"overseer_dungeon_campaign", "map=" + map + ",goal_item=" + item,
+                         {{"map", map}, {"goal_kind", kind}, {"goal_item", item},
+                          {"runs_wanted", OrderArg(call, "runs")}}});
+    plan.accepted = true;
+    return plan;
+}
+
+OrderPlan PlanAim(OrderCall const& call, OrderLookups const& look)
+{
+    OrderPlan plan;
+    std::string item;
+    if (!ResolveInto(plan, "item", OrderArg(call, "item"), look.items, item))
+        return plan;
+    plan.rows.push_back({"overseer_aim", "item=" + item, {{"item", item}}});
+    plan.accepted = true;
+    return plan;
+}
+
+OrderPlan PlanLevelGoal(OrderCall const& call, OrderLookups const& look)
+{
+    OrderPlan plan;
+    std::string member;
+    if (!ResolveInto(plan, "member", OrderArg(call, "member"), look.members, member))
+        return plan;
+    std::string const level = OrderArg(call, "level");
+    plan.resolved.emplace_back("level", level);
+    plan.rows.push_back({"overseer_level_goal", "member=" + member,
+                         {{"member", member}, {"level", level}}});
+    plan.accepted = true;
+    return plan;
+}
+
+}  // namespace
+
+OrderPlan PlanOrder(OrderCall const& call, OrderLookups const& lookups)
+{
+    if (call.tool == "start_campaign")
+        return PlanCampaign(call, lookups);
+    if (call.tool == "set_aim" || call.tool == "farm_target")
+        return PlanAim(call, lookups);
+    if (call.tool == "set_level_target")
+        return PlanLevelGoal(call, lookups);
+    OrderPlan plan;
+    plan.question = "I cannot do '" + call.tool + "'. I can start a campaign, set an aim, "
+                    "farm a target or set a level target.";
+    return plan;
+}
+
+std::string FormatRowsWritten(std::vector<OrderRow> const& rows)
+{
+    std::string out = "[";
+    for (OrderRow const& row : rows)
+        out += std::string(out.size() > 1 ? "," : "") + "{\"table\":\"" + row.table +
+               "\",\"key\":\"" + row.key + "\"}";
+    return out + "]";
+}
+
 }  // namespace OverseerDecisions

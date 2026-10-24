@@ -20,6 +20,11 @@
 #include <vector>
 
 using OverseerDecisions::FormatOrderReply;
+using OverseerDecisions::FormatRowsWritten;
+using OverseerDecisions::OrderCall;
+using OverseerDecisions::OrderLookups;
+using OverseerDecisions::OrderPlan;
+using OverseerDecisions::PlanOrder;
 using OverseerDecisions::OrderCandidate;
 using OverseerDecisions::OrderResolution;
 using OverseerDecisions::ResolveOrderName;
@@ -123,6 +128,89 @@ void TheAuditMigrationRecordsWhoWhatAndRows()
     }
 }
 
+
+std::string Cell(OrderPlan const& plan, size_t row, std::string const& col)
+{
+    if (row >= plan.rows.size())
+        return "<no row>";
+    for (auto const& kv : plan.rows[row].columns)
+        if (kv.first == col)
+            return kv.second;
+    return "<no column>";
+}
+
+void RunDeadminesUntilItemDropsWritesOneCampaignRow()
+{
+    OrderCall call{"start_campaign", {{"map", "Deadmines"}, {"goal_kind", "item"},
+                                      {"item", "Cruel Barb"}, {"runs", "30"}}};
+    OrderLookups look;
+    look.maps = {{36, "The Deadmines"}};
+    look.items = {{2873, "Cruel Barb"}};
+    OrderPlan plan = PlanOrder(call, look);
+    CheckNum("campaign accepted", plan.accepted, 1);
+    CheckNum("campaign writes one row", plan.rows.size(), 1);
+    CheckStr("campaign table", plan.rows[0].table, "overseer_dungeon_campaign");
+    CheckStr("campaign map", Cell(plan, 0, "map"), "36");
+    CheckStr("campaign goal kind", Cell(plan, 0, "goal_kind"), "item");
+    CheckStr("campaign item", Cell(plan, 0, "goal_item"), "2873");
+    CheckStr("campaign runs", Cell(plan, 0, "runs_wanted"), "30");
+    CheckStr("reply echoes map and item ids",
+             FormatOrderReply(5, plan.resolved), "Order 5 written: map 36, item 2873.");
+}
+
+void FarmWritesAnAim()
+{
+    OrderLookups look;
+    look.items = {{2589, "Linen Cloth"}};
+    OrderPlan plan = PlanOrder({"farm_target", {{"item", "Linen Cloth"}}}, look);
+    CheckNum("farm accepted", plan.accepted, 1);
+    CheckNum("farm writes one row", plan.rows.size(), 1);
+    CheckStr("farm table", plan.rows[0].table, "overseer_aim");
+    CheckStr("farm item", Cell(plan, 0, "item"), "2589");
+}
+
+void GoLevelWritesALevelGoalForTheMember()
+{
+    OrderLookups look;
+    look.members = {{4101, "Bork"}};
+    OrderPlan plan = PlanOrder({"set_level_target", {{"member", "Bork"}, {"level", "40"}}}, look);
+    CheckNum("level accepted", plan.accepted, 1);
+    CheckStr("level table", plan.rows[0].table, "overseer_level_goal");
+    CheckStr("level member", Cell(plan, 0, "member"), "Bork");
+    CheckStr("level target", Cell(plan, 0, "level"), "40");
+    CheckStr("level reply", FormatOrderReply(6, plan.resolved), "Order 6 written: member Bork, level 40.");
+}
+
+void AnUnknownItemAsksAndWritesNoRow()
+{
+    OrderCall call{"start_campaign", {{"map", "Deadmines"}, {"goal_kind", "item"},
+                                      {"item", "Sword of Nothing"}, {"runs", "30"}}};
+    OrderLookups look;
+    look.maps = {{36, "The Deadmines"}};
+    OrderPlan plan = PlanOrder(call, look);
+    CheckNum("unknown item not accepted", plan.accepted, 0);
+    CheckNum("unknown item writes no row", plan.rows.size(), 0);
+    CheckStr("unknown item question", plan.question,
+             "I know no item called 'Sword of Nothing'. Which did you mean?");
+
+    look.members = {};
+    plan = PlanOrder({"set_level_target", {{"member", "Nobody"}, {"level", "40"}}}, look);
+    CheckNum("unknown member writes no row", plan.rows.size(), 0);
+    plan = PlanOrder({"bake_cake", {}}, look);
+    CheckNum("unknown tool not accepted", plan.accepted, 0);
+}
+
+void TheRowsWrittenColumnNamesEveryRow()
+{
+    OrderLookups look;
+    look.maps = {{36, "The Deadmines"}};
+    look.items = {{2873, "Cruel Barb"}};
+    OrderPlan plan = PlanOrder({"start_campaign", {{"map", "Deadmines"}, {"goal_kind", "item"},
+                                                   {"item", "Cruel Barb"}, {"runs", "30"}}}, look);
+    CheckStr("rows_written", FormatRowsWritten(plan.rows),
+             "[{\"table\":\"overseer_dungeon_campaign\",\"key\":\"map=36,goal_item=2873\"}]");
+}
+
 }  // namespace
 
 int main()
@@ -134,6 +222,11 @@ int main()
     ALonePartialMatchIsAnIdButNoMatchIsNot();
     TheReplyEchoesEveryResolvedId();
     TheAuditMigrationRecordsWhoWhatAndRows();
+    RunDeadminesUntilItemDropsWritesOneCampaignRow();
+    FarmWritesAnAim();
+    GoLevelWritesALevelGoalForTheMember();
+    AnUnknownItemAsksAndWritesNoRow();
+    TheRowsWrittenColumnNamesEveryRow();
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);

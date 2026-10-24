@@ -26364,6 +26364,46 @@ OrderResolution ResolveOrderName(std::string const& kind, std::string const& typ
 std::string FormatOrderReply(std::uint64_t orderId,
                              std::vector<std::pair<std::string, std::string>> const& resolved);
 
+// One tool call the LLM made, as the bridge hands it over: the tool's name and
+// its string arguments (mod-overseer#150). Tools: start_campaign (map,
+// goal_kind, item, runs), set_aim and farm_target (item), set_level_target
+// (member, level).
+struct OrderCall
+{
+    std::string tool;
+    std::map<std::string, std::string> args;
+};
+
+// What the bridge's lookups returned for the names in the call.
+struct OrderLookups
+{
+    std::vector<OrderCandidate> items;
+    std::vector<OrderCandidate> maps;
+    std::vector<OrderCandidate> members;
+};
+
+struct OrderRow
+{
+    std::string table;
+    std::string key;
+    std::vector<std::pair<std::string, std::string>> columns;
+};
+
+// accepted: `rows` are the only rows the bridge writes and `resolved` is what
+// the reply echoes. Not accepted: `question` is the whole outcome, no row.
+struct OrderPlan
+{
+    bool accepted{false};
+    std::vector<OrderRow> rows;
+    std::vector<std::pair<std::string, std::string>> resolved;
+    std::string question;
+};
+
+OrderPlan PlanOrder(OrderCall const& call, OrderLookups const& lookups);
+
+// The audit row's rows_written: a JSON array of {"table","key"}.
+std::string FormatRowsWritten(std::vector<OrderRow> const& rows);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
