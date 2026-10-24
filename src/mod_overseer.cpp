@@ -15580,6 +15580,11 @@ private:
                              "for {} copper of its own, at the trainer's price, not a grant",
                              bot->GetName(), recipe, spellId, SkillName(skill), skill,
                              npc->GetEntry(), paid);
+                    LOG_INFO("module.overseer", "{}",
+                             OverseerDecisions::TrainerPurchaseLine(
+                                 bot->GetName(), "recipe", SkillName(skill), skill, spellId,
+                                 recipe,
+                                 static_cast<uint32>(bot->GetPureMaxSkillValue(skill)), paid));
                     RecordEvent(bot, "learn", spellId, recipe,
                                 "bought this recipe from its trade's trainer, at the trainer's "
                                 "price");
@@ -16092,6 +16097,7 @@ private:
         // Read before the purchase too, so the read-back below has something
         // to compare against - see the comment on `succeeded`.
         uint32 const maxBefore = static_cast<uint32>(bot->GetPureMaxSkillValue(skill));
+        uint64 const purseBefore = bot->GetMoney();
 
         // natural-only: bought at a trainer in reach, which takes its price (TeachSpell).
         trainer->TeachSpell(npc, bot, spellId);  // Trainer.h:73
@@ -16127,6 +16133,17 @@ private:
                  name, alreadyHasSkill ? "RAISED THE CAP ON" : "LEARNED", skillName, skill,
                  static_cast<uint32>(bot->GetPureSkillValue(skill)),
                  static_cast<uint32>(bot->GetPureMaxSkillValue(skill)), npc->GetName());
+        {
+            // The proof line: success path only, after the read-back above.
+            uint64 const purseAfter = bot->GetMoney();
+            SpellInfo const* rankInfo = sSpellMgr->GetSpellInfo(spellId);
+            LOG_INFO("module.overseer", "{}",
+                     OverseerDecisions::TrainerPurchaseLine(
+                         name, "rank", skillName, skill, spellId,
+                         rankInfo ? std::string(rankInfo->SpellName[LOCALE_enUS]) : std::string(),
+                         static_cast<uint32>(bot->GetPureMaxSkillValue(skill)),
+                         purseBefore > purseAfter ? purseBefore - purseAfter : 0));
+        }
         RecordEvent(bot, "learn", skill, skillName,
                     alreadyHasSkill
                         ? "trained the next tier of this skill from a trainer it was sent to"
@@ -16182,6 +16199,7 @@ private:
             return true;
         }
 
+        uint64 const purseBefore = bot->GetMoney();
         // natural-only: bought at a trainer in reach, which takes its price (TeachSpell).
         trainer->TeachSpell(npc, bot, recipe);
         if (!bot->HasSpell(recipe))
@@ -16199,6 +16217,12 @@ private:
                  "overseer: '{}' bought the recipe '{}' ({}) the roster names from '{}' "
                  "(creature {}) for {} copper, at the trainer's price, not a grant",
                  name, recipeName, recipe, npc->GetName(), entry, cost);
+        LOG_INFO("module.overseer", "{}",
+                 OverseerDecisions::TrainerPurchaseLine(
+                     name, "recipe", SkillName(offered->ReqSkillLine), offered->ReqSkillLine,
+                     recipe, recipeName,
+                     static_cast<uint32>(bot->GetPureMaxSkillValue(offered->ReqSkillLine)),
+                     purseBefore > bot->GetMoney() ? purseBefore - bot->GetMoney() : 0));
         RecordEvent(bot, "learn", recipe, recipeName,
                     "bought the recipe the roster names from its trade's trainer");
         return true;

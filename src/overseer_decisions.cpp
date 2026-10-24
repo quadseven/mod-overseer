@@ -19269,6 +19269,17 @@ NamedRecipeStep PlanNamedRecipe(bool known, bool onTrainerList, bool canTeach, u
     return cost > purse ? NamedRecipeStep::TooPoor : NamedRecipeStep::Buy;
 }
 
+std::string TrainerPurchaseLine(std::string const& member, char const* kind,
+                                std::string const& skillName, uint32_t skillId,
+                                uint32_t spellId, std::string const& spellName,
+                                uint32_t maxSkill, uint64_t paidCopper)
+{
+    return "overseer: trainer_purchase member='" + member + "' kind=" + kind + " skill=" +
+           skillName + " (" + std::to_string(skillId) + ") spell=" + std::to_string(spellId) +
+           " '" + spellName + "' max_skill=" + std::to_string(maxSkill) +
+           " paid_copper=" + std::to_string(paidCopper);
+}
+
 char const* NamedRecipeStepWord(NamedRecipeStep step)
 {
     switch (step)
