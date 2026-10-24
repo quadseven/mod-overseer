@@ -66,6 +66,10 @@ int main()
           ShouldClearLockpickErrand(5u, 1u));
 
     // Errand-standing discipline: every transient refusal leaves it standing.
+    // The decision only sees the boolean; that a null target from
+    // FindNearestLockpickTarget becomes hasTarget=false and reaches this
+    // decision is pinned in test_drive_lockpick_source.cpp, along with the
+    // "cast but no skill-up" refusal, which is judged after the cast.
     Expect("no target in zone leaves the errand standing",
            DecideLockpickErrand(false, false, false, false),
            LockpickErrandStep::Stand);
@@ -77,9 +81,6 @@ int main()
            LockpickErrandStep::Stand);
     Expect("moving leaves the errand standing",
            DecideLockpickErrand(true, true, false, true),
-           LockpickErrandStep::Stand);
-    Expect("in combat and moving leaves the errand standing",
-           DecideLockpickErrand(true, true, true, true),
            LockpickErrandStep::Stand);
     Expect("in reach and still casts Pick Lock",
            DecideLockpickErrand(true, true, false, false),

@@ -45581,6 +45581,10 @@ private:
         uint32 jobWalks{0};
         uint32 jobFineSteps{0};
         bool jobSaidForeignWalk{false};
+        // THE MAP A TELDRASSIL CROSSING IS REALLY FOR (wow-overseer#1401): while
+        // the island's boat leg is under way this crossing is a ride to Auberdine
+        // on map 1, and this is the map the row asked for, crossed next.
+        uint32 thenMap{0};
         // A `ride-to-stop` ROW: a crossing between two stops of one map. The
         // point of the stop it rides to, and where the member stood when the
         // row started, which fixes the stop it boards at while the transport
@@ -46286,6 +46290,41 @@ private:
                  ev.startYards, memo.jobWalks, D::CROSS_BERTH_WALK_TRIES, why);
     }
 
+    // THE ISLAND'S BOAT IS DONE: the crossing goes on as the cross the row asked
+    // for, from the mainland, with every clock and memo of the first leg fresh
+    // (wow-overseer#1401). The row stays 'verifying' and is written at the end
+    // of the second leg.
+    void BeginSecondCrossingLeg(std::string const& name, LoneCrossing& memo, Player* p)
+    {
+        uint32 const then = memo.thenMap;
+        LOG_INFO("module.overseer",
+                 "overseer: cross-to-map {} - '{}' is ashore at Auberdine on map {}; the row's "
+                 "crossing to map {} goes on from here",
+                 memo.jobRow, name, p->GetMapId(), then);
+        CancelCrossBerthWalk(name, p, "the first leg of the crossing is over");
+        memo.thenMap = 0;
+        memo.rideSameMap = false;
+        memo.crossingOriginMap = p->GetMapId();
+        memo.crossingDestinationMap = then;
+        memo.crossingRouteEntry = 0;
+        memo.crossingTransportName.clear();
+        memo.crossingMooringKnown = false;
+        memo.crossingSwept = false;
+        memo.crossingBerthGuarded = false;
+        memo.crossingBerthGuardLevel = 0;
+        memo.crossingSince = 0;
+        memo.crossingSaid = 255;
+        memo.holdSaidAt = 0;
+        memo.jobStart = std::time(nullptr);
+        memo.jobSteps = 0;
+        memo.jobWalks = 0;
+        memo.jobFineSteps = 0;
+        memo.jobSaidForeignWalk = false;
+        memo.boardApproaches = 0;
+        memo.rideX = memo.rideY = memo.rideFromX = memo.rideFromY = 0.f;
+        _stepOffReleases.erase(name);
+    }
+
     // THE ROW. Gated on pure facts (OverseerDecisions::CrossGate), then handed
     // to the stranded member's crossing as a job; the row stays 'verifying' and
     // is written when the crossing ends (FinishCrossJob).
@@ -46307,6 +46346,14 @@ private:
         if (*request.error)
             return refuse(request.error);
 
+        // A MEMBER ON TELDRASSIL TAKES THE RUT'THERAN BOAT FIRST
+        // (wow-overseer#1401): the boat priced for the asked-for map would aim
+        // its berth walk across the sea. The row is carried out as a ride to the
+        // Auberdine stop, and the asked-for map is crossed from there.
+        D::IslandFirstLeg const island =
+            D::CrossIslandFirst(who->GetMapId(), who->GetZoneId(), request);
+        D::CrossRequest const& leg = island.leg;
+
         Map* const map = who->GetMap();
         D::CrossFacts facts;
         facts.enabled = CrossEnabled();
@@ -46316,12 +46363,12 @@ private:
         facts.inCombat = who->IsInCombat();
         facts.inInstance = map && map->Instanceable();
         facts.inFlight = who->IsInFlight();
-        facts.rideRequest = request.ride;
+        facts.rideRequest = leg.ride;
         facts.onTargetMap =
-            request.ride ? (who->GetMapId() == request.map &&
-                            who->GetExactDist2d(request.x, request.y) <=
+            leg.ride ? (who->GetMapId() == leg.map &&
+                            who->GetExactDist2d(leg.x, leg.y) <=
                                 D::RIDE_ALREADY_THERE_YARDS)
-                         : who->GetMapId() == request.map;
+                         : who->GetMapId() == leg.map;
         facts.alreadyCrossing = CrossingAlone(name) || IsCrossingAlone(name);
         {
             auto const& holds = HoldsInForce();
@@ -46340,39 +46387,44 @@ private:
             // A ride is on the member's own map, so a row naming another map has
             // no ride to price.
             facts.routeKnown =
-                (!request.ride || who->GetMapId() == request.map) &&
-                PriceCrossingTransports(who, who->GetMapId(), request.map,
-                                        request.ride ? request.x : 0.f,
-                                        request.ride ? request.y : 0.f, 0, serving, stops, priced,
-                                        request.ride, who->GetPositionX(),
+                (!leg.ride || who->GetMapId() == leg.map) &&
+                PriceCrossingTransports(who, who->GetMapId(), leg.map,
+                                        leg.ride ? leg.x : 0.f,
+                                        leg.ride ? leg.y : 0.f, 0, serving, stops, priced,
+                                        leg.ride, who->GetPositionX(),
                                         who->GetPositionY()) >= 0;
             if (!facts.routeKnown)
                 LOG_INFO("module.overseer",
                          "overseer: cross-to-map {} for '{}' from map {} to map {} - priced: {}",
-                         id, name, who->GetMapId(), request.map, priced);
+                         id, name, who->GetMapId(), leg.map, priced);
         }
         if (char const* wall = D::CrossGate(facts); *wall)
             return refuse(wall);
 
         LoneCrossing started;
         started.crossingOriginMap = who->GetMapId();
-        started.crossingDestinationMap = request.map;
+        started.crossingDestinationMap = leg.map;
         started.jobRow = id;
         started.jobStart = std::time(nullptr);
         started.jobTouched = started.jobStart;
-        started.rideSameMap = request.ride;
-        started.rideX = request.x;
-        started.rideY = request.y;
+        started.rideSameMap = leg.ride;
+        started.thenMap = island.first ? request.map : 0;
+        started.rideX = leg.x;
+        started.rideY = leg.y;
         started.rideFromX = who->GetPositionX();
         started.rideFromY = who->GetPositionY();
         _loneCrossings[name] = started;
         LOG_INFO("module.overseer",
-                 "overseer: cross-to-map {} - '{}' sets out from map {} for {}{}; up to {}s",
+                 "overseer: cross-to-map {} - '{}' sets out from map {} for {}{}; up to {}s{}",
                  id, name, who->GetMapId(),
-                 request.ride ? std::string("the stop at (") + std::to_string(int(request.x)) +
-                                    ", " + std::to_string(int(request.y)) + ") on map "
+                 leg.ride ? std::string("the stop at (") + std::to_string(int(leg.x)) +
+                                    ", " + std::to_string(int(leg.y)) + ") on map "
                               : std::string("map "),
-                 request.map, CROSSING_BACKSTOP_SECONDS);
+                 leg.map, CROSSING_BACKSTOP_SECONDS,
+                 island.first ? std::string("; it is on Teldrassil, so the Rut'theran boat comes "
+                                            "first and map ") +
+                                    std::to_string(request.map) + " after it"
+                              : std::string());
         status = "verifying";
         return "";
     }
@@ -46646,6 +46698,11 @@ private:
                              "overseer: '{}' is ashore on map {} and off '{}' - its cross-to-map "
                              "crossing is over",
                              name, destination, boat);
+                    if (memo.thenMap)
+                    {
+                        BeginSecondCrossingLeg(name, memo, p);
+                        break;
+                    }
                     FinishCrossJob(name, OverseerDecisions::CrossEnd::Arrived, "", false);
                     break;
                 }
@@ -48561,6 +48618,10 @@ private:
         // Seats already given their pre-FORM repair attempt for this order.
         std::set<std::string> repairAttempted;
         std::set<std::string> repairWalkSaid;
+        // Raiders given a walk to the staging point in ASSEMBLE (#765), so the
+        // walk is released when the phase ends and said once per seat.
+        std::set<std::string> seatsWalking;
+        bool enterAwaySaid{false};
         unsigned durabilityBossesDone{std::numeric_limits<unsigned>::max()};
         unsigned repairHoldBossesDone{std::numeric_limits<unsigned>::max()};
         time_t repairHoldSince{0};
@@ -48776,6 +48837,9 @@ private:
     {
         if (!run.head.empty())
             _travelAims.Release(run.head);
+        for (std::string const& name : run.seatsWalking)
+            _travelAims.Release(name, "the raid order ended");
+        run.seatsWalking.clear();
         run.stoneRowSource.clear();
         run.stoneRowTarget.clear();
         run.stoneRowClicker.clear();
@@ -49436,6 +49500,77 @@ private:
         seen = now;
     }
 
+    // EVERY SEATED RAIDER WALKS TO THE DOOR, NOT ONLY THE HEAD (wow-overseer#765).
+    // FormRaidFromSeats puts every seat in the head's raid, and a raider on
+    // the same map follows the head only as far as it can see him; one on
+    // another continent stands idle. During ASSEMBLE each raider in the world
+    // that is not at the staging point is given the same walk the head has,
+    // through the ordinary travel aim (which carries the map, so the travel
+    // drive makes any crossing and far walk on its own legs and with its own
+    // purse). Released when ASSEMBLE ends, so nobody is walked to a door the
+    // raid has already gone through. Nothing here teleports or summons.
+    void DriveRaidSeatWalks(OverseerDecisions::FamilyRoster const& roster, RaidRunState& run,
+                            Group* group, Player* head,
+                            OverseerDecisions::RaidDoor const* door, bool walk)
+    {
+        if (!walk)
+        {
+            std::string away;
+            unsigned stillAway = 0;
+            for (std::string const& name : run.seatsWalking)
+            {
+                _travelAims.Release(name, "the raid left ASSEMBLE");
+                Player* member = ObjectAccessor::FindPlayerByName(name);
+                if (member && member->IsInWorld() &&
+                    !(member->GetMapId() == door->outsideMapId &&
+                      member->GetDistance(door->stageX, door->stageY, door->stageZ) <=
+                          OverseerDecisions::RAID_ASSEMBLE_YARDS) &&
+                    member->GetMapId() != door->insideMapId)
+                {
+                    ++stillAway;
+                    away += (away.empty() ? "" : ", ") + name;
+                }
+            }
+            if (stillAway && !run.enterAwaySaid)
+                LOG_INFO("module.overseer",
+                         "overseer: raid run for family '{}' goes in without {} raider(s) "
+                         "still away from the {} door: {}",
+                         roster.family, stillAway, door->name, away);
+            run.enterAwaySaid = true;
+            run.seatsWalking.clear();
+            return;
+        }
+        run.enterAwaySaid = false;
+        if (!group || !group->isRaidGroup())
+            return;
+        std::string const aim = OverseerDecisions::TravelAimAtPosition(
+            door->outsideMapId, door->stageX, door->stageY, door->stageZ);
+        if (aim.empty())
+            return;
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->GetSource();
+            if (!member || member == head || !member->IsInWorld() || !member->IsAlive())
+                continue;
+            std::string const name = member->GetName();
+            bool const atDoor = member->GetMapId() == door->outsideMapId &&
+                                member->GetDistance(door->stageX, door->stageY, door->stageZ) <=
+                                    OverseerDecisions::RAID_ASSEMBLE_YARDS;
+            if (atDoor || member->GetMapId() == door->insideMapId)
+            {
+                if (run.seatsWalking.erase(name))
+                    _travelAims.Release(name, "the raider reached the staging point");
+                continue;
+            }
+            _travelAims.Claim(name, aim, OverseerDecisions::TravelOwner::Run);
+            if (run.seatsWalking.insert(name).second)
+                LOG_INFO("module.overseer",
+                         "overseer: raid run for family '{}' is walking '{}' to the {} door "
+                         "from map {}",
+                         roster.family, name, door->name, member->GetMapId());
+        }
+    }
+
     void DriveRaidRun()
     {
         using OverseerDecisions::RaidRunPhase;
@@ -49611,6 +49746,8 @@ private:
                         else
                             ++facts.othersAssembled;
                     }
+                    else if (member->GetMapId() != door->outsideMapId)
+                        ++facts.awayOnOtherMap;
                 }
                 if (head && head->IsInWorld() && head->IsAlive() && head->IsSitState())
                     anyBusy = true;
@@ -50017,6 +50154,9 @@ private:
                 // A refusal is said by Claim itself, once per fence.
                 _travelAims.Claim(roster.leader, aim, OverseerDecisions::TravelOwner::Run);
             }
+
+            if (!run.seatsWalking.empty() || step.aimSeats)
+                DriveRaidSeatWalks(roster, run, group, head, door, step.aimSeats);
 
             if (step.knockMembers || step.knockHead)
             {

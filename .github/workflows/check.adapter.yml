@@ -125,21 +125,28 @@ name: The adapter compiles
 # patches/ are a real build dependency of it, and the pins live in another
 # workflow file. Running always is the version with no way to be wrong.
 #
-# THE PINS ARE READ OUT OF build.yml, NOT COPIED INTO HERE. Two workflows that
-# each carry their own copy of CORE_SHA drift the moment one is bumped and the
-# other is not, and the failure is silent in the worst possible way: the gate
-# goes on passing while compiling against a core that main no longer uses. So
-# build.yml stays the one place the pins are written and this job greps them out
-# of it, asserting it found a 40-character hex SHA for each. If that file's env
-# block is ever reformatted this job fails loudly on the next pull request rather
-# than quietly compiling against nothing.
+# THE PINS ARE READ OUT OF realm-pins.env, NOT COPIED INTO HERE (#574). That
+# file at this repository's root names the core, the mod-playerbots the realm
+# builds and every other module the realm image carries, each as a repository
+# and a full SHA. build.yml reads the same file and so does the deployment's
+# build, at the mod-overseer commit it pins. Two copies of CORE_SHA drift the
+# moment one is bumped and the other is not, and the failure is silent in the
+# worst way: the gate goes on passing while compiling against a tree the realm
+# no longer runs. #568's use-after-free (#572) got through exactly that gap,
+# because mod-junk-to-gold destroys a looted grey inside the same hook chain
+# and no job here ever cloned it. scripts/read-realm-pins.sh fails, naming the
+# file, when it is missing, a key is absent or a SHA is not 40 hex characters,
+# and there is no built-in fallback. The job clones every module the file
+# lists into the tree it configures. It still compiles one translation unit
+# with -fsyntax-only, so it cannot see a runtime ordering bug; that is the
+# runtime smoke job's (#1041).
 #
 # TWO LEGS: THE PINS AND THE UPSTREAM HEADS (wow-overseer#826). The `pins` leg
 # is everything above, unchanged, and keeps the check name `adapter`. The
 # `heads` leg compiles the same file against the core and mod-playerbots heads
 # the next roll moves to (infra#5655), so the adapter is proved against both
 # BEFORE the pins move, instead of the roll discovering the breakage. Its pins
-# are read out of build.yml the same way, from the HEADS_* entries, and the two
+# are read out of realm-pins.env the same way, from the HEADS_* entries, and the two
 # patches that stopped applying at those heads are taken from patches-heads/,
 # which replaces the same-named files in patches/ for that leg only. The leg is
 # not a required check; a red one means the adapter no longer builds against
@@ -198,35 +205,15 @@ jobs:
         with:
           path: mod-overseer
 
-      - name: Read the pins out of build.yml
+      - name: Read the pins out of realm-pins.env
         working-directory: mod-overseer
         run: |
           set -euo pipefail
-          wf=.github/workflows/build.yml
-          get_sha() {
-            grep -oE "^[[:space:]]+$1:[[:space:]]+[0-9a-f]{40}[[:space:]]*$" "$wf" \
-              | head -1 | awk '{print $2}'
-          }
-          get_url() {
-            grep -oE "^[[:space:]]+$1:[[:space:]]+https://[^[:space:]]+" "$wf" \
-              | head -1 | awk '{print $2}'
-          }
           # PIN_PREFIX is empty for the pins leg and HEADS_ for the heads leg.
-          CORE_SHA="$(get_sha "${PIN_PREFIX}CORE_SHA")"
-          MODULE_SHA="$(get_sha "${PIN_PREFIX}MODULE_SHA")"
-          CORE_REPO="$(get_url "${PIN_PREFIX}CORE_REPO")"
-          MODULE_REPO="$(get_url "${PIN_PREFIX}MODULE_REPO")"
-          for pair in "CORE_SHA=$CORE_SHA" "MODULE_SHA=$MODULE_SHA" \
-                      "CORE_REPO=$CORE_REPO" "MODULE_REPO=$MODULE_REPO"; do
-            name="${pair%%=*}"
-            value="${pair#*=}"
-            test -n "$value" || {
-              echo "::error::could not read $name out of $wf - this job compiles against the pins that workflow declares, and will not guess at them"
-              exit 1
-            }
-            echo "$name=$value" >> "$GITHUB_ENV"
-            echo "$name: $value"
-          done
+          # The script validates the whole file either way and fails, naming
+          # it, rather than guessing.
+          bash scripts/read-realm-pins.sh realm-pins.env "$PIN_PREFIX" > "$RUNNER_TEMP/realm-pins.out"
+          cat "$RUNNER_TEMP/realm-pins.out" | tee -a "$GITHUB_ENV"
 
       - name: Install what the core's own Dockerfile installs
         # The `build` stage of the pinned core's apps/docker/Dockerfile installs
@@ -295,11 +282,35 @@ jobs:
           git -C acore/modules/mod-playerbots checkout -q FETCH_HEAD
           rm -rf acore/modules/mod-playerbots/.git
 
+          # The realm image's other modules, each at the SHA the pins file
+          # names. CMake globs modules/*/, so each becomes part of the tree
+          # this job configures.
+          clone_module() {
+            name="$1"; repo="$2"; sha="$3"
+            dir="acore/modules/$name"
+            git init -q "$dir"
+            git -C "$dir" remote add origin "$repo"
+            git -C "$dir" fetch -q --depth 1 origin "$sha"
+            git -C "$dir" checkout -q FETCH_HEAD
+            rm -rf "$dir/.git"
+            echo "  $name @ ${sha:0:12}"
+          }
+          clone_module mod-ollama-chat   "$OLLAMA_CHAT_REPO"   "$OLLAMA_CHAT_SHA"
+          clone_module mod-dungeon-clear "$DUNGEON_CLEAR_REPO" "$DUNGEON_CLEAR_SHA"
+          clone_module mod-junk-to-gold  "$JUNK_TO_GOLD_REPO"  "$JUNK_TO_GOLD_SHA"
+          clone_module mod-ah-bot-plus   "$AH_BOT_REPO"        "$AH_BOT_SHA"
+
           cp -r mod-overseer acore/modules/mod-overseer
           rm -rf acore/modules/mod-overseer/.git
 
           test -f acore/apps/docker/Dockerfile
           test -d acore/modules/mod-playerbots/src
+          for m in mod-ollama-chat mod-dungeon-clear mod-junk-to-gold mod-ah-bot-plus; do
+            test -d "acore/modules/$m/src" || {
+              echo "::error::$m has no src/ - the clone did not land, so this job would compile a tree without it"
+              exit 1
+            }
+          done
           test -f acore/modules/mod-overseer/src/mod_overseer.cpp
           ls -1 acore/modules
 
@@ -321,6 +332,8 @@ jobs:
           # file that exists, so a renamed patch cannot end up applied twice.
           if [ "${{ matrix.leg }}" = heads ]; then
             for ported in patches-heads/mod-playerbots/*.patch; do
+              # No ported copies pending (the roll has landed): nothing to do.
+              [ -e "$ported" ] || continue
               target="patches/mod-playerbots/$(basename "$ported")"
               test -f "$target" || {
                 echo "::error::$ported has no same-named file in patches/mod-playerbots to replace"
@@ -437,7 +450,8 @@ jobs:
           {
             echo "### The adapter compiles (${{ matrix.leg }})"
             echo
-            echo "- pins: core \`$CORE_SHA\`, mod-playerbots \`$MODULE_SHA\`"
+            echo "- pins (realm-pins.env): core \`$CORE_SHA\`, mod-playerbots \`$MODULE_SHA\`"
+            echo "- also in the tree: mod-ollama-chat, mod-dungeon-clear, mod-junk-to-gold, mod-ah-bot-plus"
             echo "- one translation unit, \`-fsyntax-only\`, ${elapsed}s"
           } >> "$GITHUB_STEP_SUMMARY"
 

@@ -64,15 +64,15 @@ run_decisions() {
 }
 
 run_adapter() {
-  local core_repo="https://github.com/mod-playerbots/azerothcore-wotlk.git"
-  local module_repo="https://github.com/mod-playerbots/mod-playerbots.git"
-  local core_sha module_sha
-  core_sha="$(grep -oE '^[[:space:]]+CORE_SHA:[[:space:]]+[0-9a-f]{40}[[:space:]]*$' \
-    .github/workflows/build.yml | head -1 | awk '{print $2}')"
-  module_sha="$(grep -oE '^[[:space:]]+MODULE_SHA:[[:space:]]+[0-9a-f]{40}[[:space:]]*$' \
-    .github/workflows/build.yml | head -1 | awk '{print $2}')"
-  test -n "$core_sha" || { echo "could not read CORE_SHA out of build.yml" >&2; return 1; }
-  test -n "$module_sha" || { echo "could not read MODULE_SHA out of build.yml" >&2; return 1; }
+  local core_repo module_repo core_sha module_sha pins
+  # realm-pins.env is the one copy of the pins (#574); the reader fails,
+  # naming the file, rather than guessing.
+  pins="$(bash scripts/read-realm-pins.sh realm-pins.env)" || return 1
+  pin() { printf '%s\n' "$pins" | grep -E "^$1=" | head -1 | cut -d= -f2-; }
+  core_repo="$(pin CORE_REPO)"
+  module_repo="$(pin MODULE_REPO)"
+  core_sha="$(pin CORE_SHA)"
+  module_sha="$(pin MODULE_SHA)"
   echo "== adapter: pins core $core_sha, mod-playerbots $module_sha"
 
   for tool in clang++ clang cmake ninja jq; do
@@ -98,6 +98,17 @@ run_adapter() {
   git -C "$work/acore/modules/mod-playerbots" fetch -q --depth 1 origin "$module_sha"
   git -C "$work/acore/modules/mod-playerbots" checkout -q FETCH_HEAD
   rm -rf "$work/acore/modules/mod-playerbots/.git"
+
+  local name key
+  for name in mod-ollama-chat:OLLAMA_CHAT mod-dungeon-clear:DUNGEON_CLEAR \
+              mod-junk-to-gold:JUNK_TO_GOLD mod-ah-bot-plus:AH_BOT; do
+    key="${name#*:}"; name="${name%%:*}"
+    git init -q "$work/acore/modules/$name"
+    git -C "$work/acore/modules/$name" remote add origin "$(pin "${key}_REPO")"
+    git -C "$work/acore/modules/$name" fetch -q --depth 1 origin "$(pin "${key}_SHA")"
+    git -C "$work/acore/modules/$name" checkout -q FETCH_HEAD
+    rm -rf "$work/acore/modules/$name/.git"
+  done
 
   cp -r "$repo_root" "$work/acore/modules/mod-overseer"
   rm -rf "$work/acore/modules/mod-overseer/.git"

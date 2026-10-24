@@ -18156,6 +18156,12 @@ constexpr float RAID_ASSEMBLE_YARDS = 40.f;
 // wait the raid goes with whoever is there, and the log names who was not.
 constexpr long RAID_FORM_WAIT_SECONDS = 2 * 60;
 constexpr long RAID_ASSEMBLE_WAIT_SECONDS = 15 * 60;
+// A raider still on another continent is on a boat or a zeppelin with a long
+// road behind it, so ASSEMBLE waits this much longer while any raid member in
+// the world stands on a map that is neither the door's outside map nor its
+// inside map (wow-overseer#765). Bounded, so one lost seat cannot hold forty.
+constexpr long RAID_ASSEMBLE_CROSSING_EXTRA_SECONDS = 30 * 60;
+long RaidAssembleWaitSeconds(unsigned awayOnOtherMap);
 constexpr long RAID_ENTER_WAIT_SECONDS = 3 * 60;
 
 // -- inside: HOLD, CLEAR, RECOVER (#640) --------------------------------------
@@ -18245,6 +18251,9 @@ struct RaidRunFacts
     // The same count without the head, taken in the same pass, so ENTER's
     // "everyone else has crossed" never subtracts a head that was not counted.
     unsigned othersAssembled{0};
+    // Raid members in the world on a map that is neither the door's outside
+    // map nor its inside map: they still have a crossing to make (#765).
+    unsigned awayOnOtherMap{0};
     // Raid members on the inside map.
     unsigned inside{0};
     bool headAssembled{false};
@@ -18278,6 +18287,7 @@ struct RaidRunStep
     RaidRunPhase phase{RaidRunPhase::Idle};
     bool form{false};         // convert, invite and seat this poll
     bool aimStaging{false};   // the head walks to the staging point
+    bool aimSeats{false};     // every other raider in the world walks there too (#765)
     bool aimDoor{false};      // the head walks onto the door
     bool knockMembers{false}; // knock every member standing in the door
     bool knockHead{false};    // and the head, who goes last
@@ -25569,6 +25579,35 @@ struct CrossFacts
     unsigned crossingsUnderWay{0};
     unsigned atOnce{CROSS_AT_ONCE};
 };
+
+// TELDRASSIL IS AN ISLAND (wow-overseer#1401). It stands on map 1 with the rest
+// of Kalimdor, but the only road off it is the Rut'theran to Auberdine boat.
+// A `cross-to-map` row for a member on it was priced against the nearest
+// boat that names the destination map, the Menethil to Auberdine one, whose
+// berth lies across the water: the berth walk left the west shore, swam, and
+// the member drowned about once a minute. So the first leg of such a crossing
+// is the Rut'theran boat, as a same-map ride to the Auberdine stop, and the
+// asked-for map is crossed once the member is ashore there.
+constexpr std::uint32_t TELDRASSIL_MAP = 1;
+constexpr std::uint32_t TELDRASSIL_ZONE = 141;
+constexpr std::uint32_t DARNASSUS_ZONE = 1657;
+// The Auberdine stop, as a point of it (the flight master's, taxinodes node 26).
+constexpr float AUBERDINE_STOP_X = 6341.38f;
+constexpr float AUBERDINE_STOP_Y = 557.68f;
+
+// Whether this map and zone are on the island.
+bool OnTeldrassilIsland(std::uint32_t mapId, std::uint32_t zoneId);
+
+// The ride a `cross-to-map` row must take first: `first` is false for every
+// member off the island, for a ride row, and for a row naming the island's own
+// map, and the rest of the struct is then the request unchanged.
+struct IslandFirstLeg
+{
+    bool first{false};
+    CrossRequest leg;
+};
+IslandFirstLeg CrossIslandFirst(std::uint32_t mapId, std::uint32_t zoneId,
+                                CrossRequest const& request);
 
 // "" when the crossing may start; otherwise a CrossRefusal literal, the first
 // wall in the order the fields above are declared, the realm's cap last.

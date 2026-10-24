@@ -15417,6 +15417,12 @@ RaidRunStep StepRaidRunRecover(RaidRunPhase current, RaidRunFacts const& facts)
 }
 }  // namespace
 
+long RaidAssembleWaitSeconds(unsigned awayOnOtherMap)
+{
+    return RAID_ASSEMBLE_WAIT_SECONDS +
+           (awayOnOtherMap > 0 ? RAID_ASSEMBLE_CROSSING_EXTRA_SECONDS : 0);
+}
+
 RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
 {
     RaidRunStep step;
@@ -15479,6 +15485,7 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
             }
             step.phase = RaidRunPhase::Assemble;
             step.aimStaging = true;
+            step.aimSeats = true;
             step.form = facts.addable > 0;
             step.why = facts.addable > 0 ? "the raid is formed; seats that would not "
                                            "join are still asked while the head "
@@ -15499,7 +15506,7 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
             step.form = facts.addable > 0;
             if (facts.headAssembled &&
                 (facts.assembled >= facts.inWorld ||
-                 facts.heldSeconds >= RAID_ASSEMBLE_WAIT_SECONDS))
+                 facts.heldSeconds >= RaidAssembleWaitSeconds(facts.awayOnOtherMap)))
             {
                 step.phase = RaidRunPhase::Enter;
                 step.aimDoor = true;
@@ -15512,6 +15519,7 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
             }
             step.phase = RaidRunPhase::Assemble;
             step.aimStaging = true;
+            step.aimSeats = true;
             step.summonStragglers = facts.headAssembled &&
                                     facts.heldSeconds >= RAID_STONE_SUMMON_AFTER_SECONDS;
             step.why = !facts.headAssembled ? "the head is walking to the door"
@@ -22863,6 +22871,27 @@ CrossRequest ParseCrossRequest(std::string const& command)
     }
     out = CrossRequest{};
     out.error = CrossRefusal::Malformed;
+    return out;
+}
+
+bool OnTeldrassilIsland(std::uint32_t mapId, std::uint32_t zoneId)
+{
+    return mapId == TELDRASSIL_MAP && (zoneId == TELDRASSIL_ZONE || zoneId == DARNASSUS_ZONE);
+}
+
+IslandFirstLeg CrossIslandFirst(std::uint32_t mapId, std::uint32_t zoneId,
+                                CrossRequest const& request)
+{
+    IslandFirstLeg out;
+    out.leg = request;
+    if (*request.error || request.ride || request.map == TELDRASSIL_MAP ||
+        !OnTeldrassilIsland(mapId, zoneId))
+        return out;
+    out.first = true;
+    out.leg.map = TELDRASSIL_MAP;
+    out.leg.ride = true;
+    out.leg.x = AUBERDINE_STOP_X;
+    out.leg.y = AUBERDINE_STOP_Y;
     return out;
 }
 
