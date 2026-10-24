@@ -22358,6 +22358,30 @@ VendorManualVerdict DecideVendorManualPurchase(VendorManual const& manual,
                                                VendorStock const& vendorStock,
                                                uint64_t purse);
 
+// What the purchase itself came to. The core's buy handler returns nothing and
+// reports a refusal to a client the character does not have, so the adapter
+// reads the world instead: whether the vendor's list has a slot for the item,
+// whether the bags have room for one, and how many the character carries
+// before and after. Only a count that went up is a purchase; a manual already
+// in the bag proves nothing about this buy.
+struct ManualBuyOutcome
+{
+    enum class Kind
+    {
+        Bought,      // the bag gained the manual
+        NotListed,   // the vendor's list has no slot for the item
+        BagFull,     // no room in the bags for one more
+        CoreRefused, // the core was asked and the bag did not gain it
+    };
+    Kind kind{Kind::CoreRefused};
+    std::string reason; // named why; empty when kind == Bought
+};
+
+// Judge the purchase from what the adapter read. A full bag or an unlisted
+// item is named before the core is asked; past that, the counts decide.
+ManualBuyOutcome JudgeManualBuy(bool listed, bool bagHasRoom, uint32_t countBefore,
+                                uint32_t countAfter);
+
 // THE ONE RECIPE THE ROSTER NAMES (`craft_spell`), asked at the trainer it was
 // sent to. Held already is done; a spell this trainer does not list is the wrong
 // trainer; one it lists and the core will not teach (skill or level too low, the

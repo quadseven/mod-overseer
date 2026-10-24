@@ -16248,26 +16248,39 @@ private:
         return 0;
     }
 
-    // Open the vendor list the way a client does, then buy one manual at the
-    // vendor's real price. Returns whether the character now carries it.
-    bool BuyOneManual(Player* bot, WorldSession* session, Creature* vendor, uint32 itemEntry)
+    // The vendor-list slot that sells this item, or -1 when the list has none.
+    static int32 VendorSlotOf(Creature* vendor, uint32 itemEntry)
     {
-        int32 slot = -1;
-        if (VendorItemData const* items = vendor->GetVendorItems())
+        VendorItemData const* const items = vendor->GetVendorItems();
+        if (!items)
+            return -1;
+        uint32 const lineCount = items->GetItemCount();
+        for (uint32 i = 0; i < lineCount; ++i)
         {
-            uint32 const lineCount = items->GetItemCount();
-            for (uint32 i = 0; i < lineCount; ++i)
-            {
-                VendorItem const* const line = items->GetItem(i);
-                if (line && line->item == itemEntry)
-                {
-                    slot = static_cast<int32>(i);
-                    break;
-                }
-            }
+            VendorItem const* const line = items->GetItem(i);
+            if (line && line->item == itemEntry)
+                return static_cast<int32>(i);
         }
-        if (slot < 0)
-            return false;
+        return -1;
+    }
+
+    // Open the vendor list the way a client does, then buy one manual at the
+    // vendor's real price. The core's handlers return nothing and report a
+    // refusal to a client this character does not have, so the outcome is read
+    // from the world - the list slot, room in the bags, and the bag count before
+    // and after - and judged by OverseerDecisions::JudgeManualBuy, which names
+    // why when it is not a purchase.
+    OverseerDecisions::ManualBuyOutcome BuyOneManual(Player* bot, WorldSession* session,
+                                                     Creature* vendor, uint32 itemEntry)
+    {
+        int32 const slot = VendorSlotOf(vendor, itemEntry);
+        ItemPosCountVec dest;
+        bool const bagHasRoom =
+            bot->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemEntry, 1) == EQUIP_ERR_OK;
+        uint32 const countBefore = bot->GetItemCount(itemEntry, false);
+        if (slot < 0 || !bagHasRoom)
+            return OverseerDecisions::JudgeManualBuy(slot >= 0, bagHasRoom, countBefore,
+                                                     countBefore);
         {
             WorldPacket raw(CMSG_LIST_INVENTORY, 8);
             raw << vendor->GetGUID();
@@ -16286,7 +16299,8 @@ private:
             packet.Read();
             session->HandleBuyItemOpcode(packet);
         }
-        return bot->GetItemCount(itemEntry, false) > 0;
+        return OverseerDecisions::JudgeManualBuy(true, true, countBefore,
+                                                 bot->GetItemCount(itemEntry, false));
     }
 
     // Use one manual from the bag, through the core's own CMSG_USE_ITEM
@@ -16381,12 +16395,15 @@ private:
             return;
         }
 
-        if (!BuyOneManual(bot, session, vendor, manual.itemEntry))
+        OverseerDecisions::ManualBuyOutcome const bought =
+            BuyOneManual(bot, session, vendor, manual.itemEntry);
+        if (bought.kind != OverseerDecisions::ManualBuyOutcome::Kind::Bought)
         {
             LOG_WARN("module.overseer",
-                     "overseer: '{}' could not buy manual item {} from vendor {} - the core "
-                     "refused the purchase. Leaving the errand standing", name,
-                     manual.itemEntry, manual.vendorEntry);
+                     "overseer: '{}' could not buy manual item {} from vendor {} - {}. "
+                     "Clearing the errand", name, manual.itemEntry, manual.vendorEntry,
+                     bought.reason);
+            ClearBuyRecipeAim(name);
             return;
         }
 

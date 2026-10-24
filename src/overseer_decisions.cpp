@@ -19319,6 +19319,34 @@ VendorManualVerdict DecideVendorManualPurchase(VendorManual const& manual,
     return out;
 }
 
+ManualBuyOutcome JudgeManualBuy(bool listed, bool bagHasRoom, uint32_t countBefore,
+                                uint32_t countAfter)
+{
+    ManualBuyOutcome out;
+    if (!listed)
+    {
+        out.kind = ManualBuyOutcome::Kind::NotListed;
+        out.reason = "the item is not on the vendor's list";
+        return out;
+    }
+    if (!bagHasRoom)
+    {
+        out.kind = ManualBuyOutcome::Kind::BagFull;
+        out.reason = "no room in the bags for the manual";
+        return out;
+    }
+    if (countAfter > countBefore)
+    {
+        out.kind = ManualBuyOutcome::Kind::Bought;
+        return out;
+    }
+    out.kind = ManualBuyOutcome::Kind::CoreRefused;
+    out.reason = "the core refused the purchase: the character still carries " +
+                 std::to_string(countAfter) + " (carried " + std::to_string(countBefore) +
+                 " before)";
+    return out;
+}
+
 NamedRecipeStep PlanNamedRecipe(bool known, bool onTrainerList, bool canTeach, uint64_t cost,
                                 uint64_t purse)
 {

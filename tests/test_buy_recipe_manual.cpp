@@ -22,6 +22,8 @@
 #include <string>
 
 using OverseerDecisions::DecideVendorManualPurchase;
+using OverseerDecisions::JudgeManualBuy;
+using OverseerDecisions::ManualBuyOutcome;
 using OverseerDecisions::ParseVendorManual;
 using OverseerDecisions::VendorManual;
 using OverseerDecisions::VendorManualVerdict;
@@ -126,6 +128,37 @@ int main()
         Check("an empty stock is not sold", v.kind == VendorManualVerdict::Kind::NotSold);
     }
 
+    // Row 8: the core's buy handler returns nothing, so the read-back names
+    // the outcome. A manual the bag gained is bought.
+    {
+        ManualBuyOutcome const o = JudgeManualBuy(true, true, 0, 1);
+        Check("a manual the bag gained is bought",
+              o.kind == ManualBuyOutcome::Kind::Bought && o.reason.empty());
+    }
+    // Row 9: a manual already in the bag does not prove this buy worked.
+    {
+        ManualBuyOutcome const o = JudgeManualBuy(true, true, 1, 1);
+        Check("an unchanged count is a refusal even with one already carried",
+              o.kind == ManualBuyOutcome::Kind::CoreRefused);
+        Check("the core refusal names the counts",
+              o.reason.find("still carries 1 (carried 1 before)") != std::string::npos);
+    }
+    // Row 10: the vendor's list has no slot for the item.
+    {
+        ManualBuyOutcome const o = JudgeManualBuy(false, true, 0, 0);
+        Check("an item missing from the vendor list is not listed",
+              o.kind == ManualBuyOutcome::Kind::NotListed);
+        Check("the not-listed refusal names why",
+              o.reason.find("not on the vendor's list") != std::string::npos);
+    }
+    // Row 11: no room in the bags is named before the core is asked.
+    {
+        ManualBuyOutcome const o = JudgeManualBuy(true, false, 0, 0);
+        Check("a full bag is named", o.kind == ManualBuyOutcome::Kind::BagFull);
+        Check("the full-bag refusal names why",
+              o.reason.find("no room in the bags") != std::string::npos);
+    }
+
     // The drive exists in the module source and is wired to this decision.
     {
         std::string const src = Source();
@@ -138,6 +171,8 @@ int main()
               src.find("OverseerDecisions::DecideVendorManualPurchase(") != std::string::npos);
         Check("drive clears the column on a refusal, releasing the errand",
               src.find("ClearBuyRecipeAim(") != std::string::npos);
+        Check("drive judges the buy from the bag count before and after",
+              src.find("OverseerDecisions::JudgeManualBuy(") != std::string::npos);
     }
 
     if (failures)
