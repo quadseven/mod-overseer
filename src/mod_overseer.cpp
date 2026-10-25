@@ -7995,7 +7995,9 @@ void RestoreGuildRunFinderDungeons()
     QueryResult rows = CharacterDatabase.Query(
         "SELECT id, target_name, result FROM overseer_command WHERE kind = 'guild' "
         "AND command LIKE 'finder-run %' AND status = 'verifying' "
-        "AND created_at > NOW() - INTERVAL 3 HOUR");
+        "AND created_at > NOW() - INTERVAL {} SECOND",
+        OverseerDecisions::GUILD_RUN_RESTART_WINDOW_SECONDS);
+    // window: NOW() - INTERVAL {} HOUR (GUILD_RUN_RESTART_WINDOW_HOURS)
     if (!rows)
         return;
     do
@@ -43065,10 +43067,12 @@ private:
                     "TIMESTAMPDIFF(SECOND, updated_at, NOW()) FROM overseer_command "
                     "WHERE kind = 'guild' AND command LIKE 'finder-run %' "
                     "AND ((status IN ('claimed', 'verifying') AND claimed_by <> '{}' "
-                    "AND created_at > NOW() - INTERVAL 3 HOUR) "
+                    "AND created_at > NOW() - INTERVAL {} SECOND) "
                     "OR (status = 'error' AND (detail LIKE 'lost at the restart:%' "
-                    "OR detail LIKE 'restart:%') AND updated_at > NOW() - INTERVAL 3 HOUR))",
-                    g_runToken))
+                    "OR detail LIKE 'restart:%') AND updated_at > NOW() - INTERVAL {} SECOND))",
+                    g_runToken, OverseerDecisions::GUILD_RUN_RESTART_WINDOW_SECONDS,
+                    OverseerDecisions::GUILD_RUN_RESTART_WINDOW_SECONDS))
+    // window: NOW() - INTERVAL {} HOUR (GUILD_RUN_RESTART_WINDOW_HOURS)
                 do
                 {
                     Field* const fields = rows->Fetch();

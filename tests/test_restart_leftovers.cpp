@@ -201,7 +201,7 @@ void TheAdapterIsWired()
     Check("a waiting adoption's group is held", Has(strays, "for (GuildRunAdoption const& adoption : _guildRunAdoptions)"));
     Check("a row a roll already ended is read again",
           Has(strays, "OR (status = 'error' AND (detail LIKE 'lost at the restart:%' ") &&
-              Has(strays, "OR detail LIKE 'restart:%') AND updated_at > NOW() - INTERVAL 3 HOUR))"));
+              Has(strays, "OR detail LIKE 'restart:%') AND updated_at > NOW() - INTERVAL {} SECOND))"));
     Check("the take-out without the tank is said",
           Has(strays, "its finder group, read through '{}', is taken out"));
     Check("the tank alone no longer decides", !Has(strays, "Group* const group = tank ? tank->GetGroup() : nullptr;"));

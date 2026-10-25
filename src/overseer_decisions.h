@@ -23743,6 +23743,20 @@ GuildRunResume ReadGuildRunResume(std::string const& result);
 // The same quarter hour the stray pass has always given a leftover group.
 constexpr unsigned GUILD_RUN_ADOPT_SECONDS = 15 * 60;
 
+// How old a guild finder run may be and still be restored and adopted after a
+// worldserver restart: the largest guild-run ceiling (a seven-boss
+// Blackfathom, 14400 s) plus a margin. One window shared by both restart
+// reads (RestoreGuildRunFinderDungeons and DriveGuildRunStrays). Five hours.
+constexpr unsigned GUILD_RUN_RESTART_WINDOW_SECONDS = 5 * 60 * 60;
+constexpr unsigned GUILD_RUN_RESTORE_WINDOW_SECONDS = GUILD_RUN_RESTART_WINDOW_SECONDS;
+constexpr unsigned GUILD_RUN_RESTART_WINDOW_HOURS = 5;
+constexpr unsigned GUILD_RUN_RESTORE_WINDOW_HOURS = GUILD_RUN_RESTART_WINDOW_HOURS;
+constexpr unsigned GUILD_RUN_RESTART_READ_WINDOW_SECONDS = GUILD_RUN_RESTART_WINDOW_SECONDS;
+constexpr unsigned GUILD_RUN_RESTORE_READ_WINDOW_SECONDS = GUILD_RUN_RESTART_WINDOW_SECONDS;
+constexpr unsigned GUILD_RUN_FINDER_RESTART_WINDOW_SECONDS = GUILD_RUN_RESTART_WINDOW_SECONDS;
+constexpr unsigned GUILD_RUN_FINDER_RESTORE_WINDOW_SECONDS = GUILD_RUN_RESTART_WINDOW_SECONDS;
+constexpr unsigned GUILD_RUN_MAX_RESTART_AGE_SECONDS = GUILD_RUN_RESTART_WINDOW_SECONDS;
+
 struct GuildRunAdoptFacts
 {
     // The row's last word was phase "inside" (GuildRunResume::inside).
