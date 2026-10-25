@@ -354,6 +354,75 @@ void TravelAimAtPositionRefusesExtremelyLargeCoordinates()
     Check("empty aim is within column limit", aim.size() <= TRAVEL_AIM_MAX_CHARS, true);
 }
 
+// ============================================================================
+// SOURCE CONTRACT: TravelAimBook::Claim MUST REFUSE OVER-LONG AIMS. The column
+// travel_npc is VARCHAR(32) and MySQL strict mode refuses the row. The guard
+// in TravelAimBook::Claim (mod_overseer.cpp) checks target.size() > 32 and
+// returns false with a log line. This test pins that guard in the source.
+// ============================================================================
+
+void TravelAimBookClaimRefusesOverLongTargets()
+{
+    std::ifstream source("src/mod_overseer.cpp");
+    if (!source)
+    {
+        std::printf("FAIL cannot read src/mod_overseer.cpp (run from repo root)\n");
+        ++failures;
+        return;
+    }
+    std::string const text((std::istreambuf_iterator<char>(source)),
+                           std::istreambuf_iterator<char>());
+
+    // Find the TravelAimBook::Claim function
+    std::size_t const claimStart = text.find("bool Claim(std::string const& name, std::string const& target,");
+    if (claimStart == std::string::npos)
+    {
+        std::printf("FAIL cannot find TravelAimBook::Claim function\n");
+        ++failures;
+        return;
+    }
+
+    // Find the end of the Claim function (next bool/method or class closing)
+    std::size_t const claimEnd = text.find("bool ClaimedBy(", claimStart);
+    if (claimEnd == std::string::npos)
+    {
+        std::printf("FAIL cannot find end of TravelAimBook::Claim function\n");
+        ++failures;
+        return;
+    }
+
+    std::string const claimBody = text.substr(claimStart, claimEnd - claimStart);
+
+    // Verify the MAX_AIM_CHARS constant is 32
+    if (claimBody.find("constexpr std::size_t MAX_AIM_CHARS = 32;") == std::string::npos &&
+        claimBody.find("constexpr std::size_t MAX_AIM_CHARS = 32") == std::string::npos)
+    {
+        std::printf("FAIL TravelAimBook::Claim missing MAX_AIM_CHARS = 32 constant\n");
+        ++failures;
+    }
+
+    // Verify the length check: target.size() > MAX_AIM_CHARS
+    if (claimBody.find("target.size() > MAX_AIM_CHARS") == std::string::npos)
+    {
+        std::printf("FAIL TravelAimBook::Claim missing length check against MAX_AIM_CHARS\n");
+        ++failures;
+    }
+
+    // Verify the log line for refusal
+    if (claimBody.find("aim exceeds column length") == std::string::npos)
+    {
+        std::printf("FAIL TravelAimBook::Claim missing refusal log message\n");
+        ++failures;
+    }
+
+    // Verify it returns false on oversized target
+    if (claimBody.find("return false;") == std::string::npos)
+    {
+        std::printf("FAIL TravelAimBook::Claim missing return false for oversized target\n");
+        ++failures;
+    }
+}
+
 int main()
 {
     TheThreePollsThatEachDiscardedARoute();
@@ -369,6 +438,7 @@ int main()
     TravelAimAtPositionFitsNormalCoordinates();
     TravelAimAtPositionDropsPrecisionToFit();
     TravelAimAtPositionRefusesExtremelyLargeCoordinates();
+    TravelAimBookClaimRefusesOverLongTargets();
 
     if (failures)
     {
