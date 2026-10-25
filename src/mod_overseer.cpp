@@ -16729,10 +16729,10 @@ private:
         {
             if (!go || !go->isSpawned())
                 return false;
-            if (!OverseerDecisions::IsLockpickTargetEntry(go->GetEntry()))
-                return false;
-            return from->IsWithinDistInMap(go, range) &&
-                   go->GetZoneId() == from->GetZoneId();
+            return OverseerDecisions::IsLockpickTargetCandidate(go->GetEntry(),
+                                                                go->isSpawned(),
+                                                                go->GetZoneId() == from->GetZoneId(),
+                                                                from->IsWithinDistInMap(go, range));
         }
     };
 

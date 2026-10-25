@@ -26342,6 +26342,14 @@ std::size_t RecoveriesPerHour(std::vector<time_t> const& remedyTimes,
 // (the 1-100 open-world bracket, entries from the pinned world database).
 bool IsLockpickTargetEntry(std::uint32_t entry);
 
+// Whether a lockbox makes a lockpick target: a matching entry that is spawned,
+// in the bot's zone and within reach. The adapter feeds this three of its four
+// inputs - isSpawned, same zone, in range - and the entry match is the pure
+// predicate above, so this one is pure too and a test can exercise it without
+// a world, a bot, or a gameobject.
+bool IsLockpickTargetCandidate(std::uint32_t entry, bool spawned, bool sameZone,
+                               bool withinRange);
+
 // Whether a standing lockpick errand should be cleared because Lockpicking has
 // reached the level cap: the max achievable skill at a level is 5 * level.
 bool ShouldClearLockpickErrand(std::uint32_t skill, std::uint32_t level);
