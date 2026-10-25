@@ -6367,6 +6367,24 @@ public:
     bool Claim(std::string const& name, std::string const& target,
                OverseerDecisions::TravelOwner owner)
     {
+        // THE COLUMN IS THE OTHER HALF OF THE AIM'S CONTRACT, and it
+        // fails silently in non-strict mode: `overseer_roster.travel_npc` is
+        // VARCHAR(32) and MySQL truncates rather than refuses outside strict
+        // mode. A truncated aim is one the parser can never read back.
+        // Strict mode refuses the row, leaving followers stranded. Refuse
+        // oversized aims here with a clear log line, same pattern as the
+        // berth aim checks.
+        constexpr std::size_t MAX_AIM_CHARS = 32;
+        if (target.size() > MAX_AIM_CHARS)
+        {
+            LOG_ERROR("module.overseer",
+                      "overseer: travel aim for '{}' is {} characters and "
+                      "overseer_roster.travel_npc holds {}, refusing: {}",
+                      name, uint32(target.size()), uint32(MAX_AIM_CHARS), target);
+            _claimRefusalSaid[name] = "aim exceeds column length";
+            return false;
+        }
+
         auto const it = _state.find(name);
         if (it != _state.end() && it->second.target == target)
             return true;
@@ -23348,9 +23366,25 @@ private:
                 return false;
             }
         }
-        std::ostringstream aim;
-        aim << "at:" << leader->GetMapId() << ':' << ax << ',' << ay << ',' << az;
-        std::string const aimText = aim.str();
+        std::string const aimText = OverseerDecisions::TravelAimAtPosition(
+            leader->GetMapId(), ax, ay, az);
+        if (aimText.empty())
+        {
+            time_t const now = std::time(nullptr);
+            if (now - escort.badGroundSaid >= CATCH_UP_BAD_GROUND_SAID_SECONDS)
+            {
+                escort.badGroundSaid = now;
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' is not aimed at '{}' because the catch-up "
+                         "aim exceeds the roster column length (map {}, {:.1f}, {:.1f}, "
+                         "{:.1f}). The leader keeps following, and the aim is written "
+                         "again as soon as the position fits",
+                         name, leader->GetName(),
+                         static_cast<uint32>(leader->GetMapId()),
+                         ax, ay, az);
+            }
+            return false;
+        }
 
         // THE AIM IS WRITTEN BEFORE ANYTHING IS RECORDED ABOUT IT (#560).
         // TravelAimBook::Claim can refuse, when a fence protects an errand it

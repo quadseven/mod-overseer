@@ -310,6 +310,50 @@ void AnImpossibleReadingFallsToTheStricterRule()
 
 }  // namespace
 
+// ============================================================================
+// THE AIM STRING MUST FIT IN THE COLUMN. The roster column travel_npc is
+// VARCHAR(32) and MySQL strict mode refuses rows that exceed it rather than
+// truncating. A catch-up aim built from a leader's live position can produce
+// scientific notation for tiny values (e.g. -4.37e-06) which exceeds 32 chars.
+// TravelAimAtPosition handles this by dropping precision: 1 decimal → 0 decimals → empty.
+// ============================================================================
+
+using OverseerDecisions::TravelAimAtPosition;
+using OverseerDecisions::TRAVEL_AIM_MAX_CHARS;
+
+void TravelAimAtPositionFitsNormalCoordinates()
+{
+    // The exact case from the issue: bare ostringstream produces 33 chars,
+    // but TravelAimAtPosition drops to 1 decimal and fits in 25 chars.
+    std::string aim = TravelAimAtPosition(1, -4012.35f, -1234.56f, -0.0413553f);
+    Check("issue case produces non-empty aim", !aim.empty(), true);
+    Check("issue case aim fits in column", aim.size() <= TRAVEL_AIM_MAX_CHARS, true);
+    Check("issue case aim has correct prefix", aim.rfind("at:1:", 0) == 0, true);
+
+    // Normal coordinates that fit comfortably at one decimal
+    aim = TravelAimAtPosition(1, 1972.61f, -761.447f, 98.0276f);
+    Check("normal coordinates produce non-empty aim", !aim.empty(), true);
+    Check("normal aim fits in column", aim.size() <= TRAVEL_AIM_MAX_CHARS, true);
+}
+
+void TravelAimAtPositionDropsPrecisionToFit()
+{
+    // Coordinates that need zero decimals to fit (one decimal would be 34 chars)
+    // at:1000:-1234567,-6789012,-1234567 = 34 chars at 1 decimal, 31 at 0
+    std::string aim = TravelAimAtPosition(1000, -123456.f, -678901.f, -123456.f);
+    Check("medium-large coordinates produce non-empty aim", !aim.empty(), true);
+    Check("medium-large aim fits in column", aim.size() <= TRAVEL_AIM_MAX_CHARS, true);
+}
+
+void TravelAimAtPositionRefusesExtremelyLargeCoordinates()
+{
+    // Coordinates that exceed 32 chars even at zero decimals
+    // at:1000:-1234567,-6789012,-1234567 = 34 chars at 0 decimals > 32
+    std::string aim = TravelAimAtPosition(1000, -1234567.f, -6789012.f, -1234567.f);
+    Check("extremely large coordinates return empty", aim.empty(), true);
+    Check("empty aim is within column limit", aim.size() <= TRAVEL_AIM_MAX_CHARS, true);
+}
+
 int main()
 {
     TheThreePollsThatEachDiscardedARoute();
@@ -322,6 +366,9 @@ int main()
     ALeaderInTheAirIsNeverAimedAt();
     NoReadingEverAllowsAnAimStalerThanTheSurveysResolution();
     AnImpossibleReadingFallsToTheStricterRule();
+    TravelAimAtPositionFitsNormalCoordinates();
+    TravelAimAtPositionDropsPrecisionToFit();
+    TravelAimAtPositionRefusesExtremelyLargeCoordinates();
 
     if (failures)
     {
