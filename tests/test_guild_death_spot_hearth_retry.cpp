@@ -3,10 +3,9 @@
  * retried with the character held still, bounded; and a member whose hearth-out
  * failed is kept out of the zone it died in.
  *
- * MEASURED ON THE DEV REALM, 2026-10-24. Highlights, level 31, died 113 times
- * in 24 hours at the gate of Ironforge, killed by level 75 guards. Every cycle
- * the hearth-out was refused "character is moving", the hold placed by the
- * executor was never re-asserted, and the member walked back and died again.
+ * Reproduces the reported loop: a member killed by a much higher-level guard
+ * has hearth-out refused because it is moving, then walks back after the hold
+ * is lost. The decision retries are bounded and failure holds the member out.
  *
  * Compiled against src/overseer_decisions.cpp and nothing else, plus a read of
  * the module source for the wiring.
@@ -108,6 +107,12 @@ void TheAdapterIsWired()
           source.find("OverseerDecisions::DecideHearthOutRetry(") != std::string::npos, true);
     Check("the death spot keep-out decision is wired",
           source.find("OverseerDecisions::KeepOutOfDeathZone(") != std::string::npos, true);
+    Check("a failed death-spot hearth clears the outside walk",
+          source.find("bot->GetMotionMaster()->Clear();\n                bot->StopMoving();") !=
+              std::string::npos, true);
+    Check("a failed death-spot hearth holds the member still",
+          source.find("HoldStillAndReport(bot, name, \"hearth\", hold);") !=
+              std::string::npos, true);
 }
 
 }  // namespace

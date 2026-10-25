@@ -31036,12 +31036,25 @@ private:
         unsigned& tries = _guildDeathSpotTries[name];
         unsigned const boundTries = OverseerDecisions::EXIT_HEARTH_ATTEMPTS;
 
+        auto keepMemberOut = [&]()
+        {
+            bool const keepOut = OverseerDecisions::KeepOutOfDeathZone(
+                true, outmatchedHere, false);
+            if (keepOut)
+            {
+                bot->GetMotionMaster()->Clear();
+                bot->StopMoving();
+                CastHoldReport hold;
+                HoldStillAndReport(bot, name, "hearth", hold);
+            }
+            return keepOut;
+        };
+
         // The bound is spent: the hearth-out cannot succeed. Keep the member
         // out of the death zone and let the revival drive take it.
         if (tries >= boundTries)
         {
-            OverseerDecisions::KeepOutOfDeathZone(true, outmatchedHere, false);
-            return false;
+            return keepMemberOut();
         }
 
         char const* status = "error";
@@ -31080,8 +31093,7 @@ private:
                                                     boundTries);
         if (step == OverseerDecisions::HearthOutRetry::GiveUp)
         {
-            OverseerDecisions::KeepOutOfDeathZone(true, outmatchedHere, false);
-            return false;
+            return keepMemberOut();
         }
 
         // Retry: the hold was already placed by DoHearth. Say the refusal once
