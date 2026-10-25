@@ -1740,6 +1740,16 @@ ApproachQuarantineAction ApproachQuarantineDecision(
                : ApproachQuarantineAction::Clear;
 }
 
+std::string BacktickedPosition(float x, float y, float z)
+{
+    if (!FiniteReading(x) || !FiniteReading(y) || !FiniteReading(z))
+        return "`(unmeasured)`";
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(1) << "`(" << x << ", " << y << ", " << z
+        << ")`";
+    return out.str();
+}
+
 float ApproachDistance(ApproachGap const& gap)
 {
     if (!gap.measured || !FiniteReading(gap.horizontalYards) ||

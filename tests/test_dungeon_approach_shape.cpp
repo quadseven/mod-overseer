@@ -27,6 +27,7 @@ using OverseerDecisions::ApproachQuarantineDecision;
 using OverseerDecisions::ApproachQuarantineState;
 using OverseerDecisions::ApproachQuarantineAction;
 using OverseerDecisions::ApproachWhere;
+using OverseerDecisions::BacktickedPosition;
 using OverseerDecisions::DungeonRunBarrierBlockers;
 using OverseerDecisions::DungeonRunBarrierMet;
 using OverseerDecisions::DungeonRunMemberState;
@@ -167,6 +168,19 @@ void FailedApproachQuarantinesTheSameRimPosition()
                                  -680.f, -2045.f, 182.4f) ==
                   ApproachQuarantineAction::Block,
               true);
+}
+
+// THE REFUSAL LINE NAMES WHERE IT REFUSED (#396). The held and quarantine
+// warnings print the leader's position through this, so an operator can paste
+// the exact spot the gate turned down.
+void RefusedPositionIsBackticked()
+{
+    CheckText("refused position is backticked to one decimal",
+              BacktickedPosition(-705.f, -2045.f, 182.44f),
+              "`(-705.0, -2045.0, 182.4)`");
+    CheckText("non-finite position is not printed as a place",
+              BacktickedPosition(std::numeric_limits<float>::quiet_NaN(), 0.f, 0.f),
+              "`(unmeasured)`");
 }
 
 // THE ORDINARY CASE MUST STILL BE ORDINARY. A character standing at a staging
@@ -436,6 +450,7 @@ int main()
     TheDeadminesApproach();
     TheWailingCavernsApproach();
     FailedApproachQuarantinesTheSameRimPosition();
+    RefusedPositionIsBackticked();
     ArrivingIsStillArriving();
     ItAgreesWithTheStepBound();
     UnderneathIsAlsoOverhead();

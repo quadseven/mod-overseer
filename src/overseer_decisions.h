@@ -1750,6 +1750,11 @@ ApproachQuarantineAction ApproachQuarantineDecision(
     ApproachQuarantineState const& quarantine, ApproachShape shape,
     float leaderX, float leaderY, float leaderZ);
 
+// THE PLACE A REFUSAL NAMES, in backticks (#396). The held and quarantine
+// warnings print positions through this so an operator can copy the exact spot
+// the gate turned down; a non-finite reading says so instead of printing nan.
+std::string BacktickedPosition(float x, float y, float z);
+
 // HOW FAR AWAY IT REALLY IS - the three-dimensional distance, for the ratchet
 // that asks whether an approach is closing and for the line an operator reads.
 //
