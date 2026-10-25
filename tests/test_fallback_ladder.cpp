@@ -292,8 +292,13 @@ void TheFinderLastResortReasonSaysWhatIsTrue()
     std::string const noSummoner = FinderLastResortReason(f);
     Check("no summoner: never says the rung had its turn",
           noSummoner.find("had its turn") == std::string::npos);
-    Check("no summoner: says no qualifying summoner",
-          noSummoner.find("no qualifying summoner") != std::string::npos);
+    Check("no summoner: names the stone and no clicker",
+          noSummoner.find("the stone stands at the door but no summoner qualifies to click it") !=
+              std::string::npos);
+    Check("no summoner: is not the missing-stone phrase",
+          noSummoner.find("no summon was possible here") == std::string::npos);
+    Check("no summoner: still carries the summonNote",
+          noSummoner.find(f.summonNote) != std::string::npos);
 }
 
 SummonRungMember Member(char const* name, bool atStone, bool leader = false)

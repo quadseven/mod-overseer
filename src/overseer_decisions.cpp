@@ -19515,7 +19515,8 @@ std::string FinderLastResortReason(RunFailureFacts const& facts)
         return "no summon was possible here: " + facts.summonNote;
     // The stone stands at the door, but nobody in the family qualifies to
     // click it: the summon rung could never run here either.
-    return "no summon was possible here: " + facts.summonNote;
+    return "the stone stands at the door but no summoner qualifies to click it: " +
+           facts.summonNote;
 }
 
 bool FinderIsTheWayIn(bool finderIsDefault, bool familyCanQueue, std::uint32_t runNumber,
