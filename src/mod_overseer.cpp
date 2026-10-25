@@ -35380,6 +35380,7 @@ private:
     {
         using OverseerDecisions::ExitHearthStep;
 
+        DungeonPortal const* portal = FindDungeonPortal(episode.portal);
         std::vector<ExitHearthStep> steps;
         for (std::string const& name : members)
         {
@@ -35398,7 +35399,7 @@ private:
                 facts.pending = HearthPendingFor(name);
                 facts.attempts = episode.attempts[name];
                 facts.bindMap = bot->m_homebindMapId;
-                facts.doorMap = portal.outsideMapId;
+                facts.doorMap = portal ? portal->outsideMapId : episode.mapId;
             }
 
             ExitHearthStep const step = OverseerDecisions::ExitFailureHearthStep(facts);
