@@ -23926,6 +23926,12 @@ bool IsLockpickTargetEntry(std::uint32_t entry)
     return entry == 1660u || entry == 1733u;
 }
 
+bool IsLockpickTargetCandidate(std::uint32_t entry, bool spawned, bool sameZone,
+                               bool withinRange)
+{
+    return IsLockpickTargetEntry(entry) && spawned && sameZone && withinRange;
+}
+
 bool ShouldClearLockpickErrand(std::uint32_t skill, std::uint32_t level)
 {
     return skill >= 5u * level;
