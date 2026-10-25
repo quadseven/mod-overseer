@@ -35397,6 +35397,8 @@ private:
                 facts.moving = bot->isMoving();
                 facts.pending = HearthPendingFor(name);
                 facts.attempts = episode.attempts[name];
+                facts.bindMap = bot->m_homebindMapId;
+                facts.doorMap = portal.outsideMapId;
             }
 
             ExitHearthStep const step = OverseerDecisions::ExitFailureHearthStep(facts);
@@ -37386,6 +37388,8 @@ private:
                     facts.moving = bot->isMoving();
                     facts.pending = HearthPendingFor(name);
                     facts.attempts = episode.attempts[name];
+                    facts.bindMap = bot->m_homebindMapId;
+                    facts.doorMap = portal.outsideMapId;
                 }
                 way = OverseerDecisions::DecideEvacuationWay(
                     true, OverseerDecisions::ExitFailureHearthStep(facts));
@@ -39223,6 +39227,8 @@ private:
                 cast.moving = bot->isMoving();
                 cast.pending = HearthPendingFor(name);
                 cast.attempts = coord.hearthAttempts[name];
+                cast.bindMap = bot->m_homebindMapId;
+                cast.doorMap = inn.mapId;
             }
             OverseerDecisions::ExitHearthStep const castStep =
                 OverseerDecisions::ExitFailureHearthStep(cast);
@@ -44481,6 +44487,8 @@ private:
             cast.moving = bot->isMoving();
             cast.pending = HearthPendingFor(name);
             cast.attempts = coord.crossingHearthAttempts[name];
+            cast.bindMap = bot->m_homebindMapId;
+            cast.doorMap = route.berthMap;
             OverseerDecisions::ExitHearthStep const step =
                 OverseerDecisions::ExitFailureHearthStep(cast);
 
@@ -45853,6 +45861,8 @@ private:
                 cast.moving = p->isMoving();
                 cast.pending = facts.hearthInFlight;
                 cast.attempts = _strandedHearthTries[name];
+                cast.bindMap = bot->m_homebindMapId;
+                cast.doorMap = facts.leaderMap;
                 switch (OverseerDecisions::ExitFailureHearthStep(cast))
                 {
                     case OverseerDecisions::ExitHearthStep::Cast:

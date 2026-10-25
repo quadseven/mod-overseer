@@ -156,6 +156,27 @@ int main()
                   ExitFailureHearthStep(movingOnCooldown), ExitHearthStep::Impossible);
     }
 
+    // -- bind map checks --------------------------------------------------------
+    {
+        ExitHearthFacts boundDifferent = Stranded();
+        boundDifferent.bindMap = 1;  // different from door map 0
+        boundDifferent.doorMap = 0;
+        CheckStep("a member bound on a different map than the door does not cast",
+                  ExitFailureHearthStep(boundDifferent), ExitHearthStep::Impossible);
+        CheckText("and says the maps are different",
+                  ExitHearthImpossibleReason(boundDifferent), "bound on different map");
+    }
+
+    {
+        ExitHearthFacts boundSame = Stranded();
+        boundSame.bindMap = 0;  // same as door map 0
+        boundSame.doorMap = 0;
+        CheckStep("a member bound on the same map as the door still casts",
+                  ExitFailureHearthStep(boundSame), ExitHearthStep::Cast);
+        CheckText("and has no reason",
+                  ExitHearthImpossibleReason(boundSame), "");
+    }
+
     // -- the family ------------------------------------------------------------
     {
         // Ragefire: the leader inside, four outside.

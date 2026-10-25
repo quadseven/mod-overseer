@@ -18623,6 +18623,8 @@ char const* ExitHearthImpossibleReason(ExitHearthFacts const& facts, unsigned ma
         return "hearthstone on cooldown";
     if (facts.attempts >= maxAttempts)
         return "hearth attempts spent";
+    if (facts.bindMap != facts.doorMap)
+        return "bound on different map";
     return "";
 }
 

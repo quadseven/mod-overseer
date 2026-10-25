@@ -21247,6 +21247,8 @@ struct ExitHearthFacts
     bool moving{false};
     bool pending{false};
     unsigned attempts{0};
+    uint32_t bindMap{0};
+    uint32_t doorMap{0};
 };
 
 enum class ExitHearthStep
