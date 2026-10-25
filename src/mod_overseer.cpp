@@ -35234,6 +35234,7 @@ private:
         uint32 campaignId{0};
         uint32 runNumber{0};
         std::string portal;
+        uint32 outsideMapId{0};
         std::time_t since{0};
         std::map<std::string, unsigned> attempts;
         std::map<std::string, std::string> lastStep;
@@ -35376,7 +35377,7 @@ private:
     // hearth is in play, which is what holds adoption back.
     bool DriveExitHearths(std::string const& family, std::string const& leaderName,
                           std::vector<std::string> const& members, ExitHearthEpisode& episode,
-                          char const* phase)
+                          DungeonPortal const* portal, char const* phase)
     {
         using OverseerDecisions::ExitHearthStep;
 
@@ -35398,7 +35399,7 @@ private:
                 facts.pending = HearthPendingFor(name);
                 facts.attempts = episode.attempts[name];
                 facts.bindMap = bot->m_homebindMapId;
-                facts.doorMap = portal.outsideMapId;
+                facts.doorMap = portal ? portal->outsideMapId : 0;
             }
 
             ExitHearthStep const step = OverseerDecisions::ExitFailureHearthStep(facts);
@@ -37444,7 +37445,8 @@ private:
             episode.campaignId = coord.campaignId;
             episode.runNumber = coord.runNumber;
             episode.portal = coord.portalKeyword;
-            DriveExitHearths(family, leaderName, hearthers, episode, splitCopy ? "SPLIT" : "RESET");
+            episode.outsideMapId = portal.outsideMapId;
+            DriveExitHearths(family, leaderName, hearthers, episode, &portal, splitCopy ? "SPLIT" : "RESET");
         }
 
         // AND THE DOOR IS KNOCKED ON AT POLL RATE, NOT ONLY ON ARRIVAL, which
