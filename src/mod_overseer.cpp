@@ -31036,17 +31036,22 @@ private:
         unsigned& tries = _guildDeathSpotTries[name];
         unsigned const boundTries = OverseerDecisions::EXIT_HEARTH_ATTEMPTS;
 
+        // Clear any walk something outside this module put on the member and
+        // hold it still, so a hearth is not broken by movement.
+        auto holdStill = [&]()
+        {
+            bot->GetMotionMaster()->Clear();
+            bot->StopMoving();
+            CastHoldReport hold;
+            HoldStillAndReport(bot, name, "hearth", hold);
+        };
+
         auto keepMemberOut = [&]()
         {
             bool const keepOut = OverseerDecisions::KeepOutOfDeathZone(
                 true, outmatchedHere, false);
             if (keepOut)
-            {
-                bot->GetMotionMaster()->Clear();
-                bot->StopMoving();
-                CastHoldReport hold;
-                HoldStillAndReport(bot, name, "hearth", hold);
-            }
+                holdStill();
             return keepOut;
         };
 
@@ -31057,6 +31062,9 @@ private:
             return keepMemberOut();
         }
 
+        // The first hearth and every retry are driven with the member stopped:
+        // a cast driven while an outside walk moves the character is broken.
+        holdStill();
         char const* status = "error";
         std::string evidence;
         std::string const refusal = DoHearth(bot, "use", status, evidence, _pendingHearths, 0);

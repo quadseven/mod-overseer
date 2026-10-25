@@ -108,8 +108,20 @@ void TheAdapterIsWired()
     Check("the death spot keep-out decision is wired",
           source.find("OverseerDecisions::KeepOutOfDeathZone(") != std::string::npos, true);
     Check("a failed death-spot hearth clears the outside walk",
-          source.find("bot->GetMotionMaster()->Clear();\n                bot->StopMoving();") !=
+          source.find("bot->GetMotionMaster()->Clear();\n            bot->StopMoving();") !=
               std::string::npos, true);
+
+    // Every death-spot hearth, the first and each retry, is driven with the
+    // outside walk cleared and the member held still: a cast driven while
+    // something else keeps a walk on the character is broken by the movement.
+    std::size_t const spot = source.find("bool LeaveGuildDeathSpot(");
+    std::size_t const still = source.find("holdStill();\n", spot);
+    std::size_t const cast = source.find(
+        "DoHearth(bot, \"use\", status, evidence, _pendingHearths, 0);", spot);
+    Check("a death-spot hearth stops the member before it is driven",
+          spot != std::string::npos && still != std::string::npos &&
+              cast != std::string::npos && still < cast,
+          true);
     Check("a failed death-spot hearth holds the member still",
           source.find("HoldStillAndReport(bot, name, \"hearth\", hold);") !=
               std::string::npos, true);
