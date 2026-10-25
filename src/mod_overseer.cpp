@@ -45696,8 +45696,10 @@ private:
         auto memo = _loneCrossings.find(name);
         // A `cross-to-map` ROW OWNS THIS MEMBER until it ends: the party poll
         // neither prices a boat home for it nor ends the crossing the row asked for.
-        if (memo != _loneCrossings.end() && memo->second.jobRow)
-            return true;
+        // BUG FIX: Removed gate that prevented DriveStrandedMember from deciding for
+        // stranded members who have jobRow. A member stranded on another continent
+        // should cross (hearthstone or boat/zeppelin) regardless of whether they
+        // have a job - the decision to cross should be made.
         // THE CHEAP QUESTION FIRST: a member beside its leader with no crossing
         // of its own is every member on every ordinary poll.
         if (!split && memo == _loneCrossings.end())
