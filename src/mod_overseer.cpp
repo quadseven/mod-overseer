@@ -7997,7 +7997,7 @@ void RestoreGuildRunFinderDungeons()
         "AND command LIKE 'finder-run %' AND status = 'verifying' "
         "AND created_at > NOW() - INTERVAL {} SECOND",
         OverseerDecisions::GUILD_RUN_RESTART_WINDOW_SECONDS);
-    // window: NOW() - INTERVAL {} HOUR (GUILD_RUN_RESTART_WINDOW_HOURS)
+    // window: NOW() - INTERVAL {} SECOND (GUILD_RUN_RESTART_WINDOW_SECONDS)
     if (!rows)
         return;
     do
@@ -43072,7 +43072,7 @@ private:
                     "OR detail LIKE 'restart:%') AND updated_at > NOW() - INTERVAL {} SECOND))",
                     g_runToken, OverseerDecisions::GUILD_RUN_RESTART_WINDOW_SECONDS,
                     OverseerDecisions::GUILD_RUN_RESTART_WINDOW_SECONDS))
-    // window: NOW() - INTERVAL {} HOUR (GUILD_RUN_RESTART_WINDOW_HOURS)
+    // window: NOW() - INTERVAL {} SECOND (GUILD_RUN_RESTART_WINDOW_SECONDS)
                 do
                 {
                     Field* const fields = rows->Fetch();
