@@ -1728,6 +1728,28 @@ struct ApproachLimits
 
 ApproachShape ApproachShapeOf(ApproachGap const& gap, ApproachLimits const& limits);
 
+// The retry hold captured when a staging approach fails. The adapter stores
+// this state with the run coordinator; the transition itself stays pure so the
+// retry gate and its ten-yard release boundary can be tested without a world.
+struct ApproachQuarantineState
+{
+    bool active{false};
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+};
+
+enum class ApproachQuarantineAction : std::uint8_t
+{
+    Inactive,
+    Block,
+    Clear,
+};
+
+ApproachQuarantineAction ApproachQuarantineDecision(
+    ApproachQuarantineState const& quarantine, ApproachShape shape,
+    float leaderX, float leaderY, float leaderZ);
+
 // HOW FAR AWAY IT REALLY IS - the three-dimensional distance, for the ratchet
 // that asks whether an approach is closing and for the line an operator reads.
 //

@@ -52264,19 +52264,21 @@ private:
             // before the run exists is exactly the drift #220 is about.
             if (!finderWay)
             {
-                // QUARANTINE AFTER FAILED APPROACH (#396). If the coordinator
-                // has a quarantine position from a previous failed approach,
-                // check if the leader is still at or near that position. If so,
-                // refuse to open a new run. The quarantine is cleared when the
-                // leader reaches a walkable approach (ApproachShape != Overhead).
+                OverseerDecisions::ApproachRouteState scratch;
+                DungeonApproachAim const first = DungeonApproachAimFor(
+                    *portal, scratch, leader, stageX, stageY, stageZ);
+                OverseerDecisions::ApproachGap const gap = first.gap;
+                OverseerDecisions::ApproachShape const shape =
+                    OverseerDecisions::ApproachShapeOf(gap, DUNGEON_APPROACH_LIMITS);
                 if (coord.quarantined)
                 {
-                    float const dx = leader->GetPositionX() - coord.quarantineX;
-                    float const dy = leader->GetPositionY() - coord.quarantineY;
-                    float const dz = leader->GetPositionZ() - coord.quarantineZ;
-                    float const distSq = dx * dx + dy * dy + dz * dz;
-                    // Consider "at or near" as within 10 yards of the quarantined position
-                    if (distSq <= 100.0f) // 10^2 = 100
+                    OverseerDecisions::ApproachQuarantineState const quarantine{
+                        true, coord.quarantineX, coord.quarantineY, coord.quarantineZ};
+                    OverseerDecisions::ApproachQuarantineAction const action =
+                        OverseerDecisions::ApproachQuarantineDecision(
+                            quarantine, shape, leader->GetPositionX(),
+                            leader->GetPositionY(), leader->GetPositionZ());
+                    if (action == OverseerDecisions::ApproachQuarantineAction::Block)
                     {
                         LOG_WARN("module.overseer",
                                  "overseer: dungeon run QUARANTINED - leader '{}' at `{} {} {}` "
@@ -52287,30 +52289,20 @@ private:
                                  coord.quarantineX, coord.quarantineY, coord.quarantineZ);
                         return;
                     }
-                    else
-                    {
-                        // Leader has moved away from quarantined position, clear quarantine
-                        coord.quarantined = false;
-                        coord.quarantineX = 0.f;
-                        coord.quarantineY = 0.f;
-                        coord.quarantineZ = 0.f;
-                        coord.quarantineSince = 0;
-                    }
+                    coord.quarantined = false;
+                    coord.quarantineX = 0.f;
+                    coord.quarantineY = 0.f;
+                    coord.quarantineZ = 0.f;
+                    coord.quarantineSince = 0;
                 }
-
-                OverseerDecisions::ApproachRouteState scratch;
-                DungeonApproachAim const first = DungeonApproachAimFor(
-                    *portal, scratch, leader, stageX, stageY, stageZ);
-                OverseerDecisions::ApproachGap const gap = first.gap;
-                if (OverseerDecisions::ApproachShapeOf(gap, DUNGEON_APPROACH_LIMITS) ==
-                    OverseerDecisions::ApproachShape::Overhead)
+                if (shape == OverseerDecisions::ApproachShape::Overhead)
                 {
                     if (!coord.loggedAboveTheDoor)
                     {
                         coord.loggedAboveTheDoor = true;
                         LOG_WARN("module.overseer",
                                  "overseer: dungeon run held - the '{}' {} is "
-                                 "({:.1f}, {:.1f}, {:.1f}) and the leader '{}' is {}. That "
+                                 "at `({:.1f}, {:.1f}, {:.1f})` and the leader '{}' is {}. That "
                                  "is above it, not near it: no walk toward it from there "
                                  "descends, and the last-step footing check would refuse "
                                  "every direction that closed the gap. Nothing is reset, "
@@ -52328,16 +52320,6 @@ private:
                 }
                 coord.loggedAboveTheDoor = false;
 
-                // QUARANTINE AFTER FAILED APPROACH (#396). Clear quarantine
-                // when the approach is walkable (not Overhead).
-                if (coord.quarantined)
-                {
-                    coord.quarantined = false;
-                    coord.quarantineX = 0.f;
-                    coord.quarantineY = 0.f;
-                    coord.quarantineZ = 0.f;
-                    coord.quarantineSince = 0;
-                }
             }
 
             // THERE IS NO `loggedCampaignOver = false` BETWEEN THE TWO STOP

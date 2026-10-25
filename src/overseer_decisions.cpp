@@ -1721,6 +1721,25 @@ ApproachShape ApproachShapeOf(ApproachGap const& gap, ApproachLimits const& limi
                                              : ApproachShape::Closing;
 }
 
+ApproachQuarantineAction ApproachQuarantineDecision(
+    ApproachQuarantineState const& quarantine, ApproachShape shape,
+    float leaderX, float leaderY, float leaderZ)
+{
+    if (!quarantine.active)
+        return ApproachQuarantineAction::Inactive;
+    if (shape == ApproachShape::Unmeasured)
+        return ApproachQuarantineAction::Block;
+    if (shape == ApproachShape::Arrived || shape == ApproachShape::Closing)
+        return ApproachQuarantineAction::Clear;
+
+    float const dx = leaderX - quarantine.x;
+    float const dy = leaderY - quarantine.y;
+    float const dz = leaderZ - quarantine.z;
+    return dx * dx + dy * dy + dz * dz <= 100.f
+               ? ApproachQuarantineAction::Block
+               : ApproachQuarantineAction::Clear;
+}
+
 float ApproachDistance(ApproachGap const& gap)
 {
     if (!gap.measured || !FiniteReading(gap.horizontalYards) ||
