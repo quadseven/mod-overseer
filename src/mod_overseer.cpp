@@ -31095,9 +31095,12 @@ private:
         // stops the character, and the next poll finds it standing. A hearth
         // that landed but left the character on the death map is still on the
         // death map (the character is here and no hearth is in flight, so the
-        // previous cast stayed).
+        // previous cast stayed). The death map is the outmatched mark's map,
+        // or the current map when the repeat deaths counted here are on it.
+        bool const stillOnDeathMap =
+            (outmatched.at > 0 && outmatched.mapId == bot->GetMapId()) || deathsHere > 0;
         OverseerDecisions::HearthOutRetry const step =
-            OverseerDecisions::DecideHearthOutRetry(refusal.c_str(), outmatchedHere, tries,
+            OverseerDecisions::DecideHearthOutRetry(refusal.c_str(), stillOnDeathMap, tries,
                                                     boundTries);
         if (step == OverseerDecisions::HearthOutRetry::GiveUp)
         {

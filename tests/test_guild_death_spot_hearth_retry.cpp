@@ -105,6 +105,14 @@ void TheAdapterIsWired()
           !source.empty(), true);
     Check("the death spot hearth retry decision is wired",
           source.find("OverseerDecisions::DecideHearthOutRetry(") != std::string::npos, true);
+    // The retry is asked whether the member is still on its death map, not
+    // whether an outmatched death is marked here.
+    Check("the retry is given the death-map fact",
+          source.find("DecideHearthOutRetry(refusal.c_str(), stillOnDeathMap,") !=
+              std::string::npos, true);
+    Check("the retry is not given the outmatched mark as the death-map fact",
+          source.find("DecideHearthOutRetry(refusal.c_str(), outmatchedHere,") ==
+              std::string::npos, true);
     Check("the death spot keep-out decision is wired",
           source.find("OverseerDecisions::KeepOutOfDeathZone(") != std::string::npos, true);
     Check("a failed death-spot hearth clears the outside walk",
