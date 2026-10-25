@@ -22565,6 +22565,14 @@ bool RunRecoverySummonOpen(RunFailureFacts const& facts);
 // streak - or cannot be, because the door has no stone.
 bool RunRecoveryFinderOpen(RunFailureFacts const& facts);
 
+// THE LAST RESORT'S WORDS, FROM THE FACTS ALONE (issue 1141). The
+// module line and the heuristic text that names the same fact both build from
+// this, so they cannot drift: if the summon rung ran this streak it says so
+// with the count; if the door has no stone it says no summon was possible
+// here and carries the summonNote; if a stone stands but nobody qualifies to
+// click it, it says that.
+std::string FinderLastResortReason(RunFailureFacts const& facts);
+
 // -- rung two: the summon at the door ----------------------------------------
 
 // The meeting stone that serves a door is the nearest one to its entrance

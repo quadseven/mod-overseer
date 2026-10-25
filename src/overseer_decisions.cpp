@@ -2976,8 +2976,9 @@ std::string RunRecoveryHeuristicWhy(RunFailureFacts const& facts, RunRecovery ch
             break;
         case RunRecovery::DungeonFinder:
             why = std::to_string(facts.streak) +
-                  " attempts in a row never got inside and the summon rung has had its "
-                  "turn, so the family queues for its own dungeon in the dungeon finder "
+                  " attempts in a row never got inside and " +
+                  OverseerDecisions::FinderLastResortReason(facts) +
+                  ", so the family queues for its own dungeon in the dungeon finder "
                   "(the last resort)";
             break;
     }
@@ -19501,6 +19502,20 @@ bool RunRecoveryFinderOpen(RunFailureFacts const& facts)
     // on wow-dev, the Horde family (levels 13 to 17, no warlock) was on its
     // ninth failure in a row with the stone 25 yards from the door.
     return SummonsTriedThisStreak(facts) > 0 || !facts.summonReady || !facts.summonerReady;
+}
+
+std::string FinderLastResortReason(RunFailureFacts const& facts)
+{
+    unsigned const tries = SummonsTriedThisStreak(facts);
+    if (tries > 0)
+        return "the summon rung has had its turn (" +
+               std::to_string(tries) +
+               " summon recovery(s) this streak)";
+    if (!facts.summonReady)
+        return "no summon was possible here: " + facts.summonNote;
+    // The stone stands at the door, but nobody in the family qualifies to
+    // click it: the summon rung could never run here either.
+    return "no summon was possible here: " + facts.summonNote;
 }
 
 bool FinderIsTheWayIn(bool finderIsDefault, bool familyCanQueue, std::uint32_t runNumber,
