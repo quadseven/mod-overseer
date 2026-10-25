@@ -42,6 +42,15 @@ int main(int argc, char** argv)
         return Fail("DriveOrders reads the database on the world thread");
     if (drive.find("std::async(std::launch::async") == std::string::npos)
         return Fail("DriveOrders does not hand the read to a worker");
+    if (drive.find("_orderWorker.wait_for(std::chrono::seconds(0))") == std::string::npos ||
+        drive.find("std::future_status::ready") == std::string::npos ||
+        drive.find("return;") == std::string::npos)
+        return Fail("DriveOrders does not skip a poll while the worker is running");
+    if (drive.find("catch (std::exception const& e)") == std::string::npos ||
+        drive.find("_orderWorker.get()") == std::string::npos ||
+        drive.find("LOG_ERROR(\"module.overseer\", \"overseer: the order worker stopped") ==
+            std::string::npos)
+        return Fail("DriveOrders does not report a worker failure");
 
     std::string const run = Body(text, "    static void RunOrders(");
     if (run.find("overseer_order_inbox") == std::string::npos)
