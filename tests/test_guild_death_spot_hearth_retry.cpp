@@ -113,6 +113,21 @@ void TheAdapterIsWired()
     Check("a failed death-spot hearth holds the member still",
           source.find("HoldStillAndReport(bot, name, \"hearth\", hold);") !=
               std::string::npos, true);
+
+    // DoHearth must stop a moving character before returning this refusal;
+    // LeaveGuildDeathSpot then asks the decision again on a later poll.
+    std::size_t const moving = source.find("if (who->isMoving())");
+    std::size_t const stop = source.find(
+        "HoldStillAndReport(who, ev.character, \"hearth\", ev.hold);", moving);
+    std::size_t const refused = source.find("return refuse(\"character is moving\");", stop);
+    Check("a moving hearth refusal holds still before it returns",
+          moving != std::string::npos && stop != std::string::npos &&
+              refused != std::string::npos && moving < stop && stop < refused,
+          true);
+    Check("a moving hearth refusal selects a bounded retry",
+          DecideHearthOutRetry("character is moving", false, 0, 3) ==
+              HearthOutRetry::Retry,
+          true);
 }
 
 }  // namespace
