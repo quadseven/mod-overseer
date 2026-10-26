@@ -449,6 +449,12 @@ constexpr uint32 FISH_POLL_MS = 20000;
 // not wait longer than a minute for the planner to have corrected the row.
 constexpr uint32 LOCKPICK_POLL_MS = 20000;
 
+// How often a standing disenchant errand is polled. Same cadence as craft,
+// fishing and lockpick: one indexed SELECT against a column most characters
+// have zeroed, and a character without a disenchantable item should not wait
+// longer than a minute for the planner to have corrected the row.
+constexpr uint32 DISENCHANT_POLL_MS = 20000;
+
 // How often a character sent to an NPC is pointed at it again (infra#2783).
 // RPG_WANDER_NPC self-expires to IDLE after statusWanderNpcDuration, which is
 // FIVE minutes (NewRpgAction.h:65, checked at NewRpgAction.cpp:278) - six times
@@ -8214,6 +8220,7 @@ public:
         _craftTimer += diff;
         _fishTimer += diff;
         _lockpickTimer += diff;
+        _disenchantTimer += diff;
         _travelTimer += diff;
         _professionTimer += diff;
         _gearTimer += diff;
@@ -8391,6 +8398,15 @@ public:
         {
             _lockpickTimer = 0;
             DriveLockpick();
+        }
+        // Same ordering convention as DriveCraft, DriveFish and DriveLockpick
+        // above: a character is job='quest' XOR job='craft' XOR job='fish'
+        // XOR job='lockpick' XOR job='disenchant', never two at once, so this
+        // is legibility, not a correctness requirement.
+        if (_disenchantTimer >= DISENCHANT_POLL_MS)
+        {
+            _disenchantTimer = 0;
+            DriveDisenchant();
         }
         // BEFORE DriveTravel, so a staging aim this poll writes onto the
         // leader's travel_npc is picked up by DriveTravel the SAME tick
@@ -17162,6 +17178,159 @@ private:
             // The errand stands: the chest is spent this respawn, the attempt
             // failed, or the skill did not rise; the next poll picks the nearest
             // live lockbox and tries again.
+        }
+    }
+
+    // ------------------------------------- job='disenchant' (mod-overseer#444) --
+
+    // Strange Dust, the level 1-15 disenchant reagent whose entry the drive
+    // checks for in the bags after a cast. Verified against the pinned world
+    // database before this drive can confirm a reagent landed.
+    static constexpr uint32 DISENCHANT_REAGENT_ENTRY = 10940u;
+
+    // Whether `item` is a disenchant target under the fixed rule: a soulbound
+    // green (uncommon) item the bot cannot equip. The entry check is the pure
+    // predicate (OverseerDecisions::IsDisenchantTargetEntry); the soulbound and
+    // equip checks are read from the live item.
+    static bool IsDisenchantTarget(Player* bot, Item* item)
+    {
+        if (!item || !item->IsSoulBound())
+            return false;
+        ItemTemplate const* proto = item->GetTemplate();
+        if (!proto || proto->Quality != ITEM_QUALITY_UNCOMMON)
+            return false;
+        if (!OverseerDecisions::IsDisenchantTargetEntry(item->GetEntry()))
+            return false;
+        uint16 dest = 0;
+        return bot->CanEquipItem(NULL_SLOT, dest, item, true) != EQUIP_ERR_OK;
+    }
+
+    // The first disenchantable item in `bot`'s carried inventory, or nullptr.
+    // Sweeps the backpack and each bag, recursing one level into bags.
+    static Item* FindNearestDisenchantTarget(Player* bot)
+    {
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            if (Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                if (IsDisenchantTarget(bot, item))
+                    return item;
+        for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+        {
+            Bag* bag = bot->GetBagByPos(bagSlot);
+            if (!bag)
+                continue;
+            for (uint32 i = 0; i < bag->GetBagSize(); ++i)
+                if (Item* contained = bag->GetItemByPos(i))
+                    if (IsDisenchantTarget(bot, contained))
+                        return contained;
+        }
+        return nullptr;
+    }
+
+    // Polls every standing disenchant errand: finds a soulbound green the bot
+    // cannot equip, casts SPELL_EFFECT_DISENCHANT against it (spell 13262,
+    // driven through SpellCastTargets with the item as target), resolves the
+    // resulting LOOT_DISENCHANTING loot server-side, and reads the Strange Dust
+    // count back from the inventory to confirm a real disenchant instead of
+    // trusting the cast result.
+    //
+    // The errand is left standing on every refusal - no target in the bags,
+    // mid-walk, in combat, no enchanting skill, or the cast refused - so it is
+    // retried next poll. It is cleared only when Strange Dust reads higher in
+    // the bags than before the cast, matching DriveCraft's "leave the errand
+    // standing on a transient refusal" discipline.
+    void DriveDisenchant()
+    {
+        std::map<std::string, std::string> const jobs = LoadJobs();
+        if (jobs.empty())
+            return;
+
+        for (auto const& entry : jobs)
+        {
+            std::string const& name = entry.first;
+            // job='disenchant' is the permission for this drive.
+            if (entry.second != "disenchant")
+                continue;
+
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            if (!bot || !bot->IsInWorld())
+                continue;   // same "read on its own" discipline as every other drive
+            if (!bot->IsAlive() || bot->IsInCombat() || bot->isMoving())
+                continue;   // transient: the errand stands, retried next poll
+            if (bot->GetSkillValue(SKILL_ENCHANTING) == 0)
+                continue;   // cannot disenchant without Enchanting
+
+            // Find a disenchant target: a soulbound green the bot cannot equip.
+            Item* target = FindNearestDisenchantTarget(bot);
+            if (!target)
+                continue;   // nothing to disenchant: no errand, nothing to clear
+
+            // "delivered is not done": read the reagent count before the cast
+            // so the verdict rests on the inventory read-back, not the cast
+            // result.
+            uint32 const reagentBefore = bot->GetItemCount(DISENCHANT_REAGENT_ENTRY, false);
+
+            // Cast the disenchant spell against the item. SPELL_EFFECT_DISENCHANT
+            // needs an item target; SetItemTarget names it, and the core's own
+            // CheckCast decides whether the cast may proceed (item in range,
+            // soulbound check, enchanting skill vs. required skill, etc.).
+            SpellCastTargets targets;
+            targets.SetItemTarget(target);
+            SpellCastResult const result = bot->CastSpell(targets, 13262, false);
+
+            if (result != SPELL_CAST_OK)
+            {
+                // NOT CLEARED. Every failure CheckCast can return here is
+                // transient or already ruled out by the pre-filters above, so
+                // leaving the errand standing and trying again next poll is
+                // correct, the same shape DriveCraft holds for a refused cast.
+                char const* resultName = "unknown";
+                switch (result)
+                {
+                    case SPELL_FAILED_REAGENTS:    resultName = "missing reagents"; break;
+                    case SPELL_FAILED_NOT_READY:   resultName = "not ready"; break;
+                    case SPELL_FAILED_ITEM_NOT_FOUND: resultName = "item not found"; break;
+                    case SPELL_FAILED_NOT_MOUNTED: resultName = "mounted"; break;
+                    default: break;
+                }
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' tried to disenchant {} ({}) and the cast was refused "
+                         "({}; SpellCastResult {}) - leaving the errand standing for the "
+                         "next poll", name, target->GetTemplate()->Name1,
+                         static_cast<uint32>(target->GetEntry()), resultName,
+                         static_cast<uint32>(result));
+                continue;
+            }
+
+            // Resolve the LOOT_DISENCHANTING loot server-side: the core created
+            // a disenchanting loot container when the spell succeeded. With no
+            // client attached there is no loot window to take items from, so
+            // auto-store the loot into the bot's bags.
+            bot->loot.AutoStoreLoot();
+
+            // Read back whether Strange Dust landed in the bags. This is the
+            // evidence, not the cast result.
+            uint32 const reagentAfter = bot->GetItemCount(DISENCHANT_REAGENT_ENTRY, false);
+            if (OverseerDecisions::ShouldClearDisenchantErrand(reagentBefore, reagentAfter))
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' disenchanted {} ({}) and Strange Dust reads {}/{} "
+                         "in the bags - real disenchant, errand satisfied",
+                         name, target->GetTemplate()->Name1, static_cast<uint32>(target->GetEntry()),
+                         static_cast<uint32>(reagentBefore), static_cast<uint32>(reagentAfter));
+                RecordEvent(bot, "disenchant", 13262, "Disenchant",
+                            "disenchant at a world item, reagent in bags");
+                // The errand is cleared: the green was destroyed and the dust
+                // is in the bags. Nothing to clear in a column this drive does
+                // not write; the item is gone, so the next poll finds no target.
+            }
+            else
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' cast Disenchant at {} ({}) and Strange Dust did not "
+                         "rise ({}/{}); leaving the errand standing",
+                         name, target->GetTemplate()->Name1, static_cast<uint32>(target->GetEntry()),
+                         static_cast<uint32>(reagentBefore), static_cast<uint32>(reagentAfter));
+            }
         }
     }
 
@@ -78529,6 +78698,7 @@ private:
     uint32 _craftTimer = 0;
     uint32 _fishTimer = 0;
     uint32 _lockpickTimer = 0;
+    uint32 _disenchantTimer = 0;
     // WHEN A DEAD CHARACTER WAS FIRST SEEN STILL WAITING TO RELEASE, by name.
     //
     // There is no ghost clock for this state - a corpse, and therefore a ghost

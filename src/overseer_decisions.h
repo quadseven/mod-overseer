@@ -26557,6 +26557,31 @@ enum class LockpickErrandStep : std::uint8_t
 LockpickErrandStep DecideLockpickErrand(bool hasTarget, bool inReach,
                                         bool inCombat, bool moving);
 
+// Whether `entry` is one of the fixed green-item entries DriveDisenchant
+// takes apart (a soulbound green the bot cannot equip). These are item_template
+// entries from the pinned world database and must be verified against it before
+// this drive can find anything. An entry that does not match fails safe: the
+// drive finds no target, the errand stands, and the bot does nothing.
+bool IsDisenchantTargetEntry(std::uint32_t entry);
+
+// Whether a standing disenchant errand should be cleared: the reagent count in
+// the bot's bags rose after the cast, read back from the inventory (the same
+// "delivered is not done" discipline as DriveCraft and DriveLockpick).
+bool ShouldClearDisenchantErrand(std::uint32_t reagentBefore,
+                                 std::uint32_t reagentAfter);
+
+// The decision for one standing disenchant errand on one poll. Stand leaves the
+// errand standing (retried next poll); Cast means a disenchantable item is in
+// the bags, the bot is not fighting and not moving: cast SPELL_EFFECT_DISENCHANT.
+enum class DisenchantErrandStep : std::uint8_t
+{
+    Stand,
+    Cast,
+};
+
+DisenchantErrandStep DecideDisenchantErrand(bool hasItem, bool inCombat,
+                                            bool moving);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

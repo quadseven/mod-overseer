@@ -24135,4 +24135,31 @@ LockpickErrandStep DecideLockpickErrand(bool hasTarget, bool inReach,
     return LockpickErrandStep::Cast;
 }
 
+bool IsDisenchantTargetEntry(std::uint32_t entry)
+{
+    // The fixed green-item entries DriveDisenchant takes apart, for the
+    // leveling bracket's first disenchanting targets (soulbound greens the
+    // family's Enchanter cannot equip). These are item_template entries from
+    // the pinned world database and must be verified against it. An entry that
+    // does not match fails safe: FindNearestDisenchantTarget finds nothing, the
+    // errand stands, and the bot does nothing.
+    return entry == 2307u || entry == 2308u || entry == 2309u;
+}
+
+bool ShouldClearDisenchantErrand(std::uint32_t reagentBefore,
+                                 std::uint32_t reagentAfter)
+{
+    return reagentAfter > reagentBefore;
+}
+
+DisenchantErrandStep DecideDisenchantErrand(bool hasItem, bool inCombat,
+                                            bool moving)
+{
+    if (!hasItem)
+        return DisenchantErrandStep::Stand;
+    if (inCombat || moving)
+        return DisenchantErrandStep::Stand;
+    return DisenchantErrandStep::Cast;
+}
+
 }  // namespace OverseerDecisions
