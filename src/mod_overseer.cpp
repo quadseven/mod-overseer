@@ -16748,26 +16748,32 @@ private:
             if (toolStep == OverseerDecisions::CraftToolStep::Request)
             {
                 // ASKED FOR, NEVER CONJURED. The same material request a
-                // missing reagent writes, keyed on the tool's item id, so the
-                // planner buys one (and the next poll after it lands in the
-                // bags crafts with it, and ReturnCraftTools banks it after).
+                // missing reagent writes, keyed on the tool's item id. ONCE
+                // PER STATE (wow-overseer#1516): no planner pass buys from
+                // this row yet (the buy is wow-overseer#1477), so it is
+                // written when the crafter enters the "no tool" state, under
+                // the same said-once gate as the log line, not every poll.
+                // A craft, a withdraw or a return clears the state, so a
+                // crafter that loses its hammer again asks again.
                 uint32 const toolItem = OverseerDecisions::ToolItemForTotemCategory(toolCategory);
-                if (ItemTemplate const* proto = toolItem ? sObjectMgr->GetItemTemplate(toolItem) : nullptr)
-                {
-                    std::string detail = "need 1x ";
-                    detail += proto->Name1;
-                    detail += " (a tool, kept in the bank)";
-                    EventExtra extra;
-                    extra.itemGuid = toolItem;
-                    RecordEvent(bot, "material-request", spellId, info->SpellName[LOCALE_enUS],
-                                detail, extra);
-                }
                 if (SayCraftPrepOnce(name, "no tool"))
+                {
+                    if (ItemTemplate const* proto = toolItem ? sObjectMgr->GetItemTemplate(toolItem) : nullptr)
+                    {
+                        std::string detail = "need 1x ";
+                        detail += proto->Name1;
+                        detail += " (a tool, kept in the bank)";
+                        EventExtra extra;
+                        extra.itemGuid = toolItem;
+                        RecordEvent(bot, "material-request", spellId, info->SpellName[LOCALE_enUS],
+                                    detail, extra);
+                    }
                     LOG_INFO("module.overseer",
                              "overseer: '{}' has no tool of category {} anywhere, bags or bank, "
-                             "for '{}' ({}) - asked for item {} and leaving the errand standing "
-                             "(#524)",
+                             "for '{}' ({}) - asked for item {} once and leaving the errand "
+                             "standing (#524)",
                              name, toolCategory, info->SpellName[LOCALE_enUS], spellId, toolItem);
+                }
                 continue;
             }
 
