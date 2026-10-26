@@ -2948,6 +2948,19 @@ DoorAimHeight DoorAimOnTheFloor(bool haveGround, float groundZ, float arrivalYar
 constexpr std::size_t TRAVEL_AIM_MAX_CHARS = 32;
 std::string TravelAimAtPosition(std::uint32_t mapId, float x, float y, float z);
 
+// HOW MANY CHARACTERS AN AIM IS, AS THE COLUMN COUNTS THEM (wow-overseer#1517).
+// `overseer_roster.travel_npc` is VARCHAR(32) in a UTF-8 table, and VARCHAR
+// counts characters, not bytes. std::string::size() counts bytes, so an aim
+// that names an NPC with an accented or non-Latin name is longer in bytes than
+// the column measures it, and a byte guard refuses an aim MySQL would store.
+// This counts every byte that does not continue a multibyte sequence, so each
+// well-formed UTF-8 character is one; a stray continuation byte counts nothing.
+std::size_t Utf8CharCount(std::string const& text);
+
+// Does this aim fit the travel column? The one question every guard on that
+// column asks, in the column's own unit.
+bool TravelAimFitsColumn(std::string const& aim);
+
 // HOW FAR BACK FROM THIS DOOR THE PARTY GATHERS. The staging standoff is
 // measured from the door's centre, and for a sphere it is `standoffYards`
 // exactly as it always was: every sphere row stages on that number today and
