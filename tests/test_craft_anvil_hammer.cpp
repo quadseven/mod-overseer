@@ -151,6 +151,22 @@ void TheAdapterIsWired()
     Check("a missing hammer is a material request for the tool item",
           body.find("OverseerDecisions::ToolItemForTotemCategory(") != std::string::npos);
 
+    // ONCE PER STATE, NOT EVERY POLL (wow-overseer#1516). Nothing buys from a
+    // tool material-request yet (the planner buy is wow-overseer#1477), so the
+    // row is written once when the crafter enters the "no tool" state, under
+    // the same SayCraftPrepOnce gate as its log line, not on every poll.
+    std::size_t const request = body.find("if (toolStep == OverseerDecisions::CraftToolStep::Request)");
+    std::size_t const requestEnd = body.find("OverseerDecisions::CraftDismountsFirst(", request);
+    std::string const requestBody =
+        request == std::string::npos || requestEnd == std::string::npos
+            ? std::string()
+            : body.substr(request, requestEnd - request);
+    std::size_t const once = requestBody.find("if (SayCraftPrepOnce(name, \"no tool\"))");
+    std::size_t const written = requestBody.find("RecordEvent(bot, \"material-request\"");
+    Check("the tool request branch exists", !requestBody.empty());
+    Check("the tool material-request is written once per state, inside the said-once gate",
+          once != std::string::npos && written != std::string::npos && written > once);
+
     std::size_t const refusal = body.find("if (result == SPELL_FAILED_REQUIRES_SPELL_FOCUS)");
     std::size_t const walked = body.find("OverseerDecisions::CraftFocusStepFor(");
     Check("a focus refusal asks whether to walk to an Anvil",
