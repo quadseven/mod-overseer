@@ -23743,6 +23743,27 @@ GuildRunResume ReadGuildRunResume(std::string const& result);
 // The same quarter hour the stray pass has always given a leftover group.
 constexpr unsigned GUILD_RUN_ADOPT_SECONDS = 15 * 60;
 
+// HOW FAR BACK THE RESTART READS REACH (#1138). Both restart reads of a guild
+// finder row, RestoreGuildRunFinderDungeons and the DriveGuildRunStrays
+// adoption read, used to take only rows created in the last 3 hours. That
+// predates the boss-scaled ceiling: at the roll of 2026-10-24 a Blackfathom run
+// 12263 s inside, 4 of 7 bosses down and well inside its 14400 s ceiling, was
+// never read, and the claim sweep ended it. A run may live its map's ceiling
+// plus GUILD_RUN_PROGRESS_EXTENSION_SECONDS (the longest extension), and its
+// row is created before the group is formed and goes in, so the window is the
+// largest ceiling, plus that extension, plus GUILD_RUN_RESTART_MARGIN_SECONDS
+// for the time before it is inside. A row older than that is past every
+// ceiling and is not read.
+//
+// The largest ceiling: a seven-boss Blackfathom, 7 * 1800 + 1800 = 14400 s
+// (GuildRunCeilingForMap). The fifteen-boss Blackrock Depths wing row gets
+// 15 * GUILD_RUN_SECONDS_PER_BOSS = 13500 s. The test holds both under it.
+constexpr unsigned GUILD_RUN_LONGEST_CEILING_SECONDS = 7 * 30 * 60 + GUILD_RUN_CEILING_MARGIN_SECONDS;
+constexpr unsigned GUILD_RUN_RESTART_MARGIN_SECONDS = 30 * 60;
+constexpr unsigned GUILD_RUN_RESTART_WINDOW_SECONDS = GUILD_RUN_LONGEST_CEILING_SECONDS +
+                                                      GUILD_RUN_PROGRESS_EXTENSION_SECONDS +
+                                                      GUILD_RUN_RESTART_MARGIN_SECONDS;
+
 struct GuildRunAdoptFacts
 {
     // The row's last word was phase "inside" (GuildRunResume::inside).
