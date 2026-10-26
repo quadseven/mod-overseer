@@ -6386,14 +6386,26 @@ public:
         // (OverseerDecisions::TravelAimAtPosition); this is the backstop so a
         // future writer cannot reopen the hole, and it names the value the
         // core's own error leaves out.
-        if (target.size() > TRAVEL_AIM_COLUMN_CHARS)
+        //
+        // COUNTED IN CHARACTERS, AND SAID ONCE PER NAME AND TARGET
+        // (wow-overseer#1517). The column is VARCHAR in characters, so a byte
+        // count refused an NPC name with multibyte letters that MySQL would
+        // have stored. And a caller re-asks the same aim on every poll, so the
+        // error is said when the refused aim changes, not every time.
+        if (!OverseerDecisions::TravelAimFitsColumn(target))
         {
-            LOG_ERROR("module.overseer",
-                      "overseer: travel aim '{}' for '{}' is {} characters and "
-                      "overseer_roster.travel_npc holds {}, so it is refused and "
-                      "nothing is written (#1139)",
-                      target, name, uint32(target.size()),
-                      uint32(TRAVEL_AIM_COLUMN_CHARS));
+            auto const said = _aimTooLongSaid.find(name);
+            if (said == _aimTooLongSaid.end() || said->second != target)
+            {
+                _aimTooLongSaid[name] = target;
+                LOG_ERROR("module.overseer",
+                          "overseer: travel aim '{}' for '{}' is {} characters and "
+                          "overseer_roster.travel_npc holds {}, so it is refused and "
+                          "nothing is written (#1139). Said once per aim",
+                          target, name,
+                          uint32(OverseerDecisions::Utf8CharCount(target)),
+                          uint32(TRAVEL_AIM_COLUMN_CHARS));
+            }
             _claimRefusalSaid[name] = "an aim too long for the travel column";
             return false;
         }
@@ -6473,6 +6485,7 @@ public:
             }
         }
         _claimRefusalSaid.erase(name);
+        _aimTooLongSaid.erase(name);
         // A LIVE RUN TAKING THE COLUMN OVER SOMEBODY'S WALK IS SAID, ONCE PER
         // TAKEOVER (#656). The next claim finds the aim is the book's own and
         // writes quietly, so this prints once for each aim it replaces.
@@ -6545,8 +6558,9 @@ public:
     bool FenceRefuses(std::string const& name, std::string const& target,
                       OverseerDecisions::TravelOwner owner)
     {
-        // The column-width refusal Claim makes first (#1139) is a refusal too.
-        if (target.size() > TRAVEL_AIM_COLUMN_CHARS)
+        // The column-width refusal Claim makes first (#1139) is a refusal too,
+        // counted the same way, in characters (wow-overseer#1517).
+        if (!OverseerDecisions::TravelAimFitsColumn(target))
             return true;
         auto const it = _state.find(name);
         if (it != _state.end() && it->second.target == target)
@@ -7316,6 +7330,9 @@ private:
     // so a refusal is said once per state rather than every poll (#560).
     // Erased when a claim writes. World thread only.
     std::map<std::string, std::string> _claimRefusalSaid;
+    // The last over-long aim refused for each character (wow-overseer#1517),
+    // so the width refusal is said once per name and target, not per poll.
+    std::map<std::string, std::string> _aimTooLongSaid;
     // What economy errands have cost each character lately. Beside `_refused`
     // and for the same reason: it has to outlive the errands it is counting, or
     // it counts one errand at a time and never reaches a share of anything. Its

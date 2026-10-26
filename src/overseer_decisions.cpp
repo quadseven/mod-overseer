@@ -2078,6 +2078,20 @@ std::string TravelAimAtPosition(std::uint32_t mapId, float x, float y, float z)
     return {};
 }
 
+std::size_t Utf8CharCount(std::string const& text)
+{
+    std::size_t count = 0;
+    for (unsigned char const byte : text)
+        if ((byte & 0xC0u) != 0x80u)
+            ++count;
+    return count;
+}
+
+bool TravelAimFitsColumn(std::string const& aim)
+{
+    return Utf8CharCount(aim) <= TRAVEL_AIM_MAX_CHARS;
+}
+
 DoorAimHeight DoorAimOnTheFloor(float triggerZ, bool haveGround, float groundZ,
                                 float arrivalYards, float triggerRadiusYards)
 {
