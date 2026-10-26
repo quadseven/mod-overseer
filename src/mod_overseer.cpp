@@ -31026,12 +31026,9 @@ private:
             return true;
 
         uint32 const stone = HearthstoneSpellOf(bot);
-        bool const hearthReady = stone && !bot->HasSpellCooldown(stone) && !HearthPendingFor(name);
-        if (OverseerDecisions::GuildLeavesDeathSpot(deathsHere, GHOST_RECOVERY_LIMITS.repeatDeaths,
-                                                    hearthReady, bot->IsInCombat(),
-                                                    outmatchedHere) !=
-            OverseerDecisions::GuildDeathSpotStep::Hearth)
-            return false;
+        bool const stoneOnCooldown = stone && bot->HasSpellCooldown(stone);
+        bool const hearthReady = stone && !stoneOnCooldown && !HearthPendingFor(name);
+        bool const inCombat = bot->IsInCombat();
 
         unsigned& tries = _guildDeathSpotTries[name];
         unsigned const boundTries = OverseerDecisions::EXIT_HEARTH_ATTEMPTS;
@@ -31055,12 +31052,32 @@ private:
             return keepOut;
         };
 
-        // The bound is spent: the hearth-out cannot succeed. Keep the member
-        // out of the death zone and let the revival drive take it.
-        if (tries >= boundTries)
+        // The hearth-out cannot succeed now (no stone, the stone on cooldown,
+        // or the tries spent): a member killed far above its level is held
+        // where it stands instead of being handed back to the drives that walk
+        // it toward the killer. Asked before GuildLeavesDeathSpot, which says
+        // Stay for a stone that is not ready and so released the member to
+        // walk back in. A member in combat is left to fight or flee.
+        if (!inCombat &&
+            OverseerDecisions::KeepOutOfDeathZone(
+                OverseerDecisions::HearthOutCannotSucceed(stone != 0, stoneOnCooldown, tries,
+                                                          boundTries),
+                outmatchedHere, false))
         {
-            return keepMemberOut();
+            holdStill();
+            return true;
         }
+
+        if (OverseerDecisions::GuildLeavesDeathSpot(deathsHere, GHOST_RECOVERY_LIMITS.repeatDeaths,
+                                                    hearthReady, inCombat,
+                                                    outmatchedHere) !=
+            OverseerDecisions::GuildDeathSpotStep::Hearth)
+            return false;
+
+        // The bound is spent on a member hearthing out of repeat deaths (an
+        // outmatched one was held above): stop asking it every poll.
+        if (tries >= boundTries)
+            return keepMemberOut();
 
         // The first hearth and every retry are driven with the member stopped:
         // a cast driven while an outside walk moves the character is broken.

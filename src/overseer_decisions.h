@@ -21925,6 +21925,14 @@ HearthOutRetry DecideHearthOutRetry(char const* refusal, bool stillOnDeathMap,
 bool KeepOutOfDeathZone(bool hearthOutFailed, bool stillInDeathZone,
                         bool guildMovedIt);
 
+// A death-spot hearth-out that cannot be driven now: the member carries no
+// hearthstone, its stone is on cooldown, or this episode's tries are spent.
+// Its answer is the `hearthOutFailed` that KeepOutOfDeathZone takes, so a
+// member killed far above its level is held where it stands rather than
+// handed back to the drives that walk it toward the killer again.
+bool HearthOutCannotSucceed(bool hasStone, bool stoneOnCooldown, unsigned tries,
+                            unsigned boundTries);
+
 // "corpse_run", "spirit_healer", "wait", "ladder": the words written to
 // overseer_death.ghost_recovery and to the log.
 char const* GhostRecoveryWord(GhostRecovery choice);

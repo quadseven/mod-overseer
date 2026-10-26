@@ -17672,6 +17672,12 @@ bool KeepOutOfDeathZone(bool hearthOutFailed, bool stillInDeathZone,
     return hearthOutFailed && stillInDeathZone && !guildMovedIt;
 }
 
+bool HearthOutCannotSucceed(bool hasStone, bool stoneOnCooldown, unsigned tries,
+                            unsigned boundTries)
+{
+    return !hasStone || stoneOnCooldown || tries >= boundTries;
+}
+
 HeadTradeAnswer AnswerTradeAtHead(bool traderIsKin, uint32_t theyOffer, uint32_t theirCopper,
                                   uint32_t weGive, uint32_t ourCopper, uint32_t openSeconds)
 {

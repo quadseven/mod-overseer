@@ -20,6 +20,7 @@
 
 using OverseerDecisions::DecideHearthOutRetry;
 using OverseerDecisions::HearthOutRetry;
+using OverseerDecisions::HearthOutCannotSucceed;
 using OverseerDecisions::KeepOutOfDeathZone;
 
 namespace
@@ -95,6 +96,22 @@ void TheKeepOutDecision()
           !KeepOutOfDeathZone(false, true, false), true);
 }
 
+void TheHearthThatCannotSucceed()
+{
+    // The 2026-10-24 loop: the hearth was cast and broken, or landed and left
+    // the member where it was, and the next poll found the stone not ready.
+    // A stone that is not ready is a hearth-out that cannot succeed, and the
+    // member killed far above its level is kept out rather than released.
+    Check("stone on cooldown", HearthOutCannotSucceed(true, true, 0, 3), true);
+    Check("no hearthstone", HearthOutCannotSucceed(false, false, 0, 3), true);
+    Check("tries spent", HearthOutCannotSucceed(true, false, 3, 3), true);
+    Check("stone ready, tries left", HearthOutCannotSucceed(true, false, 2, 3), false);
+    Check("an outmatched member whose stone is on cooldown is kept out",
+          KeepOutOfDeathZone(HearthOutCannotSucceed(true, true, 1, 3), true, false), true);
+    Check("a member not outmatched here is not held for a cooldown",
+          KeepOutOfDeathZone(HearthOutCannotSucceed(true, true, 1, 3), false, false), false);
+}
+
 void TheAdapterIsWired()
 {
     std::ifstream in("src/mod_overseer.cpp");
@@ -130,6 +147,15 @@ void TheAdapterIsWired()
           spot != std::string::npos && still != std::string::npos &&
               cast != std::string::npos && still < cast,
           true);
+    // GuildLeavesDeathSpot says Stay for a stone that is not ready, and Stay
+    // returned the member to the drives that walk it back toward the killer.
+    // The keep-out for a hearth-out that cannot succeed is asked first.
+    std::size_t const cannot = source.find("OverseerDecisions::HearthOutCannotSucceed(", spot);
+    std::size_t const gate = source.find("OverseerDecisions::GuildLeavesDeathSpot(", spot);
+    Check("a hearth-out that cannot succeed keeps the member out before the stone gate",
+          spot != std::string::npos && cannot != std::string::npos &&
+              gate != std::string::npos && cannot < gate,
+          true);
     Check("a failed death-spot hearth holds the member still",
           source.find("HoldStillAndReport(bot, name, \"hearth\", hold);") !=
               std::string::npos, true);
@@ -156,6 +182,7 @@ int main()
 {
     TheRetryDecision();
     TheKeepOutDecision();
+    TheHearthThatCannotSucceed();
     TheAdapterIsWired();
     if (failures)
     {
