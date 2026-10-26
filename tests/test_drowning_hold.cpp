@@ -411,7 +411,8 @@ SelfDeathReadingFacts Row(int32_t mask, int32_t guardSeconds, char const* killer
     facts.selfAttributed = std::string(killer) == "self";
     facts.fall = AccountForFall(yardsFallen, 0.f, 1.f, z,
                                 OverseerDecisions::VOID_PLANE_Z);
-    facts.liquid = OverseerDecisions::DeathLiquid::Water;
+    facts.liquid = OverseerDecisions::ClassifyDeathLiquid(
+        1, 1 | 2, 4, 8);
     return facts;
 }
 
