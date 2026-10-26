@@ -16758,6 +16758,54 @@ constexpr char const* NotReached = "the character did not reach the portal in ti
 // Its own refusals first, then CastRefusalRetry for the shared ones.
 TownRetry PortalUseRefusalRetry(std::string const& detail);
 
+// ------------------------------------------ family mage portal network --
+//
+// A REQUEST FOR A MAGE PORTAL. The operator or any family member asks for a
+// portal to a major city. The module resolves the city to a caster (Og for
+// Alliance, Oz for Horde) and a spell id (Portal preferred, Teleport as
+// fallback), then triggers a cast through the existing steering mechanism.
+//
+// THE COMMAND GRAMMAR.
+//
+//     portal <city>
+//
+// City names (case-insensitive): stormwind, ironforge, darnassus, orgrimmar,
+// thunder bluff, undercity, shattrath, dalaran.
+//
+// THE REFUSAL LITERALS. No quote characters: they go into an UPDATE.
+namespace PortalRefusal
+{
+constexpr char const* Malformed = "a portal row takes exactly one city name";
+constexpr char const* UnknownCity = "unknown city - try stormwind, ironforge, darnassus, orgrimmar, thunder bluff, undercity, shattrath, dalaran";
+constexpr char const* NoCaster = "no family mage serves that city";
+constexpr char const* CasterNotReady = "the mage is not online or cannot cast";
+constexpr char const* SpellNotKnown = "the mage does not know that spell - train it first with 'cast walk-to-trainer class'";
+constexpr char const* AlreadyRunning = "a portal row is already running for that caster";
+}  // namespace PortalRefusal
+
+// Retry classification for portal refusals.
+TownRetry PortalRefusalRetry(std::string const& detail);
+
+// Portal request parsed from the command string.
+struct PortalRequest
+{
+    bool ok{false};
+    std::string city;          // normalized city name
+    std::string casterName;    // the mage who will cast
+    std::uint32_t spellId{0};  // spell to cast
+    bool isPortal{true};       // true = Portal (creates object), false = Teleport
+    char const* error{""};     // refusal literal when ok is false
+};
+
+// Normalize a city name to the registry key.
+std::string NormalizePortalCity(std::string const& input);
+
+// Parse a portal command: "portal <city>".
+PortalRequest ParsePortalRequest(std::string const& command);
+
+// Resolve a city to the best caster and spell from the overseer_portal table.
+PortalRequest ResolvePortalRequest(std::string const& city);
+
 // ONE GAME OBJECT IN REACH, AS FACTS. The adapter reads every one in its sweep;
 // this file decides which may be clicked.
 struct PortalCandidate

@@ -14003,6 +14003,90 @@ TownRetry PortalUseRefusalRetry(std::string const& detail)
     return CastRefusalRetry(detail);
 }
 
+// ------------------------------------------ family mage portal network --
+
+TownRetry PortalRefusalRetry(std::string const& detail)
+{
+    // Malformed and unknown city are permanent.
+    if (detail == PortalRefusal::Malformed || detail == PortalRefusal::UnknownCity)
+        return TownRetry::Never;
+    // No caster for that city means the family setup is wrong.
+    if (detail == PortalRefusal::NoCaster)
+        return TownRetry::Never;
+    // Caster not ready, spell not known, already running - all transient.
+    if (detail == PortalRefusal::CasterNotReady ||
+        detail == PortalRefusal::SpellNotKnown ||
+        detail == PortalRefusal::AlreadyRunning)
+        return TownRetry::Later;
+    return TownRetry::Never;
+}
+
+std::string NormalizePortalCity(std::string const& input)
+{
+    std::string out = input;
+    for (char& c : out)
+        c = std::tolower(static_cast<unsigned char>(c));
+    // Trim whitespace.
+    while (!out.empty() && std::isspace(static_cast<unsigned char>(out.front())))
+        out.erase(out.begin());
+    while (!out.empty() && std::isspace(static_cast<unsigned char>(out.back())))
+        out.pop_back();
+    // Normalize "thunderbluff" -> "thunder bluff".
+    if (out == "thunderbluff")
+        out = "thunder bluff";
+    return out;
+}
+
+PortalRequest ParsePortalRequest(std::string const& command)
+{
+    PortalRequest req;
+    std::string verb = command;
+    // Trim leading whitespace.
+    while (!verb.empty() && std::isspace(static_cast<unsigned char>(verb.front())))
+        verb.erase(verb.begin());
+    // Expect "portal <city>".
+    if (verb.size() < 7 || verb.substr(0, 6) != "portal")
+    {
+        req.error = PortalRefusal::Malformed;
+        return req;
+    }
+    std::string city = verb.substr(6);
+    // Trim whitespace after "portal".
+    while (!city.empty() && std::isspace(static_cast<unsigned char>(city.front())))
+        city.erase(city.begin());
+    if (city.empty())
+    {
+        req.error = PortalRefusal::Malformed;
+        return req;
+    }
+    req.city = NormalizePortalCity(city);
+    req.ok = true;
+    return req;
+}
+
+PortalRequest ResolvePortalRequest(std::string const& city)
+{
+    PortalRequest req;
+    req.city = city;
+
+    // Query the overseer_portal table for this city.
+    QueryResult result = CharacterDatabase.Query(
+        "SELECT caster_name, spell_id, is_portal FROM overseer_portal WHERE city = '{}' ORDER BY is_portal DESC LIMIT 1",
+        city);
+    if (!result)
+    {
+        req.error = PortalRefusal::UnknownCity;
+        return req;
+    }
+
+    Field* fields = result->Fetch();
+    req.casterName = fields[0].Get<std::string>();
+    req.spellId = fields[1].Get<uint32>();
+    req.isPortal = fields[2].Get<bool>();
+    req.ok = true;
+    return req;
+}
+
 char const* PortalCandidateWall(PortalCandidate const& c)
 {
     if (c.type != SPELLCASTER_OBJECT_TYPE)

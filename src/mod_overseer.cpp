@@ -57876,6 +57876,10 @@ private:
         // rows it can before it hands out new work.
         ResolveCastChecks(sincePollMs);
 
+        // ...and the mage portals, which wait out one cast time and read the
+        // world for the portal object or the teleport, same as a cast (#XXXX).
+        ResolvePortalChecks(sincePollMs);
+
         // ...and the portal clicks, which walk to the mage's portal, click it,
         // and read the crossing back the way a cast's teleport is read (#410).
         ResolvePortalUses(sincePollMs);
@@ -58241,6 +58245,21 @@ private:
                                        _pendingLearns, id);
             else if (kind == "cast")
                 detail = DoCast(player, command, status, rowResult, _pendingCasts, id);
+            else if (kind == "portal")
+            {
+                // A FAMILY MAGE PORTAL. The target is the mage who will cast
+                // (Og for Alliance cities, Oz for Horde cities). The row's
+                // claimed_by is the requester (operator or family member).
+                Player* caster = ObjectAccessor::FindPlayerByName(targetName);
+                if (!caster)
+                {
+                    detail = "the mage is not in the world";
+                }
+                else
+                {
+                    detail = DoPortal(caster, command, status, rowResult, _pendingPortals, id);
+                }
+            }
             else if (kind == "guild" && OverseerDecisions::IsBattlegroundQueueRow(command))
                 // A MEMBER QUEUES A BATTLEGROUND (wow-overseer#589), on
                 // kind='guild' and routed on the first word like the finder
@@ -69688,19 +69707,31 @@ private:
 
     // A cast waiting out its own cast time. Held on the world thread beside
     // _pendingHearths and bounded the same way.
-    struct CastCheck
-    {
-        uint32 id{0};
-        std::string targetName;
-        CastEvidence ev;
-    };
+struct CastCheck
+{
+    uint32 id{0};
+    std::string targetName;
+    CastEvidence ev;
+};
 
-    // CASTS WAITING OUT THEIR OWN CAST. World thread only, exactly like
-    // _pendingHearths and for the same reason, and bounded the same way: at
-    // most COMMANDS_PER_POLL are added per poll and every one is resolved
-    // within its own window. Declared here rather than beside _pendingChecks
-    // because a member's TYPE has to be complete where the member is declared.
-    std::vector<CastCheck> _pendingCasts;
+// A PORTAL REQUEST WAITING OUT ITS CAST. Same lifetime rules as CastCheck.
+struct PortalCheck
+{
+    uint32 id{0};
+    std::string casterName;  // the mage who casts
+    std::string city;        // the city being portaled to
+    CastEvidence ev;         // reused cast evidence (spellId, from, now, etc.)
+};
+
+// CASTS WAITING OUT THEIR OWN CAST. World thread only, exactly like
+// _pendingHearths and for the same reason, and bounded the same way: at
+// most COMMANDS_PER_POLL are added per poll and every one is resolved
+// within its own window. Declared here rather than beside _pendingChecks
+// because a member's TYPE has to be complete where the member is declared.
+std::vector<CastCheck> _pendingCasts;
+
+// PORTALS WAITING OUT THEIR CAST. Same lifetime rules as _pendingCasts.
+std::vector<PortalCheck> _pendingPortals;
 
     static void CastPlace(std::ostringstream& o, OverseerDecisions::HomeBind const& p)
     {
@@ -70156,6 +70187,180 @@ private:
         return "";
     }
 
+    // ---------------------------------------------------------- DO PORTAL --
+    //
+    // A FAMILY MAGE PORTAL. The operator or any family member requests a
+    // portal to a major city. The module resolves the city to a caster (Og for
+    // Alliance, Oz for Horde) and a spell id from the overseer_portal table,
+    // then triggers the cast through the existing steering mechanism.
+    //
+    // THE COMMAND GRAMMAR.
+    //
+    //     portal <city>
+    //
+    // City names: stormwind, ironforge, darnassus, orgrimmar, thunder bluff,
+    // undercity, shattrath, dalaran.
+    //
+    // THE RESOLUTION FLOW.
+    //
+    // 1. Parse the command to get the city name.
+    // 2. Query overseer_portal for the city -> (caster_name, spell_id, is_portal).
+    // 3. Find the caster in the family roster (must be a family mage).
+    // 4. Verify the caster is online, not in combat, and can cast.
+    // 5. Verify the caster knows the spell.
+    // 6. Hold the caster still and send the cast.
+    //
+    // THE SPELL CAST. Portal spells (is_portal=1) create a gameobject that
+    // party members can click. Teleport spells (is_portal=0) move the caster.
+    // The caster is the family mage, not the requester.
+    //
+    // THIS REUSES CastEvidence BECAUSE A PORTAL IS A CAST. The evidence fields
+    // (spellId, from, now, objectExpected, teleportExpected, etc.) are exactly
+    // what the cast resolver needs to judge whether the portal/teleport landed.
+    static char const* DoPortal(Player* who, std::string const& command, char const*& status,
+                                std::string& out, std::vector<PortalCheck>& parked, uint32 id)
+    {
+        using OverseerDecisions::CastEvidence;
+        using OverseerDecisions::CastVerifyWindowMs;
+        using OverseerDecisions::CastOutcome;
+        using OverseerDecisions::ParsePortalRequest;
+        using OverseerDecisions::ResolvePortalRequest;
+        using OverseerDecisions::PortalRequest;
+        using OverseerDecisions::PortalRefusal;
+        using OverseerDecisions::PortalRefusalRetry;
+
+        CastEvidence ev;
+        ev.character = who->GetName();  // the mage who will cast
+        ev.request = command;
+
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            out = CastJson(ev, "refused", reason);
+            return reason;
+        };
+
+        // Parse the portal command: "portal <city>"
+        PortalRequest request = ParsePortalRequest(command);
+        if (!request.ok)
+        {
+            out = CastJson(ev, "refused", request.error);
+            return request.error;
+        }
+
+        // Resolve city to caster and spell from the portal registry.
+        request = ResolvePortalRequest(request.city);
+        if (!request.ok)
+        {
+            out = CastJson(ev, "refused", request.error);
+            return request.error;
+        }
+
+        ev.spellId = request.spellId;
+        ev.objectExpected = request.isPortal;  // Portal spells create an object
+        ev.teleportExpected = !request.isPortal;  // Teleport spells move the caster
+
+        // ONE PORTAL PER CASTER AT A TIME.
+        for (PortalCheck const& running : parked)
+            if (running.casterName == request.casterName)
+                return refuse(PortalRefusal::AlreadyRunning);
+
+        WorldSession* session = who->GetSession();
+        if (!session)
+            return refuse(PortalRefusal::CasterNotReady);
+        if (!who->IsInWorld())
+            return refuse(PortalRefusal::CasterNotReady);
+
+        // The caster needs a bot AI for the cast and for teleport acknowledgment.
+        PlayerbotAI* botAI = GET_PLAYERBOT_AI(who);
+        if (!botAI)
+            return refuse(PortalRefusal::CasterNotReady);
+
+        if (who->m_mover != who)
+            return refuse(PortalRefusal::CasterNotReady);
+
+        if (!who->IsAlive())
+            return refuse(PortalRefusal::CasterNotReady);
+        if (who->IsInFlight())
+            return refuse(PortalRefusal::CasterNotReady);
+        if (who->IsInCombat())
+            return refuse(PortalRefusal::CasterNotReady);
+        if (who->HasUnitState(UNIT_STATE_STUNNED))
+            return refuse(PortalRefusal::CasterNotReady);
+        if (SessionIsLoggingOut(session))
+            return refuse(PortalRefusal::CasterNotReady);
+        if (who->GetTradeData())
+            return refuse(PortalRefusal::CasterNotReady);
+        if (who->IsNonMeleeSpellCast(false))
+            return refuse(PortalRefusal::CasterNotReady);
+
+        SpellInfo const* spell = sSpellMgr->GetSpellInfo(ev.spellId);
+        if (!spell)
+            return refuse(PortalRefusal::SpellNotKnown);
+
+        if (spell->IsPassive())
+            return refuse(PortalRefusal::SpellNotKnown);
+
+        // THE CORE CHECK: does this mage know the spell?
+        if (!who->HasActiveSpell(ev.spellId))
+            return refuse(PortalRefusal::SpellNotKnown);
+
+        if (who->HasSpellCooldown(ev.spellId))
+            return refuse(PortalRefusal::CasterNotReady);
+        if (who->GetGlobalCooldownMgr().HasGlobalCooldown(spell))
+            return refuse(PortalRefusal::CasterNotReady);
+
+        // Power cost (mana for portals/teleports).
+        int32 const powerCost = spell->CalcPowerCost(who, spell->GetSchoolMask());
+        bool const powerIsReadable = powerCost > 0 && spell->PowerType == uint32(POWER_MANA);
+        if (powerIsReadable)
+        {
+            ev.powerBefore = int32(who->GetPower(POWER_MANA));
+            if (ev.powerBefore < powerCost)
+                return refuse(PortalRefusal::CasterNotReady);
+        }
+
+        // Portal reagents (runes).
+        uint32 reagentCount = 0;
+        ReadFirstReagent(spell, ev.reagentEntry, reagentCount);
+        if (ev.reagentEntry)
+        {
+            ev.reagentBefore = int32(who->GetItemCount(ev.reagentEntry, false));
+            if (uint32(ev.reagentBefore) < reagentCount)
+                return refuse(PortalRefusal::CasterNotReady);
+        }
+
+        // CAST TIME AND VERIFICATION WINDOW.
+        ev.castMs = spell->GetCastTime();
+        ev.windowMs = CastVerifyWindowMs(ev.castMs, 1, 0, 0, 0, 0);
+        ev.from = ReadStandingPlace(who);
+        ev.movingAtStart = who->isMoving();
+
+        // ---- ask the mage to stand, and cast NOTHING yet --------------------
+        //
+        // Same pattern as conjure/hearth/cast: apply the hold first, send the
+        // first cast on the first poll that finds the mage standing still.
+        HoldConjurerStill(who, botAI, ev);
+
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' will open portal to {} (spell {}); has {}, wants {}, "
+                 "up to {} casts, {} when the row was claimed; judging in {}ms",
+                 ev.character, request.city.c_str(), ev.spellId,
+                 ev.movingAtStart ? "moving" : "standing",
+                 ev.windowMs);
+
+        PortalCheck check;
+        check.id = id;
+        check.casterName = request.casterName;
+        check.city = request.city;
+        check.ev = ev;
+        parked.push_back(check);
+
+        status = "verifying";
+        ev.verdict = CastOutcome::Unreadable;
+        out = CastJson(ev, "casting", "");
+        return "";
+    }
+
     // WHERE A CAST IS ACTUALLY ANSWERED. Runs from the same poll as
     // ResolveHearthChecks and for the same reason: the thing being judged
     // happens on the world's clock, not on the queue's.
@@ -70373,6 +70578,208 @@ private:
         }
 
         _pendingCasts.swap(stillCasting);
+    }
+
+    // WHERE A PORTAL IS ACTUALLY ANSWERED. Same logic as ResolveCastChecks
+    // because a portal request IS a cast by the family mage. The only difference
+    // is that we track the caster name (the mage) rather than a target name.
+    void ResolvePortalChecks(uint32 elapsedMs)
+    {
+        using OverseerDecisions::CastOutcome;
+        using OverseerDecisions::CastOutcomeWord;
+        using OverseerDecisions::CastPlaceChanged;
+        using OverseerDecisions::CastReadBack;
+        using OverseerDecisions::JudgeCast;
+        using OverseerDecisions::ReadTeleportFlight;
+        using OverseerDecisions::TeleportFlight;
+
+        std::vector<PortalCheck> stillCasting;
+        stillCasting.reserve(_pendingPortals.size());
+
+        for (PortalCheck& check : _pendingPortals)
+        {
+            check.ev.waitedMs += elapsedMs;
+
+            // ASKED WITH checkInWorld FALSE: a map change takes the character
+            // out of the world while it crosses.
+            uint32 const ceilingMs = check.ev.windowMs + HEARTH_SETTLE_CEILING_MS;
+            Player* bot = ObjectAccessor::FindPlayerByName(check.casterName, false);
+            TeleportFlight const flight =
+                ReadTeleportFlight(bot != nullptr, bot && bot->IsInWorld(),
+                                   bot && bot->IsBeingTeleported(), check.ev.waitedMs,
+                                   ceilingMs);
+
+            if (flight == TeleportFlight::Gone)
+            {
+                char const* const gone =
+                    "left the world before the portal could be read back";
+                LOG_WARN("module.overseer",
+                         "overseer: portal {} for '{}' to {} cannot be judged - the mage is no "
+                         "longer in the world and is not crossing one",
+                         check.id, check.casterName.c_str(), check.city.c_str());
+                check.ev.verdict = CastOutcome::Unreadable;
+                ReleaseHold(check.casterName, bot,
+                            "the mage left the world mid-portal", "portal");
+                CharacterDatabase.Execute(
+                    "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
+                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                    Esc(gone), EscLong(CastJson(check.ev, "unreadable", gone)), check.id,
+                    g_runToken);
+                continue;
+            }
+
+            // NOT JUDGED WHILE IT IS STILL WORKING.
+            if (check.ev.waitedMs < check.ev.windowMs)
+            {
+                stillCasting.push_back(check);
+                continue;
+            }
+
+            // STILL ARRIVING IS NOT STILL STANDING THERE.
+            if (flight == TeleportFlight::InFlight)
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: portal {} for '{}' to {} is past its {}ms window but a teleport "
+                         "has not landed yet; waiting rather than calling it a failure",
+                         check.id, check.casterName.c_str(), check.city.c_str(),
+                         check.ev.windowMs);
+                stillCasting.push_back(check);
+                continue;
+            }
+
+            // ---- read the world back ------------------------------------------
+            CastReadBack read;
+            read.casterReadable = bot != nullptr;
+            read.objectExpected = check.ev.objectExpected;
+            read.teleportExpected = check.ev.teleportExpected;
+            read.costExpected = check.ev.costExpected;
+
+            if (bot)
+            {
+                check.ev.now = ReadStandingPlace(bot);
+                read.placeChanged =
+                    CastPlaceChanged(check.ev.from, check.ev.now, CAST_MOVED_YARDS);
+
+                if (check.ev.objectExpected)
+                {
+                    check.ev.objectFound = 0;
+                    if (GameObject* made = FindObjectThisCastMade(bot, check.ev.spellId))
+                    {
+                        check.ev.objectFound = 1;
+                        read.objectFound = true;
+                        check.ev.objectEntry = made->GetEntry();
+                        check.ev.objectGuid = made->GetGUID().GetCounter();
+                        check.ev.objectAt.known = true;
+                        check.ev.objectAt.mapId = made->GetMapId();
+                        check.ev.objectAt.areaId = made->GetAreaId();
+                        check.ev.objectAt.x = made->GetPositionX();
+                        check.ev.objectAt.y = made->GetPositionY();
+                        check.ev.objectAt.z = made->GetPositionZ();
+                        if (GameObjectTemplate const* info = made->GetGOInfo())
+                        {
+                            check.ev.objectType = uint32(info->type);
+                            if (info->type == GAMEOBJECT_TYPE_SPELLCASTER)
+                            {
+                                check.ev.objectCastsSpell = info->spellcaster.spellId;
+                                check.ev.objectPartyOnly =
+                                    info->spellcaster.partyOnly ? 1 : 0;
+                            }
+                        }
+                    }
+                }
+
+                if (check.ev.reagentEntry)
+                {
+                    check.ev.reagentAfter =
+                        int32(bot->GetItemCount(check.ev.reagentEntry, false));
+                    if (check.ev.reagentBefore >= 0
+                        && check.ev.reagentAfter < check.ev.reagentBefore)
+                        read.costPaid = true;
+                }
+                if (check.ev.powerBefore >= 0)
+                {
+                    check.ev.powerAfter = int32(bot->GetPower(POWER_MANA));
+                    if (check.ev.powerAfter < check.ev.powerBefore)
+                        read.costPaid = true;
+                }
+                check.ev.cooldownAtVerdict = bot->HasSpellCooldown(check.ev.spellId) ? 1 : 0;
+                if (check.ev.cooldownAtVerdict)
+                    read.costPaid = true;
+            }
+
+            // The hold comes off before the verdict is written.
+            ReleaseHold(check.casterName, bot, "the portal row ended", "portal");
+
+            check.ev.verdict = JudgeCast(read);
+
+            char const* status = "error";
+            char const* detail = "";
+            char const* outcome = CastOutcomeWord(check.ev.verdict);
+
+            switch (check.ev.verdict)
+            {
+                case CastOutcome::Made:
+                    status = "applied";
+                    LOG_INFO("module.overseer",
+                             "overseer: portal {} - '{}' opened portal to {} (object {} guid {} type {}) "
+                             "with spell {}, read back after {}ms",
+                             check.id, check.casterName.c_str(), check.city.c_str(),
+                             check.ev.objectEntry, check.ev.objectGuid, check.ev.objectType,
+                             check.ev.spellId, check.ev.waitedMs);
+                    break;
+                case CastOutcome::Moved:
+                    status = "applied";
+                    LOG_INFO("module.overseer",
+                             "overseer: portal {} - '{}' teleported to {}: map {} to map {}, read back "
+                             "after {}ms",
+                             check.id, check.casterName.c_str(), check.city.c_str(),
+                             check.ev.from.mapId, check.ev.now.mapId, check.ev.waitedMs);
+                    break;
+                case CastOutcome::Spent:
+                    status = "applied";
+                    LOG_INFO("module.overseer",
+                             "overseer: portal {} - '{}' cast spell {} for {}; it cost something "
+                             "(reagent {} went {} to {}, mana {} to {}, cooldown {}), which is "
+                             "all this row can read of that spell",
+                             check.id, check.casterName.c_str(), check.ev.spellId, check.city.c_str(),
+                             check.ev.reagentEntry, check.ev.reagentBefore,
+                             check.ev.reagentAfter, check.ev.powerBefore,
+                             check.ev.powerAfter,
+                             check.ev.cooldownAtVerdict > 0 ? "running" : "clear");
+                    break;
+                case CastOutcome::Nothing:
+                    status = "unchanged";
+                    detail = check.ev.objectExpected
+                                 ? "the cast went out and the portal it makes is not there"
+                                 : check.ev.teleportExpected
+                                     ? "the cast went out and the mage never moved"
+                                     : "the cast went out and it cost the mage nothing";
+                    LOG_WARN("module.overseer",
+                             "overseer: portal {} - '{}' cast spell {} for {} and nothing came of it: "
+                             "{} (the wall named at the packet was: {})",
+                             check.id, check.casterName.c_str(), check.ev.spellId, check.city.c_str(),
+                             detail,
+                             check.ev.castBlocker ? check.ev.castBlocker : "none");
+                    break;
+                case CastOutcome::Unreadable:
+                    status = "error";
+                    detail = read.casterReadable
+                                 ? "that spell makes nothing this row can read back"
+                                 : "the mage could not be read back after the cast";
+                    LOG_WARN("module.overseer",
+                             "overseer: portal {} - '{}' and spell {}: {}", check.id,
+                             check.casterName.c_str(), check.ev.spellId, detail);
+                    break;
+            }
+
+            CharacterDatabase.Execute(
+                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
+                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+                status, Esc(detail), EscLong(CastJson(check.ev, outcome, detail)), check.id,
+                g_runToken);
+        }
+
+        _pendingPortals.swap(stillCasting);
     }
 
     // ================================ `use-portal`: click the party's portal ==
