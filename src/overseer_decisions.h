@@ -21284,17 +21284,20 @@ constexpr uint32_t OUTLAND_MAP_ID = 530;
 constexpr uint32_t NORTHREND_MAP_ID = 571;
 
 // THE BLOOD ELF AND DRAENEI STARTING LANDS (#765). They stand on map 530,
-// but they are where those two races level from 1 to about 20, as a player
-// who rolls one does before taking the boat or the orb to the old world.
-// Reading the whole map as Outland left 42 guild members on the starting isles
-// at level 8, refused every errand. The zones, with their two capitals, where
-// those races' trainers are.
-constexpr uint32_t EVERSONG_WOODS_ZONE_ID = 3430;
-constexpr uint32_t GHOSTLANDS_ZONE_ID = 3433;
-constexpr uint32_t SILVERMOON_CITY_ZONE_ID = 3487;
-constexpr uint32_t AZUREMYST_ISLE_ZONE_ID = 3524;
-constexpr uint32_t BLOODMYST_ISLE_ZONE_ID = 3525;
-constexpr uint32_t THE_EXODAR_ZONE_ID = 3557;
+ // but they are where those two races level from 1 to about 20, as a player
+ // who rolls one does before taking the boat or the orb to the old world.
+ // Reading the whole map as Outland left 42 guild members on the starting isles
+ // at level 8, refused every errand. The zones, with their two capitals, where
+ // those races' trainers are.
+ constexpr uint32_t EVERSONG_WOODS_ZONE_ID = 3430;
+ constexpr uint32_t GHOSTLANDS_ZONE_ID = 3433;
+ constexpr uint32_t SILVERMOON_CITY_ZONE_ID = 3487;
+ constexpr uint32_t AZUREMYST_ISLE_ZONE_ID = 3524;
+ constexpr uint32_t BLOODMYST_ISLE_ZONE_ID = 3525;
+ constexpr uint32_t THE_EXODAR_ZONE_ID = 3557;
+ // The sea zones next to the starting isles on map 530. Members who cross to
+ // or from Azuremyst by boat stand on that shore and berth (#1157).
+ constexpr uint32_t VEILED_SEA_ZONE_ID = 3479;
 
 // Outland or Northrend, by the map alone. True for the starting lands too, so a
 // question that has a zone asks IsOutsideClassic instead.
