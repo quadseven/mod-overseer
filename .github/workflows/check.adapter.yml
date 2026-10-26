@@ -248,15 +248,34 @@ jobs:
         # error naming the package this job wanted rather than somebody else's
         # Release file. So this turns an unrelated third party's publishing
         # mistake from "the gate is red and says nothing" into "the gate ran".
+        #
+        # FAIL FAST AND RETRY. Each apt request times out after 30 seconds and
+        # retries 3 times, and the whole step times out at 10 minutes, well
+        # under the job's 20. If one slow mirror read still stalls, the install
+        # is retried at most 3 times before this step fails, naming itself,
+        # instead of hanging until the job's 20-minute cancel turns the check
+        # red.
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           # Reported rather than fatal - see the note above this step.
-          sudo apt-get update -qq || echo "::warning::apt-get update reported an error, which is usually a third-party repository on the runner image rather than one this job installs from. The install below is what decides, and it fails hard if a package cannot be fetched."
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential libtool cmake-data ninja-build cmake clang \
-            git curl unzip openssl \
-            default-libmysqlclient-dev libboost-all-dev libssl-dev libmysql++-dev \
-            libreadline-dev zlib1g-dev libbz2-dev libncurses-dev liblzma-dev
+          sudo apt-get update -o Acquire::http::Timeout=30 -o Acquire::Retries=3 -qq || echo "::warning::apt-get update reported an error, which is usually a third-party repository on the runner image rather than one this job installs from. The install below is what decides, and it fails hard if a package cannot be fetched."
+          for attempt in 1 2 3; do
+            if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              -o Acquire::http::Timeout=30 -o Acquire::Retries=3 \
+              build-essential libtool cmake-data ninja-build cmake clang \
+              git curl unzip openssl \
+              default-libmysqlclient-dev libboost-all-dev libssl-dev libmysql++-dev \
+              libreadline-dev zlib1g-dev libbz2-dev libncurses-dev liblzma-dev; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Install what the core's own Dockerfile installs: stalled after 3 attempts" >&2
+              exit 1
+            fi
+            echo "Install what the core's own Dockerfile installs: attempt $attempt failed, retrying..."
+            sleep 5
+          done
           clang++ --version | head -1
           cmake --version | head -1
 
