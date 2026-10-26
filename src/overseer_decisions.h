@@ -11455,6 +11455,69 @@ constexpr char const* NotReadBack        = "the transaction did not read back";
 // (mod-overseer#169) is what happens when a sender cannot tell the two apart.
 bool AuctionRefusalRetryable(std::string const& reason);
 
+// --------------------------------------------- trade WTB (want to buy) -----------
+//
+// A WTB CANDIDATE is an item the family wants (appears in FamilyWants.wantList)
+// that is NOT currently listed on the auction house (ahPrice == 0) AND whose
+// price is within the family's auction budget (AuctionBudgetAllows). The
+// cooldown ledger prevents spamming the same item: after an offer is made for
+// an item, a 10-minute (configurable) cooldown applies per item entry before
+// another offer for that item may be made. The offer log records every offer
+// attempt with the member name, result (Accepted/Declined), and a reason string.
+
+enum class WtbOfferResult : std::uint8_t
+{
+    Accepted,
+    Declined,
+};
+
+// One WTB offer recorded in the log.
+struct WtbOfferEntry
+{
+    uint32_t itemEntry{0};
+    std::string member;
+    WtbOfferResult result{WtbOfferResult::Declined};
+    std::string reason;
+    time_t time{0};
+};
+
+// Log of WTB offers.
+struct WtbOfferLog
+{
+    std::vector<WtbOfferEntry> entries;
+};
+
+// Record a WTB offer outcome in the log.
+void WtbOfferLogRecord(WtbOfferLog& log, uint32_t itemEntry,
+                       std::string const& member, WtbOfferResult result,
+                       std::string const& reason, time_t now);
+
+// Per-item cooldown ledger: maps item entry to the last time an offer was made.
+using WtbCooldownLedger = std::map<uint32_t, time_t>;
+
+// Check if an offer for `itemEntry` is allowed under the cooldown. Returns
+// true if enough time has passed since the last offer for this item (or if
+// there was no previous offer). `cooldownSeconds` is the minimum interval
+// between offers for the same item (typically 600 = 10 minutes).
+bool WtbCooldownCheck(WtbCooldownLedger const& ledger, uint32_t itemEntry,
+                      time_t now, time_t cooldownSeconds);
+
+// Record that an offer for `itemEntry` was made at `now`. Updates the ledger
+// so subsequent WtbCooldownCheck calls will enforce the cooldown.
+void WtbCooldownRecord(WtbCooldownLedger& ledger, uint32_t itemEntry, time_t now);
+
+// Is this item a WTB candidate right now?
+//   - `wants`: the family's want list (from FamilyWants)
+//   - `itemEntry`: the item being considered
+//   - `ahPrice`: current lowest buyout price on the AH for this item, or 0 if not listed
+//   - `money`, `reserve`, `sharePercent`: budget parameters passed to AuctionBudgetAllows
+//   - `candidatePrice`: the price we would offer (must pass AuctionBudgetAllows)
+// Returns true if the item is wanted, not on AH (ahPrice == 0), and the
+// candidatePrice passes the budget check.
+bool WtbCandidate(FamilyWants const& wants, uint32_t itemEntry, uint32_t ahPrice,
+                  uint32_t money, uint32_t reserve, uint32_t sharePercent,
+                  uint32_t candidatePrice);
+
 // ----------------------------------------- a home somebody chose (#274) --
 //
 // WHAT A kind='bind' ROW MAY SAY.

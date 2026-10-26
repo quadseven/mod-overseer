@@ -9688,6 +9688,59 @@ bool AuctionBudgetAllows(uint32_t money, uint32_t reserve, uint32_t sharePercent
     return price <= remainder && price <= share;
 }
 
+void WtbOfferLogRecord(WtbOfferLog& log, uint32_t itemEntry,
+                       std::string const& member, WtbOfferResult result,
+                       std::string const& reason, time_t now)
+{
+    WtbOfferEntry entry;
+    entry.itemEntry = itemEntry;
+    entry.member = member;
+    entry.result = result;
+    entry.reason = reason;
+    entry.time = now;
+    log.entries.push_back(std::move(entry));
+}
+
+bool WtbCooldownCheck(WtbCooldownLedger const& ledger, uint32_t itemEntry,
+                      time_t now, time_t cooldownSeconds)
+{
+    auto it = ledger.find(itemEntry);
+    if (it == ledger.end())
+        return true;  // no previous offer for this item
+    time_t lastOffer = it->second;
+    return now >= lastOffer + cooldownSeconds;
+}
+
+void WtbCooldownRecord(WtbCooldownLedger& ledger, uint32_t itemEntry, time_t now)
+{
+    ledger[itemEntry] = now;
+}
+
+bool WtbCandidate(FamilyWants const& wants, uint32_t itemEntry, uint32_t ahPrice,
+                  uint32_t money, uint32_t reserve, uint32_t sharePercent,
+                  uint32_t candidatePrice)
+{
+    // Must be in the family's want list
+    bool wanted = false;
+    for (uint32_t id : wants.wantList)
+    {
+        if (id == itemEntry)
+        {
+            wanted = true;
+            break;
+        }
+    }
+    if (!wanted)
+        return false;
+
+    // Must not be on the auction house (ahPrice == 0 means not listed)
+    if (ahPrice != 0)
+        return false;
+
+    // Candidate price must pass budget check
+    return AuctionBudgetAllows(money, reserve, sharePercent, candidatePrice);
+}
+
 AuctionBidVerdict AuctionBidAcceptable(uint32_t price, uint32_t startBid,
                                        uint32_t currentBid, uint32_t buyout,
                                        uint32_t outbidStep)
