@@ -198,14 +198,24 @@ void TheMarkEndsOnArrival()
               stayed != std::string::npos && erase != std::string::npos && erase < stayed,
           true);
 
+    // Searched in [LeaveGuildDeathSpot, ResolveHearthChecks) rather than in a
+    // slice cut at one closing-brace pattern: a brace added inside the
+    // function (a lambda, an inner block) would end such a slice early.
     std::size_t const spot = source.find("bool LeaveGuildDeathSpot(");
-    std::size_t const end = source.find("\n    }\n", spot);
-    std::string const body = source.substr(spot, end - spot);
+    bool const ordered = spot != std::string::npos && resolve != std::string::npos &&
+                         spot < resolve;
+    auto inRange = [&](std::size_t at) { return ordered && at != std::string::npos && at < resolve; };
+    std::size_t const moved =
+        ordered ? source.find("bool const guildMovedIt = SummonPendingFor(name);", spot)
+                : std::string::npos;
+    std::size_t const firstKeepOut =
+        ordered ? source.find("KeepOutOfDeathZone(", spot) : std::string::npos;
     Check("the guild move is read in LeaveGuildDeathSpot",
-          body.find("bool const guildMovedIt = SummonPendingFor(name);") != std::string::npos,
-          true);
+          inRange(moved), true);
+    Check("the guild move is read before the first keep-out decision",
+          inRange(moved) && inRange(firstKeepOut) && moved < firstKeepOut, true);
     Check("no keep-out in LeaveGuildDeathSpot is told the guild never moves it",
-          body.find("outmatchedHere, false)") == std::string::npos, true);
+          ordered && !inRange(source.find("outmatchedHere, false)", spot)), true);
     Check("a summon in flight is looked up by the summoned name",
           source.find("bool SummonPendingFor(std::string const& name) const") !=
               std::string::npos,
