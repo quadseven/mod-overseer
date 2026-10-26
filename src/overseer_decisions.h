@@ -2953,8 +2953,10 @@ std::string TravelAimAtPosition(std::uint32_t mapId, float x, float y, float z);
 // counts characters, not bytes. std::string::size() counts bytes, so an aim
 // that names an NPC with an accented or non-Latin name is longer in bytes than
 // the column measures it, and a byte guard refuses an aim MySQL would store.
-// This counts every byte that does not continue a multibyte sequence, so each
-// well-formed UTF-8 character is one; a stray continuation byte counts nothing.
+// This counts every byte that does not continue a multibyte sequence: each
+// well-formed UTF-8 character is one, a stray continuation byte counts nothing,
+// and an invalid lead byte (0xC0, 0xFF) counts as one. It does not validate;
+// MySQL refuses invalid UTF-8 on write anyway.
 std::size_t Utf8CharCount(std::string const& text);
 
 // Does this aim fit the travel column? The one question every guard on that
