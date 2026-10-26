@@ -176,6 +176,15 @@ standing craft errand needs is banked the next time the character stands in
 reach of a banker, alive, out of combat, not flying and not trading. Nobody is
 walked to a banker to put it back.
 
+Only a hammer a planned recipe has needed goes back (wow-overseer#1515): the
+member must have had a standing craft errand for a recipe that needs tool
+category 162 since its hammer last went back. A hammer in the bags of a member
+whose plan never asked for one (the planner skips every Anvil recipe today, or
+it is an engineer's) is left where it is. That memory is the module's own and a
+restart forgets it, which fails closed: the hammer stays in the bags until the
+next such errand. A deposit the bank refuses (a full bank) is logged once per
+answer, not on every 20 second poll, and tried again at the next banker.
+
 ### Anvil: walked to, in town
 
 A focus refusal for an Anvil (`OverseerDecisions::FocusIsWalkedTo`) walks a job

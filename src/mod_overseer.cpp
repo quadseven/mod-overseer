@@ -16542,12 +16542,20 @@ private:
         return true;
     }
 
+    // Every member a standing craft errand has named a tool-needing recipe for
+    // since its tool last went back (wow-overseer#1515). World thread only.
+    // Lost on a restart, which fails closed: the tool stays in the bags until
+    // the next such errand.
+    std::set<std::string> _craftToolPlanned;
+
     // THE HAMMER GOES BACK IN THE BANK (#524). The operator's decision is that
     // the Blacksmith Hammer lives in the crafter's own bank and comes out to
     // craft. Once no standing craft errand needs it, it is banked the next
     // time the character stands in reach of a banker; nobody is walked to one
     // for it. Through DoBank, the bank verb's executor, so the checks and the
-    // read-back are that verb's.
+    // read-back are that verb's. Only for a member a planned recipe needed it
+    // for (wow-overseer#1515): a hammer nothing on the plan has asked for is
+    // left in the bags, and a deposit that fails is said once, not per poll.
     void ReturnCraftTools()
     {
         QueryResult result = CharacterDatabase.Query(
@@ -16570,22 +16578,38 @@ private:
             if (errand != errands.end())
                 if (SpellInfo const* info = sSpellMgr->GetSpellInfo(errand->second))
                     stillNeeded = SpellNeedsTool(info, category);
+            if (stillNeeded)
+                _craftToolPlanned.insert(name);
+            bool const planned = _craftToolPlanned.count(name) != 0;
             bool const able = bot->IsAlive() && !bot->IsInCombat() && !bot->IsInFlight() &&
                               !bot->GetTradeData();
             bool anyBanker = false;
             bool const bankerInReach =
-                !stillNeeded && able && BankerInReach(bot, anyBanker) != nullptr;
-            if (!OverseerDecisions::CraftToolGoesBack(true, stillNeeded, bankerInReach, able))
+                planned && !stillNeeded && able && BankerInReach(bot, anyBanker) != nullptr;
+            if (!OverseerDecisions::CraftToolGoesBack(true, planned, stillNeeded, bankerInReach, able))
                 continue;
             char const* status = "error";
             std::string out;
             DoBank(bot, "deposit guid:" + std::to_string(tool->GetGUID().GetCounter()), status, out);
-            LOG_INFO("module.overseer",
-                     "overseer: '{}' put its {} back in the bank, no craft errand needs it "
-                     "(#524): {}{}{}",
-                     name, tool->GetTemplate()->Name1, status, out.empty() ? "" : " - ",
-                     out.substr(0, 300));
-            _craftPrepSaid.erase(name);
+            if (std::string(status) == "delivered")
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' put its {} back in the bank, no craft errand needs it "
+                         "(#524): {}{}{}",
+                         name, tool->GetTemplate()->Name1, status, out.empty() ? "" : " - ",
+                         out.substr(0, 300));
+                _craftToolPlanned.erase(name);
+                _craftPrepSaid.erase(name);
+                continue;
+            }
+            // A full bank answers the same way every poll: said once per
+            // answer, and tried again at the next banker.
+            if (SayCraftPrepOnce(name, std::string("tool not banked: ") + status))
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' could not put its {} back in the bank (#524): {}{}{} - "
+                         "keeping it in the bags and trying again at a banker; said once",
+                         name, tool->GetTemplate()->Name1, status, out.empty() ? "" : " - ",
+                         out.substr(0, 300));
         } while (result->NextRow());
     }
 
