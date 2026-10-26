@@ -17618,6 +17618,94 @@ unsigned FocusLighterSpell(unsigned requiresSpellFocus)
     return requiresSpellFocus == SPELL_FOCUS_COOKING_FIRE ? SPELL_BASIC_CAMPFIRE : 0;
 }
 
+bool FocusIsWalkedTo(unsigned requiresSpellFocus)
+{
+    return requiresSpellFocus == SPELL_FOCUS_ANVIL;
+}
+
+unsigned ToolItemForTotemCategory(unsigned totemCategory)
+{
+    return totemCategory == TOTEM_CATEGORY_BLACKSMITH_HAMMER ? ITEM_BLACKSMITH_HAMMER : 0;
+}
+
+CraftToolStep CraftToolStepFor(CraftToolPlace place, bool bankerInReach, bool mayWalk)
+{
+    switch (place)
+    {
+        case CraftToolPlace::NotNeeded:
+        case CraftToolPlace::Carried:
+            return CraftToolStep::Cast;
+        case CraftToolPlace::Banked:
+            if (bankerInReach)
+                return CraftToolStep::Withdraw;
+            return mayWalk ? CraftToolStep::WalkToBanker : CraftToolStep::Wait;
+        case CraftToolPlace::Missing:
+            return CraftToolStep::Request;
+    }
+    return CraftToolStep::Wait;
+}
+
+char const* CraftToolStepWord(CraftToolStep step)
+{
+    switch (step)
+    {
+        case CraftToolStep::Cast:         return "cast";
+        case CraftToolStep::Withdraw:     return "withdraw";
+        case CraftToolStep::WalkToBanker: return "walk to a banker";
+        case CraftToolStep::Wait:         return "wait";
+        case CraftToolStep::Request:      return "request";
+    }
+    return "wait";
+}
+
+bool CraftToolGoesBack(bool inBags, bool stillNeeded, bool bankerInReach, bool able)
+{
+    return inBags && !stillNeeded && bankerInReach && able;
+}
+
+int NearestFocusSpawn(std::vector<FocusSpawn> const& spawns, unsigned mapId, float x, float y,
+                      float limitYards)
+{
+    int best = -1;
+    float bestSq = limitYards * limitYards;
+    for (std::size_t i = 0; i < spawns.size(); ++i)
+    {
+        FocusSpawn const& s = spawns[i];
+        if (s.mapId != mapId)
+            continue;
+        float const dx = s.x - x;
+        float const dy = s.y - y;
+        float const sq = dx * dx + dy * dy;
+        if (sq <= bestSq)
+        {
+            bestSq = sq;
+            best = static_cast<int>(i);
+        }
+    }
+    return best;
+}
+
+CraftFocusStep CraftFocusStepFor(bool walkedTo, bool mayWalk, float nearestYards)
+{
+    if (!walkedTo || !mayWalk)
+        return CraftFocusStep::Stand;
+    if (nearestYards < 0.f)
+        return CraftFocusStep::NoneNear;
+    if (nearestYards <= CRAFT_FOCUS_STANDING_YARDS)
+        return CraftFocusStep::Stand;
+    return CraftFocusStep::Walk;
+}
+
+std::string FocusSpawnAim(FocusSpawn const& spawn)
+{
+    auto whole = [](float v) {
+        long const r = static_cast<long>(v < 0.f ? v - 0.5f : v + 0.5f);
+        return std::to_string(r);
+    };
+    return "at:" + std::to_string(spawn.mapId) + ":" + whole(spawn.x) + "," + whole(spawn.y) +
+           "," + whole(spawn.z);
+}
+
 GhostRecovery GuildGhostFallback(unsigned deathsHere, bool healerGraveKnown,
                                  unsigned repeatDeaths)
 {

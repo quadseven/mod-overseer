@@ -8371,6 +8371,7 @@ public:
         {
             _craftTimer = 0;
             DriveCraft();
+            ReturnCraftTools();
             DriveHeadTrades();
         }
         // Same ordering convention as DriveCraft just above, and the same
@@ -16338,10 +16339,14 @@ private:
     // is crafted out of thin air - the same "fail closed, not open" shape
     // every other drive in this file holds to.
     //
-    // ANVILS AND THE BLACKSMITH HAMMER (#524): Anvil-gated recipes are out of
-    // scope here, and the planner must not name one. The decisions and the
-    // swap-and-restore design are in docs/design/profession-crafting-drive.md,
-    // section "Anvil, Hammer and reagent-gated Blacksmithing recipes".
+    // ANVILS AND THE BLACKSMITH HAMMER (#524). A worn Blacksmithing recipe
+    // needs an Anvil (RequiresSpellFocus 1) and a Blacksmith Hammer (tool
+    // category 162, satisfied by one in the bags; nothing is equipped). The
+    // hammer is kept in the crafter's own bank and taken out to craft
+    // (CraftToolStepFor); a job 'craft' crafter refused for an Anvil is walked
+    // to the nearest one in town (CraftFocusStepFor); ReturnCraftTools puts the
+    // hammer back once nothing needs it. See docs/design/profession-crafting-
+    // drive.md, section "Anvil, Hammer and reagent-gated Blacksmithing recipes".
     //
     // A focus the crafter can conjure where it stands is provided instead
     // (OverseerDecisions::FocusLighterSpell, quadseven/mod-overseer#534):
@@ -16411,6 +16416,152 @@ private:
                      kin ? "family or guild" : "a stranger");
             _headTradeSeen.erase(name);
         }
+    }
+
+    // EVERY ANVIL IN THE WORLD, read once out of the gameobject spawn table
+    // (#524). BuildTravelIndex reads creature spawns only, and an Anvil has no
+    // creature paired with it the way a guild vault has its banker, so this is
+    // a second, narrow index: type 8 GAMEOBJECT_TYPE_SPELL_FOCUS, focusId (Data0)
+    // naming a focus the craft drive walks to. Spawns only change on a restart,
+    // so it is built on first use and kept.
+    std::vector<OverseerDecisions::FocusSpawn> _anvilSpawns;
+    bool _anvilSpawnsBuilt = false;
+
+    std::vector<OverseerDecisions::FocusSpawn> const& AnvilSpawns()
+    {
+        if (_anvilSpawnsBuilt)
+            return _anvilSpawns;
+        _anvilSpawnsBuilt = true;
+        // GetAllGOData  ObjectMgr.h  GameObjectDataContainer const& GetAllGOData() const
+        for (auto const& [spawnId, data] : sObjectMgr->GetAllGOData())
+        {
+            (void)spawnId;
+            GameObjectTemplate const* proto = sObjectMgr->GetGameObjectTemplate(data.id);
+            if (!proto || proto->type != GAMEOBJECT_TYPE_SPELL_FOCUS ||
+                !OverseerDecisions::FocusIsWalkedTo(proto->spellFocus.focusId))
+                continue;
+            OverseerDecisions::FocusSpawn spawn;
+            spawn.mapId = data.mapid;
+            spawn.x = data.posX;
+            spawn.y = data.posY;
+            spawn.z = data.posZ;
+            _anvilSpawns.push_back(spawn);
+        }
+        LOG_INFO("module.overseer",
+                 "overseer: indexed {} Anvil spawn(s) for the craft drive (#524)",
+                 _anvilSpawns.size());
+        return _anvilSpawns;
+    }
+
+    // A tool of this category sitting in the character's own bank: its 28
+    // slots and every bag in a bank bag slot. The bags and what is worn are
+    // Player::HasItemTotemCategory's half; this is the half it does not read.
+    static Item* FindBankedTool(Player* who, uint32 totemCategory)
+    {
+        for (uint8 slot = BANK_SLOT_ITEM_START; slot < BANK_SLOT_ITEM_END; ++slot)
+            if (Item* item = who->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                if (who->IsTotemCategoryCompatiableWith(item->GetTemplate(), totemCategory))
+                    return item;
+        for (uint8 bagSlot = BANK_SLOT_BAG_START; bagSlot < BANK_SLOT_BAG_END; ++bagSlot)
+        {
+            Bag* bag = who->GetBagByPos(bagSlot);
+            if (!bag)
+                continue;
+            for (uint32 i = 0; i < bag->GetBagSize(); ++i)
+                if (Item* item = bag->GetItemByPos(i))
+                    if (who->IsTotemCategoryCompatiableWith(item->GetTemplate(), totemCategory))
+                        return item;
+        }
+        return nullptr;
+    }
+
+    // A tool of this category in the character's bags (backpack and worn
+    // bags), never one that is equipped: a weapon in hand is not put away.
+    static Item* FindBaggedTool(Player* who, uint32 totemCategory)
+    {
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            if (Item* item = who->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                if (who->IsTotemCategoryCompatiableWith(item->GetTemplate(), totemCategory))
+                    return item;
+        for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+        {
+            Bag* bag = who->GetBagByPos(bagSlot);
+            if (!bag)
+                continue;
+            for (uint32 i = 0; i < bag->GetBagSize(); ++i)
+                if (Item* item = bag->GetItemByPos(i))
+                    if (who->IsTotemCategoryCompatiableWith(item->GetTemplate(), totemCategory))
+                        return item;
+        }
+        return nullptr;
+    }
+
+    static bool SpellNeedsTool(SpellInfo const* info, uint32 totemCategory)
+    {
+        for (uint8 t = 0; t < info->TotemCategory.size(); ++t)
+            if (info->TotemCategory[t] == totemCategory)
+                return true;
+        return false;
+    }
+
+    // Said once per character and state, so a hammer waiting for a banker is
+    // one line and not one per poll. World thread only.
+    std::map<std::string, std::string> _craftPrepSaid;
+
+    bool SayCraftPrepOnce(std::string const& name, std::string const& said)
+    {
+        auto const it = _craftPrepSaid.find(name);
+        if (it != _craftPrepSaid.end() && it->second == said)
+            return false;
+        _craftPrepSaid[name] = said;
+        return true;
+    }
+
+    // THE HAMMER GOES BACK IN THE BANK (#524). The operator's decision is that
+    // the Blacksmith Hammer lives in the crafter's own bank and comes out to
+    // craft. Once no standing craft errand needs it, it is banked the next
+    // time the character stands in reach of a banker; nobody is walked to one
+    // for it. Through DoBank, the bank verb's executor, so the checks and the
+    // read-back are that verb's.
+    void ReturnCraftTools()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name FROM overseer_roster WHERE enabled = 1");
+        if (!result)
+            return;
+        std::map<std::string, uint32> const errands = LoadCraftErrands();
+        uint32 const category = OverseerDecisions::TOTEM_CATEGORY_BLACKSMITH_HAMMER;
+        do
+        {
+            std::string const name = result->Fetch()[0].Get<std::string>();
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            if (!bot || !bot->IsInWorld())
+                continue;
+            Item* tool = FindBaggedTool(bot, category);
+            if (!tool)
+                continue;
+            bool stillNeeded = false;
+            auto const errand = errands.find(name);
+            if (errand != errands.end())
+                if (SpellInfo const* info = sSpellMgr->GetSpellInfo(errand->second))
+                    stillNeeded = SpellNeedsTool(info, category);
+            bool const able = bot->IsAlive() && !bot->IsInCombat() && !bot->IsInFlight() &&
+                              !bot->GetTradeData();
+            bool anyBanker = false;
+            bool const bankerInReach =
+                !stillNeeded && able && BankerInReach(bot, anyBanker) != nullptr;
+            if (!OverseerDecisions::CraftToolGoesBack(true, stillNeeded, bankerInReach, able))
+                continue;
+            char const* status = "error";
+            std::string out;
+            DoBank(bot, "deposit guid:" + std::to_string(tool->GetGUID().GetCounter()), status, out);
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' put its {} back in the bank, no craft errand needs it "
+                     "(#524): {}{}{}",
+                     name, tool->GetTemplate()->Name1, status, out.empty() ? "" : " - ",
+                     out.substr(0, 300));
+            _craftPrepSaid.erase(name);
+        } while (result->NextRow());
     }
 
     void DriveCraft()
@@ -16507,6 +16658,94 @@ private:
             if (shortOfReagents)
                 continue;
 
+            // THE TOOL A RECIPE NEEDS (#524). CheckCast asks
+            // Player::HasItemTotemCategory, which reads what is worn and what
+            // is in the bags; the Blacksmith Hammer is kept in the bank, so the
+            // bank is the half asked here. Decided before the cast because the
+            // core refuses the Anvil first, and the banker is the walk to take
+            // before the Anvil, not after it.
+            bool const mayWalk = jobIt->second == "craft";
+            OverseerDecisions::CraftToolPlace toolPlace = OverseerDecisions::CraftToolPlace::NotNeeded;
+            uint32 toolCategory = 0;
+            Item* bankedTool = nullptr;
+            for (uint8 t = 0; t < info->TotemCategory.size(); ++t)
+            {
+                uint32 const category = info->TotemCategory[t];
+                if (!category || bot->HasItemTotemCategory(category))
+                    continue;
+                toolCategory = category;
+                bankedTool = FindBankedTool(bot, category);
+                toolPlace = bankedTool ? OverseerDecisions::CraftToolPlace::Banked
+                                       : OverseerDecisions::CraftToolPlace::Missing;
+                break;
+            }
+            bool anyBanker = false;
+            bool const bankerInReach = toolPlace == OverseerDecisions::CraftToolPlace::Banked &&
+                                       BankerInReach(bot, anyBanker) != nullptr;
+            OverseerDecisions::CraftToolStep const toolStep =
+                OverseerDecisions::CraftToolStepFor(toolPlace, bankerInReach, mayWalk);
+            if (toolStep == OverseerDecisions::CraftToolStep::Withdraw)
+            {
+                char const* status = "error";
+                std::string out;
+                DoBank(bot, "withdraw guid:" + std::to_string(bankedTool->GetGUID().GetCounter()),
+                       status, out);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' took its {} out of the bank to craft '{}' ({}) (#524): "
+                         "{}{}{}",
+                         name, bankedTool->GetTemplate()->Name1, info->SpellName[LOCALE_enUS],
+                         spellId, status, out.empty() ? "" : " - ", out.substr(0, 300));
+                _craftPrepSaid.erase(name);
+                continue;   // cast on the next poll, with the tool in the bags
+            }
+            if (toolStep == OverseerDecisions::CraftToolStep::WalkToBanker)
+            {
+                if (_travelAims.Claim(name, "banker", OverseerDecisions::TravelOwner::TownTrip) &&
+                    SayCraftPrepOnce(name, "walking to a banker"))
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' needs the tool kept in its bank (category {}) for "
+                             "'{}' ({}) and no banker is in reach - walked to one (#524)",
+                             name, toolCategory, info->SpellName[LOCALE_enUS], spellId);
+                continue;
+            }
+            if (toolStep == OverseerDecisions::CraftToolStep::Wait)
+            {
+                if (SayCraftPrepOnce(name, "waiting for a banker"))
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' needs the tool kept in its bank (category {}) for "
+                             "'{}' ({}) and is on job '{}', which the craft drive does not walk "
+                             "anywhere - it takes the tool out the next time a banker is in "
+                             "reach (#524)",
+                             name, toolCategory, info->SpellName[LOCALE_enUS], spellId,
+                             jobIt->second);
+                continue;
+            }
+            if (toolStep == OverseerDecisions::CraftToolStep::Request)
+            {
+                // ASKED FOR, NEVER CONJURED. The same material request a
+                // missing reagent writes, keyed on the tool's item id, so the
+                // planner buys one (and the next poll after it lands in the
+                // bags crafts with it, and ReturnCraftTools banks it after).
+                uint32 const toolItem = OverseerDecisions::ToolItemForTotemCategory(toolCategory);
+                if (ItemTemplate const* proto = toolItem ? sObjectMgr->GetItemTemplate(toolItem) : nullptr)
+                {
+                    std::string detail = "need 1x ";
+                    detail += proto->Name1;
+                    detail += " (a tool, kept in the bank)";
+                    EventExtra extra;
+                    extra.itemGuid = toolItem;
+                    RecordEvent(bot, "material-request", spellId, info->SpellName[LOCALE_enUS],
+                                detail, extra);
+                }
+                if (SayCraftPrepOnce(name, "no tool"))
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' has no tool of category {} anywhere, bags or bank, "
+                             "for '{}' ({}) - asked for item {} and leaving the errand standing "
+                             "(#524)",
+                             name, toolCategory, info->SpellName[LOCALE_enUS], spellId, toolItem);
+                continue;
+            }
+
             // Off the mount first, through the handler a client drives for the
             // same reason (see the cast hold, #337): it does both Dismount()
             // and the aura removal.
@@ -16529,6 +16768,7 @@ private:
                          name, info->SpellName[LOCALE_enUS], spellId);
                 RecordEvent(bot, "craft", spellId, info->SpellName[LOCALE_enUS],
                             "crafted an item toward its profession");
+                _craftPrepSaid.erase(name);
                 continue;   // errand stays standing - Python re-asserts or replaces it
             }
 
@@ -16565,6 +16805,49 @@ private:
 
             if (result == SPELL_FAILED_REQUIRES_SPELL_FOCUS)
             {
+                // A WORLD FOCUS IN TOWN IS WALKED TO (#524): an Anvil, for a
+                // job 'craft' crafter, within a town's walk. Already at one,
+                // the refusal stands below rather than looping the walk.
+                bool const walkedTo = OverseerDecisions::FocusIsWalkedTo(info->RequiresSpellFocus);
+                float nearestYards = -1.f;
+                OverseerDecisions::FocusSpawn nearest;
+                if (walkedTo && mayWalk)
+                {
+                    std::vector<OverseerDecisions::FocusSpawn> const& anvils = AnvilSpawns();
+                    int const pick = OverseerDecisions::NearestFocusSpawn(
+                        anvils, bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(),
+                        OverseerDecisions::CRAFT_FOCUS_WALK_LIMIT_YARDS);
+                    if (pick >= 0)
+                    {
+                        nearest = anvils[pick];
+                        nearestYards = bot->GetExactDist2d(nearest.x, nearest.y);
+                    }
+                }
+                OverseerDecisions::CraftFocusStep const focusStep =
+                    OverseerDecisions::CraftFocusStepFor(walkedTo, mayWalk, nearestYards);
+                if (focusStep == OverseerDecisions::CraftFocusStep::Walk)
+                {
+                    std::string const aim = OverseerDecisions::FocusSpawnAim(nearest);
+                    if (_travelAims.Claim(name, aim, OverseerDecisions::TravelOwner::TownTrip) &&
+                        SayCraftPrepOnce(name, "walking to " + aim))
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' needs an Anvil for '{}' ({}) - walked to the "
+                                 "nearest one, {:.0f}y away at '{}' (#524)",
+                                 name, info->SpellName[LOCALE_enUS], spellId, nearestYards, aim);
+                    continue;
+                }
+                if (focusStep == OverseerDecisions::CraftFocusStep::NoneNear)
+                {
+                    if (SayCraftPrepOnce(name, "no anvil near"))
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' needs an Anvil for '{}' ({}) and none stands "
+                                 "within {:.0f}y on map {} - not walked across the world for "
+                                 "one; the errand stands (#524)",
+                                 name, info->SpellName[LOCALE_enUS], spellId,
+                                 OverseerDecisions::CRAFT_FOCUS_WALK_LIMIT_YARDS, bot->GetMapId());
+                    continue;
+                }
+
                 // A CONJURABLE FOCUS IS PROVIDED, not waited for (#534).
                 uint32 const lighter =
                     OverseerDecisions::FocusLighterSpell(info->RequiresSpellFocus);
