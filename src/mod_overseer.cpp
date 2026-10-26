@@ -33563,9 +33563,10 @@ private:
             // Service Entrance, stands at x 3185.48 - locked (flags 34, lock
             // 879), closed (state 1), opened in practice by the Key to the City
             // or by its button, gameobject 175432 at (3191.1, -4044.29), which
-            // no bot presses. With that gateway polygon treated as shut the
-            // walk out reaches nothing past the five; with it open, as the
-            // navmesh is built (it does not model doors), the same walk reaches
+            // DriveStratholmeYard presses (#645). With that gateway polygon
+            // treated as shut the walk out reaches nothing past the five; with
+            // it open, as the navmesh is built (it does not model doors), the
+            // same walk reaches
             // 23472 polygons, the main gate among them. So the gateway is the
             // only way out. The portcullis to the east, gameobject 175370 at
             // (3271.52, -4064.31), is not on the yard's edge at all: no
@@ -33575,9 +33576,10 @@ private:
             // door stops a bot's walk, and that has not been measured; a way
             // out through a locked door is not one this module counts on. The
             // rows are kept, not deleted: a party found inside map 329 after a
-            // restart is still adopted and walked to 2221, and a row comes off
-            // the withheld list once a way out exists (a button press, or a
-            // surveyed exit).
+            // restart is still adopted and walked to 2221. The way out now
+            // exists (DriveStratholmeYard: walk, button, or each member's own
+            // hearth, #645), and the rows come off the withheld list once a
+            // live run has been seen leaving the yard by it.
             //
             // areatrigger.sql: (2214,0,3237.46,-4060.6,112.01,0,10,10,10,0)
             // areatrigger_teleport.sql: (2214,'Stratholme - Eastern Plaguelands Instance',329,3593.15,-3646.56,138.5,5.33)
@@ -35928,6 +35930,224 @@ private:
         }
         return OverseerDecisions::ExitHearthHoldsAdoption(
             steps, static_cast<uint32>(std::time(nullptr) - episode.since));
+    }
+
+    // ---- a Stratholme run's way out of the exit yard (#645) -------------------
+    //
+    // Every Stratholme run leaves map 329 by areatrigger 2221, which lands in a
+    // yard closed except through the Elders' Square Service Entrance (see the
+    // stratholme-undead row). A player opens it with the button inside the
+    // yard or hearths out, and so does this: an EXIT through 2221 opens an
+    // episode for the family, and each poll reads the door, asks
+    // OverseerDecisions::DecideStratholmeExit and does what it says. Walk aims
+    // the one walking out past the open door; Button walks it to the button and
+    // presses it with CMSG_GAMEOBJ_USE, the packet a client sends; Hearth casts
+    // each member's own hearthstone through DriveExitHearths. No other teleport
+    // is ordered. The episode ends when nobody is left in the yard, when no way
+    // out is left, or at its ceiling, and the coordinator waits while it runs.
+    struct StratholmeYardEpisode
+    {
+        std::time_t since{0};
+        std::time_t buttonWalkSince{0};
+        unsigned presses{0};
+        std::string said;     // the last way-out line, so it is said once
+        std::string walker;   // whose aim the episode holds
+        std::string aim;
+        ExitHearthEpisode hearth;
+    };
+    std::map<std::string, StratholmeYardEpisode> _stratholmeYards;
+
+    void OpenStratholmeYard(std::string const& family, DungeonPortal const& portal,
+                            DungeonRunCoordinatorState const& run)
+    {
+        if (portal.exitTriggerId != OverseerDecisions::STRATHOLME_YARD_EXIT_TRIGGER)
+            return;
+        StratholmeYardEpisode yard;
+        yard.since = std::time(nullptr);
+        // The hearth leg's timeline rows are the run's own.
+        yard.hearth.runId = run.runId ? run.runId : ActiveRunIdOnMap(portal.insideMapId);
+        yard.hearth.campaignId = run.campaignId;
+        yard.hearth.runNumber = run.runNumber;
+        yard.hearth.portal = portal.keyword;
+        _stratholmeYards[family] = yard;
+        LOG_INFO("module.overseer",
+                 "overseer: family '{}' left '{}' by areatrigger {} into the exit yard; "
+                 "the way out is read from the Service Entrance on the next poll",
+                 family, portal.keyword, portal.exitTriggerId);
+    }
+
+    static std::vector<Player*> MembersInStratholmeYard(std::vector<std::string> const& members)
+    {
+        std::vector<Player*> inYard;
+        for (std::string const& name : members)
+        {
+            Player* member = ObjectAccessor::FindPlayerByName(name);
+            if (member && member->IsInWorld() &&
+                OverseerDecisions::InStratholmeExitYard(member->GetMapId(),
+                                                        member->GetPositionX(),
+                                                        member->GetPositionY()))
+                inYard.push_back(member);
+        }
+        return inYard;
+    }
+
+    // The members whose own hearthstone takes them out of the yard, and those
+    // already casting one.
+    std::vector<std::string> StratholmeHearthers(std::vector<Player*> const& inYard) const
+    {
+        std::vector<std::string> hearthers;
+        for (Player* member : inYard)
+        {
+            uint32 const stone = HearthstoneSpellOf(member);
+            if (HearthPendingFor(member->GetName()) ||
+                OverseerDecisions::StratholmeHearthLeavesTheYard(
+                    stone && !member->HasSpellCooldown(stone), member->m_homebindMapId,
+                    member->m_homebindX, member->m_homebindY))
+                hearthers.push_back(member->GetName());
+        }
+        return hearthers;
+    }
+
+    void AimStratholmeWalker(StratholmeYardEpisode& yard, Player* walker, float x, float y,
+                             float z)
+    {
+        std::ostringstream at;
+        at << "at:0:" << x << ',' << y << ',' << z;
+        if (!yard.walker.empty() && yard.walker != walker->GetName())
+            _travelAims.ReleaseRunAim(yard.walker, yard.aim, "the Stratholme yard way out");
+        yard.walker = walker->GetName();
+        yard.aim = at.str();
+        _travelAims.Claim(yard.walker, yard.aim, OverseerDecisions::TravelOwner::Run);
+    }
+
+    void CloseStratholmeYard(std::string const& family, StratholmeYardEpisode const& yard)
+    {
+        if (!yard.walker.empty())
+            _travelAims.ReleaseRunAim(yard.walker, yard.aim, "the Stratholme yard way out");
+        _stratholmeYards.erase(family);
+    }
+
+    void PressStratholmeButton(StratholmeYardEpisode& yard, Player* walker, GameObject* button,
+                               std::time_t now)
+    {
+        if (!yard.buttonWalkSince)
+            yard.buttonWalkSince = now;
+        if (walker->GetDistance(button) > button->GetInteractionDistance())
+        {
+            AimStratholmeWalker(yard, walker, button->GetPositionX(), button->GetPositionY(),
+                                button->GetPositionZ());
+            return;
+        }
+        ++yard.presses;
+        DriveGameObjectUse(walker->GetSession(), button->GetGUID());
+        LOG_INFO("module.overseer",
+                 "overseer: stratholme exit: '{}' pressed the Service Entrance button "
+                 "(press {} of {}); the door is read again on the next poll",
+                 walker->GetName(), yard.presses, OverseerDecisions::STRATHOLME_BUTTON_PRESSES);
+    }
+
+    // ONE POLL OF THE WAY OUT. Returns whether the episode is still running,
+    // which holds the coordinator for the family.
+    bool DriveStratholmeYard(std::string const& family, std::string const& leaderName,
+                             std::vector<std::string> const& members)
+    {
+        auto const found = _stratholmeYards.find(family);
+        if (found == _stratholmeYards.end())
+            return false;
+        StratholmeYardEpisode& yard = found->second;
+        std::time_t const now = std::time(nullptr);
+        std::vector<Player*> const inYard = MembersInStratholmeYard(members);
+        if (inYard.empty())
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: stratholme exit: every member of '{}' is out of the yard",
+                     family);
+            CloseStratholmeYard(family, yard);
+            return false;
+        }
+        if (now - yard.since >= static_cast<std::time_t>(
+                                    OverseerDecisions::STRATHOLME_YARD_EPISODE_SECONDS))
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: stratholme exit: {} of '{}' still in the yard after {} "
+                     "minutes; the way out gives up and the ordinary drives take them",
+                     static_cast<uint32>(inYard.size()), family,
+                     OverseerDecisions::STRATHOLME_YARD_EPISODE_SECONDS / 60);
+            CloseStratholmeYard(family, yard);
+            return false;
+        }
+
+        Player* walker = inYard.front();
+        for (Player* member : inYard)
+            if (member->GetName() == leaderName)
+                walker = member;
+        GameObject* const door = walker->FindNearestGameObject(
+            OverseerDecisions::STRATHOLME_SERVICE_ENTRANCE_ENTRY,
+            OverseerDecisions::STRATHOLME_YARD_SEARCH_YARDS);
+        GameObject* const button = walker->FindNearestGameObject(
+            OverseerDecisions::STRATHOLME_SERVICE_BUTTON_ENTRY,
+            OverseerDecisions::STRATHOLME_YARD_SEARCH_YARDS);
+        std::vector<std::string> const hearthers = StratholmeHearthers(inYard);
+
+        OverseerDecisions::StratholmeExitFacts facts;
+        facts.doorOpen = door && door->GetGoState() == GO_STATE_ACTIVE;
+        facts.buttonInReach = OverseerDecisions::StratholmeButtonInReach(
+            button && button->isSpawned(), yard.presses,
+            yard.buttonWalkSince ? static_cast<uint32>(now - yard.buttonWalkSince) : 0u);
+        facts.hearthAvailable = !hearthers.empty();
+        OverseerDecisions::StratholmeExitWay const way =
+            OverseerDecisions::DecideStratholmeExit(facts);
+
+        char const* const doorWord = facts.doorOpen ? "open" : "closed";
+        std::string const line =
+            std::string(doorWord) + "/" + OverseerDecisions::StratholmeExitWayWord(way);
+        if (yard.said != line)
+        {
+            yard.said = line;
+            LOG_INFO("module.overseer", "overseer: stratholme exit: door {}, way out {}",
+                     doorWord, OverseerDecisions::StratholmeExitWayWord(way));
+        }
+
+        switch (way)
+        {
+            case OverseerDecisions::StratholmeExitWay::Walk:
+                AimStratholmeWalker(
+                    yard, walker,
+                    door->GetPositionX() - OverseerDecisions::STRATHOLME_WALK_OUT_YARDS,
+                    door->GetPositionY(), door->GetPositionZ());
+                return true;
+
+            case OverseerDecisions::StratholmeExitWay::Button:
+                // buttonInReach already needs a spawned button; the guard keeps
+                // that promise at the call that dereferences it.
+                if (!button)
+                    return true;
+                PressStratholmeButton(yard, walker, button, now);
+                return true;
+
+            case OverseerDecisions::StratholmeExitWay::Hearth:
+                if (!yard.hearth.since)
+                    yard.hearth.since = now;
+                if (DriveExitHearths(family, leaderName, hearthers, yard.hearth,
+                                     "STRATHOLME_YARD"))
+                    return true;
+                LOG_WARN("module.overseer",
+                         "overseer: stratholme exit: no hearth is left in play for the {} of "
+                         "'{}' still in the yard; the ordinary drives take them",
+                         static_cast<uint32>(inYard.size()), family);
+                CloseStratholmeYard(family, yard);
+                return false;
+
+            case OverseerDecisions::StratholmeExitWay::None:
+                break;
+        }
+        LOG_WARN("module.overseer",
+                 "overseer: stratholme exit: the door is shut, the button is out of reach "
+                 "and no member in the yard can hearth out, so '{}' is left to the ordinary "
+                 "drives",
+                 family);
+        CloseStratholmeYard(family, yard);
+        return false;
     }
 
     // WHERE A RUN STANDS, in the words the fetch rule reads (2026-09-23). Here
@@ -51968,6 +52188,11 @@ private:
             }
         }
 
+        // A FAMILY IN STRATHOLME'S EXIT YARD IS GOT OUT OF IT BEFORE ANYTHING
+        // ELSE IS DECIDED FOR IT (#645). See DriveStratholmeYard.
+        if (DriveStratholmeYard(family, leaderName, members))
+            return;
+
         if (coord.phase == DungeonRunPhase::Idle)
         {
             // job != 'dungeon' is the ordinary case - most polls, this drive
@@ -54141,6 +54366,9 @@ private:
                                  "areatrigger {} and are on map {} - the run is over",
                                  static_cast<uint32>(members.size()), triggerId,
                                  portal->outsideMapId);
+                        // AND A RUN THAT LEFT INTO STRATHOLME'S EXIT YARD
+                        // IS WALKED OR HEARTHED OUT OF IT (#645).
+                        OpenStratholmeYard(family, *portal, coord);
                         // THE ONE PRECONDITION A RESET CANNOT BE GIVEN BY
                         // ANYTHING ELSE (#144): every member out of the
                         // instance. EXIT is what establishes it, and this is
