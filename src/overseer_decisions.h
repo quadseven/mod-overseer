@@ -2274,6 +2274,18 @@ bool DungeonRunBarrierMet(std::vector<DungeonRunMemberState> const& members,
 std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& members,
                                       ApproachLimits const& limits);
 
+// THE MEMBERS ALREADY THROUGH THE DOOR THAT THE BARRIER COUNTS AS STAGED (#165):
+// inside, seen, alive and out of combat, comma separated, empty when none. The
+// blockers line above leaves them out, because they are not what it is waiting
+// on; this is what names them, so "inside already" and "not seen" are never
+// confused for the same member again.
+std::string DungeonRunBarrierInsideAlready(std::vector<DungeonRunMemberState> const& members);
+
+// THE WHOLE "BARRIER holds - ..." SENTENCE: the blockers, then
+// "; inside already, counted as staged: <names>" when anybody is.
+std::string DungeonRunBarrierHolds(std::vector<DungeonRunMemberState> const& members,
+                                   ApproachLimits const& limits);
+
 // SHOULD THIS MEMBER BE HELD WHERE IT STANDS UNTIL THE BARRIER OPENS (#346)?
 //
 // WHAT ARRIVING AT A STAGING POINT ACTUALLY DOES TODAY. Nothing in this module
