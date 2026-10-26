@@ -2274,6 +2274,18 @@ bool DungeonRunBarrierMet(std::vector<DungeonRunMemberState> const& members,
 std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& members,
                                       ApproachLimits const& limits);
 
+// THE MEMBERS ALREADY THROUGH THE DOOR THAT THE BARRIER COUNTS AS STAGED (#165):
+// inside, seen, alive and out of combat, comma separated, empty when none. The
+// blockers line above leaves them out, because they are not what it is waiting
+// on; this is what names them, so "inside already" and "not seen" are never
+// confused for the same member again.
+std::string DungeonRunBarrierInsideAlready(std::vector<DungeonRunMemberState> const& members);
+
+// THE WHOLE "BARRIER holds - ..." SENTENCE: the blockers, then
+// "; inside already, counted as staged: <names>" when anybody is.
+std::string DungeonRunBarrierHolds(std::vector<DungeonRunMemberState> const& members,
+                                   ApproachLimits const& limits);
+
 // SHOULD THIS MEMBER BE HELD WHERE IT STANDS UNTIL THE BARRIER OPENS (#346)?
 //
 // WHAT ARRIVING AT A STAGING POINT ACTUALLY DOES TODAY. Nothing in this module
@@ -9353,9 +9365,25 @@ struct BoardApproachLimits
 // step from it, however many polls that takes, so that case never boards. The
 // distance is bounded by `maxApproaches`. Waiting for the boat (Hold) asks
 // with `approachesSoFar` zero, so the walker is already close when it docks.
+//
+// A STEP ABOARD TAKEN THIS STOP IS NOT UNDONE (#758). The step walks the
+// walker from the berth onto the nearest deck edge the map confirms, and that
+// edge is not always within `fromBerthYards` of the berth: at the Azuremyst
+// dock (map 530) it is 9.2 yards out, at the Kalimdor docks 3.9. The bot AI
+// does not always attach a walker the moment he stands on the deck (a 3.9-yard
+// step missed twice before it sailed), so the next Board poll can find him on
+// the deck edge, not aboard, and more than `fromBerthYards` from the berth.
+// Reading that as "close on the berth" walked him back off the deck with a
+// pathed step: four times in twelve minutes on 2026-10-24 he read 28 yards out
+// fifteen seconds later, the crossing said Walk, and his cross hold was
+// released with the ship still docked. So while `steppedAboardThisStop` holds
+// (the caller clears it when the reading leaves Board), a level walker is
+// stepped aboard again from where he stands. A walker no longer level with the
+// berth (in the water) still closes on it first.
 BoardApproach BoardApproachFrom(bool levelWithBerth, float berthYards,
                                 std::uint32_t approachesSoFar,
-                                BoardApproachLimits const& limits);
+                                BoardApproachLimits const& limits,
+                                bool steppedAboardThisStop = false);
 
 // ------------------- a crossing's hold that no crossing read this poll (#758) --
 //
@@ -20343,6 +20371,106 @@ constexpr unsigned SPELL_FOCUS_COOKING_FIRE = 4;
 constexpr unsigned SPELL_BASIC_CAMPFIRE = 818;
 unsigned FocusLighterSpell(unsigned requiresSpellFocus);
 
+// ANVIL, HAMMER: THE TWO THINGS A WORN BLACKSMITHING RECIPE NEEDS (#524).
+//
+// Read from the spell data, not from a guide: Runed Copper Belt (2666) and
+// every worn recipe after it carry RequiresSpellFocus 1, "Anvil", and
+// RequiredTotemCategoryID 162, "Blacksmith Hammer". Neither is an equipped
+// weapon: the core's CheckCast asks Player::HasItemTotemCategory, which
+// looks at what is worn AND what is in the bags (PlayerStorage.cpp), so a
+// hammer in a bag is enough and nothing the character wields is touched.
+// No worn recipe carries an EquippedItemClass. An Anvil is a world spawn,
+// gameobject type 8 (GAMEOBJECT_TYPE_SPELL_FOCUS) with Data0 (focusId) 1;
+// Data1 is the 10 yard reach of the focus, not its id.
+constexpr unsigned SPELL_FOCUS_ANVIL = 1;
+constexpr unsigned TOTEM_CATEGORY_BLACKSMITH_HAMMER = 162;
+constexpr unsigned ITEM_BLACKSMITH_HAMMER = 5956;
+
+// Is this focus a world object the crafter is WALKED to? An Anvil only. A
+// Cooking Fire is lit where the crafter stands (FocusLighterSpell); a Forge
+// and everything else is left to the refusal it always got.
+bool FocusIsWalkedTo(unsigned requiresSpellFocus);
+
+// The item a family buys for a tool category, or 0 when none is known. The
+// operator's decision (#524): the Blacksmith Hammer is bought, kept in the
+// crafter's own bank, and taken out to craft.
+unsigned ToolItemForTotemCategory(unsigned totemCategory);
+
+// WHERE THE TOOL A RECIPE NEEDS IS, AND WHAT THE CRAFT DRIVE DOES ABOUT IT.
+//   NotNeeded / Carried  -> Cast: nothing to fetch.
+//   Banked, banker here  -> Withdraw, through the bank verb's own executor.
+//   Banked, no banker    -> WalkToBanker, only on job 'craft': a family on a
+//                           campaign job crafts where it waits and is never
+//                           walked off by the craft drive. Otherwise Wait.
+//   Missing              -> Request: a material request for the tool, which
+//                           the planner answers by buying it. Never conjured.
+enum class CraftToolPlace : uint8_t
+{
+    NotNeeded,
+    Carried,
+    Banked,
+    Missing,
+};
+enum class CraftToolStep : uint8_t
+{
+    Cast,
+    Withdraw,
+    WalkToBanker,
+    Wait,
+    Request,
+};
+CraftToolStep CraftToolStepFor(CraftToolPlace place, bool bankerInReach, bool mayWalk);
+char const* CraftToolStepWord(CraftToolStep step);
+
+// IS THE TOOL PUT BACK IN THE BANK NOW? Only a tool in the bags (never one that
+// is worn), only when no standing craft errand still needs it, only with a
+// banker in reach and the character able to bank (alive, out of combat, not
+// in flight, not trading). Nobody is walked to a banker to put it back: it
+// goes back the next time the character stands at one.
+bool CraftToolGoesBack(bool inBags, bool stillNeeded, bool bankerInReach, bool able);
+
+// A WORLD SPAWN OF A SPELL FOCUS, as the adapter reads it out of the
+// gameobject spawn table.
+struct FocusSpawn
+{
+    unsigned mapId{0};
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+};
+
+// How far the craft drive walks a crafter to an Anvil: a town, not a journey.
+// Zones are not levels and travel does not know that (AGENTS.md), so an Anvil
+// further than this is not walked to and the refusal stands.
+constexpr float CRAFT_FOCUS_WALK_LIMIT_YARDS = 400.f;
+// Within this of the nearest Anvil's spawn the crafter is already at it: the
+// focus reaches 10 yards and arrival at a place is 5. A refusal there is not
+// fixed by walking again, so it stands rather than looping a walk.
+constexpr float CRAFT_FOCUS_STANDING_YARDS = 8.f;
+
+// The index of the nearest spawn on `mapId` within `limitYards` (in the plane)
+// of (x, y), or -1 when there is none.
+int NearestFocusSpawn(std::vector<FocusSpawn> const& spawns, unsigned mapId, float x, float y,
+                      float limitYards);
+
+// WHAT A FOCUS REFUSAL LEADS TO. `nearestYards` is the plane distance to the
+// nearest spawn within the walk limit, negative when there is none.
+//   not walked to, or not job 'craft'   -> Stand (the refusal stands)
+//   no spawn within the limit           -> NoneNear
+//   within CRAFT_FOCUS_STANDING_YARDS   -> Stand (already there)
+//   otherwise                           -> Walk
+enum class CraftFocusStep : uint8_t
+{
+    Stand,
+    NoneNear,
+    Walk,
+};
+CraftFocusStep CraftFocusStepFor(bool walkedTo, bool mayWalk, float nearestYards);
+
+// The travel aim for a focus spawn, `at:<map>:<x>,<y>,<z>` in whole yards so it
+// fits the 32 character travel column.
+std::string FocusSpawnAim(FocusSpawn const& spawn);
+
 
 // A TRADE OPENED TO A SELFBOT HEAD IS ANSWERED LIKE A PERSON WOULD. mod-playerbots'
 // TradeStatusAction returns at once for a selfbot (a human is assumed at the
@@ -21887,6 +22015,35 @@ struct GuildOutmatchedMark
 // zone, inside `windowMinutes` of the death.
 bool OutmatchedHere(GuildOutmatchedMark const& mark, int64_t now, uint32_t mapId,
                     uint32_t zoneId, uint32_t windowMinutes);
+
+// A guild death-spot hearth-out that was refused because the character was
+// moving, or that ended with the character still on the death map, is retried
+// with the character held still. `tries` counts retries already asked this
+// episode; `boundTries` is the ceiling. Returns Retry while a retry is in
+// order and tries < boundTries; GiveUp once the bound is spent or the refusal
+// cannot be waited out.
+enum class HearthOutRetry
+{
+    Retry,
+    GiveUp,
+};
+
+HearthOutRetry DecideHearthOutRetry(char const* refusal, bool stillOnDeathMap,
+                                    unsigned tries, unsigned boundTries);
+
+// A member whose hearth-out failed is kept out of the zone it died in until
+// it has left the map or the guild moves it. True when the hearth-out failed,
+// the member still stands in the death zone, and the guild has not moved it.
+bool KeepOutOfDeathZone(bool hearthOutFailed, bool stillInDeathZone,
+                        bool guildMovedIt);
+
+// A death-spot hearth-out that cannot be driven now: the member carries no
+// hearthstone, its stone is on cooldown, or this episode's tries are spent.
+// Its answer is the `hearthOutFailed` that KeepOutOfDeathZone takes, so a
+// member killed far above its level is held where it stands rather than
+// handed back to the drives that walk it toward the killer again.
+bool HearthOutCannotSucceed(bool hasStone, bool stoneOnCooldown, unsigned tries,
+                            unsigned boundTries);
 
 // "corpse_run", "spirit_healer", "wait", "ladder": the words written to
 // overseer_death.ghost_recovery and to the log.
@@ -23534,8 +23691,10 @@ constexpr float GUILD_RUN_RESTED_MANA_PCT = 80.f;
 constexpr unsigned GUILD_RUN_REST_MAX_SECONDS = 120;
 constexpr unsigned GUILD_RUN_REST_REARM_SECONDS = 45;
 constexpr unsigned GUILD_RUN_REGROUP_WAIT_SECONDS = 180;
-// A pause or resume the dungeon module refused is asked again after this long.
+// A pause or resume the dungeon module refused is asked again after this long,
+// and each refusal in a row doubles the wait, up to the cap (GuildRunHoldRetry).
 constexpr unsigned GUILD_RUN_HOLD_RETRY_SECONDS = 15;
+constexpr unsigned GUILD_RUN_HOLD_RETRY_MAX_SECONDS = 240;
 
 // One living member inside, read for the rest.
 struct GuildRunMemberShape
@@ -23580,6 +23739,11 @@ struct GuildRunHoldFacts
     unsigned restMaxSeconds{GUILD_RUN_REST_MAX_SECONDS};
     // False inside GUILD_RUN_REST_REARM_SECONDS of a rest that timed out.
     bool restRearmed{true};
+    // A living Priest, Paladin, Shaman or Druid of the run is inside: the read
+    // the stuck-revival drive makes for a corpse run (LivingResurrectorFor),
+    // and the dungeon module's own (DcRezRecovery::CanRecover). Without one the
+    // dungeon module refuses `dc pause resume` while a member lies dead.
+    bool livingResurrector{true};
 };
 
 enum class GuildRunHoldStep : std::uint8_t
@@ -23620,7 +23784,36 @@ struct GuildRunHold
 // players drinks first, then raises its dead, then pulls. So with a body
 // inside, a group under a trigger rests (bounded as any rest), and the hold is
 // let go for the rez once the living are over their triggers.
+//
+// NO RESUME NOBODY CAN TAKE (mod-overseer#1140). The dungeon module refuses a
+// resume while a member lies dead and no living member can resurrect them. In
+// Blackfathom run 1189170 (2026-10-24) the hold let go for the body anyway and
+// the resume was refused 89 times in 82 minutes, every 15 s, while the corpse
+// run released the same member to a ghost about every 14 minutes. So with a
+// body inside and no living resurrector the hold is kept (why Dead) until the
+// corpse run's release takes the body out (its rez budget) and the ghost walks
+// back in. A rest under way is still a rest until its bound.
 GuildRunHold GuildRunHoldNext(GuildRunHoldFacts const& facts);
+
+// THE HOLD'S RETRY CLOCK. A refused pause or resume is not asked again for
+// GUILD_RUN_HOLD_RETRY_SECONDS, doubled for each refusal in a row up to
+// GUILD_RUN_HOLD_RETRY_MAX_SECONDS; an accepted one starts it again.
+struct GuildRunHoldRetry
+{
+    unsigned refusals{0};
+    std::time_t refusedAt{0};
+};
+
+// The wait after `refusals` refusals in a row: 0 for none, then 15, 30, 60,
+// 120, 240, 240, ...
+unsigned GuildRunHoldRetrySeconds(unsigned refusals);
+// May the hold be asked at `now`?
+bool GuildRunHoldMayAsk(GuildRunHoldRetry const& retry, std::time_t now);
+// A refusal at `now`: true when it is the first of a run of refusals, so the
+// reason is said once.
+bool GuildRunHoldRefused(GuildRunHoldRetry& retry, std::time_t now);
+// An accepted pause or resume: the refusals before it, and the clock is reset.
+unsigned GuildRunHoldAccepted(GuildRunHoldRetry& retry);
 
 // FOCUS FIRE ON A SKULL. In 39 of 45 Deadmines first wipes (2026-10-08 to
 // 2026-10-10) the group went down in one fight, and the tank died first in 32.
@@ -23726,6 +23919,27 @@ GuildRunResume ReadGuildRunResume(std::string const& result);
 // How long the next worldserver waits for a run's members to log back in.
 // The same quarter hour the stray pass has always given a leftover group.
 constexpr unsigned GUILD_RUN_ADOPT_SECONDS = 15 * 60;
+
+// HOW FAR BACK THE RESTART READS REACH (#1138). Both restart reads of a guild
+// finder row, RestoreGuildRunFinderDungeons and the DriveGuildRunStrays
+// adoption read, used to take only rows created in the last 3 hours. That
+// predates the boss-scaled ceiling: at the roll of 2026-10-24 a Blackfathom run
+// 12263 s inside, 4 of 7 bosses down and well inside its 14400 s ceiling, was
+// never read, and the claim sweep ended it. A run may live its map's ceiling
+// plus GUILD_RUN_PROGRESS_EXTENSION_SECONDS (the longest extension), and its
+// row is created before the group is formed and goes in, so the window is the
+// largest ceiling, plus that extension, plus GUILD_RUN_RESTART_MARGIN_SECONDS
+// for the time before it is inside. A row older than that is past every
+// ceiling and is not read.
+//
+// The largest ceiling: a seven-boss Blackfathom, 7 * 1800 + 1800 = 14400 s
+// (GuildRunCeilingForMap). The fifteen-boss Blackrock Depths wing row gets
+// 15 * GUILD_RUN_SECONDS_PER_BOSS = 13500 s. The test holds both under it.
+constexpr unsigned GUILD_RUN_LONGEST_CEILING_SECONDS = 7 * 30 * 60 + GUILD_RUN_CEILING_MARGIN_SECONDS;
+constexpr unsigned GUILD_RUN_RESTART_MARGIN_SECONDS = 30 * 60;
+constexpr unsigned GUILD_RUN_RESTART_WINDOW_SECONDS = GUILD_RUN_LONGEST_CEILING_SECONDS +
+                                                      GUILD_RUN_PROGRESS_EXTENSION_SECONDS +
+                                                      GUILD_RUN_RESTART_MARGIN_SECONDS;
 
 struct GuildRunAdoptFacts
 {
@@ -26406,6 +26620,14 @@ std::size_t RecoveriesPerHour(std::vector<time_t> const& remedyTimes,
 // Whether `entry` is one of the live lockbox entries DriveLockpick trains on
 // (the 1-100 open-world bracket, entries from the pinned world database).
 bool IsLockpickTargetEntry(std::uint32_t entry);
+
+// Whether a lockbox makes a lockpick target: a matching entry that is spawned,
+// in the bot's zone and within reach. The adapter feeds this three of its four
+// inputs - isSpawned, same zone, in range - and the entry match is the pure
+// predicate above, so this one is pure too and a test can exercise it without
+// a world, a bot, or a gameobject.
+bool IsLockpickTargetCandidate(std::uint32_t entry, bool spawned, bool sameZone,
+                               bool withinRange);
 
 // Whether a standing lockpick errand should be cleared because Lockpicking has
 // reached the level cap: the max achievable skill at a level is 5 * level.

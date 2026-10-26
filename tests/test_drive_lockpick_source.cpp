@@ -96,6 +96,20 @@ int main()
     if (Count(drive, "ClearLockpickErrand(name)") != 1)
         return Fail("DriveLockpick must clear the errand in exactly one place, the level cap");
 
+    // The zone-sweep predicate routes through IsLockpickTargetCandidate and
+    // passes isSpawned and the zone comparison; dropping either input fails.
+    std::size_t const checkStart = text.find("struct LockboxNearbyCheck");
+    std::size_t const checkEnd = text.find("};", checkStart);
+    if (checkStart == std::string::npos || checkEnd == std::string::npos)
+        return Fail("cannot find the LockboxNearbyCheck predicate");
+    std::string const checkBody = text.substr(checkStart, checkEnd - checkStart);
+    if (checkBody.find("IsLockpickTargetCandidate(") == std::string::npos)
+        return Fail("LockboxNearbyCheck must route its decision through IsLockpickTargetCandidate");
+    if (checkBody.find("go->isSpawned()") == std::string::npos)
+        return Fail("LockboxNearbyCheck must pass isSpawned to IsLockpickTargetCandidate");
+    if (checkBody.find("go->GetZoneId() == from->GetZoneId()") == std::string::npos)
+        return Fail("LockboxNearbyCheck must pass the zone comparison to IsLockpickTargetCandidate");
+
     std::cout << "test_drive_lockpick_source: all cases passed\n";
     return EXIT_SUCCESS;
 }

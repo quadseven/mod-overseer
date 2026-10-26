@@ -1321,6 +1321,23 @@ static GraveyardStruct const* SafeGraveyardNear(Player* bot, GraveyardStruct con
     return nullptr;
 }
 
+// A class the dungeon module elects to raise the dead (DcRezRecovery's
+// IsRezClass): the one read both the stuck-revival drive and the guild run's
+// rest hold make of "can anybody here resurrect".
+static bool IsResurrectorClass(Player const* member)
+{
+    switch (member->getClass())
+    {
+        case CLASS_PRIEST:
+        case CLASS_PALADIN:
+        case CLASS_SHAMAN:
+        case CLASS_DRUID:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static Player* LivingResurrectorFor(Player* dead)
 {
     Group* group = dead ? dead->GetGroup() : nullptr;
@@ -1334,16 +1351,8 @@ static Player* LivingResurrectorFor(Player* dead)
             continue;
         if (member->GetMapId() != dead->GetMapId())
             continue;
-        switch (member->getClass())
-        {
-            case CLASS_PRIEST:
-            case CLASS_PALADIN:
-            case CLASS_SHAMAN:
-            case CLASS_DRUID:
-                return member;
-            default:
-                break;
-        }
+        if (IsResurrectorClass(member))
+            return member;
     }
     return nullptr;
 }
@@ -8004,7 +8013,8 @@ void RestoreGuildRunFinderDungeons()
     QueryResult rows = CharacterDatabase.Query(
         "SELECT id, target_name, result FROM overseer_command WHERE kind = 'guild' "
         "AND command LIKE 'finder-run %' AND status = 'verifying' "
-        "AND created_at > NOW() - INTERVAL 3 HOUR");
+        "AND created_at > NOW() - INTERVAL {} SECOND",
+        OverseerDecisions::GUILD_RUN_RESTART_WINDOW_SECONDS);
     if (!rows)
         return;
     do
@@ -8370,6 +8380,7 @@ public:
         {
             _craftTimer = 0;
             DriveCraft();
+            ReturnCraftTools();
             DriveHeadTrades();
         }
         // Same ordering convention as DriveCraft just above, and the same
@@ -16443,10 +16454,14 @@ private:
     // is crafted out of thin air - the same "fail closed, not open" shape
     // every other drive in this file holds to.
     //
-    // ANVILS AND THE BLACKSMITH HAMMER (#524): Anvil-gated recipes are out of
-    // scope here, and the planner must not name one. The decisions and the
-    // swap-and-restore design are in docs/design/profession-crafting-drive.md,
-    // section "Anvil, Hammer and reagent-gated Blacksmithing recipes".
+    // ANVILS AND THE BLACKSMITH HAMMER (#524). A worn Blacksmithing recipe
+    // needs an Anvil (RequiresSpellFocus 1) and a Blacksmith Hammer (tool
+    // category 162, satisfied by one in the bags; nothing is equipped). The
+    // hammer is kept in the crafter's own bank and taken out to craft
+    // (CraftToolStepFor); a job 'craft' crafter refused for an Anvil is walked
+    // to the nearest one in town (CraftFocusStepFor); ReturnCraftTools puts the
+    // hammer back once nothing needs it. See docs/design/profession-crafting-
+    // drive.md, section "Anvil, Hammer and reagent-gated Blacksmithing recipes".
     //
     // A focus the crafter can conjure where it stands is provided instead
     // (OverseerDecisions::FocusLighterSpell, quadseven/mod-overseer#534):
@@ -16516,6 +16531,152 @@ private:
                      kin ? "family or guild" : "a stranger");
             _headTradeSeen.erase(name);
         }
+    }
+
+    // EVERY ANVIL IN THE WORLD, read once out of the gameobject spawn table
+    // (#524). BuildTravelIndex reads creature spawns only, and an Anvil has no
+    // creature paired with it the way a guild vault has its banker, so this is
+    // a second, narrow index: type 8 GAMEOBJECT_TYPE_SPELL_FOCUS, focusId (Data0)
+    // naming a focus the craft drive walks to. Spawns only change on a restart,
+    // so it is built on first use and kept.
+    std::vector<OverseerDecisions::FocusSpawn> _anvilSpawns;
+    bool _anvilSpawnsBuilt = false;
+
+    std::vector<OverseerDecisions::FocusSpawn> const& AnvilSpawns()
+    {
+        if (_anvilSpawnsBuilt)
+            return _anvilSpawns;
+        _anvilSpawnsBuilt = true;
+        // GetAllGOData  ObjectMgr.h  GameObjectDataContainer const& GetAllGOData() const
+        for (auto const& [spawnId, data] : sObjectMgr->GetAllGOData())
+        {
+            (void)spawnId;
+            GameObjectTemplate const* proto = sObjectMgr->GetGameObjectTemplate(data.id);
+            if (!proto || proto->type != GAMEOBJECT_TYPE_SPELL_FOCUS ||
+                !OverseerDecisions::FocusIsWalkedTo(proto->spellFocus.focusId))
+                continue;
+            OverseerDecisions::FocusSpawn spawn;
+            spawn.mapId = data.mapid;
+            spawn.x = data.posX;
+            spawn.y = data.posY;
+            spawn.z = data.posZ;
+            _anvilSpawns.push_back(spawn);
+        }
+        LOG_INFO("module.overseer",
+                 "overseer: indexed {} Anvil spawn(s) for the craft drive (#524)",
+                 _anvilSpawns.size());
+        return _anvilSpawns;
+    }
+
+    // A tool of this category sitting in the character's own bank: its 28
+    // slots and every bag in a bank bag slot. The bags and what is worn are
+    // Player::HasItemTotemCategory's half; this is the half it does not read.
+    static Item* FindBankedTool(Player* who, uint32 totemCategory)
+    {
+        for (uint8 slot = BANK_SLOT_ITEM_START; slot < BANK_SLOT_ITEM_END; ++slot)
+            if (Item* item = who->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                if (who->IsTotemCategoryCompatiableWith(item->GetTemplate(), totemCategory))
+                    return item;
+        for (uint8 bagSlot = BANK_SLOT_BAG_START; bagSlot < BANK_SLOT_BAG_END; ++bagSlot)
+        {
+            Bag* bag = who->GetBagByPos(bagSlot);
+            if (!bag)
+                continue;
+            for (uint32 i = 0; i < bag->GetBagSize(); ++i)
+                if (Item* item = bag->GetItemByPos(i))
+                    if (who->IsTotemCategoryCompatiableWith(item->GetTemplate(), totemCategory))
+                        return item;
+        }
+        return nullptr;
+    }
+
+    // A tool of this category in the character's bags (backpack and worn
+    // bags), never one that is equipped: a weapon in hand is not put away.
+    static Item* FindBaggedTool(Player* who, uint32 totemCategory)
+    {
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            if (Item* item = who->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                if (who->IsTotemCategoryCompatiableWith(item->GetTemplate(), totemCategory))
+                    return item;
+        for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+        {
+            Bag* bag = who->GetBagByPos(bagSlot);
+            if (!bag)
+                continue;
+            for (uint32 i = 0; i < bag->GetBagSize(); ++i)
+                if (Item* item = bag->GetItemByPos(i))
+                    if (who->IsTotemCategoryCompatiableWith(item->GetTemplate(), totemCategory))
+                        return item;
+        }
+        return nullptr;
+    }
+
+    static bool SpellNeedsTool(SpellInfo const* info, uint32 totemCategory)
+    {
+        for (uint8 t = 0; t < info->TotemCategory.size(); ++t)
+            if (info->TotemCategory[t] == totemCategory)
+                return true;
+        return false;
+    }
+
+    // Said once per character and state, so a hammer waiting for a banker is
+    // one line and not one per poll. World thread only.
+    std::map<std::string, std::string> _craftPrepSaid;
+
+    bool SayCraftPrepOnce(std::string const& name, std::string const& said)
+    {
+        auto const it = _craftPrepSaid.find(name);
+        if (it != _craftPrepSaid.end() && it->second == said)
+            return false;
+        _craftPrepSaid[name] = said;
+        return true;
+    }
+
+    // THE HAMMER GOES BACK IN THE BANK (#524). The operator's decision is that
+    // the Blacksmith Hammer lives in the crafter's own bank and comes out to
+    // craft. Once no standing craft errand needs it, it is banked the next
+    // time the character stands in reach of a banker; nobody is walked to one
+    // for it. Through DoBank, the bank verb's executor, so the checks and the
+    // read-back are that verb's.
+    void ReturnCraftTools()
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name FROM overseer_roster WHERE enabled = 1");
+        if (!result)
+            return;
+        std::map<std::string, uint32> const errands = LoadCraftErrands();
+        uint32 const category = OverseerDecisions::TOTEM_CATEGORY_BLACKSMITH_HAMMER;
+        do
+        {
+            std::string const name = result->Fetch()[0].Get<std::string>();
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            if (!bot || !bot->IsInWorld())
+                continue;
+            Item* tool = FindBaggedTool(bot, category);
+            if (!tool)
+                continue;
+            bool stillNeeded = false;
+            auto const errand = errands.find(name);
+            if (errand != errands.end())
+                if (SpellInfo const* info = sSpellMgr->GetSpellInfo(errand->second))
+                    stillNeeded = SpellNeedsTool(info, category);
+            bool const able = bot->IsAlive() && !bot->IsInCombat() && !bot->IsInFlight() &&
+                              !bot->GetTradeData();
+            bool anyBanker = false;
+            bool const bankerInReach =
+                !stillNeeded && able && BankerInReach(bot, anyBanker) != nullptr;
+            if (!OverseerDecisions::CraftToolGoesBack(true, stillNeeded, bankerInReach, able))
+                continue;
+            char const* status = "error";
+            std::string out;
+            DoBank(bot, "deposit guid:" + std::to_string(tool->GetGUID().GetCounter()), status, out);
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' put its {} back in the bank, no craft errand needs it "
+                     "(#524): {}{}{}",
+                     name, tool->GetTemplate()->Name1, status, out.empty() ? "" : " - ",
+                     out.substr(0, 300));
+            _craftPrepSaid.erase(name);
+        } while (result->NextRow());
     }
 
     void DriveCraft()
@@ -16612,6 +16773,94 @@ private:
             if (shortOfReagents)
                 continue;
 
+            // THE TOOL A RECIPE NEEDS (#524). CheckCast asks
+            // Player::HasItemTotemCategory, which reads what is worn and what
+            // is in the bags; the Blacksmith Hammer is kept in the bank, so the
+            // bank is the half asked here. Decided before the cast because the
+            // core refuses the Anvil first, and the banker is the walk to take
+            // before the Anvil, not after it.
+            bool const mayWalk = jobIt->second == "craft";
+            OverseerDecisions::CraftToolPlace toolPlace = OverseerDecisions::CraftToolPlace::NotNeeded;
+            uint32 toolCategory = 0;
+            Item* bankedTool = nullptr;
+            for (uint8 t = 0; t < info->TotemCategory.size(); ++t)
+            {
+                uint32 const category = info->TotemCategory[t];
+                if (!category || bot->HasItemTotemCategory(category))
+                    continue;
+                toolCategory = category;
+                bankedTool = FindBankedTool(bot, category);
+                toolPlace = bankedTool ? OverseerDecisions::CraftToolPlace::Banked
+                                       : OverseerDecisions::CraftToolPlace::Missing;
+                break;
+            }
+            bool anyBanker = false;
+            bool const bankerInReach = toolPlace == OverseerDecisions::CraftToolPlace::Banked &&
+                                       BankerInReach(bot, anyBanker) != nullptr;
+            OverseerDecisions::CraftToolStep const toolStep =
+                OverseerDecisions::CraftToolStepFor(toolPlace, bankerInReach, mayWalk);
+            if (toolStep == OverseerDecisions::CraftToolStep::Withdraw)
+            {
+                char const* status = "error";
+                std::string out;
+                DoBank(bot, "withdraw guid:" + std::to_string(bankedTool->GetGUID().GetCounter()),
+                       status, out);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' took its {} out of the bank to craft '{}' ({}) (#524): "
+                         "{}{}{}",
+                         name, bankedTool->GetTemplate()->Name1, info->SpellName[LOCALE_enUS],
+                         spellId, status, out.empty() ? "" : " - ", out.substr(0, 300));
+                _craftPrepSaid.erase(name);
+                continue;   // cast on the next poll, with the tool in the bags
+            }
+            if (toolStep == OverseerDecisions::CraftToolStep::WalkToBanker)
+            {
+                if (_travelAims.Claim(name, "banker", OverseerDecisions::TravelOwner::TownTrip) &&
+                    SayCraftPrepOnce(name, "walking to a banker"))
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' needs the tool kept in its bank (category {}) for "
+                             "'{}' ({}) and no banker is in reach - walked to one (#524)",
+                             name, toolCategory, info->SpellName[LOCALE_enUS], spellId);
+                continue;
+            }
+            if (toolStep == OverseerDecisions::CraftToolStep::Wait)
+            {
+                if (SayCraftPrepOnce(name, "waiting for a banker"))
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' needs the tool kept in its bank (category {}) for "
+                             "'{}' ({}) and is on job '{}', which the craft drive does not walk "
+                             "anywhere - it takes the tool out the next time a banker is in "
+                             "reach (#524)",
+                             name, toolCategory, info->SpellName[LOCALE_enUS], spellId,
+                             jobIt->second);
+                continue;
+            }
+            if (toolStep == OverseerDecisions::CraftToolStep::Request)
+            {
+                // ASKED FOR, NEVER CONJURED. The same material request a
+                // missing reagent writes, keyed on the tool's item id, so the
+                // planner buys one (and the next poll after it lands in the
+                // bags crafts with it, and ReturnCraftTools banks it after).
+                uint32 const toolItem = OverseerDecisions::ToolItemForTotemCategory(toolCategory);
+                if (ItemTemplate const* proto = toolItem ? sObjectMgr->GetItemTemplate(toolItem) : nullptr)
+                {
+                    std::string detail = "need 1x ";
+                    detail += proto->Name1;
+                    detail += " (a tool, kept in the bank)";
+                    EventExtra extra;
+                    extra.itemGuid = toolItem;
+                    RecordEvent(bot, "material-request", spellId, info->SpellName[LOCALE_enUS],
+                                detail, extra);
+                }
+                if (SayCraftPrepOnce(name, "no tool"))
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' has no tool of category {} anywhere, bags or bank, "
+                             "for '{}' ({}) - asked for item {} and leaving the errand standing "
+                             "(#524)",
+                             name, toolCategory, info->SpellName[LOCALE_enUS], spellId, toolItem);
+                continue;
+            }
+
             // Off the mount first, through the handler a client drives for the
             // same reason (see the cast hold, #337): it does both Dismount()
             // and the aura removal.
@@ -16634,6 +16883,7 @@ private:
                          name, info->SpellName[LOCALE_enUS], spellId);
                 RecordEvent(bot, "craft", spellId, info->SpellName[LOCALE_enUS],
                             "crafted an item toward its profession");
+                _craftPrepSaid.erase(name);
                 continue;   // errand stays standing - Python re-asserts or replaces it
             }
 
@@ -16670,6 +16920,49 @@ private:
 
             if (result == SPELL_FAILED_REQUIRES_SPELL_FOCUS)
             {
+                // A WORLD FOCUS IN TOWN IS WALKED TO (#524): an Anvil, for a
+                // job 'craft' crafter, within a town's walk. Already at one,
+                // the refusal stands below rather than looping the walk.
+                bool const walkedTo = OverseerDecisions::FocusIsWalkedTo(info->RequiresSpellFocus);
+                float nearestYards = -1.f;
+                OverseerDecisions::FocusSpawn nearest;
+                if (walkedTo && mayWalk)
+                {
+                    std::vector<OverseerDecisions::FocusSpawn> const& anvils = AnvilSpawns();
+                    int const pick = OverseerDecisions::NearestFocusSpawn(
+                        anvils, bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(),
+                        OverseerDecisions::CRAFT_FOCUS_WALK_LIMIT_YARDS);
+                    if (pick >= 0)
+                    {
+                        nearest = anvils[pick];
+                        nearestYards = bot->GetExactDist2d(nearest.x, nearest.y);
+                    }
+                }
+                OverseerDecisions::CraftFocusStep const focusStep =
+                    OverseerDecisions::CraftFocusStepFor(walkedTo, mayWalk, nearestYards);
+                if (focusStep == OverseerDecisions::CraftFocusStep::Walk)
+                {
+                    std::string const aim = OverseerDecisions::FocusSpawnAim(nearest);
+                    if (_travelAims.Claim(name, aim, OverseerDecisions::TravelOwner::TownTrip) &&
+                        SayCraftPrepOnce(name, "walking to " + aim))
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' needs an Anvil for '{}' ({}) - walked to the "
+                                 "nearest one, {:.0f}y away at '{}' (#524)",
+                                 name, info->SpellName[LOCALE_enUS], spellId, nearestYards, aim);
+                    continue;
+                }
+                if (focusStep == OverseerDecisions::CraftFocusStep::NoneNear)
+                {
+                    if (SayCraftPrepOnce(name, "no anvil near"))
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' needs an Anvil for '{}' ({}) and none stands "
+                                 "within {:.0f}y on map {} - not walked across the world for "
+                                 "one; the errand stands (#524)",
+                                 name, info->SpellName[LOCALE_enUS], spellId,
+                                 OverseerDecisions::CRAFT_FOCUS_WALK_LIMIT_YARDS, bot->GetMapId());
+                    continue;
+                }
+
                 // A CONJURABLE FOCUS IS PROVIDED, not waited for (#534).
                 uint32 const lighter =
                     OverseerDecisions::FocusLighterSpell(info->RequiresSpellFocus);
@@ -16844,10 +17137,10 @@ private:
         {
             if (!go || !go->isSpawned())
                 return false;
-            if (!OverseerDecisions::IsLockpickTargetEntry(go->GetEntry()))
-                return false;
-            return from->IsWithinDistInMap(go, range) &&
-                   go->GetZoneId() == from->GetZoneId();
+            return OverseerDecisions::IsLockpickTargetCandidate(go->GetEntry(),
+                                                                go->isSpawned(),
+                                                                go->GetZoneId() == from->GetZoneId(),
+                                                                from->IsWithinDistInMap(go, range));
         }
     };
 
@@ -31128,47 +31421,141 @@ private:
                 GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES);
         }
         if (!outmatchedHere && !deathsHere)
+        {
+            // The member left the death zone: forget how many times we asked.
+            _guildDeathSpotTries.erase(name);
+            _guildDeathSpotRefusal.erase(name);
             return false;
+        }
+
+        // A hearth already cast is waiting for its verdict: stay in this path
+        // until ResolveHearthChecks reads it back.
+        if (HearthPendingFor(name))
+            return true;
+
         uint32 const stone = HearthstoneSpellOf(bot);
-        bool const hearthReady = stone && !bot->HasSpellCooldown(stone) && !HearthPendingFor(name);
+        bool const stoneOnCooldown = stone && bot->HasSpellCooldown(stone);
+        bool const hearthReady = stone && !stoneOnCooldown && !HearthPendingFor(name);
+        bool const inCombat = bot->IsInCombat();
+
+        unsigned& tries = _guildDeathSpotTries[name];
+        unsigned const boundTries = OverseerDecisions::EXIT_HEARTH_ATTEMPTS;
+
+        // Clear any walk something outside this module put on the member and
+        // hold it still, so a hearth is not broken by movement.
+        auto holdStill = [&]()
+        {
+            bot->GetMotionMaster()->Clear();
+            bot->StopMoving();
+            CastHoldReport hold;
+            HoldStillAndReport(bot, name, "hearth", hold);
+        };
+
+        auto keepMemberOut = [&]()
+        {
+            bool const keepOut = OverseerDecisions::KeepOutOfDeathZone(
+                true, outmatchedHere, false);
+            if (keepOut)
+                holdStill();
+            return keepOut;
+        };
+
+        // The hearth-out cannot succeed now (no stone, the stone on cooldown,
+        // or the tries spent): a member killed far above its level is held
+        // where it stands instead of being handed back to the drives that walk
+        // it toward the killer. Asked before GuildLeavesDeathSpot, which says
+        // Stay for a stone that is not ready and so released the member to
+        // walk back in. A member in combat is left to fight or flee.
+        if (!inCombat &&
+            OverseerDecisions::KeepOutOfDeathZone(
+                OverseerDecisions::HearthOutCannotSucceed(stone != 0, stoneOnCooldown, tries,
+                                                          boundTries),
+                outmatchedHere, false))
+        {
+            holdStill();
+            return true;
+        }
+
         if (OverseerDecisions::GuildLeavesDeathSpot(deathsHere, GHOST_RECOVERY_LIMITS.repeatDeaths,
-                                                    hearthReady, bot->IsInCombat(),
+                                                    hearthReady, inCombat,
                                                     outmatchedHere) !=
             OverseerDecisions::GuildDeathSpotStep::Hearth)
             return false;
+
+        // The bound is spent on a member hearthing out of repeat deaths (an
+        // outmatched one was held above): stop asking it every poll.
+        if (tries >= boundTries)
+            return keepMemberOut();
+
+        // The first hearth and every retry are driven with the member stopped:
+        // a cast driven while an outside walk moves the character is broken.
+        holdStill();
         char const* status = "error";
         std::string evidence;
         std::string const refusal = DoHearth(bot, "use", status, evidence, _pendingHearths, 0);
-        // A refusal that repeats every poll (bound at this spot, already
-        // casting) is said once, not once a poll.
-        std::string& said = _guildDeathSpotRefusal[name];
-        if (!refusal.empty() && said == refusal)
-            return false;
-        said = refusal;
-        if (outmatchedHere)
-            LOG_INFO("module.overseer",
-                     "overseer: '{}' (level {}) was killed in zone {} by a level {} creature, "
-                     "far above its own level, {}min ago and hearths out after that first death "
-                     "instead of trying again{}",
-                     name, bot->GetLevel(), outmatched.zoneId, outmatched.killerLevel,
-                     (now - outmatched.at) / 60,
-                     refusal.empty() ? std::string() : " - refused: " + refusal);
-        else
-            LOG_INFO("module.overseer",
-                     "overseer: '{}' (level {}) has died {} time(s) within {:.0f} yards of where "
-                     "it stands in {}min and hearths out instead of fighting on there{}",
-                     name, bot->GetLevel(), deathsHere, GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES,
-                     refusal.empty() ? std::string() : " - refused: " + refusal);
-        if (refusal.empty() && outmatchedHere)
+
+        if (refusal.empty())
         {
-            // Only the death this hearth answered: one the hook wrote since is
-            // a new death and keeps its own mark.
-            std::lock_guard<std::mutex> lock(g_guildOutmatchedMutex);
-            auto const mark = g_guildOutmatched.find(name);
-            if (mark != g_guildOutmatched.end() && mark->second.at == outmatched.at)
-                g_guildOutmatched.erase(mark);
+            // Cast started: the verdict comes later in ResolveHearthChecks. Do
+            // not erase the outmatched mark until we know the hearth arrived.
+            if (outmatchedHere)
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' (level {}) was killed in zone {} by a level {} creature, "
+                         "far above its own level, {}min ago and hearths out after that first death "
+                         "instead of trying again",
+                         name, bot->GetLevel(), outmatched.zoneId, outmatched.killerLevel,
+                         (now - outmatched.at) / 60);
+            else
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' (level {}) has died {} time(s) within {:.0f} yards of where "
+                         "it stands in {}min and hearths out instead of fighting on there",
+                         name, bot->GetLevel(), deathsHere, GHOST_REPEAT_RADIUS,
+                         GHOST_REPEAT_MINUTES);
+            ++tries;
+            return true;
         }
-        return refusal.empty();
+
+        // Refused: decide whether to retry or give up. The only refusal this
+        // poll can change is "character is moving" - the hold DoHearth placed
+        // stops the character, and the next poll finds it standing. A hearth
+        // that landed but left the character on the death map is still on the
+        // death map (the character is here and no hearth is in flight, so the
+        // previous cast stayed). The death map is the outmatched mark's map,
+        // or the current map when the repeat deaths counted here are on it.
+        bool const stillOnDeathMap =
+            (outmatched.at > 0 && outmatched.mapId == bot->GetMapId()) || deathsHere > 0;
+        OverseerDecisions::HearthOutRetry const step =
+            OverseerDecisions::DecideHearthOutRetry(refusal.c_str(), stillOnDeathMap, tries,
+                                                    boundTries);
+        if (step == OverseerDecisions::HearthOutRetry::GiveUp)
+        {
+            return keepMemberOut();
+        }
+
+        // Retry: the hold was already placed by DoHearth. Say the refusal once
+        // per distinct reason, but keep asking on every poll until the bound
+        // is spent.
+        std::string& said = _guildDeathSpotRefusal[name];
+        if (!refusal.empty() && said != refusal)
+        {
+            said = refusal;
+            if (outmatchedHere)
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' (level {}) was killed in zone {} by a level {} creature, "
+                         "far above its own level, {}min ago and hearths out after that first death "
+                         "instead of trying again - refused: {}",
+                         name, bot->GetLevel(), outmatched.zoneId, outmatched.killerLevel,
+                         (now - outmatched.at) / 60, refusal);
+            else
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' (level {}) has died {} time(s) within {:.0f} yards of where "
+                         "it stands in {}min and hearths out instead of fighting on there - "
+                         "refused: {}",
+                         name, bot->GetLevel(), deathsHere, GHOST_REPEAT_RADIUS,
+                         GHOST_REPEAT_MINUTES, refusal);
+        }
+        ++tries;
+        return true;
     }
 
     // ---------------------------------- a natural guild member's own trainer --
@@ -41195,7 +41582,10 @@ private:
         unsigned atDoorSaid{0};
         unsigned ghostsWalked{0};
         bool brainHeld{false};
-        std::time_t holdRefusedAt{0};
+        // Refusals of the pause or resume in a row (GuildRunHoldRetry), and
+        // whether "nobody can raise the body" was said for this hold (#1140).
+        OverseerDecisions::GuildRunHoldRetry holdRetry;
+        bool holdDeadSaid{false};
         std::time_t holdAssertedAt{0};
         std::time_t heldSince{0};
         std::time_t regroupSince{0};
@@ -42263,15 +42653,29 @@ private:
         return who.empty() ? std::string("nobody") : who;
     }
 
+    // The first member of the run lying dead in its dungeon, or empty.
+    static std::string GuildRunFirstDeadInside(GuildRun const& run)
+    {
+        for (std::string const& name : run.names)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            if (p && p->IsInWorld() && !p->IsAlive() && p->GetMapId() == run.mapId &&
+                (!run.instanceId || p->GetInstanceId() == run.instanceId))
+                return name;
+        }
+        return std::string();
+    }
+
     // Pause (`hold`) or resume the dungeon brain, from the tank, on every
     // living member inside: the elected leader takes it and a follower answers
     // true at once (DcPauseAction), as with `dc on`. True when nobody refused.
-    // A refusal is said and asked again after GUILD_RUN_HOLD_RETRY_SECONDS.
+    // A refusal is asked again after a wait that doubles with each refusal in
+    // a row (OverseerDecisions::GuildRunHoldRetry, #1140), and its reason is
+    // said once, on the first refusal, not every time it is asked.
     bool IssueGuildRunHold(GuildRun& run, bool hold, std::time_t now)
     {
         Player* const tank = ObjectAccessor::FindPlayerByName(run.tank);
-        if (!tank || !tank->IsInWorld() ||
-            now - run.holdRefusedAt < OverseerDecisions::GUILD_RUN_HOLD_RETRY_SECONDS)
+        if (!tank || !tank->IsInWorld() || !OverseerDecisions::GuildRunHoldMayAsk(run.holdRetry, now))
             return false;
         bool any = false;
         bool all = true;
@@ -42288,15 +42692,28 @@ private:
         if (any && all)
         {
             run.holdAssertedAt = now;
+            if (unsigned const refused = OverseerDecisions::GuildRunHoldAccepted(run.holdRetry))
+                LOG_INFO("module.overseer",
+                         "overseer: guild run rest {} - 'dc pause {}' from '{}' taken after {} "
+                         "refusal(s)",
+                         run.id, hold ? "pause" : "resume", run.tank, refused);
             return true;
         }
-        run.holdRefusedAt = now;
-        if (any)
+        if (!any)
+            return false;
+        if (OverseerDecisions::GuildRunHoldRefused(run.holdRetry, now))
+        {
+            // The dungeon module's own refusal (DcPauseAction), in its words.
+            std::string const dead = GuildRunFirstDeadInside(run);
             LOG_INFO("module.overseer",
-                     "overseer: guild run rest {} - 'dc pause {}' from '{}' refused (see "
-                     "playerbots.dungeonclear); asked again in {}s",
+                     "overseer: guild run rest {} - 'dc pause {}' from '{}' refused ({}); asked "
+                     "again in {}s, the wait doubling up to {}s while it is refused",
                      run.id, hold ? "pause" : "resume", run.tank,
-                     OverseerDecisions::GUILD_RUN_HOLD_RETRY_SECONDS);
+                     dead.empty() ? std::string("see playerbots.dungeonclear")
+                                  : dead + " is dead - rez and try again",
+                     OverseerDecisions::GuildRunHoldRetrySeconds(run.holdRetry.refusals),
+                     OverseerDecisions::GUILD_RUN_HOLD_RETRY_MAX_SECONDS);
+        }
         return false;
     }
 
@@ -42314,6 +42731,7 @@ private:
         facts.aliveInside = poll.aliveInside;
         facts.deadInside = poll.inside - poll.aliveInside;
         facts.ghostsComingBack = ghostsWalking;
+        bool resurrector = false;
         std::vector<OverseerDecisions::GuildRunMemberShape> living;
         for (std::size_t i = 0; i < run.names.size(); ++i)
         {
@@ -42322,10 +42740,13 @@ private:
                 continue;
             if (p->IsInCombat())
                 facts.anyFighting = true;
+            if (IsResurrectorClass(p))
+                resurrector = true;
             living.push_back(GuildRunShapeOf(
                 p, i < run.seats.size() && run.seats[i] == OverseerDecisions::GuildSeat::Healer));
         }
         facts.need = OverseerDecisions::GuildRunRestNeedOf(living);
+        facts.livingResurrector = resurrector;
         run.regroupSince =
             poll.aliveInside && ghostsWalking ? (run.regroupSince ? run.regroupSince : now) : 0;
         facts.secondsRegrouping =
@@ -42340,6 +42761,7 @@ private:
                 return;
             run.brainHeld = true;
             run.heldSince = now;
+            run.holdDeadSaid = false;
             run.restSince = hold.why == GuildRunHoldWhy::Rest ? now : 0;
             // The deploy proof: "guild run rest" is said nowhere else.
             if (hold.why == GuildRunHoldWhy::Regroup)
@@ -42375,6 +42797,7 @@ private:
             run.brainHeld = false;
             run.heldSince = 0;
             run.restSince = 0;
+            run.holdDeadSaid = false;
             return;
         }
         if (!run.brainHeld)
@@ -42391,6 +42814,21 @@ private:
             run.restSince = 0;
         else if (hold.why == GuildRunHoldWhy::Rest && !run.restSince)
             run.restSince = now;
+        // A body inside that nobody alive can raise keeps the hold (#1140):
+        // said once per hold, and the corpse run's release ends it.
+        if (hold.why == GuildRunHoldWhy::Dead && !run.holdDeadSaid)
+        {
+            run.holdDeadSaid = true;
+            std::string const dead = GuildRunFirstDeadInside(run);
+            LOG_INFO("module.overseer",
+                     "overseer: guild run rest {} - the dungeon brain stays held: '{}' lies dead "
+                     "inside and no living member can resurrect ({} is dead - rez and try "
+                     "again); the corpse run releases the body after {}s and the ghost walks "
+                     "back in",
+                     run.id, dead.empty() ? std::string("a member") : dead,
+                     dead.empty() ? std::string("a member") : dead,
+                     OverseerDecisions::GUILD_RUN_ROLE_RECOVERY_SECONDS);
+        }
         if (poll.aliveInside && !facts.anyFighting &&
             now - run.holdAssertedAt >= OverseerDecisions::GUILD_RUN_HOLD_RETRY_SECONDS)
             IssueGuildRunHold(run, true, now);
@@ -43180,10 +43618,10 @@ private:
                     "TIMESTAMPDIFF(SECOND, updated_at, NOW()) FROM overseer_command "
                     "WHERE kind = 'guild' AND command LIKE 'finder-run %' "
                     "AND ((status IN ('claimed', 'verifying') AND claimed_by <> '{}' "
-                    "AND created_at > NOW() - INTERVAL 3 HOUR) "
+                    "AND created_at > NOW() - INTERVAL {} SECOND) "
                     "OR (status = 'error' AND (detail LIKE 'lost at the restart:%' "
                     "OR detail LIKE 'restart:%') AND updated_at > NOW() - INTERVAL 3 HOUR))",
-                    g_runToken))
+                    g_runToken, OverseerDecisions::GUILD_RUN_RESTART_WINDOW_SECONDS))
                 do
                 {
                     Field* const fields = rows->Fetch();
@@ -45019,9 +45457,14 @@ private:
                 holdTheLeader();
                 bool const boardLevel = LevelWithBerth(leader, route);
                 float const fromBerth = leader->GetExactDist2d(route.berthX, route.berthY);
+                // ONCE HE HAS STEPPED THIS STOP he is stepped again, not walked
+                // back to the berth off the deck he is on (#758):
+                // crossingBoardStepSaid is set by the step and cleared when
+                // the reading leaves Board.
                 if (OverseerDecisions::BoardApproachFrom(boardLevel, fromBerth,
                                                          coord.crossingBoardApproaches,
-                                                         CROSSING_BOARD_APPROACH) ==
+                                                         CROSSING_BOARD_APPROACH,
+                                                         coord.crossingBoardStepSaid) ==
                         OverseerDecisions::BoardApproach::CloseOnBerth &&
                     boardLevel)
                 {
@@ -45598,6 +46041,10 @@ private:
         // row started, which fixes the stop it boards at while the transport
         // carries it past the others.
         uint32 boardApproaches{0};
+        // A step aboard was taken while the reading has said Board, so the
+        // next Board poll steps again rather than walking him back off the
+        // deck (#758). Cleared whenever the reading is not Board.
+        bool boardStepped{false};
         bool rideSameMap{false};
         float rideX{0.f};
         float rideY{0.f};
@@ -46329,6 +46776,7 @@ private:
         memo.jobFineSteps = 0;
         memo.jobSaidForeignWalk = false;
         memo.boardApproaches = 0;
+        memo.boardStepped = false;
         memo.rideX = memo.rideY = memo.rideFromX = memo.rideFromY = 0.f;
         _stepOffReleases.erase(name);
     }
@@ -46523,6 +46971,8 @@ private:
         // hold (taken below) must not be refused for it.
         if (memo.jobRow && step.action != OverseerDecisions::CrossingAction::Walk)
             CancelCrossBerthWalk(name, p, "the crossing no longer asks for a walk");
+        if (step.action != OverseerDecisions::CrossingAction::Board)
+            memo.boardStepped = false;
 
         uint8 const said = static_cast<uint8>(step.action);
         bool const fresh = memo.crossingSaid != said;
@@ -46613,9 +47063,11 @@ private:
                 holdIt();
                 // BOUNDED, so a berth nobody can stand within a few yards of
                 // never keeps the boat from being boarded at all.
+                // A WALKER ALREADY STEPPED ABOARD THIS STOP is stepped again,
+                // not walked back off the deck toward the berth (#758).
                 if (OverseerDecisions::BoardApproachFrom(
                         LevelWithBerth(p, route), p->GetExactDist2d(route.berthX, route.berthY),
-                        memo.boardApproaches, CROSSING_BOARD_APPROACH) ==
+                        memo.boardApproaches, CROSSING_BOARD_APPROACH, memo.boardStepped) ==
                     OverseerDecisions::BoardApproach::CloseOnBerth)
                 {
                     ++memo.boardApproaches;
@@ -46642,6 +47094,7 @@ private:
                                                 /*generatePath*/ false,
                                                 /*forceDestination*/ false);
                 LetHeldCharacterWalk(name, CROSSING_STEP_WALK_SECONDS);
+                memo.boardStepped = true;
                 if (fresh)
                     LOG_INFO("module.overseer",
                              "overseer: '{}' steps aboard '{}' at ({:.1f}, {:.1f}, {:.1f}) on "
@@ -54548,11 +55001,10 @@ private:
             state.alive = member->IsAlive();
             // IsInCombat  Unit.h:936  bool IsInCombat() const
             state.inCombat = member->IsInCombat();
-            // ALREADY THROUGH THE DOOR (#165). Recorded for the blockers line
-            // and for the give-up below, and for nothing else: the predicate
-            // still counts this member as not staged, because whether being
-            // ahead should satisfy a barrier is that issue's own question. What
-            // this fixes today is a run that spent forty-three minutes saying
+            // ALREADY THROUGH THE DOOR (#165). An inside member who is alive
+            // and out of combat counts as staged (DungeonRunBarrierMet), and
+            // the holds and satisfied lines name it as "inside already" rather
+            // than "not seen": a run once spent forty-three minutes saying
             // "not seen" about somebody standing thirty yards away through a
             // wall.
             state.inside = member->GetMapId() == portal->insideMapId;
@@ -54794,12 +55246,20 @@ private:
             coord.crossing.since = std::time(nullptr);
             coord.loggedCrossingAim = false;
             coord.loggedCrossingWaiting = false;
+            // AND IT SAYS WHO WAS ALREADY THROUGH THE DOOR (#165). "All within
+            // 10y of the staging point" was false about an early entrant, and
+            // an early entrant is the case this barrier was changed to let in.
+            std::string const insideAlready =
+                OverseerDecisions::DungeonRunBarrierInsideAlready(states);
             LOG_INFO("module.overseer",
                      "overseer: dungeon run BARRIER satisfied - all {} roster members "
-                     "alive, out of combat and within {:.0f}y of the staging point. ENTER "
+                     "alive, out of combat and within {:.0f}y of the staging point{}. ENTER "
                      "takes them the last {}y to areatrigger {} and knocks for all of "
                      "them at once, followers first and the leader last",
                      static_cast<uint32>(states.size()), DUNGEON_BARRIER_RADIUS_YARDS,
+                     insideAlready.empty()
+                         ? std::string()
+                         : " or inside already (" + insideAlready + ")",
                      static_cast<uint32>(DUNGEON_STAGING_STANDOFF_YARDS),
                      portal->entryTriggerId);
             return;
@@ -54820,7 +55280,7 @@ private:
             std::time(nullptr) - coord.stagingSince > DUNGEON_STAGING_BACKSTOP_SECONDS)
         {
             FailStaging(coord, leaderName, members, *portal, "BARRIER",
-                        OverseerDecisions::DungeonRunBarrierBlockers(
+                        OverseerDecisions::DungeonRunBarrierHolds(
                             states, DUNGEON_APPROACH_LIMITS),
                         IsDungeonJob(leaderJob));
             return;
@@ -54831,7 +55291,7 @@ private:
             coord.loggedBarrierWaiting = true;
             LOG_INFO("module.overseer",
                      "overseer: dungeon run BARRIER holds - {}",
-                     OverseerDecisions::DungeonRunBarrierBlockers(
+                     OverseerDecisions::DungeonRunBarrierHolds(
                          states, DUNGEON_APPROACH_LIMITS));
         }
     }
@@ -78230,6 +78690,10 @@ private:
     std::map<std::string, std::vector<OverseerDecisions::GuildDeathMark>> _guildDeathMarks;
     // The last hearth refusal LeaveGuildDeathSpot logged for a member, by name.
     std::map<std::string, std::string> _guildDeathSpotRefusal;
+    // How many times this episode's hearth-out has been asked of a member, by
+    // name. Bounded so a member whose hearth-out cannot succeed is not asked
+    // every poll for ever; reset when the member leaves the death zone.
+    std::map<std::string, unsigned> _guildDeathSpotTries;
     // DriveGuildTraining: every class trainer spawn by the class it serves, the
     // entry each spot is, the trainer each member was last sent to, and when
     // the drive last ran.
