@@ -6386,14 +6386,26 @@ public:
         // (OverseerDecisions::TravelAimAtPosition); this is the backstop so a
         // future writer cannot reopen the hole, and it names the value the
         // core's own error leaves out.
-        if (target.size() > TRAVEL_AIM_COLUMN_CHARS)
+        //
+        // COUNTED IN CHARACTERS, AND SAID ONCE PER NAME AND TARGET
+        // (wow-overseer#1517). The column is VARCHAR in characters, so a byte
+        // count refused an NPC name with multibyte letters that MySQL would
+        // have stored. And a caller re-asks the same aim on every poll, so the
+        // error is said when the refused aim changes, not every time.
+        if (!OverseerDecisions::TravelAimFitsColumn(target))
         {
-            LOG_ERROR("module.overseer",
-                      "overseer: travel aim '{}' for '{}' is {} characters and "
-                      "overseer_roster.travel_npc holds {}, so it is refused and "
-                      "nothing is written (#1139)",
-                      target, name, uint32(target.size()),
-                      uint32(TRAVEL_AIM_COLUMN_CHARS));
+            auto const said = _aimTooLongSaid.find(name);
+            if (said == _aimTooLongSaid.end() || said->second != target)
+            {
+                _aimTooLongSaid[name] = target;
+                LOG_ERROR("module.overseer",
+                          "overseer: travel aim '{}' for '{}' is {} characters and "
+                          "overseer_roster.travel_npc holds {}, so it is refused and "
+                          "nothing is written (#1139). Said once per aim",
+                          target, name,
+                          uint32(OverseerDecisions::Utf8CharCount(target)),
+                          uint32(TRAVEL_AIM_COLUMN_CHARS));
+            }
             _claimRefusalSaid[name] = "an aim too long for the travel column";
             return false;
         }
@@ -6473,6 +6485,7 @@ public:
             }
         }
         _claimRefusalSaid.erase(name);
+        _aimTooLongSaid.erase(name);
         // A LIVE RUN TAKING THE COLUMN OVER SOMEBODY'S WALK IS SAID, ONCE PER
         // TAKEOVER (#656). The next claim finds the aim is the book's own and
         // writes quietly, so this prints once for each aim it replaces.
@@ -6545,8 +6558,9 @@ public:
     bool FenceRefuses(std::string const& name, std::string const& target,
                       OverseerDecisions::TravelOwner owner)
     {
-        // The column-width refusal Claim makes first (#1139) is a refusal too.
-        if (target.size() > TRAVEL_AIM_COLUMN_CHARS)
+        // The column-width refusal Claim makes first (#1139) is a refusal too,
+        // counted the same way, in characters (wow-overseer#1517).
+        if (!OverseerDecisions::TravelAimFitsColumn(target))
             return true;
         auto const it = _state.find(name);
         if (it != _state.end() && it->second.target == target)
@@ -7316,6 +7330,9 @@ private:
     // so a refusal is said once per state rather than every poll (#560).
     // Erased when a claim writes. World thread only.
     std::map<std::string, std::string> _claimRefusalSaid;
+    // The last over-long aim refused for each character (wow-overseer#1517),
+    // so the width refusal is said once per name and target, not per poll.
+    std::map<std::string, std::string> _aimTooLongSaid;
     // What economy errands have cost each character lately. Beside `_refused`
     // and for the same reason: it has to outlive the errands it is counting, or
     // it counts one errand at a time and never reaches a share of anything. Its
@@ -16542,12 +16559,20 @@ private:
         return true;
     }
 
+    // Every member a standing craft errand has named a tool-needing recipe for
+    // since its tool last went back (wow-overseer#1515). World thread only.
+    // Lost on a restart, which fails closed: the tool stays in the bags until
+    // the next such errand.
+    std::set<std::string> _craftToolPlanned;
+
     // THE HAMMER GOES BACK IN THE BANK (#524). The operator's decision is that
     // the Blacksmith Hammer lives in the crafter's own bank and comes out to
     // craft. Once no standing craft errand needs it, it is banked the next
     // time the character stands in reach of a banker; nobody is walked to one
     // for it. Through DoBank, the bank verb's executor, so the checks and the
-    // read-back are that verb's.
+    // read-back are that verb's. Only for a member a planned recipe needed it
+    // for (wow-overseer#1515): a hammer nothing on the plan has asked for is
+    // left in the bags, and a deposit that fails is said once, not per poll.
     void ReturnCraftTools()
     {
         QueryResult result = CharacterDatabase.Query(
@@ -16570,22 +16595,38 @@ private:
             if (errand != errands.end())
                 if (SpellInfo const* info = sSpellMgr->GetSpellInfo(errand->second))
                     stillNeeded = SpellNeedsTool(info, category);
+            if (stillNeeded)
+                _craftToolPlanned.insert(name);
+            bool const planned = _craftToolPlanned.count(name) != 0;
             bool const able = bot->IsAlive() && !bot->IsInCombat() && !bot->IsInFlight() &&
                               !bot->GetTradeData();
             bool anyBanker = false;
             bool const bankerInReach =
-                !stillNeeded && able && BankerInReach(bot, anyBanker) != nullptr;
-            if (!OverseerDecisions::CraftToolGoesBack(true, stillNeeded, bankerInReach, able))
+                planned && !stillNeeded && able && BankerInReach(bot, anyBanker) != nullptr;
+            if (!OverseerDecisions::CraftToolGoesBack(true, planned, stillNeeded, bankerInReach, able))
                 continue;
             char const* status = "error";
             std::string out;
             DoBank(bot, "deposit guid:" + std::to_string(tool->GetGUID().GetCounter()), status, out);
-            LOG_INFO("module.overseer",
-                     "overseer: '{}' put its {} back in the bank, no craft errand needs it "
-                     "(#524): {}{}{}",
-                     name, tool->GetTemplate()->Name1, status, out.empty() ? "" : " - ",
-                     out.substr(0, 300));
-            _craftPrepSaid.erase(name);
+            if (std::string(status) == "delivered")
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' put its {} back in the bank, no craft errand needs it "
+                         "(#524): {}{}{}",
+                         name, tool->GetTemplate()->Name1, status, out.empty() ? "" : " - ",
+                         out.substr(0, 300));
+                _craftToolPlanned.erase(name);
+                _craftPrepSaid.erase(name);
+                continue;
+            }
+            // A full bank answers the same way every poll: said once per
+            // answer, and tried again at the next banker.
+            if (SayCraftPrepOnce(name, std::string("tool not banked: ") + status))
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' could not put its {} back in the bank (#524): {}{}{} - "
+                         "keeping it in the bags and trying again at a banker; said once",
+                         name, tool->GetTemplate()->Name1, status, out.empty() ? "" : " - ",
+                         out.substr(0, 300));
         } while (result->NextRow());
     }
 
@@ -16748,26 +16789,32 @@ private:
             if (toolStep == OverseerDecisions::CraftToolStep::Request)
             {
                 // ASKED FOR, NEVER CONJURED. The same material request a
-                // missing reagent writes, keyed on the tool's item id, so the
-                // planner buys one (and the next poll after it lands in the
-                // bags crafts with it, and ReturnCraftTools banks it after).
+                // missing reagent writes, keyed on the tool's item id. ONCE
+                // PER STATE (wow-overseer#1516): no planner pass buys from
+                // this row yet (the buy is wow-overseer#1477), so it is
+                // written when the crafter enters the "no tool" state, under
+                // the same said-once gate as the log line, not every poll.
+                // A craft, a withdraw or a return clears the state, so a
+                // crafter that loses its hammer again asks again.
                 uint32 const toolItem = OverseerDecisions::ToolItemForTotemCategory(toolCategory);
-                if (ItemTemplate const* proto = toolItem ? sObjectMgr->GetItemTemplate(toolItem) : nullptr)
-                {
-                    std::string detail = "need 1x ";
-                    detail += proto->Name1;
-                    detail += " (a tool, kept in the bank)";
-                    EventExtra extra;
-                    extra.itemGuid = toolItem;
-                    RecordEvent(bot, "material-request", spellId, info->SpellName[LOCALE_enUS],
-                                detail, extra);
-                }
                 if (SayCraftPrepOnce(name, "no tool"))
+                {
+                    if (ItemTemplate const* proto = toolItem ? sObjectMgr->GetItemTemplate(toolItem) : nullptr)
+                    {
+                        std::string detail = "need 1x ";
+                        detail += proto->Name1;
+                        detail += " (a tool, kept in the bank)";
+                        EventExtra extra;
+                        extra.itemGuid = toolItem;
+                        RecordEvent(bot, "material-request", spellId, info->SpellName[LOCALE_enUS],
+                                    detail, extra);
+                    }
                     LOG_INFO("module.overseer",
                              "overseer: '{}' has no tool of category {} anywhere, bags or bank, "
-                             "for '{}' ({}) - asked for item {} and leaving the errand standing "
-                             "(#524)",
+                             "for '{}' ({}) - asked for item {} once and leaving the errand "
+                             "standing (#524)",
                              name, toolCategory, info->SpellName[LOCALE_enUS], spellId, toolItem);
+                }
                 continue;
             }
 
