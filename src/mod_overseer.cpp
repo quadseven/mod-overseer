@@ -31306,47 +31306,141 @@ private:
                 GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES);
         }
         if (!outmatchedHere && !deathsHere)
+        {
+            // The member left the death zone: forget how many times we asked.
+            _guildDeathSpotTries.erase(name);
+            _guildDeathSpotRefusal.erase(name);
             return false;
+        }
+
+        // A hearth already cast is waiting for its verdict: stay in this path
+        // until ResolveHearthChecks reads it back.
+        if (HearthPendingFor(name))
+            return true;
+
         uint32 const stone = HearthstoneSpellOf(bot);
-        bool const hearthReady = stone && !bot->HasSpellCooldown(stone) && !HearthPendingFor(name);
+        bool const stoneOnCooldown = stone && bot->HasSpellCooldown(stone);
+        bool const hearthReady = stone && !stoneOnCooldown && !HearthPendingFor(name);
+        bool const inCombat = bot->IsInCombat();
+
+        unsigned& tries = _guildDeathSpotTries[name];
+        unsigned const boundTries = OverseerDecisions::EXIT_HEARTH_ATTEMPTS;
+
+        // Clear any walk something outside this module put on the member and
+        // hold it still, so a hearth is not broken by movement.
+        auto holdStill = [&]()
+        {
+            bot->GetMotionMaster()->Clear();
+            bot->StopMoving();
+            CastHoldReport hold;
+            HoldStillAndReport(bot, name, "hearth", hold);
+        };
+
+        auto keepMemberOut = [&]()
+        {
+            bool const keepOut = OverseerDecisions::KeepOutOfDeathZone(
+                true, outmatchedHere, false);
+            if (keepOut)
+                holdStill();
+            return keepOut;
+        };
+
+        // The hearth-out cannot succeed now (no stone, the stone on cooldown,
+        // or the tries spent): a member killed far above its level is held
+        // where it stands instead of being handed back to the drives that walk
+        // it toward the killer. Asked before GuildLeavesDeathSpot, which says
+        // Stay for a stone that is not ready and so released the member to
+        // walk back in. A member in combat is left to fight or flee.
+        if (!inCombat &&
+            OverseerDecisions::KeepOutOfDeathZone(
+                OverseerDecisions::HearthOutCannotSucceed(stone != 0, stoneOnCooldown, tries,
+                                                          boundTries),
+                outmatchedHere, false))
+        {
+            holdStill();
+            return true;
+        }
+
         if (OverseerDecisions::GuildLeavesDeathSpot(deathsHere, GHOST_RECOVERY_LIMITS.repeatDeaths,
-                                                    hearthReady, bot->IsInCombat(),
+                                                    hearthReady, inCombat,
                                                     outmatchedHere) !=
             OverseerDecisions::GuildDeathSpotStep::Hearth)
             return false;
+
+        // The bound is spent on a member hearthing out of repeat deaths (an
+        // outmatched one was held above): stop asking it every poll.
+        if (tries >= boundTries)
+            return keepMemberOut();
+
+        // The first hearth and every retry are driven with the member stopped:
+        // a cast driven while an outside walk moves the character is broken.
+        holdStill();
         char const* status = "error";
         std::string evidence;
         std::string const refusal = DoHearth(bot, "use", status, evidence, _pendingHearths, 0);
-        // A refusal that repeats every poll (bound at this spot, already
-        // casting) is said once, not once a poll.
-        std::string& said = _guildDeathSpotRefusal[name];
-        if (!refusal.empty() && said == refusal)
-            return false;
-        said = refusal;
-        if (outmatchedHere)
-            LOG_INFO("module.overseer",
-                     "overseer: '{}' (level {}) was killed in zone {} by a level {} creature, "
-                     "far above its own level, {}min ago and hearths out after that first death "
-                     "instead of trying again{}",
-                     name, bot->GetLevel(), outmatched.zoneId, outmatched.killerLevel,
-                     (now - outmatched.at) / 60,
-                     refusal.empty() ? std::string() : " - refused: " + refusal);
-        else
-            LOG_INFO("module.overseer",
-                     "overseer: '{}' (level {}) has died {} time(s) within {:.0f} yards of where "
-                     "it stands in {}min and hearths out instead of fighting on there{}",
-                     name, bot->GetLevel(), deathsHere, GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES,
-                     refusal.empty() ? std::string() : " - refused: " + refusal);
-        if (refusal.empty() && outmatchedHere)
+
+        if (refusal.empty())
         {
-            // Only the death this hearth answered: one the hook wrote since is
-            // a new death and keeps its own mark.
-            std::lock_guard<std::mutex> lock(g_guildOutmatchedMutex);
-            auto const mark = g_guildOutmatched.find(name);
-            if (mark != g_guildOutmatched.end() && mark->second.at == outmatched.at)
-                g_guildOutmatched.erase(mark);
+            // Cast started: the verdict comes later in ResolveHearthChecks. Do
+            // not erase the outmatched mark until we know the hearth arrived.
+            if (outmatchedHere)
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' (level {}) was killed in zone {} by a level {} creature, "
+                         "far above its own level, {}min ago and hearths out after that first death "
+                         "instead of trying again",
+                         name, bot->GetLevel(), outmatched.zoneId, outmatched.killerLevel,
+                         (now - outmatched.at) / 60);
+            else
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' (level {}) has died {} time(s) within {:.0f} yards of where "
+                         "it stands in {}min and hearths out instead of fighting on there",
+                         name, bot->GetLevel(), deathsHere, GHOST_REPEAT_RADIUS,
+                         GHOST_REPEAT_MINUTES);
+            ++tries;
+            return true;
         }
-        return refusal.empty();
+
+        // Refused: decide whether to retry or give up. The only refusal this
+        // poll can change is "character is moving" - the hold DoHearth placed
+        // stops the character, and the next poll finds it standing. A hearth
+        // that landed but left the character on the death map is still on the
+        // death map (the character is here and no hearth is in flight, so the
+        // previous cast stayed). The death map is the outmatched mark's map,
+        // or the current map when the repeat deaths counted here are on it.
+        bool const stillOnDeathMap =
+            (outmatched.at > 0 && outmatched.mapId == bot->GetMapId()) || deathsHere > 0;
+        OverseerDecisions::HearthOutRetry const step =
+            OverseerDecisions::DecideHearthOutRetry(refusal.c_str(), stillOnDeathMap, tries,
+                                                    boundTries);
+        if (step == OverseerDecisions::HearthOutRetry::GiveUp)
+        {
+            return keepMemberOut();
+        }
+
+        // Retry: the hold was already placed by DoHearth. Say the refusal once
+        // per distinct reason, but keep asking on every poll until the bound
+        // is spent.
+        std::string& said = _guildDeathSpotRefusal[name];
+        if (!refusal.empty() && said != refusal)
+        {
+            said = refusal;
+            if (outmatchedHere)
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' (level {}) was killed in zone {} by a level {} creature, "
+                         "far above its own level, {}min ago and hearths out after that first death "
+                         "instead of trying again - refused: {}",
+                         name, bot->GetLevel(), outmatched.zoneId, outmatched.killerLevel,
+                         (now - outmatched.at) / 60, refusal);
+            else
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' (level {}) has died {} time(s) within {:.0f} yards of where "
+                         "it stands in {}min and hearths out instead of fighting on there - "
+                         "refused: {}",
+                         name, bot->GetLevel(), deathsHere, GHOST_REPEAT_RADIUS,
+                         GHOST_REPEAT_MINUTES, refusal);
+        }
+        ++tries;
+        return true;
     }
 
     // ---------------------------------- a natural guild member's own trainer --
@@ -78481,6 +78575,10 @@ private:
     std::map<std::string, std::vector<OverseerDecisions::GuildDeathMark>> _guildDeathMarks;
     // The last hearth refusal LeaveGuildDeathSpot logged for a member, by name.
     std::map<std::string, std::string> _guildDeathSpotRefusal;
+    // How many times this episode's hearth-out has been asked of a member, by
+    // name. Bounded so a member whose hearth-out cannot succeed is not asked
+    // every poll for ever; reset when the member leaves the death zone.
+    std::map<std::string, unsigned> _guildDeathSpotTries;
     // DriveGuildTraining: every class trainer spawn by the class it serves, the
     // entry each spot is, the trainer each member was last sent to, and when
     // the drive last ran.

@@ -22016,6 +22016,35 @@ struct GuildOutmatchedMark
 bool OutmatchedHere(GuildOutmatchedMark const& mark, int64_t now, uint32_t mapId,
                     uint32_t zoneId, uint32_t windowMinutes);
 
+// A guild death-spot hearth-out that was refused because the character was
+// moving, or that ended with the character still on the death map, is retried
+// with the character held still. `tries` counts retries already asked this
+// episode; `boundTries` is the ceiling. Returns Retry while a retry is in
+// order and tries < boundTries; GiveUp once the bound is spent or the refusal
+// cannot be waited out.
+enum class HearthOutRetry
+{
+    Retry,
+    GiveUp,
+};
+
+HearthOutRetry DecideHearthOutRetry(char const* refusal, bool stillOnDeathMap,
+                                    unsigned tries, unsigned boundTries);
+
+// A member whose hearth-out failed is kept out of the zone it died in until
+// it has left the map or the guild moves it. True when the hearth-out failed,
+// the member still stands in the death zone, and the guild has not moved it.
+bool KeepOutOfDeathZone(bool hearthOutFailed, bool stillInDeathZone,
+                        bool guildMovedIt);
+
+// A death-spot hearth-out that cannot be driven now: the member carries no
+// hearthstone, its stone is on cooldown, or this episode's tries are spent.
+// Its answer is the `hearthOutFailed` that KeepOutOfDeathZone takes, so a
+// member killed far above its level is held where it stands rather than
+// handed back to the drives that walk it toward the killer again.
+bool HearthOutCannotSucceed(bool hasStone, bool stoneOnCooldown, unsigned tries,
+                            unsigned boundTries);
+
 // "corpse_run", "spirit_healer", "wait", "ladder": the words written to
 // overseer_death.ghost_recovery and to the log.
 char const* GhostRecoveryWord(GhostRecovery choice);
