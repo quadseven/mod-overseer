@@ -36,6 +36,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <sstream>
+#include <string>
 
 using OverseerDecisions::CatchUpAimFacts;
 using OverseerDecisions::CatchUpAimIsStale;
@@ -52,6 +54,14 @@ void Check(char const* what, bool got, bool want)
         return;
     std::printf("FAIL %s: got %s, wanted %s\n", what, got ? "true" : "false",
                 want ? "true" : "false");
+    ++failures;
+}
+
+void Check(char const* what, std::string const& got, std::string const& want)
+{
+    if (got == want)
+        return;
+    std::printf("FAIL %s: got '%s', wanted '%s'\n", what, got.c_str(), want.c_str());
     ++failures;
 }
 
@@ -311,47 +321,53 @@ void AnImpossibleReadingFallsToTheStricterRule()
 }  // namespace
 
 // ============================================================================
-// THE AIM STRING MUST FIT IN THE COLUMN. The roster column travel_npc is
-// VARCHAR(32) and MySQL strict mode refuses rows that exceed it rather than
-// truncating. A catch-up aim built from a leader's live position can produce
-// scientific notation for tiny values (e.g. -4.37e-06) which exceeds 32 chars.
-// TravelAimAtPosition handles this by dropping precision: 1 decimal → 0 decimals → empty.
+// THE CATCH-UP AIM MUST FIT THE COLUMN (#1139). overseer_roster.travel_npc is
+// TRAVEL_AIM_MAX_CHARS (32) wide and the realm database is in strict mode, so
+// an over-long row is refused, not truncated. The catch-up walk used to build
+// its aim with a bare ostringstream; that the catch-up now goes through
+// TravelAimAtPosition is pinned in test_catch_up_aim_column_source.cpp. These
+// pin what TravelAimAtPosition gives for the positions that matter.
 // ============================================================================
 
 using OverseerDecisions::TravelAimAtPosition;
 using OverseerDecisions::TRAVEL_AIM_MAX_CHARS;
 
-void TravelAimAtPositionFitsNormalCoordinates()
+// The defect's own shape: default stream formatting of the issue's position
+// is 33 characters, one over the column.
+void TheOldCatchUpFormatOverflowedTheColumn()
 {
-    // The exact case from the issue: bare ostringstream produces 33 chars,
-    // but TravelAimAtPosition drops to 1 decimal and fits in 25 chars.
-    std::string aim = TravelAimAtPosition(1, -4012.35f, -1234.56f, -0.0413553f);
-    Check("issue case produces non-empty aim", !aim.empty(), true);
-    Check("issue case aim fits in column", aim.size() <= TRAVEL_AIM_MAX_CHARS, true);
-    Check("issue case aim has correct prefix", aim.rfind("at:1:", 0) == 0, true);
-
-    // Normal coordinates that fit comfortably at one decimal
-    aim = TravelAimAtPosition(1, 1972.61f, -761.447f, 98.0276f);
-    Check("normal coordinates produce non-empty aim", !aim.empty(), true);
-    Check("normal aim fits in column", aim.size() <= TRAVEL_AIM_MAX_CHARS, true);
+    std::ostringstream old;
+    old << "at:" << 1 << ':' << -4012.35f << ',' << -1234.56f << ',' << -0.0413553f;
+    Check("the old bare-stream aim is over the column",
+          old.str().size() > TRAVEL_AIM_MAX_CHARS, true);
 }
 
-void TravelAimAtPositionDropsPrecisionToFit()
+void TheIssuePositionIsAimedInOneDecimal()
 {
-    // Coordinates that need zero decimals to fit (one decimal would be 34 chars)
-    // at:1000:-1234567,-6789012,-1234567 = 34 chars at 1 decimal, 31 at 0
-    std::string aim = TravelAimAtPosition(1000, -123456.f, -678901.f, -123456.f);
-    Check("medium-large coordinates produce non-empty aim", !aim.empty(), true);
-    Check("medium-large aim fits in column", aim.size() <= TRAVEL_AIM_MAX_CHARS, true);
+    std::string const aim = TravelAimAtPosition(1, -4012.35f, -1234.56f, -0.0413553f);
+    Check("the issue position fits the column", aim.size() <= TRAVEL_AIM_MAX_CHARS, true);
+    Check("and is written at one decimal", aim, std::string("at:1:-4012.4,-1234.6,-0.0"));
+
+    // A tiny shore-corrected z that default formatting writes in scientific
+    // notation is written as a plain decimal.
+    std::string const tiny = TravelAimAtPosition(1, -4012.35f, -1234.56f, -4.37e-06f);
+    Check("a tiny z fits the column", tiny.size() <= TRAVEL_AIM_MAX_CHARS, true);
+    Check("and carries no exponent", tiny.find('e') == std::string::npos, true);
 }
 
-void TravelAimAtPositionRefusesExtremelyLargeCoordinates()
+// at:1000:-123456.0,-678901.0,-123456.0 is 37 characters; whole yards are 31.
+void APositionTooWideForOneDecimalIsAimedInWholeYards()
 {
-    // Coordinates that exceed 32 chars even at zero decimals
-    // at:1000:-1234567,-6789012,-1234567 = 34 chars at 0 decimals > 32
-    std::string aim = TravelAimAtPosition(1000, -1234567.f, -6789012.f, -1234567.f);
-    Check("extremely large coordinates return empty", aim.empty(), true);
-    Check("empty aim is within column limit", aim.size() <= TRAVEL_AIM_MAX_CHARS, true);
+    std::string const aim = TravelAimAtPosition(1000, -123456.f, -678901.f, -123456.f);
+    Check("whole yards are used", aim, std::string("at:1000:-123456,-678901,-123456"));
+}
+
+// at:1000:-1234567,-6789012,-1234567 is 34 characters even in whole yards, so
+// there is no aim to write and the caller must not claim one.
+void APositionTooWideForWholeYardsGivesNoAim()
+{
+    Check("no aim is given",
+          TravelAimAtPosition(1000, -1234567.f, -6789012.f, -1234567.f), std::string());
 }
 
 int main()
@@ -366,9 +382,10 @@ int main()
     ALeaderInTheAirIsNeverAimedAt();
     NoReadingEverAllowsAnAimStalerThanTheSurveysResolution();
     AnImpossibleReadingFallsToTheStricterRule();
-    TravelAimAtPositionFitsNormalCoordinates();
-    TravelAimAtPositionDropsPrecisionToFit();
-    TravelAimAtPositionRefusesExtremelyLargeCoordinates();
+    TheOldCatchUpFormatOverflowedTheColumn();
+    TheIssuePositionIsAimedInOneDecimal();
+    APositionTooWideForOneDecimalIsAimedInWholeYards();
+    APositionTooWideForWholeYardsGivesNoAim();
 
     if (failures)
     {

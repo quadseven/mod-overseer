@@ -6367,21 +6367,25 @@ public:
     bool Claim(std::string const& name, std::string const& target,
                OverseerDecisions::TravelOwner owner)
     {
-        // THE COLUMN IS THE OTHER HALF OF THE AIM'S CONTRACT, and it
-        // fails silently in non-strict mode: `overseer_roster.travel_npc` is
-        // VARCHAR(32) and MySQL truncates rather than refuses outside strict
-        // mode. A truncated aim is one the parser can never read back.
-        // Strict mode refuses the row, leaving followers stranded. Refuse
-        // oversized aims here with a clear log line, same pattern as the
-        // berth aim checks.
-        constexpr std::size_t MAX_AIM_CHARS = 32;
-        if (target.size() > MAX_AIM_CHARS)
+        // THE AIM HAS TO FIT THE COLUMN BEFORE ANY FENCE IS ASKED (#1139).
+        // `overseer_roster.travel_npc` is TRAVEL_AIM_COLUMN_CHARS wide. In
+        // strict mode MySQL refuses an over-long row (errno 1406) and the core
+        // logs the refusal without the value, so the caller believes the aim
+        // was written; outside strict mode it truncates, and a truncated aim
+        // is one the parser can never read back. Either way the walk never
+        // starts. Every writer is meant to size its own aim
+        // (OverseerDecisions::TravelAimAtPosition); this is the backstop so a
+        // future writer cannot reopen the hole, and it names the value the
+        // core's own error leaves out.
+        if (target.size() > TRAVEL_AIM_COLUMN_CHARS)
         {
             LOG_ERROR("module.overseer",
-                      "overseer: travel aim for '{}' is {} characters and "
-                      "overseer_roster.travel_npc holds {}, refusing: {}",
-                      name, uint32(target.size()), uint32(MAX_AIM_CHARS), target);
-            _claimRefusalSaid[name] = "aim exceeds column length";
+                      "overseer: travel aim '{}' for '{}' is {} characters and "
+                      "overseer_roster.travel_npc holds {}, so it is refused and "
+                      "nothing is written (#1139)",
+                      target, name, uint32(target.size()),
+                      uint32(TRAVEL_AIM_COLUMN_CHARS));
+            _claimRefusalSaid[name] = "an aim too long for the travel column";
             return false;
         }
 
@@ -6532,6 +6536,9 @@ public:
     bool FenceRefuses(std::string const& name, std::string const& target,
                       OverseerDecisions::TravelOwner owner)
     {
+        // The column-width refusal Claim makes first (#1139) is a refusal too.
+        if (target.size() > TRAVEL_AIM_COLUMN_CHARS)
+            return true;
         auto const it = _state.find(name);
         if (it != _state.end() && it->second.target == target)
             return false;
@@ -23366,6 +23373,13 @@ private:
                 return false;
             }
         }
+        // SIZED TO THE COLUMN, LIKE EVERY OTHER `at:` WRITER (#1139). This was
+        // a bare ostringstream: six significant digits, so a shore-corrected z
+        // such as -0.0413553 made `at:1:-4012.35,-1234.56,-0.0413553`, 33
+        // characters, which strict mode refused while the follower was logged
+        // as aimed. TravelAimAtPosition gives one decimal, then whole yards,
+        // then nothing; nothing leaves the follower on `follow`, said like the
+        // unmeasured-ground refusal above.
         std::string const aimText = OverseerDecisions::TravelAimAtPosition(
             leader->GetMapId(), ax, ay, az);
         if (aimText.empty())
@@ -23376,12 +23390,11 @@ private:
                 escort.badGroundSaid = now;
                 LOG_WARN("module.overseer",
                          "overseer: '{}' is not aimed at '{}' because the catch-up "
-                         "aim exceeds the roster column length (map {}, {:.1f}, {:.1f}, "
-                         "{:.1f}). The leader keeps following, and the aim is written "
-                         "again as soon as the position fits",
-                         name, leader->GetName(),
-                         static_cast<uint32>(leader->GetMapId()),
-                         ax, ay, az);
+                         "aim does not fit the {}-character travel column even in whole "
+                         "yards (map {}, {}, {}, {}) (#1139). It keeps following, and "
+                         "the aim is written again as soon as the position fits",
+                         name, leader->GetName(), uint32(TRAVEL_AIM_COLUMN_CHARS),
+                         static_cast<uint32>(leader->GetMapId()), ax, ay, az);
             }
             return false;
         }
