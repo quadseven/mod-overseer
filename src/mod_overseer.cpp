@@ -36112,6 +36112,10 @@ private:
                 return true;
 
             case OverseerDecisions::StratholmeExitWay::Button:
+                // buttonInReach already needs a spawned button; the guard keeps
+                // that promise at the call that dereferences it.
+                if (!button)
+                    return true;
                 PressStratholmeButton(yard, walker, button, now);
                 return true;
 
