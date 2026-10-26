@@ -26620,6 +26620,68 @@ enum class LockpickErrandStep : std::uint8_t
 LockpickErrandStep DecideLockpickErrand(bool hasTarget, bool inReach,
                                         bool inCombat, bool moving);
 
+// -- Stratholme exit yard way out (#645) --------------------------------------
+// What a family does once it stands in the exit yard after a run. Walk: the
+// Service Entrance is open. Button: press gameobject 175432, then walk. Hearth:
+// each member uses its own hearthstone. None: no way out is available.
+enum class StratholmeExitWay : std::uint8_t
+{
+    Walk,
+    Button,
+    Hearth,
+    None,
+};
+
+struct StratholmeExitFacts
+{
+    bool doorOpen{false};
+    bool buttonInReach{false};
+    bool hearthAvailable{false};
+};
+
+StratholmeExitWay DecideStratholmeExit(StratholmeExitFacts const& facts);
+
+char const* StratholmeExitWayWord(StratholmeExitWay way);
+
+// The run's exit trigger whose landing is the yard, and the two gameobjects in
+// it: the Elders' Square Service Entrance and the button that opens it.
+constexpr std::uint32_t STRATHOLME_YARD_EXIT_TRIGGER = 2221;
+constexpr std::uint32_t STRATHOLME_SERVICE_ENTRANCE_ENTRY = 175369;
+constexpr std::uint32_t STRATHOLME_SERVICE_BUTTON_ENTRY = 175432;
+// The yard as the navmesh closes it (the stratholme-undead row in
+// mod_overseer.cpp): five polygons from x 3200 to 3241 and y -4057 to -4032,
+// and the gateway polygon from x 3180 to 3200 that the door stands in, on map
+// 0. West of x 3180 is Elders' Square, which is outside.
+constexpr float STRATHOLME_YARD_WEST_X = 3180.f;
+constexpr float STRATHOLME_YARD_EAST_X = 3241.f;
+constexpr float STRATHOLME_YARD_SOUTH_Y = -4057.f;
+constexpr float STRATHOLME_YARD_NORTH_Y = -4032.f;
+// How far from the one walking out the door and the button are looked for:
+// 2221's landing stands 51 yards from the door.
+constexpr float STRATHOLME_YARD_SEARCH_YARDS = 80.f;
+// How far past the door, west, the leader is walked once it is open.
+constexpr float STRATHOLME_WALK_OUT_YARDS = 20.f;
+// The button counts as out of reach once it has been pressed this many times
+// with the door still shut, or the leader has not got to it in this long.
+constexpr unsigned STRATHOLME_BUTTON_PRESSES = 3;
+constexpr std::uint32_t STRATHOLME_BUTTON_WALK_SECONDS = 3 * 60;
+// The whole way out gives up after this long and leaves the family to the
+// ordinary drives, said in the log.
+constexpr std::uint32_t STRATHOLME_YARD_EPISODE_SECONDS = 15 * 60;
+
+// Whether a point on `mapId` stands in the exit yard.
+bool InStratholmeExitYard(std::uint32_t mapId, float x, float y);
+
+// Whether the button is still worth walking to: it is spawned, it has not
+// been pressed STRATHOLME_BUTTON_PRESSES times already, and the walk to it has
+// not run past STRATHOLME_BUTTON_WALK_SECONDS.
+bool StratholmeButtonInReach(bool spawned, unsigned presses, std::uint32_t secondsWalking);
+
+// Whether a member's own hearthstone takes it out of the yard: it carries one
+// off cooldown and its bind is not in the yard itself.
+bool StratholmeHearthLeavesTheYard(bool stoneReady, std::uint32_t bindMap, float bindX,
+                                   float bindY);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
