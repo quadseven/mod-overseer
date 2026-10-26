@@ -9688,6 +9688,59 @@ bool AuctionBudgetAllows(uint32_t money, uint32_t reserve, uint32_t sharePercent
     return price <= remainder && price <= share;
 }
 
+void WtbOfferLogRecord(WtbOfferLog& log, uint32_t itemEntry,
+                       std::string const& member, WtbOfferResult result,
+                       std::string const& reason, time_t now)
+{
+    WtbOfferEntry entry;
+    entry.itemEntry = itemEntry;
+    entry.member = member;
+    entry.result = result;
+    entry.reason = reason;
+    entry.time = now;
+    log.entries.push_back(std::move(entry));
+}
+
+bool WtbCooldownCheck(WtbCooldownLedger const& ledger, uint32_t itemEntry,
+                      time_t now, time_t cooldownSeconds)
+{
+    auto it = ledger.find(itemEntry);
+    if (it == ledger.end())
+        return true;  // no previous offer for this item
+    time_t lastOffer = it->second;
+    return now >= lastOffer + cooldownSeconds;
+}
+
+void WtbCooldownRecord(WtbCooldownLedger& ledger, uint32_t itemEntry, time_t now)
+{
+    ledger[itemEntry] = now;
+}
+
+bool WtbCandidate(FamilyWants const& wants, uint32_t itemEntry, uint32_t ahPrice,
+                  uint32_t money, uint32_t reserve, uint32_t sharePercent,
+                  uint32_t candidatePrice)
+{
+    // Must be in the family's want list
+    bool wanted = false;
+    for (uint32_t id : wants.wantList)
+    {
+        if (id == itemEntry)
+        {
+            wanted = true;
+            break;
+        }
+    }
+    if (!wanted)
+        return false;
+
+    // Must not be on the auction house (ahPrice == 0 means not listed)
+    if (ahPrice != 0)
+        return false;
+
+    // Candidate price must pass budget check
+    return AuctionBudgetAllows(money, reserve, sharePercent, candidatePrice);
+}
+
 AuctionBidVerdict AuctionBidAcceptable(uint32_t price, uint32_t startBid,
                                        uint32_t currentBid, uint32_t buyout,
                                        uint32_t outbidStep)
@@ -17658,9 +17711,9 @@ char const* CraftToolStepWord(CraftToolStep step)
     return "wait";
 }
 
-bool CraftToolGoesBack(bool inBags, bool stillNeeded, bool bankerInReach, bool able)
+bool CraftToolGoesBack(bool inBags, bool planned, bool stillNeeded, bool bankerInReach, bool able)
 {
-    return inBags && !stillNeeded && bankerInReach && able;
+    return inBags && planned && !stillNeeded && bankerInReach && able;
 }
 
 int NearestFocusSpawn(std::vector<FocusSpawn> const& spawns, unsigned mapId, float x, float y,
@@ -24252,6 +24305,47 @@ LockpickErrandStep DecideLockpickErrand(bool hasTarget, bool inReach,
     if (inCombat || moving)
         return LockpickErrandStep::Stand;
     return LockpickErrandStep::Cast;
+}
+
+StratholmeExitWay DecideStratholmeExit(StratholmeExitFacts const& facts)
+{
+    if (facts.doorOpen)
+        return StratholmeExitWay::Walk;
+    if (facts.buttonInReach)
+        return StratholmeExitWay::Button;
+    if (facts.hearthAvailable)
+        return StratholmeExitWay::Hearth;
+    return StratholmeExitWay::None;
+}
+
+char const* StratholmeExitWayWord(StratholmeExitWay way)
+{
+    switch (way)
+    {
+        case StratholmeExitWay::Walk:   return "walk";
+        case StratholmeExitWay::Button: return "button";
+        case StratholmeExitWay::Hearth: return "hearth";
+        case StratholmeExitWay::None:   return "none";
+    }
+    return "unknown";
+}
+
+bool InStratholmeExitYard(std::uint32_t mapId, float x, float y)
+{
+    return mapId == 0 && x >= STRATHOLME_YARD_WEST_X && x <= STRATHOLME_YARD_EAST_X &&
+           y >= STRATHOLME_YARD_SOUTH_Y && y <= STRATHOLME_YARD_NORTH_Y;
+}
+
+bool StratholmeButtonInReach(bool spawned, unsigned presses, std::uint32_t secondsWalking)
+{
+    return spawned && presses < STRATHOLME_BUTTON_PRESSES &&
+           secondsWalking < STRATHOLME_BUTTON_WALK_SECONDS;
+}
+
+bool StratholmeHearthLeavesTheYard(bool stoneReady, std::uint32_t bindMap, float bindX,
+                                   float bindY)
+{
+    return stoneReady && !InStratholmeExitYard(bindMap, bindX, bindY);
 }
 
 }  // namespace OverseerDecisions

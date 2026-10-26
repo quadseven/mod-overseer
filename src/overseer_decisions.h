@@ -11455,6 +11455,69 @@ constexpr char const* NotReadBack        = "the transaction did not read back";
 // (mod-overseer#169) is what happens when a sender cannot tell the two apart.
 bool AuctionRefusalRetryable(std::string const& reason);
 
+// --------------------------------------------- trade WTB (want to buy) -----------
+//
+// A WTB CANDIDATE is an item the family wants (appears in FamilyWants.wantList)
+// that is NOT currently listed on the auction house (ahPrice == 0) AND whose
+// price is within the family's auction budget (AuctionBudgetAllows). The
+// cooldown ledger prevents spamming the same item: after an offer is made for
+// an item, a 10-minute (configurable) cooldown applies per item entry before
+// another offer for that item may be made. The offer log records every offer
+// attempt with the member name, result (Accepted/Declined), and a reason string.
+
+enum class WtbOfferResult : std::uint8_t
+{
+    Accepted,
+    Declined,
+};
+
+// One WTB offer recorded in the log.
+struct WtbOfferEntry
+{
+    uint32_t itemEntry{0};
+    std::string member;
+    WtbOfferResult result{WtbOfferResult::Declined};
+    std::string reason;
+    time_t time{0};
+};
+
+// Log of WTB offers.
+struct WtbOfferLog
+{
+    std::vector<WtbOfferEntry> entries;
+};
+
+// Record a WTB offer outcome in the log.
+void WtbOfferLogRecord(WtbOfferLog& log, uint32_t itemEntry,
+                       std::string const& member, WtbOfferResult result,
+                       std::string const& reason, time_t now);
+
+// Per-item cooldown ledger: maps item entry to the last time an offer was made.
+using WtbCooldownLedger = std::map<uint32_t, time_t>;
+
+// Check if an offer for `itemEntry` is allowed under the cooldown. Returns
+// true if enough time has passed since the last offer for this item (or if
+// there was no previous offer). `cooldownSeconds` is the minimum interval
+// between offers for the same item (typically 600 = 10 minutes).
+bool WtbCooldownCheck(WtbCooldownLedger const& ledger, uint32_t itemEntry,
+                      time_t now, time_t cooldownSeconds);
+
+// Record that an offer for `itemEntry` was made at `now`. Updates the ledger
+// so subsequent WtbCooldownCheck calls will enforce the cooldown.
+void WtbCooldownRecord(WtbCooldownLedger& ledger, uint32_t itemEntry, time_t now);
+
+// Is this item a WTB candidate right now?
+//   - `wants`: the family's want list (from FamilyWants)
+//   - `itemEntry`: the item being considered
+//   - `ahPrice`: current lowest buyout price on the AH for this item, or 0 if not listed
+//   - `money`, `reserve`, `sharePercent`: budget parameters passed to AuctionBudgetAllows
+//   - `candidatePrice`: the price we would offer (must pass AuctionBudgetAllows)
+// Returns true if the item is wanted, not on AH (ahPrice == 0), and the
+// candidatePrice passes the budget check.
+bool WtbCandidate(FamilyWants const& wants, uint32_t itemEntry, uint32_t ahPrice,
+                  uint32_t money, uint32_t reserve, uint32_t sharePercent,
+                  uint32_t candidatePrice);
+
 // ----------------------------------------- a home somebody chose (#274) --
 //
 // WHAT A kind='bind' ROW MAY SAY.
@@ -20423,11 +20486,15 @@ CraftToolStep CraftToolStepFor(CraftToolPlace place, bool bankerInReach, bool ma
 char const* CraftToolStepWord(CraftToolStep step);
 
 // IS THE TOOL PUT BACK IN THE BANK NOW? Only a tool in the bags (never one that
-// is worn), only when no standing craft errand still needs it, only with a
-// banker in reach and the character able to bank (alive, out of combat, not
-// in flight, not trading). Nobody is walked to a banker to put it back: it
-// goes back the next time the character stands at one.
-bool CraftToolGoesBack(bool inBags, bool stillNeeded, bool bankerInReach, bool able);
+// is worn), only for a member a planned recipe has needed it for (a craft
+// errand of theirs named a recipe that needs the tool, wow-overseer#1515),
+// only when no standing craft errand still needs it, only with a banker in
+// reach and the character able to bank (alive, out of combat, not in flight,
+// not trading). Nobody is walked to a banker to put it back: it goes back the
+// next time the character stands at one. A tool no planned recipe needed is
+// not the craft drive's: the planner skips every Anvil recipe today, and an
+// engineer's hammer is not banked out from under the next errand.
+bool CraftToolGoesBack(bool inBags, bool planned, bool stillNeeded, bool bankerInReach, bool able);
 
 // A WORLD SPAWN OF A SPELL FOCUS, as the adapter reads it out of the
 // gameobject spawn table.
@@ -26645,6 +26712,68 @@ enum class LockpickErrandStep : std::uint8_t
 
 LockpickErrandStep DecideLockpickErrand(bool hasTarget, bool inReach,
                                         bool inCombat, bool moving);
+
+// -- Stratholme exit yard way out (#645) --------------------------------------
+// What a family does once it stands in the exit yard after a run. Walk: the
+// Service Entrance is open. Button: press gameobject 175432, then walk. Hearth:
+// each member uses its own hearthstone. None: no way out is available.
+enum class StratholmeExitWay : std::uint8_t
+{
+    Walk,
+    Button,
+    Hearth,
+    None,
+};
+
+struct StratholmeExitFacts
+{
+    bool doorOpen{false};
+    bool buttonInReach{false};
+    bool hearthAvailable{false};
+};
+
+StratholmeExitWay DecideStratholmeExit(StratholmeExitFacts const& facts);
+
+char const* StratholmeExitWayWord(StratholmeExitWay way);
+
+// The run's exit trigger whose landing is the yard, and the two gameobjects in
+// it: the Elders' Square Service Entrance and the button that opens it.
+constexpr std::uint32_t STRATHOLME_YARD_EXIT_TRIGGER = 2221;
+constexpr std::uint32_t STRATHOLME_SERVICE_ENTRANCE_ENTRY = 175369;
+constexpr std::uint32_t STRATHOLME_SERVICE_BUTTON_ENTRY = 175432;
+// The yard as the navmesh closes it (the stratholme-undead row in
+// mod_overseer.cpp): five polygons from x 3200 to 3241 and y -4057 to -4032,
+// and the gateway polygon from x 3180 to 3200 that the door stands in, on map
+// 0. West of x 3180 is Elders' Square, which is outside.
+constexpr float STRATHOLME_YARD_WEST_X = 3180.f;
+constexpr float STRATHOLME_YARD_EAST_X = 3241.f;
+constexpr float STRATHOLME_YARD_SOUTH_Y = -4057.f;
+constexpr float STRATHOLME_YARD_NORTH_Y = -4032.f;
+// How far from the one walking out the door and the button are looked for:
+// 2221's landing stands 51 yards from the door.
+constexpr float STRATHOLME_YARD_SEARCH_YARDS = 80.f;
+// How far past the door, west, the leader is walked once it is open.
+constexpr float STRATHOLME_WALK_OUT_YARDS = 20.f;
+// The button counts as out of reach once it has been pressed this many times
+// with the door still shut, or the leader has not got to it in this long.
+constexpr unsigned STRATHOLME_BUTTON_PRESSES = 3;
+constexpr std::uint32_t STRATHOLME_BUTTON_WALK_SECONDS = 3 * 60;
+// The whole way out gives up after this long and leaves the family to the
+// ordinary drives, said in the log.
+constexpr std::uint32_t STRATHOLME_YARD_EPISODE_SECONDS = 15 * 60;
+
+// Whether a point on `mapId` stands in the exit yard.
+bool InStratholmeExitYard(std::uint32_t mapId, float x, float y);
+
+// Whether the button is still worth walking to: it is spawned, it has not
+// been pressed STRATHOLME_BUTTON_PRESSES times already, and the walk to it has
+// not run past STRATHOLME_BUTTON_WALK_SECONDS.
+bool StratholmeButtonInReach(bool spawned, unsigned presses, std::uint32_t secondsWalking);
+
+// Whether a member's own hearthstone takes it out of the yard: it carries one
+// off cooldown and its bind is not in the yard itself.
+bool StratholmeHearthLeavesTheYard(bool stoneReady, std::uint32_t bindMap, float bindX,
+                                   float bindY);
 
 }  // namespace OverseerDecisions
 

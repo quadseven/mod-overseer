@@ -6385,6 +6385,28 @@ public:
     bool Claim(std::string const& name, std::string const& target,
                OverseerDecisions::TravelOwner owner)
     {
+        // THE AIM HAS TO FIT THE COLUMN BEFORE ANY FENCE IS ASKED (#1139).
+        // `overseer_roster.travel_npc` is TRAVEL_AIM_COLUMN_CHARS wide. In
+        // strict mode MySQL refuses an over-long row (errno 1406) and the core
+        // logs the refusal without the value, so the caller believes the aim
+        // was written; outside strict mode it truncates, and a truncated aim
+        // is one the parser can never read back. Either way the walk never
+        // starts. Every writer is meant to size its own aim
+        // (OverseerDecisions::TravelAimAtPosition); this is the backstop so a
+        // future writer cannot reopen the hole, and it names the value the
+        // core's own error leaves out.
+        if (target.size() > TRAVEL_AIM_COLUMN_CHARS)
+        {
+            LOG_ERROR("module.overseer",
+                      "overseer: travel aim '{}' for '{}' is {} characters and "
+                      "overseer_roster.travel_npc holds {}, so it is refused and "
+                      "nothing is written (#1139)",
+                      target, name, uint32(target.size()),
+                      uint32(TRAVEL_AIM_COLUMN_CHARS));
+            _claimRefusalSaid[name] = "an aim too long for the travel column";
+            return false;
+        }
+
         auto const it = _state.find(name);
         if (it != _state.end() && it->second.target == target)
             return true;
@@ -6532,6 +6554,9 @@ public:
     bool FenceRefuses(std::string const& name, std::string const& target,
                       OverseerDecisions::TravelOwner owner)
     {
+        // The column-width refusal Claim makes first (#1139) is a refusal too.
+        if (target.size() > TRAVEL_AIM_COLUMN_CHARS)
+            return true;
         auto const it = _state.find(name);
         if (it != _state.end() && it->second.target == target)
             return false;
@@ -16659,12 +16684,20 @@ private:
         return true;
     }
 
+    // Every member a standing craft errand has named a tool-needing recipe for
+    // since its tool last went back (wow-overseer#1515). World thread only.
+    // Lost on a restart, which fails closed: the tool stays in the bags until
+    // the next such errand.
+    std::set<std::string> _craftToolPlanned;
+
     // THE HAMMER GOES BACK IN THE BANK (#524). The operator's decision is that
     // the Blacksmith Hammer lives in the crafter's own bank and comes out to
     // craft. Once no standing craft errand needs it, it is banked the next
     // time the character stands in reach of a banker; nobody is walked to one
     // for it. Through DoBank, the bank verb's executor, so the checks and the
-    // read-back are that verb's.
+    // read-back are that verb's. Only for a member a planned recipe needed it
+    // for (wow-overseer#1515): a hammer nothing on the plan has asked for is
+    // left in the bags, and a deposit that fails is said once, not per poll.
     void ReturnCraftTools()
     {
         QueryResult result = CharacterDatabase.Query(
@@ -16687,22 +16720,38 @@ private:
             if (errand != errands.end())
                 if (SpellInfo const* info = sSpellMgr->GetSpellInfo(errand->second))
                     stillNeeded = SpellNeedsTool(info, category);
+            if (stillNeeded)
+                _craftToolPlanned.insert(name);
+            bool const planned = _craftToolPlanned.count(name) != 0;
             bool const able = bot->IsAlive() && !bot->IsInCombat() && !bot->IsInFlight() &&
                               !bot->GetTradeData();
             bool anyBanker = false;
             bool const bankerInReach =
-                !stillNeeded && able && BankerInReach(bot, anyBanker) != nullptr;
-            if (!OverseerDecisions::CraftToolGoesBack(true, stillNeeded, bankerInReach, able))
+                planned && !stillNeeded && able && BankerInReach(bot, anyBanker) != nullptr;
+            if (!OverseerDecisions::CraftToolGoesBack(true, planned, stillNeeded, bankerInReach, able))
                 continue;
             char const* status = "error";
             std::string out;
             DoBank(bot, "deposit guid:" + std::to_string(tool->GetGUID().GetCounter()), status, out);
-            LOG_INFO("module.overseer",
-                     "overseer: '{}' put its {} back in the bank, no craft errand needs it "
-                     "(#524): {}{}{}",
-                     name, tool->GetTemplate()->Name1, status, out.empty() ? "" : " - ",
-                     out.substr(0, 300));
-            _craftPrepSaid.erase(name);
+            if (std::string(status) == "delivered")
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' put its {} back in the bank, no craft errand needs it "
+                         "(#524): {}{}{}",
+                         name, tool->GetTemplate()->Name1, status, out.empty() ? "" : " - ",
+                         out.substr(0, 300));
+                _craftToolPlanned.erase(name);
+                _craftPrepSaid.erase(name);
+                continue;
+            }
+            // A full bank answers the same way every poll: said once per
+            // answer, and tried again at the next banker.
+            if (SayCraftPrepOnce(name, std::string("tool not banked: ") + status))
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' could not put its {} back in the bank (#524): {}{}{} - "
+                         "keeping it in the bags and trying again at a banker; said once",
+                         name, tool->GetTemplate()->Name1, status, out.empty() ? "" : " - ",
+                         out.substr(0, 300));
         } while (result->NextRow());
     }
 
@@ -16865,26 +16914,32 @@ private:
             if (toolStep == OverseerDecisions::CraftToolStep::Request)
             {
                 // ASKED FOR, NEVER CONJURED. The same material request a
-                // missing reagent writes, keyed on the tool's item id, so the
-                // planner buys one (and the next poll after it lands in the
-                // bags crafts with it, and ReturnCraftTools banks it after).
+                // missing reagent writes, keyed on the tool's item id. ONCE
+                // PER STATE (wow-overseer#1516): no planner pass buys from
+                // this row yet (the buy is wow-overseer#1477), so it is
+                // written when the crafter enters the "no tool" state, under
+                // the same said-once gate as the log line, not every poll.
+                // A craft, a withdraw or a return clears the state, so a
+                // crafter that loses its hammer again asks again.
                 uint32 const toolItem = OverseerDecisions::ToolItemForTotemCategory(toolCategory);
-                if (ItemTemplate const* proto = toolItem ? sObjectMgr->GetItemTemplate(toolItem) : nullptr)
-                {
-                    std::string detail = "need 1x ";
-                    detail += proto->Name1;
-                    detail += " (a tool, kept in the bank)";
-                    EventExtra extra;
-                    extra.itemGuid = toolItem;
-                    RecordEvent(bot, "material-request", spellId, info->SpellName[LOCALE_enUS],
-                                detail, extra);
-                }
                 if (SayCraftPrepOnce(name, "no tool"))
+                {
+                    if (ItemTemplate const* proto = toolItem ? sObjectMgr->GetItemTemplate(toolItem) : nullptr)
+                    {
+                        std::string detail = "need 1x ";
+                        detail += proto->Name1;
+                        detail += " (a tool, kept in the bank)";
+                        EventExtra extra;
+                        extra.itemGuid = toolItem;
+                        RecordEvent(bot, "material-request", spellId, info->SpellName[LOCALE_enUS],
+                                    detail, extra);
+                    }
                     LOG_INFO("module.overseer",
                              "overseer: '{}' has no tool of category {} anywhere, bags or bank, "
-                             "for '{}' ({}) - asked for item {} and leaving the errand standing "
-                             "(#524)",
+                             "for '{}' ({}) - asked for item {} once and leaving the errand "
+                             "standing (#524)",
                              name, toolCategory, info->SpellName[LOCALE_enUS], spellId, toolItem);
+                }
                 continue;
             }
 
@@ -23783,9 +23838,31 @@ private:
                 return false;
             }
         }
-        std::ostringstream aim;
-        aim << "at:" << leader->GetMapId() << ':' << ax << ',' << ay << ',' << az;
-        std::string const aimText = aim.str();
+        // SIZED TO THE COLUMN, LIKE EVERY OTHER `at:` WRITER (#1139). This was
+        // a bare ostringstream: six significant digits, so a shore-corrected z
+        // such as -0.0413553 made `at:1:-4012.35,-1234.56,-0.0413553`, 33
+        // characters, which strict mode refused while the follower was logged
+        // as aimed. TravelAimAtPosition gives one decimal, then whole yards,
+        // then nothing; nothing leaves the follower on `follow`, said like the
+        // unmeasured-ground refusal above.
+        std::string const aimText = OverseerDecisions::TravelAimAtPosition(
+            leader->GetMapId(), ax, ay, az);
+        if (aimText.empty())
+        {
+            time_t const now = std::time(nullptr);
+            if (now - escort.badGroundSaid >= CATCH_UP_BAD_GROUND_SAID_SECONDS)
+            {
+                escort.badGroundSaid = now;
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' is not aimed at '{}' because the catch-up "
+                         "aim does not fit the {}-character travel column even in whole "
+                         "yards (map {}, {}, {}, {}) (#1139). It keeps following, and "
+                         "the aim is written again as soon as the position fits",
+                         name, leader->GetName(), uint32(TRAVEL_AIM_COLUMN_CHARS),
+                         static_cast<uint32>(leader->GetMapId()), ax, ay, az);
+            }
+            return false;
+        }
 
         // THE AIM IS WRITTEN BEFORE ANYTHING IS RECORDED ABOUT IT (#560).
         // TravelAimBook::Claim can refuse, when a fence protects an errand it
@@ -33689,9 +33766,10 @@ private:
             // Service Entrance, stands at x 3185.48 - locked (flags 34, lock
             // 879), closed (state 1), opened in practice by the Key to the City
             // or by its button, gameobject 175432 at (3191.1, -4044.29), which
-            // no bot presses. With that gateway polygon treated as shut the
-            // walk out reaches nothing past the five; with it open, as the
-            // navmesh is built (it does not model doors), the same walk reaches
+            // DriveStratholmeYard presses (#645). With that gateway polygon
+            // treated as shut the walk out reaches nothing past the five; with
+            // it open, as the navmesh is built (it does not model doors), the
+            // same walk reaches
             // 23472 polygons, the main gate among them. So the gateway is the
             // only way out. The portcullis to the east, gameobject 175370 at
             // (3271.52, -4064.31), is not on the yard's edge at all: no
@@ -33701,9 +33779,10 @@ private:
             // door stops a bot's walk, and that has not been measured; a way
             // out through a locked door is not one this module counts on. The
             // rows are kept, not deleted: a party found inside map 329 after a
-            // restart is still adopted and walked to 2221, and a row comes off
-            // the withheld list once a way out exists (a button press, or a
-            // surveyed exit).
+            // restart is still adopted and walked to 2221. The way out now
+            // exists (DriveStratholmeYard: walk, button, or each member's own
+            // hearth, #645), and the rows come off the withheld list once a
+            // live run has been seen leaving the yard by it.
             //
             // areatrigger.sql: (2214,0,3237.46,-4060.6,112.01,0,10,10,10,0)
             // areatrigger_teleport.sql: (2214,'Stratholme - Eastern Plaguelands Instance',329,3593.15,-3646.56,138.5,5.33)
@@ -36054,6 +36133,224 @@ private:
         }
         return OverseerDecisions::ExitHearthHoldsAdoption(
             steps, static_cast<uint32>(std::time(nullptr) - episode.since));
+    }
+
+    // ---- a Stratholme run's way out of the exit yard (#645) -------------------
+    //
+    // Every Stratholme run leaves map 329 by areatrigger 2221, which lands in a
+    // yard closed except through the Elders' Square Service Entrance (see the
+    // stratholme-undead row). A player opens it with the button inside the
+    // yard or hearths out, and so does this: an EXIT through 2221 opens an
+    // episode for the family, and each poll reads the door, asks
+    // OverseerDecisions::DecideStratholmeExit and does what it says. Walk aims
+    // the one walking out past the open door; Button walks it to the button and
+    // presses it with CMSG_GAMEOBJ_USE, the packet a client sends; Hearth casts
+    // each member's own hearthstone through DriveExitHearths. No other teleport
+    // is ordered. The episode ends when nobody is left in the yard, when no way
+    // out is left, or at its ceiling, and the coordinator waits while it runs.
+    struct StratholmeYardEpisode
+    {
+        std::time_t since{0};
+        std::time_t buttonWalkSince{0};
+        unsigned presses{0};
+        std::string said;     // the last way-out line, so it is said once
+        std::string walker;   // whose aim the episode holds
+        std::string aim;
+        ExitHearthEpisode hearth;
+    };
+    std::map<std::string, StratholmeYardEpisode> _stratholmeYards;
+
+    void OpenStratholmeYard(std::string const& family, DungeonPortal const& portal,
+                            DungeonRunCoordinatorState const& run)
+    {
+        if (portal.exitTriggerId != OverseerDecisions::STRATHOLME_YARD_EXIT_TRIGGER)
+            return;
+        StratholmeYardEpisode yard;
+        yard.since = std::time(nullptr);
+        // The hearth leg's timeline rows are the run's own.
+        yard.hearth.runId = run.runId ? run.runId : ActiveRunIdOnMap(portal.insideMapId);
+        yard.hearth.campaignId = run.campaignId;
+        yard.hearth.runNumber = run.runNumber;
+        yard.hearth.portal = portal.keyword;
+        _stratholmeYards[family] = yard;
+        LOG_INFO("module.overseer",
+                 "overseer: family '{}' left '{}' by areatrigger {} into the exit yard; "
+                 "the way out is read from the Service Entrance on the next poll",
+                 family, portal.keyword, portal.exitTriggerId);
+    }
+
+    static std::vector<Player*> MembersInStratholmeYard(std::vector<std::string> const& members)
+    {
+        std::vector<Player*> inYard;
+        for (std::string const& name : members)
+        {
+            Player* member = ObjectAccessor::FindPlayerByName(name);
+            if (member && member->IsInWorld() &&
+                OverseerDecisions::InStratholmeExitYard(member->GetMapId(),
+                                                        member->GetPositionX(),
+                                                        member->GetPositionY()))
+                inYard.push_back(member);
+        }
+        return inYard;
+    }
+
+    // The members whose own hearthstone takes them out of the yard, and those
+    // already casting one.
+    std::vector<std::string> StratholmeHearthers(std::vector<Player*> const& inYard) const
+    {
+        std::vector<std::string> hearthers;
+        for (Player* member : inYard)
+        {
+            uint32 const stone = HearthstoneSpellOf(member);
+            if (HearthPendingFor(member->GetName()) ||
+                OverseerDecisions::StratholmeHearthLeavesTheYard(
+                    stone && !member->HasSpellCooldown(stone), member->m_homebindMapId,
+                    member->m_homebindX, member->m_homebindY))
+                hearthers.push_back(member->GetName());
+        }
+        return hearthers;
+    }
+
+    void AimStratholmeWalker(StratholmeYardEpisode& yard, Player* walker, float x, float y,
+                             float z)
+    {
+        std::ostringstream at;
+        at << "at:0:" << x << ',' << y << ',' << z;
+        if (!yard.walker.empty() && yard.walker != walker->GetName())
+            _travelAims.ReleaseRunAim(yard.walker, yard.aim, "the Stratholme yard way out");
+        yard.walker = walker->GetName();
+        yard.aim = at.str();
+        _travelAims.Claim(yard.walker, yard.aim, OverseerDecisions::TravelOwner::Run);
+    }
+
+    void CloseStratholmeYard(std::string const& family, StratholmeYardEpisode const& yard)
+    {
+        if (!yard.walker.empty())
+            _travelAims.ReleaseRunAim(yard.walker, yard.aim, "the Stratholme yard way out");
+        _stratholmeYards.erase(family);
+    }
+
+    void PressStratholmeButton(StratholmeYardEpisode& yard, Player* walker, GameObject* button,
+                               std::time_t now)
+    {
+        if (!yard.buttonWalkSince)
+            yard.buttonWalkSince = now;
+        if (walker->GetDistance(button) > button->GetInteractionDistance())
+        {
+            AimStratholmeWalker(yard, walker, button->GetPositionX(), button->GetPositionY(),
+                                button->GetPositionZ());
+            return;
+        }
+        ++yard.presses;
+        DriveGameObjectUse(walker->GetSession(), button->GetGUID());
+        LOG_INFO("module.overseer",
+                 "overseer: stratholme exit: '{}' pressed the Service Entrance button "
+                 "(press {} of {}); the door is read again on the next poll",
+                 walker->GetName(), yard.presses, OverseerDecisions::STRATHOLME_BUTTON_PRESSES);
+    }
+
+    // ONE POLL OF THE WAY OUT. Returns whether the episode is still running,
+    // which holds the coordinator for the family.
+    bool DriveStratholmeYard(std::string const& family, std::string const& leaderName,
+                             std::vector<std::string> const& members)
+    {
+        auto const found = _stratholmeYards.find(family);
+        if (found == _stratholmeYards.end())
+            return false;
+        StratholmeYardEpisode& yard = found->second;
+        std::time_t const now = std::time(nullptr);
+        std::vector<Player*> const inYard = MembersInStratholmeYard(members);
+        if (inYard.empty())
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: stratholme exit: every member of '{}' is out of the yard",
+                     family);
+            CloseStratholmeYard(family, yard);
+            return false;
+        }
+        if (now - yard.since >= static_cast<std::time_t>(
+                                    OverseerDecisions::STRATHOLME_YARD_EPISODE_SECONDS))
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: stratholme exit: {} of '{}' still in the yard after {} "
+                     "minutes; the way out gives up and the ordinary drives take them",
+                     static_cast<uint32>(inYard.size()), family,
+                     OverseerDecisions::STRATHOLME_YARD_EPISODE_SECONDS / 60);
+            CloseStratholmeYard(family, yard);
+            return false;
+        }
+
+        Player* walker = inYard.front();
+        for (Player* member : inYard)
+            if (member->GetName() == leaderName)
+                walker = member;
+        GameObject* const door = walker->FindNearestGameObject(
+            OverseerDecisions::STRATHOLME_SERVICE_ENTRANCE_ENTRY,
+            OverseerDecisions::STRATHOLME_YARD_SEARCH_YARDS);
+        GameObject* const button = walker->FindNearestGameObject(
+            OverseerDecisions::STRATHOLME_SERVICE_BUTTON_ENTRY,
+            OverseerDecisions::STRATHOLME_YARD_SEARCH_YARDS);
+        std::vector<std::string> const hearthers = StratholmeHearthers(inYard);
+
+        OverseerDecisions::StratholmeExitFacts facts;
+        facts.doorOpen = door && door->GetGoState() == GO_STATE_ACTIVE;
+        facts.buttonInReach = OverseerDecisions::StratholmeButtonInReach(
+            button && button->isSpawned(), yard.presses,
+            yard.buttonWalkSince ? static_cast<uint32>(now - yard.buttonWalkSince) : 0u);
+        facts.hearthAvailable = !hearthers.empty();
+        OverseerDecisions::StratholmeExitWay const way =
+            OverseerDecisions::DecideStratholmeExit(facts);
+
+        char const* const doorWord = facts.doorOpen ? "open" : "closed";
+        std::string const line =
+            std::string(doorWord) + "/" + OverseerDecisions::StratholmeExitWayWord(way);
+        if (yard.said != line)
+        {
+            yard.said = line;
+            LOG_INFO("module.overseer", "overseer: stratholme exit: door {}, way out {}",
+                     doorWord, OverseerDecisions::StratholmeExitWayWord(way));
+        }
+
+        switch (way)
+        {
+            case OverseerDecisions::StratholmeExitWay::Walk:
+                AimStratholmeWalker(
+                    yard, walker,
+                    door->GetPositionX() - OverseerDecisions::STRATHOLME_WALK_OUT_YARDS,
+                    door->GetPositionY(), door->GetPositionZ());
+                return true;
+
+            case OverseerDecisions::StratholmeExitWay::Button:
+                // buttonInReach already needs a spawned button; the guard keeps
+                // that promise at the call that dereferences it.
+                if (!button)
+                    return true;
+                PressStratholmeButton(yard, walker, button, now);
+                return true;
+
+            case OverseerDecisions::StratholmeExitWay::Hearth:
+                if (!yard.hearth.since)
+                    yard.hearth.since = now;
+                if (DriveExitHearths(family, leaderName, hearthers, yard.hearth,
+                                     "STRATHOLME_YARD"))
+                    return true;
+                LOG_WARN("module.overseer",
+                         "overseer: stratholme exit: no hearth is left in play for the {} of "
+                         "'{}' still in the yard; the ordinary drives take them",
+                         static_cast<uint32>(inYard.size()), family);
+                CloseStratholmeYard(family, yard);
+                return false;
+
+            case OverseerDecisions::StratholmeExitWay::None:
+                break;
+        }
+        LOG_WARN("module.overseer",
+                 "overseer: stratholme exit: the door is shut, the button is out of reach "
+                 "and no member in the yard can hearth out, so '{}' is left to the ordinary "
+                 "drives",
+                 family);
+        CloseStratholmeYard(family, yard);
+        return false;
     }
 
     // WHERE A RUN STANDS, in the words the fetch rule reads (2026-09-23). Here
@@ -52094,6 +52391,11 @@ private:
             }
         }
 
+        // A FAMILY IN STRATHOLME'S EXIT YARD IS GOT OUT OF IT BEFORE ANYTHING
+        // ELSE IS DECIDED FOR IT (#645). See DriveStratholmeYard.
+        if (DriveStratholmeYard(family, leaderName, members))
+            return;
+
         if (coord.phase == DungeonRunPhase::Idle)
         {
             // job != 'dungeon' is the ordinary case - most polls, this drive
@@ -54267,6 +54569,9 @@ private:
                                  "areatrigger {} and are on map {} - the run is over",
                                  static_cast<uint32>(members.size()), triggerId,
                                  portal->outsideMapId);
+                        // AND A RUN THAT LEFT INTO STRATHOLME'S EXIT YARD
+                        // IS WALKED OR HEARTHED OUT OF IT (#645).
+                        OpenStratholmeYard(family, *portal, coord);
                         // THE ONE PRECONDITION A RESET CANNOT BE GIVEN BY
                         // ANYTHING ELSE (#144): every member out of the
                         // instance. EXIT is what establishes it, and this is
