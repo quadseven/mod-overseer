@@ -18380,7 +18380,6 @@ struct RaidRunFacts
     std::time_t lastWipeAt{0};       // epoch seconds of the previous wipe (0 = none)
     bool samePlace{false};           // this wipe is at the same place as the last
     bool membersSick{false};         // members still carry Resurrection Sickness
-    bool samePullPresent{false};     // the same pull is still in front of the door
     std::string graveyard;           // the graveyard the party would revive at
     std::time_t now{0};              // this poll's epoch seconds
 };

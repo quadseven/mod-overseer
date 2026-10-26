@@ -15478,10 +15478,9 @@ RaidRunStep StepRaidRunRecover(RaidRunPhase current, RaidRunFacts const& facts)
         return step;
     }
 
-    // While members still carry Resurrection Sickness, or the same pull that
-    // wiped them is still in front of the door, do not walk the party straight
-    // back in; wait out the sickness instead of a second wipe (#1165).
-    if (wiped && (facts.membersSick || facts.samePullPresent))
+    // While members still carry Resurrection Sickness, do not walk the party
+    // straight back in; wait it out instead of risking another wipe (#1165).
+    if (wiped && facts.membersSick)
     {
         step.runBack = false;
         step.why = "members still carry Resurrection Sickness; waiting it out before the run-back";
