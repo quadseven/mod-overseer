@@ -33329,7 +33329,8 @@ private:
             // areatrigger_teleport.sql: (244,'Razorfen Kraul Entrance',47,1943,1544.63,82,1.38)
             // areatrigger.sql: (242,47,1936.39,1534.47,86.8769,8,0,0,0,0)
             // areatrigger_teleport.sql: (242,'Razorfen Kraul Instance Start',1,-4464.92,-1666.24,81.8928,4.28827)
-            {"razorfen-kraul", 1, 244, 47, 242, 0.f, 0.f, 0.f},
+            {"razorfen-kraul", 1, 244, 47, 242, 0.f, 0.f, 0.f, {}, 0.f, 0.f, 0.f,
+             "the way up is the Great Lift (gameobject 19844), a lift the walker cannot ride"},
             // RAZORFEN DOWNS, on the same rim about 900 yards east, with the
             // same two ways up for an Alliance party and the Bael'dun digsite
             // closer still for a Horde one. Door minimum level 25.
@@ -33338,7 +33339,8 @@ private:
             // areatrigger_teleport.sql: (442,'Razorfen Downs Entrance',129,2592.55,1107.5,51.29,4.74)
             // areatrigger.sql: (444,129,2593.94,1124.64,56.179,11,0,0,0,0)
             // areatrigger_teleport.sql: (444,'Razorfen Downs Instance Start',1,-4658.12,-2526.35,81.492,1.25978)
-            {"razorfen-downs", 1, 442, 129, 444, 0.f, 0.f, 0.f},
+            {"razorfen-downs", 1, 442, 129, 444, 0.f, 0.f, 0.f, {}, 0.f, 0.f, 0.f,
+             "the way up is the Great Lift (gameobject 19844), a lift the walker cannot ride"},
             // GNOMEREGAN, THE FRONT DOOR, on map 0 in a cavern about 105 yards
             // under Dun Morogh. The way down is the lift (gameobject 80023,
             // "Vator"), a transport the walker cannot path across, so this door
@@ -33351,7 +33353,8 @@ private:
             // areatrigger_teleport.sql: (324,'Gnomeregan Entrance',90,-332.22,-2.28,-150.86,2.77)
             // areatrigger.sql: (322,90,-312.205,-4.63256,-148.657,14,0,0,0,0)
             // areatrigger_teleport.sql: (322,'Gnomeregan Instance Start',0,-5163.33,927.623,257.188,0)
-            {"gnomeregan", 0, 324, 90, 322, 0.f, 0.f, 0.f},
+            {"gnomeregan", 0, 324, 90, 322, 0.f, 0.f, 0.f, {}, 0.f, 0.f, 0.f,
+             "the way down is the Vator (gameobject 80023), a lift the walker cannot ride"},
             // GNOMEREGAN, THE TRAIN DEPOT DOOR, in the same cavern. Between the
             // cavern and this trigger stands the Workshop Door, gameobject
             // 90566 at (-4861.05, 740.452, 249.389), locked (flags 34, lock
@@ -33366,7 +33369,7 @@ private:
             // areatrigger.sql: (525,90,-717.868,1.37207,-241.293,12,0,0,0,0)
             // areatrigger_teleport.sql: (525,'Gnomeregan Train Depot Instance',0,-4858.27,756.435,244.923,0)
             {"gnomeregan-depot", 0, 523, 90, 525, 0.f, 0.f, 0.f, {}, 0.f, 0.f, 0.f,
-             nullptr, 90566},
+             "the way down is the Vator (gameobject 80023), a lift the walker cannot ride", 90566},
             // ULDAMAN, THE FRONT DOOR, on map 0 at the bottom of the dig site
             // cave in Loch Modan. The trigger is at z 213.7 with the surface
             // about 165 yards over it, which is the "door at the bottom of a

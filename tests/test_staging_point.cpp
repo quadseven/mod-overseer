@@ -594,6 +594,76 @@ void TheBlackrockDepthsRowNamesItsInn()
               true);
 }
 
+// THE TWO LIFTS ARE REFUSED WITH A NAMED REASON. Gnomeregan's front door and
+// train depot both need the Vator (gameobject 80023), a transport the walker
+// cannot ride, and neither has any walkable way down - the door stands about
+// 105 yards under Dun Morogh. Razorfen Kraul and Razorfen Downs both need the
+// Great Lift (gameobject 19844) for the short way up from Thalanaar; the long
+// way past Camp Taurajo exists but is unsurveyed, so until a corridor is
+// measured the lift is the only named approach and the walker cannot ride it.
+// Each row is therefore withheld with a reason that names the lift, so the
+// coordinator refuses to open a run and says why, rather than walking a party
+// at a door it cannot reach on foot.
+bool RowWithheldNamesLift(std::string const& all, std::string const& keyword,
+                          std::string const& gameobject)
+{
+    std::string const opening = "{\"" + keyword + "\",";
+    std::size_t const start = all.find(opening);
+    if (start == std::string::npos)
+        return false;
+
+    // Find the end of this row's initializer (matching closing brace).
+    int depth = 0;
+    std::size_t i = start;
+    for (; i < all.size(); ++i)
+    {
+        if (all.compare(i, 2, "//") == 0)
+        {
+            i = all.find('\n', i);
+            if (i == std::string::npos)
+                return false;
+            continue;
+        }
+        if (all[i] == '{')
+            ++depth;
+        else if (all[i] == '}' && --depth == 0)
+            break;
+    }
+    if (i == all.size())
+        return false;
+
+    // The withheld field is the last string literal in the initializer, right
+    // before the closing brace. The keyword is the first. Extract the last
+    // quoted string and check it is not nullptr and names the lift.
+    std::string body = all.substr(start, i - start + 1);
+    std::size_t lastQuote = body.rfind('"');
+    if (lastQuote == std::string::npos)
+        return false;
+    std::size_t firstQuote = body.rfind('"', lastQuote - 1);
+    if (firstQuote == std::string::npos)
+        return false;
+
+    std::string withheld = body.substr(firstQuote + 1, lastQuote - firstQuote - 1);
+    return withheld != "nullptr" && withheld.find(gameobject) != std::string::npos;
+}
+
+void TheLiftDoorsAreRefusedWithANamedReason()
+{
+    std::string const all = ReadSource();
+
+    CheckBool("gnomeregan is withheld for the Vator lift (gameobject 80023)",
+              RowWithheldNamesLift(all, "gnomeregan", "80023"), true);
+
+    CheckBool("gnomeregan-depot is withheld for the Vator lift (gameobject 80023)",
+              RowWithheldNamesLift(all, "gnomeregan-depot", "80023"), true);
+
+    CheckBool("razorfen-kraul is withheld for the Great Lift (gameobject 19844)",
+              RowWithheldNamesLift(all, "razorfen-kraul", "19844"), true);
+
+    CheckBool("razorfen-downs is withheld for the Great Lift (gameobject 19844)",
+              RowWithheldNamesLift(all, "razorfen-downs", "19844"), true);
+}
+
 }  // namespace
 
 int main()
@@ -610,5 +680,6 @@ int main()
     TheFallbackHeightIsCheckedAgainstTheDoor();
     EveryRefusalSaysSomething();
     TheBlackrockDepthsRowNamesItsInn();
+    TheLiftDoorsAreRefusedWithANamedReason();
     return failures ? 1 : 0;
 }
