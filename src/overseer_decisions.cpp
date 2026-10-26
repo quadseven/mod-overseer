@@ -17711,9 +17711,9 @@ char const* CraftToolStepWord(CraftToolStep step)
     return "wait";
 }
 
-bool CraftToolGoesBack(bool inBags, bool stillNeeded, bool bankerInReach, bool able)
+bool CraftToolGoesBack(bool inBags, bool planned, bool stillNeeded, bool bankerInReach, bool able)
 {
-    return inBags && !stillNeeded && bankerInReach && able;
+    return inBags && planned && !stillNeeded && bankerInReach && able;
 }
 
 int NearestFocusSpawn(std::vector<FocusSpawn> const& spawns, unsigned mapId, float x, float y,

@@ -20486,11 +20486,15 @@ CraftToolStep CraftToolStepFor(CraftToolPlace place, bool bankerInReach, bool ma
 char const* CraftToolStepWord(CraftToolStep step);
 
 // IS THE TOOL PUT BACK IN THE BANK NOW? Only a tool in the bags (never one that
-// is worn), only when no standing craft errand still needs it, only with a
-// banker in reach and the character able to bank (alive, out of combat, not
-// in flight, not trading). Nobody is walked to a banker to put it back: it
-// goes back the next time the character stands at one.
-bool CraftToolGoesBack(bool inBags, bool stillNeeded, bool bankerInReach, bool able);
+// is worn), only for a member a planned recipe has needed it for (a craft
+// errand of theirs named a recipe that needs the tool, wow-overseer#1515),
+// only when no standing craft errand still needs it, only with a banker in
+// reach and the character able to bank (alive, out of combat, not in flight,
+// not trading). Nobody is walked to a banker to put it back: it goes back the
+// next time the character stands at one. A tool no planned recipe needed is
+// not the craft drive's: the planner skips every Anvil recipe today, and an
+// engineer's hammer is not banked out from under the next errand.
+bool CraftToolGoesBack(bool inBags, bool planned, bool stillNeeded, bool bankerInReach, bool able);
 
 // A WORLD SPAWN OF A SPELL FOCUS, as the adapter reads it out of the
 // gameobject spawn table.
