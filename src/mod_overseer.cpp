@@ -31416,6 +31416,10 @@ private:
         bool const stoneOnCooldown = stone && bot->HasSpellCooldown(stone);
         bool const hearthReady = stone && !stoneOnCooldown && !HearthPendingFor(name);
         bool const inCombat = bot->IsInCombat();
+        // The guild moving the member (a summon of it in flight) frees it from
+        // the keep-out, so the hold below never pins a member being summoned
+        // away (wow-overseer#1514).
+        bool const guildMovedIt = SummonPendingFor(name);
 
         unsigned& tries = _guildDeathSpotTries[name];
         unsigned const boundTries = OverseerDecisions::EXIT_HEARTH_ATTEMPTS;
@@ -31433,7 +31437,7 @@ private:
         auto keepMemberOut = [&]()
         {
             bool const keepOut = OverseerDecisions::KeepOutOfDeathZone(
-                true, outmatchedHere, false);
+                true, outmatchedHere, guildMovedIt);
             if (keepOut)
                 holdStill();
             return keepOut;
@@ -31449,7 +31453,7 @@ private:
             OverseerDecisions::KeepOutOfDeathZone(
                 OverseerDecisions::HearthOutCannotSucceed(stone != 0, stoneOnCooldown, tries,
                                                           boundTries),
-                outmatchedHere, false))
+                outmatchedHere, guildMovedIt))
         {
             holdStill();
             return true;
@@ -31475,19 +31479,19 @@ private:
 
         if (refusal.empty())
         {
-            // Cast started: the verdict comes later in ResolveHearthChecks. Do
-            // not erase the outmatched mark until we know the hearth arrived.
+            // Cast started: the verdict comes later in ResolveHearthChecks,
+            // which erases the outmatched mark when the hearth arrives.
             if (outmatchedHere)
                 LOG_INFO("module.overseer",
                          "overseer: '{}' (level {}) was killed in zone {} by a level {} creature, "
-                         "far above its own level, {}min ago and hearths out after that first death "
-                         "instead of trying again",
+                         "far above its own level, {}min ago and starts a hearth out after that "
+                         "first death instead of trying again",
                          name, bot->GetLevel(), outmatched.zoneId, outmatched.killerLevel,
                          (now - outmatched.at) / 60);
             else
                 LOG_INFO("module.overseer",
                          "overseer: '{}' (level {}) has died {} time(s) within {:.0f} yards of where "
-                         "it stands in {}min and hearths out instead of fighting on there",
+                         "it stands in {}min and starts a hearth out instead of fighting on there",
                          name, bot->GetLevel(), deathsHere, GHOST_REPEAT_RADIUS,
                          GHOST_REPEAT_MINUTES);
             ++tries;
@@ -35749,6 +35753,15 @@ private:
     {
         for (HearthCheck const& check : _pendingHearths)
             if (check.targetName == name)
+                return true;
+        return false;
+    }
+
+    // Whether a summon of `name` is in flight: the guild is moving it.
+    bool SummonPendingFor(std::string const& name) const
+    {
+        for (SummonCheck const& check : _pendingSummons)
+            if (check.summonedName == name)
                 return true;
         return false;
     }
@@ -69885,6 +69898,23 @@ private:
                     // Home on a deck of Acherus, a death knight settles at its
                     // bind point for its next row (2026-10-09).
                     SettleOnTheDeck(bot, "hearth");
+                    // An outmatched member that reached home has hearthed out:
+                    // its mark goes, so LeaveGuildDeathSpot does not hold it
+                    // still for the rest of the window when home lies in the
+                    // zone it died in (wow-overseer#1514).
+                    {
+                        std::lock_guard<std::mutex> lock(g_guildOutmatchedMutex);
+                        auto const mark = g_guildOutmatched.find(check.targetName);
+                        if (mark != g_guildOutmatched.end())
+                        {
+                            LOG_INFO("module.overseer",
+                                     "overseer: '{}' hearthed out of zone {}, where a level {} "
+                                     "creature outmatched it; the mark is cleared",
+                                     check.targetName, mark->second.zoneId,
+                                     mark->second.killerLevel);
+                            g_guildOutmatched.erase(mark);
+                        }
+                    }
                     break;
 
                 case HearthOutcome::Stayed:
