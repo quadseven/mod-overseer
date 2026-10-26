@@ -23562,8 +23562,10 @@ constexpr float GUILD_RUN_RESTED_MANA_PCT = 80.f;
 constexpr unsigned GUILD_RUN_REST_MAX_SECONDS = 120;
 constexpr unsigned GUILD_RUN_REST_REARM_SECONDS = 45;
 constexpr unsigned GUILD_RUN_REGROUP_WAIT_SECONDS = 180;
-// A pause or resume the dungeon module refused is asked again after this long.
+// A pause or resume the dungeon module refused is asked again after this long,
+// and each refusal in a row doubles the wait, up to the cap (GuildRunHoldRetry).
 constexpr unsigned GUILD_RUN_HOLD_RETRY_SECONDS = 15;
+constexpr unsigned GUILD_RUN_HOLD_RETRY_MAX_SECONDS = 240;
 
 // One living member inside, read for the rest.
 struct GuildRunMemberShape
@@ -23608,6 +23610,11 @@ struct GuildRunHoldFacts
     unsigned restMaxSeconds{GUILD_RUN_REST_MAX_SECONDS};
     // False inside GUILD_RUN_REST_REARM_SECONDS of a rest that timed out.
     bool restRearmed{true};
+    // A living Priest, Paladin, Shaman or Druid of the run is inside: the read
+    // the stuck-revival drive makes for a corpse run (LivingResurrectorFor),
+    // and the dungeon module's own (DcRezRecovery::CanRecover). Without one the
+    // dungeon module refuses `dc pause resume` while a member lies dead.
+    bool livingResurrector{true};
 };
 
 enum class GuildRunHoldStep : std::uint8_t
@@ -23648,7 +23655,36 @@ struct GuildRunHold
 // players drinks first, then raises its dead, then pulls. So with a body
 // inside, a group under a trigger rests (bounded as any rest), and the hold is
 // let go for the rez once the living are over their triggers.
+//
+// NO RESUME NOBODY CAN TAKE (mod-overseer#1140). The dungeon module refuses a
+// resume while a member lies dead and no living member can resurrect them. In
+// Blackfathom run 1189170 (2026-10-24) the hold let go for the body anyway and
+// the resume was refused 89 times in 82 minutes, every 15 s, while the corpse
+// run released the same member to a ghost about every 14 minutes. So with a
+// body inside and no living resurrector the hold is kept (why Dead) until the
+// corpse run's release takes the body out (its rez budget) and the ghost walks
+// back in. A rest under way is still a rest until its bound.
 GuildRunHold GuildRunHoldNext(GuildRunHoldFacts const& facts);
+
+// THE HOLD'S RETRY CLOCK. A refused pause or resume is not asked again for
+// GUILD_RUN_HOLD_RETRY_SECONDS, doubled for each refusal in a row up to
+// GUILD_RUN_HOLD_RETRY_MAX_SECONDS; an accepted one starts it again.
+struct GuildRunHoldRetry
+{
+    unsigned refusals{0};
+    std::time_t refusedAt{0};
+};
+
+// The wait after `refusals` refusals in a row: 0 for none, then 15, 30, 60,
+// 120, 240, 240, ...
+unsigned GuildRunHoldRetrySeconds(unsigned refusals);
+// May the hold be asked at `now`?
+bool GuildRunHoldMayAsk(GuildRunHoldRetry const& retry, std::time_t now);
+// A refusal at `now`: true when it is the first of a run of refusals, so the
+// reason is said once.
+bool GuildRunHoldRefused(GuildRunHoldRetry& retry, std::time_t now);
+// An accepted pause or resume: the refusals before it, and the clock is reset.
+unsigned GuildRunHoldAccepted(GuildRunHoldRetry& retry);
 
 // FOCUS FIRE ON A SKULL. In 39 of 45 Deadmines first wipes (2026-10-08 to
 // 2026-10-10) the group went down in one fight, and the tank died first in 32.

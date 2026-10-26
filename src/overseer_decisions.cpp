@@ -20657,6 +20657,10 @@ GuildRunHold GuildRunHoldNext(GuildRunHoldFacts const& facts)
         }
         if (low && facts.secondsResting < facts.restMaxSeconds)
             hold.why = GuildRunHoldWhy::Rest;
+        else if (!facts.livingResurrector)
+            // Nobody alive can raise the body, and the dungeon module refuses a
+            // resume until somebody can (#1140): stay held for the corpse run.
+            hold.why = GuildRunHoldWhy::Dead;
         else
             hold = {GuildRunHoldStep::Release,
                     low ? GuildRunHoldWhy::RestTimedOut : GuildRunHoldWhy::Dead};
@@ -20680,6 +20684,35 @@ GuildRunHold GuildRunHoldNext(GuildRunHoldFacts const& facts)
     else
         hold.why = GuildRunHoldWhy::Rest;
     return hold;
+}
+
+unsigned GuildRunHoldRetrySeconds(unsigned refusals)
+{
+    if (refusals == 0)
+        return 0;
+    unsigned seconds = GUILD_RUN_HOLD_RETRY_SECONDS;
+    for (unsigned i = 1; i < refusals && seconds < GUILD_RUN_HOLD_RETRY_MAX_SECONDS; ++i)
+        seconds *= 2;
+    return std::min(seconds, GUILD_RUN_HOLD_RETRY_MAX_SECONDS);
+}
+
+bool GuildRunHoldMayAsk(GuildRunHoldRetry const& retry, std::time_t now)
+{
+    return retry.refusals == 0 ||
+           now - retry.refusedAt >= static_cast<std::time_t>(GuildRunHoldRetrySeconds(retry.refusals));
+}
+
+bool GuildRunHoldRefused(GuildRunHoldRetry& retry, std::time_t now)
+{
+    retry.refusedAt = now;
+    return ++retry.refusals == 1;
+}
+
+unsigned GuildRunHoldAccepted(GuildRunHoldRetry& retry)
+{
+    unsigned const refusals = retry.refusals;
+    retry = GuildRunHoldRetry{};
+    return refusals;
 }
 
 std::vector<std::string> GuildRunSeatTactics(GuildSeat seat)

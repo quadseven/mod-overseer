@@ -1321,6 +1321,23 @@ static GraveyardStruct const* SafeGraveyardNear(Player* bot, GraveyardStruct con
     return nullptr;
 }
 
+// A class the dungeon module elects to raise the dead (DcRezRecovery's
+// IsRezClass): the one read both the stuck-revival drive and the guild run's
+// rest hold make of "can anybody here resurrect".
+static bool IsResurrectorClass(Player const* member)
+{
+    switch (member->getClass())
+    {
+        case CLASS_PRIEST:
+        case CLASS_PALADIN:
+        case CLASS_SHAMAN:
+        case CLASS_DRUID:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static Player* LivingResurrectorFor(Player* dead)
 {
     Group* group = dead ? dead->GetGroup() : nullptr;
@@ -1334,16 +1351,8 @@ static Player* LivingResurrectorFor(Player* dead)
             continue;
         if (member->GetMapId() != dead->GetMapId())
             continue;
-        switch (member->getClass())
-        {
-            case CLASS_PRIEST:
-            case CLASS_PALADIN:
-            case CLASS_SHAMAN:
-            case CLASS_DRUID:
-                return member;
-            default:
-                break;
-        }
+        if (IsResurrectorClass(member))
+            return member;
     }
     return nullptr;
 }
@@ -41081,7 +41090,10 @@ private:
         unsigned atDoorSaid{0};
         unsigned ghostsWalked{0};
         bool brainHeld{false};
-        std::time_t holdRefusedAt{0};
+        // Refusals of the pause or resume in a row (GuildRunHoldRetry), and
+        // whether "nobody can raise the body" was said for this hold (#1140).
+        OverseerDecisions::GuildRunHoldRetry holdRetry;
+        bool holdDeadSaid{false};
         std::time_t holdAssertedAt{0};
         std::time_t heldSince{0};
         std::time_t regroupSince{0};
@@ -42149,15 +42161,29 @@ private:
         return who.empty() ? std::string("nobody") : who;
     }
 
+    // The first member of the run lying dead in its dungeon, or empty.
+    static std::string GuildRunFirstDeadInside(GuildRun const& run)
+    {
+        for (std::string const& name : run.names)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            if (p && p->IsInWorld() && !p->IsAlive() && p->GetMapId() == run.mapId &&
+                (!run.instanceId || p->GetInstanceId() == run.instanceId))
+                return name;
+        }
+        return std::string();
+    }
+
     // Pause (`hold`) or resume the dungeon brain, from the tank, on every
     // living member inside: the elected leader takes it and a follower answers
     // true at once (DcPauseAction), as with `dc on`. True when nobody refused.
-    // A refusal is said and asked again after GUILD_RUN_HOLD_RETRY_SECONDS.
+    // A refusal is asked again after a wait that doubles with each refusal in
+    // a row (OverseerDecisions::GuildRunHoldRetry, #1140), and its reason is
+    // said once, on the first refusal, not every time it is asked.
     bool IssueGuildRunHold(GuildRun& run, bool hold, std::time_t now)
     {
         Player* const tank = ObjectAccessor::FindPlayerByName(run.tank);
-        if (!tank || !tank->IsInWorld() ||
-            now - run.holdRefusedAt < OverseerDecisions::GUILD_RUN_HOLD_RETRY_SECONDS)
+        if (!tank || !tank->IsInWorld() || !OverseerDecisions::GuildRunHoldMayAsk(run.holdRetry, now))
             return false;
         bool any = false;
         bool all = true;
@@ -42174,15 +42200,28 @@ private:
         if (any && all)
         {
             run.holdAssertedAt = now;
+            if (unsigned const refused = OverseerDecisions::GuildRunHoldAccepted(run.holdRetry))
+                LOG_INFO("module.overseer",
+                         "overseer: guild run rest {} - 'dc pause {}' from '{}' taken after {} "
+                         "refusal(s)",
+                         run.id, hold ? "pause" : "resume", run.tank, refused);
             return true;
         }
-        run.holdRefusedAt = now;
-        if (any)
+        if (!any)
+            return false;
+        if (OverseerDecisions::GuildRunHoldRefused(run.holdRetry, now))
+        {
+            // The dungeon module's own refusal (DcPauseAction), in its words.
+            std::string const dead = GuildRunFirstDeadInside(run);
             LOG_INFO("module.overseer",
-                     "overseer: guild run rest {} - 'dc pause {}' from '{}' refused (see "
-                     "playerbots.dungeonclear); asked again in {}s",
+                     "overseer: guild run rest {} - 'dc pause {}' from '{}' refused ({}); asked "
+                     "again in {}s, the wait doubling up to {}s while it is refused",
                      run.id, hold ? "pause" : "resume", run.tank,
-                     OverseerDecisions::GUILD_RUN_HOLD_RETRY_SECONDS);
+                     dead.empty() ? std::string("see playerbots.dungeonclear")
+                                  : dead + " is dead - rez and try again",
+                     OverseerDecisions::GuildRunHoldRetrySeconds(run.holdRetry.refusals),
+                     OverseerDecisions::GUILD_RUN_HOLD_RETRY_MAX_SECONDS);
+        }
         return false;
     }
 
@@ -42200,6 +42239,7 @@ private:
         facts.aliveInside = poll.aliveInside;
         facts.deadInside = poll.inside - poll.aliveInside;
         facts.ghostsComingBack = ghostsWalking;
+        bool resurrector = false;
         std::vector<OverseerDecisions::GuildRunMemberShape> living;
         for (std::size_t i = 0; i < run.names.size(); ++i)
         {
@@ -42208,10 +42248,13 @@ private:
                 continue;
             if (p->IsInCombat())
                 facts.anyFighting = true;
+            if (IsResurrectorClass(p))
+                resurrector = true;
             living.push_back(GuildRunShapeOf(
                 p, i < run.seats.size() && run.seats[i] == OverseerDecisions::GuildSeat::Healer));
         }
         facts.need = OverseerDecisions::GuildRunRestNeedOf(living);
+        facts.livingResurrector = resurrector;
         run.regroupSince =
             poll.aliveInside && ghostsWalking ? (run.regroupSince ? run.regroupSince : now) : 0;
         facts.secondsRegrouping =
@@ -42226,6 +42269,7 @@ private:
                 return;
             run.brainHeld = true;
             run.heldSince = now;
+            run.holdDeadSaid = false;
             run.restSince = hold.why == GuildRunHoldWhy::Rest ? now : 0;
             // The deploy proof: "guild run rest" is said nowhere else.
             if (hold.why == GuildRunHoldWhy::Regroup)
@@ -42261,6 +42305,7 @@ private:
             run.brainHeld = false;
             run.heldSince = 0;
             run.restSince = 0;
+            run.holdDeadSaid = false;
             return;
         }
         if (!run.brainHeld)
@@ -42277,6 +42322,21 @@ private:
             run.restSince = 0;
         else if (hold.why == GuildRunHoldWhy::Rest && !run.restSince)
             run.restSince = now;
+        // A body inside that nobody alive can raise keeps the hold (#1140):
+        // said once per hold, and the corpse run's release ends it.
+        if (hold.why == GuildRunHoldWhy::Dead && !run.holdDeadSaid)
+        {
+            run.holdDeadSaid = true;
+            std::string const dead = GuildRunFirstDeadInside(run);
+            LOG_INFO("module.overseer",
+                     "overseer: guild run rest {} - the dungeon brain stays held: '{}' lies dead "
+                     "inside and no living member can resurrect ({} is dead - rez and try "
+                     "again); the corpse run releases the body after {}s and the ghost walks "
+                     "back in",
+                     run.id, dead.empty() ? std::string("a member") : dead,
+                     dead.empty() ? std::string("a member") : dead,
+                     OverseerDecisions::GUILD_RUN_ROLE_RECOVERY_SECONDS);
+        }
         if (poll.aliveInside && !facts.anyFighting &&
             now - run.holdAssertedAt >= OverseerDecisions::GUILD_RUN_HOLD_RETRY_SECONDS)
             IssueGuildRunHold(run, true, now);
