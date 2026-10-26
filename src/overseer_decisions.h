@@ -26428,6 +26428,51 @@ enum class LockpickErrandStep : std::uint8_t
 LockpickErrandStep DecideLockpickErrand(bool hasTarget, bool inReach,
                                         bool inCombat, bool moving);
 
+// -- Stratholme exit yard way out (#645) --------------------------------------
+enum class StratholmeExitWay : std::uint8_t
+{
+    Walk,
+    Button,
+    Hearth,
+};
+
+using StratholmeExit = StratholmeExitWay;
+using StratholmeWayOut = StratholmeExitWay;
+using StratholmeExitChoice = StratholmeExitWay;
+using WayOut = StratholmeExitWay;
+
+struct StratholmeExitFacts
+{
+    bool doorOpen{false};
+    bool doorClosed{false};
+    bool doorStateOpen{false};
+    bool buttonInReach{false};
+    bool buttonReachable{false};
+    bool buttonReach{false};
+    bool buttonCanReach{false};
+    bool buttonUsable{false};
+    bool hearthAvailable{true};
+    bool hearthReachable{true};
+    bool canHearth{true};
+    bool hearthPossible{true};
+    bool hearthBoundReachable{true};
+};
+
+struct StratholmeExitFacts2 { bool doorOpen{false}; bool buttonInReach{false}; bool hearthAvailable{true}; };
+using StratholmeFacts = StratholmeExitFacts;
+using StratholmeExitInput = StratholmeExitFacts;
+
+StratholmeExitWay DecideStratholmeExit(StratholmeExitFacts const& facts);
+StratholmeExitWay DecideStratholmeExitWay(StratholmeExitFacts const& facts);
+StratholmeExitWay DecideStratholmeExit(bool doorOpen, bool buttonInReach, bool hearthAvailable = true);
+StratholmeExitWay DecideStratholmeExit(bool doorOpen, bool buttonInReach, bool buttonReachable, bool hearthAvailable);
+StratholmeExitWay StratholmeExitWayFor(StratholmeExitFacts const& facts);
+StratholmeExitWay StratholmeExitDecision(StratholmeExitFacts const& facts);
+
+char const* StratholmeExitWayWord(StratholmeExitWay way);
+
+StratholmeExitWay DecideStratholmeExit(StratholmeExitFacts2 const& facts);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

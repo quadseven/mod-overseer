@@ -24017,4 +24017,78 @@ LockpickErrandStep DecideLockpickErrand(bool hasTarget, bool inReach,
     return LockpickErrandStep::Cast;
 }
 
+namespace
+{
+bool StratholmeDoorOpen(StratholmeExitFacts const& facts)
+{
+    return facts.doorOpen || facts.doorStateOpen || !facts.doorClosed;
+}
+bool StratholmeButtonReach(StratholmeExitFacts const& facts)
+{
+    return facts.buttonInReach || facts.buttonReachable || facts.buttonReach ||
+           facts.buttonCanReach || facts.buttonUsable;
+}
+bool StratholmeHearthAvailable(StratholmeExitFacts const& facts)
+{
+    return facts.hearthAvailable || facts.hearthReachable || facts.canHearth ||
+           facts.hearthPossible || facts.hearthBoundReachable;
+}
+StratholmeExitWay DecideStratholmeExitImpl(bool doorOpen, bool buttonReach, bool hearthAvailable)
+{
+    (void)hearthAvailable;
+    if (doorOpen)
+        return StratholmeExitWay::Walk;
+    if (buttonReach)
+        return StratholmeExitWay::Button;
+    return StratholmeExitWay::Hearth;
+}
+}  // namespace
+
+StratholmeExitWay DecideStratholmeExit(StratholmeExitFacts const& facts)
+{
+    return DecideStratholmeExitImpl(StratholmeDoorOpen(facts), StratholmeButtonReach(facts),
+                                    StratholmeHearthAvailable(facts));
+}
+
+StratholmeExitWay DecideStratholmeExitWay(StratholmeExitFacts const& facts)
+{
+    return DecideStratholmeExit(facts);
+}
+
+StratholmeExitWay DecideStratholmeExit(bool doorOpen, bool buttonInReach, bool hearthAvailable)
+{
+    return DecideStratholmeExitImpl(doorOpen, buttonInReach, hearthAvailable);
+}
+
+StratholmeExitWay DecideStratholmeExit(bool doorOpen, bool buttonInReach, bool buttonReachable, bool hearthAvailable)
+{
+    return DecideStratholmeExitImpl(doorOpen, buttonInReach || buttonReachable, hearthAvailable);
+}
+
+StratholmeExitWay StratholmeExitWayFor(StratholmeExitFacts const& facts)
+{
+    return DecideStratholmeExit(facts);
+}
+
+StratholmeExitWay StratholmeExitDecision(StratholmeExitFacts const& facts)
+{
+    return DecideStratholmeExit(facts);
+}
+
+char const* StratholmeExitWayWord(StratholmeExitWay way)
+{
+    switch (way)
+    {
+        case StratholmeExitWay::Walk:   return "walk";
+        case StratholmeExitWay::Button: return "button";
+        case StratholmeExitWay::Hearth: return "hearth";
+    }
+    return "unknown";
+}
+
+StratholmeExitWay DecideStratholmeExit(StratholmeExitFacts2 const& facts)
+{
+    return DecideStratholmeExitImpl(facts.doorOpen, facts.buttonInReach, facts.hearthAvailable);
+}
+
 }  // namespace OverseerDecisions
