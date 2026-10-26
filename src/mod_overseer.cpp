@@ -47601,6 +47601,23 @@ private:
                         owed += ", ";
                     owed += name + " (" + std::to_string(damaged) + " damaged, " +
                             std::to_string(broken) + " broken)";
+
+                    // If the travel drive previously refused this repair aim for
+                    // this character, do not re-claim it. The travel drive will
+                    // not re-walk the same refused path (Refuse makes the aim
+                    // unavailable for a cooldown). Log once and mark settled so
+                    // the repair leg stops re-granting the same refused errand.
+                    if (_travelAims.RefusedReason(name, "repair").has_value())
+                    {
+                        if (SayRepairLegOnce(coord, name, "refused"))
+                            LOG_INFO("module.overseer",
+                                     "overseer: '{}' was refused a repair walk ({}); "
+                                     "repair leg stops re-granting it",
+                                     name, *_travelAims.RefusedReason(name, "repair"));
+                        repairSettled.insert(name);
+                        break;
+                    }
+
                     if (SayRepairLegOnce(coord, name, "walking"))
                         LOG_INFO("module.overseer",
                                  "overseer: '{}' carries {} damaged item(s), {} of them at "
