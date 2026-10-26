@@ -176,6 +176,42 @@ void TheAdapterIsWired()
           true);
 }
 
+
+// wow-overseer#1514: mod-overseer#1144 stopped erasing the outmatched mark at
+// cast start and erased it nowhere else, so a member whose hearth landed in
+// the zone it died in, or one with no stone, was held still every poll for the
+// whole window. The mark goes when the hearth read-back says Arrived, and a
+// summon of the member (the guild moving it) frees it from the hold.
+void TheMarkEndsOnArrival()
+{
+    std::ifstream in("src/mod_overseer.cpp");
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    std::string const source = buffer.str();
+
+    std::size_t const resolve = source.find("void ResolveHearthChecks(uint32 elapsedMs)");
+    std::size_t const arrived = source.find("case HearthOutcome::Arrived:", resolve);
+    std::size_t const stayed = source.find("case HearthOutcome::Stayed:", arrived);
+    std::size_t const erase = source.find("g_guildOutmatched.erase(", arrived);
+    Check("an arrived hearth erases the outmatched mark",
+          resolve != std::string::npos && arrived != std::string::npos &&
+              stayed != std::string::npos && erase != std::string::npos && erase < stayed,
+          true);
+
+    std::size_t const spot = source.find("bool LeaveGuildDeathSpot(");
+    std::size_t const end = source.find("\n    }\n", spot);
+    std::string const body = source.substr(spot, end - spot);
+    Check("the guild move is read in LeaveGuildDeathSpot",
+          body.find("bool const guildMovedIt = SummonPendingFor(name);") != std::string::npos,
+          true);
+    Check("no keep-out in LeaveGuildDeathSpot is told the guild never moves it",
+          body.find("outmatchedHere, false)") == std::string::npos, true);
+    Check("a summon in flight is looked up by the summoned name",
+          source.find("bool SummonPendingFor(std::string const& name) const") !=
+              std::string::npos,
+          true);
+}
+
 }  // namespace
 
 int main()
@@ -184,6 +220,7 @@ int main()
     TheKeepOutDecision();
     TheHearthThatCannotSucceed();
     TheAdapterIsWired();
+    TheMarkEndsOnArrival();
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);
