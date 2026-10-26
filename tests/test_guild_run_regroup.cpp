@@ -298,6 +298,9 @@ void ABodyNobodyCanRaiseKeepsTheHold()
     facts.secondsResting = 30;
     ExpectHold("a rest under way is still a rest", facts, GuildRunHoldStep::Nothing,
                GuildRunHoldWhy::Rest);
+    facts.secondsResting = GUILD_RUN_REST_MAX_SECONDS - 1;
+    ExpectHold("one second under the bound the rest still wins over the body", facts,
+               GuildRunHoldStep::Nothing, GuildRunHoldWhy::Rest);
     facts.secondsResting = GUILD_RUN_REST_MAX_SECONDS;
     ExpectHold("a timed-out rest does not ask a resume nobody can take either", facts,
                GuildRunHoldStep::Nothing, GuildRunHoldWhy::Dead);
