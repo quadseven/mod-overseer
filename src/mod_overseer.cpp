@@ -54448,11 +54448,10 @@ private:
             state.alive = member->IsAlive();
             // IsInCombat  Unit.h:936  bool IsInCombat() const
             state.inCombat = member->IsInCombat();
-            // ALREADY THROUGH THE DOOR (#165). Recorded for the blockers line
-            // and for the give-up below, and for nothing else: the predicate
-            // still counts this member as not staged, because whether being
-            // ahead should satisfy a barrier is that issue's own question. What
-            // this fixes today is a run that spent forty-three minutes saying
+            // ALREADY THROUGH THE DOOR (#165). An inside member who is alive
+            // and out of combat counts as staged (DungeonRunBarrierMet), and
+            // the holds and satisfied lines name it as "inside already" rather
+            // than "not seen": a run once spent forty-three minutes saying
             // "not seen" about somebody standing thirty yards away through a
             // wall.
             state.inside = member->GetMapId() == portal->insideMapId;
@@ -54694,12 +54693,20 @@ private:
             coord.crossing.since = std::time(nullptr);
             coord.loggedCrossingAim = false;
             coord.loggedCrossingWaiting = false;
+            // AND IT SAYS WHO WAS ALREADY THROUGH THE DOOR (#165). "All within
+            // 10y of the staging point" was false about an early entrant, and
+            // an early entrant is the case this barrier was changed to let in.
+            std::string const insideAlready =
+                OverseerDecisions::DungeonRunBarrierInsideAlready(states);
             LOG_INFO("module.overseer",
                      "overseer: dungeon run BARRIER satisfied - all {} roster members "
-                     "alive, out of combat and within {:.0f}y of the staging point. ENTER "
+                     "alive, out of combat and within {:.0f}y of the staging point{}. ENTER "
                      "takes them the last {}y to areatrigger {} and knocks for all of "
                      "them at once, followers first and the leader last",
                      static_cast<uint32>(states.size()), DUNGEON_BARRIER_RADIUS_YARDS,
+                     insideAlready.empty()
+                         ? std::string()
+                         : " or inside already (" + insideAlready + ")",
                      static_cast<uint32>(DUNGEON_STAGING_STANDOFF_YARDS),
                      portal->entryTriggerId);
             return;
@@ -54720,7 +54727,7 @@ private:
             std::time(nullptr) - coord.stagingSince > DUNGEON_STAGING_BACKSTOP_SECONDS)
         {
             FailStaging(coord, leaderName, members, *portal, "BARRIER",
-                        OverseerDecisions::DungeonRunBarrierBlockers(
+                        OverseerDecisions::DungeonRunBarrierHolds(
                             states, DUNGEON_APPROACH_LIMITS),
                         IsDungeonJob(leaderJob));
             return;
@@ -54731,7 +54738,7 @@ private:
             coord.loggedBarrierWaiting = true;
             LOG_INFO("module.overseer",
                      "overseer: dungeon run BARRIER holds - {}",
-                     OverseerDecisions::DungeonRunBarrierBlockers(
+                     OverseerDecisions::DungeonRunBarrierHolds(
                          states, DUNGEON_APPROACH_LIMITS));
         }
     }

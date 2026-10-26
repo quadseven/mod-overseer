@@ -1433,15 +1433,19 @@ std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& 
         std::string why;
         if (!member.seen)
             why = "not seen";
+        // A MEMBER INSIDE WHO IS ALIVE AND OUT OF COMBAT IS NOT A BLOCKER (#165),
+        // so it is not on this list at all. It satisfies DungeonRunBarrierMet,
+        // and a "holds - Ugga (already inside)" line named somebody the barrier
+        // had stopped waiting for as if it were waiting for her. It is named
+        // separately, by DungeonRunBarrierInsideAlready.
+        else if (member.inside && member.alive && !member.inCombat)
+            continue;
+        // AND ONE INSIDE WHO IS DEAD OR FIGHTING SAYS BOTH, so "inside already"
+        // and "not seen" can never be the same sentence about the same member.
         else if (!member.alive)
-            why = "dead";
+            why = member.inside ? "dead, inside already" : "dead";
         else if (member.inCombat)
-            why = "in combat";
-        // BEFORE "wrong map", because being inside IS a wrong map and is the
-        // one wrong map that means something specific: the member is ahead of
-        // the party rather than lost behind it. See DungeonRunMemberState.
-        else if (member.inside)
-            why = "already inside";
+            why = member.inside ? "in combat, inside already" : "in combat";
         else if (member.distanceFromStage < 0.f)
             why = "wrong map";
         else
@@ -1471,6 +1475,37 @@ std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& 
         blockers += member.name + " (" + why + ")";
     }
     return blockers;
+}
+
+std::string DungeonRunBarrierInsideAlready(std::vector<DungeonRunMemberState> const& members)
+{
+    // EXACTLY THE inside MEMBERS THE PREDICATE ACCEPTS, and no others. One
+    // inside but dead or fighting is still a blocker, and is named by
+    // DungeonRunBarrierBlockers with "inside already" in its reason instead.
+    std::string names;
+    for (DungeonRunMemberState const& member : members)
+    {
+        if (!member.inside || !member.seen || !member.alive || member.inCombat)
+            continue;
+        if (!names.empty())
+            names += ", ";
+        names += member.name;
+    }
+    return names;
+}
+
+std::string DungeonRunBarrierHolds(std::vector<DungeonRunMemberState> const& members,
+                                   ApproachLimits const& limits)
+{
+    std::string line = DungeonRunBarrierBlockers(members, limits);
+    std::string const inside = DungeonRunBarrierInsideAlready(members);
+    if (!inside.empty())
+    {
+        if (!line.empty())
+            line += "; ";
+        line += "inside already, counted as staged: " + inside;
+    }
+    return line;
 }
 
 DungeonApproach DungeonPortalApproach(std::uint32_t leaderMapId,
