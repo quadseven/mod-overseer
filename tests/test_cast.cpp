@@ -105,6 +105,18 @@ void ABareSpellIdIsACastOnSelf()
     Check("bare id names nobody", r.targetName.empty(), true);
 }
 
+void CityPortalNamesResolveToSpellIds()
+{
+    CastRequest const stormwind = ParseCastRequest("portal:stormwind");
+    Check("Stormwind portal alias parses", stormwind.ok, true);
+    CheckNum("Stormwind portal alias", stormwind.spellId, 10059);
+    CheckNum("Ironforge portal alias", ParseCastRequest("portal:ironforge").spellId, 11416);
+    CheckNum("Orgrimmar portal alias", ParseCastRequest("portal:orgrimmar").spellId, 11417);
+    CastRequest const thunder = ParseCastRequest("PORTAL:THUNDER-BLUFF on:self");
+    Check("Thunder Bluff alias accepts the existing target syntax", thunder.ok, true);
+    CheckNum("Thunder Bluff portal alias", thunder.spellId, 11419);
+}
+
 void WhitespaceAroundTheRowIsNotAnError()
 {
     CastRequest const r = ParseCastRequest("   10059\t ");
@@ -553,6 +565,7 @@ void ThePreflightRefusalsAreDistinctFromThePostCastWalls()
 int main()
 {
     ABareSpellIdIsACastOnSelf();
+    CityPortalNamesResolveToSpellIds();
     WhitespaceAroundTheRowIsNotAnError();
     OnSelfIsTheBareFormSaidOutLoud();
     ANamedTargetIsCarriedThrough();

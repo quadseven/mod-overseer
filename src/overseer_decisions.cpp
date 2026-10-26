@@ -13740,6 +13740,22 @@ CastRequest ParseCastRequest(std::string const& command)
         return request;
     }
 
+    // City portals use the same cast executor and verification as numeric
+    // spell requests. Names are deliberately aliases for the spell ids, not a
+    // second way to cast or a promise that a character knows the spell.
+    std::string portal = words[0];
+    for (char& c : portal)
+        if (c >= 'A' && c <= 'Z')
+            c = char(c - 'A' + 'a');
+    if (portal == "portal:stormwind")
+        words[0] = "10059";
+    else if (portal == "portal:ironforge")
+        words[0] = "11416";
+    else if (portal == "portal:orgrimmar")
+        words[0] = "11417";
+    else if (portal == "portal:thunder-bluff")
+        words[0] = "11419";
+
     if (!ReadSpellId(words[0], request.spellId))
     {
         // TWO DIFFERENT MISTAKES AND THEY ARE NAMED APART. A word that is all
