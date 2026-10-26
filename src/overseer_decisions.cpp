@@ -24109,7 +24109,7 @@ namespace
 {
 bool StratholmeDoorOpen(StratholmeExitFacts const& facts)
 {
-    return facts.doorOpen || facts.doorStateOpen || !facts.doorClosed;
+    return facts.doorOpen || facts.doorStateOpen;
 }
 bool StratholmeButtonReach(StratholmeExitFacts const& facts)
 {
@@ -24123,12 +24123,13 @@ bool StratholmeHearthAvailable(StratholmeExitFacts const& facts)
 }
 StratholmeExitWay DecideStratholmeExitImpl(bool doorOpen, bool buttonReach, bool hearthAvailable)
 {
-    (void)hearthAvailable;
     if (doorOpen)
         return StratholmeExitWay::Walk;
     if (buttonReach)
         return StratholmeExitWay::Button;
-    return StratholmeExitWay::Hearth;
+    if (hearthAvailable)
+        return StratholmeExitWay::Hearth;
+    return StratholmeExitWay::Walk;
 }
 }  // namespace
 

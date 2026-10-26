@@ -7,6 +7,7 @@
 #include "overseer_decisions.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -49,7 +50,15 @@ void CheckText(char const* what, std::string const& got, std::string const& want
 
 std::string ReadModule()
 {
-    std::ifstream source("src/mod_overseer.cpp");
+    std::string const path = std::getenv("OVERSEER_SOURCE") ? std::getenv("OVERSEER_SOURCE")
+                                                             : "src/mod_overseer.cpp";
+    std::ifstream source(path);
+    if (!source)
+    {
+        std::printf("FAIL ReadModule: could not open %s\n", path.c_str());
+        ++failures;
+        return std::string();
+    }
     std::stringstream text;
     text << source.rdbuf();
     return text.str();
