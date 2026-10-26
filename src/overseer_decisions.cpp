@@ -24158,4 +24158,22 @@ char const* StratholmeExitWayWord(StratholmeExitWay way)
     return "unknown";
 }
 
+bool InStratholmeExitYard(std::uint32_t mapId, float x, float y)
+{
+    return mapId == 0 && x >= STRATHOLME_YARD_WEST_X && x <= STRATHOLME_YARD_EAST_X &&
+           y >= STRATHOLME_YARD_SOUTH_Y && y <= STRATHOLME_YARD_NORTH_Y;
+}
+
+bool StratholmeButtonInReach(bool spawned, unsigned presses, std::uint32_t secondsWalking)
+{
+    return spawned && presses < STRATHOLME_BUTTON_PRESSES &&
+           secondsWalking < STRATHOLME_BUTTON_WALK_SECONDS;
+}
+
+bool StratholmeHearthLeavesTheYard(bool stoneReady, std::uint32_t bindMap, float bindX,
+                                   float bindY)
+{
+    return stoneReady && !InStratholmeExitYard(bindMap, bindX, bindY);
+}
+
 }  // namespace OverseerDecisions

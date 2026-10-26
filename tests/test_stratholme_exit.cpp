@@ -13,6 +13,9 @@
 #include <string>
 
 using OverseerDecisions::DecideStratholmeExit;
+using OverseerDecisions::InStratholmeExitYard;
+using OverseerDecisions::StratholmeButtonInReach;
+using OverseerDecisions::StratholmeHearthLeavesTheYard;
 using OverseerDecisions::StratholmeExitFacts;
 using OverseerDecisions::StratholmeExitWay;
 using OverseerDecisions::StratholmeExitWayWord;
@@ -119,6 +122,72 @@ int main()
     {
         StratholmeExitFacts facts;
         CheckWay("no way out is none", DecideStratholmeExit(facts), StratholmeExitWay::None);
+    }
+
+    // the yard: 2221's landing, the button and the door are in it; Elders'
+    // Square west of the gateway, the main gate and another map are not
+    {
+        CheckBool("2221's landing is in the yard", InStratholmeExitYard(0, 3235.46f, -4050.6f),
+                  true);
+        CheckBool("the button is in the yard", InStratholmeExitYard(0, 3191.1f, -4044.29f), true);
+        CheckBool("the door is in the yard", InStratholmeExitYard(0, 3185.48f, -4039.1f), true);
+        CheckBool("past the door is out", InStratholmeExitYard(0, 3165.48f, -4039.1f), false);
+        CheckBool("the main gate is out", InStratholmeExitYard(0, 3392.46f, -3396.77f), false);
+        CheckBool("the instance map is not the yard", InStratholmeExitYard(329, 3235.46f, -4050.6f),
+                  false);
+    }
+
+    // the button stops being in reach once pressed out or walked too long
+    {
+        CheckBool("spawned, unpressed, fresh walk is in reach", StratholmeButtonInReach(true, 0, 0),
+                  true);
+        CheckBool("not spawned is out of reach", StratholmeButtonInReach(false, 0, 0), false);
+        CheckBool("pressed out is out of reach",
+                  StratholmeButtonInReach(true, OverseerDecisions::STRATHOLME_BUTTON_PRESSES, 0),
+                  false);
+        CheckBool("walked too long is out of reach",
+                  StratholmeButtonInReach(true, 0, OverseerDecisions::STRATHOLME_BUTTON_WALK_SECONDS),
+                  false);
+    }
+
+    // a hearth counts only when the stone is ready and the bind is not the yard
+    {
+        CheckBool("ready stone bound in a town leaves",
+                  StratholmeHearthLeavesTheYard(true, 0, -8833.38f, 628.62f), true);
+        CheckBool("stone on cooldown does not leave",
+                  StratholmeHearthLeavesTheYard(false, 0, -8833.38f, 628.62f), false);
+        CheckBool("bound in the yard does not leave",
+                  StratholmeHearthLeavesTheYard(true, 0, 3235.46f, -4050.6f), false);
+    }
+
+    // the module reads the door, asks the decision, says which way ran, and
+    // opens the way out where a run leaves by 2221
+    {
+        std::string const source = ReadModule();
+        CheckBool("the module asks DecideStratholmeExit",
+                  source.find("OverseerDecisions::DecideStratholmeExit(") != std::string::npos, true);
+        CheckBool("the module logs the way out",
+                  source.find("\"overseer: stratholme exit: door {}, way out {}") !=
+                      std::string::npos,
+                  true);
+        CheckBool("the module reads the Service Entrance's state",
+                  source.find("STRATHOLME_SERVICE_ENTRANCE_ENTRY") != std::string::npos &&
+                      source.find("GetGoState() == GO_STATE_ACTIVE") != std::string::npos,
+                  true);
+        CheckBool("the module uses the button the way a client does",
+                  source.find("DriveGameObjectUse(walker->GetSession(), button->GetGUID())") !=
+                      std::string::npos,
+                  true);
+        CheckBool("the hearth is the member's own, through DriveExitHearths",
+                  source.find("DriveExitHearths(family, leaderName, hearthers, yard.hearth,") !=
+                      std::string::npos,
+                  true);
+        CheckBool("an EXIT through 2221 opens the yard episode",
+                  source.find("OpenStratholmeYard(family, *portal, coord)") != std::string::npos, true);
+        CheckBool("the coordinator drives the yard before its phases",
+                  source.find("if (DriveStratholmeYard(family, leaderName, members))") !=
+                      std::string::npos,
+                  true);
     }
 
     // both Stratholme rows stay withheld
