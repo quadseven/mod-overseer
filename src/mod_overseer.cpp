@@ -5173,6 +5173,7 @@ struct PendingDeath
     uint16 mapId = 0;
     uint32 zoneId = 0;
     float x = 0.f, y = 0.f, z = 0.f;
+    OverseerDecisions::DeathLiquid liquid = OverseerDecisions::DeathLiquid::Unknown;
 
     std::string killerType;    // 'creature' | 'player' | 'self' | 'environment'
     std::string killerName;
@@ -5502,6 +5503,11 @@ void RecordDeath(Player* player)
     d.x = player->GetPositionX();
     d.y = player->GetPositionY();
     d.z = player->GetPositionZ();
+    LiquidData const liquidData = player->GetMap()->GetLiquidData(
+        player->GetPhaseMask(), d.x, d.y, d.z, player->GetCollisionHeight(), {});
+    d.liquid = OverseerDecisions::ClassifyDeathLiquid(
+        liquidData.Flags, MAP_LIQUID_TYPE_WATER | MAP_LIQUID_TYPE_OCEAN,
+        MAP_LIQUID_TYPE_MAGMA, MAP_LIQUID_TYPE_SLIME);
 
     if (Group* group = player->GetGroup())
     {
@@ -57186,7 +57192,7 @@ private:
         bool const hitColumns = DeathHitColumnsPresent();
         std::ostringstream ss;
         ss << "INSERT INTO overseer_death (character_name, character_guid, level, "
-              "map, zone, pos_x, pos_y, pos_z, killer_type, killer_name, killer_entry, "
+              "map, zone, pos_x, pos_y, pos_z, liquid_type, killer_type, killer_name, killer_entry, "
               "health_at_death, max_health_at_death, seconds_since_full_health, "
               "damage_1, damage_1_seconds, damage_1_source, "
               "damage_2, damage_2_seconds, damage_2_source, "
@@ -57212,6 +57218,7 @@ private:
                << ',' << static_cast<uint32>(d.mapId)
                << ',' << d.zoneId
                << ',' << d.x << ',' << d.y << ',' << d.z
+               << ",'" << OverseerDecisions::DeathLiquidName(d.liquid) << "'"
                << ",'" << Esc(d.killerType) << "'"
                << ",'" << Esc(d.killerName) << "'"
                << ',' << d.killerEntry
@@ -57335,7 +57342,8 @@ private:
                      OverseerDecisions::ReadSelfDeath(
                          {batch.back().fallGuardStandDown,
                           batch.back().fallGuardSeconds,
-                          batch.back().killerType == "self", account},
+                          batch.back().killerType == "self", account,
+                          batch.back().liquid},
                          DEATH_READING_LIMITS)));
     }
 

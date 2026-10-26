@@ -12097,6 +12097,20 @@ enum class SelfDeathReading
     Fall,
 };
 
+// LiquidData::type_flags is a core bitmask. Keep the decision on the plain
+// values so it can be tested without pulling AzerothCore headers into CI.
+enum class DeathLiquid
+{
+    Unknown,
+    Water,
+    Magma,
+    Slime,
+};
+
+DeathLiquid ClassifyDeathLiquid(uint8_t liquidFlags, uint8_t waterFlag,
+                                uint8_t magmaFlag, uint8_t slimeFlag);
+char const* DeathLiquidName(DeathLiquid liquid);
+
 struct SelfDeathReadingFacts
 {
     // `overseer_death.fall_guard_standdown` exactly as the column holds it,
@@ -12112,6 +12126,7 @@ struct SelfDeathReadingFacts
     // so this rule cannot disagree with the one the summary line already
     // prints.
     FallAccount fall{FallAccount::Unsampled};
+    DeathLiquid liquid{DeathLiquid::Unknown};
 };
 
 struct SelfDeathReadingLimits

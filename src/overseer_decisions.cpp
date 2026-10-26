@@ -16406,7 +16406,7 @@ SelfDeathReading ReadSelfDeath(SelfDeathReadingFacts const& facts,
         return SelfDeathReading::Fall;
 
     uint16_t const mask = static_cast<uint16_t>(facts.fallGuardMask);
-    if (mask & FALL_GUARD_IN_WATER)
+    if ((mask & FALL_GUARD_IN_WATER) && facts.liquid == DeathLiquid::Water)
         return SelfDeathReading::Drowning;
 
     // EVERYTHING ELSE, INCLUDING A MASK OF ZERO. The guard looked and found
@@ -16414,6 +16414,30 @@ SelfDeathReading ReadSelfDeath(SelfDeathReadingFacts const& facts,
     // character died - which is the honest answer for two of the six rows in
     // the 2026-09-18 cluster, however suggestive the four beside them are.
     return SelfDeathReading::NoOpinion;
+}
+
+DeathLiquid ClassifyDeathLiquid(uint8_t liquidFlags, uint8_t waterFlag,
+                                uint8_t magmaFlag, uint8_t slimeFlag)
+{
+    if (liquidFlags & magmaFlag)
+        return DeathLiquid::Magma;
+    if (liquidFlags & slimeFlag)
+        return DeathLiquid::Slime;
+    if (liquidFlags & waterFlag)
+        return DeathLiquid::Water;
+    return DeathLiquid::Unknown;
+}
+
+char const* DeathLiquidName(DeathLiquid liquid)
+{
+    switch (liquid)
+    {
+        case DeathLiquid::Water: return "water";
+        case DeathLiquid::Magma: return "magma";
+        case DeathLiquid::Slime: return "slime";
+        case DeathLiquid::Unknown: return "unknown";
+    }
+    return "unknown";
 }
 
 char const* SelfDeathReadingName(SelfDeathReading reading)
