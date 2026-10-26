@@ -15753,17 +15753,31 @@ private:
         return result->Fetch()[0].Get<std::string>();
     }
 
-    // Read `overseer_death` for deaths inside `windowSeconds` and turn each
-    // row into a DeathRecord. The table may not exist on a world that has not
-    // run the migration - a null result degrades to an empty vector, which is
-    // the safe direction: nothing is learned and nothing is unlearned.
+    // The last scored zone and creature danger from overseer_death, refreshed by
+    // ReportDeathDanger on the death flush timer. ReportDeathDanger, DriveTravel
+    // and DoHunt are all members of OverseerWorldScript, so these members are the
+    // shared state between them. They are lost on restart, which costs nothing:
+    // the next flush repopulates them.
+    std::vector<OverseerDecisions::ZoneDanger> g_zoneDanger;
+    std::vector<OverseerDecisions::CreatureDanger> g_creatureDanger;
+
+    // The result of reading `overseer_death`: the deaths in the window, and
+    // whether the table was read at all. A query failure is not the same as an
+    // empty graveyard - the former is an outage that must not be mistaken for
+    // "nothing learned" - so the caller can tell them apart and log the failure.
     // `killerLevel` comes from creature_template.maxlevel; when a death has no
     // creature killer the join misses and killerLevel stays 0, which is the
     // honest "not known" sentinel.
-    std::vector<OverseerDecisions::DeathRecord> ReadDeathRecords(int64 windowSeconds)
+    struct DeathRecordsRead
+    {
+        std::vector<OverseerDecisions::DeathRecord> deaths;
+        bool ok{false};  // true only when the query ran and returned rows
+    };
+
+    DeathRecordsRead ReadDeathRecords(int64 windowSeconds)
     {
         if (windowSeconds <= 0)
-            return {};
+            return {};  // no query attempted: not an outage, nothing to score
         QueryResult result = CharacterDatabase.Query(
             "SELECT d.level, d.zone, d.killer_type, d.killer_entry, "
             "COALESCE(ct.maxlevel, 0), UNIX_TIMESTAMP(d.created_at) "
@@ -15773,7 +15787,12 @@ private:
             "WHERE d.created_at >= NOW() - INTERVAL {} SECOND",
             windowSeconds);
         if (!result)
-            return {};
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: death danger - failed to read overseer_death; the danger "
+                     "memory is not refreshed until the table can be queried again");
+            return {};  // query failure: distinct from an empty graveyard
+        }
         std::vector<OverseerDecisions::DeathRecord> deaths;
         do
         {
@@ -15787,7 +15806,7 @@ private:
             d.createdAt = static_cast<std::time_t>(f[5].Get<uint64>());
             deaths.push_back(d);
         } while (result->NextRow());
-        return deaths;
+        return {std::move(deaths), true};
     }
 
     // The youngest level in `who`'s group, or `who`'s own level when alone.
@@ -15817,13 +15836,21 @@ private:
         if (!who || windowSeconds <= 0)
             return;
         uint32_t const partyLevel = YoungestPartyLevel(who);
-        std::vector<OverseerDecisions::DeathRecord> const deaths = ReadDeathRecords(windowSeconds);
+        DeathRecordsRead const read = ReadDeathRecords(windowSeconds);
+        if (!read.ok)
+            return;  // query failure was already logged by ReadDeathRecords
+        std::vector<OverseerDecisions::DeathRecord> const deaths = read.deaths;
         if (deaths.empty())
             return;
         std::vector<OverseerDecisions::ZoneDanger> const zones =
             OverseerDecisions::ScoreZoneDanger(deaths, now, partyLevel, windowSeconds, levelGap);
         std::vector<OverseerDecisions::CreatureDanger> const creatures =
             OverseerDecisions::ScoreCreatureDanger(deaths, now, windowSeconds);
+        // Publish the scores so DriveTravel can steer around lethal zones and
+        // DoHunt can refuse pulls against entries that have killed a party
+        // member. Stale scores are harmless: the next flush replaces them.
+        g_zoneDanger = zones;
+        g_creatureDanger = creatures;
         unsigned const dangerousZones = std::count_if(zones.begin(), zones.end(),
             [](OverseerDecisions::ZoneDanger const& z)
             { return OverseerDecisions::ZoneIsTooDangerous(z, 3u); });
@@ -27296,6 +27323,43 @@ private:
                     _travelAims.ClearPoisonedAim(name, target);
                 }
                 continue;
+            }
+
+            // LEARN FROM DEATHS (#151): the scored zone danger names the zones
+            // the party has recently died in to creatures far above its level.
+            // Steer travel away from the aimed zone when a safe route exists,
+            // and stand down - naming the avoided zone - when every route
+            // enters a too-dangerous zone. With one aim per character there is
+            // no alternative leg to route onto, so a dangerous aimed zone means
+            // no safe route and the errand is not walked there.
+            {
+                Map* const map = bot->GetMap();
+                uint32_t const targetZone =
+                    map ? map->GetZoneId(bot->GetPhaseMask(),
+                                         pos.GetPositionX(), pos.GetPositionY(),
+                                         pos.GetPositionZ())
+                        : 0;
+                std::vector<OverseerDecisions::TravelLeg> const legs = {{targetZone, true}};
+                OverseerDecisions::TravelAvoidance const verdict =
+                    OverseerDecisions::AvoidDangerousZone(legs, g_zoneDanger, 3u);
+                if (verdict.noAlternative)
+                {
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' was sent to '{}' but zone {} is above the death "
+                             "danger threshold - no safe route exists, so the errand is not "
+                             "walked there ({} avoided)",
+                             name, target, verdict.avoidedZone, verdict.avoidedZone);
+                    _travelAims.Refuse(name, target, "the zone is above the death danger threshold");
+                    _travelAims.Release(name, "the travel drive (zone above the death danger threshold)");
+                    continue;
+                }
+                if (verdict.avoid)
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' was sent to '{}' but zone {} is above the death "
+                             "danger threshold - routing around it ({} avoided)",
+                             name, target, verdict.avoidedZone, verdict.avoidedZone);
+                }
             }
 
             // ARRIVAL IS THE PRIMARY RELEASE, measured against the spawn point
@@ -78255,6 +78319,19 @@ private:
         facts.atCapacity = _hunts.size() >= HuntAtOnce();
         if (char const* wall = D::HuntGate(facts); *wall)
             return refuse(wall);
+
+        // LEARN FROM DEATHS (#151): a creature entry that has killed a party
+        // member twice in the window is not pulled voluntarily until the party
+        // has levelled past it. Fighting back when attacked is unchanged, so
+        // only the voluntary hunt pull is refused here.
+        auto const hunted = std::find_if(g_creatureDanger.begin(), g_creatureDanger.end(),
+                                         [&](OverseerDecisions::CreatureDanger const& c)
+                                         { return c.entry == hunt.entry; });
+        if (hunted != g_creatureDanger.end() &&
+            OverseerDecisions::CreaturePullIsSuppressed(*hunted, 2u))
+        {
+            return refuse("the creature has killed a party member twice - pulls are suppressed");
+        }
 
         PlayerbotAI* const botAI = GET_PLAYERBOT_AI(who);
         // The bot's own wandering would walk it off the spawn between pulls, and
