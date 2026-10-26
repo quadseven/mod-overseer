@@ -1433,15 +1433,19 @@ std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& 
         std::string why;
         if (!member.seen)
             why = "not seen";
+        // A MEMBER INSIDE WHO IS ALIVE AND OUT OF COMBAT IS NOT A BLOCKER (#165),
+        // so it is not on this list at all. It satisfies DungeonRunBarrierMet,
+        // and a "holds - Ugga (already inside)" line named somebody the barrier
+        // had stopped waiting for as if it were waiting for her. It is named
+        // separately, by DungeonRunBarrierInsideAlready.
+        else if (member.inside && member.alive && !member.inCombat)
+            continue;
+        // AND ONE INSIDE WHO IS DEAD OR FIGHTING SAYS BOTH, so "inside already"
+        // and "not seen" can never be the same sentence about the same member.
         else if (!member.alive)
-            why = "dead";
+            why = member.inside ? "dead, inside already" : "dead";
         else if (member.inCombat)
-            why = "in combat";
-        // BEFORE "wrong map", because being inside IS a wrong map and is the
-        // one wrong map that means something specific: the member is ahead of
-        // the party rather than lost behind it. See DungeonRunMemberState.
-        else if (member.inside)
-            why = "already inside";
+            why = member.inside ? "in combat, inside already" : "in combat";
         else if (member.distanceFromStage < 0.f)
             why = "wrong map";
         else
@@ -1471,6 +1475,37 @@ std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& 
         blockers += member.name + " (" + why + ")";
     }
     return blockers;
+}
+
+std::string DungeonRunBarrierInsideAlready(std::vector<DungeonRunMemberState> const& members)
+{
+    // EXACTLY THE inside MEMBERS THE PREDICATE ACCEPTS, and no others. One
+    // inside but dead or fighting is still a blocker, and is named by
+    // DungeonRunBarrierBlockers with "inside already" in its reason instead.
+    std::string names;
+    for (DungeonRunMemberState const& member : members)
+    {
+        if (!member.inside || !member.seen || !member.alive || member.inCombat)
+            continue;
+        if (!names.empty())
+            names += ", ";
+        names += member.name;
+    }
+    return names;
+}
+
+std::string DungeonRunBarrierHolds(std::vector<DungeonRunMemberState> const& members,
+                                   ApproachLimits const& limits)
+{
+    std::string line = DungeonRunBarrierBlockers(members, limits);
+    std::string const inside = DungeonRunBarrierInsideAlready(members);
+    if (!inside.empty())
+    {
+        if (!line.empty())
+            line += "; ";
+        line += "inside already, counted as staged: " + inside;
+    }
+    return line;
 }
 
 DungeonApproach DungeonPortalApproach(std::uint32_t leaderMapId,
@@ -17583,6 +17618,94 @@ unsigned FocusLighterSpell(unsigned requiresSpellFocus)
     return requiresSpellFocus == SPELL_FOCUS_COOKING_FIRE ? SPELL_BASIC_CAMPFIRE : 0;
 }
 
+bool FocusIsWalkedTo(unsigned requiresSpellFocus)
+{
+    return requiresSpellFocus == SPELL_FOCUS_ANVIL;
+}
+
+unsigned ToolItemForTotemCategory(unsigned totemCategory)
+{
+    return totemCategory == TOTEM_CATEGORY_BLACKSMITH_HAMMER ? ITEM_BLACKSMITH_HAMMER : 0;
+}
+
+CraftToolStep CraftToolStepFor(CraftToolPlace place, bool bankerInReach, bool mayWalk)
+{
+    switch (place)
+    {
+        case CraftToolPlace::NotNeeded:
+        case CraftToolPlace::Carried:
+            return CraftToolStep::Cast;
+        case CraftToolPlace::Banked:
+            if (bankerInReach)
+                return CraftToolStep::Withdraw;
+            return mayWalk ? CraftToolStep::WalkToBanker : CraftToolStep::Wait;
+        case CraftToolPlace::Missing:
+            return CraftToolStep::Request;
+    }
+    return CraftToolStep::Wait;
+}
+
+char const* CraftToolStepWord(CraftToolStep step)
+{
+    switch (step)
+    {
+        case CraftToolStep::Cast:         return "cast";
+        case CraftToolStep::Withdraw:     return "withdraw";
+        case CraftToolStep::WalkToBanker: return "walk to a banker";
+        case CraftToolStep::Wait:         return "wait";
+        case CraftToolStep::Request:      return "request";
+    }
+    return "wait";
+}
+
+bool CraftToolGoesBack(bool inBags, bool stillNeeded, bool bankerInReach, bool able)
+{
+    return inBags && !stillNeeded && bankerInReach && able;
+}
+
+int NearestFocusSpawn(std::vector<FocusSpawn> const& spawns, unsigned mapId, float x, float y,
+                      float limitYards)
+{
+    int best = -1;
+    float bestSq = limitYards * limitYards;
+    for (std::size_t i = 0; i < spawns.size(); ++i)
+    {
+        FocusSpawn const& s = spawns[i];
+        if (s.mapId != mapId)
+            continue;
+        float const dx = s.x - x;
+        float const dy = s.y - y;
+        float const sq = dx * dx + dy * dy;
+        if (sq <= bestSq)
+        {
+            bestSq = sq;
+            best = static_cast<int>(i);
+        }
+    }
+    return best;
+}
+
+CraftFocusStep CraftFocusStepFor(bool walkedTo, bool mayWalk, float nearestYards)
+{
+    if (!walkedTo || !mayWalk)
+        return CraftFocusStep::Stand;
+    if (nearestYards < 0.f)
+        return CraftFocusStep::NoneNear;
+    if (nearestYards <= CRAFT_FOCUS_STANDING_YARDS)
+        return CraftFocusStep::Stand;
+    return CraftFocusStep::Walk;
+}
+
+std::string FocusSpawnAim(FocusSpawn const& spawn)
+{
+    auto whole = [](float v) {
+        long const r = static_cast<long>(v < 0.f ? v - 0.5f : v + 0.5f);
+        return std::to_string(r);
+    };
+    return "at:" + std::to_string(spawn.mapId) + ":" + whole(spawn.x) + "," + whole(spawn.y) +
+           "," + whole(spawn.z);
+}
+
 GhostRecovery GuildGhostFallback(unsigned deathsHere, bool healerGraveKnown,
                                  unsigned repeatDeaths)
 {
@@ -17646,6 +17769,36 @@ bool OutmatchedHere(GuildOutmatchedMark const& mark, int64_t now, uint32_t mapId
     if (mark.at <= 0 || mark.mapId != mapId || mark.zoneId != zoneId)
         return false;
     return now - mark.at <= int64_t(windowMinutes) * 60;
+}
+
+HearthOutRetry DecideHearthOutRetry(char const* refusal, bool stillOnDeathMap,
+                                    unsigned tries, unsigned boundTries)
+{
+    if (tries >= boundTries)
+        return HearthOutRetry::GiveUp;
+    // A refusal that nothing this poll can change - no stone, on cooldown,
+    // dead, not in the world - is not waited out. The only refusal this
+    // decision retries is "character is moving": the hold placed by DoHearth
+    // stops the character, and the next poll finds it standing.
+    if (refusal && *refusal && std::string(refusal) != "character is moving")
+        return HearthOutRetry::GiveUp;
+    // The hearth landed but left the character on the death map, or the cast
+    // was refused for movement: hold it still and drive the hearth again.
+    if (stillOnDeathMap || (refusal && *refusal))
+        return HearthOutRetry::Retry;
+    return HearthOutRetry::GiveUp;
+}
+
+bool KeepOutOfDeathZone(bool hearthOutFailed, bool stillInDeathZone,
+                        bool guildMovedIt)
+{
+    return hearthOutFailed && stillInDeathZone && !guildMovedIt;
+}
+
+bool HearthOutCannotSucceed(bool hasStone, bool stoneOnCooldown, unsigned tries,
+                            unsigned boundTries)
+{
+    return !hasStone || stoneOnCooldown || tries >= boundTries;
 }
 
 HeadTradeAnswer AnswerTradeAtHead(bool traderIsKin, uint32_t theyOffer, uint32_t theirCopper,
@@ -20624,6 +20777,10 @@ GuildRunHold GuildRunHoldNext(GuildRunHoldFacts const& facts)
         }
         if (low && facts.secondsResting < facts.restMaxSeconds)
             hold.why = GuildRunHoldWhy::Rest;
+        else if (!facts.livingResurrector)
+            // Nobody alive can raise the body, and the dungeon module refuses a
+            // resume until somebody can (#1140): stay held for the corpse run.
+            hold.why = GuildRunHoldWhy::Dead;
         else
             hold = {GuildRunHoldStep::Release,
                     low ? GuildRunHoldWhy::RestTimedOut : GuildRunHoldWhy::Dead};
@@ -20647,6 +20804,35 @@ GuildRunHold GuildRunHoldNext(GuildRunHoldFacts const& facts)
     else
         hold.why = GuildRunHoldWhy::Rest;
     return hold;
+}
+
+unsigned GuildRunHoldRetrySeconds(unsigned refusals)
+{
+    if (refusals == 0)
+        return 0;
+    unsigned seconds = GUILD_RUN_HOLD_RETRY_SECONDS;
+    for (unsigned i = 1; i < refusals && seconds < GUILD_RUN_HOLD_RETRY_MAX_SECONDS; ++i)
+        seconds *= 2;
+    return std::min(seconds, GUILD_RUN_HOLD_RETRY_MAX_SECONDS);
+}
+
+bool GuildRunHoldMayAsk(GuildRunHoldRetry const& retry, std::time_t now)
+{
+    return retry.refusals == 0 ||
+           now - retry.refusedAt >= static_cast<std::time_t>(GuildRunHoldRetrySeconds(retry.refusals));
+}
+
+bool GuildRunHoldRefused(GuildRunHoldRetry& retry, std::time_t now)
+{
+    retry.refusedAt = now;
+    return ++retry.refusals == 1;
+}
+
+unsigned GuildRunHoldAccepted(GuildRunHoldRetry& retry)
+{
+    unsigned const refusals = retry.refusals;
+    retry = GuildRunHoldRetry{};
+    return refusals;
 }
 
 std::vector<std::string> GuildRunSeatTactics(GuildSeat seat)
@@ -23928,6 +24114,12 @@ bool IsLockpickTargetEntry(std::uint32_t entry)
     return entry == 1660u || entry == 1733u;
 }
 
+bool IsLockpickTargetCandidate(std::uint32_t entry, bool spawned, bool sameZone,
+                               bool withinRange)
+{
+    return IsLockpickTargetEntry(entry) && spawned && sameZone && withinRange;
+}
+
 bool ShouldClearLockpickErrand(std::uint32_t skill, std::uint32_t level)
 {
     return skill >= 5u * level;
@@ -23943,6 +24135,47 @@ LockpickErrandStep DecideLockpickErrand(bool hasTarget, bool inReach,
     if (inCombat || moving)
         return LockpickErrandStep::Stand;
     return LockpickErrandStep::Cast;
+}
+
+StratholmeExitWay DecideStratholmeExit(StratholmeExitFacts const& facts)
+{
+    if (facts.doorOpen)
+        return StratholmeExitWay::Walk;
+    if (facts.buttonInReach)
+        return StratholmeExitWay::Button;
+    if (facts.hearthAvailable)
+        return StratholmeExitWay::Hearth;
+    return StratholmeExitWay::None;
+}
+
+char const* StratholmeExitWayWord(StratholmeExitWay way)
+{
+    switch (way)
+    {
+        case StratholmeExitWay::Walk:   return "walk";
+        case StratholmeExitWay::Button: return "button";
+        case StratholmeExitWay::Hearth: return "hearth";
+        case StratholmeExitWay::None:   return "none";
+    }
+    return "unknown";
+}
+
+bool InStratholmeExitYard(std::uint32_t mapId, float x, float y)
+{
+    return mapId == 0 && x >= STRATHOLME_YARD_WEST_X && x <= STRATHOLME_YARD_EAST_X &&
+           y >= STRATHOLME_YARD_SOUTH_Y && y <= STRATHOLME_YARD_NORTH_Y;
+}
+
+bool StratholmeButtonInReach(bool spawned, unsigned presses, std::uint32_t secondsWalking)
+{
+    return spawned && presses < STRATHOLME_BUTTON_PRESSES &&
+           secondsWalking < STRATHOLME_BUTTON_WALK_SECONDS;
+}
+
+bool StratholmeHearthLeavesTheYard(bool stoneReady, std::uint32_t bindMap, float bindX,
+                                   float bindY)
+{
+    return stoneReady && !InStratholmeExitYard(bindMap, bindX, bindY);
 }
 
 }  // namespace OverseerDecisions

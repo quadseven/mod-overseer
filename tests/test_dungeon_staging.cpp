@@ -15,9 +15,13 @@
 #include "overseer_decisions.h"
 
 #include <cstdio>
+#include <string>
 #include <vector>
 
 using OverseerDecisions::ApproachLimits;
+using OverseerDecisions::DungeonRunBarrierBlockers;
+using OverseerDecisions::DungeonRunBarrierHolds;
+using OverseerDecisions::DungeonRunBarrierInsideAlready;
 using OverseerDecisions::DungeonRunBarrierMet;
 using OverseerDecisions::DungeonRunEntryState;
 using OverseerDecisions::DungeonRunHoldsAtStage;
@@ -34,6 +38,14 @@ void Check(char const* what, bool got, bool want)
         return;
     std::printf("FAIL %s: got %s, wanted %s\n", what, got ? "true" : "false",
                 want ? "true" : "false");
+    ++failures;
+}
+
+void CheckText(char const* what, std::string const& got, std::string const& want)
+{
+    if (got == want)
+        return;
+    std::printf("FAIL %s: got '%s', wanted '%s'\n", what, got.c_str(), want.c_str());
     ++failures;
 }
 
@@ -199,6 +211,59 @@ void EverythingHeldIsAlreadySatisfyingTheBarrier()
           DungeonRunBarrierMet(party, LIMITS), true);
 }
 
+
+// THE LINE NAMES AN EARLY ENTRANT AS INSIDE ALREADY, NOT AS A BLOCKER (#165).
+// The barrier counts her as staged, so a "holds" line that listed her among the
+// members it waits for said the opposite of what the predicate decided. And the
+// same member is never "not seen" and "inside already" in one line.
+DungeonRunMemberState Named(char const* name, DungeonRunMemberState state)
+{
+    state.name = name;
+    return state;
+}
+
+void TheBarrierLineNamesAnEarlyEntrantAsInsideAlready()
+{
+    DungeonRunMemberState ugga = Named("Ugga", ReadyMember(-1.f));
+    ugga.inside = true;
+    DungeonRunMemberState missing = Named("Og", DungeonRunMemberState{});
+
+    std::vector<DungeonRunMemberState> waiting;
+    waiting.push_back(Named("Bork", ReadyMember(34.f)));
+    waiting.push_back(ugga);
+    waiting.push_back(missing);
+    Check("still waiting on Bork and Og", DungeonRunBarrierMet(waiting, LIMITS), false);
+    CheckText("the blockers leave the early entrant out",
+              DungeonRunBarrierBlockers(waiting, LIMITS), "Bork (34y out), Og (not seen)");
+    CheckText("the holds line names her as inside already",
+              DungeonRunBarrierHolds(waiting, LIMITS),
+              "Bork (34y out), Og (not seen); inside already, counted as staged: Ugga");
+
+    // The rest arrive: the barrier opens, and the satisfied line can say who
+    // was through the door already.
+    std::vector<DungeonRunMemberState> arrived;
+    arrived.push_back(Named("Bork", ReadyMember(4.f)));
+    arrived.push_back(ugga);
+    arrived.push_back(Named("Og", ReadyMember(2.f)));
+    Check("the rest arrive and the barrier opens", DungeonRunBarrierMet(arrived, LIMITS), true);
+    CheckText("nobody blocks", DungeonRunBarrierBlockers(arrived, LIMITS), "");
+    CheckText("and the early entrant is named", DungeonRunBarrierInsideAlready(arrived), "Ugga");
+
+    // Inside but fighting, or dead, is still a blocker, and says both.
+    DungeonRunMemberState fighting = ugga;
+    fighting.inCombat = true;
+    DungeonRunMemberState dead = Named("Grog", ReadyMember(-1.f));
+    dead.inside = true;
+    dead.alive = false;
+    std::vector<DungeonRunMemberState> held;
+    held.push_back(fighting);
+    held.push_back(dead);
+    CheckText("inside and not ready says both",
+              DungeonRunBarrierHolds(held, LIMITS),
+              "Ugga (in combat, inside already), Grog (dead, inside already)");
+    CheckText("and is not counted as staged", DungeonRunBarrierInsideAlready(held), "");
+}
+
 }  // namespace
 
 int main()
@@ -213,5 +278,6 @@ int main()
     AnUnmeasuredMemberIsNotHeld();
     AnInsideMemberSatisfiesTheBarrierAndIsStillNotHeld();
     EverythingHeldIsAlreadySatisfyingTheBarrier();
+    TheBarrierLineNamesAnEarlyEntrantAsInsideAlready();
     return failures ? 1 : 0;
 }

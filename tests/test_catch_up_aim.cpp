@@ -36,6 +36,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <sstream>
+#include <string>
 
 using OverseerDecisions::CatchUpAimFacts;
 using OverseerDecisions::CatchUpAimIsStale;
@@ -52,6 +54,14 @@ void Check(char const* what, bool got, bool want)
         return;
     std::printf("FAIL %s: got %s, wanted %s\n", what, got ? "true" : "false",
                 want ? "true" : "false");
+    ++failures;
+}
+
+void Check(char const* what, std::string const& got, std::string const& want)
+{
+    if (got == want)
+        return;
+    std::printf("FAIL %s: got '%s', wanted '%s'\n", what, got.c_str(), want.c_str());
     ++failures;
 }
 
@@ -310,6 +320,56 @@ void AnImpossibleReadingFallsToTheStricterRule()
 
 }  // namespace
 
+// ============================================================================
+// THE CATCH-UP AIM MUST FIT THE COLUMN (#1139). overseer_roster.travel_npc is
+// TRAVEL_AIM_MAX_CHARS (32) wide and the realm database is in strict mode, so
+// an over-long row is refused, not truncated. The catch-up walk used to build
+// its aim with a bare ostringstream; that the catch-up now goes through
+// TravelAimAtPosition is pinned in test_catch_up_aim_column_source.cpp. These
+// pin what TravelAimAtPosition gives for the positions that matter.
+// ============================================================================
+
+using OverseerDecisions::TravelAimAtPosition;
+using OverseerDecisions::TRAVEL_AIM_MAX_CHARS;
+
+// The defect's own shape: default stream formatting of the issue's position
+// is 33 characters, one over the column.
+void TheOldCatchUpFormatOverflowedTheColumn()
+{
+    std::ostringstream old;
+    old << "at:" << 1 << ':' << -4012.35f << ',' << -1234.56f << ',' << -0.0413553f;
+    Check("the old bare-stream aim is over the column",
+          old.str().size() > TRAVEL_AIM_MAX_CHARS, true);
+}
+
+void TheIssuePositionIsAimedInOneDecimal()
+{
+    std::string const aim = TravelAimAtPosition(1, -4012.35f, -1234.56f, -0.0413553f);
+    Check("the issue position fits the column", aim.size() <= TRAVEL_AIM_MAX_CHARS, true);
+    Check("and is written at one decimal", aim, std::string("at:1:-4012.4,-1234.6,-0.0"));
+
+    // A tiny shore-corrected z that default formatting writes in scientific
+    // notation is written as a plain decimal.
+    std::string const tiny = TravelAimAtPosition(1, -4012.35f, -1234.56f, -4.37e-06f);
+    Check("a tiny z fits the column", tiny.size() <= TRAVEL_AIM_MAX_CHARS, true);
+    Check("and carries no exponent", tiny.find('e') == std::string::npos, true);
+}
+
+// at:1000:-123456.0,-678901.0,-123456.0 is 37 characters; whole yards are 31.
+void APositionTooWideForOneDecimalIsAimedInWholeYards()
+{
+    std::string const aim = TravelAimAtPosition(1000, -123456.f, -678901.f, -123456.f);
+    Check("whole yards are used", aim, std::string("at:1000:-123456,-678901,-123456"));
+}
+
+// at:1000:-1234567,-6789012,-1234567 is 34 characters even in whole yards, so
+// there is no aim to write and the caller must not claim one.
+void APositionTooWideForWholeYardsGivesNoAim()
+{
+    Check("no aim is given",
+          TravelAimAtPosition(1000, -1234567.f, -6789012.f, -1234567.f), std::string());
+}
+
 int main()
 {
     TheThreePollsThatEachDiscardedARoute();
@@ -322,6 +382,10 @@ int main()
     ALeaderInTheAirIsNeverAimedAt();
     NoReadingEverAllowsAnAimStalerThanTheSurveysResolution();
     AnImpossibleReadingFallsToTheStricterRule();
+    TheOldCatchUpFormatOverflowedTheColumn();
+    TheIssuePositionIsAimedInOneDecimal();
+    APositionTooWideForOneDecimalIsAimedInWholeYards();
+    APositionTooWideForWholeYardsGivesNoAim();
 
     if (failures)
     {

@@ -4,6 +4,7 @@
 #include <cstdlib>
 
 using OverseerDecisions::DecideLockpickErrand;
+using OverseerDecisions::IsLockpickTargetCandidate;
 using OverseerDecisions::IsLockpickTargetEntry;
 using OverseerDecisions::LockpickErrandStep;
 using OverseerDecisions::ShouldClearLockpickErrand;
@@ -52,6 +53,20 @@ int main()
           !IsLockpickTargetEntry(0u));
     Check("an arbitrary non-lockbox entry is not a lockpick target",
           !IsLockpickTargetEntry(9999u));
+
+    // Candidate predicate: a matching entry that is spawned, in zone and in
+    // range is in; dropping any one input keeps it out.
+    std::uint32_t const entry = 1660u;
+    Check("a spawned, in-zone, in-range matching entry is a candidate",
+          IsLockpickTargetCandidate(entry, true, true, true));
+    Check("a despawned matching entry is not a candidate",
+          !IsLockpickTargetCandidate(entry, false, true, true));
+    Check("a matching entry in another zone is not a candidate",
+          !IsLockpickTargetCandidate(entry, true, false, true));
+    Check("a matching entry out of range is not a candidate",
+          !IsLockpickTargetCandidate(entry, true, true, false));
+    Check("a non-lockbox entry that meets all three is not a candidate",
+          !IsLockpickTargetCandidate(9999u, true, true, true));
 
     // Level-cap clear: max achievable skill at a level is 5 * level.
     Check("skill exactly at the cap clears the errand",
