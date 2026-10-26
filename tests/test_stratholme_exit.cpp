@@ -79,7 +79,6 @@ int main()
     {
         StratholmeExitFacts facts;
         facts.doorOpen = false;
-        facts.doorClosed = true;
         facts.buttonInReach = true;
         CheckWay("door closed, button in reach means button",
                  DecideStratholmeExit(facts), StratholmeExitWay::Button);
@@ -89,8 +88,8 @@ int main()
     {
         StratholmeExitFacts facts;
         facts.doorOpen = false;
-        facts.doorClosed = true;
         facts.buttonInReach = false;
+        facts.hearthAvailable = true;
         CheckWay("button out of reach means hearth", DecideStratholmeExit(facts),
                  StratholmeExitWay::Hearth);
     }
@@ -100,10 +99,9 @@ int main()
     {
         StratholmeExitFacts openF, closedF, farF;
         openF.doorOpen = true;
-        closedF.doorClosed = true;
         closedF.buttonInReach = true;
-        farF.doorClosed = true;
         farF.buttonInReach = false;
+        farF.hearthAvailable = true;
         StratholmeExitWay ways[3] = {DecideStratholmeExit(openF), DecideStratholmeExit(closedF),
                                      DecideStratholmeExit(farF)};
         for (int i = 0; i < 3; ++i)
@@ -115,6 +113,12 @@ int main()
         }
         CheckText("hearth is the only teleporting outcome's word",
                   StratholmeExitWayWord(StratholmeExitWay::Hearth), "hearth");
+    }
+
+    // no door, no button, no hearth: nothing to order
+    {
+        StratholmeExitFacts facts;
+        CheckWay("no way out is none", DecideStratholmeExit(facts), StratholmeExitWay::None);
     }
 
     // both Stratholme rows stay withheld
