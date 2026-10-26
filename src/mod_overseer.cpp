@@ -48925,6 +48925,8 @@ private:
         // -- inside (#640) --
         // What the timeline counts, for the whole order.
         unsigned wipes{0};
+        time_t lastWipeAt{0};       // epoch seconds of the most recent wipe
+        uint32_t lastWipeMap{0};    // the map it wiped on, for the same-place test
         unsigned released{0};
         unsigned regroups{0};
         unsigned skips{0};
@@ -50043,6 +50045,10 @@ private:
                     if (!member || !member->IsInWorld())
                         continue;
                     ++facts.inWorld;
+                    // A party member still carrying Resurrection Sickness holds
+                    // the run-back after a wipe (#1165).
+                    if (member->HasAura(15007))
+                        facts.membersSick = true;
                     // A GHOST WALKING BACK (#640), timed per ghost from when the
                     // run first saw it released; the window is
                     // RaidGhostMayBeWalked's.
@@ -50316,6 +50322,20 @@ private:
                 continue;
             }
 
+            facts.wipes = run.wipes;
+            facts.now = std::time(nullptr);
+            facts.lastWipeAt = run.lastWipeAt;
+            if (door)
+            {
+                facts.samePlace = facts.wipes >= 1 && run.lastWipeMap == door->insideMapId;
+                if (head && head->IsInWorld())
+                {
+                    GraveyardStruct const* grave =
+                        sGraveyard->GetClosestGraveyard(head, head->GetTeamId());
+                    facts.graveyard = grave ? grave->name : std::string();
+                }
+            }
+
             OverseerDecisions::RaidRunStep const step =
                 OverseerDecisions::StepRaidRun(run.phase, facts);
 
@@ -50357,12 +50377,14 @@ private:
                 if (step.phase == RaidRunPhase::Recover && OverseerDecisions::RaidWiped(facts))
                 {
                     ++run.wipes;
+                    run.lastWipeAt = std::time(nullptr);
+                    run.lastWipeMap = door ? door->insideMapId : 0;
                     LOG_WARN("module.overseer",
                              "overseer: raid run for family '{}' WIPED in {} ({} dead and {} "
-                             "alive inside) - wipe {}; the dead are released and run back, "
-                             "and the order stands",
+                             "alive inside) - wipe {} at the '{}' graveyard; the dead are "
+                             "released and run back, and the order stands",
                              roster.family, door ? door->name : "?", facts.insideDead,
-                             facts.insideAlive, run.wipes);
+                             facts.insideAlive, run.wipes, facts.graveyard);
                 }
                 run.phase = step.phase;
                 run.phaseSince = std::time(nullptr);

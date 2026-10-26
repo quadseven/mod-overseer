@@ -18308,6 +18308,18 @@ struct RaidRunFacts
     bool stallRegroup{false};
     // Every encounter the instance script keeps is done.
     bool cleared{false};
+
+    // THE WIPE LOOP GUARD (#1165). After a wipe the run does not walk the party
+    // straight back in while members still carry Resurrection Sickness, and a
+    // second wipe of the same run at the same place inside 600 s ends the
+    // attempt instead of a third walk-in.
+    std::uint32_t wipes{0};          // previous wipes of this run, not this one
+    std::time_t lastWipeAt{0};       // epoch seconds of the previous wipe (0 = none)
+    bool samePlace{false};           // this wipe is at the same place as the last
+    bool membersSick{false};         // members still carry Resurrection Sickness
+    bool samePullPresent{false};     // the same pull is still in front of the door
+    std::string graveyard;           // the graveyard the party would revive at
+    std::time_t now{0};              // this poll's epoch seconds
 };
 
 struct RaidRunStep

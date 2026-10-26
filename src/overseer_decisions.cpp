@@ -15411,6 +15411,30 @@ RaidRunStep StepRaidRunRecover(RaidRunPhase current, RaidRunFacts const& facts)
     bool const wiped = RaidWiped(facts);
     // The dead inside are released only when nobody standing can raise them.
     step.releaseDead = wiped;
+
+    // A second wipe of the same run at the same place inside 600 s ends the
+    // attempt rather than starting a third (#1165).
+    if (wiped && facts.wipes >= 1 && facts.samePlace && facts.lastWipeAt != 0 &&
+        facts.now != 0 && facts.now - facts.lastWipeAt < 600)
+    {
+        step.phase = RaidRunPhase::Idle;
+        step.release = true;
+        step.runBack = false;
+        step.knockMembers = false;
+        step.why = "the same run wiped at the same place within 600 s; ending the attempt";
+        return step;
+    }
+
+    // While members still carry Resurrection Sickness, or the same pull that
+    // wiped them is still in front of the door, do not walk the party straight
+    // back in; wait out the sickness instead of a second wipe (#1165).
+    if (wiped && (facts.membersSick || facts.samePullPresent))
+    {
+        step.runBack = false;
+        step.why = "members still carry Resurrection Sickness; waiting it out before the run-back";
+        return step;
+    }
+
     // Every ghost is walked back, with the head's client attached (nothing
     // walks for a door the operator cannot watch); the bound is per ghost
     // (RaidGhostMayBeWalked).
