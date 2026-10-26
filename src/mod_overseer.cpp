@@ -6376,6 +6376,28 @@ public:
     bool Claim(std::string const& name, std::string const& target,
                OverseerDecisions::TravelOwner owner)
     {
+        // THE AIM HAS TO FIT THE COLUMN BEFORE ANY FENCE IS ASKED (#1139).
+        // `overseer_roster.travel_npc` is TRAVEL_AIM_COLUMN_CHARS wide. In
+        // strict mode MySQL refuses an over-long row (errno 1406) and the core
+        // logs the refusal without the value, so the caller believes the aim
+        // was written; outside strict mode it truncates, and a truncated aim
+        // is one the parser can never read back. Either way the walk never
+        // starts. Every writer is meant to size its own aim
+        // (OverseerDecisions::TravelAimAtPosition); this is the backstop so a
+        // future writer cannot reopen the hole, and it names the value the
+        // core's own error leaves out.
+        if (target.size() > TRAVEL_AIM_COLUMN_CHARS)
+        {
+            LOG_ERROR("module.overseer",
+                      "overseer: travel aim '{}' for '{}' is {} characters and "
+                      "overseer_roster.travel_npc holds {}, so it is refused and "
+                      "nothing is written (#1139)",
+                      target, name, uint32(target.size()),
+                      uint32(TRAVEL_AIM_COLUMN_CHARS));
+            _claimRefusalSaid[name] = "an aim too long for the travel column";
+            return false;
+        }
+
         auto const it = _state.find(name);
         if (it != _state.end() && it->second.target == target)
             return true;
@@ -6523,6 +6545,9 @@ public:
     bool FenceRefuses(std::string const& name, std::string const& target,
                       OverseerDecisions::TravelOwner owner)
     {
+        // The column-width refusal Claim makes first (#1139) is a refusal too.
+        if (target.size() > TRAVEL_AIM_COLUMN_CHARS)
+            return true;
         auto const it = _state.find(name);
         if (it != _state.end() && it->second.target == target)
             return false;
@@ -23641,9 +23666,31 @@ private:
                 return false;
             }
         }
-        std::ostringstream aim;
-        aim << "at:" << leader->GetMapId() << ':' << ax << ',' << ay << ',' << az;
-        std::string const aimText = aim.str();
+        // SIZED TO THE COLUMN, LIKE EVERY OTHER `at:` WRITER (#1139). This was
+        // a bare ostringstream: six significant digits, so a shore-corrected z
+        // such as -0.0413553 made `at:1:-4012.35,-1234.56,-0.0413553`, 33
+        // characters, which strict mode refused while the follower was logged
+        // as aimed. TravelAimAtPosition gives one decimal, then whole yards,
+        // then nothing; nothing leaves the follower on `follow`, said like the
+        // unmeasured-ground refusal above.
+        std::string const aimText = OverseerDecisions::TravelAimAtPosition(
+            leader->GetMapId(), ax, ay, az);
+        if (aimText.empty())
+        {
+            time_t const now = std::time(nullptr);
+            if (now - escort.badGroundSaid >= CATCH_UP_BAD_GROUND_SAID_SECONDS)
+            {
+                escort.badGroundSaid = now;
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' is not aimed at '{}' because the catch-up "
+                         "aim does not fit the {}-character travel column even in whole "
+                         "yards (map {}, {}, {}, {}) (#1139). It keeps following, and "
+                         "the aim is written again as soon as the position fits",
+                         name, leader->GetName(), uint32(TRAVEL_AIM_COLUMN_CHARS),
+                         static_cast<uint32>(leader->GetMapId()), ax, ay, az);
+            }
+            return false;
+        }
 
         // THE AIM IS WRITTEN BEFORE ANYTHING IS RECORDED ABOUT IT (#560).
         // TravelAimBook::Claim can refuse, when a fence protects an errand it
