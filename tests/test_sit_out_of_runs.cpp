@@ -64,8 +64,8 @@ void OnlyTheNamedMemberSitsOut()
 
 void TheMemberSittingOutOpensNoRun()
 {
-    Check("a member sitting out may not open a run", !MayOpenRunFor(true));
-    Check("a member in the party may", MayOpenRunFor(false));
+    Check("a member sitting out may not open a run", !MayOpenRunFor(true, false));
+    Check("a member in the party may", MayOpenRunFor(false, false));
 }
 
 void ARunTheMemberLeadsEndsNamingTheSitOut()

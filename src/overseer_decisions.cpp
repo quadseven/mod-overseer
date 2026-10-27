@@ -22916,9 +22916,9 @@ bool SitsOutOfRuns(FamilyStandin const* standin, std::string const& name)
     return standin && standin->Active() && !name.empty() && standin->outName == name;
 }
 
-bool MayOpenRunFor(bool sittingOut)
+bool MayOpenRunFor(bool sittingOut, bool lentToAGuildRun)
 {
-    return !sittingOut;
+    return !sittingOut && !lentToAGuildRun;
 }
 
 std::string SitOutRunEndedReason(std::string const& leader)

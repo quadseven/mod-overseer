@@ -25629,7 +25629,16 @@ bool SitsOutOfRuns(FamilyStandin const* standin, std::string const& name);
 
 // May the arming drive open or touch a dungeon run on behalf of this character.
 // Never for the member sitting out: it is not the family's party any more.
-bool MayOpenRunFor(bool sittingOut);
+//
+// NOR FOR A MEMBER LENT TO A GUILD RUN (#1092). Measured 2026-10-23 to
+// 2026-10-27: every family dungeon run that stayed active with an empty member
+// list for over an hour was a healer its family had lent to a guild finder
+// run. The arming drive saw a roster character on an instance map and opened
+// a family run for it; the guild run's own clear was that run's heartbeat, so
+// it stayed active for the whole guild run (68 to 136 minutes) and ended
+// 'emptied' only when the member left. The guild run arms and ends its own
+// group, so the family's run table has nothing to say about it.
+bool MayOpenRunFor(bool sittingOut, bool lentToAGuildRun);
 
 // The ended_reason of an open run whose leader sits out, naming the sit-out.
 std::string SitOutRunEndedReason(std::string const& leader);

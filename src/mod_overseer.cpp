@@ -29561,8 +29561,24 @@ private:
             // heartbeat. ABOVE the open, so the row is never written, and the
             // brain is stood down because a refused `dc on` ("No tank bot found
             // in your group") every poll is all it would otherwise get.
-            if (!OverseerDecisions::MayOpenRunFor(SittingOutOfRuns(name)))
+            //
+            // NOR DOES A MEMBER LENT TO A GUILD RUN, live, waiting to be
+            // adopted, or a stray of one. The guild run arms, rests and ends
+            // its own group; a family run opened here had the lent member's
+            // presence in the guild clear as its heartbeat, an empty member
+            // list, and stayed active for the whole guild run, on the map key
+            // the family's own next run needs.
+            // Nothing is issued and nothing is stood down: the brain is the
+            // guild run's. The record is forgotten so the member is asked
+            // afresh if it is ever seen inside for its family again.
+            bool const lentToAGuildRun = NamedByAGuildRun(name);
+            if (!OverseerDecisions::MayOpenRunFor(SittingOutOfRuns(name), lentToAGuildRun))
             {
+                if (lentToAGuildRun)
+                {
+                    _dcOnIssued.erase(name);
+                    continue;
+                }
                 EndRunLedByMemberSittingOut(name, bot->GetMapId());
                 StandDownDungeonBrain(name, bot, botAI);
                 continue;
@@ -51367,6 +51383,11 @@ private:
         {
             OverseerDecisions::FamilyStandin const& standin = entry.second;
             if (!OverseerDecisions::SitsOutOfRuns(&standin, standin.outName))
+                continue;
+            // A member lent to a guild run is that run's until it ends, and the
+            // guild run walks its own group out; it is not pulled through the
+            // door mid-clear from here.
+            if (NamedByAGuildRun(standin.outName))
                 continue;
             Player* const out = ObjectAccessor::FindPlayerByName(standin.outName);
             if (!out || !out->IsInWorld() || !out->IsAlive())
