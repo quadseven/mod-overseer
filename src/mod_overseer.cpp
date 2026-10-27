@@ -49568,6 +49568,8 @@ private:
         // -- inside (#640) --
         // What the timeline counts, for the whole order.
         unsigned wipes{0};
+        time_t lastWipeAt{0};       // epoch seconds of the most recent wipe
+        uint32_t lastWipeMap{0};    // the map it wiped on, for the same-place test
         unsigned released{0};
         unsigned regroups{0};
         unsigned skips{0};
@@ -50686,6 +50688,10 @@ private:
                     if (!member || !member->IsInWorld())
                         continue;
                     ++facts.inWorld;
+                    // A party member still carrying Resurrection Sickness holds
+                    // the run-back after a wipe (#1165).
+                    if (member->HasAura(15007))
+                        facts.membersSick = true;
                     // A GHOST WALKING BACK (#640), timed per ghost from when the
                     // run first saw it released; the window is
                     // RaidGhostMayBeWalked's.
@@ -50959,11 +50965,29 @@ private:
                 continue;
             }
 
+            OverseerDecisions::RaidWipeFacts(facts, run.wipes, run.lastWipeAt, run.lastWipeMap,
+                                             door ? door->insideMapId : 0,
+                                             std::time(nullptr));
+            if (door)
+            {
+                if (head && head->IsInWorld())
+                {
+                    GraveyardStruct const* grave =
+                        sGraveyard->GetClosestGraveyard(head, head->GetTeamId());
+                    facts.graveyard = grave ? grave->name : std::string();
+                }
+            }
+
             OverseerDecisions::RaidRunStep const step =
                 OverseerDecisions::StepRaidRun(run.phase, facts);
 
             if (step.release)
             {
+                // An attempt ended by a wipe (#1165) still has its corpses
+                // inside, and ReleaseRaidRun keeps the raid while anybody is:
+                // they are released first, or the run would never let go.
+                if (step.releaseDead && door && group && group->isRaidGroup())
+                    run.released += ReleaseRaidDead(group, door);
                 if (ReleaseRaidRun(roster.family, run, door))
                 {
                     LOG_INFO("module.overseer",
@@ -50997,15 +51021,17 @@ private:
                          OverseerDecisions::RaidRunPhaseName(step.phase), step.why,
                          facts.inWorld, facts.assembled, facts.inside, facts.insideAlive,
                          uint32(seats.size()));
-                if (step.phase == RaidRunPhase::Recover && OverseerDecisions::RaidWiped(facts))
+                if (OverseerDecisions::RaidRunCountsWipe(run.phase, step, facts))
                 {
                     ++run.wipes;
+                    run.lastWipeAt = std::time(nullptr);
+                    run.lastWipeMap = door ? door->insideMapId : 0;
                     LOG_WARN("module.overseer",
                              "overseer: raid run for family '{}' WIPED in {} ({} dead and {} "
-                             "alive inside) - wipe {}; the dead are released and run back, "
-                             "and the order stands",
+                             "alive inside) - wipe {} at the '{}' graveyard; the dead are "
+                             "released and run back, and the order stands",
                              roster.family, door ? door->name : "?", facts.insideDead,
-                             facts.insideAlive, run.wipes);
+                             facts.insideAlive, run.wipes, facts.graveyard);
                 }
                 run.phase = step.phase;
                 run.phaseSince = std::time(nullptr);
