@@ -104,6 +104,26 @@ void TheSectionsAreAllThereInOrder(std::string const& doc)
         Check(order.c_str(), at > last);
         last = at;
     }
+
+    // No extra `## ` section either: the headings outside code fences are
+    // exactly kSections, in order, so a section slipped in between two
+    // required ones fails here too.
+    std::vector<std::string> found;
+    bool fenced = false;
+    std::istringstream lines(doc);
+    for (std::string line; std::getline(lines, line);)
+    {
+        if (line.rfind("```", 0) == 0)
+            fenced = !fenced;
+        else if (!fenced && line.rfind("## ", 0) == 0)
+            found.push_back(line);
+    }
+    if (found != kSections)
+    {
+        for (std::string const& title : found)
+            std::printf("README ## heading: %s\n", title.c_str());
+    }
+    Check("the ## sections are exactly the seven required, in order", found == kSections);
 }
 
 void HowItWorksHasOneMermaidDiagram(std::string const& doc)
