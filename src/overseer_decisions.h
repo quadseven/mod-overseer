@@ -4465,6 +4465,75 @@ bool IsTravelGuardAim(std::string const& aim);
 // that names no place at all.
 std::string TravelGuardPlace(std::string const& aim);
 
+// The map a guard names: `guard:1:-1048,-3665,24` is map 1. False for anything
+// that is not a guard, and for a guard whose map is not a plain number.
+bool TravelGuardMap(std::string const& aim, std::uint32_t& map);
+
+// ------------- where a guard walks the character it is written on (#163) ------
+//
+// MEASURED ON THE DEV REALM, 2026-10-26: the operator wrote a guard into all
+// five roster rows while the family was dying in one zone. The column held for
+// the whole fifteen minutes, and still one of the five never left:
+//
+//   * the guard walked none of the four followers. Each was refused as "does
+//     not carry `new rpg` - nothing walks it anywhere", and three got out only
+//     because they followed the leader onto a flight and an errand outside the
+//     module hearthed them;
+//   * the fifth's guard named its own homebind, on map 1, while it stood on
+//     map 0. The travel drive released it as "no such spawn on map 0", and the
+//     guard, still in the column, refused the catch-up walk that would have
+//     taken it out with the leader. It died three more times while guarded.
+//
+// So a guard is resolved to a place on the map the character stands on before
+// it is walked, and a resolved guard steers its character itself, follower or
+// leader (GuardWalkSteers): the guard is the person saying "get out", and a
+// follower standing in formation on the ground that is killing it is the
+// opposite of out.
+enum class GuardWalk : std::uint8_t
+{
+    // The guard names a place on the map the character stands on, or the map
+    // is not known: walked to the place the guard names, as before.
+    OwnPlace,
+    // The guard names a place on another map, and the character's leader
+    // carries a guard on the map the character stands on: walked to the
+    // leader's guard place, which is where the rest of the family is going.
+    LeadersPlace,
+    // The guard names a place on another map and nothing on this map stands in
+    // for it. Nothing walks the character; said once, loudly, rather than
+    // released every poll as a missing spawn while the column says guarded.
+    OtherMap,
+    // The guard names no place at all.
+    NoPlace,
+};
+
+char const* GuardWalkName(GuardWalk walk);
+
+struct GuardWalkFacts
+{
+    // This character's `travel_npc`, a guard.
+    std::string guard;
+    // Where the character stands. Unknown (not in the world this poll) is
+    // answered as OwnPlace: the drive finds nobody to walk anyway.
+    bool mapKnown{false};
+    std::uint32_t currentMap{0};
+    // The `travel_npc` of the character's group leader, or empty when it leads,
+    // has no group, or the leader's column is empty.
+    std::string leaderColumn;
+};
+
+struct GuardWalkVerdict
+{
+    GuardWalk walk{GuardWalk::NoPlace};
+    // The `at:` aim to walk, empty for OtherMap and NoPlace.
+    std::string place;
+};
+
+GuardWalkVerdict ReadGuardWalk(GuardWalkFacts const& facts);
+
+// Does a guard resolved this way walk its character itself, follower or not?
+// True exactly when there is a place to walk to.
+bool GuardWalkSteers(GuardWalk walk);
+
 // WHAT THE TRAVEL DRIVE DOES WITH AN AIM IT LET GO OF AND COULD NOT CLEAR
 // (#558).
 //
