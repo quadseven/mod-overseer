@@ -26575,6 +26575,465 @@ private:
         return true;
     }
 
+    // ------------------------------ a family mage's way to a capital (#1161) --
+    //
+    // The decision is in OverseerDecisions; this is the world half. It reads the
+    // mage's own spellbook and this world's SpellMgr for every candidate, so
+    // the spell id, its reagent and its destination are the data's rather than
+    // a table written down here. A cast row is the existing `cast` verb (#408);
+    // a portal is clicked by the existing `use-portal` verb (#410), leader
+    // first, and the stranded drive carries everybody the leader leaves behind.
+    //
+    // ONE RUN PER AIM. A cast takes a cast time and a portal click takes a walk
+    // across the camp, so DriveTravel must not walk the traveller off the errand
+    // while a row still owns it - a cross-map aim would be released and the
+    // errand lost. `holds` is that fence, read before DriveTravel touches the
+    // character. The row's own status is the verdict, never its delivery.
+    struct MageTravelRun
+    {
+        std::string aim;
+        std::string traveller;
+        std::string mage;
+        std::string castSource;
+        std::string clickSource;
+        std::time_t castSince{0};
+        std::time_t clickSince{0};
+        std::uint32_t spellId{0};
+        bool portal{false};
+        bool holds{false};
+        // A named refusal (a missing reagent, say) stands the traveller down
+        // for a few minutes instead of walking the distance the refusal was
+        // about. The walk resumes afterwards if the aim is still there.
+        bool refused{false};
+        std::time_t refusedAt{0};
+    };
+
+    static constexpr std::time_t MAGE_TRAVEL_ROW_CEILING_SECONDS = 120;
+    static constexpr std::time_t MAGE_TRAVEL_REFUSAL_HOLD_SECONDS = 300;
+
+    // Where a portal spell's object sends whoever clicks it: the object's own
+    // spellcaster spell, read through the same teleport effect the portal drive
+    // uses.
+    static bool MagePortalTarget(std::uint32_t spellId, std::uint32_t& map, float& x,
+                                 float& y, float& z)
+    {
+        SpellInfo const* spell = sSpellMgr->GetSpellInfo(spellId);
+        if (!spell)
+            return false;
+        for (SpellEffectInfo const& effect : spell->GetEffects())
+        {
+            if (effect.Effect != SPELL_EFFECT_TRANS_DOOR)
+                continue;
+            GameObjectTemplate const* object =
+                sObjectMgr->GetGameObjectTemplate(uint32(effect.MiscValue));
+            if (!object || object->type != GAMEOBJECT_TYPE_SPELLCASTER ||
+                !object->spellcaster.spellId)
+                continue;
+            if (PortalDestination(object->spellcaster.spellId, map, x, y, z))
+                return true;
+        }
+        return false;
+    }
+
+    // Every spell the mage knows that reaches this aim, with the reagent the
+    // spell's own SpellInfo asks for. `matched` is false when none does, which
+    // is the common case and is not a cast at all.
+    static bool ReadMageTravelSpells(Player* mage, std::uint32_t aimMap, float aimX,
+                                     float aimY, float aimZ,
+                                     std::vector<OverseerDecisions::MageTravelSpell>& out)
+    {
+        bool matched = false;
+        float const limit = OverseerDecisions::MAGE_CAPITAL_ARRIVE_YARDS;
+        for (auto const& known : mage->GetSpellMap())
+        {
+            PlayerSpell const* entry = known.second;
+            if (!entry || entry->State == PLAYERSPELL_REMOVED || !entry->Active)
+                continue;
+            std::uint32_t const spellId = known.first;
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+            if (!info || info->IsPassive())
+                continue;
+
+            OverseerDecisions::MageTravelSpell spell;
+            spell.spellId = spellId;
+            spell.knownToMage = true;
+            std::uint32_t map = 0;
+            float x = 0.f;
+            float y = 0.f;
+            float z = 0.f;
+            if (MagePortalTarget(spellId, map, x, y, z))
+                spell.kind = OverseerDecisions::MageTravelSpellKind::Portal;
+            else if (PortalDestination(spellId, map, x, y, z))
+                spell.kind = OverseerDecisions::MageTravelSpellKind::Teleport;
+            else
+                continue;
+            if (map != aimMap)
+                continue;
+            float const dx = x - aimX;
+            float const dy = y - aimY;
+            float const dz = z - aimZ;
+            if (dx * dx + dy * dy + dz * dz > limit * limit)
+                continue;
+
+            for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                if (info->Reagent[i] > 0 && info->ReagentCount[i] > 0)
+                {
+                    spell.reagentEntry = uint32(info->Reagent[i]);
+                    spell.reagentRequired = uint32(info->ReagentCount[i]);
+                    break;
+                }
+            if (spell.reagentEntry)
+                spell.reagentCarried = mage->GetItemCount(spell.reagentEntry, false);
+
+            out.push_back(spell);
+            matched = true;
+        }
+        return matched;
+    }
+
+    // The family's mage, preferring the traveller itself when it is one. A
+    // member on another map is still the family's mage, but cannot put a portal
+    // down where the traveller stands; the facts say so.
+    static Player* FamilyMage(Player* traveller, std::string const& family,
+                              std::map<std::string, std::string> const& families)
+    {
+        if (traveller->getClass() == CLASS_MAGE)
+            return traveller;
+        Player* best = nullptr;
+        float bestYards = 0.f;
+        for (auto const& [name, rowFamily] : families)
+        {
+            if (rowFamily != family)
+                continue;
+            Player* member = ObjectAccessor::FindPlayerByName(name);
+            if (!member || !member->IsInWorld() || member->getClass() != CLASS_MAGE)
+                continue;
+            float const yards = member->GetMapId() == traveller->GetMapId()
+                                    ? member->GetDistance(traveller)
+                                    : 100000.f;
+            if (!best || yards < bestYards)
+            {
+                best = member;
+                bestYards = yards;
+            }
+        }
+        return best;
+    }
+
+    // Family members standing with the mage, and whether the traveller is one of
+    // them. A portal moves a party, so its clicker has to be here.
+    static unsigned FamilyStandingWith(Player* mage, std::string const& family,
+                                       std::map<std::string, std::string> const& families,
+                                       std::string const& travellerName,
+                                       bool& travellerWithMage)
+    {
+        travellerWithMage = false;
+        if (!mage || !mage->IsInWorld())
+            return 0;
+        unsigned standing = 0;
+        for (auto const& [name, rowFamily] : families)
+        {
+            if (rowFamily != family || name == mage->GetName())
+                continue;
+            Player* member = ObjectAccessor::FindPlayerByName(name);
+            if (!member || !member->IsInWorld() || member->GetMapId() != mage->GetMapId())
+                continue;
+            if (member->GetDistance(mage) > OverseerDecisions::MAGE_PORTAL_GATHER_YARDS)
+                continue;
+            ++standing;
+            if (name == travellerName)
+                travellerWithMage = true;
+        }
+        return standing;
+    }
+
+    static bool ReadMageTravelRow(std::string const& source, std::string& status,
+                                  std::string& detail)
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT status, detail FROM overseer_command WHERE source = '{}' "
+            "ORDER BY id DESC LIMIT 1",
+            Esc(source));
+        if (!result)
+            return false;
+        Field* row = result->Fetch();
+        status = row[0].Get<std::string>();
+        detail = row[1].Get<std::string>();
+        return true;
+    }
+
+    static bool MageTravelRowFinished(std::string const& status)
+    {
+        return status == "applied" || status == "unchanged" || status == "error";
+    }
+
+    static std::string MageTravelSource(char const* verb, std::string const& name,
+                                        std::time_t now)
+    {
+        std::string source = std::string(verb) + " " + name + " " + std::to_string(now);
+        if (source.size() > 64)
+            source.resize(64);
+        return source;
+    }
+
+    static void QueueMageTravelCast(Player* mage, std::uint32_t spellId,
+                                    std::string const& source)
+    {
+        CharacterDatabase.Execute(
+            "INSERT INTO overseer_command (target_name, command, kind, target_arg, source) "
+            "VALUES ('{}', '{}', 'cast', '', '{}')",
+            Esc(mage->GetName()), Esc(std::to_string(spellId)), Esc(source));
+    }
+
+    static void QueueMageTravelClick(Player* traveller, std::string const& source)
+    {
+        CharacterDatabase.Execute(
+            "INSERT INTO overseer_command (target_name, command, kind, target_arg, source) "
+            "VALUES ('{}', 'use-portal', 'quest', '', '{}')",
+            Esc(traveller->GetName()), Esc(source));
+    }
+
+    void EndMageTravel(MageTravelRun& run)
+    {
+        run.castSource.clear();
+        run.clickSource.clear();
+        run.castSince = 0;
+        run.clickSince = 0;
+        run.holds = false;
+    }
+
+    // Read the row this run is waiting on. True while it still owns the
+    // traveller; false once it has ended, whether or not the cast took.
+    bool PollMageTravelRun(MageTravelRun& run, std::time_t now)
+    {
+        bool const casting = !run.castSource.empty();
+        std::string const& source = casting ? run.castSource : run.clickSource;
+        std::time_t const since = casting ? run.castSince : run.clickSince;
+        std::string status;
+        std::string detail;
+        bool const found = ReadMageTravelRow(source, status, detail);
+
+        if (!found || !MageTravelRowFinished(status))
+        {
+            if (now - since < MAGE_TRAVEL_ROW_CEILING_SECONDS)
+            {
+                run.holds = true;
+                return true;
+            }
+            LOG_WARN("module.overseer",
+                     "overseer: family mage travel for '{}' ended - no verdict on row '{}' "
+                     "within {}s",
+                     run.traveller, source, MAGE_TRAVEL_ROW_CEILING_SECONDS);
+            EndMageTravel(run);
+            return false;
+        }
+
+        if (status != "applied")
+        {
+            std::string const why = detail.empty() ? std::string() : ": " + detail;
+            LOG_WARN("module.overseer",
+                     "overseer: family mage travel for '{}' ended - spell {} {} ({}{})",
+                     run.traveller, run.spellId, run.portal ? "portal" : "teleport", status,
+                     why);
+            EndMageTravel(run);
+            return false;
+        }
+
+        if (casting && run.portal)
+        {
+            Player* traveller = ObjectAccessor::FindPlayerByName(run.traveller);
+            if (!traveller || !traveller->IsInWorld())
+            {
+                LOG_WARN("module.overseer",
+                         "overseer: family mage travel for '{}' ended - the portal stands "
+                         "but the traveller cannot be found",
+                         run.traveller);
+                EndMageTravel(run);
+                return false;
+            }
+            run.castSource.clear();
+            run.castSince = 0;
+            run.clickSource = MageTravelSource("mage_portal", run.traveller, now);
+            run.clickSince = now;
+            QueueMageTravelClick(traveller, run.clickSource);
+            LOG_INFO("module.overseer",
+                     "overseer: family mage '{}' set a portal for '{}' - the leader walks "
+                     "to it and crosses first; the stranded drive carries the rest",
+                     run.mage, run.traveller);
+            run.holds = true;
+            return true;
+        }
+
+        LOG_INFO("module.overseer",
+                 "overseer: family mage travel for '{}' finished - spell {} {} applied",
+                 run.traveller, run.spellId, run.portal ? "portal" : "teleport");
+        EndMageTravel(run);
+        return false;
+    }
+
+    // The facts the decision needs, or false when this aim is not one the mage
+    // can take: no mage, a mage outside the traveller's party, or no spell that
+    // reaches the aim. Kept out of DriveMageTravel so each function answers one
+    // question.
+    static bool ReadMageTravelFacts(Player* traveller, std::string const& name,
+                                    std::string const& family,
+                                    std::map<std::string, std::string> const& families,
+                                    std::uint32_t aimMap, float aimX, float aimY, float aimZ,
+                                    OverseerDecisions::MageTravelFacts& facts, Player*& mage)
+    {
+        mage = FamilyMage(traveller, family, families);
+        if (!mage)
+            return false;
+        bool const travellerIsMage = mage == traveller;
+        // A portal's clicker must be in its owner's group (GameObject::Use);
+        // families are normally one group, and a mage outside it cannot portal
+        // the traveller.
+        if (!travellerIsMage &&
+            (!traveller->GetGroup() || traveller->GetGroup() != mage->GetGroup()))
+            return false;
+
+        bool travellerWithMage = false;
+        unsigned const party = FamilyStandingWith(mage, family, families, name,
+                                                  travellerWithMage);
+        std::vector<OverseerDecisions::MageTravelSpell> spells;
+        if (!ReadMageTravelSpells(mage, aimMap, aimX, aimY, aimZ, spells))
+            return false;
+
+        facts.mage = mage->GetName();
+        facts.traveller = name;
+        facts.mageReadable = true;
+        facts.mageInWorld = mage->IsInWorld();
+        facts.mageAlive = mage->IsAlive();
+        facts.mageInCombat = mage->IsInCombat();
+        facts.mageCasting = mage->IsNonMeleeSpellCast(false);
+        facts.travellerIsMage = travellerIsMage;
+        facts.travellerGrouped = traveller->GetGroup() != nullptr;
+        facts.travellerLeadsGroup =
+            traveller->GetGroup() &&
+            traveller->GetGroup()->GetLeaderGUID() == traveller->GetGUID();
+        facts.travellerWithMage = travellerIsMage || travellerWithMage;
+        facts.destinationIsCapital = true;
+        facts.destinationMap = aimMap;
+        facts.mageMap = mage->GetMapId();
+        facts.walkYards = traveller->GetMapId() == aimMap
+                              ? traveller->GetDistance(aimX, aimY, aimZ)
+                              : -1.f;
+        facts.partyWithMage = party;
+        facts.spells = spells;
+        return true;
+    }
+
+    void BeginMageTravel(std::string const& name, std::string const& aim, Player* mage,
+                         OverseerDecisions::MageTravelFacts const& facts,
+                         OverseerDecisions::MageTravelPlan const& plan, std::time_t now)
+    {
+        MageTravelRun& run = _mageTravel[name];
+        run.aim = aim;
+        run.traveller = name;
+        run.mage = mage->GetName();
+        run.spellId = plan.spellId;
+        LOG_INFO("module.overseer", "overseer: {}",
+                 OverseerDecisions::MageTravelLine(facts, plan));
+        if (plan.step == OverseerDecisions::MageTravelStep::Refuse)
+        {
+            run.holds = true;
+            run.refused = true;
+            run.refusedAt = now;
+            return;
+        }
+
+        run.portal = plan.step == OverseerDecisions::MageTravelStep::Portal;
+        run.holds = true;
+        // The row is aimed at the mage, but its source names the traveller: two
+        // leaders can ask the same mage for a portal in one poll, and their
+        // cast rows must not share a source.
+        run.castSource = MageTravelSource("mage_cast", name, now);
+        run.castSince = now;
+        QueueMageTravelCast(mage, plan.spellId, run.castSource);
+    }
+
+    void DriveMageTravel(std::map<std::string, std::string> const& aims)
+    {
+        std::map<std::string, std::string> const families = LoadRosterFamilies();
+        if (families.empty())
+            return;
+        std::time_t const now = std::time(nullptr);
+
+        for (auto const& [name, columnAim] : aims)
+        {
+            if (OverseerDecisions::IsTravelGuardAim(columnAim))
+                continue;
+            if (!HomeBindAim(name).empty())
+                continue;
+            std::uint32_t aimMap = 0;
+            float aimX = 0.f;
+            float aimY = 0.f;
+            float aimZ = 0.f;
+            if (!OverseerDecisions::ParsePlaceAim(columnAim, aimMap, aimX, aimY, aimZ))
+                continue;
+
+            auto runIt = _mageTravel.find(name);
+            if (runIt != _mageTravel.end() && runIt->second.aim != columnAim)
+            {
+                _mageTravel.erase(runIt);
+                runIt = _mageTravel.end();
+            }
+            if (runIt != _mageTravel.end())
+            {
+                MageTravelRun& run = runIt->second;
+                if (!run.castSource.empty() || !run.clickSource.empty())
+                {
+                    PollMageTravelRun(run, now);
+                    continue;
+                }
+                if (run.refused)
+                {
+                    if (now - run.refusedAt < MAGE_TRAVEL_REFUSAL_HOLD_SECONDS)
+                    {
+                        run.holds = true;
+                        continue;
+                    }
+                    // The hold is over, and the reason for the refusal may be
+                    // gone (a reagent bought, a spell learned). Forget the run
+                    // and let the plan below ask again this poll; keeping it
+                    // would suppress every future attempt for this aim.
+                    _mageTravel.erase(runIt);
+                }
+                else
+                {
+                    // A cast that already ran is not repeated every poll; the
+                    // walk below is the fallback and the aim will clear or be
+                    // re-planned by its own writer.
+                    continue;
+                }
+            }
+
+            Player* traveller = ObjectAccessor::FindPlayerByName(name);
+            if (!traveller || !traveller->IsInWorld())
+                continue;
+            auto const familyIt = families.find(name);
+            if (familyIt == families.end())
+                continue;
+
+            Player* mage = nullptr;
+            OverseerDecisions::MageTravelFacts facts;
+            if (!ReadMageTravelFacts(traveller, name, familyIt->second, families, aimMap,
+                                     aimX, aimY, aimZ, facts, mage))
+                continue;
+            OverseerDecisions::MageTravelPlan const plan =
+                OverseerDecisions::PlanMageTravel(facts);
+            if (plan.step == OverseerDecisions::MageTravelStep::Walk)
+                continue;
+            BeginMageTravel(name, columnAim, mage, facts, plan, now);
+        }
+    }
+
+    bool MageTravelHolds(std::string const& name, std::string const& aim) const
+    {
+        auto const it = _mageTravel.find(name);
+        return it != _mageTravel.end() && it->second.holds && it->second.aim == aim;
+    }
+
     void DriveTravel()
     {
         if (!_leftoverAimsSwept)
@@ -26586,6 +27045,10 @@ private:
         // an empty target never reaches this loop, exactly as before.
         std::map<std::string, std::string> const aims = _travelAims.Load();
         NoteTravelGuards(aims);
+        // A family mage has a spell for its capital (#1161). Asked before the
+        // walk below so a long or cross-map aim is turned into a cast rather
+        // than being released as unreachable.
+        DriveMageTravel(aims);
         // Read once for the whole sweep rather than per character: the errands
         // and the trades are the same handful of rows, and this is the read
         // that decides both WHERE a character is sent and what it does when it
@@ -26645,6 +27108,14 @@ private:
             // the prune is about rows that vanished, not about characters this
             // loop declined to move.
             stillAimed.insert(name);
+
+            // A CAST OR A PORTAL CLICK OWNS THE TRAVELLER THIS POLL (#1161).
+            // Walking it toward the same aim would either race the cast's hold
+            // or, for an aim on another map, release the errand as unreachable
+            // before the portal exists. The mage drive releases this fence when
+            // the row's verdict is read, and the walk resumes then.
+            if (MageTravelHolds(name, columnAim))
+                continue;
 
             // THE CAMPAIGN BIND OUTRANKS A TOWN ERRAND WRITTEN OVER IT (#583).
             // The bind trip and every other errand share this one column, so
@@ -71202,7 +71673,7 @@ private:
     // spell_target_position row. False for a spell that moves nobody, so a
     // portal whose destination cannot be read is never taken for one that leads
     // to the leader.
-    static bool PortalDestination(uint32 spellId, uint32& map)
+    static bool PortalDestination(uint32 spellId, uint32& map, float& x, float& y, float& z)
     {
         SpellInfo const* spell = sSpellMgr->GetSpellInfo(spellId);
         if (!spell)
@@ -71217,6 +71688,9 @@ private:
                     sSpellMgr->GetSpellTargetPosition(spellId, SpellEffIndex(i)))
             {
                 map = to->target_mapId;
+                x = to->target_X;
+                y = to->target_Y;
+                z = to->target_Z;
                 return true;
             }
         }
@@ -71251,7 +71725,11 @@ private:
             c.charges = info->GetCharges();
             c.uses = go->GetUseCount();
             c.yards = who->GetDistance(go);
-            c.destinationKnown = PortalDestination(info->spellcaster.spellId, c.destinationMap);
+            float x = 0.f;
+            float y = 0.f;
+            float z = 0.f;
+            c.destinationKnown =
+                PortalDestination(info->spellcaster.spellId, c.destinationMap, x, y, z);
             objects.push_back(go);
             out.push_back(c);
         }
@@ -79402,6 +79880,12 @@ private:
     // style. Both drives reach the column through this and nothing else. World
     // thread only, like everything else on these loops.
     TravelAimBook _travelAims;
+    // The family mage's cast or portal errand (#1161), keyed by the character
+    // the aim names. A run holds its traveller out of DriveTravel while a row
+    // still owns it, and remembers that this aim has already been tried so a
+    // refusal is said once rather than on every poll. World thread only; lost
+    // on restart, which costs one repeated cast attempt and no correctness.
+    std::map<std::string, MageTravelRun> _mageTravel;
     // Whether the first travel poll has cleared the point aims a previous
     // process left in the roster (#658), and how many polls have asked.
     bool _leftoverAimsSwept = false;

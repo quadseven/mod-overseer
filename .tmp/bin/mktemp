@@ -1,0 +1,3 @@
+#!/bin/sh
+if [ "$1" = "-d" ]; then shift; exec /usr/bin/mktemp -d "${1:-$TMPDIR/overseer.XXXXXX}"; fi
+exec /usr/bin/mktemp "$@"

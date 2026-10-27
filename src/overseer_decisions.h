@@ -16882,6 +16882,126 @@ struct PortalOrderFacts
 };
 bool PortalLeaderCrossesFirst(PortalOrderFacts const& facts);
 
+// ------------------------------- a family mage's way to a capital (#1161) --
+//
+// THE LONG WALK THAT DOES NOT HAVE TO BE A WALK. Both families carry one mage,
+// and a mage of the levels this roster has earned knows Teleport and Portal for
+// the capital its side lives in. A character sent to that capital from the
+// other continent, or from far enough away on the same one, was walking the
+// whole way even though one cast would put it there. The walk is not wrong so
+// much as unexplained: the module could drive a cast (#408) and click a portal
+// (#410) and simply never asked the mage.
+//
+// WHAT A CAST CAN MOVE, AND WHO CLICKS. A teleport moves the caster and nobody
+// else, so it is the answer when the character being sent IS the mage. A portal
+// puts an object beside the caster and moves whoever clicks it, so it is the
+// answer for a family member who is not the mage - but only the party's leader
+// may cross first (#410), and the clicker has to be standing with the mage. A
+// mage that is not its party's leader therefore casts the teleport rather than
+// a portal it may not use first.
+//
+// THE SPELLS ARE READ, NOT REMEMBERED. `MageTravelSpell` is built by the caller
+// from the character's own spellbook and this world's SpellMgr: its reagent is
+// SpellInfo's own, and its destination is the spell's own spell_target_position
+// or, for a portal, the spellcaster object's spell. Nothing here names a spell
+// id, a rank or a coordinate, so a world with different data gets a different
+// answer rather than a stale table.
+//
+// THE SAME REGISTERS THAT SAY "DO NOT CAST" SAY "DO NOT WALK". A mage that is
+// dead, fighting, already casting or out of the world is not a reason to walk
+// the family across a continent; the plan says Walk, which is what this module
+// did before the cast existed, and the caller's own poll tries again.
+enum class MageTravelStep
+{
+    Walk,
+    Teleport,
+    Portal,
+    Refuse,
+};
+
+enum class MageTravelSpellKind
+{
+    Teleport,
+    Portal,
+};
+
+// One spell the mage knows that reaches the aimed capital. Only spells that
+// MATCH the destination are handed in; the decision never compares coordinates
+// and so cannot disagree with the data the caller read.
+struct MageTravelSpell
+{
+    std::uint32_t spellId{0};
+    MageTravelSpellKind kind{MageTravelSpellKind::Teleport};
+    bool knownToMage{false};
+    // False when the spellbook has the id but this world's SpellMgr does not,
+    // which is a refusal with a name rather than a silent walk.
+    bool resolvesInSpellData{true};
+    std::uint32_t reagentEntry{0};
+    std::uint32_t reagentRequired{0};
+    std::uint32_t reagentCarried{0};
+};
+
+struct MageTravelFacts
+{
+    std::string mage;       // for the line, never for a decision
+    std::string traveller;  // for the line, never for a decision
+    bool mageReadable{false};
+    bool mageInWorld{false};
+    bool mageAlive{false};
+    bool mageInCombat{false};
+    bool mageCasting{false};
+    bool travellerIsMage{false};
+    bool travellerLeadsGroup{false};
+    bool travellerGrouped{false};
+    // The traveller is the mage, or it is close enough to the mage to click a
+    // portal the mage puts down.
+    bool travellerWithMage{false};
+    bool destinationIsCapital{false};
+    std::uint32_t destinationMap{0};
+    std::uint32_t mageMap{0};
+    // -1 when the traveller is on another map, which is always a long walk.
+    float walkYards{-1.f};
+    // Family members standing with the mage, the traveller included when it is
+    // one of them. A portal is a party's way, not one character's.
+    unsigned partyWithMage{0};
+    std::vector<MageTravelSpell> spells;
+};
+
+struct MageTravelPlan
+{
+    MageTravelStep step{MageTravelStep::Walk};
+    std::uint32_t spellId{0};
+    // A MageTravelRefusal literal for Refuse; empty otherwise.
+    char const* reason{""};
+};
+
+// A same-map walk shorter than this is not worth a portal. Long enough to be a
+// crossing of a zone, short enough that a capital's own courtyard is walked.
+constexpr float MAGE_TRAVEL_LONG_WALK_YARDS = 1200.f;
+// Who counts as "standing with the mage" for the portal's party.
+constexpr float MAGE_PORTAL_GATHER_YARDS = 30.f;
+// The aim is treated as the capital when it is this close to the spell's own
+// destination. Capitals are large; the portal's own landing point is one spot
+// inside one.
+constexpr float MAGE_CAPITAL_ARRIVE_YARDS = 1500.f;
+
+namespace MageTravelRefusal
+{
+constexpr char const* UnknownSpell = "the core does not know that spell";
+constexpr char const* MissingReagent = "the character is missing a reagent for that spell";
+}  // namespace MageTravelRefusal
+
+// Walk, cast, or refuse. Pure: every fact it needs is in `facts`.
+MageTravelPlan PlanMageTravel(MageTravelFacts const& facts);
+
+// "walk", "teleport", "portal", "refuse". The word a log line and a test pin.
+char const* MageTravelStepWord(MageTravelStep step);
+
+// ONE LINE FOR THE WORLD SERVER LOG. Names the mage, the spell and the reason,
+// whether the plan was a cast, a refusal or a walk, so a live check can read
+// the same sentence the decision made instead of reconstructing it from rows.
+std::string MageTravelLine(MageTravelFacts const& facts, MageTravelPlan const& plan);
+
 // ------------------------------------------ learning a recipe from an item --
 //
 // WHAT THIS IS, AND WHY IT IS NOT THE TRAINER PROBLEM. A crafting recipe

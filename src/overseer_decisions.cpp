@@ -14142,6 +14142,186 @@ bool PortalLeaderCrossesFirst(PortalOrderFacts const& f)
     return f.grouped && !f.leadsGroup && f.leaderReadable && f.leaderMap == f.portalMap;
 }
 
+// ------------------------------- a family mage's way to a capital (#1161) --
+
+namespace
+{
+// The first known spell of one kind that this world can actually explain.
+MageTravelSpell const* UsableSpell(std::vector<MageTravelSpell> const& spells,
+                                   MageTravelSpellKind kind)
+{
+    for (MageTravelSpell const& spell : spells)
+        if (spell.knownToMage && spell.resolvesInSpellData && spell.kind == kind)
+            return &spell;
+    return nullptr;
+}
+
+MageTravelSpell const* UnknownSpell(std::vector<MageTravelSpell> const& spells)
+{
+    for (MageTravelSpell const& spell : spells)
+        if (spell.knownToMage && !spell.resolvesInSpellData)
+            return &spell;
+    return nullptr;
+}
+
+bool ShortOfReagent(MageTravelSpell const& spell)
+{
+    return spell.reagentEntry != 0 && spell.reagentCarried < spell.reagentRequired;
+}
+
+MageTravelPlan Refuse(MageTravelSpell const& spell, char const* reason)
+{
+    MageTravelPlan plan;
+    plan.step = MageTravelStep::Refuse;
+    plan.spellId = spell.spellId;
+    plan.reason = reason;
+    return plan;
+}
+
+MageTravelPlan Cast(MageTravelSpell const& spell)
+{
+    MageTravelPlan plan;
+    plan.step = spell.kind == MageTravelSpellKind::Portal ? MageTravelStep::Portal
+                                                          : MageTravelStep::Teleport;
+    plan.spellId = spell.spellId;
+    return plan;
+}
+
+// A mage that would move its own body chooses the teleport, which nobody has to
+// click. It reaches for the portal only when it leads the group (so it may
+// cross first) or nobody is standing with it to be left behind.
+MageTravelPlan MageMovesItself(MageTravelFacts const& f, MageTravelSpell const* teleport,
+                               MageTravelSpell const* portal)
+{
+    if (teleport)
+        return Cast(*teleport);
+    if (!portal)
+        return MageTravelPlan{};
+    // The portal's owner may always click its own; a grouped follower may not
+    // cross before its leader (#410), so only the leader or a character in no
+    // group at all may take this route.
+    bool const mayClick = f.travellerLeadsGroup || !f.travellerGrouped;
+    if (!mayClick)
+        return MageTravelPlan{};
+    if (ShortOfReagent(*portal))
+        return Refuse(*portal, MageTravelRefusal::MissingReagent);
+    return Cast(*portal);
+}
+
+std::string WalkReason(MageTravelFacts const& f, bool longWalk)
+{
+    if (!f.destinationIsCapital)
+        return "the aim is not one of the capitals this mage has a spell for";
+    if (!f.mageReadable || !f.mageInWorld || !f.mageAlive || f.mageInCombat || f.mageCasting)
+        return "the mage cannot cast where it stands";
+    if (!longWalk)
+        return "the capital is close enough to walk";
+    if (f.travellerIsMage)
+    {
+        MageTravelSpell const* const portal = UsableSpell(f.spells, MageTravelSpellKind::Portal);
+        if (portal && !f.travellerLeadsGroup && f.travellerGrouped)
+            return "the mage does not lead the party, so its own portal would wait";
+    }
+    if (!f.travellerIsMage && !f.travellerLeadsGroup)
+        return "the traveller does not lead the party, so the portal would wait";
+    if (!f.travellerIsMage && !f.travellerWithMage)
+        return "the traveller is not standing with the mage";
+    return "no spell the mage knows reaches it";
+}
+
+std::string CastReason(MageTravelFacts const& f, bool portal)
+{
+    std::string reason =
+        f.walkYards < 0.f ? "the aim is on another map"
+                          : "the walk is " + std::to_string(static_cast<int>(f.walkYards)) +
+                                " yards";
+    if (portal)
+        reason += " and " + std::to_string(f.partyWithMage) + " family members stand with it";
+    return reason;
+}
+
+char const* SpellKindWord(MageTravelFacts const& f, std::uint32_t spellId)
+{
+    for (MageTravelSpell const& spell : f.spells)
+        if (spell.spellId == spellId)
+            return spell.kind == MageTravelSpellKind::Portal ? "portal" : "teleport";
+    return "teleport";
+}
+}  // namespace
+
+MageTravelPlan PlanMageTravel(MageTravelFacts const& f)
+{
+    if (!f.destinationIsCapital)
+        return MageTravelPlan{};
+    if (!f.mageReadable || !f.mageInWorld || !f.mageAlive || f.mageInCombat || f.mageCasting)
+        return MageTravelPlan{};
+
+    bool const longWalk =
+        f.destinationMap != f.mageMap || f.walkYards >= MAGE_TRAVEL_LONG_WALK_YARDS;
+    if (!longWalk)
+        return MageTravelPlan{};
+
+    MageTravelSpell const* const teleport =
+        UsableSpell(f.spells, MageTravelSpellKind::Teleport);
+    MageTravelSpell const* const portal = UsableSpell(f.spells, MageTravelSpellKind::Portal);
+    if (!teleport && !portal)
+    {
+        if (MageTravelSpell const* unknown = UnknownSpell(f.spells))
+            return Refuse(*unknown, MageTravelRefusal::UnknownSpell);
+        return MageTravelPlan{};
+    }
+
+    if (f.travellerIsMage)
+        return MageMovesItself(f, teleport, portal);
+
+    // Somebody else is being sent. Only a portal moves them, and only a leader
+    // may click it first; a mage that is not with the traveller cannot put one
+    // down where the traveller stands.
+    if (!f.travellerLeadsGroup || !f.travellerWithMage || !portal)
+        return MageTravelPlan{};
+    if (ShortOfReagent(*portal))
+        return Refuse(*portal, MageTravelRefusal::MissingReagent);
+    return Cast(*portal);
+}
+
+char const* MageTravelStepWord(MageTravelStep step)
+{
+    switch (step)
+    {
+        case MageTravelStep::Walk:     return "walk";
+        case MageTravelStep::Teleport: return "teleport";
+        case MageTravelStep::Portal:   return "portal";
+        case MageTravelStep::Refuse:   return "refuse";
+    }
+    return "walk";
+}
+
+std::string MageTravelLine(MageTravelFacts const& f, MageTravelPlan const& p)
+{
+    std::string const mage = f.mage.empty() ? std::string("the family mage") : f.mage;
+    std::string const forWhom =
+        f.traveller.empty() || f.traveller == f.mage ? std::string()
+                                                     : " for '" + f.traveller + "'";
+    std::string const line = "family mage '" + mage + "'";
+
+    if (p.step == MageTravelStep::Walk)
+    {
+        bool const longWalk =
+            f.destinationIsCapital &&
+            (f.destinationMap != f.mageMap ||
+             f.walkYards >= MAGE_TRAVEL_LONG_WALK_YARDS);
+        return line + " walks to the capital - " + WalkReason(f, longWalk);
+    }
+    if (p.step == MageTravelStep::Refuse)
+        return line + " refuses spell " + std::to_string(p.spellId) + " (" +
+               SpellKindWord(f, p.spellId) + ")" + forWhom + " to the capital - " + p.reason;
+
+    bool const portal = p.step == MageTravelStep::Portal;
+    return line + " casts spell " + std::to_string(p.spellId) + " (" +
+           MageTravelStepWord(p.step) + ")" + forWhom + " to the capital - " +
+           CastReason(f, portal);
+}
+
 bool IsLearnRow(std::string const& command)
 {
     std::vector<std::string> const words = LearnWords(command);
