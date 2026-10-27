@@ -50649,12 +50649,11 @@ private:
                 continue;
             }
 
-            facts.wipes = run.wipes;
-            facts.now = std::time(nullptr);
-            facts.lastWipeAt = run.lastWipeAt;
+            OverseerDecisions::RaidWipeFacts(facts, run.wipes, run.lastWipeAt, run.lastWipeMap,
+                                             door ? door->insideMapId : 0,
+                                             std::time(nullptr));
             if (door)
             {
-                facts.samePlace = facts.wipes >= 1 && run.lastWipeMap == door->insideMapId;
                 if (head && head->IsInWorld())
                 {
                     GraveyardStruct const* grave =
@@ -50668,6 +50667,11 @@ private:
 
             if (step.release)
             {
+                // An attempt ended by a wipe (#1165) still has its corpses
+                // inside, and ReleaseRaidRun keeps the raid while anybody is:
+                // they are released first, or the run would never let go.
+                if (step.releaseDead && door && group && group->isRaidGroup())
+                    run.released += ReleaseRaidDead(group, door);
                 if (ReleaseRaidRun(roster.family, run, door))
                 {
                     LOG_INFO("module.overseer",
@@ -50701,7 +50705,7 @@ private:
                          OverseerDecisions::RaidRunPhaseName(step.phase), step.why,
                          facts.inWorld, facts.assembled, facts.inside, facts.insideAlive,
                          uint32(seats.size()));
-                if (step.phase == RaidRunPhase::Recover && OverseerDecisions::RaidWiped(facts))
+                if (OverseerDecisions::RaidRunCountsWipe(run.phase, step, facts))
                 {
                     ++run.wipes;
                     run.lastWipeAt = std::time(nullptr);

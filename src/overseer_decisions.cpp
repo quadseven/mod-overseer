@@ -15331,6 +15331,22 @@ bool RaidWiped(RaidRunFacts const& facts)
     return !facts.insideCombat && facts.insideDead * 100 >= total * RAID_WIPE_PCT;
 }
 
+void RaidWipeFacts(RaidRunFacts& facts, unsigned wipes, std::time_t lastWipeAt,
+                   std::uint32_t lastWipeMap, std::uint32_t doorMap, std::time_t now)
+{
+    facts.wipes = wipes;
+    facts.lastWipeAt = lastWipeAt;
+    facts.now = now;
+    facts.samePlace = wipes >= 1 && lastWipeMap == doorMap;
+}
+
+bool RaidRunCountsWipe(RaidRunPhase current, RaidRunStep const& step,
+                       RaidRunFacts const& facts)
+{
+    return step.phase == RaidRunPhase::Recover && current != RaidRunPhase::Recover &&
+           RaidWiped(facts);
+}
+
 bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct)
 {
     return lowestDurabilityPct < floorPct;
@@ -15480,9 +15496,13 @@ RaidRunStep StepRaidRunRecover(RaidRunPhase current, RaidRunFacts const& facts)
     step.releaseDead = wiped;
 
     // A second wipe of the same run at the same place inside 600 s ends the
-    // attempt rather than starting a third (#1165).
-    if (wiped && facts.wipes >= 1 && facts.samePlace && facts.lastWipeAt != 0 &&
-        facts.now != 0 && facts.now - facts.lastWipeAt < 600)
+    // attempt rather than starting a third (#1165). Only a NEW wipe counts: the
+    // poll that moves the run into RECOVER. A later RECOVER poll that still
+    // sees the corpses of the wipe already on the book is the same wipe, and
+    // ending there would end the run after its first one. releaseDead stays
+    // set, so the corpses are released before the order is let go.
+    if (wiped && current != RaidRunPhase::Recover && facts.wipes >= 1 && facts.samePlace &&
+        facts.lastWipeAt != 0 && facts.now != 0 && facts.now - facts.lastWipeAt < 600)
     {
         step.phase = RaidRunPhase::Idle;
         step.release = true;
@@ -15492,9 +15512,12 @@ RaidRunStep StepRaidRunRecover(RaidRunPhase current, RaidRunFacts const& facts)
         return step;
     }
 
-    // While members still carry Resurrection Sickness, do not walk the party
-    // straight back in; wait it out instead of risking another wipe (#1165).
-    if (wiped && facts.membersSick)
+    // While members still carry Resurrection Sickness after a wipe, do not
+    // walk the party back in; wait it out instead of risking another wipe
+    // (#1165). The sickness comes from the spirit healer, who revives a member
+    // alive at the graveyard outside, so this is read whether or not corpses
+    // are still inside: by the time anybody is sick, usually none are.
+    if (facts.wipes >= 1 && facts.membersSick)
     {
         step.runBack = false;
         step.why = "members still carry Resurrection Sickness; waiting it out before the run-back";

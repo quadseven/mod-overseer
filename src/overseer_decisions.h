@@ -18388,10 +18388,11 @@ struct RaidRunFacts
     bool cleared{false};
 
     // THE WIPE LOOP GUARD (#1165). After a wipe the run does not walk the party
-    // straight back in while members still carry Resurrection Sickness, and a
-    // second wipe of the same run at the same place inside 600 s ends the
-    // attempt instead of a third walk-in.
-    std::uint32_t wipes{0};          // previous wipes of this run, not this one
+    // back in while members still carry Resurrection Sickness (they only carry
+    // it once the spirit healer revived them outside, so the hold is read in
+    // RECOVER with nobody dead inside), and a second wipe of the same run at
+    // the same place inside 600 s ends the attempt instead of a third walk-in.
+    std::uint32_t wipes{0};          // wipes already on the run's book
     std::time_t lastWipeAt{0};       // epoch seconds of the previous wipe (0 = none)
     bool samePlace{false};           // this wipe is at the same place as the last
     bool membersSick{false};         // members still carry Resurrection Sickness
@@ -18422,6 +18423,17 @@ struct RaidRunStep
 
 // Is the raid wiped, by RAID_WIPE_PCT? See that constant.
 bool RaidWiped(RaidRunFacts const& facts);
+
+// THE WIPE BOOK (#1165). The adapter keeps three things about a run's wipes:
+// how many, when the last one was, and on which map. RaidWipeFacts copies them
+// into a poll's facts (samePlace: a wipe is on the book and it was on the
+// door's map); RaidRunCountsWipe says whether this poll's step is a NEW wipe,
+// which is only the move into RECOVER, never a later RECOVER poll that still
+// sees the same corpses inside.
+void RaidWipeFacts(RaidRunFacts& facts, unsigned wipes, std::time_t lastWipeAt,
+                   std::uint32_t lastWipeMap, std::uint32_t doorMap, std::time_t now);
+bool RaidRunCountsWipe(RaidRunPhase current, RaidRunStep const& step,
+                       RaidRunFacts const& facts);
 
 // A raid seat is due for repair when its lowest wearable item is below the
 // configured floor. An item with no maximum durability is not part of the
