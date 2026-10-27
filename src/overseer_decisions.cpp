@@ -18806,6 +18806,7 @@ bool IsStartingLand(uint32_t mapId, uint32_t zoneId)
         case AZUREMYST_ISLE_ZONE_ID:
         case BLOODMYST_ISLE_ZONE_ID:
         case THE_EXODAR_ZONE_ID:
+        case VEILED_SEA_ZONE_ID:
             return true;
         default:
             return false;
