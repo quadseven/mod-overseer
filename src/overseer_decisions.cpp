@@ -22921,6 +22921,11 @@ bool MayOpenRunFor(bool sittingOut, bool lentToAGuildRun)
     return !sittingOut && !lentToAGuildRun;
 }
 
+bool CountsAsInADungeonRun(bool onDungeonMap, bool activeRunOnMap, bool namedByAGuildRun)
+{
+    return onDungeonMap && (activeRunOnMap || namedByAGuildRun);
+}
+
 std::string SitOutRunEndedReason(std::string const& leader)
 {
     return "leader '" + leader + "' is sitting out for a stand-in, so the run is closed and "

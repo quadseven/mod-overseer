@@ -20,6 +20,8 @@
 #include <iterator>
 #include <string>
 
+using OverseerDecisions::CountsAsInADungeonRun;
+using OverseerDecisions::MayCraftNow;
 using OverseerDecisions::MayOpenRunFor;
 
 namespace
@@ -54,12 +56,73 @@ std::string Body(std::string const& text, char const* signature)
     return end == std::string::npos ? std::string() : text.substr(start, end - start);
 }
 
+// A guild run writes no family run row, and the empty family run this change
+// stops opening was the only thing that stood the other drives down for a lent
+// member. So the run-presence check counts the guild run itself.
+void ALentMemberInsideAGuildClearCountsAsInARun()
+{
+    Check("a member named by a guild run, on the dungeon map, is in a run",
+          CountsAsInADungeonRun(true, false, true));
+    Check("a family run row on the map still counts", CountsAsInADungeonRun(true, true, false));
+    Check("on a dungeon map with neither, it is not in a run",
+          !CountsAsInADungeonRun(false, false, false) && !CountsAsInADungeonRun(true, false, false));
+    Check("named by a guild run but not on a dungeon map, it is not inside one",
+          !CountsAsInADungeonRun(false, false, true));
+    Check("a lent healer on a campaign job does not craft mid-clear",
+          !MayCraftNow("dungeon", CountsAsInADungeonRun(true, false, true), true, false, false));
+    Check("nor on a town run job",
+          !MayCraftNow("town run", CountsAsInADungeonRun(true, false, true), true, false, false));
+}
+
+// Every drive that stood down for the orphan family run row asks the check
+// that counts a guild run, not the row-only InDungeonRun.
+void TheStandDownDrivesAskTheGuildRunToo(std::string const& text)
+{
+    std::string const helper = Body(text, "bool InAnyDungeonRun(Player* bot) const");
+    Check("InAnyDungeonRun is found", !helper.empty());
+    Check("which asks the decision",
+          helper.find("OverseerDecisions::CountsAsInADungeonRun(") != std::string::npos);
+    Check("with the family run row", helper.find("ActiveRunOnMap(") != std::string::npos);
+    Check("and the guild runs", helper.find("NamedByAGuildRun(") != std::string::npos);
+
+    struct Site
+    {
+        char const* drive;
+        char const* asks;
+        char const* what;
+    };
+    Site const sites[] = {
+        {"void DriveCraft()", "MayCraftNow(jobIt->second, InAnyDungeonRun(bot),",
+         "the craft drive does not craft for a lent member mid-clear"},
+        {"void DriveLockpick()", "if (InAnyDungeonRun(bot))",
+         "the lockpick errand stands down for a lent member"},
+        {"void DriveRecipeManuals()", "|| InAnyDungeonRun(bot))",
+         "the recipe-manual errand stands down for a lent member"},
+        {"void DriveStuckRevival()", "bool const inRun = InAnyDungeonRun(bot);",
+         "the healer-death path treats a lent member as in a run"},
+        {"void DriveFamilyQuests(", "if (InAnyDungeonRun(bot))",
+         "the quest drive stands down for a lent member"},
+        {"void DriveProfessions()", "if (InAnyDungeonRun(bot))",
+         "the profession plan stands down for a lent member"},
+        {"void DriveCatchUp(", "|| InAnyDungeonRun(p))",
+         "the catch-up walk leaves a lent member alone"},
+    };
+    for (Site const& site : sites)
+    {
+        std::string const body = Body(text, site.drive);
+        Check(site.drive, !body.empty());
+        Check(site.what, body.find(site.asks) != std::string::npos);
+    }
+}
+
 void TheArmingDriveAsksTheGuildRunsFirst()
 {
     std::ifstream source("src/mod_overseer.cpp");
     Check("src/mod_overseer.cpp is readable", static_cast<bool>(source));
     std::string const text((std::istreambuf_iterator<char>(source)),
                            std::istreambuf_iterator<char>());
+
+    TheStandDownDrivesAskTheGuildRunToo(text);
 
     std::string const drive = Body(text, "void DriveDungeonClear()");
     Check("DriveDungeonClear is found", !drive.empty());
@@ -102,6 +165,7 @@ void TheArmingDriveAsksTheGuildRunsFirst()
 int main()
 {
     AMemberLentToAGuildRunOpensNoRun();
+    ALentMemberInsideAGuildClearCountsAsInARun();
     TheArmingDriveAsksTheGuildRunsFirst();
     if (failures)
         return 1;

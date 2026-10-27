@@ -12788,6 +12788,25 @@ private:
         return ActiveRunOnMap(bot->GetMapId());
     }
 
+    // IS THIS CHARACTER IN ANY DUNGEON RUN, the family's or a guild run's
+    // (OverseerDecisions::CountsAsInADungeonRun, #1092)? InDungeonRun asks
+    // only the family run table, and a guild run writes no row there: it
+    // keeps its five in memory. A member lent to a guild run used to be
+    // covered by the empty family run the arming drive opened for it, which
+    // #1092 stops, so every drive that stands down for a run on a character
+    // that can be lent asks this instead, or it would craft, pick locks or
+    // walk to a recipe vendor mid-clear.
+    bool InAnyDungeonRun(Player* bot) const
+    {
+        if (!bot)
+            return false;
+        Map* map = bot->GetMap();
+        bool const onDungeonMap = map && map->IsDungeon();
+        return OverseerDecisions::CountsAsInADungeonRun(
+            onDungeonMap, onDungeonMap && ActiveRunOnMap(bot->GetMapId()),
+            onDungeonMap && NamedByAGuildRun(bot->GetName()));
+    }
+
     // Is a run open on this map? Cached for the length of a tick because every
     // steering drive asks the same question about the same handful of
     // characters, and the answer cannot change between two drives in one tick.
@@ -13890,7 +13909,7 @@ private:
             //   GetMap     Object.h:631     Map* GetMap() const
             //   IsDungeon  Map.h:298        bool IsDungeon() const
             //   GetMapId   Position.h:281   uint32 GetMapId() const
-            if (InDungeonRun(bot))
+            if (InAnyDungeonRun(bot))
             {
                 LOG_DEBUG("module.overseer",
                           "overseer: '{}' is in a dungeon run - the quest drive "
@@ -16680,7 +16699,7 @@ private:
             // campaign job crafts while it waits in town, never inside a run,
             // in a fight or on the move.
             // isMoving  Unit.h  bool isMoving() const
-            if (!OverseerDecisions::MayCraftNow(jobIt->second, InDungeonRun(bot),
+            if (!OverseerDecisions::MayCraftNow(jobIt->second, InAnyDungeonRun(bot),
                                                 bot->IsAlive(), bot->IsInCombat(),
                                                 bot->isMoving()))
                 continue;
@@ -17178,7 +17197,7 @@ private:
             Player* bot = ObjectAccessor::FindPlayerByName(name);
             if (!bot || !bot->IsInWorld())
                 continue;   // same "read on its own" discipline as every other drive
-            if (InDungeonRun(bot))
+            if (InAnyDungeonRun(bot))
                 continue;   // a lockbox is a world object, not a dungeon errand
             if (!bot->IsAlive() || bot->getClass() != CLASS_ROGUE || !bot->HasSpell(1804))
                 continue;
@@ -17560,7 +17579,7 @@ private:
         for (auto const& [name, column] : errands)
         {
             Player* bot = ObjectAccessor::FindPlayerByName(name);
-            if (!bot || !bot->IsInWorld() || InDungeonRun(bot))
+            if (!bot || !bot->IsInWorld() || InAnyDungeonRun(bot))
                 continue;
             DriveRecipeManual(bot, name, column);
         }
@@ -18833,7 +18852,7 @@ private:
             // there is no trainer inside an instance to make it good on - so
             // this belongs to the run, not to the profession plan, exactly as
             // the quest aim does.
-            if (InDungeonRun(bot))
+            if (InAnyDungeonRun(bot))
             {
                 LOG_DEBUG("module.overseer",
                           "overseer: '{}' is in a dungeon run - the profession "
@@ -24599,7 +24618,7 @@ private:
         // follower already on a taxi is closing the gap faster than a walk
         // would; a follower inside a run is the run's. And the leader has to
         // be standing on something, for the reason OnTheGround gives.
-        if (!p->IsAlive() || p->IsInFlight() || InDungeonRun(p))
+        if (!p->IsAlive() || p->IsInFlight() || InAnyDungeonRun(p))
             return;
         // A FOLLOWER HELD FOR BEING TOO FAR STAYS HELD, and is not sent on
         // another walk that the flight has already refused (2026-09-23).
@@ -30758,7 +30777,7 @@ private:
             // anti-stacking rule lives in DecideGhostRecovery now.
             auto const healerExpected = [&](int64 deadSeconds) -> bool
             {
-                bool const inRun = InDungeonRun(bot);
+                bool const inRun = InAnyDungeonRun(bot);
                 Player* rezzer = inRun ? LivingResurrectorFor(bot) : nullptr;
                 OverseerDecisions::HealerStandDownFacts standDown;
                 standDown.deadSeconds = deadSeconds;

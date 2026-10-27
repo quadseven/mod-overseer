@@ -25640,6 +25640,16 @@ bool SitsOutOfRuns(FamilyStandin const* standin, std::string const& name);
 // group, so the family's run table has nothing to say about it.
 bool MayOpenRunFor(bool sittingOut, bool lentToAGuildRun);
 
+// Does a character count as inside a dungeon run, for every drive that stands
+// down for one? Only on a dungeon map, and then when a family run row is open
+// on that map, or when the character is named by a guild run. A guild run
+// keeps its state in memory and writes no run row, so before #1092 the only
+// thing that stood the craft, lockpick, recipe-manual, quest and profession
+// drives down for a member lent to one was the empty family run the arming
+// drive wrongly opened for it. That run is no longer opened, so the guild run
+// has to be counted here instead.
+bool CountsAsInADungeonRun(bool onDungeonMap, bool activeRunOnMap, bool namedByAGuildRun);
+
 // The ended_reason of an open run whose leader sits out, naming the sit-out.
 std::string SitOutRunEndedReason(std::string const& leader);
 
