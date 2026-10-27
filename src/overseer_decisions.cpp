@@ -3580,6 +3580,75 @@ std::string TravelGuardPlace(std::string const& aim)
     return "at:" + place;
 }
 
+bool TravelGuardMap(std::string const& aim, std::uint32_t& map)
+{
+    if (!IsTravelGuardAim(aim))
+        return false;
+    std::size_t const start = sizeof(TRAVEL_GUARD_PREFIX) - 1;
+    std::size_t const colon = aim.find(':', start);
+    if (colon == std::string::npos || colon == start || colon - start > 9)
+        return false;
+    std::uint32_t parsed = 0;
+    for (std::size_t i = start; i < colon; ++i)
+    {
+        char const c = aim[i];
+        if (c < '0' || c > '9')
+            return false;
+        parsed = parsed * 10 + static_cast<std::uint32_t>(c - '0');
+    }
+    map = parsed;
+    return true;
+}
+
+char const* GuardWalkName(GuardWalk walk)
+{
+    switch (walk)
+    {
+        case GuardWalk::OwnPlace:     return "its own guard place";
+        case GuardWalk::LeadersPlace: return "its leader's guard place";
+        case GuardWalk::OtherMap:     return "a guard place on another map";
+        case GuardWalk::NoPlace:      return "no place";
+    }
+    return "no place";
+}
+
+GuardWalkVerdict ReadGuardWalk(GuardWalkFacts const& facts)
+{
+    GuardWalkVerdict verdict;
+    std::string const own = TravelGuardPlace(facts.guard);
+    if (own.empty())
+        return verdict;  // NoPlace
+    // A map that cannot be read, or a character whose map is not known, keeps
+    // the answer the guard had before this existed: the drive walks the place
+    // as written and its own resolve says whether it can.
+    std::uint32_t guardMap = 0;
+    if (!facts.mapKnown || !TravelGuardMap(facts.guard, guardMap) ||
+        guardMap == facts.currentMap)
+    {
+        verdict.walk = GuardWalk::OwnPlace;
+        verdict.place = own;
+        return verdict;
+    }
+    // ON ANOTHER MAP. The leader's guard is where the rest of the family is
+    // being taken, so it is the one place on this map that means "out" too.
+    std::uint32_t leaderMap = 0;
+    std::string const leaderPlace = TravelGuardPlace(facts.leaderColumn);
+    if (!leaderPlace.empty() && TravelGuardMap(facts.leaderColumn, leaderMap) &&
+        leaderMap == facts.currentMap)
+    {
+        verdict.walk = GuardWalk::LeadersPlace;
+        verdict.place = leaderPlace;
+        return verdict;
+    }
+    verdict.walk = GuardWalk::OtherMap;
+    return verdict;
+}
+
+bool GuardWalkSteers(GuardWalk walk)
+{
+    return walk == GuardWalk::OwnPlace || walk == GuardWalk::LeadersPlace;
+}
+
 LandedErrand LandedErrandStep(std::string const& landedAim,
                               std::string const& columnAim,
                               bool atCounter,

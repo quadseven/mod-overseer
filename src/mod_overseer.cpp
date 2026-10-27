@@ -23779,9 +23779,22 @@ private:
                                        : std::string();
     }
 
+    // A GUARDED CHARACTER STEERS ITSELF, FOLLOWER OR NOT (#163), once the
+    // travel drive has resolved its guard to a place on its own map. Measured
+    // 2026-10-26: four guarded followers were each refused as "nothing walks
+    // it anywhere", and the one that was not on its leader's flight stayed on
+    // the ground that was killing it. Clearing the column erases the entry,
+    // this goes false, and KeepRosterFollowing takes the strategy back.
+    bool WalksItsGuard(std::string const& name) const
+    {
+        auto const it = _travelGuards.find(name);
+        return it != _travelGuards.end() &&
+               OverseerDecisions::GuardWalkSteers(it->second.walk);
+    }
+
     bool MaySteerItself(std::string const& name) const
     {
-        return IsEscorted(name) ||
+        return IsEscorted(name) || WalksItsGuard(name) ||
                (SplitFromLeader(name) &&
                 OverseerDecisions::CutOffFollowerRoams(TownJobFor(name),
                                                        _travelAims.TargetFor(name)));
@@ -26556,6 +26569,72 @@ private:
         }
     }
 
+    // WHERE THIS POLL WALKS A GUARDED CHARACTER (#163), or empty for nowhere.
+    // See OverseerDecisions::ReadGuardWalk: a guard on the map the character
+    // stands on is walked as written, one on another map is walked to the
+    // leader's guard place when the leader carries one on this map, and is
+    // otherwise refused loudly once rather than released every poll as "no
+    // such spawn" while the column says guarded. The verdict is kept on the
+    // guard's entry, because WalksItsGuard (and so MaySteerItself) reads it.
+    std::string GuardTarget(std::string const& name, std::string const& guard,
+                            std::map<std::string, std::string> const& aims)
+    {
+        OverseerDecisions::GuardWalkFacts facts;
+        facts.guard = guard;
+        if (Player* bot = ObjectAccessor::FindPlayerByName(name))
+        {
+            facts.mapKnown = true;
+            facts.currentMap = bot->GetMapId();
+            if (Group* group = bot->GetGroup())
+                if (group->GetLeaderGUID() != bot->GetGUID())
+                    if (Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID()))
+                    {
+                        auto const leaderAim = aims.find(leader->GetName());
+                        if (leaderAim != aims.end())
+                            facts.leaderColumn = leaderAim->second;
+                    }
+        }
+        OverseerDecisions::GuardWalkVerdict const verdict =
+            OverseerDecisions::ReadGuardWalk(facts);
+
+        auto const seen = _travelGuards.find(name);
+        if (seen == _travelGuards.end())
+            return verdict.place;
+        OverseerDecisions::GuardWalk const before = seen->second.walk;
+        bool const changed = before != verdict.walk;
+        seen->second.walk = verdict.walk;
+        if (changed)
+            seen->second.walkSaid = false;
+        if (seen->second.walkSaid)
+            return verdict.place;
+        seen->second.walkSaid = true;
+        std::uint32_t guardMap = 0;
+        OverseerDecisions::TravelGuardMap(guard, guardMap);
+        if (verdict.walk == OverseerDecisions::GuardWalk::LeadersPlace)
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' carries the operator guard '{}' for map {} but stands on "
+                     "map {} - it is walked to its leader's guard place {} instead, and "
+                     "steers itself there (#163)",
+                     name, guard, guardMap, facts.currentMap, verdict.place);
+        else if (verdict.walk == OverseerDecisions::GuardWalk::OtherMap)
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' carries the operator guard '{}' for map {} but stands on "
+                     "map {}, and its leader carries no guard on map {} - NOTHING WALKS IT "
+                     "OUT. The quest drive stands down for it; write a guard that names a "
+                     "place on map {} for it or its leader (#163)",
+                     name, guard, guardMap, facts.currentMap, facts.currentMap,
+                     facts.currentMap);
+        // The first OwnPlace is what NoteTravelGuards already said; a later
+        // one is a character that has reached its guard's own map.
+        else if (verdict.walk == OverseerDecisions::GuardWalk::OwnPlace &&
+                 before != OverseerDecisions::GuardWalk::NoPlace)
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is walked to the place its operator guard '{}' names, "
+                     "{}, and steers itself there (#163)",
+                     name, guard, verdict.place);
+        return verdict.place;
+    }
+
     // THE FIRST TRAVEL POLL CLEARS WHAT A GONE PROCESS LEFT BEHIND (#658). See
     // OverseerDecisions::ReadLeftoverAim. Once per process, before the first
     // Load, because the only aims it can be wrong about are the ones written
@@ -26686,16 +26765,18 @@ private:
             // after the bind lands or the trip is given up.
             //
             // AN OPERATOR'S GUARD OUTRANKS THE BIND TRIP AND EVERYTHING ELSE
-            // (#163), and is walked as the `at:` place it names. The column
-            // keeps the guard; only `target` is the translation, so every
-            // release below reads the guard back and leaves it standing.
+            // (#163), and is walked as the `at:` place it resolves to on the
+            // map the character stands on (GuardTarget). The column keeps the
+            // guard; only `target` is the translation, so every release below
+            // reads the guard back and leaves it standing.
             bool const guarded = OverseerDecisions::IsTravelGuardAim(columnAim);
             std::string const bindAim = guarded ? std::string() : HomeBindAim(name);
             std::string const target =
-                guarded ? OverseerDecisions::TravelGuardPlace(columnAim)
+                guarded ? GuardTarget(name, columnAim, aims)
                         : OverseerDecisions::TravelAimBesideBind(bindAim, columnAim);
-            // A guard that names no place holds the character from questing and
-            // walks it nowhere; NoteTravelGuards has already said so.
+            // A guard that names no place, or only a place on another map,
+            // holds the character from questing and walks it nowhere;
+            // NoteTravelGuards or GuardTarget has already said so.
             if (target.empty())
                 continue;
             if (!guarded && target != columnAim &&
@@ -79460,6 +79541,11 @@ private:
     {
         std::string aim;
         time_t since{0};
+        // How the travel drive last resolved it (GuardTarget), and whether
+        // that answer has been said. NoPlace until the drive has looked, so a
+        // guard steers nobody before it has a place to walk to.
+        OverseerDecisions::GuardWalk walk{OverseerDecisions::GuardWalk::NoPlace};
+        bool walkSaid{false};
     };
     std::map<std::string, TravelGuardSeen> _travelGuards;
     // The talent reset errand (#626). Who is walking to a class trainer for
