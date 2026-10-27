@@ -82,6 +82,8 @@ void TheArmingDriveAsksTheGuildRunsFirst()
     Check("which skips the member", branchEnd != std::string::npos && branchEnd < opens);
     std::string const lentBranch =
         branch == std::string::npos ? std::string() : drive.substr(branch, branchEnd - branch);
+    Check("and forgets its dc on record, so its family asks afresh later",
+          lentBranch.find("_dcOnIssued.erase(name);") != std::string::npos);
     Check("without standing the brain down",
           lentBranch.find("StandDownDungeonBrain(") == std::string::npos);
     Check("and without closing a run as a sit-out",
