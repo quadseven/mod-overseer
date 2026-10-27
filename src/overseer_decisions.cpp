@@ -17833,6 +17833,41 @@ unsigned ToolItemForTotemCategory(unsigned totemCategory)
     return totemCategory == TOTEM_CATEGORY_BLACKSMITH_HAMMER ? ITEM_BLACKSMITH_HAMMER : 0;
 }
 
+unsigned ReagentShortBy(unsigned need, unsigned have)
+{
+    return have >= need ? 0 : need - have;
+}
+
+std::string MaterialRequestDetail(unsigned need, unsigned have, std::string const& itemName)
+{
+    std::string detail = "short ";
+    detail += std::to_string(ReagentShortBy(need, have));
+    detail += "x ";
+    detail += itemName;
+    detail += " (needs ";
+    detail += std::to_string(need);
+    detail += ", has ";
+    detail += std::to_string(have);
+    detail += ")";
+    return detail;
+}
+
+bool OpenMaterialRequests::Open(std::string const& character, unsigned recipe, unsigned reagent)
+{
+    return _open.emplace(Key{character, recipe, reagent}, true).second;
+}
+
+void OpenMaterialRequests::Close(std::string const& character, unsigned recipe, unsigned reagent)
+{
+    _open.erase(Key{character, recipe, reagent});
+}
+
+bool OpenMaterialRequests::IsOpen(std::string const& character, unsigned recipe,
+                                  unsigned reagent) const
+{
+    return _open.count(Key{character, recipe, reagent}) > 0;
+}
+
 CraftToolStep CraftToolStepFor(CraftToolPlace place, bool bankerInReach, bool mayWalk)
 {
     switch (place)

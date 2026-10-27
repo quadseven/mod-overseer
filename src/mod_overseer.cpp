@@ -16572,6 +16572,10 @@ private:
     // one line and not one per poll. World thread only.
     std::map<std::string, std::string> _craftPrepSaid;
 
+    // The reagent material requests still open (#1099), so a craft that skips
+    // every poll for the same missing reagent asks once. World thread only.
+    OverseerDecisions::OpenMaterialRequests _materialRequests;
+
     bool SayCraftPrepOnce(std::string const& name, std::string const& said)
     {
         auto const it = _craftPrepSaid.find(name);
@@ -16722,25 +16726,36 @@ private:
                     continue;
                 uint32 const reagentId = static_cast<uint32>(info->Reagent[x]);
                 uint32 const reagentCount = static_cast<uint32>(info->ReagentCount[x]);
-                if (!bot->HasItemCount(reagentId, reagentCount))
+                if (bot->HasItemCount(reagentId, reagentCount))
                 {
-                    shortOfReagents = true;
+                    // Enough again: the open request for it, if any, is answered.
+                    _materialRequests.Close(name, spellId, reagentId);
+                    continue;
+                }
+                shortOfReagents = true;
 
-                    // Write a material-request event for this missing reagent.
-                    // itemGuid is set to the reagent item ID so the event key
-                    // (character_name, kind, subject_id, bucket, itemGuid)
-                    // deduplicates per character, recipe, and reagent combination.
-                    if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(reagentId))
-                    {
-                        std::string detail = "need ";
-                        detail += std::to_string(reagentCount);
-                        detail += "x ";
-                        detail += proto->Name1;
-                        EventExtra extra;
-                        extra.itemGuid = reagentId;
-                        RecordEvent(bot, "material-request", spellId,
-                                    info->SpellName[LOCALE_enUS], detail, extra);
-                    }
+                // ONE MATERIAL REQUEST PER CHARACTER, RECIPE AND REAGENT (#1099),
+                // saying how many the crafter is SHORT. The event key's hourly
+                // bucket alone would write a fresh row every hour this craft
+                // keeps skipping; the open-request gate writes one, and the next
+                // after the crafter has held enough and run short again.
+                // itemGuid carries the reagent's item id so two reagents of one
+                // recipe are two rows. GetItemCount, like HasItemCount above,
+                // counts the bags and not the bank.
+                ItemTemplate const* proto = sObjectMgr->GetItemTemplate(reagentId);
+                if (proto && _materialRequests.Open(name, spellId, reagentId))
+                {
+                    uint32 const have = bot->GetItemCount(reagentId, false);
+                    std::string const detail =
+                        OverseerDecisions::MaterialRequestDetail(reagentCount, have, proto->Name1);
+                    EventExtra extra;
+                    extra.itemGuid = reagentId;
+                    RecordEvent(bot, "material-request", spellId, info->SpellName[LOCALE_enUS],
+                                detail, extra);
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' skipped '{}' ({}) - material-request for item {}: {} "
+                             "(#1099)",
+                             name, info->SpellName[LOCALE_enUS], spellId, reagentId, detail);
                 }
             }
             if (shortOfReagents)

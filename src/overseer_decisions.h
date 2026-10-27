@@ -20579,6 +20579,53 @@ bool FocusIsWalkedTo(unsigned requiresSpellFocus);
 // crafter's own bank, and taken out to craft.
 unsigned ToolItemForTotemCategory(unsigned totemCategory);
 
+// A MATERIAL REQUEST FOR A REAGENT (#1099). DriveCraft skips a craft whose
+// reagents the crafter does not hold; the skip is the only moment anything
+// knows a crafter is short, so it writes a `material-request` event the site
+// routes to a gatherer or a buyer. The event says how many the crafter is
+// SHORT, not how many the recipe needs: a crafter holding 2 of 6 bars asks
+// for 4. 0 means not short, and nothing is asked.
+unsigned ReagentShortBy(unsigned need, unsigned have);
+
+// The event's detail: "short 4x Copper Bar (needs 6, has 2)".
+std::string MaterialRequestDetail(unsigned need, unsigned have, std::string const& itemName);
+
+// AT MOST ONE OPEN REQUEST per character, recipe and reagent. A request opens
+// when a skip for that reagent writes its event and stays open while the
+// crafter is still short, so the poll that skips the same craft a minute later
+// writes nothing. It closes the first time the crafter holds enough of that
+// reagent for that recipe; a crafter short again after that asks again. Kept
+// in memory on the world thread: a restart forgets what is open, which fails
+// toward asking once more rather than never.
+class OpenMaterialRequests
+{
+public:
+    // True when no request is open for this key: the caller writes the event
+    // and the request is now open. False while one is already open.
+    bool Open(std::string const& character, unsigned recipe, unsigned reagent);
+    // The crafter holds enough of this reagent for this recipe again.
+    void Close(std::string const& character, unsigned recipe, unsigned reagent);
+    bool IsOpen(std::string const& character, unsigned recipe, unsigned reagent) const;
+    std::size_t Size() const { return _open.size(); }
+
+private:
+    struct Key
+    {
+        std::string character;
+        unsigned recipe = 0;
+        unsigned reagent = 0;
+        bool operator<(Key const& other) const
+        {
+            if (character != other.character)
+                return character < other.character;
+            if (recipe != other.recipe)
+                return recipe < other.recipe;
+            return reagent < other.reagent;
+        }
+    };
+    std::map<Key, bool> _open;
+};
+
 // WHERE THE TOOL A RECIPE NEEDS IS, AND WHAT THE CRAFT DRIVE DOES ABOUT IT.
 //   NotNeeded / Carried  -> Cast: nothing to fetch.
 //   Banked, banker here  -> Withdraw, through the bank verb's own executor.
