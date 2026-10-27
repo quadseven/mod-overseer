@@ -156,6 +156,59 @@ int main()
                   ExitFailureHearthStep(movingOnCooldown), ExitHearthStep::Impossible);
     }
 
+    // -- a stone bound on another continent (#1142) ------------------------------
+    {
+        // Measured on the dev realm 2026-10-20: a member hearthed out of
+        // Uldaman (map 70) to its bind on map 1 while the family stood on map 0,
+        // the continent the door lets out on, and the family stayed split for
+        // more than 21 hours.
+        ExitHearthFacts farBind = Stranded();
+        farBind.doorMapKnown = true;
+        farBind.doorMapId = 0;
+        farBind.bindMapId = 1;
+        ExitHearthStep const step = ExitFailureHearthStep(farBind);
+        CheckBool("a stone bound off the door's continent is not cast",
+                  step == ExitHearthStep::Cast, false);
+        CheckStep("it is impossible, so the existing walk-out path keeps it", step,
+                  ExitHearthStep::Impossible);
+        std::string const why = ExitHearthImpossibleReason(farBind);
+        CheckBool("the reason names the bind's map",
+                  why.find("map 1") != std::string::npos, true);
+        CheckBool("the reason names the door's map",
+                  why.find("map 0") != std::string::npos, true);
+        CheckBool("the reason says the stone is withheld",
+                  why.find("withheld") != std::string::npos, true);
+
+        ExitHearthFacts moving = farBind;
+        moving.moving = true;
+        CheckStep("a member bound far away is not held still for a cast that never comes",
+                  ExitFailureHearthStep(moving), ExitHearthStep::Impossible);
+
+        ExitHearthFacts homeBind = farBind;
+        homeBind.bindMapId = 0;
+        CheckStep("a stone bound on the door's map is still cast",
+                  ExitFailureHearthStep(homeBind), ExitHearthStep::Cast);
+        CheckText("and nothing is impossible about it", ExitHearthImpossibleReason(homeBind),
+                  "");
+
+        ExitHearthFacts unread = Stranded();
+        unread.bindMapId = 1;
+        CheckStep("a caller with no door map keeps the old rule (crossing, regroup)",
+                  ExitFailureHearthStep(unread), ExitHearthStep::Cast);
+
+        // The attempts bound is unchanged by the new rule.
+        CheckBool("the attempts bound is still three", EXIT_HEARTH_ATTEMPTS == 3u, true);
+        ExitHearthFacts lastTry = homeBind;
+        lastTry.attempts = EXIT_HEARTH_ATTEMPTS - 1;
+        CheckStep("the last attempt on the door's map is still cast",
+                  ExitFailureHearthStep(lastTry), ExitHearthStep::Cast);
+        lastTry.attempts = EXIT_HEARTH_ATTEMPTS;
+        CheckStep("and spent attempts still stop it", ExitFailureHearthStep(lastTry),
+                  ExitHearthStep::Impossible);
+        CheckText("with the same reason as before", ExitHearthImpossibleReason(lastTry),
+                  "hearth attempts spent");
+    }
+
     // -- the family ------------------------------------------------------------
     {
         // Ragefire: the leader inside, four outside.

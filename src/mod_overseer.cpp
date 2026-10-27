@@ -36081,6 +36081,11 @@ private:
     {
         DungeonRunCoordinatorState run;  // preserved until every member has left
         uint32 mapId{0};
+        // The map the exit door lets out on (the portal's outsideMapId), so a
+        // stone bound on another continent is withheld (#1142). Unknown until
+        // set, and then the old rule holds.
+        bool doorMapKnown{false};
+        uint32 doorMapId{0};
         uint32 runId{0};
         uint32 campaignId{0};
         uint32 runNumber{0};
@@ -36257,6 +36262,9 @@ private:
                 facts.moving = bot->isMoving();
                 facts.pending = HearthPendingFor(name);
                 facts.attempts = episode.attempts[name];
+                facts.doorMapKnown = episode.doorMapKnown;
+                facts.doorMapId = episode.doorMapId;
+                facts.bindMapId = static_cast<uint32_t>(bot->m_homebindMapId);
             }
 
             ExitHearthStep const step = OverseerDecisions::ExitFailureHearthStep(facts);
@@ -36331,7 +36339,7 @@ private:
                 case ExitHearthStep::Impossible:
                     if (changed)
                     {
-                        char const* const why =
+                        std::string const why =
                             OverseerDecisions::ExitHearthImpossibleReason(facts);
                         LOG_WARN("module.overseer",
                                  "overseer: EXIT HEARTH - '{}' is still on map {} and cannot "
@@ -36387,6 +36395,8 @@ private:
         yard.hearth.campaignId = run.campaignId;
         yard.hearth.runNumber = run.runNumber;
         yard.hearth.portal = portal.keyword;
+        yard.hearth.doorMapKnown = true;
+        yard.hearth.doorMapId = portal.outsideMapId;
         _stratholmeYards[family] = yard;
         LOG_INFO("module.overseer",
                  "overseer: family '{}' left '{}' by areatrigger {} into the exit yard; "
@@ -38423,6 +38433,8 @@ private:
         {
             episode = ExitHearthEpisode();
             episode.mapId = portal.insideMapId;
+            episode.doorMapKnown = true;
+            episode.doorMapId = portal.outsideMapId;
             episode.since = std::time(nullptr);
         }
         time_t const now = std::time(nullptr);
@@ -38464,6 +38476,9 @@ private:
                     facts.moving = bot->isMoving();
                     facts.pending = HearthPendingFor(name);
                     facts.attempts = episode.attempts[name];
+                    facts.doorMapKnown = episode.doorMapKnown;
+                    facts.doorMapId = episode.doorMapId;
+                    facts.bindMapId = static_cast<uint32_t>(bot->m_homebindMapId);
                 }
                 way = OverseerDecisions::DecideEvacuationWay(
                     true, OverseerDecisions::ExitFailureHearthStep(facts));
@@ -38486,8 +38501,9 @@ private:
                               "overseer: dungeon run {} cannot hearth '{}' out of map {} "
                               "either - its walk to areatrigger {} was released as "
                               "unreachable or has not got it out in {} minutes, and its "
-                              "hearthstone is missing, cooling down or out of attempts, so "
-                              "it keeps walking at the door until one of those changes",
+                              "hearthstone is missing, cooling down, out of attempts or "
+                              "bound on another continent (withheld, #1142), so it keeps "
+                              "walking at the door until one of those changes",
                               coord.runNumber, name, portal.insideMapId, portal.exitTriggerId,
                               static_cast<uint32>(
                                   OverseerDecisions::EVACUATION_WALK_BOUND_SECONDS / 60));
@@ -54933,6 +54949,8 @@ private:
                             ExitHearthEpisode episode;
                             episode.run = coord;
                             episode.mapId = portal->insideMapId;
+                            episode.doorMapKnown = true;
+                            episode.doorMapId = portal->outsideMapId;
                             episode.runId = coord.runId ? coord.runId
                                                         : ActiveRunIdOnMap(portal->insideMapId);
                             episode.campaignId = coord.campaignId;
