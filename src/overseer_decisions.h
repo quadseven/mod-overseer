@@ -21477,6 +21477,19 @@ struct ExitHearthFacts
     bool moving{false};
     bool pending{false};
     unsigned attempts{0};
+    // WHERE THE STONE LEADS (#1142). Measured on the dev realm 2026-10-20: a
+    // member hearthed out of Uldaman (map 70) to its bind on map 1 while the
+    // family stood on map 0, the continent the door lets out on; the bridge
+    // logged the family split for 76475 seconds. `doorMapId` is the map the
+    // exit door lets out on (the portal's outsideMapId) and `bindMapId` the
+    // member's hearthstone bind map. A stone bound on another map is withheld,
+    // the rule #1060 applied to HeldGroundFacts. `doorMapKnown` is false for the
+    // callers that are not leaving by a door (crossing, regroup, stranded),
+    // whose own rules already decided where the stone leads; they keep the old
+    // behaviour.
+    bool doorMapKnown{false};
+    uint32_t doorMapId{0};
+    uint32_t bindMapId{0};
 };
 
 enum class ExitHearthStep
@@ -21485,7 +21498,8 @@ enum class ExitHearthStep
     Cast,        // drive the hearth executor now
     StopFirst,   // moving: hold it still this poll, cast on a later one
     Waiting,     // a hearth is in flight, or combat has to end first
-    Impossible   // dead, no stone, stone on cooldown, or the attempts are spent
+    Impossible   // dead, no stone, stone on cooldown, the attempts are spent,
+                 // or the stone is bound off the door's map (#1142)
 };
 
 // How many casts one episode may ask of one character. A cast that never
@@ -21521,8 +21535,9 @@ ExitHearthStep ExitFailureHearthStep(ExitHearthFacts const& facts,
 char const* ExitHearthStepWord(ExitHearthStep step);
 
 // Why a member cannot hearth, in the words the log and the timeline use; empty
-// for a member that can, or is not inside.
-char const* ExitHearthImpossibleReason(ExitHearthFacts const& facts,
+// for a member that can, or is not inside. A stone bound off the door's map
+// names both maps and says it is withheld.
+std::string ExitHearthImpossibleReason(ExitHearthFacts const& facts,
                                        unsigned maxAttempts = EXIT_HEARTH_ATTEMPTS);
 
 // Whether a hearth is in play for the family: some member inside is being
