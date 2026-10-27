@@ -132,77 +132,85 @@ and `professions.CRAFTING` rather than re-deriving them):
 ## Anvil, Hammer and reagent-gated Blacksmithing recipes (#524)
 
 Every "worn" Blacksmithing recipe (Runed Copper Belt through Imperial Plate
-Boots) needs a nearby Anvil and an equipped Blacksmith Hammer, and the two
-Green Iron recipes also need Green Dye from a vendor. DriveCraft casts in place
-and the core's `CheckCast` refuses them, so they stay out of the recipe table.
-The three decisions below are what the follow-up work builds against.
+Boots) needs a nearby Anvil and a Blacksmith Hammer, and the two Green Iron
+recipes also need Green Dye from a vendor.
 
-### Anvil: Anvil-gated recipes are OUT OF SCOPE for DriveCraft until the Hammer swap lands
+### The facts, corrected
 
-Facts, read from the world database: every Anvil is a `GAMEOBJECT_TYPE_SPELL_FOCUS`
-(type 8) with `data1 = 10`, the same value `SpellInfo::RequiresSpellFocus`
-carries. It is a real spawn, not a DBC concept. `BuildTravelIndex` indexes
-creature spawns only, so walking to an Anvil needs a second index of
-GameObject spawns filtered to that type and focus, with the existing same-map
-nearest-candidate ranking on top. The guild-bank walk is not a precedent: it
-walks to a banker creature and searches for the vault after arriving, and
-Anvils have no paired creature.
+An earlier pass of this section recorded two facts that the spell data does
+not bear out, and the design built on them was wrong:
 
-Decision: the travel half alone unblocks no recipe, because every Anvil recipe
-also needs the Hammer. So Anvil travel is not built on its own. Until both
-halves land the planner must not hand DriveCraft an Anvil-gated spell. A spell
-that slips through still fails closed: `SPELL_FAILED_REQUIRES_SPELL_FOCUS` is
-logged and the errand stands, which is the existing behaviour.
+- The Anvil is spell focus **1** (SpellFocusObject "Anvil"), the value
+  `SpellInfo::RequiresSpellFocus` carries for Runed Copper Belt (2666) and the
+  rest. In `gameobject_template` an Anvil is `type = 8`
+  (`GAMEOBJECT_TYPE_SPELL_FOCUS`) with **`data0`** (`spellFocus.focusId`) = 1.
+  `data1 = 10` is `spellFocus.dist`, the 10 yard reach of the focus, not its
+  id; focus 10 is "Machine Shop".
+- The Blacksmith Hammer is a **tool**, not an equipped weapon: the recipes carry
+  `RequiredTotemCategoryID` 162 ("Blacksmith Hammer") and no
+  `EquippedItemClass`. The core's `CheckCast` answers it with
+  `Player::HasItemTotemCategory`, which reads what is worn and what is in the
+  bags (`SPELL_FAILED_TOTEM_CATEGORY` when neither has one). A hammer in a bag
+  is enough, so nothing the character wields is ever swapped.
 
-### Hammer: EquippedItemClass is not broad enough, so a temporary swap is the design
+### Hammer: bought, kept in the bank, taken out to craft
 
-Facts: the Blacksmith Hammer (item 5956) is a main-hand weapon of class 2,
-subclass 14 (`ITEM_SUBCLASS_WEAPON_MISC`). The worn recipes' `EquippedItemClass`
-is weapon with a subclass mask for that miscellaneous subclass, not "any
-one-handed weapon", so a character's real weapon never satisfies it. Equipping
-the Hammer necessarily displaces the weapon in hand.
+The operator's decision (2026-10-24): buy the Blacksmith Hammer (item 5956),
+keep it in the crafter's own bank, and withdraw it when crafting. Not borrowed,
+not skipped. DriveCraft decides it with `OverseerDecisions::CraftToolStepFor`,
+before the cast:
 
-Decision: swap in, craft, swap back. There is no precedent in the module: the
-gear-upgrade drive swaps one way and permanently. The swap needs these rules
-before any code is written:
+- No tool needed, or one in the bags: cast.
+- In the bank with a banker in reach: withdraw it through `DoBank`, the bank
+  verb's executor, and cast on the next poll.
+- In the bank with no banker: a job `craft` crafter is walked to a banker
+  (a `banker` aim claimed on the travel book as a town trip, so it yields to a
+  profession errand and to any errand another pass wrote). A family on a
+  campaign job is never walked off by the craft drive; it waits.
+- Nowhere at all: a `material-request` event for item 5956, the same event a
+  missing reagent writes. The planner answers it by buying one; it is never
+  conjured.
 
-- Persist what was equipped before the swap (a roster column, like every other
-  standing errand) so a crash mid-swap and a worldserver restart cannot strand
-  the original weapon. On the next poll a stored weapon with the Hammer still
-  in hand means "swap back first", before any new craft.
-- Trigger only under `MayCraftNow`: alive, out of combat, not moving, not in a
-  run. If a character is pulled into combat while holding the Hammer, the swap
-  back takes precedence over the craft errand on the next out-of-combat poll,
-  and the combat strategies are not touched.
-- Require bag space for the displaced weapon before swapping; with none, leave
-  the weapon where it is and the errand standing. Never drop or sell an item to
-  make room.
-- Read the world back after each swap (`GetItemByPos`), not the call's return,
-  as the module does everywhere else a command should change the world.
-- Death, logout or a reassigned job while the Hammer is in hand takes the same
-  swap-back path on the next login poll, since the stored weapon is the only
-  state needed.
+`ReturnCraftTools` puts it back: a hammer in the bags (never one worn) that no
+standing craft errand needs is banked the next time the character stands in
+reach of a banker, alive, out of combat, not flying and not trading. Nobody is
+walked to a banker to put it back.
 
-Not built in this change: it needs the adapter build to verify, and it unblocks
-nothing without the Anvil half.
+Only a hammer a planned recipe has needed goes back (wow-overseer#1515): the
+member must have had a standing craft errand for a recipe that needs tool
+category 162 since its hammer last went back. A hammer in the bags of a member
+whose plan never asked for one (the planner skips every Anvil recipe today, or
+it is an engineer's) is left where it is. That memory is the module's own and a
+restart forgets it, which fails closed: the hammer stays in the bags until the
+next such errand. A deposit the bank refuses (a full bank) is logged once per
+answer, not on every 20 second poll, and tried again at the next banker.
 
-### Reagents: craft reagents stay out of scope for town-trip buying
+### Anvil: walked to, in town
 
-Green Dye is the only vendor-bought craft reagent in the Blacksmithing
-progression, and its only users (Green Iron Leggings and Bracers) are Anvil
-and Hammer gated. Extending the `kind='buy'` errand (food and drink today,
-with money and bag-space checks) for a reagent that no reachable recipe uses
-would be dead code, so craft reagents stay out of scope for town-trip buying
-until those two recipes can run. When they can, the extension reuses the same
-affordability and bag-space checks and adds Green Dye as the first non-food
-item. Reagent buying for v1 remains the family's own gathering, as above.
+A focus refusal for an Anvil (`OverseerDecisions::FocusIsWalkedTo`) walks a job
+`craft` crafter to the nearest Anvil spawn on its map within
+`CRAFT_FOCUS_WALK_LIMIT_YARDS` (400, a town and not a journey: zones are not
+levels). The spawns are a second index, read once from
+`sObjectMgr->GetAllGOData()` and filtered to type 8 with focusId 1, because
+`BuildTravelIndex` reads creature spawns only and an Anvil has no paired
+creature. The walk is an `at:` place in whole yards, claimed on the travel book
+as a town trip. Within `CRAFT_FOCUS_STANDING_YARDS` of the nearest Anvil the
+refusal stands rather than walking again, and with no Anvil in reach it is said
+once and the errand stands, which is the old behaviour.
+
+### Reagents: Green Dye is the planner's
+
+Vendor-bought reagents are bought by the planner's craft-supply pass, which
+already writes `kind='buy'` rows (`entry:<id> count:<n> max:<price>`) that the
+module's buy verb answers for any vendor item; nothing in this module is food
+or drink specific. Green Dye joins that table, and the hammer purchase joins it
+too, in the planner, not here.
 
 ### Recipe table
 
-The deferred Blacksmithing recipes are not added to `RECIPES` in this change.
-The table lives in the Python planner, not in this repository, and each entry
-needs the two-source check (wowhead.com/wotlk and classicdb.ch) of spell id,
-item id and reagents once the Anvil and Hammer halves exist.
+The deferred Blacksmithing recipes are added to `RECIPES` in the planner, which
+is not in this repository, with the two-source check (wowhead.com/wotlk and
+classicdb.ch) of spell id, item id and reagents.
 
 ## Why nothing was implemented in this pass
 

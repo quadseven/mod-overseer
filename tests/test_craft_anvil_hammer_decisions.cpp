@@ -2,8 +2,8 @@
  * The Blacksmithing Anvil + Hammer + Green Dye decisions (#524) are written
  * down in docs/design/profession-crafting-drive.md, and DriveCraft's own
  * comment points at them. Pin both, so a later change to how the drive treats
- * a spell-focus or equipped-tool refusal has to update the decision, not leave
- * it contradicting the code.
+ * a spell-focus or tool refusal has to update the decision, not leave it
+ * contradicting the code. The behaviour itself is test_craft_anvil_hammer.cpp.
  *
  * Reads docs and source as text (run from the repo root); needs no link.
  */
@@ -56,17 +56,20 @@ int main()
 
     Check("the doc has the Anvil/Hammer/dye section",
           Has(doc, "## Anvil, Hammer and reagent-gated Blacksmithing recipes (#524)"));
-    Check("the Anvil decision names the focus field", Has(doc, "RequiresSpellFocus"));
-    Check("the Anvil decision says the recipes are out of scope for now",
-          Has(doc, "Anvil-gated recipes are OUT OF SCOPE"));
-    Check("the Hammer decision says EquippedItemClass is not broad",
-          Has(doc, "EquippedItemClass") && Has(doc, "is not broad enough"));
-    Check("the Hammer design covers a crash mid-swap", Has(doc, "crash mid-swap"));
-    Check("the Hammer design covers combat and bag space",
-          Has(doc, "combat") && Has(doc, "bag space"));
+    Check("the Anvil is focus 1, read from data0, not data1",
+          Has(doc, "spell focus **1**") && Has(doc, "`spellFocus.focusId`) = 1") &&
+              Has(doc, "`spellFocus.dist`"));
+    Check("the Hammer is a tool category, not an equipped weapon",
+          Has(doc, "`RequiredTotemCategoryID` 162") && Has(doc, "HasItemTotemCategory") &&
+              Has(doc, "nothing the character wields is ever swapped"));
+    Check("the operator's decision is recorded",
+          Has(doc, "keep it in the crafter's own bank, and withdraw it when crafting"));
+    Check("the Hammer goes back to the bank", Has(doc, "`ReturnCraftTools` puts it back"));
+    Check("the Anvil walk is bounded to a town", Has(doc, "`CRAFT_FOCUS_WALK_LIMIT_YARDS` (400"));
     Check("the reagent decision names Green Dye", Has(doc, "Green Dye"));
-    Check("the reagent decision keeps craft reagents out of kind='buy'",
-          Has(doc, "craft reagents stay out of scope for town-trip buying"));
+    Check("Green Dye is bought by the planner's buy rows", Has(doc, "Green Dye joins that table"));
+    Check("the old swap design is gone",
+          !Has(doc, "crash mid-swap") && !Has(doc, "Anvil-gated recipes are OUT OF SCOPE"));
     Check("DriveCraft's comment points at the decisions",
           Has(src, "#524") && Has(src, "Anvil, Hammer and reagent-gated"));
 
