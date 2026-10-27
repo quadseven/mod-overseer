@@ -2948,6 +2948,21 @@ DoorAimHeight DoorAimOnTheFloor(bool haveGround, float groundZ, float arrivalYar
 constexpr std::size_t TRAVEL_AIM_MAX_CHARS = 32;
 std::string TravelAimAtPosition(std::uint32_t mapId, float x, float y, float z);
 
+// HOW MANY CHARACTERS AN AIM IS, AS THE COLUMN COUNTS THEM (wow-overseer#1517).
+// `overseer_roster.travel_npc` is VARCHAR(32) in a UTF-8 table, and VARCHAR
+// counts characters, not bytes. std::string::size() counts bytes, so an aim
+// that names an NPC with an accented or non-Latin name is longer in bytes than
+// the column measures it, and a byte guard refuses an aim MySQL would store.
+// This counts every byte that does not continue a multibyte sequence: each
+// well-formed UTF-8 character is one, a stray continuation byte counts nothing,
+// and an invalid lead byte (0xC0, 0xFF) counts as one. It does not validate;
+// MySQL refuses invalid UTF-8 on write anyway.
+std::size_t Utf8CharCount(std::string const& text);
+
+// Does this aim fit the travel column? The one question every guard on that
+// column asks, in the column's own unit.
+bool TravelAimFitsColumn(std::string const& aim);
+
 // HOW FAR BACK FROM THIS DOOR THE PARTY GATHERS. The staging standoff is
 // measured from the door's centre, and for a sphere it is `standoffYards`
 // exactly as it always was: every sphere row stages on that number today and
@@ -20497,11 +20512,15 @@ CraftToolStep CraftToolStepFor(CraftToolPlace place, bool bankerInReach, bool ma
 char const* CraftToolStepWord(CraftToolStep step);
 
 // IS THE TOOL PUT BACK IN THE BANK NOW? Only a tool in the bags (never one that
-// is worn), only when no standing craft errand still needs it, only with a
-// banker in reach and the character able to bank (alive, out of combat, not
-// in flight, not trading). Nobody is walked to a banker to put it back: it
-// goes back the next time the character stands at one.
-bool CraftToolGoesBack(bool inBags, bool stillNeeded, bool bankerInReach, bool able);
+// is worn), only for a member a planned recipe has needed it for (a craft
+// errand of theirs named a recipe that needs the tool, wow-overseer#1515),
+// only when no standing craft errand still needs it, only with a banker in
+// reach and the character able to bank (alive, out of combat, not in flight,
+// not trading). Nobody is walked to a banker to put it back: it goes back the
+// next time the character stands at one. A tool no planned recipe needed is
+// not the craft drive's: the planner skips every Anvil recipe today, and an
+// engineer's hammer is not banked out from under the next errand.
+bool CraftToolGoesBack(bool inBags, bool planned, bool stillNeeded, bool bankerInReach, bool able);
 
 // A WORLD SPAWN OF A SPELL FOCUS, as the adapter reads it out of the
 // gameobject spawn table.
