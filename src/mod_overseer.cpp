@@ -448,6 +448,9 @@ constexpr uint32 FISH_POLL_MS = 20000;
 // have zeroed, and a character at the wrong level or without the spell should
 // not wait longer than a minute for the planner to have corrected the row.
 constexpr uint32 LOCKPICK_POLL_MS = 20000;
+// How often a standing buy_recipe_item errand is polled (#1098). A use is a
+// 3000ms cast, so the next poll is long enough after it to read HasSpell back.
+constexpr uint32 RECIPE_MANUAL_POLL_MS = 20000;
 
 // How often a character sent to an NPC is pointed at it again (infra#2783).
 // RPG_WANDER_NPC self-expires to IDLE after statusWanderNpcDuration, which is
@@ -8256,6 +8259,7 @@ public:
         _craftTimer += diff;
         _fishTimer += diff;
         _lockpickTimer += diff;
+        _recipeManualTimer += diff;
         _travelTimer += diff;
         _professionTimer += diff;
         _gearTimer += diff;
@@ -8433,6 +8437,11 @@ public:
         {
             _lockpickTimer = 0;
             DriveLockpick();
+        }
+        if (_recipeManualTimer >= RECIPE_MANUAL_POLL_MS)
+        {
+            _recipeManualTimer = 0;
+            DriveRecipeManuals();
         }
         // BEFORE DriveTravel, so a staging aim this poll writes onto the
         // leader's travel_npc is picked up by DriveTravel the SAME tick
@@ -17234,6 +17243,313 @@ private:
             // The errand stands: the chest is spent this respawn, the attempt
             // failed, or the skill did not rise; the next poll picks the nearest
             // live lockbox and tries again.
+        }
+    }
+
+    // ------------------------ a recipe manual bought from a vendor (#1098) --
+    //
+    // Some secondary-trade recipes are taught by a manual a vendor sells, not
+    // by a trainer, so TrainOnArrival never reaches them. The roster names the
+    // manual and the vendor in `buy_recipe_item` ("<item>:<vendor>"), and
+    // OverseerDecisions::PlanRecipeManual decides each poll. The trusted calls
+    // are this module's own verbs: DoBuy for the purchase (the core's
+    // BuyItemFromVendorSlot, read back from the bags and the purse) and
+    // DoLearnRecipe for the use (the core's CMSG_USE_ITEM handler, with the
+    // character held still for the 3000ms cast). The proof is HasSpell on a
+    // later poll, the read-back TrainOnArrival makes after TeachSpell.
+
+    // The id handed to MovePoint for the last yards to the vendor. Read by
+    // nobody, for the reason SUMMON_APPROACH_POINT_ID gives.
+    static constexpr uint32 RECIPE_MANUAL_APPROACH_POINT_ID = 0;
+
+    // How long the hold tolerates that step, in seconds.
+    static constexpr uint32 RECIPE_MANUAL_APPROACH_SECONDS = 20;
+
+    // What this worldserver has done for one errand. The column says what is
+    // wanted; this says what has been tried and paid, which the proof line
+    // and the bound on uses read. Lost on a restart, which costs at most one
+    // more use of a manual already carried.
+    struct RecipeManualProgress
+    {
+        uint32 usesTried = 0;
+        uint64 paidCopper = 0;
+        bool bought = false;
+        bool walkSaid = false;
+    };
+
+    // Bounded by the roster: an entry lives only while its name has a
+    // standing buy_recipe_item. ReleaseRecipeManual erases it on every
+    // release this drive makes, and DriveRecipeManuals prunes, at the top of
+    // every poll, any name whose column was cleared from outside (the site,
+    // an operator, a disabled row), so no entry outlives its errand.
+    std::map<std::string, RecipeManualProgress> _recipeManuals;
+
+    // Every enabled character with a standing errand, name -> column. Read on
+    // its own: a worldserver whose db-import has not added the column gets no
+    // result and this drive does nothing.
+    std::map<std::string, std::string> LoadRecipeManualErrands()
+    {
+        std::map<std::string, std::string> errands;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT name, buy_recipe_item FROM overseer_roster "
+            "WHERE enabled = 1 AND buy_recipe_item <> ''");
+        if (!result)
+            return errands;
+        do
+        {
+            Field* fields = result->Fetch();
+            errands[fields[0].Get<std::string>()] = fields[1].Get<std::string>();
+        } while (result->NextRow());
+        return errands;
+    }
+
+    void ReleaseRecipeManual(std::string const& name)
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_roster SET buy_recipe_item = '' WHERE name = '{}'", Esc(name));
+        _recipeManuals.erase(name);
+    }
+
+    void RefuseRecipeManual(std::string const& name, std::string const& column,
+                            std::string const& why)
+    {
+        LOG_WARN("module.overseer",
+                 "overseer: '{}' cannot get the recipe manual '{}' it was sent for: {}. "
+                 "Releasing the buy_recipe_item errand rather than asking again every poll",
+                 name, column, why);
+        ReleaseRecipeManual(name);
+    }
+
+    bool LearnPendingFor(std::string const& name) const
+    {
+        for (LearnCheck const& check : _pendingLearns)
+            if (check.targetName == name)
+                return true;
+        return false;
+    }
+
+    // The vendor's price for one of the item, priced as DoBuy and the core
+    // price it: BuyPrice, then floor() of the reputation discount. False when
+    // its list does not carry the item for gold.
+    static bool VendorSellsForGold(Player* bot, Creature* vendor, ItemTemplate const* proto,
+                                   uint64& price)
+    {
+        price = 0;
+        VendorItemData const* items = vendor->GetVendorItems();
+        if (!items || !proto)
+            return false;
+        for (uint32 i = 0; i < items->GetItemCount(); ++i)
+        {
+            VendorItem const* line = items->GetItem(i);
+            if (!line || line->item != proto->ItemId)
+                continue;
+            if (line->ExtendedCost)
+                return false;
+            price = uint64(std::floor(uint32(proto->BuyPrice) *
+                                      bot->GetReputationPriceDiscount(vendor)));
+            return true;
+        }
+        return false;
+    }
+
+    OverseerDecisions::RecipeManualFacts ReadRecipeManualFacts(
+        Player* bot, std::string const& name, Creature* vendor, ItemTemplate const* proto,
+        uint32 recipe, uint32 itemEntry)
+    {
+        OverseerDecisions::RecipeManualFacts facts;
+        facts.teachesRecipe = recipe != 0;
+        facts.knowsRecipe = bot->HasSpell(recipe);
+        facts.learning = LearnPendingFor(name) || bot->IsNonMeleeSpellCast(false);
+        facts.carriesManual = bot->GetItemCount(itemEntry, false) > 0;
+        facts.usesTried = _recipeManuals[name].usesTried;
+        facts.vendorNearby = vendor && vendor->IsAlive();
+        facts.vendorInReach = facts.vendorNearby &&
+            bot->GetNPCIfCanInteractWith(vendor->GetGUID(), UNIT_NPC_FLAG_VENDOR);
+        facts.vendorSells = facts.vendorInReach && VendorSellsForGold(bot, vendor, proto, facts.price);
+        facts.purse = bot->GetMoney();
+        return facts;
+    }
+
+    // The walk, through the travel aim book like every other module walk, so
+    // a guard, a run or the bridge's own errand in the column is not written
+    // over. A refused claim leaves the errand standing; Claim says why once.
+    void WalkToManualVendor(std::string const& name,
+                            OverseerDecisions::RecipeManualErrand const& errand)
+    {
+        if (!_travelAims.Claim(name, std::to_string(errand.vendorEntry),
+                               OverseerDecisions::TravelOwner::TownTrip))
+            return;
+        RecipeManualProgress& progress = _recipeManuals[name];
+        if (progress.walkSaid)
+            return;
+        progress.walkSaid = true;
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is walked to vendor creature {} to buy recipe manual item {}",
+                 name, errand.vendorEntry, errand.itemEntry);
+    }
+
+    // The last yards: the arrival radius is wider than the interact gate the
+    // core sells through. One grounded step per poll, as DriveLockpick takes.
+    static void ApproachManualVendor(Player* bot, std::string const& name, Creature* vendor)
+    {
+        WorldPosition const want(vendor->GetMapId(), vendor->GetPositionX(),
+                                 vendor->GetPositionY(), vendor->GetPositionZ());
+        WorldPosition step;
+        if (!GroundedStep(bot, want, step))
+            return;
+        bot->GetMotionMaster()->MovePoint(RECIPE_MANUAL_APPROACH_POINT_ID, step.GetPositionX(),
+                                          step.GetPositionY(), step.GetPositionZ());
+        LetHeldCharacterWalk(name, RECIPE_MANUAL_APPROACH_SECONDS);
+    }
+
+    // One manual through the buy verb, capped at the price the plan judged so
+    // the verb refuses a sale the plan did not agree to. True when the bags
+    // gained it. A refusal the errand cannot outwait releases it; any other
+    // stands for the next poll.
+    bool BuyRecipeManual(Player* bot, std::string const& name, std::string const& column,
+                         OverseerDecisions::RecipeManualErrand const& errand, uint64 price)
+    {
+        std::string const buy = "entry:" + std::to_string(errand.itemEntry) +
+                                " count:1 max:" + std::to_string(price);
+        char const* status = "";
+        std::string out;
+        uint64 const purseBefore = bot->GetMoney();
+        std::string const detail = DoBuy(bot, buy, status, out);
+        if (detail.empty())
+        {
+            RecipeManualProgress& progress = _recipeManuals[name];
+            progress.bought = true;
+            progress.paidCopper = purseBefore > bot->GetMoney() ? purseBefore - bot->GetMoney() : 0;
+            return true;
+        }
+        if (OverseerDecisions::ManualBuyRefusalReleases(detail))
+        {
+            RefuseRecipeManual(name, column, detail);
+            return false;
+        }
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' could not buy recipe manual item {} this poll: {}. The "
+                 "errand stands for the next poll", name, errand.itemEntry, detail);
+        return false;
+    }
+
+    // One use through the learn verb. Id 0 because a drive's use has no
+    // overseer_command row: the verdict ResolveLearnChecks writes matches
+    // none, and this drive reads HasSpell back itself on its next poll.
+    void UseRecipeManual(Player* bot, std::string const& name, std::string const& column,
+                         uint32 itemEntry)
+    {
+        std::string const use = "use entry:" + std::to_string(itemEntry);
+        char const* status = "";
+        std::string out;
+        std::string const detail = DoLearnRecipe(bot, use, status, out, _pendingLearns, 0);
+        if (detail.empty())
+        {
+            ++_recipeManuals[name].usesTried;
+            return;
+        }
+        if (OverseerDecisions::ManualUseRefusalReleases(detail))
+        {
+            RefuseRecipeManual(name, column, detail);
+            return;
+        }
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' could not use recipe manual item {} this poll: {}. The "
+                 "errand stands for the next poll", name, itemEntry, detail);
+    }
+
+    // The recipe reads back as known. The proof line is written only for a
+    // manual this errand bought; one already carried, or a recipe already
+    // known, says so in a line of its own.
+    void FinishRecipeManual(Player* bot, std::string const& name,
+                            OverseerDecisions::RecipeManualErrand const& errand,
+                            ItemTemplate const* proto, uint32 recipe)
+    {
+        RecipeManualProgress const progress = _recipeManuals[name];
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(recipe);
+        std::string const recipeName =
+            info ? std::string(info->SpellName[LOCALE_enUS]) : std::string();
+        if (progress.bought)
+        {
+            LOG_INFO("module.overseer", "{}",
+                     OverseerDecisions::ManualPurchaseLine(
+                         name, errand.itemEntry, proto ? proto->Name1 : std::string(),
+                         errand.vendorEntry, recipe, recipeName, progress.paidCopper));
+            RecordEvent(bot, "learn", recipe, recipeName,
+                        "bought this recipe's manual from a vendor and used it from the bags");
+        }
+        else if (progress.usesTried)
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' learned recipe '{}' ({}) from manual item {} it already "
+                     "carried; nothing was bought", name, recipeName, recipe, errand.itemEntry);
+            RecordEvent(bot, "learn", recipe, recipeName,
+                        "used this recipe's manual from the bags");
+        }
+        else
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' already knows recipe '{}' ({}) that manual item {} "
+                     "teaches; nothing was bought", name, recipeName, recipe, errand.itemEntry);
+        ReleaseRecipeManual(name);
+    }
+
+    // One poll of one character's errand.
+    void DriveRecipeManual(Player* bot, std::string const& name, std::string const& column)
+    {
+        OverseerDecisions::RecipeManualErrand errand;
+        if (!OverseerDecisions::ParseRecipeManualErrand(column, errand))
+        {
+            RefuseRecipeManual(name, column, OverseerDecisions::RecipeManualRefusal::Malformed);
+            return;
+        }
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(errand.itemEntry);
+        uint32 useSpell = 0;
+        uint32 const recipe = RecipeTaughtByItem(proto, useSpell);
+        Creature* vendor = bot->FindNearestCreature(errand.vendorEntry, TRAVEL_ARRIVED_YARDS);
+        OverseerDecisions::RecipeManualFacts const facts =
+            ReadRecipeManualFacts(bot, name, vendor, proto, recipe, errand.itemEntry);
+
+        OverseerDecisions::RecipeManualPlan const plan = OverseerDecisions::PlanRecipeManual(facts);
+        switch (plan.step)
+        {
+            case OverseerDecisions::RecipeManualStep::Learned:
+                FinishRecipeManual(bot, name, errand, proto, recipe);
+                return;
+            case OverseerDecisions::RecipeManualStep::Refuse:
+                RefuseRecipeManual(name, column, plan.refusal);
+                return;
+            case OverseerDecisions::RecipeManualStep::Wait:
+                return;
+            case OverseerDecisions::RecipeManualStep::Walk:
+                WalkToManualVendor(name, errand);
+                return;
+            case OverseerDecisions::RecipeManualStep::Approach:
+                ApproachManualVendor(bot, name, vendor);
+                return;
+            case OverseerDecisions::RecipeManualStep::Buy:
+                // Used in the same poll it is bought, so a walk-away between
+                // the two cannot leave a paid manual sitting in the bags.
+                if (BuyRecipeManual(bot, name, column, errand, facts.price))
+                    UseRecipeManual(bot, name, column, errand.itemEntry);
+                return;
+            case OverseerDecisions::RecipeManualStep::Use:
+                UseRecipeManual(bot, name, column, errand.itemEntry);
+                return;
+        }
+    }
+
+    void DriveRecipeManuals()
+    {
+        std::map<std::string, std::string> const errands = LoadRecipeManualErrands();
+        // Progress for a column cleared from outside goes with it.
+        for (auto it = _recipeManuals.begin(); it != _recipeManuals.end();)
+            it = errands.count(it->first) ? std::next(it) : _recipeManuals.erase(it);
+        for (auto const& [name, column] : errands)
+        {
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            if (!bot || !bot->IsInWorld() || InDungeonRun(bot))
+                continue;
+            DriveRecipeManual(bot, name, column);
         }
     }
 
@@ -49252,6 +49568,8 @@ private:
         // -- inside (#640) --
         // What the timeline counts, for the whole order.
         unsigned wipes{0};
+        time_t lastWipeAt{0};       // epoch seconds of the most recent wipe
+        uint32_t lastWipeMap{0};    // the map it wiped on, for the same-place test
         unsigned released{0};
         unsigned regroups{0};
         unsigned skips{0};
@@ -50370,6 +50688,10 @@ private:
                     if (!member || !member->IsInWorld())
                         continue;
                     ++facts.inWorld;
+                    // A party member still carrying Resurrection Sickness holds
+                    // the run-back after a wipe (#1165).
+                    if (member->HasAura(15007))
+                        facts.membersSick = true;
                     // A GHOST WALKING BACK (#640), timed per ghost from when the
                     // run first saw it released; the window is
                     // RaidGhostMayBeWalked's.
@@ -50643,11 +50965,29 @@ private:
                 continue;
             }
 
+            OverseerDecisions::RaidWipeFacts(facts, run.wipes, run.lastWipeAt, run.lastWipeMap,
+                                             door ? door->insideMapId : 0,
+                                             std::time(nullptr));
+            if (door)
+            {
+                if (head && head->IsInWorld())
+                {
+                    GraveyardStruct const* grave =
+                        sGraveyard->GetClosestGraveyard(head, head->GetTeamId());
+                    facts.graveyard = grave ? grave->name : std::string();
+                }
+            }
+
             OverseerDecisions::RaidRunStep const step =
                 OverseerDecisions::StepRaidRun(run.phase, facts);
 
             if (step.release)
             {
+                // An attempt ended by a wipe (#1165) still has its corpses
+                // inside, and ReleaseRaidRun keeps the raid while anybody is:
+                // they are released first, or the run would never let go.
+                if (step.releaseDead && door && group && group->isRaidGroup())
+                    run.released += ReleaseRaidDead(group, door);
                 if (ReleaseRaidRun(roster.family, run, door))
                 {
                     LOG_INFO("module.overseer",
@@ -50681,15 +51021,17 @@ private:
                          OverseerDecisions::RaidRunPhaseName(step.phase), step.why,
                          facts.inWorld, facts.assembled, facts.inside, facts.insideAlive,
                          uint32(seats.size()));
-                if (step.phase == RaidRunPhase::Recover && OverseerDecisions::RaidWiped(facts))
+                if (OverseerDecisions::RaidRunCountsWipe(run.phase, step, facts))
                 {
                     ++run.wipes;
+                    run.lastWipeAt = std::time(nullptr);
+                    run.lastWipeMap = door ? door->insideMapId : 0;
                     LOG_WARN("module.overseer",
                              "overseer: raid run for family '{}' WIPED in {} ({} dead and {} "
-                             "alive inside) - wipe {}; the dead are released and run back, "
-                             "and the order stands",
+                             "alive inside) - wipe {} at the '{}' graveyard; the dead are "
+                             "released and run back, and the order stands",
                              roster.family, door ? door->name : "?", facts.insideDead,
-                             facts.insideAlive, run.wipes);
+                             facts.insideAlive, run.wipes, facts.graveyard);
                 }
                 run.phase = step.phase;
                 run.phaseSince = std::time(nullptr);
@@ -78881,6 +79223,7 @@ private:
     uint32 _craftTimer = 0;
     uint32 _fishTimer = 0;
     uint32 _lockpickTimer = 0;
+    uint32 _recipeManualTimer = 0;
     // WHEN A DEAD CHARACTER WAS FIRST SEEN STILL WAITING TO RELEASE, by name.
     //
     // There is no ghost clock for this state - a corpse, and therefore a ghost
