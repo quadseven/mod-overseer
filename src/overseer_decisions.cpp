@@ -2092,6 +2092,28 @@ bool TravelAimFitsColumn(std::string const& aim)
     return Utf8CharCount(aim) <= TRAVEL_AIM_MAX_CHARS;
 }
 
+std::string FitEndedReasonColumn(std::string const& reason)
+{
+    if (Utf8CharCount(reason) <= DUNGEON_RUN_ENDED_REASON_CHARS)
+        return reason;
+    static char const mark[] = "...";
+    std::size_t const keep = DUNGEON_RUN_ENDED_REASON_CHARS - (sizeof(mark) - 1);
+    // Walk to the lead byte of character number keep + 1; everything before it
+    // is exactly `keep` whole characters, the way Utf8CharCount counts them.
+    std::size_t seen = 0;
+    std::size_t cut = 0;
+    for (; cut < reason.size(); ++cut)
+    {
+        if ((static_cast<unsigned char>(reason[cut]) & 0xC0u) != 0x80u)
+        {
+            if (seen == keep)
+                break;
+            ++seen;
+        }
+    }
+    return reason.substr(0, cut) + mark;
+}
+
 DoorAimHeight DoorAimOnTheFloor(float triggerZ, bool haveGround, float groundZ,
                                 float arrivalYards, float triggerRadiusYards)
 {

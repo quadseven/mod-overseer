@@ -2590,6 +2590,12 @@ constexpr uint32 LOOT_COUNCIL_POLL_MS = 2000;
 // which nothing suffers from. Two minutes is many arming passes.
 constexpr uint32 RUN_COLD_SECONDS = 120;
 
+// The ended_reason a run closed by its cold heartbeat is written with. It goes
+// through FitEndedReasonColumn like every other ended_reason (#1186), so a
+// later edit to the wording cannot overflow the column unnoticed.
+constexpr char HEARTBEAT_COLD_REASON[] =
+    "heartbeat cold - nobody from the roster seen on the map";
+
 // How often the dungeon run coordinator polls (mod-overseer#88, "the party
 // owns the run"). Faster than QUEST_POLL_MS on
 // purpose: the failure this closes is "Bork and Grog reached the tank's
@@ -12969,18 +12975,18 @@ private:
                 CharacterDatabase.Execute(
                     "UPDATE overseer_dungeon_run SET state = 'ended', ended_at = NOW(), "
                     "outcome = 'emptied', "
-                    "ended_reason = 'heartbeat cold - nobody from the roster seen on the "
-                    "map' "
+                    "ended_reason = '{}' "
                     "WHERE id = {} AND state = 'active' "
                     "AND last_progress_at < NOW() - INTERVAL {} SECOND",
+                    Esc(OverseerDecisions::FitEndedReasonColumn(HEARTBEAT_COLD_REASON)),
                     runId, RUN_COLD_SECONDS);
             else
                 CharacterDatabase.Execute(
                     "UPDATE overseer_dungeon_run SET state = 'ended', ended_at = NOW(), "
-                    "ended_reason = 'heartbeat cold - nobody from the roster seen on the "
-                    "map' "
+                    "ended_reason = '{}' "
                     "WHERE id = {} AND state = 'active' "
                     "AND last_progress_at < NOW() - INTERVAL {} SECOND",
+                    Esc(OverseerDecisions::FitEndedReasonColumn(HEARTBEAT_COLD_REASON)),
                     runId, RUN_COLD_SECONDS);
 
             LOG_INFO("module.overseer",
@@ -13393,18 +13399,24 @@ private:
         if (!runId)
             return;
 
+        // The reason is cut to the column before the statement is built
+        // (#1186). In strict mode MySQL refuses an over-long ended_reason and
+        // the whole UPDATE with it, which leaves the run active - the very
+        // thing this function exists to prevent.
+        std::string const fitted = OverseerDecisions::FitEndedReasonColumn(reason);
+
         if (RunAccountingPresent())
             CharacterDatabase.Execute(
                 "UPDATE overseer_dungeon_run SET state = 'ended', ended_at = NOW(), "
                 "outcome = '{}', ended_reason = '{}' WHERE id = {} AND state = 'active'",
-                Esc(outcome), Esc(reason), runId);
+                Esc(outcome), Esc(fitted), runId);
         else
             // No outcome column to write to. The run is still closed, because
             // leaving it open is the thing that actually breaks the next run.
             CharacterDatabase.Execute(
                 "UPDATE overseer_dungeon_run SET state = 'ended', ended_at = NOW(), "
                 "ended_reason = '{}' WHERE id = {} AND state = 'active'",
-                Esc(reason), runId);
+                Esc(fitted), runId);
     }
 
     // A RUN THAT NEVER GOT INSIDE IS STILL AN ATTEMPT, AND AN ATTEMPT NOBODY
@@ -13441,7 +13453,8 @@ private:
             "(leader_name, map_id, state, ended_at, ended_reason, campaign_id, "
             " run_number, outcome, members) "
             "VALUES ('{}', {}, 'ended', NOW(), '{}', {}, {}, '{}', '{}')",
-            Esc(leaderName), mapId, Esc(reason), campaignId, runNumber, outcome,
+            Esc(leaderName), mapId,
+            Esc(OverseerDecisions::FitEndedReasonColumn(reason)), campaignId, runNumber, outcome,
             Esc(members));
     }
 
