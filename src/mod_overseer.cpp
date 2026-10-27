@@ -40589,17 +40589,19 @@ private:
                     _travelAims.Release(leaderName, "the run's dungeon finder recovery");
                     // LOUD ON PURPOSE, EVERY TIME: each of these is the walk and
                     // the summon both having failed, and the count is what tells
-                    // an operator how often that happens.
+                    // an operator how often that happens. The rung's own words,
+                    // from OverseerDecisions::FinderLastResortReason, say whether
+                    // the summon rung actually had its turn this streak or could
+                    // never run at this door.
                     LOG_ERROR("module.overseer",
                               "overseer: DUNGEON FINDER - dungeon campaign {} for family '{}' "
                               "('{}') queues the family for its own dungeon '{}' (map {}) as "
-                              "the LAST RESORT: {} attempts in a row never got inside and the "
-                              "summon rung has had its turn ({} summon recovery(s) this streak; "
-                              "{}). Used {} time(s) today for this family",
+                              "the LAST RESORT: {} attempts in a row never got inside and {}. "
+                              "Used {} time(s) today for this family",
                               coord.campaignId, FamilyOfCoordinator(coord), leaderName,
                               portal.keyword, portal.insideMapId, coord.recoveryAttempt,
-                              OverseerDecisions::SummonsTriedThisStreak(coord.recoveryFacts),
-                              coord.recoveryFacts.summonNote, finderUsesToday);
+                              OverseerDecisions::FinderLastResortReason(coord.recoveryFacts),
+                              finderUsesToday);
                     return;
                 case OverseerDecisions::RunRecovery::RestageNearer:
                 case OverseerDecisions::RunRecovery::WaitForClient:
