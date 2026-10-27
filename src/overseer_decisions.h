@@ -2963,6 +2963,19 @@ std::size_t Utf8CharCount(std::string const& text);
 // column asks, in the column's own unit.
 bool TravelAimFitsColumn(std::string const& aim);
 
+// THE WIDTH OF A DUNGEON RUN'S ended_reason, AND THE CUT THAT RESPECTS IT
+// (#1186). `overseer_dungeon_run.ended_reason` is VARCHAR(200) in a UTF-8
+// table and the realm runs in strict mode, so a longer reason is refused with
+// errno 1406 and the whole UPDATE goes with it: state, ended_at and outcome
+// stay as they were and the run is left active, which is what breaks the next
+// run on that map. A stalled run's reason carries the dungeon module's own stop
+// reason and can run past the column. So every writer passes its reason
+// through this first: 200 characters or fewer come back unchanged; a longer
+// one keeps its start, is cut on a character boundary, and ends in "..." so a
+// reader can tell, the whole within the column counted in characters.
+constexpr std::size_t DUNGEON_RUN_ENDED_REASON_CHARS = 200;
+std::string FitEndedReasonColumn(std::string const& reason);
+
 // HOW FAR BACK FROM THIS DOOR THE PARTY GATHERS. The staging standoff is
 // measured from the door's centre, and for a sphere it is `standoffYards`
 // exactly as it always was: every sphere row stages on that number today and
