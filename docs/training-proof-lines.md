@@ -29,3 +29,26 @@ A named recipe the trainer refused is logged as `was refused recipe <id> by
 '<trainer>' (creature <n>): <word>`, where the word is one of `not_sold`,
 `cannot_teach` or `too_poor`. A sale that went through TeachSpell but left the
 character without the spell is logged as `was not taught`.
+
+## A recipe manual bought from a vendor
+
+A roster row whose `buy_recipe_item` names `<item entry>:<vendor entry>` is
+walked to that vendor, buys the manual, and uses it from the bags. Once
+`HasSpell` reads the recipe back on a later poll, it writes one line:
+
+```
+overseer: manual_purchase member='<name>' item=<id> '<item name>' vendor=<entry> spell=<id> '<spell name>' paid_copper=<n>
+```
+
+The shape is pinned by `tests/test_buy_recipe_manual.cpp`. The purchase also
+writes an `overseer_event` row of kind `learn`. A recipe the character already
+knew, or learned from a manual it already carried, gets a line of its own
+saying nothing was bought.
+
+A refusal is logged as `cannot get the recipe manual '<column>' it was sent for:
+<reason>`, and the column is cleared. The module writes these reasons: `the
+vendor does not sell the manual`, `the character cannot afford the manual`, `the
+item teaches no recipe when it is used`, `the manual was used and the recipe is
+still not known`, and a malformed column. A refusal from the buy or learn verb
+is passed on in its own words. Full bags, an out-of-stock vendor, or a character
+that is moving or fighting leave the errand standing for the next poll.
