@@ -6202,6 +6202,9 @@ public:
         // flag it would be re-asked, and re-queried, on every poll of an errand
         // that has already been told there is nothing to find.
         bool routePlanned{false};
+        // The walker's count of deaths on a planned leg when this route was
+        // planned (#502): a newer death plans the errand's route again.
+        std::uint32_t routePlannedAtDeaths{0};
         // WHETHER THAT ROUTE WAS MEASURED OR SURVEYED (#344), which decides two
         // things RouteLeg would otherwise get wrong: whether the minimum route
         // length may throw it away in the last yards, and whether the aim may
@@ -21575,7 +21578,19 @@ private:
         // This death has been read already; cleared once the walker lives.
         bool deathNoted{false};
         std::vector<OverseerDecisions::DiedOnLeg> died;
+        // How many deaths on a planned leg have been remembered for this
+        // walker. An errand's route records it when planned, and a route
+        // planned before a newer death is planned again (PlanRouteOnce), so an
+        // errand to a fixed place is not walked down the old route.
+        std::uint32_t deathsOnLegs{0};
     };
+
+    // The walker's count of remembered deaths on a leg; 0 if never routed.
+    static std::uint32_t DeathsOnLegsOf(std::string const& name)
+    {
+        auto const it = DiedOnLegBook().find(name);
+        return it == DiedOnLegBook().end() ? 0 : it->second.deathsOnLegs;
+    }
 
     static std::map<std::string, DiedOnLegMemory>& DiedOnLegBook()
     {
@@ -21623,6 +21638,10 @@ private:
             std::vector<OverseerDecisions::RouteLegSpan> const on =
                 OverseerDecisions::LegsOfDeath(memory.legs, memory.points, x, y,
                                                DIED_ON_LEG_LIMITS);
+            // A death on the route plans every errand of this walker again once
+            // it lives, whether or not its aim moves (PlanErrandRouteAgain).
+            if (!on.empty())
+                ++memory.deathsOnLegs;
             for (OverseerDecisions::RouteLegSpan const& leg : on)
             {
                 OverseerDecisions::RememberDiedOnLeg(memory.died, leg.from, leg.to, now,
@@ -22946,9 +22965,24 @@ private:
                               TravelAimBook::TravelState& state, std::string const& name,
                               std::string const& target)
     {
-        if (state.routePlanned)
+        // AND AGAIN AFTER A DEATH ON THE ROUTE (#502). A catch-up walk's aim
+        // moves with its leader and is planned anew, but an errand to a fixed
+        // place keeps its aim through the death; without this it walks the
+        // planned route again, down the leg that killed it, and the price on
+        // that leg is never asked. Planned again from where the walker stands
+        // once it lives, never while it is a ghost.
+        std::uint32_t const deaths = DeathsOnLegsOf(bot->GetName());
+        if (!OverseerDecisions::PlanErrandRouteAgain(state.routePlanned,
+                                                     state.routePlannedAtDeaths, deaths,
+                                                     bot->IsAlive()))
             return;
+        if (state.routePlanned)
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' died on the route to '{}' it was planned - the "
+                     "errand's route is planned again from where it stands (#502)",
+                     name, target);
         state.routePlanned = true;
+        state.routePlannedAtDeaths = deaths;
         state.route = PlanRoute(bot, want, name, target, state.routeIsMeasured,
                                 state.routeJoinsCorridor);
         state.routeCursor = OverseerDecisions::RouteCursor{};

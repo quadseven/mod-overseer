@@ -11618,6 +11618,14 @@ std::uint32_t DiedOnLegsOnPlan(std::vector<std::uint32_t> const& nodes,
     return count;
 }
 
+bool PlanErrandRouteAgain(bool planned, std::uint32_t plannedAtDeaths,
+                          std::uint32_t deathsNow, bool alive)
+{
+    if (!planned)
+        return true;
+    return alive && plannedAtDeaths != deathsNow;
+}
+
 FlightLoanStep ReadFlightLoan(bool lent, bool sawFlying, bool inFlight, time_t since,
                               time_t now, time_t boardLimit)
 {

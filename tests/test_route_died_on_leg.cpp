@@ -23,6 +23,7 @@ using OverseerDecisions::DiedOnLeg;
 using OverseerDecisions::DiedOnLegLimits;
 using OverseerDecisions::DiedOnLegsOnPlan;
 using OverseerDecisions::LegsOfDeath;
+using OverseerDecisions::PlanErrandRouteAgain;
 using OverseerDecisions::PlanFootRoute;
 using OverseerDecisions::PriceDiedOnLegs;
 using OverseerDecisions::RememberDiedOnLeg;
@@ -278,6 +279,52 @@ void NonsenseLimitsChangeNothing()
     Check("a refused link stays refused", refused[2].yards < 0.f, true);
 }
 
+// THE FIXED ERRAND (#502). An errand to a trainer, a vendor or a mailbox keeps
+// its aim through a death, so nothing re-planned its route: the walker was
+// released down the same route, and the price on the died-on leg was never
+// asked. A plan records the walker's count of remembered deaths, and a newer
+// death plans it again once the walker lives.
+void AFixedErrandIsPlannedAgainAfterADeath()
+{
+    Check("a route never planned is planned", PlanErrandRouteAgain(false, 0, 0, true), true);
+    Check("and is planned even for a ghost (today's rule)",
+          PlanErrandRouteAgain(false, 0, 1, false), true);
+    Check("a planned route with no newer death is kept", PlanErrandRouteAgain(true, 0, 0, true),
+          false);
+    Check("a planned route with a newer death is kept while the walker is dead",
+          PlanErrandRouteAgain(true, 0, 1, false), false);
+    Check("and planned again once it lives", PlanErrandRouteAgain(true, 0, 1, true), true);
+    Check("a route planned after that death is kept", PlanErrandRouteAgain(true, 1, 1, true),
+          false);
+
+    // The whole sequence for an errand whose aim (node 20) never moves.
+    std::vector<RouteLink> links = Links(true);
+    std::uint32_t deaths = 0;
+    std::uint32_t plannedAt = deaths;
+    RoutePlan plan = FromNode199(links);
+    Check("fixed errand: first plan walks node 3487", Walks(plan, 3487), true);
+
+    std::vector<RouteLegSpan> legs;
+    std::vector<RoutePoint> points;
+    Route(legs, points);
+    std::vector<DiedOnLeg> died;
+    for (RouteLegSpan const& leg : LegsOfDeath(legs, points, 987.f, 5.f, DiedOnLegLimits{}))
+        RememberDiedOnLeg(died, leg.from, leg.to, NOW, DiedOnLegLimits{});
+    ++deaths;
+
+    Check("fixed errand: dead, the route is not re-planned",
+          PlanErrandRouteAgain(true, plannedAt, deaths, false), false);
+    Check("fixed errand: revived, the route is re-planned",
+          PlanErrandRouteAgain(true, plannedAt, deaths, true), true);
+    std::vector<RouteLink> priced = links;
+    PriceDiedOnLegs(priced, died, NOW + 60, DiedOnLegLimits{});
+    plan = FromNode199(priced);
+    plannedAt = deaths;
+    Check("fixed errand: the re-plan goes round node 3487", Walks(plan, 3487), false);
+    Check("fixed errand: and is then kept", PlanErrandRouteAgain(true, plannedAt, deaths, true),
+          false);
+}
+
 }  // namespace
 
 int main()
@@ -289,6 +336,7 @@ int main()
     ItIsForgottenAfterTheHold();
     WithNoWayRoundItStillWalksAndSaysSo();
     NonsenseLimitsChangeNothing();
+    AFixedErrandIsPlannedAgainAfterADeath();
     if (failures)
     {
         std::printf("%d of %d checks failed\n", failures, checks);

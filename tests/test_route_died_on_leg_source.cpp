@@ -56,6 +56,25 @@ int main()
     if (note.find("!memory.plannedAlive") == std::string::npos)
         return Fail("a route planned for a ghost must not be blamed for its death");
 
+    if (note.find("++memory.deathsOnLegs;") == std::string::npos)
+        return Fail("a death on a planned leg must be counted, so errands plan again");
+
+    // An errand to a fixed place keeps its aim through a death: its route must
+    // be planned again once the walker lives, or the price is never asked.
+    std::string const once = Between(text, "static void PlanRouteOnce(",
+                                     "THE ROAD A LONG ERRAND TO A PLACE WAS PLANNED ALONG");
+    if (once.empty())
+        return Fail("cannot find PlanRouteOnce");
+    if (once.find("DeathsOnLegsOf(bot->GetName())") == std::string::npos ||
+        once.find("OverseerDecisions::PlanErrandRouteAgain(state.routePlanned,") ==
+            std::string::npos ||
+        once.find("bot->IsAlive()") == std::string::npos)
+        return Fail("PlanRouteOnce must plan a route again after a death on it, once alive");
+    if (once.find("state.routePlannedAtDeaths = deaths;") == std::string::npos)
+        return Fail("PlanRouteOnce must record the death count its plan was made at");
+    if (once.find("if (state.routePlanned)\n            return;") != std::string::npos)
+        return Fail("PlanRouteOnce must not keep a planned route whatever happened since");
+
     std::string const drive = Between(text, "void DriveTravel()", "SweepLeftoverAims() ||");
     if (drive.find("NoteDeathsOnRoutes();") == std::string::npos)
         return Fail("DriveTravel must read deaths first, before any errand is looked at");

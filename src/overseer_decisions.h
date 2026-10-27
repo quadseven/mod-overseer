@@ -13880,6 +13880,19 @@ std::uint32_t PriceDiedOnLegs(std::vector<RouteLink>& links, std::vector<DiedOnL
 std::uint32_t DiedOnLegsOnPlan(std::vector<std::uint32_t> const& nodes,
                                std::vector<DiedOnLeg> const& died, std::time_t now);
 
+// WHETHER AN ERRAND'S ROUTE IS PLANNED AGAIN AFTER A DEATH ON IT (#502). A
+// route is planned once per errand and kept until the aim changes. A catch-up
+// walk rewrites its aim with the leader's position, so it gets a new plan, and
+// the new plan prices the died-on leg; an errand to a fixed place (a trainer, a
+// vendor, a mailbox) keeps its aim through the death and would walk the old
+// route again, down the leg that killed it. So each plan records how many
+// deaths its walker had had remembered (`plannedAtDeaths`), and a plan made
+// before a newer one (`deathsNow`) is made again: but only once the walker is
+// alive, because a ghost's route ends at its corpse and is not the errand's.
+// True also for a route never planned, which is today's rule.
+bool PlanErrandRouteAgain(bool planned, std::uint32_t plannedAtDeaths,
+                          std::uint32_t deathsNow, bool alive);
+
 // ------------------ a staging walk that is measured rather than routed (#342) --
 //
 // THE ROUTE PLANNER ABOVE IS RIGHT ABOUT ITS GRAPH AND WRONG ABOUT THE WORLD,
