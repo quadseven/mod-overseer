@@ -17277,6 +17277,11 @@ private:
         bool walkSaid = false;
     };
 
+    // Bounded by the roster: an entry lives only while its name has a
+    // standing buy_recipe_item. ReleaseRecipeManual erases it on every
+    // release this drive makes, and DriveRecipeManuals prunes, at the top of
+    // every poll, any name whose column was cleared from outside (the site,
+    // an operator, a disabled row), so no entry outlives its errand.
     std::map<std::string, RecipeManualProgress> _recipeManuals;
 
     // Every enabled character with a standing errand, name -> column. Read on

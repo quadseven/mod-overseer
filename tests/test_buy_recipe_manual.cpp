@@ -16,6 +16,7 @@
 
 #include "overseer_decisions.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -54,6 +55,18 @@ std::string Source()
     std::stringstream ss;
     ss << in.rdbuf();
     return ss.str();
+}
+
+// The body of the module's buy verb, DoBuy, from its signature to the closing
+// brace at member indent. Empty when the signature is not found.
+std::string DoBuyBody()
+{
+    std::string const source = Source();
+    std::size_t const start = source.find("static char const* DoBuy(Player* buyer,");
+    if (start == std::string::npos)
+        return std::string();
+    std::size_t const end = source.find("\n    }\n", start);
+    return source.substr(start, end == std::string::npos ? std::string::npos : end - start);
 }
 
 // A character standing at a vendor that sells the manual, with the money for
@@ -186,20 +199,36 @@ int main()
     }
 
     // ---- which verb refusals release the errand -------------------------
-    Check("a vendor that does not stock the item releases",
-          ManualBuyRefusalReleases("vendor does not stock the item"));
-    Check("a purse the core finds short releases",
-          ManualBuyRefusalReleases("cannot afford the purchase"));
-    Check("a price over the cap the drive set releases",
-          ManualBuyRefusalReleases("price exceeds the cap the row set"));
-    Check("an item for the other faction releases",
-          ManualBuyRefusalReleases("item is for the other faction"));
-    Check("full bags stand for the next poll",
-          !ManualBuyRefusalReleases("bags cannot take the item"));
-    Check("a vendor out of range stands, so the walk can close it",
-          !ManualBuyRefusalReleases("vendor not in range"));
-    Check("a limited vendor out of stock stands until it restocks",
-          !ManualBuyRefusalReleases("vendor is out of stock"));
+    // Each detail below is fed to the release table AND looked up as a
+    // refuse("...") inside DoBuy itself, so a test detail the real buy verb
+    // never says (or a verb whose words drift from the table) fails here
+    // rather than passing against a phantom.
+    struct BuyRefusalRow
+    {
+        char const* what;
+        char const* detail;
+        bool releases;
+    };
+    BuyRefusalRow const buyRefusals[] = {
+        {"a vendor that does not stock the item releases", "vendor does not stock the item", true},
+        {"a purse the core finds short releases", "cannot afford the purchase", true},
+        {"a price over the cap the drive set releases", "price exceeds the cap the row set", true},
+        {"an item for the other faction releases", "item is for the other faction", true},
+        {"full bags stand for the next poll", "bags cannot take the item", false},
+        {"a vendor out of range stands, so the walk can close it", "vendor not in range", false},
+        {"a limited vendor out of stock stands until it restocks", "vendor is out of stock", false},
+    };
+    std::string const doBuy = DoBuyBody();
+    Check("DoBuy is found in the module source", !doBuy.empty());
+    for (BuyRefusalRow const& row : buyRefusals)
+    {
+        Check(row.what, ManualBuyRefusalReleases(row.detail) == row.releases);
+        if (doBuy.find(std::string("refuse(\"") + row.detail + "\"") == std::string::npos)
+        {
+            std::printf("FAIL DoBuy never refuses with '%s'\n", row.detail);
+            ++failures;
+        }
+    }
     Check("a skill too low to use the manual releases",
           ManualUseRefusalReleases(OverseerDecisions::LearnRefusal::SkillTooLow));
     Check("a manual already known releases",
@@ -236,6 +265,14 @@ int main()
           source.find("facts.knowsRecipe = bot->HasSpell(recipe);") != std::string::npos);
     Check("a refusal clears the column",
           source.find("SET buy_recipe_item = ''") != std::string::npos);
+    Check("the release escapes the roster name in its UPDATE",
+          source.find("\"UPDATE overseer_roster SET buy_recipe_item = '' WHERE name = '{}'\", "
+                      "Esc(name));") != std::string::npos);
+    Check("a release drops the errand's progress with the column",
+          source.find("Esc(name));\n        _recipeManuals.erase(name);") != std::string::npos);
+    Check("progress for a column cleared from outside is pruned every poll",
+          source.find("it = errands.count(it->first) ? std::next(it) : _recipeManuals.erase(it);") !=
+              std::string::npos);
     Check("the drive is polled",
           source.find("DriveRecipeManuals();") != std::string::npos);
 
