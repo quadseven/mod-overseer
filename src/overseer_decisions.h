@@ -2948,6 +2948,34 @@ DoorAimHeight DoorAimOnTheFloor(bool haveGround, float groundZ, float arrivalYar
 constexpr std::size_t TRAVEL_AIM_MAX_CHARS = 32;
 std::string TravelAimAtPosition(std::uint32_t mapId, float x, float y, float z);
 
+// HOW MANY CHARACTERS AN AIM IS, AS THE COLUMN COUNTS THEM (wow-overseer#1517).
+// `overseer_roster.travel_npc` is VARCHAR(32) in a UTF-8 table, and VARCHAR
+// counts characters, not bytes. std::string::size() counts bytes, so an aim
+// that names an NPC with an accented or non-Latin name is longer in bytes than
+// the column measures it, and a byte guard refuses an aim MySQL would store.
+// This counts every byte that does not continue a multibyte sequence: each
+// well-formed UTF-8 character is one, a stray continuation byte counts nothing,
+// and an invalid lead byte (0xC0, 0xFF) counts as one. It does not validate;
+// MySQL refuses invalid UTF-8 on write anyway.
+std::size_t Utf8CharCount(std::string const& text);
+
+// Does this aim fit the travel column? The one question every guard on that
+// column asks, in the column's own unit.
+bool TravelAimFitsColumn(std::string const& aim);
+
+// THE WIDTH OF A DUNGEON RUN'S ended_reason, AND THE CUT THAT RESPECTS IT
+// (#1186). `overseer_dungeon_run.ended_reason` is VARCHAR(200) in a UTF-8
+// table and the realm runs in strict mode, so a longer reason is refused with
+// errno 1406 and the whole UPDATE goes with it: state, ended_at and outcome
+// stay as they were and the run is left active, which is what breaks the next
+// run on that map. A stalled run's reason carries the dungeon module's own stop
+// reason and can run past the column. So every writer passes its reason
+// through this first: 200 characters or fewer come back unchanged; a longer
+// one keeps its start, is cut on a character boundary, and ends in "..." so a
+// reader can tell, the whole within the column counted in characters.
+constexpr std::size_t DUNGEON_RUN_ENDED_REASON_CHARS = 200;
+std::string FitEndedReasonColumn(std::string const& reason);
+
 // HOW FAR BACK FROM THIS DOOR THE PARTY GATHERS. The staging standoff is
 // measured from the door's centre, and for a sphere it is `standoffYards`
 // exactly as it always was: every sphere row stages on that number today and
@@ -11455,6 +11483,69 @@ constexpr char const* NotReadBack        = "the transaction did not read back";
 // (mod-overseer#169) is what happens when a sender cannot tell the two apart.
 bool AuctionRefusalRetryable(std::string const& reason);
 
+// --------------------------------------------- trade WTB (want to buy) -----------
+//
+// A WTB CANDIDATE is an item the family wants (appears in FamilyWants.wantList)
+// that is NOT currently listed on the auction house (ahPrice == 0) AND whose
+// price is within the family's auction budget (AuctionBudgetAllows). The
+// cooldown ledger prevents spamming the same item: after an offer is made for
+// an item, a 10-minute (configurable) cooldown applies per item entry before
+// another offer for that item may be made. The offer log records every offer
+// attempt with the member name, result (Accepted/Declined), and a reason string.
+
+enum class WtbOfferResult : std::uint8_t
+{
+    Accepted,
+    Declined,
+};
+
+// One WTB offer recorded in the log.
+struct WtbOfferEntry
+{
+    uint32_t itemEntry{0};
+    std::string member;
+    WtbOfferResult result{WtbOfferResult::Declined};
+    std::string reason;
+    time_t time{0};
+};
+
+// Log of WTB offers.
+struct WtbOfferLog
+{
+    std::vector<WtbOfferEntry> entries;
+};
+
+// Record a WTB offer outcome in the log.
+void WtbOfferLogRecord(WtbOfferLog& log, uint32_t itemEntry,
+                       std::string const& member, WtbOfferResult result,
+                       std::string const& reason, time_t now);
+
+// Per-item cooldown ledger: maps item entry to the last time an offer was made.
+using WtbCooldownLedger = std::map<uint32_t, time_t>;
+
+// Check if an offer for `itemEntry` is allowed under the cooldown. Returns
+// true if enough time has passed since the last offer for this item (or if
+// there was no previous offer). `cooldownSeconds` is the minimum interval
+// between offers for the same item (typically 600 = 10 minutes).
+bool WtbCooldownCheck(WtbCooldownLedger const& ledger, uint32_t itemEntry,
+                      time_t now, time_t cooldownSeconds);
+
+// Record that an offer for `itemEntry` was made at `now`. Updates the ledger
+// so subsequent WtbCooldownCheck calls will enforce the cooldown.
+void WtbCooldownRecord(WtbCooldownLedger& ledger, uint32_t itemEntry, time_t now);
+
+// Is this item a WTB candidate right now?
+//   - `wants`: the family's want list (from FamilyWants)
+//   - `itemEntry`: the item being considered
+//   - `ahPrice`: current lowest buyout price on the AH for this item, or 0 if not listed
+//   - `money`, `reserve`, `sharePercent`: budget parameters passed to AuctionBudgetAllows
+//   - `candidatePrice`: the price we would offer (must pass AuctionBudgetAllows)
+// Returns true if the item is wanted, not on AH (ahPrice == 0), and the
+// candidatePrice passes the budget check.
+bool WtbCandidate(FamilyWants const& wants, uint32_t itemEntry, uint32_t ahPrice,
+                  uint32_t money, uint32_t reserve, uint32_t sharePercent,
+                  uint32_t candidatePrice);
+
 // ----------------------------------------- a home somebody chose (#274) --
 //
 // WHAT A kind='bind' ROW MAY SAY.
@@ -18308,6 +18399,18 @@ struct RaidRunFacts
     bool stallRegroup{false};
     // Every encounter the instance script keeps is done.
     bool cleared{false};
+
+    // THE WIPE LOOP GUARD (#1165). After a wipe the run does not walk the party
+    // back in while members still carry Resurrection Sickness (they only carry
+    // it once the spirit healer revived them outside, so the hold is read in
+    // RECOVER with nobody dead inside), and a second wipe of the same run at
+    // the same place inside 600 s ends the attempt instead of a third walk-in.
+    std::uint32_t wipes{0};          // wipes already on the run's book
+    std::time_t lastWipeAt{0};       // epoch seconds of the previous wipe (0 = none)
+    bool samePlace{false};           // this wipe is at the same place as the last
+    bool membersSick{false};         // members still carry Resurrection Sickness
+    std::string graveyard;           // the graveyard the party would revive at
+    std::time_t now{0};              // this poll's epoch seconds
 };
 
 struct RaidRunStep
@@ -18333,6 +18436,17 @@ struct RaidRunStep
 
 // Is the raid wiped, by RAID_WIPE_PCT? See that constant.
 bool RaidWiped(RaidRunFacts const& facts);
+
+// THE WIPE BOOK (#1165). The adapter keeps three things about a run's wipes:
+// how many, when the last one was, and on which map. RaidWipeFacts copies them
+// into a poll's facts (samePlace: a wipe is on the book and it was on the
+// door's map); RaidRunCountsWipe says whether this poll's step is a NEW wipe,
+// which is only the move into RECOVER, never a later RECOVER poll that still
+// sees the same corpses inside.
+void RaidWipeFacts(RaidRunFacts& facts, unsigned wipes, std::time_t lastWipeAt,
+                   std::uint32_t lastWipeMap, std::uint32_t doorMap, std::time_t now);
+bool RaidRunCountsWipe(RaidRunPhase current, RaidRunStep const& step,
+                       RaidRunFacts const& facts);
 
 // A raid seat is due for repair when its lowest wearable item is below the
 // configured floor. An item with no maximum durability is not part of the
@@ -20423,11 +20537,15 @@ CraftToolStep CraftToolStepFor(CraftToolPlace place, bool bankerInReach, bool ma
 char const* CraftToolStepWord(CraftToolStep step);
 
 // IS THE TOOL PUT BACK IN THE BANK NOW? Only a tool in the bags (never one that
-// is worn), only when no standing craft errand still needs it, only with a
-// banker in reach and the character able to bank (alive, out of combat, not
-// in flight, not trading). Nobody is walked to a banker to put it back: it
-// goes back the next time the character stands at one.
-bool CraftToolGoesBack(bool inBags, bool stillNeeded, bool bankerInReach, bool able);
+// is worn), only for a member a planned recipe has needed it for (a craft
+// errand of theirs named a recipe that needs the tool, wow-overseer#1515),
+// only when no standing craft errand still needs it, only with a banker in
+// reach and the character able to bank (alive, out of combat, not in flight,
+// not trading). Nobody is walked to a banker to put it back: it goes back the
+// next time the character stands at one. A tool no planned recipe needed is
+// not the craft drive's: the planner skips every Anvil recipe today, and an
+// engineer's hammer is not banked out from under the next errand.
+bool CraftToolGoesBack(bool inBags, bool planned, bool stillNeeded, bool bankerInReach, bool able);
 
 // A WORLD SPAWN OF A SPELL FOCUS, as the adapter reads it out of the
 // gameobject spawn table.
@@ -22548,6 +22666,108 @@ std::string TrainerPurchaseLine(std::string const& member, char const* kind,
                                 uint32_t spellId, std::string const& spellName,
                                 uint32_t maxSkill, uint64_t paidCopper);
 
+// ------------------------------- a recipe manual bought from a vendor (#1098) --
+//
+// Some secondary-trade recipes are taught by a manual item a vendor sells (First
+// Aid's Heavy Silk Bandage, Cooking's Smoked Bear Meat), not by a trainer. The
+// roster names the manual and the vendor in `buy_recipe_item`, and
+// DriveRecipeManuals walks the character there, buys the manual through the buy
+// verb, uses it through the learn verb, and reads HasSpell back on a later poll,
+// because the learn is a 3000ms cast. These are the parts of that with no world
+// in them.
+
+// The `buy_recipe_item` column, "<item_template entry>:<creature_template
+// entry>". The vendor is part of the instruction: the character is sent to THAT
+// vendor for THAT manual, not to whichever vendor happens to stand nearest.
+struct RecipeManualErrand
+{
+    uint32_t itemEntry{0};
+    uint32_t vendorEntry{0};
+};
+
+// False for an empty column and for a malformed one (a side missing, not plain
+// digits, zero, or past uint32), with `out` reset either way. Digits are read
+// by hand rather than through std::stoul, so nothing here can throw.
+bool ParseRecipeManualErrand(std::string const& column, RecipeManualErrand& out);
+
+// How many times one manual is used before the errand is refused. A use the
+// learn verb refused for a passing reason (moving, mid-cast) never reached the
+// core and is tried again; a second that still teaches nothing is the item, and
+// asking a third time every poll is the retry loop the column exists to end.
+constexpr uint32_t RECIPE_MANUAL_MAX_USES = 2;
+
+// The refusal literals, written into the log line. No quote characters.
+namespace RecipeManualRefusal
+{
+constexpr char const* Malformed = "malformed buy_recipe_item: want <item entry>:<vendor entry>";
+constexpr char const* NotARecipe = "the item teaches no recipe when it is used";
+constexpr char const* NotSold = "the vendor does not sell the manual";
+constexpr char const* TooPoor = "the character cannot afford the manual";
+constexpr char const* UsedAndNotLearned =
+    "the manual was used and the recipe is still not known";
+}  // namespace RecipeManualRefusal
+
+// Everything the plan reads, as the adapter measured it this poll.
+struct RecipeManualFacts
+{
+    bool teachesRecipe{false};  // the item template teaches a recipe on use
+    bool knowsRecipe{false};    // HasSpell on that recipe
+    bool learning{false};       // a use is still casting or waiting to be read back
+    bool carriesManual{false};  // the manual is in the bags
+    uint32_t usesTried{0};      // uses this errand has asked for so far
+    bool vendorNearby{false};   // the named vendor is alive inside the arrival radius
+    bool vendorInReach{false};  // and inside the interact gate the core sells through
+    bool vendorSells{false};    // its list carries the manual for gold
+    uint64_t price{0};          // copper, reputation discount applied
+    uint64_t purse{0};          // copper the character holds
+};
+
+enum class RecipeManualStep : uint8_t
+{
+    Learned,  // the recipe is known: the errand is done
+    Refuse,   // say why and clear the column
+    Wait,     // a use is in flight; read it back next poll
+    Use,      // use the manual from the bags
+    Walk,     // claim a walk to the vendor
+    Approach, // close the last yards from the arrival radius to the interact gate
+    Buy,      // buy one manual from the vendor
+};
+
+struct RecipeManualPlan
+{
+    RecipeManualStep step{RecipeManualStep::Wait};
+    char const* refusal{""};  // one of RecipeManualRefusal when step is Refuse
+};
+
+// One poll of the errand. A known recipe ends it before anything else is asked;
+// a manual already in the bags is used rather than bought again; the vendor is
+// walked to, and then stepped up to, before its stock or price is judged,
+// because the core sells only inside the interact gate; and a manual that has been used and still taught nothing
+// is refused rather than bought again with the character's money.
+RecipeManualPlan PlanRecipeManual(RecipeManualFacts const& facts);
+
+// Does this refusal from the buy verb release the errand? Every refusal
+// BuyRefusalRetry calls Never, and two it calls otherwise that the errand cannot
+// outwait: a vendor that does not stock the manual, and a purse the core finds
+// short. Full bags, an out-of-stock vendor and a vendor out of range stand.
+bool ManualBuyRefusalReleases(std::string const& detail);
+
+// Does this refusal from the learn verb release the errand? Anything
+// LearnRefusalRetry does not call Later: the item, the skill and the bind are
+// not answered by waiting another poll.
+bool ManualUseRefusalReleases(std::string const& detail);
+
+// THE PROOF LINE FOR A MANUAL BOUGHT AND LEARNED, written once, only after
+// HasSpell reads the recipe back, and in the same family as
+// TrainerPurchaseLine so docs/training-proof-lines.md can list both:
+//
+//   overseer: manual_purchase member='<name>' item=<id> '<item name>'
+//       vendor=<entry> spell=<id> '<spell name>' paid_copper=<n>
+std::string ManualPurchaseLine(std::string const& member, uint32_t itemEntry,
+                               std::string const& itemName, uint32_t vendorEntry,
+                               uint32_t spellId, std::string const& spellName,
+                               uint64_t paidCopper);
+
 // "walk", "resting" ... for the log line.
 char const* TrainingStopStepWord(TrainingStopStep step);
 
@@ -22708,6 +22928,14 @@ bool RunRecoverySummonOpen(RunFailureFacts const& facts);
 // has reached `summonAfter`, and the summon rung has already been tried this
 // streak - or cannot be, because the door has no stone.
 bool RunRecoveryFinderOpen(RunFailureFacts const& facts);
+
+// THE LAST RESORT'S WORDS, FROM THE FACTS ALONE (issue 1141). The
+// module line and the heuristic text that names the same fact both build from
+// this, so they cannot drift: if the summon rung ran this streak it says so
+// with the count; if the door has no stone it says no summon was possible
+// here and carries the summonNote; if a stone stands but nobody qualifies to
+// click it, it says that.
+std::string FinderLastResortReason(RunFailureFacts const& facts);
 
 // -- rung two: the summon at the door ----------------------------------------
 

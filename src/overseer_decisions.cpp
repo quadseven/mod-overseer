@@ -2078,6 +2078,42 @@ std::string TravelAimAtPosition(std::uint32_t mapId, float x, float y, float z)
     return {};
 }
 
+std::size_t Utf8CharCount(std::string const& text)
+{
+    std::size_t count = 0;
+    for (unsigned char const byte : text)
+        if ((byte & 0xC0u) != 0x80u)
+            ++count;
+    return count;
+}
+
+bool TravelAimFitsColumn(std::string const& aim)
+{
+    return Utf8CharCount(aim) <= TRAVEL_AIM_MAX_CHARS;
+}
+
+std::string FitEndedReasonColumn(std::string const& reason)
+{
+    if (Utf8CharCount(reason) <= DUNGEON_RUN_ENDED_REASON_CHARS)
+        return reason;
+    static char const mark[] = "...";
+    std::size_t const keep = DUNGEON_RUN_ENDED_REASON_CHARS - (sizeof(mark) - 1);
+    // Walk to the lead byte of character number keep + 1; everything before it
+    // is exactly `keep` whole characters, the way Utf8CharCount counts them.
+    std::size_t seen = 0;
+    std::size_t cut = 0;
+    for (; cut < reason.size(); ++cut)
+    {
+        if ((static_cast<unsigned char>(reason[cut]) & 0xC0u) != 0x80u)
+        {
+            if (seen == keep)
+                break;
+            ++seen;
+        }
+    }
+    return reason.substr(0, cut) + mark;
+}
+
 DoorAimHeight DoorAimOnTheFloor(float triggerZ, bool haveGround, float groundZ,
                                 float arrivalYards, float triggerRadiusYards)
 {
@@ -3011,8 +3047,9 @@ std::string RunRecoveryHeuristicWhy(RunFailureFacts const& facts, RunRecovery ch
             break;
         case RunRecovery::DungeonFinder:
             why = std::to_string(facts.streak) +
-                  " attempts in a row never got inside and the summon rung has had its "
-                  "turn, so the family queues for its own dungeon in the dungeon finder "
+                  " attempts in a row never got inside and " +
+                  OverseerDecisions::FinderLastResortReason(facts) +
+                  ", so the family queues for its own dungeon in the dungeon finder "
                   "(the last resort)";
             break;
     }
@@ -9688,6 +9725,59 @@ bool AuctionBudgetAllows(uint32_t money, uint32_t reserve, uint32_t sharePercent
     return price <= remainder && price <= share;
 }
 
+void WtbOfferLogRecord(WtbOfferLog& log, uint32_t itemEntry,
+                       std::string const& member, WtbOfferResult result,
+                       std::string const& reason, time_t now)
+{
+    WtbOfferEntry entry;
+    entry.itemEntry = itemEntry;
+    entry.member = member;
+    entry.result = result;
+    entry.reason = reason;
+    entry.time = now;
+    log.entries.push_back(std::move(entry));
+}
+
+bool WtbCooldownCheck(WtbCooldownLedger const& ledger, uint32_t itemEntry,
+                      time_t now, time_t cooldownSeconds)
+{
+    auto it = ledger.find(itemEntry);
+    if (it == ledger.end())
+        return true;  // no previous offer for this item
+    time_t lastOffer = it->second;
+    return now >= lastOffer + cooldownSeconds;
+}
+
+void WtbCooldownRecord(WtbCooldownLedger& ledger, uint32_t itemEntry, time_t now)
+{
+    ledger[itemEntry] = now;
+}
+
+bool WtbCandidate(FamilyWants const& wants, uint32_t itemEntry, uint32_t ahPrice,
+                  uint32_t money, uint32_t reserve, uint32_t sharePercent,
+                  uint32_t candidatePrice)
+{
+    // Must be in the family's want list
+    bool wanted = false;
+    for (uint32_t id : wants.wantList)
+    {
+        if (id == itemEntry)
+        {
+            wanted = true;
+            break;
+        }
+    }
+    if (!wanted)
+        return false;
+
+    // Must not be on the auction house (ahPrice == 0 means not listed)
+    if (ahPrice != 0)
+        return false;
+
+    // Candidate price must pass budget check
+    return AuctionBudgetAllows(money, reserve, sharePercent, candidatePrice);
+}
+
 AuctionBidVerdict AuctionBidAcceptable(uint32_t price, uint32_t startBid,
                                        uint32_t currentBid, uint32_t buyout,
                                        uint32_t outbidStep)
@@ -15264,6 +15354,22 @@ bool RaidWiped(RaidRunFacts const& facts)
     return !facts.insideCombat && facts.insideDead * 100 >= total * RAID_WIPE_PCT;
 }
 
+void RaidWipeFacts(RaidRunFacts& facts, unsigned wipes, std::time_t lastWipeAt,
+                   std::uint32_t lastWipeMap, std::uint32_t doorMap, std::time_t now)
+{
+    facts.wipes = wipes;
+    facts.lastWipeAt = lastWipeAt;
+    facts.now = now;
+    facts.samePlace = wipes >= 1 && lastWipeMap == doorMap;
+}
+
+bool RaidRunCountsWipe(RaidRunPhase current, RaidRunStep const& step,
+                       RaidRunFacts const& facts)
+{
+    return step.phase == RaidRunPhase::Recover && current != RaidRunPhase::Recover &&
+           RaidWiped(facts);
+}
+
 bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct)
 {
     return lowestDurabilityPct < floorPct;
@@ -15411,6 +15517,36 @@ RaidRunStep StepRaidRunRecover(RaidRunPhase current, RaidRunFacts const& facts)
     bool const wiped = RaidWiped(facts);
     // The dead inside are released only when nobody standing can raise them.
     step.releaseDead = wiped;
+
+    // A second wipe of the same run at the same place inside 600 s ends the
+    // attempt rather than starting a third (#1165). Only a NEW wipe counts: the
+    // poll that moves the run into RECOVER. A later RECOVER poll that still
+    // sees the corpses of the wipe already on the book is the same wipe, and
+    // ending there would end the run after its first one. releaseDead stays
+    // set, so the corpses are released before the order is let go.
+    if (wiped && current != RaidRunPhase::Recover && facts.wipes >= 1 && facts.samePlace &&
+        facts.lastWipeAt != 0 && facts.now != 0 && facts.now - facts.lastWipeAt < 600)
+    {
+        step.phase = RaidRunPhase::Idle;
+        step.release = true;
+        step.runBack = false;
+        step.knockMembers = false;
+        step.why = "the same run wiped at the same place within 600 s; ending the attempt";
+        return step;
+    }
+
+    // While members still carry Resurrection Sickness after a wipe, do not
+    // walk the party back in; wait it out instead of risking another wipe
+    // (#1165). The sickness comes from the spirit healer, who revives a member
+    // alive at the graveyard outside, so this is read whether or not corpses
+    // are still inside: by the time anybody is sick, usually none are.
+    if (facts.wipes >= 1 && facts.membersSick)
+    {
+        step.runBack = false;
+        step.why = "members still carry Resurrection Sickness; waiting it out before the run-back";
+        return step;
+    }
+
     // Every ghost is walked back, with the head's client attached (nothing
     // walks for a door the operator cannot watch); the bound is per ghost
     // (RaidGhostMayBeWalked).
@@ -17658,9 +17794,9 @@ char const* CraftToolStepWord(CraftToolStep step)
     return "wait";
 }
 
-bool CraftToolGoesBack(bool inBags, bool stillNeeded, bool bankerInReach, bool able)
+bool CraftToolGoesBack(bool inBags, bool planned, bool stillNeeded, bool bankerInReach, bool able)
 {
-    return inBags && !stillNeeded && bankerInReach && able;
+    return inBags && planned && !stillNeeded && bankerInReach && able;
 }
 
 int NearestFocusSpawn(std::vector<FocusSpawn> const& spawns, unsigned mapId, float x, float y,
@@ -19577,6 +19713,91 @@ std::string TrainerPurchaseLine(std::string const& member, char const* kind,
            " paid_copper=" + std::to_string(paidCopper);
 }
 
+namespace
+{
+
+// Plain decimal digits that fit a uint32 and are not zero.
+bool ParseEntryDigits(std::string const& text, uint32_t& out)
+{
+    if (text.empty() || text.size() > 10)
+        return false;
+    uint64_t value = 0;
+    for (char ch : text)
+    {
+        if (ch < '0' || ch > '9')
+            return false;
+        value = value * 10 + static_cast<uint64_t>(ch - '0');
+    }
+    if (value == 0 || value > UINT32_MAX)
+        return false;
+    out = static_cast<uint32_t>(value);
+    return true;
+}
+
+}  // namespace
+
+bool ParseRecipeManualErrand(std::string const& column, RecipeManualErrand& out)
+{
+    out = RecipeManualErrand();
+    std::string::size_type const colon = column.find(':');
+    if (colon == std::string::npos)
+        return false;
+    RecipeManualErrand parsed;
+    if (!ParseEntryDigits(column.substr(0, colon), parsed.itemEntry) ||
+        !ParseEntryDigits(column.substr(colon + 1), parsed.vendorEntry))
+        return false;
+    out = parsed;
+    return true;
+}
+
+RecipeManualPlan PlanRecipeManual(RecipeManualFacts const& facts)
+{
+    namespace R = RecipeManualRefusal;
+    if (facts.knowsRecipe)
+        return {RecipeManualStep::Learned, ""};
+    if (!facts.teachesRecipe)
+        return {RecipeManualStep::Refuse, R::NotARecipe};
+    if (facts.learning)
+        return {RecipeManualStep::Wait, ""};
+    if (facts.usesTried >= RECIPE_MANUAL_MAX_USES ||
+        (facts.usesTried > 0 && !facts.carriesManual))
+        return {RecipeManualStep::Refuse, R::UsedAndNotLearned};
+    if (facts.carriesManual)
+        return {RecipeManualStep::Use, ""};
+    if (!facts.vendorNearby)
+        return {RecipeManualStep::Walk, ""};
+    if (!facts.vendorInReach)
+        return {RecipeManualStep::Approach, ""};
+    if (!facts.vendorSells)
+        return {RecipeManualStep::Refuse, R::NotSold};
+    if (facts.price > facts.purse)
+        return {RecipeManualStep::Refuse, R::TooPoor};
+    return {RecipeManualStep::Buy, ""};
+}
+
+bool ManualBuyRefusalReleases(std::string const& detail)
+{
+    return BuyRefusalRetry(detail) == TownRetry::Never ||
+           detail == "vendor does not stock the item" ||
+           detail == "cannot afford the purchase";
+}
+
+bool ManualUseRefusalReleases(std::string const& detail)
+{
+    return LearnRefusalRetry(detail) != TownRetry::Later;
+}
+
+std::string ManualPurchaseLine(std::string const& member, uint32_t itemEntry,
+                               std::string const& itemName, uint32_t vendorEntry,
+                               uint32_t spellId, std::string const& spellName,
+                               uint64_t paidCopper)
+{
+    return "overseer: manual_purchase member='" + member + "' item=" +
+           std::to_string(itemEntry) + " '" + itemName + "' vendor=" +
+           std::to_string(vendorEntry) + " spell=" + std::to_string(spellId) + " '" +
+           spellName + "' paid_copper=" + std::to_string(paidCopper);
+}
+
 char const* NamedRecipeStepWord(NamedRecipeStep step)
 {
     switch (step)
@@ -19655,6 +19876,21 @@ bool RunRecoveryFinderOpen(RunFailureFacts const& facts)
     // on wow-dev, the Horde family (levels 13 to 17, no warlock) was on its
     // ninth failure in a row with the stone 25 yards from the door.
     return SummonsTriedThisStreak(facts) > 0 || !facts.summonReady || !facts.summonerReady;
+}
+
+std::string FinderLastResortReason(RunFailureFacts const& facts)
+{
+    unsigned const tries = SummonsTriedThisStreak(facts);
+    if (tries > 0)
+        return "the summon rung has had its turn (" +
+               std::to_string(tries) +
+               " summon recovery(s) this streak)";
+    if (!facts.summonReady)
+        return "no summon was possible here: " + facts.summonNote;
+    // The stone stands at the door, but nobody in the family qualifies to
+    // click it: the summon rung could never run here either.
+    return "the stone stands at the door but no summoner qualifies to click it: " +
+           facts.summonNote;
 }
 
 bool FinderIsTheWayIn(bool finderIsDefault, bool familyCanQueue, std::uint32_t runNumber,
