@@ -25760,7 +25760,26 @@ bool SitsOutOfRuns(FamilyStandin const* standin, std::string const& name);
 
 // May the arming drive open or touch a dungeon run on behalf of this character.
 // Never for the member sitting out: it is not the family's party any more.
-bool MayOpenRunFor(bool sittingOut);
+//
+// NOR FOR A MEMBER LENT TO A GUILD RUN (#1092). Measured 2026-10-23 to
+// 2026-10-27: every family dungeon run that stayed active with an empty member
+// list for over an hour was a healer its family had lent to a guild finder
+// run. The arming drive saw a roster character on an instance map and opened
+// a family run for it; the guild run's own clear was that run's heartbeat, so
+// it stayed active for the whole guild run (68 to 136 minutes) and ended
+// 'emptied' only when the member left. The guild run arms and ends its own
+// group, so the family's run table has nothing to say about it.
+bool MayOpenRunFor(bool sittingOut, bool lentToAGuildRun);
+
+// Does a character count as inside a dungeon run, for every drive that stands
+// down for one? Only on a dungeon map, and then when a family run row is open
+// on that map, or when the character is named by a guild run. A guild run
+// keeps its state in memory and writes no run row, so before #1092 the only
+// thing that stood the craft, lockpick, recipe-manual, quest and profession
+// drives down for a member lent to one was the empty family run the arming
+// drive wrongly opened for it. That run is no longer opened, so the guild run
+// has to be counted here instead.
+bool CountsAsInADungeonRun(bool onDungeonMap, bool activeRunOnMap, bool namedByAGuildRun);
 
 // The ended_reason of an open run whose leader sits out, naming the sit-out.
 std::string SitOutRunEndedReason(std::string const& leader);
