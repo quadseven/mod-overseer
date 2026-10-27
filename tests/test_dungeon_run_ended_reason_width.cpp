@@ -77,15 +77,43 @@ std::string ReadFile(char const* path)
     return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
-// The text of the member function that starts at `signature`, up to the next
-// line that closes a member function at the class's indentation.
+// The text of the function that starts at `signature`, through the brace that
+// closes its body. Braces are matched by depth rather than by indentation, so a
+// nested block cannot end the body early, and braces inside string and
+// character literals (the SQL's '{}' placeholders) are skipped. Empty when the
+// signature or a balanced body is not found.
 std::string Body(std::string const& text, char const* signature)
 {
     std::size_t const start = text.find(signature);
     if (start == std::string::npos)
         return std::string();
-    std::size_t const end = text.find("\n    }\n", start);
-    return end == std::string::npos ? std::string() : text.substr(start, end - start);
+    std::size_t const open = text.find('{', start);
+    if (open == std::string::npos)
+        return std::string();
+    int depth = 0;
+    for (std::size_t i = open; i < text.size(); ++i)
+    {
+        char const c = text[i];
+        if (c == '"' || c == '\'')
+        {
+            for (++i; i < text.size() && text[i] != c; ++i)
+                if (text[i] == '\\')
+                    ++i;
+            continue;
+        }
+        if (c == '/' && i + 1 < text.size() && text[i + 1] == '/')
+        {
+            i = text.find('\n', i);
+            if (i == std::string::npos)
+                return std::string();
+            continue;
+        }
+        if (c == '{')
+            ++depth;
+        else if (c == '}' && --depth == 0)
+            return text.substr(start, i + 1 - start);
+    }
+    return std::string();
 }
 }  // namespace
 
