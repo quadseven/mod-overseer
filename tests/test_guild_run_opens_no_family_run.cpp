@@ -56,6 +56,24 @@ std::string Body(std::string const& text, char const* signature)
     return end == std::string::npos ? std::string() : text.substr(start, end - start);
 }
 
+// Body() ends at the first close at the class's four-space indentation. A
+// body that walked past its own function's close would hold the next member's
+// four-space line (a signature, a comment); one that did not holds none.
+bool OneMember(std::string const& body)
+{
+    std::size_t at = body.find('\n');
+    while (at != std::string::npos)
+    {
+        std::size_t const line = at + 1;
+        char const next = line + 4 < body.size() ? body[line + 4] : ' ';
+        if (body.compare(line, 4, "    ") == 0 && next != ' ' && next != '\n' &&
+            next != '{' && next != '}' && next != '#')
+            return false;
+        at = body.find('\n', line);
+    }
+    return true;
+}
+
 // A guild run writes no family run row, and the empty family run this change
 // stops opening was the only thing that stood the other drives down for a lent
 // member. So the run-presence check counts the guild run itself.
@@ -111,6 +129,7 @@ void TheStandDownDrivesAskTheGuildRunToo(std::string const& text)
     {
         std::string const body = Body(text, site.drive);
         Check(site.drive, !body.empty());
+        Check("and its body is that drive's alone", OneMember(body));
         Check(site.what, body.find(site.asks) != std::string::npos);
     }
 }
