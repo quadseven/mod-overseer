@@ -23873,10 +23873,15 @@ RebuffSpell RebuffSpellFor(unsigned classId)
 RebuffDecision DecideRebuff(RebuffFacts const& facts)
 {
     RebuffDecision decision;
-    // Counted before any refusal, so a step that does not cast still says how
-    // many were missing and how many were in reach.
+    std::uint8_t const casterSubgroup = facts.casterSubgroup;
+    // Count only the caster's own subgroup for the party step. In a party
+    // everyone is subgroup 0, so this is the whole party and nothing changes;
+    // in a raid it is only the caster's formed group. Members in other
+    // subgroups are left to the cross-party target below.
     for (RebuffMember const& member : facts.members)
     {
+        if (member.subgroup != casterSubgroup)
+            continue;
         if (!member.alive || !member.sameMap || member.hasBuff)
             continue;
         ++decision.missing;
@@ -23904,6 +23909,31 @@ RebuffDecision DecideRebuff(RebuffFacts const& facts)
         decision.step = RebuffStep::LowMana;
     else
         decision.step = RebuffStep::Cast;
+
+    // At most one cross-party target: the nearest in-reach, in-sight, alive
+    // member of another subgroup who lacks the buff and whose subgroup has no
+    // able buffer of it. Only in a raid; never a guild member outside it, and
+    // never more than one per caster per poll.
+    if (facts.inRaid)
+    {
+        RebuffMember const* best = nullptr;
+        for (RebuffMember const& member : facts.members)
+        {
+            if (member.subgroup == casterSubgroup)
+                continue;
+            if (!member.alive || !member.sameMap || !member.inSight)
+                continue;
+            if (member.hasBuff || member.hasBuffer)
+                continue;
+            if (member.yards > REBUFF_REACH_YARDS)
+                continue;
+            if (!best || member.yards < best->yards)
+                best = &member;
+        }
+        if (best)
+            decision.crossPartyTarget = *best;
+    }
+
     return decision;
 }
 

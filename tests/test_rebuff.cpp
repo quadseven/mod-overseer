@@ -30,6 +30,7 @@ using OverseerDecisions::RebuffSpell;
 using OverseerDecisions::RebuffSpellFor;
 using OverseerDecisions::RebuffStep;
 using OverseerDecisions::RebuffStepWord;
+using OverseerDecisions::REBUFF_REACH_YARDS;
 
 namespace
 {
@@ -585,6 +586,18 @@ int main()
     TheClassTable();
     EveryStepHasAWord();
     TheDriveIsWired();
+    // RAID GROUPING (#1159): only the caster's own subgroup for the party step,
+    // and at most one cross-party target guarded by reach, sight, life, map and
+    // the double-buff rule.
+    CasterOwnSubgroupOnlyWhenInRaid();
+    CrossPartyTargetChosenWhenNoBufferInSubgroup();
+    CrossPartyTargetRejectedIfBufferInSubgroup();
+    CrossPartyTargetRejectedIfOutofReach();
+    CrossPartyTargetRejectedIfOutOfSight();
+    CrossPartyTargetRejectedIfDead();
+    CrossPartyTargetRejectedIfNotSameMap();
+    CrossPartyTargetIsNearest();
+    CrossPartyTargetAtMostOnePerPoll();
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);

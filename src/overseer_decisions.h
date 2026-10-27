@@ -51,6 +51,7 @@
 #include <cstdio>
 #include <ctime>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -26366,11 +26367,14 @@ RebuffSpell RebuffSpellFor(unsigned classId);
 // One member of the caster's group, the caster included, as the caster sees it.
 struct RebuffMember
 {
+    std::string name{};       // the member's name, so the drive can cast on them
     bool alive{true};
     bool sameMap{true};       // in the world, on the caster's map
     bool hasBuff{false};      // the aura or its group variant, from any caster
     float yards{0.0f};        // from the caster
     bool inSight{true};       // line of sight from the caster
+    std::uint8_t subgroup{0}; // the raid subgroup the member sits in (0 in a party)
+    bool hasBuffer{false};    // the member's subgroup has a living buffer of this buff able to cast
 };
 
 struct RebuffFacts
@@ -26383,6 +26387,8 @@ struct RebuffFacts
     std::uint32_t mana{0};
     std::uint32_t maxMana{0};
     std::uint32_t cost{0};    // of the rank the caster would cast
+    bool inRaid{false};          // the caster is in a raid
+    std::uint8_t casterSubgroup{0};  // the caster's own subgroup
     std::vector<RebuffMember> members;
 };
 
@@ -26411,6 +26417,10 @@ struct RebuffDecision
     RebuffStep step{RebuffStep::NoSpell};
     std::size_t missing{0};   // living members on the map without the buff
     std::size_t inReach{0};   // of those, within reach and sight
+    // At most one cross-party target: the nearest in-reach, in-sight, alive
+    // member of another raid subgroup who lacks the buff and whose subgroup
+    // has no able buffer of it. Empty unless the caster is in a raid.
+    std::optional<RebuffMember> crossPartyTarget;
 };
 
 RebuffDecision DecideRebuff(RebuffFacts const& facts);

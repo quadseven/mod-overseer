@@ -56689,6 +56689,20 @@ private:
         } while (result->NextRow());
     }
 
+    // Cast the single-target rank of the caster's buff on a named raid member
+    // through the module's existing cast path (PlayerbotAI::CastSpell, the same
+    // call the conjure drive uses). The refusals the drive guards - reserve,
+    // combat, mount and casting - are checked before this is called, so this
+    // only attempts a cast the caster is allowed to make.
+    static bool CastCrossPartyBuff(Player* bot, PlayerbotAI* botAI, uint32 spellId,
+                                   std::string const& targetName)
+    {
+        Player* target = ObjectAccessor::FindPlayerByName(targetName, true);
+        if (!target || !target->IsAlive() || target->GetMapId() != bot->GetMapId())
+            return false;
+        return botAI->CastSpell(spellId, target);
+    }
+
     // Keep the party buff on the family, not only the strategy that allows it
     // (mod-overseer#823). The decision and why it is shaped this way are
     // OverseerDecisions::DecideRebuff; this reads the caster and its group,
@@ -56740,12 +56754,48 @@ private:
                 facts.cost = cost > 0 ? static_cast<uint32>(cost) : 0;
             }
 
+            // In a raid, note the caster's own subgroup and which subgroups
+            // already have a living buffer of this buff able to cast. The
+            // double-buff guard never sends the caster to buff a raid member
+            // whose subgroup already has a buffer of its own.
+            std::map<std::uint8_t, bool> subgroupHasBuffer;
+            auto const ableBuffer = [&](Player* member) -> bool {
+                if (!member->IsAlive() || member->IsInCombat() ||
+                    member->IsNonMeleeSpellCast(false) || member->IsMounted() ||
+                    member->IsInFlight())
+                    return false;
+                OverseerDecisions::RebuffSpell const mSpell =
+                    OverseerDecisions::RebuffSpellFor(static_cast<unsigned>(member->getClass()));
+                if (!mSpell.action)
+                    return false;
+                AiObjectContext* mContext = SteerableAI(member)->GetAiObjectContext();
+                uint32 const mSpellId =
+                    mContext ? mContext->GetValue<uint32>("spell id", mSpell.aura)->Get() : 0;
+                SpellInfo const* mInfo = mSpellId ? sSpellMgr->GetSpellInfo(mSpellId) : nullptr;
+                return mInfo && member->HasSpell(mSpellId);
+            };
+            if (Group* group = bot->GetGroup())
+            {
+                if (group->isRaidGroup())
+                {
+                    facts.inRaid = true;
+                    facts.casterSubgroup = group->GetMemberGroup(bot->GetGUID());
+                    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                        if (Player* member = ref->GetSource() && ableBuffer(member))
+                            subgroupHasBuffer[group->GetMemberGroup(member->GetGUID())] = true;
+                }
+            }
+
             auto readMember = [&](Player* member) {
                 OverseerDecisions::RebuffMember seen;
+                seen.name = member->GetName();
                 seen.alive = member->IsAlive();
                 seen.sameMap = member->IsInWorld() && member->GetMap() == bot->GetMap();
                 seen.hasBuff = botAI->HasAura(spell.aura, member) ||
                                botAI->HasAura(spell.groupAura, member);
+                if (Group* group = bot->GetGroup())
+                    seen.subgroup = group->GetMemberGroup(member->GetGUID());
+                seen.hasBuffer = subgroupHasBuffer[seen.subgroup];
                 if (seen.sameMap)
                 {
                     seen.yards = member == bot ? 0.0f : bot->GetDistance(member);
@@ -56774,8 +56824,20 @@ private:
                          static_cast<uint32>(decision.missing));
                 _rebuffAsked.erase(asked);
             }
+            // Read back a cross-party ask: if the target now carries the buff,
+            // the ask was delivered.
+            auto const crossAsked = _rebuffCrossAsked.find(name);
+            if (crossAsked != _rebuffCrossAsked.end())
+            {
+                if (!decision.crossPartyTarget)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' cross-party ask for '{}' last poll - the target "
+                             "now carries '{}'", name, crossAsked->second, spell.aura);
+                _rebuffCrossAsked.erase(crossAsked);
+            }
 
-            if (decision.step != OverseerDecisions::RebuffStep::Cast)
+            if (decision.step != OverseerDecisions::RebuffStep::Cast &&
+                !decision.crossPartyTarget)
             {
                 auto const said = _rebuffSaid.find(name);
                 if (said != _rebuffSaid.end() && said->second == decision.step)
@@ -56796,17 +56858,33 @@ private:
             }
 
             _rebuffSaid[name] = decision.step;
-            bool const took = botAI->DoSpecificAction(spell.action, Event(), true);
-            if (took)
-                _rebuffAsked[name] = decision.missing;
-            LOG_INFO("module.overseer",
-                     "overseer: '{}' is asked for '{}' - {} member(s) missing '{}', {} within "
-                     "{} yards and sight, mana {} of {} for a cost of {}; the action {}",
-                     name, spell.action, static_cast<uint32>(decision.missing), spell.aura,
-                     static_cast<uint32>(decision.inReach),
-                     static_cast<uint32>(OverseerDecisions::REBUFF_REACH_YARDS), facts.mana,
-                     facts.maxMana, facts.cost,
-                     took ? "ran" : "refused (useless, impossible or failed)");
+            if (decision.step == OverseerDecisions::RebuffStep::Cast)
+            {
+                bool const took = botAI->DoSpecificAction(spell.action, Event(), true);
+                if (took)
+                    _rebuffAsked[name] = decision.missing;
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is asked for '{}' - {} member(s) missing '{}', {} within "
+                         "{} yards and sight, mana {} of {} for a cost of {}; the action {}",
+                         name, spell.action, static_cast<uint32>(decision.missing), spell.aura,
+                         static_cast<uint32>(decision.inReach),
+                         static_cast<uint32>(OverseerDecisions::REBUFF_REACH_YARDS), facts.mana,
+                         facts.maxMana, facts.cost,
+                         took ? "ran" : "refused (useless, impossible or failed)");
+            }
+
+            // Cross-party target: cast the single-target rank on the named member
+            // of another raid subgroup whose subgroup has no able buffer of this buff.
+            if (decision.crossPartyTarget)
+            {
+                _rebuffCrossAsked[name] = decision.crossPartyTarget->name;
+                bool const cast = CastCrossPartyBuff(bot, botAI, spellId,
+                                                     decision.crossPartyTarget->name);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' is asked to cross-party rebuff '{}' on '{}' - the "
+                         "cast {}", name, spell.aura, decision.crossPartyTarget->name,
+                         cast ? "ran" : "refused (useless, impossible or failed)");
+            }
         } while (result->NextRow());
     }
 
@@ -79008,10 +79086,12 @@ private:
     std::map<std::string, TrainingStopLegState> _trainingStopLegs;
     // Who has been told once that the tank strategies would not take.
     std::set<std::string> _tankStrategyRefused;
-    // DriveRebuff (#823): the last step said for each caster, and the members
-    // missing the buff when its party buff action was last asked to run.
+    // DriveRebuff (#823, #1159): the last step said for each caster, the members
+    // missing the buff when its party buff action was last asked to run, and the
+    // cross-party target a raid caster was last asked to buff.
     std::map<std::string, OverseerDecisions::RebuffStep> _rebuffSaid;
     std::map<std::string, std::size_t> _rebuffAsked;
+    std::map<std::string, std::string> _rebuffCrossAsked;
 
     // The unlearn this module has already refused for each character, so a
     // standing disagreement about the price is said once rather than twice a
