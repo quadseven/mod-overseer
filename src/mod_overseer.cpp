@@ -24405,6 +24405,7 @@ private:
         {
             _partySplitSaid.erase(name);
             _partySplitLineSaid.erase(name);
+            _strandedReasonSaid.erase(name);
         }
 
         // A MEMBER ON ANOTHER CONTINENT GOES BACK AS A PLAYER WOULD (#274): its
@@ -46908,6 +46909,20 @@ private:
         std::string const word = OverseerDecisions::StrandedWayName(way);
         bool const fresh = _strandedWaySaid[name] != word;
         _strandedWaySaid[name] = word;
+
+        // A split can outlive any one verdict, including an active crossing
+        // or a deliberate stand-down. Repeat the member's current reason on a
+        // fixed cadence so none of those states can stay silent indefinitely.
+        time_t const now = std::time(nullptr);
+        auto const lastReason = _strandedReasonSaid.find(name);
+        if (split && (lastReason == _strandedReasonSaid.end() ||
+                      now - lastReason->second >= STRANDED_REASON_REPEAT_SECONDS))
+        {
+            _strandedReasonSaid[name] = now;
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' remains split across maps {} and {} - stranded way {}: {}",
+                     name, facts.memberMap, facts.leaderMap, word, why);
+        }
 
         switch (way)
         {
@@ -79333,6 +79348,11 @@ private:
                                 // not clobbered again every poll
     };
     std::map<std::string, FollowStallState> _followStall;
+
+    static constexpr time_t STRANDED_REASON_REPEAT_SECONDS = 15 * 60;
+    // The last time each split member's stranded verdict and reason were
+    // logged; renewed every fifteen minutes while the maps remain split.
+    std::map<std::string, time_t> _strandedReasonSaid;
 
     // Which map this follower's leader was on when the split was last said
     // (#241). World thread only and unguarded, like _followStall beside it:

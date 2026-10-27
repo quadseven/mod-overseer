@@ -202,6 +202,21 @@ void WhatComesFirst()
     CheckWay("a default reading decides nothing", DecideStrandedWay(blank), StrandedWay::Wait);
 }
 
+void ExitEpisodeDoesNotOwnTheCrossing()
+{
+    // A quest or town job and a crossing record left by the exit episode do
+    // not mean that the family is bringing this member back. The member must
+    // still decide its own way across.
+    StrandedFacts facts = Stranded();
+    facts.crossingUnderWay = true;
+    CheckWay("an exit-episode crossing record does not suppress a boat decision",
+             DecideStrandedWay(facts), StrandedWay::Sail);
+
+    facts.boundOnLeaderMap = true;
+    CheckWay("a ready bind on the leader's map still wins over the stale crossing record",
+             DecideStrandedWay(facts), StrandedWay::Hearth);
+}
+
 // The stranded member, read as the one member of its own crossing.
 CrossingMember Lone(std::uint32_t map, float berthDistance, bool aboard = false)
 {
@@ -323,6 +338,7 @@ int main()
     SteppingOffTheDeck();
     TheWayAcross();
     WhatComesFirst();
+    ExitEpisodeDoesNotOwnTheCrossing();
     TheLoneCrossing();
     if (failures)
     {

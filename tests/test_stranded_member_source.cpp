@@ -59,6 +59,9 @@ int main()
     std::string const stranded = Body(text, "bool DriveStrandedMember(");
     if (stranded.find("OverseerDecisions::DecideStrandedWay(facts)") == std::string::npos)
         return Fail("the stranded member must be decided by DecideStrandedWay");
+    if (stranded.find("QueryResult jobRow") != std::string::npos ||
+        stranded.find("jobRow->") != std::string::npos)
+        return Fail("a job row must not gate the stranded member's way decision");
     if (stranded.find("PriceCrossingTransports(") == std::string::npos)
         return Fail("a boat home must be priced the way the family's crossing is");
     if (stranded.find("DoHearth(") == std::string::npos ||
@@ -85,6 +88,12 @@ int main()
     if (drive.find("TeleportTo(") != std::string::npos ||
         stranded.find("TeleportTo(") != std::string::npos)
         return Fail("nothing on a stranded member's way home may teleport it");
+
+    if (stranded.find("STRANDED_REASON_REPEAT_SECONDS") == std::string::npos ||
+        stranded.find("_strandedReasonSaid") == std::string::npos ||
+        stranded.find("StrandedWayName(way)") == std::string::npos ||
+        stranded.find("_strandedWhy[name]") == std::string::npos)
+        return Fail("every prolonged split must periodically log its verdict and reason");
 
     std::string const sweep = Body(text, "void SweepDungeonEscorts()");
     if (sweep.find("it->second.crossing") == std::string::npos)
