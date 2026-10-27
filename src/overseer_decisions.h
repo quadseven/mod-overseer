@@ -22627,6 +22627,108 @@ std::string TrainerPurchaseLine(std::string const& member, char const* kind,
                                 uint32_t spellId, std::string const& spellName,
                                 uint32_t maxSkill, uint64_t paidCopper);
 
+// ------------------------------- a recipe manual bought from a vendor (#1098) --
+//
+// Some secondary-trade recipes are taught by a manual item a vendor sells (First
+// Aid's Heavy Silk Bandage, Cooking's Smoked Bear Meat), not by a trainer. The
+// roster names the manual and the vendor in `buy_recipe_item`, and
+// DriveRecipeManuals walks the character there, buys the manual through the buy
+// verb, uses it through the learn verb, and reads HasSpell back on a later poll,
+// because the learn is a 3000ms cast. These are the parts of that with no world
+// in them.
+
+// The `buy_recipe_item` column, "<item_template entry>:<creature_template
+// entry>". The vendor is part of the instruction: the character is sent to THAT
+// vendor for THAT manual, not to whichever vendor happens to stand nearest.
+struct RecipeManualErrand
+{
+    uint32_t itemEntry{0};
+    uint32_t vendorEntry{0};
+};
+
+// False for an empty column and for a malformed one (a side missing, not plain
+// digits, zero, or past uint32), with `out` reset either way. Digits are read
+// by hand rather than through std::stoul, so nothing here can throw.
+bool ParseRecipeManualErrand(std::string const& column, RecipeManualErrand& out);
+
+// How many times one manual is used before the errand is refused. A use the
+// learn verb refused for a passing reason (moving, mid-cast) never reached the
+// core and is tried again; a second that still teaches nothing is the item, and
+// asking a third time every poll is the retry loop the column exists to end.
+constexpr uint32_t RECIPE_MANUAL_MAX_USES = 2;
+
+// The refusal literals, written into the log line. No quote characters.
+namespace RecipeManualRefusal
+{
+constexpr char const* Malformed = "malformed buy_recipe_item: want <item entry>:<vendor entry>";
+constexpr char const* NotARecipe = "the item teaches no recipe when it is used";
+constexpr char const* NotSold = "the vendor does not sell the manual";
+constexpr char const* TooPoor = "the character cannot afford the manual";
+constexpr char const* UsedAndNotLearned =
+    "the manual was used and the recipe is still not known";
+}  // namespace RecipeManualRefusal
+
+// Everything the plan reads, as the adapter measured it this poll.
+struct RecipeManualFacts
+{
+    bool teachesRecipe{false};  // the item template teaches a recipe on use
+    bool knowsRecipe{false};    // HasSpell on that recipe
+    bool learning{false};       // a use is still casting or waiting to be read back
+    bool carriesManual{false};  // the manual is in the bags
+    uint32_t usesTried{0};      // uses this errand has asked for so far
+    bool vendorNearby{false};   // the named vendor is alive inside the arrival radius
+    bool vendorInReach{false};  // and inside the interact gate the core sells through
+    bool vendorSells{false};    // its list carries the manual for gold
+    uint64_t price{0};          // copper, reputation discount applied
+    uint64_t purse{0};          // copper the character holds
+};
+
+enum class RecipeManualStep : uint8_t
+{
+    Learned,  // the recipe is known: the errand is done
+    Refuse,   // say why and clear the column
+    Wait,     // a use is in flight; read it back next poll
+    Use,      // use the manual from the bags
+    Walk,     // claim a walk to the vendor
+    Approach, // close the last yards from the arrival radius to the interact gate
+    Buy,      // buy one manual from the vendor
+};
+
+struct RecipeManualPlan
+{
+    RecipeManualStep step{RecipeManualStep::Wait};
+    char const* refusal{""};  // one of RecipeManualRefusal when step is Refuse
+};
+
+// One poll of the errand. A known recipe ends it before anything else is asked;
+// a manual already in the bags is used rather than bought again; the vendor is
+// walked to, and then stepped up to, before its stock or price is judged,
+// because the core sells only inside the interact gate; and a manual that has been used and still taught nothing
+// is refused rather than bought again with the character's money.
+RecipeManualPlan PlanRecipeManual(RecipeManualFacts const& facts);
+
+// Does this refusal from the buy verb release the errand? Every refusal
+// BuyRefusalRetry calls Never, and two it calls otherwise that the errand cannot
+// outwait: a vendor that does not stock the manual, and a purse the core finds
+// short. Full bags, an out-of-stock vendor and a vendor out of range stand.
+bool ManualBuyRefusalReleases(std::string const& detail);
+
+// Does this refusal from the learn verb release the errand? Anything
+// LearnRefusalRetry does not call Later: the item, the skill and the bind are
+// not answered by waiting another poll.
+bool ManualUseRefusalReleases(std::string const& detail);
+
+// THE PROOF LINE FOR A MANUAL BOUGHT AND LEARNED, written once, only after
+// HasSpell reads the recipe back, and in the same family as
+// TrainerPurchaseLine so docs/training-proof-lines.md can list both:
+//
+//   overseer: manual_purchase member='<name>' item=<id> '<item name>'
+//       vendor=<entry> spell=<id> '<spell name>' paid_copper=<n>
+std::string ManualPurchaseLine(std::string const& member, uint32_t itemEntry,
+                               std::string const& itemName, uint32_t vendorEntry,
+                               uint32_t spellId, std::string const& spellName,
+                               uint64_t paidCopper);
+
 // "walk", "resting" ... for the log line.
 char const* TrainingStopStepWord(TrainingStopStep step);
 
