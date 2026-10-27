@@ -18878,7 +18878,7 @@ ExitHearthStep ExitFailureHearthStep(ExitHearthFacts const& facts, unsigned maxA
     // its own cast is what puts the cooldown on.
     if (facts.pending)
         return ExitHearthStep::Waiting;
-    if (*ExitHearthImpossibleReason(facts, maxAttempts))
+    if (!ExitHearthImpossibleReason(facts, maxAttempts).empty())
         return ExitHearthStep::Impossible;
     // The executor refuses both of these, and both pass on their own.
     if (facts.inCombat)
@@ -18936,7 +18936,7 @@ char const* ExitHearthStepWord(ExitHearthStep step)
     return "unknown";
 }
 
-char const* ExitHearthImpossibleReason(ExitHearthFacts const& facts, unsigned maxAttempts)
+std::string ExitHearthImpossibleReason(ExitHearthFacts const& facts, unsigned maxAttempts)
 {
     if (!facts.inWorld || !facts.onInsideMap)
         return "";
@@ -18948,6 +18948,12 @@ char const* ExitHearthImpossibleReason(ExitHearthFacts const& facts, unsigned ma
         return "hearthstone on cooldown";
     if (facts.attempts >= maxAttempts)
         return "hearth attempts spent";
+    // A hearth to another continent splits the family (#1142): the stone is
+    // withheld and the member stays on the walk-out path the episode bounds.
+    if (facts.doorMapKnown && facts.bindMapId != facts.doorMapId)
+        return "hearthstone bound on map " + std::to_string(facts.bindMapId) +
+               ", not on map " + std::to_string(facts.doorMapId) +
+               " where the exit door lets out, so the stone is withheld";
     return "";
 }
 
