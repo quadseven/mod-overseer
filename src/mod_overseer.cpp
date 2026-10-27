@@ -29260,9 +29260,9 @@ private:
     // after the last follow poll - so the brain is not left off for a poll
     // when the leader is mid-relog.
     //
-    // Returns null rather than falling back to the bot itself, because the bot
-    // itself is precisely the issuer that is always rejected, and retrying with
-    // it is how this went unnoticed for so long.
+    // The leader is considered first, followed by any other member that may
+    // issue dungeon-clear commands. This may return the bot itself when the
+    // bot is the leader and qualifies. Returns null only when nobody qualifies.
     static Player* AuthorizedDcIssuer(Player* bot)
     {
         if (!bot)
