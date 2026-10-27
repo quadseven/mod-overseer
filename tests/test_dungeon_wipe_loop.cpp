@@ -130,10 +130,20 @@ void ASingleMemberDeathIsNotAffected()
     facts.insideDead = 1;
     facts.membersSick = true;
     facts.graveyard = "The Great Lift";
+    Check("one dead of five is not a wipe", !RaidWiped(facts));
     RaidRunStep const notWiped = StepRaidRun(RaidRunPhase::Hold, facts);
     CheckPhase("not a wipe holds HOLD", notWiped.phase, RaidRunPhase::Hold);
     Check("and is not blocked by the sickness rule", !notWiped.release);
     Check("the member is not released", !notWiped.releaseDead);
+    Check("nobody is walked back", !notWiped.runBack);
+
+    // The same death with nobody sick decides exactly the same step.
+    facts.membersSick = false;
+    RaidRunStep const notSick = StepRaidRun(RaidRunPhase::Hold, facts);
+    CheckPhase("the sickness does not change the phase", notWiped.phase, notSick.phase);
+    Check("or the release", notWiped.release == notSick.release);
+    Check("or the run-back", notWiped.runBack == notSick.runBack);
+    Check("or the reason", std::string(notWiped.why) == std::string(notSick.why));
 }
 
 } // namespace
