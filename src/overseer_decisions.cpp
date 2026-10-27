@@ -11518,6 +11518,106 @@ LoneGreyDensity ScoreLoneGreyDensity(std::vector<DangerSpawn> const& spawns,
     return out;
 }
 
+namespace
+{
+bool DiedOnLegLimitsSane(DiedOnLegLimits const& limits)
+{
+    return limits.nearYards > 0.f && limits.holdSeconds > 0 && limits.priceYards >= 0.f &&
+           std::isfinite(limits.priceYards);
+}
+
+bool SameLeg(std::uint32_t aFrom, std::uint32_t aTo, std::uint32_t bFrom, std::uint32_t bTo)
+{
+    return (aFrom == bFrom && aTo == bTo) || (aFrom == bTo && aTo == bFrom);
+}
+
+void ForgetExpired(std::vector<DiedOnLeg>& died, std::time_t now)
+{
+    died.erase(std::remove_if(died.begin(), died.end(),
+                              [now](DiedOnLeg const& leg) { return leg.until <= now; }),
+               died.end());
+}
+}  // namespace
+
+std::vector<RouteLegSpan> LegsOfDeath(std::vector<RouteLegSpan> const& legs,
+                                      std::vector<RoutePoint> const& route, float x, float y,
+                                      DiedOnLegLimits const& limits)
+{
+    std::vector<RouteLegSpan> out;
+    if (!DiedOnLegLimitsSane(limits) || !std::isfinite(x) || !std::isfinite(y))
+        return out;
+    float const nearSquared = limits.nearYards * limits.nearYards;
+    for (RouteLegSpan const& leg : legs)
+    {
+        std::size_t const end = std::min(leg.endPoint, route.size());
+        for (std::size_t i = leg.firstPoint; i < end; ++i)
+        {
+            float const dx = route[i].x - x;
+            float const dy = route[i].y - y;
+            if (dx * dx + dy * dy <= nearSquared)
+            {
+                out.push_back(leg);
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+void RememberDiedOnLeg(std::vector<DiedOnLeg>& died, std::uint32_t from, std::uint32_t to,
+                       std::time_t now, DiedOnLegLimits const& limits)
+{
+    if (!DiedOnLegLimitsSane(limits))
+        return;
+    ForgetExpired(died, now);
+    std::time_t const until = now + static_cast<std::time_t>(limits.holdSeconds);
+    for (DiedOnLeg& leg : died)
+        if (SameLeg(leg.from, leg.to, from, to))
+        {
+            leg.until = until;
+            return;
+        }
+    DiedOnLeg leg;
+    leg.from = from;
+    leg.to = to;
+    leg.until = until;
+    died.push_back(leg);
+}
+
+std::uint32_t PriceDiedOnLegs(std::vector<RouteLink>& links, std::vector<DiedOnLeg>& died,
+                              std::time_t now, DiedOnLegLimits const& limits)
+{
+    ForgetExpired(died, now);
+    if (!DiedOnLegLimitsSane(limits) || died.empty())
+        return 0;
+    for (RouteLink& link : links)
+    {
+        if (!link.onFoot || !(link.yards >= 0.f))
+            continue;
+        for (DiedOnLeg const& leg : died)
+            if (SameLeg(link.from, link.to, leg.from, leg.to))
+            {
+                link.yards += limits.priceYards;
+                break;
+            }
+    }
+    return static_cast<std::uint32_t>(died.size());
+}
+
+std::uint32_t DiedOnLegsOnPlan(std::vector<std::uint32_t> const& nodes,
+                               std::vector<DiedOnLeg> const& died, std::time_t now)
+{
+    std::uint32_t count = 0;
+    for (std::size_t i = 0; i + 1 < nodes.size(); ++i)
+        for (DiedOnLeg const& leg : died)
+            if (leg.until > now && SameLeg(nodes[i], nodes[i + 1], leg.from, leg.to))
+            {
+                ++count;
+                break;
+            }
+    return count;
+}
+
 FlightLoanStep ReadFlightLoan(bool lent, bool sawFlying, bool inFlight, time_t since,
                               time_t now, time_t boardLimit)
 {

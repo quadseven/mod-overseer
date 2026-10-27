@@ -13798,6 +13798,88 @@ LoneGreyDensity ScoreLoneGreyDensity(std::vector<DangerSpawn> const& spawns,
                                      bool walkerHasGroup, LoneGreyDensityRule const& rule,
                                      DangerLimits const& limits);
 
+// ------------- a leg a walker died on is not walked again at once (#502) ----
+//
+// THE BORK SEQUENCE. A level 60 walker died 13 yards from survey node 3487 in
+// Tanaris, on a leg of the route PlanFootRoute had planned for it, revived at
+// node 199 two legs back, and was released down the same legs again. Nothing
+// about the plan had changed: the planner had learned nothing from the death,
+// so the same search over the same graph gave the same answer.
+//
+// THE RULE. When a walker dies within `nearYards` of a leg of the route it was
+// last planned, every such leg is remembered for that walker for
+// `holdSeconds`. While it is remembered, the walker's own plans price the leg
+// (both directions, because the ground does not care which way it is walked)
+// at `priceYards` more than its survey cost. A way round that costs less than
+// that is taken; when there is none, the leg is still walked and the caller can
+// say so, which is better than no route at all.
+//
+// PRICED, NOT DELETED, on purpose. Deleting the leg can leave a walker with no
+// route, and then it walks at its aim unaided, which is how #316 started. And
+// PER WALKER, not on the shared survey: a death says what this walker could
+// not survive, and the next character down that road may be twenty levels
+// higher.
+struct RouteLegSpan
+{
+    std::uint32_t from{0};
+    std::uint32_t to{0};
+    // The leg's points in the route: [firstPoint, endPoint).
+    std::size_t firstPoint{0};
+    std::size_t endPoint{0};
+};
+
+struct DiedOnLeg
+{
+    std::uint32_t from{0};
+    std::uint32_t to{0};
+    // Remembered until this moment, and forgotten at it.
+    std::time_t until{0};
+};
+
+struct DiedOnLegLimits
+{
+    // How far from a point of a leg a death may be and still be ON that leg.
+    // Bork died 13 yards from the node; a leg's recorded points are about five
+    // yards apart, so forty is wide enough to cover a fight that drifted off
+    // the path and narrow enough not to reach the next road over.
+    float nearYards{40.f};
+    // How long a death on a leg is remembered. Long enough to cover the corpse
+    // run, the revive and the re-release that #502 measured, and bounded so a
+    // walker that has levelled past the danger gets its road back.
+    std::int64_t holdSeconds{2 * 60 * 60};
+    // What walking a remembered leg costs on top of its survey distance. A way
+    // round up to this much longer is taken. Two thousand yards is about the
+    // longest single walk link the survey holds (1906 yards), so a detour of a
+    // leg or two is always preferred to the leg the walker died on.
+    float priceYards{2000.f};
+};
+
+// Which legs of the route the walker died on: every leg with a point within
+// `nearYards` of (x, y). A death beside a node is on both legs that meet
+// there, which is right: it is the place that killed, not the direction. Empty
+// for a death off the route, an empty route, or limits that are nonsense.
+std::vector<RouteLegSpan> LegsOfDeath(std::vector<RouteLegSpan> const& legs,
+                                      std::vector<RoutePoint> const& route, float x, float y,
+                                      DiedOnLegLimits const& limits);
+
+// Remember a death on the leg `from`-`to` at `now`. Forgets what has expired,
+// refreshes a leg already remembered in either direction, and adds one that is
+// not. Does nothing when the limits are nonsense.
+void RememberDiedOnLeg(std::vector<DiedOnLeg>& died, std::uint32_t from, std::uint32_t to,
+                       std::time_t now, DiedOnLegLimits const& limits);
+
+// Price the remembered legs on a copy of the survey's links: every walk link
+// matching a remembered leg in either direction costs `priceYards` more.
+// Forgets what has expired at `now`, and returns how many legs are still
+// remembered. A link the survey refused (negative cost) stays refused.
+std::uint32_t PriceDiedOnLegs(std::vector<RouteLink>& links, std::vector<DiedOnLeg>& died,
+                              std::time_t now, DiedOnLegLimits const& limits);
+
+// How many legs of a planned node sequence are remembered deaths at `now`, so
+// a plan that still walks one (there was no cheaper way round) can say so.
+std::uint32_t DiedOnLegsOnPlan(std::vector<std::uint32_t> const& nodes,
+                               std::vector<DiedOnLeg> const& died, std::time_t now);
+
 // ------------------ a staging walk that is measured rather than routed (#342) --
 //
 // THE ROUTE PLANNER ABOVE IS RIGHT ABOUT ITS GRAPH AND WRONG ABOUT THE WORLD,
