@@ -7121,6 +7121,25 @@ FallAccount AccountForFall(float recordedYardsFallen, float safeFallYards,
                : FallAccount::Survivable;
 }
 
+bool FallStartedBelowWorld(float lastZ, bool surfaceAboveFound,
+                           float surfaceAboveZ, bool groundBelowFound,
+                           float groundBelowZ, float toleranceYards)
+{
+    // Nothing over it, so there is nothing for it to be below.
+    if (!surfaceAboveFound)
+        return false;
+    // Within the tolerance of the surface is standing on it. Written as a
+    // negated < so a NaN reading falls out as "not below" rather than
+    // recording a void fall nobody could check.
+    if (!(lastZ < surfaceAboveZ - toleranceYards))
+        return false;
+    // Ground under its feet (at or below the probe start) means the surface
+    // above is a roof, a canopy or a ceiling, not the world it fell through.
+    if (groundBelowFound && groundBelowZ <= lastZ + toleranceYards)
+        return false;
+    return true;
+}
+
 char const* FallAccountName(FallAccount account)
 {
     switch (account)

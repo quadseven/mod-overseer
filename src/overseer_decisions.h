@@ -7900,6 +7900,33 @@ FallAccount AccountForFall(float recordedYardsFallen, float safeFallYards = 0.f,
                            bool startedBelowSurface = false);
 char const* FallAccountName(FallAccount account);
 
+// DID THE LAST SAMPLE START UNDER THE WORLD, OR JUST UNDER SOMETHING (#1211).
+//
+// RecordDeath used to call a death a void fall whenever the last sampled
+// position was below the highest surface a long probe found over it. That
+// probe returns the HIGHEST surface at the character's x and y, so a roof, a
+// bridge, a tree canopy, a cave ceiling or an overhang above a character
+// standing on ordinary ground read as "below the surface". Measured on the dev
+// realm after #1107 went live: 33 of the 47 rows written as void falls were
+// surface deaths that fell 0 to 2.1 yards, 21 of them creature kills in combat.
+//
+// SO TWO READINGS ARE ASKED FOR, NOT ONE. `surfaceAbove*` is that long probe,
+// unchanged. `groundBelow*` is a second probe started `toleranceYards` over
+// the sample and searching down from there. A character with ground under its
+// own feet is standing on the world, whatever is over its head, and is never
+// below it. Under the world there is nothing to find: the terrain height only
+// counts from above it, and a downward ray from under the map hits nothing.
+//
+// THE TOLERANCE IS THE OTHER HALF. A character a few yards under the sampled
+// surface is float jitter on the ground it stands on, not a body that has gone
+// through it, so it is not below the surface either.
+constexpr float FALL_START_SURFACE_TOLERANCE_YARDS = 5.0f;
+
+bool FallStartedBelowWorld(float lastZ, bool surfaceAboveFound,
+                           float surfaceAboveZ, bool groundBelowFound,
+                           float groundBelowZ,
+                           float toleranceYards = FALL_START_SURFACE_TOLERANCE_YARDS);
+
 // ------------------------------------------------- a revival and a party --
 //
 // A REVIVAL MAY NOT PUT A CHARACTER ON A MAP ITS PARTY IS NOT ON, unless there
