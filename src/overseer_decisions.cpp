@@ -17993,6 +17993,52 @@ bool MayCraftNow(std::string const& job, bool inDungeonRun, bool alive, bool inC
     return campaignJob && !inDungeonRun && alive && !inCombat && !moving;
 }
 
+unsigned CraftLoneDeathsInZone(std::vector<CraftLoneDeath> const& deaths, uint32_t mapId,
+                               uint32_t zoneId, int64_t now, CraftLoneDeathLimits const& limits)
+{
+    unsigned count = 0;
+    for (CraftLoneDeath const& d : deaths)
+        if (d.craftJob && !d.grouped && d.mapId == mapId && d.zoneId == zoneId &&
+            d.at <= now && now - d.at <= limits.windowSeconds)
+            ++count;
+    return count;
+}
+
+void PruneCraftLoneDeaths(std::vector<CraftLoneDeath>& deaths, int64_t now,
+                          CraftLoneDeathLimits const& limits)
+{
+    deaths.erase(std::remove_if(deaths.begin(), deaths.end(),
+                                [&](CraftLoneDeath const& d)
+                                { return now - d.at > limits.windowSeconds; }),
+                 deaths.end());
+}
+
+CraftLoneDeathStep DecideCraftLoneDeaths(CraftLoneDeathFacts const& facts,
+                                         CraftLoneDeathLimits const& limits)
+{
+    if (facts.job != "craft" || facts.grouped || facts.deathsHere < limits.deaths)
+        return CraftLoneDeathStep::Stay;
+    if (facts.resting)
+        return CraftLoneDeathStep::Stay;
+    if (!facts.alive)
+        return CraftLoneDeathStep::Defer;
+    return facts.hearthReady ? CraftLoneDeathStep::Hearth : CraftLoneDeathStep::Defer;
+}
+
+char const* CraftLoneDeathStepWord(CraftLoneDeathStep step)
+{
+    switch (step)
+    {
+        case CraftLoneDeathStep::Hearth:
+            return "hearthing to its bind, an inn under guards";
+        case CraftLoneDeathStep::Defer:
+            return "its craft step is deferred until it can hearth out";
+        case CraftLoneDeathStep::Stay:
+            break;
+    }
+    return "staying";
+}
+
 bool CraftDismountsFirst(bool mounted, bool inFlight)
 {
     return mounted && !inFlight;
