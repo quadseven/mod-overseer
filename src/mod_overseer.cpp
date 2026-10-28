@@ -77295,6 +77295,39 @@ private:
                                                                         spawn.z);
                                         }),
                          spawns.end());
+        // TELDRASSIL IS AN ISLAND ON MAP 1 (#1206). A walk is a straight walk on
+        // the walker's own map and takes no boat, so a destination across the
+        // water from the island, or onto it from the mainland, is left out: the
+        // walk headed at it and swam until it drowned off the west coast. With
+        // none left on the walker's own shore the walk holds, and says why; a
+        // cross-to-map row is what takes the Rut'theran boat (#1133).
+        if (ev.mapId == D::TELDRASSIL_MAP && map)
+        {
+            uint32 const fromZone = who->GetZoneId();
+            std::size_t const before = spawns.size();
+            spawns.erase(std::remove_if(spawns.begin(), spawns.end(),
+                                        [who, map, fromZone](Spawn const& spawn)
+                                        {
+                                            return D::AcrossTeldrassilShore(
+                                                D::TELDRASSIL_MAP, fromZone,
+                                                map->GetZoneId(who->GetPhaseMask(), spawn.x,
+                                                               spawn.y, spawn.z));
+                                        }),
+                         spawns.end());
+            std::size_t const across = before - spawns.size();
+            if (across)
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: {} walk {} - '{}' stands in zone {}, {} Teldrassil; {} of {} "
+                         "destination(s) lie across the water and are left out: a walk takes "
+                         "no Rut'theran boat, so it does not swim for them (#1206)",
+                         noun, id, ev.character, fromZone,
+                         D::OnTeldrassilIsland(ev.mapId, fromZone) ? "on" : "off", across,
+                         before);
+                if (spawns.empty())
+                    return refuse(R::AcrossTheWater);
+            }
+        }
         ev.mailboxesOnMap = static_cast<uint32>(spawns.size());
 
         std::vector<D::MailboxCandidate> candidates;
