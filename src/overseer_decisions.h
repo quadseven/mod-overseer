@@ -21367,16 +21367,38 @@ bool WarriorNeedsMeleePursuit(uint8_t classId, bool tanks, bool inCombat,
 struct TankPursuitFacts
 {
     uint8_t classId{0};
-    bool tanks{false};          // "tank" is in the combat engine
+    bool tanks{false};          // TankStrategyListedName is in the combat engine
     bool inCombat{false};
     bool inMeleeRange{false};   // of its victim, or its selection with none
     bool onInstanceMap{false};  // Map::Instanceable (dungeon, raid, battleground)
     bool heldStill{false};      // any overseer hold, revival hold included
     bool mounted{false};
     bool alive{true};
+    bool hasVictim{true};       // a victim, or a selection, it may attack (#1212)
 };
 
 bool TankMayPursue(TankPursuitFacts const& facts);
+
+// THE NAME A CLASS'S TANK STRATEGY IS LISTED UNDER (#1212). `tank` is what the
+// combat engine is ASKED for, and mod-playerbots resolves it per class: its
+// strategy factories map `tank` to the class's own tank strategy, and the
+// engine lists a strategy by that strategy's getName(), not by the word that
+// created it. So after `+tank` a warrior or a paladin lists `prot`, a death
+// knight `blood` and a druid `bear`; only a class whose tank strategy is itself
+// called `tank` lists `tank`. Asking the live list for `tank` therefore answered
+// no for every warrior tank there is, which kept the #1049 pursuit from ever
+// running and had the tank-strategy drive hand `+tank` to protection warriors
+// on every poll and report that it did not take.
+std::string TankStrategyListedName(uint8_t classId);
+
+// WHY A WARRIOR TANK OUT OF REACH IN THE OPEN WORLD IS NOT CHASED (#1212). Empty
+// when there is nothing to say: the pursuit runs, the character is not a warrior
+// tank, is out of combat, is in melee reach, or is on an instance map (that one
+// is #1055's gate working as meant, and a line per dungeon fight would bury the
+// rest). Otherwise the reason, so the drive can say once per fight why a tank in
+// combat out of reach is left where it is, and a silence in the log means "never
+// out of reach" rather than "asked and refused".
+std::string TankPursuitWithheld(TankPursuitFacts const& facts);
 
 // A TANK HOLDING A TWO-HANDER IS MEASURED THE OTHER WAY ROUND. The sweep scores
 // a two-hander against the PAIR it would replace (#14), and it scores a shield

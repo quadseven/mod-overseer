@@ -29274,18 +29274,32 @@ private:
             // LOS-break drag, the one maneuver that keeps it out of melee
             // reach on purpose. TankMayPursue says where it may act; see its
             // comment for the instance map, the holds, mounted and dead.
+            //
+            // THE TANK STRATEGY BY THE NAME THE ENGINE LISTS IT UNDER (#1212).
+            // A warrior's `tank` is listed as `prot`, so asking for `tank` here
+            // answered no for every warrior tank and the chase never ran.
+            //
+            // AND A REFUSAL IS SAID TOO, once per fight, so a silence in the
+            // log can be told apart from a tank that is never out of reach.
             if (!bot->IsInCombat())
+            {
                 _tankPursuitSaid.erase(name);
+                _tankPursuitWithheldSaid.erase(name);
+            }
             Unit* combatVictim = bot->GetVictim();
             if (!combatVictim)
                 combatVictim = bot->GetSelectedUnit();
-            if (combatVictim && bot->IsValidAttackTarget(combatVictim))
+            if (combatVictim && !bot->IsValidAttackTarget(combatVictim))
+                combatVictim = nullptr;
             {
                 OverseerDecisions::TankPursuitFacts pursuit;
                 pursuit.classId = bot->getClass();
-                pursuit.tanks = StrategyPresent(botAI, StrategyItem{"tank", true});
+                pursuit.tanks = StrategyPresent(
+                    botAI,
+                    StrategyItem{OverseerDecisions::TankStrategyListedName(pursuit.classId), true});
                 pursuit.inCombat = bot->IsInCombat();
-                pursuit.inMeleeRange = bot->IsWithinMeleeRange(combatVictim);
+                pursuit.hasVictim = combatVictim != nullptr;
+                pursuit.inMeleeRange = combatVictim && bot->IsWithinMeleeRange(combatVictim);
                 Map* pursuitMap = bot->GetMap();
                 pursuit.onInstanceMap = !pursuitMap || pursuitMap->Instanceable();
                 pursuit.heldStill = HeldStill(name) || HeldAfterRevival(name);
@@ -29303,6 +29317,16 @@ private:
                                  name, combatVictim->GetName(),
                                  bot->GetDistance(combatVictim));
                     bot->GetMotionMaster()->MoveChase(combatVictim);
+                }
+                else
+                {
+                    std::string const withheld =
+                        OverseerDecisions::TankPursuitWithheld(pursuit);
+                    if (!withheld.empty() && _tankPursuitWithheldSaid.insert(name).second)
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' tanks in combat in the open world and is "
+                                 "not chased into melee reach - {} (#1212)",
+                                 name, withheld);
                 }
             }
 
@@ -57370,7 +57394,11 @@ private:
             // one before the two are compared.
             facts.talentsInTree =
                 specTab <= 2 && OverseerDecisions::DominantTree(points) == specTab;
-            facts.hasTank = StrategyPresent(botAI, StrategyItem{"tank", true});
+            // By the name the engine lists it under (#1212): `+tank` is listed
+            // as `prot` on a warrior, so asking for `tank` re-handed it every poll.
+            std::string const tankListed =
+                OverseerDecisions::TankStrategyListedName(bot->getClass());
+            facts.hasTank = StrategyPresent(botAI, StrategyItem{tankListed, true});
             facts.hasTankAssist = StrategyPresent(botAI, StrategyItem{"tank assist", true});
 
             std::string const change = OverseerDecisions::TankStrategyChange(facts);
@@ -57378,7 +57406,7 @@ private:
                 continue;
 
             botAI->ChangeStrategy(change.c_str(), BOT_STATE_COMBAT);
-            bool const nowTank = StrategyPresent(botAI, StrategyItem{"tank", true}) &&
+            bool const nowTank = StrategyPresent(botAI, StrategyItem{tankListed, true}) &&
                                  StrategyPresent(botAI, StrategyItem{"tank assist", true});
             if (nowTank)
             {
@@ -79715,6 +79743,9 @@ private:
     // DriveEngagementSafety says it once per fight rather than every poll.
     // Erased on the first poll that finds the character out of combat (#1055).
     std::set<std::string> _tankPursuitSaid;
+    // Tanks whose withheld pursuit has been said this fight (#1212), cleared
+    // with the set above.
+    std::set<std::string> _tankPursuitWithheldSaid;
     uint32 _terrainRecoveryTimer = 0;
     // GATHERING/BARRIER coordinator poll (mod-overseer#88). Its own timer,
     // not piggybacked on QUEST_POLL_MS or ENGAGEMENT_POLL_MS: this drive is
