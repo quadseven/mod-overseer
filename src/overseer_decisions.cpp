@@ -15540,6 +15540,11 @@ char const* RaidRunPhaseName(RaidRunPhase phase)
     return "IDLE";
 }
 
+bool RaidReleaseDisbandsAnyway(std::time_t endingSince, std::time_t now)
+{
+    return endingSince != 0 && now - endingSince >= RAID_RELEASE_WAIT_SECONDS;
+}
+
 bool RaidWiped(RaidRunFacts const& facts)
 {
     unsigned const total = facts.insideAlive + facts.insideDead;

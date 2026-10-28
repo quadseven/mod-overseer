@@ -18636,6 +18636,17 @@ struct RaidRunStep
 // Is the raid wiped, by RAID_WIPE_PCT? See that constant.
 bool RaidWiped(RaidRunFacts const& facts);
 
+// THE RELEASE OF AN ENDED ATTEMPT WAITS, BUT NOT FOREVER (#1222). The release
+// keeps the raid while anybody is on the raid map, because a disband there is
+// a forced eviction from the instance. Nothing walks a living survivor out (up
+// to 10% can be standing, RAID_WIPE_PCT being 90, a feign-death hunter for
+// one), so without a bound the order stalls until that member dies or leaves.
+// From the poll whose release first did not finish (endingSince, 0 = none), the
+// wait is RAID_RELEASE_WAIT_SECONDS; after that the raid is disbanded with the
+// survivor inside, and the core's eviction puts the survivor out.
+constexpr long RAID_RELEASE_WAIT_SECONDS = 2 * 60;
+bool RaidReleaseDisbandsAnyway(std::time_t endingSince, std::time_t now);
+
 // THE WIPE BOOK (#1165). The adapter keeps three things about a run's wipes:
 // how many, when the last one was, and on which map. RaidWipeFacts copies them
 // into a poll's facts (samePlace: a wipe is on the book and it was on the

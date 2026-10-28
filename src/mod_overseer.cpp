@@ -50125,6 +50125,9 @@ private:
         // attempt is over, and every poll until the release finishes lets go
         // again rather than walking anybody back in (#1201).
         bool attemptEnding{false};
+        // When that release first did not finish, so the wait for the living
+        // still inside is bounded (#1222, RaidReleaseDisbandsAnyway).
+        time_t attemptEndingSince{0};
         unsigned released{0};
         unsigned regroups{0};
         unsigned skips{0};
@@ -50382,9 +50385,12 @@ private:
     // this run converted. The group is disbanded (the core's own call; a raid
     // cannot be turned back into a party) only when nobody in it is inside the
     // raid map, because a disband there is a forced eviction from the instance.
+    // That wait is bounded (#1222): once RaidReleaseDisbandsAnyway says so, the
+    // raid is disbanded with the survivor inside and the core puts him out. The
+    // wait is said once, on the poll that first finds somebody inside.
     // KeepRosterGrouped re-forms the family's party on its next poll.
     bool ReleaseRaidRun(std::string const& family, RaidRunState& run,
-                        OverseerDecisions::RaidDoor const* door)
+                        OverseerDecisions::RaidDoor const* door, time_t now)
     {
         if (!run.head.empty())
             _travelAims.Release(run.head);
@@ -50406,11 +50412,24 @@ private:
                 Player* member = ref->GetSource();
                 if (member && door && member->GetMapId() == door->insideMapId)
                 {
-                    LOG_INFO("module.overseer",
-                             "overseer: raid run for family '{}' ended but '{}' is still "
-                             "inside {} - the raid is kept until nobody is, and the "
-                             "release is tried again next poll",
-                             family, member->GetName(), door->name);
+                    if (OverseerDecisions::RaidReleaseDisbandsAnyway(run.attemptEndingSince,
+                                                                     now))
+                    {
+                        LOG_INFO("module.overseer",
+                                 "overseer: raid run for family '{}' waited {} s for '{}' "
+                                 "to leave {} - the raid is disbanded anyway and the "
+                                 "instance puts the survivor out",
+                                 family, long(now - run.attemptEndingSince),
+                                 member->GetName(), door->name);
+                        break;
+                    }
+                    if (!run.attemptEnding)
+                        LOG_INFO("module.overseer",
+                                 "overseer: raid run for family '{}' ended but '{}' is still "
+                                 "inside {} - the raid is kept until nobody is, for at most "
+                                 "{} s, and the release is tried again every poll",
+                                 family, member->GetName(), door->name,
+                                 OverseerDecisions::RAID_RELEASE_WAIT_SECONDS);
                     return false;
                 }
             }
@@ -51566,7 +51585,7 @@ private:
                 // they are released first, or the run would never let go.
                 if (step.releaseDead && door && group && group->isRaidGroup())
                     run.released += ReleaseRaidDead(group, door);
-                if (ReleaseRaidRun(roster.family, run, door))
+                if (ReleaseRaidRun(roster.family, run, door, std::time(nullptr)))
                 {
                     LOG_INFO("module.overseer",
                              "overseer: raid run for family '{}' released at {} - {}",
@@ -51591,6 +51610,7 @@ private:
                     // The attempt is over even though the raid is kept: the
                     // next poll lets go again instead of walking back in.
                     run.attemptEnding = true;
+                    run.attemptEndingSince = std::time(nullptr);
                     LOG_INFO("module.overseer",
                              "overseer: raid run for family '{}' ended its attempt at {} - "
                              "{}; the release waits for the living still inside, and "
