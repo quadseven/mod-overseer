@@ -8315,6 +8315,21 @@ bool FamilyHoldsInTown(std::vector<std::string> const& jobs);
 // status (a flight, a far grind spot, a camp) and the family is left behind.
 bool LeaderCarriesNewRpg(std::string const& job, bool onAnErrand);
 
+// A RUN INSIDE ITS DUNGEON HOLDS `new rpg` OFF EVERY MEMBER IN THERE (#1210).
+// Measured on the dev realm 2026-10-25: the dungeon finder took a family into
+// map 90, all five of it, and within seconds the leader was outside again and
+// the run ended 'emptied'. He had been handed `new rpg` back one poll before
+// the finder queue, his rpg stuck counters were stale from before the run, and
+// on the first rpg tick inside upstream's MoveFarTo judged him stuck and
+// teleported him to his old rpg destination outside. Nothing inside a run walks
+// under `new rpg`: STAGED_INSIDE waits for the census and CLEARING is the
+// dungeon brain's. So while the run is STAGED_INSIDE or CLEARING, a member
+// standing on the run's own map does not carry `new rpg`, and gets it back only
+// once the run has moved on (EXITING walks out under its own aim, and a run
+// that ended holds nothing). A member outside the map is left alone: the walk
+// back in for a stranded member is an escort under `new rpg`.
+bool RunHoldsNewRpgOff(bool runStagedInsideOrClearing, bool onTheRunsMap);
+
 // A FLIGHT THE LEADER DID NOT ASK FOR TAKES THE FAMILY'S LEADER AWAY (#697).
 // Measured on the dev realm 2026-09-24: the Horde family waited in Orgrimmar
 // on its Ragefire campaign. At 11:49:06 the regroup hold on the leader ended
@@ -13879,6 +13894,13 @@ struct DiedOnLegLimits
     // longest single walk link the survey holds (1906 yards), so a detour of a
     // leg or two is always preferred to the leg the walker died on.
     float priceYards{2000.f};
+    // How recently a walker must have been stepped along its planned route
+    // for a death to be charged to a leg of it (#1228). The route memory
+    // outlives the walk: an errand ends, its route is dropped in the last
+    // yards, the walker goes questing beside the road. A death there is not a
+    // death on the route, and charging it priced a road the walker had left.
+    // Four travel polls, so the poll that finds the body is always inside it.
+    std::int64_t walkedWithinSeconds{60};
 };
 
 // Which legs of the route the walker died on: every leg with a point within
@@ -13919,6 +13941,55 @@ std::uint32_t DiedOnLegsOnPlan(std::vector<std::uint32_t> const& nodes,
 // True also for a route never planned, which is today's rule.
 bool PlanErrandRouteAgain(bool planned, std::uint32_t plannedAtDeaths,
                           std::uint32_t deathsNow, bool alive);
+
+// ------------- a death is charged to the leg actually walked (#1228) --------
+//
+// THE #1228 SEQUENCE. After #502 shipped, one member logged three deaths on the
+// same leg inside its 120-minute price window. Two things let that happen.
+//
+// The memory of a walker's route outlived the walking of it, so a death near
+// a remembered road was charged to it whether or not the walker was still on
+// it. LegsWalkedAtDeath charges a death only while the walker was stepped
+// along that plan within `walkedWithinSeconds`, and only to the leg its cursor
+// was on and the legs either side of it (a death at a node is on both legs
+// that meet there), each still within `nearYards` of the body.
+//
+// And a walk that starts between two nodes joins the surveyed road it stands
+// on before any plan is priced. A walker revived at its corpse stands on the
+// leg that killed it, so its next walk (a trainer walk, in the measured case)
+// joined that very road, walked it unpriced, and said nothing. The road join
+// now pays DiedOnLegPrice for a remembered leg like any planned leg does, and
+// DiedOnLegsOnRoute counts every leg of the route actually returned, the
+// joined road included, so a walk that still has to take one says so.
+std::vector<RouteLegSpan> LegsWalkedAtDeath(std::vector<RouteLegSpan> const& legs,
+                                            std::vector<RoutePoint> const& route,
+                                            std::uint32_t cursorAt, std::time_t steppedAt,
+                                            std::time_t now, float x, float y,
+                                            DiedOnLegLimits const& limits);
+
+// What walking the leg `from`-`to` (either direction) costs this walker on top
+// of its distance at `now`: `priceYards` while it is remembered, else 0.
+float DiedOnLegPrice(std::uint32_t from, std::uint32_t to, std::vector<DiedOnLeg> const& died,
+                     std::time_t now, DiedOnLegLimits const& limits);
+
+// How many legs of a returned route (its spans, joined road included) are
+// remembered deaths at `now`.
+std::uint32_t DiedOnLegsOnRoute(std::vector<RouteLegSpan> const& legs,
+                                std::vector<DiedOnLeg> const& died, std::time_t now);
+
+// How many remembered legs are still priced at `now`.
+std::uint32_t DiedOnLegsHeld(std::vector<DiedOnLeg> const& died, std::time_t now);
+
+// WHETHER A WALK TO A CREATURE FOLLOWS THE WALKER'S PRICED ROUTE (#1228). A
+// walk to a creature (a trainer, a vendor) is handed whole to upstream's
+// mover, which walks its own path and never asks the survey or its prices, so
+// the trainer walk after a death went back down the leg that killed. While the
+// walker holds any died-on leg it is stepped along the survey route planned
+// for it, which prices that leg, and the creature is handed over when the
+// route is spent. A place walk is always routed, so this is false for it, and
+// false for a walker that holds nothing, which keeps every other creature walk
+// exactly as it was.
+bool SteerCreatureWalkAlongRoute(bool creatureAim, std::uint32_t diedOnLegsHeld);
 
 // ------------------ a staging walk that is measured rather than routed (#342) --
 //
@@ -15162,6 +15233,16 @@ struct CastHoldFacts
     bool hasStay{false};    // the strategy whose action stands a bot still
     bool hasFollow{false};  // moved by the party rather than by its own drive
     bool hasNewRpg{false};  // the self-drive: relevance 11, outranks everything
+    // The strategy that lets CheckMountStateAction act at all (its isUseful
+    // returns false for an unmounted bot without it), and so the SOURCE of
+    // every re-mount mid-hold (#1229). Undoing a mount after it lands, every
+    // poll, lost a hearth cast every time: the member was back on the mount
+    // before the next cast could be driven.
+    bool hasMount{false};
+    // The hold is for a cast. A staging hold leaves the mount alone, the
+    // same way it leaves the stand state alone, because a party waiting at a
+    // door is not about to cast anything.
+    bool readyToCast{false};
 };
 
 // What the hold changes, and therefore exactly what the release owes back. A
@@ -15174,6 +15255,7 @@ struct CastHoldPlan
     bool addStay{false};
     bool dropFollow{false};
     bool dropNewRpg{false};
+    bool dropMount{false};  // suspended for the hold, restored by the release
 };
 
 // The plan, given what is there.
@@ -18636,6 +18718,17 @@ struct RaidRunStep
 // Is the raid wiped, by RAID_WIPE_PCT? See that constant.
 bool RaidWiped(RaidRunFacts const& facts);
 
+// THE RELEASE OF AN ENDED ATTEMPT WAITS, BUT NOT FOREVER (#1222). The release
+// keeps the raid while anybody is on the raid map, because a disband there is
+// a forced eviction from the instance. Nothing walks a living survivor out (up
+// to 10% can be standing, RAID_WIPE_PCT being 90, a feign-death hunter for
+// one), so without a bound the order stalls until that member dies or leaves.
+// From the poll whose release first did not finish (endingSince, 0 = none), the
+// wait is RAID_RELEASE_WAIT_SECONDS; after that the raid is disbanded with the
+// survivor inside, and the core's eviction puts the survivor out.
+constexpr long RAID_RELEASE_WAIT_SECONDS = 2 * 60;
+bool RaidReleaseDisbandsAnyway(std::time_t endingSince, std::time_t now);
+
 // THE WIPE BOOK (#1165). The adapter keeps three things about a run's wipes:
 // how many, when the last one was, and on which map. RaidWipeFacts copies them
 // into a poll's facts (samePlace: a wipe is on the book and it was on the
@@ -18668,6 +18761,7 @@ struct DungeonWipeBook
     std::time_t endedAt{0};          // when a repeat wipe ended the attempt (0 = never)
     std::uint32_t endedMap{0};       // and on which map
     bool holdSaid{false};            // the IDLE hold line was said for this ending
+    bool adoptionHoldSaid{false};    // and the refused-adoption line (#1223), on its own
 };
 
 // Books a family run that ended 'wipe' on `mapId` at `now`. True when it is a
@@ -18681,6 +18775,17 @@ bool DungeonWipeBookEndsAttempt(DungeonWipeBook& book, std::uint32_t mapId, std:
 // WIPE_SICK_HOLD_MAX_SECONDS. Another dungeon is never held.
 bool DungeonWipeHoldsRunStart(DungeonWipeBook const& book, std::uint32_t mapId,
                               bool membersSick, std::time_t now);
+
+// Whether IDLE refuses to ADOPT a run it finds a member already inside on
+// `mapId` (#1223). Adoption is the other way back into a held attempt: a ghost
+// that runs its corpse back through the portal is revived inside, and adopting
+// it at STAGED_INSIDE or CLEARING resumes the run at the same pull, which is
+// the loop the hold exists to end. So the same hold refuses it. A cleared
+// instance (EXIT) is still adopted, because that adoption only walks the
+// member out and starts nothing.
+bool DungeonWipeHoldsAdoption(DungeonWipeBook const& book, std::uint32_t mapId,
+                              bool membersSick, std::time_t now,
+                              DungeonRunAdoptPhase adoptAt);
 
 // A raid seat is due for repair when its lowest wearable item is below the
 // configured floor. An item with no maximum durability is not part of the
@@ -21156,10 +21261,28 @@ RouteLimits FarWalkRoadLimits();
 //     held where it stands with the family, and ask again;
 //   * otherwise the errand is refused, and the writer of the aim learns why.
 //
-// NOT JUDGED HERE, ON PURPOSE. A catch-up walk has its own leg rule (#697) and a
-// live dungeon run's walks are the run's; neither is this decision's to stop.
-// An aim at a creature is not judged either: ResolveTravelTarget already reads
-// the line to it before it is chosen (#300), and it has no planned road.
+// NOT JUDGED HERE, ON PURPOSE. A member's own catch-up walk has its own leg rule
+// (#697) and a live dungeon run's walks are the run's; neither is this
+// decision's to stop.
+//
+// AND WHAT #1209 ADDED, MEASURED 2026-10-18 TO 2026-10-27. The road check held
+// for a day and then 55 family deaths came back on the same road, levels 41 to
+// 48, nearly all of them members the check never judged. Two walks were let
+// through:
+//
+//   * THE LEADER GOING BACK FOR A MEMBER. That walk rides the catch-up lease,
+//     so the catch-up exclusion above let it through, and it is the walk the
+//     whole family follows: on 2026-10-25 the leader was sent back 13,044
+//     yards for a member in the south, the family behind him, and twelve deaths
+//     in Burning Steppes followed in sixteen minutes. It is the family's walk,
+//     not a lone member's, so it is judged here like any other (`leaderFetch`).
+//   * AN AIM AT A SPAWN (a vendor, a trainer). ResolveTravelTarget reads the
+//     line to it at the WALKER's level when it is chosen (#300), but the family
+//     behind the walker is younger. A long one is judged here too, along the
+//     straight line it is walked, at the youngest member's level (`spawnAim`).
+//
+// A follower is never judged on its own: it walks where its leader walks, so
+// judging every walk the leader is sent down is what holds the follower to it.
 
 // A walk shorter than this is not a journey and is walked as before.
 // TRAVEL_FLIGHT_MIN_YARDS: the distance at which this module already calls a
@@ -21176,8 +21299,14 @@ struct ErrandRoadFacts
     float walkYards{0.f};
     // The aim is a place (`at:` or `trigger:`), which is what has a planned road.
     bool placeAim{false};
+    // The aim is a spawn (a vendor, a trainer): its road is the straight line
+    // it is walked along (#1209).
+    bool spawnAim{false};
     // A catch-up walk (#697 judges it) or a live run's walk (the run's).
     bool catchUp{false};
+    // The catch-up walk is the LEADER going back for a member, with the family
+    // behind him. Judged, because it is the family's walk (#1209).
+    bool leaderFetch{false};
     bool liveRun{false};
     // JudgeRoute of the planned road from where the walker stands, read at the
     // youngest walking member's level under FarWalkRoadLimits. Unread is
@@ -21199,12 +21328,22 @@ enum class ErrandRoadStep : std::uint8_t
     Refuse,         // nothing carries it there but the road: the errand is refused
 };
 
+// Whether this walk is one the road decision judges at all, before its road is
+// read: a long walk to a place or a spawn, not a member's own catch-up (unless
+// it is the leader going back for a member), not a live run's walk. The module
+// reads the road only when this says yes; the road itself is not consulted.
+bool ErrandRoadJudges(ErrandRoadFacts const& facts);
+
 // THE ORDER IS THE PREFERENCE, and a flight is not in it because it is asked
 // before this is.
 ErrandRoadStep DecideErrandRoad(ErrandRoadFacts const& facts);
 
 // "walk", "hearth", "wait for hearth", "refuse".
 char const* ErrandRoadStepWord(ErrandRoadStep step);
+
+// Which walk was judged, for the log line that says the answer: "the leader
+// going back for a member", "a walk to a spawn", or "a walk to a place".
+char const* ErrandRoadWalkWord(ErrandRoadFacts const& facts);
 
 // The refusal recorded against the aim, and said to whoever wrote it.
 constexpr char const* ErrandLethalRoad =
@@ -22560,8 +22699,19 @@ bool KeepOutOfDeathZone(bool hearthOutFailed, bool stillInDeathZone,
 // Its answer is the `hearthOutFailed` that KeepOutOfDeathZone takes, so a
 // member killed far above its level is held where it stands rather than
 // handed back to the drives that walk it toward the killer again.
+//
+// AND A HOLD THAT KEEPS ENDING AT ITS CEILING WITHOUT A CAST (#1229). Each hold
+// placed for this hearth-out that reached its ceiling with no cast started is
+// counted, and `ceilingReleases` in a row at or past `ceilingBound` is a
+// hearth-out that cannot succeed either: the member goes to the keep-out
+// instead of a new hold that ends the same way. Measured before this, one
+// member was held, re-mounted, released at the ceiling and held again eleven
+// times in five minutes and never cast once.
+constexpr unsigned HEARTH_HOLD_CEILING_RELEASES = 3;
+
 bool HearthOutCannotSucceed(bool hasStone, bool stoneOnCooldown, unsigned tries,
-                            unsigned boundTries);
+                            unsigned boundTries, unsigned ceilingReleases = 0,
+                            unsigned ceilingBound = HEARTH_HOLD_CEILING_RELEASES);
 
 // "corpse_run", "spirit_healer", "wait", "ladder": the words written to
 // overseer_death.ghost_recovery and to the log.
@@ -26470,6 +26620,38 @@ bool OnTeldrassilIsland(std::uint32_t mapId, std::uint32_t zoneId);
 // destination's zone, read off the map's area data) are on different sides of
 // the water. A zone the map could not name (0) is not on the island.
 bool AcrossTeldrassilShore(std::uint32_t mapId, std::uint32_t fromZone, std::uint32_t toZone);
+
+// THE SHORE CHECK READS A ZONE ONLY NEAR THE ISLAND (#1224). Reading the zone
+// of a point (Map::GetZoneId) loads that point's grid on the world thread:
+// terrain, vmap and mmap tiles. Asked of every mailbox, vendor or spawn
+// candidate on map 1, one Kalimdor walk loaded grids all over the continent.
+// The box is the island zone's own world map rectangle (WorldMapArea for zone
+// 141: x 8437.5 to 11831.25, y -1277.08 to 3814.58), widened by a margin so
+// every point of the island, its shore and the Rut'theran dock is inside it.
+// It reaches no mainland zone: Darkshore ends at x 7133, Winterspring at x
+// 8223, and Moonglade lies south of y -1381. A point outside it is off the
+// island without asking the map, which is what a zone of 0 already meant.
+constexpr float TELDRASSIL_BOX_MIN_X = 8437.5f - 250.0f;
+constexpr float TELDRASSIL_BOX_MAX_X = 11831.25f + 250.0f;
+constexpr float TELDRASSIL_BOX_MIN_Y = -1277.08f - 250.0f;
+constexpr float TELDRASSIL_BOX_MAX_Y = 3814.58f + 250.0f;
+
+// Whether (x, y) on this map lies in the box around Teldrassil.
+bool NearTeldrassil(std::uint32_t mapId, float x, float y);
+
+// AcrossTeldrassilShore for a destination at (x, y), calling `zoneAt()` for its
+// zone only when the destination is near the island. `fromZone` is the
+// walker's own zone, which the walker already carries and costs nothing.
+template <typename ZoneAt>
+bool AcrossTeldrassilShoreAt(std::uint32_t mapId, std::uint32_t fromZone, float x, float y,
+                             ZoneAt&& zoneAt)
+{
+    if (mapId != TELDRASSIL_MAP)
+        return false;
+    if (!NearTeldrassil(mapId, x, y))
+        return OnTeldrassilIsland(mapId, fromZone);
+    return AcrossTeldrassilShore(mapId, fromZone, zoneAt());
+}
 
 // The ride a `cross-to-map` row must take first: `first` is false for every
 // member off the island, for a ride row, and for a row naming the island's own
