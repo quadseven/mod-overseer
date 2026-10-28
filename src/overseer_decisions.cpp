@@ -4345,6 +4345,7 @@ bool KindSharesChatTrigger(std::string const& kind)
         "chat",   "gm",     "probe",  "give",       "trade", "share",  "quest",
         "job",    "sell",   "repair", "buy",        "bank",  "auction", "bind",
         "hearth", "conjure", "cast",  "summon",     "guild", "naturalize", "mail",
+        "disenchant",
     };
     for (char const* own : OWN_HANDLER)
         if (kind == own)
@@ -24800,6 +24801,108 @@ bool StratholmeHearthLeavesTheYard(bool stoneReady, std::uint32_t bindMap, float
                                    float bindY)
 {
     return stoneReady && !InStratholmeExitYard(bindMap, bindX, bindY);
+}
+
+}  // namespace OverseerDecisions
+
+namespace OverseerDecisions
+{
+
+bool IsDisenchantRequest(std::string const& command)
+{
+    std::size_t const first = command.find_first_not_of(" \t");
+    if (first == std::string::npos)
+        return false;
+    std::size_t const last = command.find_last_not_of(" \t");
+    return command.compare(first, last - first + 1, DISENCHANT_REQUEST) == 0;
+}
+
+int PickDisenchantItem(std::vector<DisenchantCandidate> const& bags)
+{
+    for (std::size_t i = 0; i < bags.size(); ++i)
+    {
+        DisenchantCandidate const& c = bags[i];
+        if (c.quality == ITEM_QUALITY_GREEN && c.soulbound && !c.wearable && c.disenchantable &&
+            !c.refused)
+            return static_cast<int>(i);
+    }
+    return -1;
+}
+
+bool DisenchantReagentSeen(std::vector<DisenchantReagent> const& reagents)
+{
+    for (DisenchantReagent const& r : reagents)
+        if (r.now > r.before)
+            return true;
+    return false;
+}
+
+DisenchantStep DecideDisenchant(DisenchantFacts const& facts)
+{
+    // The bags first: a reagent seen is done whatever else is true.
+    if (facts.reagentSeen)
+        return DisenchantStep::Done;
+    if (facts.lootOnTarget)
+        return DisenchantStep::TakeLoot;
+    bool const budgetSpent = facts.castsSpent >= DISENCHANT_CASTS_ALLOWED && !facts.casting;
+    if (budgetSpent || facts.waitedMs >= DISENCHANT_WINDOW_MS)
+        return DisenchantStep::GiveUp;
+    if (!facts.present || !facts.able || facts.moving || facts.casting || facts.otherLootOpen)
+        return DisenchantStep::Wait;
+    if (!facts.hasItem)
+        return DisenchantStep::NoItem;
+    return DisenchantStep::Cast;
+}
+
+char const* DisenchantStepWord(DisenchantStep step)
+{
+    switch (step)
+    {
+        case DisenchantStep::Done:     return "done";
+        case DisenchantStep::TakeLoot: return "take-loot";
+        case DisenchantStep::Cast:     return "cast";
+        case DisenchantStep::Wait:     return "wait";
+        case DisenchantStep::NoItem:   return "no-item";
+        case DisenchantStep::GiveUp:   return "gave-up";
+    }
+    return "unknown";
+}
+
+bool DisenchantErrandStands(DisenchantStep step)
+{
+    return step == DisenchantStep::TakeLoot || step == DisenchantStep::Cast ||
+           step == DisenchantStep::Wait;
+}
+
+char const* DisenchantRowStatus(DisenchantStep step)
+{
+    if (step == DisenchantStep::Done)
+        return "applied";
+    if (DisenchantErrandStands(step))
+        return "";
+    return "unchanged";
+}
+
+char const* DisenchantRowDetail(DisenchantStep step)
+{
+    if (step == DisenchantStep::NoItem)
+        return "no soulbound green it cannot wear is in its bags";
+    if (step == DisenchantStep::GiveUp)
+        return "no disenchant reagent reached its bags";
+    return "";
+}
+
+std::string DisenchantResultJson(DisenchantEvidence const& ev, DisenchantStep step)
+{
+    return std::string("{\"outcome\":\"") + DisenchantStepWord(step) +
+           "\",\"item_entry\":" + std::to_string(ev.itemEntry) +
+           ",\"casts_spent\":" + std::to_string(ev.castsSpent) +
+           ",\"casts_refused\":" + std::to_string(ev.castsRefused) +
+           ",\"reagent_entry\":" + std::to_string(ev.reagentEntry) +
+           ",\"reagent_gained\":" + std::to_string(ev.reagentGained) +
+           ",\"waited_ms\":" + std::to_string(ev.waitedMs) +
+           ",\"mechanism\":\"Disenchant cast untriggered at an owned item; "
+           "the loot window taken with CMSG_AUTOSTORE_LOOT_ITEM; the bags read back\"}";
 }
 
 }  // namespace OverseerDecisions

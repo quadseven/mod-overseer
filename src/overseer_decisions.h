@@ -27276,6 +27276,132 @@ bool StratholmeButtonInReach(bool spawned, unsigned presses, std::uint32_t secon
 bool StratholmeHearthLeavesTheYard(bool stoneReady, std::uint32_t bindMap, float bindX,
                                    float bindY);
 
+// -- DriveDisenchant: an owned item disenchanted, the reagent read back (#444) --
+//
+// A kind='disenchant' row gives a character with Enchanting a standing errand:
+// disenchant one item it already owns, picked by a fixed rule (a soulbound
+// green it cannot wear), until a reagent of that item's disenchant loot is
+// counted in its bags. Group-loot disenchant votes are a different path
+// (LootDisenchantFacts above, PR #1112).
+//
+// "delivered is not done" (AGENTS.md): CastSpell answering SPELL_CAST_OK only
+// starts a timed cast; when it completes the core opens a LOOT_DISENCHANTING window
+// on the item, the character takes it, and the item is destroyed on release.
+// Only the bag count says a reagent arrived, so only the bag count ends the
+// errand as done.
+
+// Disenchant (Enchanting), the spell every enchanter learns with the trade.
+constexpr std::uint32_t DISENCHANT_SPELL = 13262;
+// ITEM_QUALITY_UNCOMMON in the core: a green.
+constexpr std::uint32_t ITEM_QUALITY_GREEN = 2;
+// Casts that may be accepted for one row before it gives up. A cast that ends
+// with nothing in the bags (a full bag sends the reagent to the mailbox) is
+// worth one more try on the next green, not an endless loop.
+constexpr unsigned DISENCHANT_CASTS_ALLOWED = 3;
+// How long one row may run, waits included, before it gives up.
+constexpr std::uint32_t DISENCHANT_WINDOW_MS = 120000;
+
+// The fixed rule's word, the whole command text of a kind='disenchant' row.
+// One word, so a later allocation rule can be another word.
+constexpr char DISENCHANT_REQUEST[] = "soulbound-green";
+
+// Whether `command` (blanks around it ignored) is a disenchant request.
+bool IsDisenchantRequest(std::string const& command);
+
+// One item in a character's bags, as the fixed rule reads it. `disenchantable`
+// is the core's own per-item test (a weapon or armour with a DisenchantID and a
+// skill requirement the character meets); `refused` marks an item CastSpell
+// already refused for this row, so it is not picked again.
+struct DisenchantCandidate
+{
+    std::uint32_t quality{0};
+    bool soulbound{false};
+    bool wearable{false};
+    bool disenchantable{false};
+    bool refused{false};
+};
+
+// The index of the first item, in bag order, that is a soulbound green the
+// character cannot wear, that the core would disenchant and that was not
+// refused already; -1 when none is.
+int PickDisenchantItem(std::vector<DisenchantCandidate> const& bags);
+
+// One reagent entry a disenchant window held: its bag count before the cast
+// and its bag count now.
+struct DisenchantReagent
+{
+    std::uint32_t entry{0};
+    std::uint32_t before{0};
+    std::uint32_t now{0};
+};
+
+// Whether any reagent is counted in the bags above its count before the cast.
+bool DisenchantReagentSeen(std::vector<DisenchantReagent> const& reagents);
+
+// What DriveDisenchant reads off the character for one errand on one poll.
+struct DisenchantFacts
+{
+    bool present{false};        // in the world
+    bool able{false};           // alive, out of combat, not flying, not trading
+    bool moving{false};
+    bool casting{false};        // a cast (this row's own, likely) is in flight
+    bool lootOnTarget{false};   // the loot window is on this row's item
+    bool otherLootOpen{false};  // a loot window is open on something else
+    bool reagentSeen{false};    // DisenchantReagentSeen over the bag counts
+    bool hasItem{false};        // PickDisenchantItem found one
+    unsigned castsSpent{0};     // casts CastSpell accepted for this row
+    unsigned castsRefused{0};   // casts CastSpell refused for this row
+    std::uint32_t waitedMs{0};
+};
+
+// Done: a reagent is in the bags; the errand is cleared. TakeLoot: take the
+// window on the item and release it. Cast: cast Disenchant at the picked item.
+// Wait: the character cannot cast this poll; the errand stands. NoItem: nothing
+// in the bags fits the rule; the errand is cleared. GiveUp: the budget or the
+// window ran out with nothing seen; the errand is cleared.
+enum class DisenchantStep : std::uint8_t
+{
+    Done,
+    TakeLoot,
+    Cast,
+    Wait,
+    NoItem,
+    GiveUp,
+};
+
+DisenchantStep DecideDisenchant(DisenchantFacts const& facts);
+
+char const* DisenchantStepWord(DisenchantStep step);
+
+// Whether the errand is still standing after this step: true for TakeLoot,
+// Cast and Wait, the DriveCraft discipline for a transient refusal.
+bool DisenchantErrandStands(DisenchantStep step);
+
+// The overseer_command.status a step ends its row with: "applied" for Done,
+// "unchanged" for NoItem and GiveUp, and "" for a standing errand, whose row
+// stays `verifying`. A closed set, so the row update writes no free text.
+char const* DisenchantRowStatus(DisenchantStep step);
+
+// The overseer_command.detail a step ends its row with, from the same closed
+// set: "" for Done and for a standing errand, a fixed sentence otherwise. None
+// carries a quote character.
+char const* DisenchantRowDetail(DisenchantStep step);
+
+// What a row's result JSON says, numbers only.
+struct DisenchantEvidence
+{
+    std::uint32_t itemEntry{0};
+    unsigned castsSpent{0};
+    unsigned castsRefused{0};
+    std::uint32_t reagentEntry{0};
+    std::uint32_t reagentGained{0};
+    std::uint32_t waitedMs{0};
+};
+
+// The row's result: the step's word and the evidence's numbers, nothing else,
+// so it holds no quote character.
+std::string DisenchantResultJson(DisenchantEvidence const& ev, DisenchantStep step);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

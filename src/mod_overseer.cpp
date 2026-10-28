@@ -130,6 +130,18 @@
  *                     back between every one. `up_to:<n>` is a total and not
  *                     an amount to add, so a row that stopped short can simply
  *                     be sent again. See 2026_09_08_01_overseer_conjure.sql.
+ *      kind='disenchant' - have a character with Enchanting disenchant one item
+ *                     it already owns, picked by a fixed rule (`soulbound-green`,
+ *                     the whole command text: a soulbound green it cannot
+ *                     wear), and count the reagent that lands in its bags. The
+ *                     handler casts NOTHING: the row parks in `verifying` and
+ *                     DriveDisenchant casts Disenchant at the item, takes the
+ *                     LOOT_DISENCHANTING window with the packets a client's
+ *                     click sends, and ends the row `applied` only when a
+ *                     reagent that window held is counted in the bags above its
+ *                     count before. A refusal that passes (a fight, a cast in
+ *                     flight, a cooldown) leaves the errand standing, as
+ *                     DriveCraft does. See 2026_10_26_00_overseer_disenchant.sql.
  *
  *     WHAT A FINISHED ROW CLAIMS. `delivered` means the module carried the
  *     row out. It has never meant the BOT CHANGED, because a whispered
@@ -260,6 +272,7 @@
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
 #include "Creature.h"
+#include "Spell.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "Timer.h"
@@ -59301,6 +59314,10 @@ private:
         // single call can wait that out (#147).
         ResolveConjureChecks(sincePollMs);
 
+        // ...and the disenchants, which this poll also DRIVES: a cast, then a
+        // loot window, then the bags read back (#444).
+        DriveDisenchant(sincePollMs);
+
         // ...and the casts, which wait out one cast time each and then read
         // the world for the thing the spell was supposed to do (#408). After
         // the conjures for no deeper reason than that a poll should end the
@@ -59649,6 +59666,8 @@ private:
                                   _pendingSummons, id);
             else if (kind == "conjure")
                 detail = DoConjure(player, command, status, rowResult, _pendingConjures, id);
+            else if (kind == "disenchant")
+                detail = DoDisenchant(player, command, status, rowResult, _pendingDisenchants, id);
             else if (kind == "cast" && OverseerDecisions::IsTrainerWalkRow(command))
                 // The mailbox walk aimed at a trainer (#621). On kind='cast'
                 // beside `use`, the other verb that teaches a character
@@ -70161,6 +70180,351 @@ private:
         _pendingConjures.swap(stillRunning);
     }
 
+    // ---------------------------------------------------------- disenchant --
+    //
+    // kind='disenchant' (#444): a character with Enchanting disenchants one
+    // item it already owns and the reagent is counted in its bags. Strange Dust
+    // has no other source, and the first enchant the guide trains consumes it.
+    //
+    // THE PATH, read in the pinned core. CastSpell with an item target runs
+    // Spell::CheckCast, whose SPELL_EFFECT_DISENCHANT case refuses an item the
+    // caster does not own, a quality outside green to purple, a class other
+    // than weapon or armour, no DisenchantID, or an Enchanting skill below the
+    // item's RequiredDisenchantSkill. When the cast completes, Spell::EffectDisEnchant
+    // calls Player::SendLoot(item, LOOT_DISENCHANTING), which fills item->loot
+    // from the item's DisenchantID and sets the character's loot guid to the
+    // item. A client then sends CMSG_AUTOSTORE_LOOT_ITEM per slot, and the core
+    // releases and destroys the item once its loot is taken (DoLootRelease).
+    // A bot has no client, so DriveDisenchant sends those packets itself, the
+    // way DoOpenLockboxes does for a picked lockbox.
+    //
+    // THE PROOF IS THE BAGS. mod-playerbots' own loot strategy may answer the
+    // window first; either way what decides the row is the bag count of every
+    // reagent the window held (noted by NoteDisenchantLoot as the window
+    // opens), against that count before anything was taken.
+    //
+    // NO BLOCKING DATABASE CALL IN THE POLL. The errand lives in _pendingDisenchants
+    // from the row's claim until it ends, so DriveDisenchant reads nothing from
+    // the database, and its one write is the row's end, enqueued through
+    // CharacterDatabase.Execute like every resolver here, with values from
+    // OverseerDecisions' closed sets.
+
+    struct DisenchantCheck
+    {
+        uint32 id{0};
+        std::string targetName;
+        // The item the last cast went at, and every item CastSpell refused for
+        // this row, so the rule picks another.
+        ObjectGuid item;
+        std::set<ObjectGuid> refused;
+        OverseerDecisions::DisenchantEvidence ev;
+    };
+
+    // DISENCHANTS STILL RUNNING. World thread only, like _pendingConjures, and
+    // bounded the same way: one per character, and each ends inside
+    // DISENCHANT_WINDOW_MS.
+    std::vector<DisenchantCheck> _pendingDisenchants;
+
+    // What a character's disenchant window held: the item it is on, and each
+    // reagent entry with its bag count as the window opened.
+    struct DisenchantWindow
+    {
+        uint64 item{0};
+        std::map<uint32, uint32> before;
+    };
+
+    static std::mutex& DisenchantWindowsLock()
+    {
+        static std::mutex lock;
+        return lock;
+    }
+
+    // By name, for the characters with a disenchant row running and no one
+    // else: DoDisenchant adds a name, FinishDisenchant removes it, and the
+    // hook only fills a name already here. Written from a map thread by the
+    // hook, read on the world thread, so behind DisenchantWindowsLock.
+    static std::map<std::string, DisenchantWindow>& DisenchantWindows()
+    {
+        static std::map<std::string, DisenchantWindow> windows;
+        return windows;
+    }
+
+    static void ExpectDisenchantCast(std::string const& name, ObjectGuid item)
+    {
+        std::lock_guard<std::mutex> guard(DisenchantWindowsLock());
+        DisenchantWindow& window = DisenchantWindows()[name];
+        window.item = item.GetRawValue();
+        window.before.clear();
+    }
+
+    static void ForgetDisenchantWindow(std::string const& name)
+    {
+        std::lock_guard<std::mutex> guard(DisenchantWindowsLock());
+        DisenchantWindows().erase(name);
+    }
+
+    static DisenchantWindow CopyDisenchantWindow(std::string const& name)
+    {
+        std::lock_guard<std::mutex> guard(DisenchantWindowsLock());
+        auto const it = DisenchantWindows().find(name);
+        return it == DisenchantWindows().end() ? DisenchantWindow() : it->second;
+    }
+
+public:
+    // THE REAGENTS A DISENCHANT WINDOW HOLDS, noted from Player::SendLoot
+    // (OverseerChestScript) after the loot is filled and before anything can
+    // take it, with each one's bag count at that moment. Read only: nothing
+    // is taken here, because this runs inside the spell's own effect and the
+    // item it would destroy is still the spell's target.
+    static void NoteDisenchantLoot(Player* who, ObjectGuid item, Loot const& loot)
+    {
+        std::lock_guard<std::mutex> guard(DisenchantWindowsLock());
+        auto const it = DisenchantWindows().find(who->GetName());
+        if (it == DisenchantWindows().end() || it->second.item != item.GetRawValue())
+            return;
+        it->second.before.clear();
+        for (LootItem const& li : loot.items)
+            it->second.before[li.itemid] = who->GetItemCount(li.itemid);
+    }
+
+private:
+    // The core's own per-item test in CheckCast's SPELL_EFFECT_DISENCHANT case,
+    // read so the rule never picks an item the cast would refuse.
+    static bool CoreWouldDisenchant(Player* bot, ItemTemplate const* proto)
+    {
+        if (proto->Class != ITEM_CLASS_WEAPON && proto->Class != ITEM_CLASS_ARMOR)
+            return false;
+        if (!proto->DisenchantID || proto->RequiredDisenchantSkill == uint32(-1))
+            return false;
+        return proto->RequiredDisenchantSkill <= bot->GetSkillValue(SKILL_ENCHANTING);
+    }
+
+    // The item the fixed rule picks out of the backpack and the worn bags
+    // (OverseerDecisions::PickDisenchantItem), or nullptr.
+    static Item* PickDisenchantTarget(Player* bot, std::set<ObjectGuid> const& refused)
+    {
+        std::vector<Item*> items;
+        std::vector<OverseerDecisions::DisenchantCandidate> bags;
+        auto note = [&](Item* item)
+        {
+            ItemTemplate const* proto = item ? item->GetTemplate() : nullptr;
+            if (!proto)
+                return;
+            OverseerDecisions::DisenchantCandidate c;
+            c.quality = proto->Quality;
+            c.soulbound = item->IsSoulBound();
+            c.wearable = bot->CanUseItem(proto) == EQUIP_ERR_OK;
+            c.disenchantable = CoreWouldDisenchant(bot, proto);
+            c.refused = refused.count(item->GetGUID()) != 0;
+            items.push_back(item);
+            bags.push_back(c);
+        };
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            note(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
+        for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+            if (Bag* bag = bot->GetBagByPos(bagSlot))
+                for (uint32 i = 0; i < bag->GetBagSize(); ++i)
+                    note(bag->GetItemByPos(i));
+        int const pick = OverseerDecisions::PickDisenchantItem(bags);
+        return pick < 0 ? nullptr : items[pick];
+    }
+
+    // THE BAGS READ BACK: every reagent the window held, its count now against
+    // its count as the window opened. The first that rose goes in the row.
+    static bool ReadDisenchantReagents(Player* bot, DisenchantCheck& check)
+    {
+        DisenchantWindow const window = CopyDisenchantWindow(check.targetName);
+        std::vector<OverseerDecisions::DisenchantReagent> reagents;
+        for (auto const& [entry, before] : window.before)
+        {
+            OverseerDecisions::DisenchantReagent r;
+            r.entry = entry;
+            r.before = before;
+            r.now = bot->GetItemCount(entry);
+            if (r.now > r.before && !check.ev.reagentEntry)
+            {
+                check.ev.reagentEntry = entry;
+                check.ev.reagentGained = r.now - r.before;
+            }
+            reagents.push_back(r);
+        }
+        return OverseerDecisions::DisenchantReagentSeen(reagents);
+    }
+
+    static bool AbleToDisenchant(Player* bot)
+    {
+        WorldSession* const session = bot->GetSession();
+        return session && !SessionIsLoggingOut(session) && bot->IsAlive() &&
+               !bot->IsInCombat() && !bot->IsInFlight() && !bot->GetTradeData() &&
+               bot->HasSpell(OverseerDecisions::DISENCHANT_SPELL);
+    }
+
+    static OverseerDecisions::DisenchantFacts ReadDisenchantFacts(Player* bot,
+                                                                  DisenchantCheck& check,
+                                                                  Item*& pick)
+    {
+        OverseerDecisions::DisenchantFacts facts;
+        facts.castsSpent = check.ev.castsSpent;
+        facts.castsRefused = check.ev.castsRefused;
+        facts.waitedMs = check.ev.waitedMs;
+        pick = nullptr;
+        if (!bot || !bot->IsInWorld())
+            return facts;
+        facts.present = true;
+        facts.reagentSeen = ReadDisenchantReagents(bot, check);
+        facts.able = AbleToDisenchant(bot);
+        facts.moving = bot->isMoving();
+        facts.casting = bot->IsNonMeleeSpellCast(false);
+        ObjectGuid const loot = bot->GetLootGUID();
+        facts.lootOnTarget = !loot.IsEmpty() && loot == check.item;
+        facts.otherLootOpen = !loot.IsEmpty() && !facts.lootOnTarget;
+        pick = PickDisenchantTarget(bot, check.refused);
+        facts.hasItem = pick != nullptr;
+        return facts;
+    }
+
+    // Cast Disenchant at the picked item. Accepted only starts the cast: the
+    // row is judged on the bags. A refusal leaves the errand standing; an item
+    // the core will not disenchant is not picked again for this row.
+    static void CastDisenchant(Player* bot, DisenchantCheck& check, Item* item)
+    {
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(OverseerDecisions::DISENCHANT_SPELL);
+        if (!info)
+            return;  // DoDisenchant refused the row already; the window ends it
+        check.item = item->GetGUID();
+        check.ev.itemEntry = item->GetEntry();
+        ExpectDisenchantCast(check.targetName, check.item);
+        SpellCastTargets targets;
+        targets.SetItemTarget(item);
+        // natural-only: Disenchant, a spell the character knows (HasSpell in
+        // AbleToDisenchant), cast untriggered at an item it owns; CheckCast
+        // refuses anything a player could not disenchant.
+        SpellCastResult const result = bot->CastSpell(targets, info, nullptr, TRIGGERED_NONE);
+        if (result == SPELL_CAST_OK)
+        {
+            ++check.ev.castsSpent;
+            LOG_INFO("module.overseer",
+                     "overseer: disenchant {} - '{}' casts Disenchant at item {} ({}); judged on "
+                     "its bags, not on the cast",
+                     check.id, check.targetName, check.ev.itemEntry, item->GetTemplate()->Name1);
+            return;
+        }
+        ++check.ev.castsRefused;
+        if (result == SPELL_FAILED_CANT_BE_DISENCHANTED || result == SPELL_FAILED_LOW_CASTLEVEL)
+            check.refused.insert(check.item);
+        LOG_INFO("module.overseer",
+                 "overseer: disenchant {} - '{}' was refused casting Disenchant at item {} "
+                 "(SpellCastResult {}) - leaving the errand standing for the next poll",
+                 check.id, check.targetName, check.ev.itemEntry, static_cast<uint32>(result));
+    }
+
+    // Take the window on the item as a client's clicks would, then release
+    // it. The core destroys the item once its loot is taken, which also
+    // clears the loot guid, so each take first asks whether the window is
+    // still on the item.
+    static void TakeDisenchantLoot(Player* bot, DisenchantCheck const& check)
+    {
+        WorldSession* const session = bot->GetSession();
+        Item* item = bot->GetItemByGuid(check.item);
+        if (!session || !item)
+            return;
+        std::vector<uint8> const slots = OverseerDecisions::ChestLootSlots(
+            check.item.GetRawValue(), bot->GetLootGUID().GetRawValue(), item->loot.items.size(),
+            item->loot.quest_items.size());
+        for (uint8 const slot : slots)
+        {
+            if (bot->GetLootGUID() != check.item)
+                break;
+            WorldPacket take(CMSG_AUTOSTORE_LOOT_ITEM, 1);
+            take << slot;
+            take.rpos(0);
+            session->HandleAutostoreLootItemOpcode(take);
+        }
+        if (bot->GetLootGUID() != check.item)
+            return;
+        WorldPacket release(CMSG_LOOT_RELEASE, 8);
+        release << check.item;
+        release.rpos(0);
+        session->HandleLootReleaseOpcode(release);
+    }
+
+    // The row's end. Every value is from a closed set (the step's status,
+    // detail and numbers-only JSON), escaped as well like every detail and
+    // result in this file; the id is the row this run claimed, and g_runToken
+    // is this run's own. Execute enqueues it.
+    static void FinishDisenchant(DisenchantCheck const& check, OverseerDecisions::DisenchantStep step)
+    {
+        ForgetDisenchantWindow(check.targetName);
+        LOG_INFO("module.overseer",
+                 "overseer: disenchant {} - '{}' {}: item {}, {} cast(s) accepted, {} refused, "
+                 "reagent {} x{} counted in the bags, {}ms",
+                 check.id, check.targetName, OverseerDecisions::DisenchantStepWord(step),
+                 check.ev.itemEntry, check.ev.castsSpent, check.ev.castsRefused,
+                 check.ev.reagentEntry, check.ev.reagentGained, check.ev.waitedMs);
+        CharacterDatabase.Execute(
+            "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
+            "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
+            OverseerDecisions::DisenchantRowStatus(step),
+            Esc(OverseerDecisions::DisenchantRowDetail(step)),
+            EscLong(OverseerDecisions::DisenchantResultJson(check.ev, step)), check.id, g_runToken);
+    }
+
+    // THE ROW'S CLAIM. Refuses what no poll can change, then parks the row in
+    // `verifying` with the errand standing; DriveDisenchant casts.
+    static char const* DoDisenchant(Player* who, std::string const& command,
+                                    char const*& status, std::string& out,
+                                    std::vector<DisenchantCheck>& parked, uint32 id)
+    {
+        if (!OverseerDecisions::IsDisenchantRequest(command))
+            return "a disenchant row's command is soulbound-green";
+        for (DisenchantCheck const& running : parked)
+            if (running.targetName == who->GetName())
+                return "a disenchant is already running for this character";
+        if (!who->HasSpell(OverseerDecisions::DISENCHANT_SPELL))
+            return "the character does not know Disenchant";
+        if (!sSpellMgr->GetSpellInfo(OverseerDecisions::DISENCHANT_SPELL))
+            return "no Disenchant spell in this world";
+
+        DisenchantCheck check;
+        check.id = id;
+        check.targetName = who->GetName();
+        parked.push_back(check);
+        ExpectDisenchantCast(check.targetName, ObjectGuid::Empty);
+        status = "verifying";
+        out = OverseerDecisions::DisenchantResultJson(check.ev, OverseerDecisions::DisenchantStep::Wait);
+        LOG_INFO("module.overseer",
+                 "overseer: disenchant {} - '{}' will disenchant a soulbound green it cannot "
+                 "wear; judging in up to {}ms",
+                 id, check.targetName, OverseerDecisions::DISENCHANT_WINDOW_MS);
+        return "";
+    }
+
+    // THE STANDING ERRANDS, one step each per poll (OverseerDecisions::
+    // DecideDisenchant). A step that leaves the errand standing keeps it for
+    // the next poll, as DriveCraft keeps a refused craft; the rest end the row.
+    void DriveDisenchant(uint32 elapsedMs)
+    {
+        std::vector<DisenchantCheck> stillRunning;
+        stillRunning.reserve(_pendingDisenchants.size());
+        for (DisenchantCheck& check : _pendingDisenchants)
+        {
+            check.ev.waitedMs += elapsedMs;
+            Player* bot = ObjectAccessor::FindPlayerByName(check.targetName);
+            Item* pick = nullptr;
+            OverseerDecisions::DisenchantStep const step =
+                OverseerDecisions::DecideDisenchant(ReadDisenchantFacts(bot, check, pick));
+            if (step == OverseerDecisions::DisenchantStep::TakeLoot)
+                TakeDisenchantLoot(bot, check);
+            else if (step == OverseerDecisions::DisenchantStep::Cast)
+                CastDisenchant(bot, check, pick);
+            if (OverseerDecisions::DisenchantErrandStands(step))
+                stillRunning.push_back(check);
+            else
+                FinishDisenchant(check, step);
+        }
+        _pendingDisenchants.swap(stillRunning);
+    }
+
     // -------------------------------------------------------------- hearth --
     //
     // Send a family member home on the game's own hearthstone: the item in its
@@ -80640,8 +81004,10 @@ private:
 // THE CHEST A MEMBER OPENED IS LOOTED BY IT (2026-10-09). Player::SendLoot calls
 // this after the window's loot is filled and before the window is sent, so the
 // member takes its loot (OverseerWorldScript::TakeChestLoot) before the bot's
-// own loot strategy can read the window and close it. Every other loot window
-// on the world leaves on the gameobject test or the registry lookup.
+// own loot strategy can read the window and close it. A disenchant row's
+// window on an item has its reagents noted and nothing taken (#444). Every
+// other loot window on the world leaves on the gameobject test or the registry
+// lookup.
 class OverseerChestScript : public PlayerScript
 {
 public:
@@ -80651,7 +81017,16 @@ public:
 
     void OnPlayerBeforeSendLoot(Player* player, ObjectGuid lootGuid, Loot* loot) override
     {
-        if (!player || !loot || !lootGuid.IsGameObject())
+        if (!player || !loot)
+            return;
+        // A disenchant row's window: its reagents are noted, nothing is taken
+        // (OverseerWorldScript::NoteDisenchantLoot, #444).
+        if (lootGuid.IsItem() && loot->loot_type == LOOT_DISENCHANTING)
+        {
+            OverseerWorldScript::NoteDisenchantLoot(player, lootGuid, *loot);
+            return;
+        }
+        if (!lootGuid.IsGameObject())
             return;
         OverseerWorldScript::TakeChestLoot(player, lootGuid, *loot);
     }
