@@ -85,7 +85,7 @@ int CheckTheRaidRelease(std::string const& text)
         return Fail("cannot find DriveRaidRun");
     if (drive.find("facts.attemptEnding = run.attemptEnding;") == std::string::npos)
         return Fail("the raid facts must carry an attempt that is still ending");
-    std::size_t const release = drive.find("if (ReleaseRaidRun(roster.family, run, door))");
+    std::size_t const release = drive.find("if (ReleaseRaidRun(roster.family, run, door, std::time(nullptr)))");
     if (release == std::string::npos)
         return Fail("cannot find the raid release");
     std::size_t const fresh = drive.find("run = RaidRunState();", release);
