@@ -23694,6 +23694,12 @@ bool AcrossTeldrassilShore(std::uint32_t mapId, std::uint32_t fromZone, std::uin
            OnTeldrassilIsland(mapId, fromZone) != OnTeldrassilIsland(mapId, toZone);
 }
 
+bool NearTeldrassil(std::uint32_t mapId, float x, float y)
+{
+    return mapId == TELDRASSIL_MAP && x >= TELDRASSIL_BOX_MIN_X && x <= TELDRASSIL_BOX_MAX_X &&
+           y >= TELDRASSIL_BOX_MIN_Y && y <= TELDRASSIL_BOX_MAX_Y;
+}
+
 IslandFirstLeg CrossIslandFirst(std::uint32_t mapId, std::uint32_t zoneId,
                                 CrossRequest const& request)
 {

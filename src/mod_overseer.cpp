@@ -77458,10 +77458,16 @@ private:
             spawns.erase(std::remove_if(spawns.begin(), spawns.end(),
                                         [who, map, fromZone](Spawn const& spawn)
                                         {
-                                            return D::AcrossTeldrassilShore(
-                                                D::TELDRASSIL_MAP, fromZone,
-                                                map->GetZoneId(who->GetPhaseMask(), spawn.x,
-                                                               spawn.y, spawn.z));
+                                            // The zone is read only near the island:
+                                            // reading it loads the grid (#1224).
+                                            return D::AcrossTeldrassilShoreAt(
+                                                D::TELDRASSIL_MAP, fromZone, spawn.x, spawn.y,
+                                                [who, map, &spawn]
+                                                {
+                                                    return map->GetZoneId(who->GetPhaseMask(),
+                                                                          spawn.x, spawn.y,
+                                                                          spawn.z);
+                                                });
                                         }),
                          spawns.end());
             std::size_t const across = before - spawns.size();
