@@ -13204,6 +13204,12 @@ CastHoldPlan PlanCastHold(CastHoldFacts const& facts)
     // hold that leaves `follow` on has stopped nothing.
     plan.dropFollow = facts.hasFollow;
     plan.dropNewRpg = facts.hasNewRpg;
+    // AND THE RE-MOUNT IS STOPPED AT ITS SOURCE FOR A CAST (#1229). The hold
+    // takes a casting character off its mount, and CheckMountStateAction put
+    // it straight back every few seconds while its travel target was far away.
+    // Without `mount` that action is not useful for an unmounted bot, so the
+    // dismount stays done. Removed only if present, for the reason above.
+    plan.dropMount = facts.readyToCast && facts.hasMount;
     return plan;
 }
 
@@ -18380,9 +18386,11 @@ bool KeepOutOfDeathZone(bool hearthOutFailed, bool stillInDeathZone,
 }
 
 bool HearthOutCannotSucceed(bool hasStone, bool stoneOnCooldown, unsigned tries,
-                            unsigned boundTries)
+                            unsigned boundTries, unsigned ceilingReleases,
+                            unsigned ceilingBound)
 {
-    return !hasStone || stoneOnCooldown || tries >= boundTries;
+    return !hasStone || stoneOnCooldown || tries >= boundTries ||
+           ceilingReleases >= ceilingBound;
 }
 
 HeadTradeAnswer AnswerTradeAtHead(bool traderIsKin, uint32_t theyOffer, uint32_t theirCopper,
