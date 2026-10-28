@@ -6,7 +6,9 @@
  * it is written to overseer_approach_quarantine when FailApproach closes the
  * attempt, read back by the IDLE gate before it decides, and deleted only when
  * the pure decision clears it. A restart between the failure and the next poll
- * used to forget it and re-open the run from the same rim.
+ * used to forget it and re-open the run from the same rim. Both quarantine
+ * lines carry `staging_failed` and `overseer_approach_quarantine` in
+ * backticks, so the live log names the decision by the exact string.
  */
 
 #include <fstream>
@@ -66,6 +68,14 @@ int main()
                 "FailApproach writes the row for its family");
         Require(source, "LoadApproachQuarantine(family, coord)",
                 "the IDLE gate loads the row before deciding");
+        Require(source, "\"`staging_failed` recorded in `overseer_approach_quarantine`: \"",
+                "the failed approach's quarantine line names the outcome and table");
+        Require(source, "dungeon run QUARANTINED `staging_failed` - leader '{}' at {} ",
+                "the IDLE quarantine block line names the outcome");
+        Require(source, "is still near the refused position {} held in ",
+                "the IDLE quarantine block line names the refused position");
+        Require(source, "\"`overseer_approach_quarantine`. \"",
+                "the IDLE quarantine block line names the table");
     }
     if (Read("data/sql/characters/base/2026_10_25_00_overseer_approach_quarantine.sql",
              schema))

@@ -39905,6 +39905,7 @@ private:
 
         LOG_WARN("module.overseer",
                  "overseer: dungeon run {} of campaign {} QUARANTINED at {} - "
+                 "`staging_failed` recorded in `overseer_approach_quarantine`: "
                  "leader was above the staging point and not descending",
                  coord.runNumber, coord.campaignId,
                  OverseerDecisions::BacktickedPosition(leaderX, leaderY, leaderZ));
@@ -54121,8 +54122,9 @@ private:
                     if (action == OverseerDecisions::ApproachQuarantineAction::Block)
                     {
                         LOG_WARN("module.overseer",
-                                 "overseer: dungeon run QUARANTINED - leader '{}' at {} "
-                                 "is still near the refused position {}. "
+                                 "overseer: dungeon run QUARANTINED `staging_failed` - leader '{}' at {} "
+                                 "is still near the refused position {} held in "
+                                 "`overseer_approach_quarantine`. "
                                  "Run will not open until leader moves to a walkable approach.",
                                  leaderName,
                                  OverseerDecisions::BacktickedPosition(
