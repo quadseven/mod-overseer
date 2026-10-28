@@ -44872,6 +44872,26 @@ private:
                         &members);
     }
 
+    // QUARANTINE AFTER FAILED APPROACH (#396), CARRIED ACROSS EVERY RESET
+    // (#1226). The quarantine is a fact about where the leader stands, not
+    // about the run that just ended, so it outlives the coordinator it was
+    // written on: IDLE clears it once the leader is away from the refused
+    // spot or the approach reads walkable. Every way out of EndRunAndDecide
+    // resets through here; resetting with a bare DungeonRunCoordinatorState()
+    // is how the evacuated and repeat-wipe returns dropped it, and a family
+    // that wiped twice after a quarantined approach could then be re-opened
+    // from the refused spot.
+    void ResetCoordinatorKeepingQuarantine(DungeonRunCoordinatorState& coord)
+    {
+        DungeonRunCoordinatorState fresh;
+        fresh.quarantined = coord.quarantined;
+        fresh.quarantineX = coord.quarantineX;
+        fresh.quarantineY = coord.quarantineY;
+        fresh.quarantineZ = coord.quarantineZ;
+        fresh.quarantineSince = coord.quarantineSince;
+        coord = fresh;
+    }
+
     // THE END OF A RUN, AND THE DECISION TO GO AGAIN.
     //
     // Every path that used to say "the run is over, returning to IDLE" comes
@@ -44973,14 +44993,6 @@ private:
         float const stageY = coord.stageY;
         float const stageZ = coord.stageZ;
 
-        // QUARANTINE AFTER FAILED APPROACH (#396). Preserve quarantine state
-        // across the coordinator reset so the next IDLE poll can check it.
-        bool const wasQuarantined = coord.quarantined;
-        float const quarantineX = coord.quarantineX;
-        float const quarantineY = coord.quarantineY;
-        float const quarantineZ = coord.quarantineZ;
-        time_t const quarantineSince = coord.quarantineSince;
-
         // THE BAGS OUTRANK THE COUNT TOO, AND FOR A SHARPER REASON THAN THE
         // OPERATOR DOES (#429). Re-arming here sets REPAIRING, and a campaign
         // that re-arms never returns to IDLE - which is the only phase
@@ -45001,7 +45013,7 @@ private:
                      "and the coordinator returns to IDLE so the town trip that empties "
                      "those bags is allowed to run at all",
                      runId, outcome, reason, campaignId);
-            coord = DungeonRunCoordinatorState();
+            ResetCoordinatorKeepingQuarantine(coord);
             return;
         }
 
@@ -45020,7 +45032,7 @@ private:
                      "'{}' no longer has job = 'dungeon', and the campaign counter does "
                      "not outrank the operator",
                      runId, outcome, reason, leaderName);
-            coord = DungeonRunCoordinatorState();
+            ResetCoordinatorKeepingQuarantine(coord);
             return;
         }
 
@@ -45031,7 +45043,7 @@ private:
                      "database has no dungeon_runs_wanted column, so there is no cap to "
                      "bound a loop with and looping without one is the worse direction to "
                      "guess in", runId, outcome, reason);
-            coord = DungeonRunCoordinatorState();
+            ResetCoordinatorKeepingQuarantine(coord);
             return;
         }
 
@@ -45050,7 +45062,7 @@ private:
                      "until a named item drops (#150) - do not exist yet; this loop stops "
                      "on the count and on nothing else",
                      runId, outcome, reason, finished, wanted, campaignId);
-            coord = DungeonRunCoordinatorState();
+            ResetCoordinatorKeepingQuarantine(coord);
             return;
         }
 
@@ -45069,19 +45081,14 @@ private:
                      "carries Resurrection Sickness",
                      runId, outcome, reason, _dungeonWipeBooks[leaderName].wipes, leaderName,
                      portal.insideMapId, uint32(OverseerDecisions::WIPE_LOOP_SECONDS));
-            coord = DungeonRunCoordinatorState();
+            ResetCoordinatorKeepingQuarantine(coord);
             return;
         }
 
-        coord = DungeonRunCoordinatorState();
-        // QUARANTINE AFTER FAILED APPROACH (#396). Restore quarantine state
-        // so the next IDLE poll can check it and refuse to re-open while the
-        // leader is still at or near the refused position.
-        coord.quarantined = wasQuarantined;
-        coord.quarantineX = quarantineX;
-        coord.quarantineY = quarantineY;
-        coord.quarantineZ = quarantineZ;
-        coord.quarantineSince = quarantineSince;
+        // QUARANTINE AFTER FAILED APPROACH (#396): carried, so the next IDLE
+        // poll still refuses to re-open while the leader is at or near the
+        // refused position.
+        ResetCoordinatorKeepingQuarantine(coord);
 
         // THE NEXT RUN DOES NOT OPEN ON BROKEN GEAR (#391). This used to set
         // RESETTING directly, and that one assignment is why a hundred-run
