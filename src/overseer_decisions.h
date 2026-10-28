@@ -21337,6 +21337,13 @@ struct RaidTimelineSnapshot
     unsigned skips{0};        // `dc skip`s, in all
     bool mainTankMarked{false};
     bool cleared{false};
+    // WHO REACHED THE DOOR (wow-overseer#765, #1207): taken on the poll that
+    // ends ASSEMBLE, so the ASSEMBLE -> ENTER row says "N of M raiders at the
+    // door". `atDoor` is the raid members within RAID_ASSEMBLE_YARDS of the
+    // staging point, the head included; `inRaid` is the raid's members. Both
+    // zero until ASSEMBLE has ended, and then the row says nothing extra.
+    unsigned atDoor{0};
+    unsigned inRaid{0};
 };
 
 std::vector<RunTimelineEvent> RaidTimelineEvents(RaidTimelineSnapshot const& before,

@@ -50093,6 +50093,11 @@ private:
         // The instance script's encounters, DONE and in all, as last read.
         unsigned bossesDone{0};
         unsigned bossesTotal{0};
+        // Who was at the door when ASSEMBLE ended (#1207), for the timeline's
+        // ASSEMBLE -> ENTER row: members within RAID_ASSEMBLE_YARDS of the
+        // staging point, the head included, and the raid's members.
+        unsigned atDoor{0};
+        unsigned inRaid{0};
         // CLEAR's stall ladder: the head's position mark, the ratchet on it,
         // when the raid last credited a boss or moved, and the regroups spent
         // since that progress. Reset on every entry to CLEAR.
@@ -50981,6 +50986,8 @@ private:
         snap.skips = run.skips;
         snap.mainTankMarked = run.mainTankMarked;
         snap.cleared = run.bossesTotal && run.bossesDone >= run.bossesTotal;
+        snap.atDoor = run.atDoor;
+        snap.inRaid = run.inRaid;
         return snap;
     }
 
@@ -51586,6 +51593,15 @@ private:
                              "released and run back, and the order stands",
                              roster.family, door ? door->name : "?", facts.insideDead,
                              facts.insideAlive, run.wipes, facts.graveyard);
+                }
+                // THE DOOR COUNT IS TAKEN AS ASSEMBLE ENDS (#1207), from the
+                // same pass that decided it ended, so the timeline row says who
+                // the walk actually brought.
+                if (run.phase == RaidRunPhase::Assemble)
+                {
+                    run.atDoor = facts.assembled;
+                    run.inRaid = group && group->isRaidGroup() ? group->GetMembersCount()
+                                                               : facts.inWorld;
                 }
                 run.phase = step.phase;
                 run.phaseSince = std::time(nullptr);

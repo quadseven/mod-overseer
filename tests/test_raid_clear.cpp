@@ -448,6 +448,51 @@ void TheTimelineWritesEachStepOnce()
         CheckString("stamped with the run that ended", released[0].portal, "moltencore");
 }
 
+// #1207: the ASSEMBLE -> ENTER row says how many raiders the walk brought to
+// the door, so 38 of 40 and 12 of 40 read apart in the run timeline.
+void TheEnterRowSaysWhoReachedTheDoor()
+{
+    RaidTimelineSnapshot assemble;
+    assemble.phase = "ASSEMBLE";
+    assemble.why = "the head walks to the staging point";
+    assemble.keyword = "moltencore";
+
+    RaidTimelineSnapshot enter = assemble;
+    enter.phase = "ENTER";
+    enter.why = "the raid is at the door; members are knocked through";
+    enter.atDoor = 38;
+    enter.inRaid = 40;
+    std::vector<RunTimelineEvent> const rows = RaidTimelineEvents(assemble, enter);
+    Check("ASSEMBLE -> ENTER is one row", rows.size() == 1);
+    if (rows.size() == 1)
+    {
+        CheckString("enter kind", rows[0].kind, "phase");
+        CheckString("the row says who reached the door", rows[0].detail,
+                    "ASSEMBLE -> ENTER: the raid is at the door; members are knocked "
+                    "through; 38 of 40 raiders at the door");
+    }
+
+    RaidTimelineSnapshot quiet = enter;
+    quiet.why.clear();
+    quiet.atDoor = 12;
+    std::vector<RunTimelineEvent> const bare = RaidTimelineEvents(assemble, quiet);
+    if (bare.size() == 1)
+        CheckString("without a why the count still reads", bare[0].detail,
+                    "ASSEMBLE -> ENTER: 12 of 40 raiders at the door");
+    else
+        Check("a bare ASSEMBLE -> ENTER is one row", false);
+
+    RaidTimelineSnapshot hold = enter;
+    hold.phase = "HOLD";
+    hold.why = "the head is inside; the raid gathers at the entrance";
+    std::vector<RunTimelineEvent> const later = RaidTimelineEvents(enter, hold);
+    if (later.size() == 1)
+        CheckString("only the ENTER row carries the count", later[0].detail,
+                    "ENTER -> HOLD: the head is inside; the raid gathers at the entrance");
+    else
+        Check("ENTER -> HOLD is one row", false);
+}
+
 }  // namespace
 
 int main()
@@ -462,6 +507,7 @@ int main()
     AHeadDeadInsideIsLeftToTheHealers();
     AnEndedOrderStillReleasesFromInside();
     TheTimelineWritesEachStepOnce();
+    TheEnterRowSaysWhoReachedTheDoor();
 
     if (failures)
     {
