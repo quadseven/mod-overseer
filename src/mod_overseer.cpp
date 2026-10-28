@@ -12037,8 +12037,15 @@ private:
                     mayCarry = OverseerDecisions::LeaderIntentWalksUnderNewRpg(held);
                 KeepLeaderStayHonest(leader, leaderName, leaderAI, held);
             }
+            // AND NOT INSIDE A RUN THAT IS STAGED OR CLEARING (#1210). Asked
+            // after every rule above, because it outranks all of them: the
+            // run's own intent walks under `new rpg` and would otherwise hand
+            // it straight back on the first poll inside.
+            bool const runHoldsNewRpgOff = KeepNewRpgOffInsideTheRun(leader, leaderAI);
+            if (runHoldsNewRpgOff)
+                mayCarry = false;
             if (!mayCarry && leaderAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) &&
-                !HeldAfterRevival(leaderName) && !HeldStill(leaderName))
+                !runHoldsNewRpgOff && !HeldAfterRevival(leaderName) && !HeldStill(leaderName))
             {
                 LOG_INFO("module.overseer",
                          "overseer: '{}' leads a family waiting in town and has no errand "
@@ -12280,7 +12287,9 @@ private:
             // realm was a flight to the next zone within five minutes. Said
             // once per split, like the split itself.
             std::string const cutOffTarget = _travelAims.TargetFor(p->GetName());
+            // Never inside a run that holds `new rpg` off its members (#1210).
             bool const cutOffIdle =
+                !KeepNewRpgOffInsideTheRun(p, botAI) &&
                 !botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) &&
                 SplitFromLeader(p->GetName()) && !IsEscorted(p->GetName()) &&
                 !HeldAfterRevival(p->GetName()) && !HeldStill(p->GetName()) &&
@@ -36320,6 +36329,59 @@ private:
         return facts;
     }
 
+    // DOES THE FAMILY'S RUN HOLD `new rpg` OFF THIS MEMBER (#1210)? While the
+    // run is STAGED_INSIDE or CLEARING and the member stands on the run's own
+    // map - see OverseerDecisions::RunHoldsNewRpgOff for the measured pull-out
+    // this stops. Read from the coordinator itself rather than the per-member
+    // phase snapshot, because the finder take-in moves the phase mid-pass and
+    // the leader's next tick inside is exactly the one that must not have it.
+    bool RunHoldsNewRpgOff(Player* p) const
+    {
+        if (!p || !p->IsInWorld())
+            return false;
+        auto const coord = _dungeonRunCoordinators.find(FamilyOfCharacter(p->GetName()));
+        if (coord == _dungeonRunCoordinators.end())
+            return false;
+        bool const inside = coord->second.phase == DungeonRunPhase::StagedInside ||
+                            coord->second.phase == DungeonRunPhase::Clearing;
+        DungeonPortal const* const portal =
+            inside ? FindDungeonPortal(coord->second.portalKeyword) : nullptr;
+        return OverseerDecisions::RunHoldsNewRpgOff(
+            inside, portal != nullptr && p->GetMapId() == portal->insideMapId);
+    }
+
+    // AND TAKES IT OFF WHILE IT DOES. True while the run holds it off, so the
+    // caller grants nothing either. The rpg status is set idle with it, so the
+    // `new rpg` handed back once the run moves on starts from nothing rather
+    // than from the destination it was walking to before the run (the same
+    // pairing the unissued-flight cancel uses). Read back, like every other
+    // strategy change in this file.
+    bool KeepNewRpgOffInsideTheRun(Player* p, PlayerbotAI* ai)
+    {
+        if (!ai || !RunHoldsNewRpgOff(p))
+            return false;
+        TakeNewRpgOffForTheRun(p, ai);
+        return true;
+    }
+
+    void TakeNewRpgOffForTheRun(Player* p, PlayerbotAI* ai)
+    {
+        if (!p || !ai || !ai->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+            return;
+        ai->rpgInfo.ChangeToIdle();  // NewRpgInfo.h:110
+        ai->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is inside its dungeon run's map {} while the run is staged "
+                 "inside or clearing - taking `new rpg` off, so a stale rpg status cannot "
+                 "walk or teleport it out of the run; it is handed back once the run moves on",
+                 p->GetName(), p->GetMapId());
+        if (ai->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+            LOG_ERROR("module.overseer",
+                      "overseer: '{}' still carries `new rpg` inside its dungeon run after "
+                      "being told to drop it - it can still be pulled out of the run",
+                      p->GetName());
+    }
+
     // THE RUN TIMELINE (overseer_dungeon_run_event). The coordinator's state is
     // snapshotted before and after each family's poll and the difference is
     // written down, one row per phase change or decision - see
@@ -41895,6 +41957,20 @@ private:
                           coord.runNumber, coord.campaignId);
                 _travelAims.Release(leaderName, "the dungeon finder took the family in");
                 StageInsideAfterFinder(coord);
+                // `new rpg` COMES OFF ON THIS POLL, NOT THE NEXT PARTY POLL
+                // (#1210). The leader measured on 2026-10-25 was outside again
+                // within seconds of this line, and the party poll that also
+                // holds it off runs every thirty. The run is STAGED_INSIDE as
+                // of the line above, so the same decision is asked here for
+                // everybody the finder put on the dungeon's map.
+                for (std::string const& name : names)
+                {
+                    Player* const p = ObjectAccessor::FindPlayerByName(name);
+                    if (p && p->IsInWorld() &&
+                        OverseerDecisions::RunHoldsNewRpgOff(
+                            true, p->GetMapId() == portal.insideMapId))
+                        TakeNewRpgOffForTheRun(p, GET_PLAYERBOT_AI(p));
+                }
                 return FinderRungOutcome::Inside;
 
             case OverseerDecisions::FinderStep::GiveUp:
