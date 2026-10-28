@@ -90,6 +90,11 @@ void TheStartingLandsAreInside()
     Check("Bloodmyst Isle", C::IsOutsideClassic(530, 3525), false);
     Check("Silvermoon City", C::IsOutsideClassic(530, 3487), false);
     Check("The Exodar", C::IsOutsideClassic(530, 3557), false);
+    // #1157: the sea zone next to Azuremyst Isle (The Veiled Sea) where members
+    // stand when crossing by boat.
+    Check("The Veiled Sea near Azuremyst", C::IsOutsideClassic(530, 3479), false);
+    Check("the sea zone is named as a starting land",
+          C::IsStartingLand(530, 3479), true);
     Check("the starting lands are named", C::IsStartingLand(530, 3524), true);
 
     Check("Hellfire Peninsula is Outland", C::IsOutsideClassic(530, 3483), true);

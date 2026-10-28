@@ -120,6 +120,12 @@ and `professions.CRAFTING` rather than re-deriving them):
   family's own gathering hasn't produced enough). v1 refuses rather than
   invents mats out of nowhere - same "no magic" discipline as everything else
   in this epic.
+  What the drive does instead is ask (#1099): a craft skipped for a reagent
+  writes one `material-request` event naming the character, the recipe
+  (`subject_id`), the reagent item (`item_guid`) and the count short
+  ("short 4x Copper Bar (needs 6, has 2)"). At most one request is open per
+  character, recipe and reagent; it closes when the bags hold enough of that
+  reagent again, and a crafter that runs short after that asks again.
 - **Recipe selection quality** beyond "cheapest known recipe that is
   currently trainable" - no attempt at optimal skill-up routing (the kind of
   spreadsheet a min-maxing human would build) for v1.
@@ -175,6 +181,15 @@ before the cast:
 standing craft errand needs is banked the next time the character stands in
 reach of a banker, alive, out of combat, not flying and not trading. Nobody is
 walked to a banker to put it back.
+
+Only a hammer a planned recipe has needed goes back (wow-overseer#1515): the
+member must have had a standing craft errand for a recipe that needs tool
+category 162 since its hammer last went back. A hammer in the bags of a member
+whose plan never asked for one (the planner skips every Anvil recipe today, or
+it is an engineer's) is left where it is. That memory is the module's own and a
+restart forgets it, which fails closed: the hammer stays in the bags until the
+next such errand. A deposit the bank refuses (a full bank) is logged once per
+answer, not on every 20 second poll, and tried again at the next banker.
 
 ### Anvil: walked to, in town
 

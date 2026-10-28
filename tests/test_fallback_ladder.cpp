@@ -247,6 +247,60 @@ void TheWordsRoundTrip()
               std::string::npos);
 }
 
+// THE LAST RESORT'S WORDS COME FROM THE FACTS, NOT FROM A FIXED SENTENCE
+// (issue 1141): the module line and the heuristic text both build from
+// FinderLastResortReason, so they can never claim the summon rung had its turn
+// when this door has no stone.
+void TheFinderLastResortReasonSaysWhatIsTrue()
+{
+    // No stone at the door and no summon this streak: names the missing stone
+    // and never claims the rung had its turn.
+    RunFailureFacts f = AllianceFourthFailure();
+    f.summonReady = false;
+    f.summonerReady = false;
+    f.summonNote = "no meeting stone within 120y of the door, so no summon";
+    f.streak = 5;
+    f.tried.clear();
+    std::string const noStone = FinderLastResortReason(f);
+    Check("no stone: never says the rung had its turn",
+          noStone.find("had its turn") == std::string::npos);
+    Check("no stone: carries the summonNote",
+          noStone.find(f.summonNote) != std::string::npos);
+
+    // A summon was applied this streak: says the rung had its turn with the count.
+    f = AllianceFourthFailure();
+    f.summonReady = true;
+    f.summonerReady = true;
+    f.streak = 5;
+    f.tried = {RunRecovery::RestageNearer, RunRecovery::Summon, RunRecovery::Summon};
+    std::string const tried = FinderLastResortReason(f);
+    Check("tried: says the rung had its turn",
+          tried.find("had its turn") != std::string::npos);
+    Check("tried: names the count",
+          tried.find("(2 summon recovery(s) this streak)") != std::string::npos);
+
+    // A stone stands at the door but nobody qualifies to click it: says so,
+    // without claiming the rung had its turn.
+    f = AllianceFourthFailure();
+    f.summonReady = true;
+    f.summonerReady = false;
+    f.summonNote =
+        "the door's meeting stone stands 25y from its trigger (summon opens at 3 in a row); "
+        "no qualifying summoner: no warlock in range";
+    f.streak = 5;
+    f.tried.clear();
+    std::string const noSummoner = FinderLastResortReason(f);
+    Check("no summoner: never says the rung had its turn",
+          noSummoner.find("had its turn") == std::string::npos);
+    Check("no summoner: names the stone and no clicker",
+          noSummoner.find("the stone stands at the door but no summoner qualifies to click it") !=
+              std::string::npos);
+    Check("no summoner: is not the missing-stone phrase",
+          noSummoner.find("no summon was possible here") == std::string::npos);
+    Check("no summoner: still carries the summonNote",
+          noSummoner.find(f.summonNote) != std::string::npos);
+}
+
 SummonRungMember Member(char const* name, bool atStone, bool leader = false)
 {
     SummonRungMember m;
@@ -598,6 +652,7 @@ int main()
     AFamilyWithNoSummonerGoesStraightToTheFinder();
     TheFinderAsTheWayIn();
     TheWordsRoundTrip();
+    TheFinderLastResortReasonSaysWhatIsTrue();
     TheRungWalksWaitsAndSummons();
     TheRowIsFoundAgainByItsSource();
     TheFamilyOffersTheRolesItsClassesCanFill();
