@@ -11645,6 +11645,76 @@ bool PlanErrandRouteAgain(bool planned, std::uint32_t plannedAtDeaths,
     return alive && plannedAtDeaths != deathsNow;
 }
 
+std::vector<RouteLegSpan> LegsWalkedAtDeath(std::vector<RouteLegSpan> const& legs,
+                                            std::vector<RoutePoint> const& route,
+                                            std::uint32_t cursorAt, std::time_t steppedAt,
+                                            std::time_t now, float x, float y,
+                                            DiedOnLegLimits const& limits)
+{
+    std::vector<RouteLegSpan> out;
+    if (!DiedOnLegLimitsSane(limits) || !(limits.walkedWithinSeconds >= 0) || legs.empty())
+        return out;
+    if (steppedAt <= 0 || now < steppedAt ||
+        static_cast<std::int64_t>(now - steppedAt) > limits.walkedWithinSeconds)
+        return out;
+    // The leg the cursor is on: the one whose points hold it, or, past the
+    // last of them, the last leg that starts at or before it.
+    std::size_t walked = legs.size();
+    for (std::size_t i = 0; i < legs.size(); ++i)
+    {
+        if (legs[i].firstPoint <= cursorAt)
+            walked = i;
+        if (legs[i].firstPoint <= cursorAt && cursorAt < legs[i].endPoint)
+            break;
+    }
+    if (walked == legs.size())
+        return out;
+    std::size_t const first = walked == 0 ? 0 : walked - 1;
+    std::size_t const last = std::min(walked + 1, legs.size() - 1);
+    std::vector<RouteLegSpan> const near(legs.begin() + static_cast<std::ptrdiff_t>(first),
+                                         legs.begin() + static_cast<std::ptrdiff_t>(last) + 1);
+    return LegsOfDeath(near, route, x, y, limits);
+}
+
+float DiedOnLegPrice(std::uint32_t from, std::uint32_t to, std::vector<DiedOnLeg> const& died,
+                     std::time_t now, DiedOnLegLimits const& limits)
+{
+    if (!DiedOnLegLimitsSane(limits))
+        return 0.f;
+    for (DiedOnLeg const& leg : died)
+        if (leg.until > now && SameLeg(from, to, leg.from, leg.to))
+            return limits.priceYards;
+    return 0.f;
+}
+
+std::uint32_t DiedOnLegsHeld(std::vector<DiedOnLeg> const& died, std::time_t now)
+{
+    std::uint32_t count = 0;
+    for (DiedOnLeg const& leg : died)
+        if (leg.until > now)
+            ++count;
+    return count;
+}
+
+bool SteerCreatureWalkAlongRoute(bool creatureAim, std::uint32_t diedOnLegsHeld)
+{
+    return creatureAim && diedOnLegsHeld > 0;
+}
+
+std::uint32_t DiedOnLegsOnRoute(std::vector<RouteLegSpan> const& legs,
+                                std::vector<DiedOnLeg> const& died, std::time_t now)
+{
+    std::uint32_t count = 0;
+    for (RouteLegSpan const& span : legs)
+        for (DiedOnLeg const& leg : died)
+            if (leg.until > now && SameLeg(span.from, span.to, leg.from, leg.to))
+            {
+                ++count;
+                break;
+            }
+    return count;
+}
+
 FlightLoanStep ReadFlightLoan(bool lent, bool sawFlying, bool inFlight, time_t since,
                               time_t now, time_t boardLimit)
 {

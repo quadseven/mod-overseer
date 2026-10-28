@@ -13879,6 +13879,13 @@ struct DiedOnLegLimits
     // longest single walk link the survey holds (1906 yards), so a detour of a
     // leg or two is always preferred to the leg the walker died on.
     float priceYards{2000.f};
+    // How recently a walker must have been stepped along its planned route
+    // for a death to be charged to a leg of it (#1228). The route memory
+    // outlives the walk: an errand ends, its route is dropped in the last
+    // yards, the walker goes questing beside the road. A death there is not a
+    // death on the route, and charging it priced a road the walker had left.
+    // Four travel polls, so the poll that finds the body is always inside it.
+    std::int64_t walkedWithinSeconds{60};
 };
 
 // Which legs of the route the walker died on: every leg with a point within
@@ -13919,6 +13926,55 @@ std::uint32_t DiedOnLegsOnPlan(std::vector<std::uint32_t> const& nodes,
 // True also for a route never planned, which is today's rule.
 bool PlanErrandRouteAgain(bool planned, std::uint32_t plannedAtDeaths,
                           std::uint32_t deathsNow, bool alive);
+
+// ------------- a death is charged to the leg actually walked (#1228) --------
+//
+// THE #1228 SEQUENCE. After #502 shipped, one member logged three deaths on the
+// same leg inside its 120-minute price window. Two things let that happen.
+//
+// The memory of a walker's route outlived the walking of it, so a death near
+// a remembered road was charged to it whether or not the walker was still on
+// it. LegsWalkedAtDeath charges a death only while the walker was stepped
+// along that plan within `walkedWithinSeconds`, and only to the leg its cursor
+// was on and the legs either side of it (a death at a node is on both legs
+// that meet there), each still within `nearYards` of the body.
+//
+// And a walk that starts between two nodes joins the surveyed road it stands
+// on before any plan is priced. A walker revived at its corpse stands on the
+// leg that killed it, so its next walk (a trainer walk, in the measured case)
+// joined that very road, walked it unpriced, and said nothing. The road join
+// now pays DiedOnLegPrice for a remembered leg like any planned leg does, and
+// DiedOnLegsOnRoute counts every leg of the route actually returned, the
+// joined road included, so a walk that still has to take one says so.
+std::vector<RouteLegSpan> LegsWalkedAtDeath(std::vector<RouteLegSpan> const& legs,
+                                            std::vector<RoutePoint> const& route,
+                                            std::uint32_t cursorAt, std::time_t steppedAt,
+                                            std::time_t now, float x, float y,
+                                            DiedOnLegLimits const& limits);
+
+// What walking the leg `from`-`to` (either direction) costs this walker on top
+// of its distance at `now`: `priceYards` while it is remembered, else 0.
+float DiedOnLegPrice(std::uint32_t from, std::uint32_t to, std::vector<DiedOnLeg> const& died,
+                     std::time_t now, DiedOnLegLimits const& limits);
+
+// How many legs of a returned route (its spans, joined road included) are
+// remembered deaths at `now`.
+std::uint32_t DiedOnLegsOnRoute(std::vector<RouteLegSpan> const& legs,
+                                std::vector<DiedOnLeg> const& died, std::time_t now);
+
+// How many remembered legs are still priced at `now`.
+std::uint32_t DiedOnLegsHeld(std::vector<DiedOnLeg> const& died, std::time_t now);
+
+// WHETHER A WALK TO A CREATURE FOLLOWS THE WALKER'S PRICED ROUTE (#1228). A
+// walk to a creature (a trainer, a vendor) is handed whole to upstream's
+// mover, which walks its own path and never asks the survey or its prices, so
+// the trainer walk after a death went back down the leg that killed. While the
+// walker holds any died-on leg it is stepped along the survey route planned
+// for it, which prices that leg, and the creature is handed over when the
+// route is spent. A place walk is always routed, so this is false for it, and
+// false for a walker that holds nothing, which keeps every other creature walk
+// exactly as it was.
+bool SteerCreatureWalkAlongRoute(bool creatureAim, std::uint32_t diedOnLegsHeld);
 
 // ------------------ a staging walk that is measured rather than routed (#342) --
 //
