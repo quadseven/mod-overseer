@@ -7341,6 +7341,11 @@ bool LeaderCarriesNewRpg(std::string const& job, bool onAnErrand)
     return onAnErrand || !HoldsInTown(job);
 }
 
+bool RunHoldsNewRpgOff(bool runStagedInsideOrClearing, bool onTheRunsMap)
+{
+    return runStagedInsideOrClearing && onTheRunsMap;
+}
+
 UnissuedFlightStep TownLeaderUnissuedFlight(bool mayCarryNewRpg, bool statusIsTravelFlight,
                                             bool moduleIssuedFlight, bool inFlight)
 {
@@ -11674,6 +11679,76 @@ bool PlanErrandRouteAgain(bool planned, std::uint32_t plannedAtDeaths,
     return alive && plannedAtDeaths != deathsNow;
 }
 
+std::vector<RouteLegSpan> LegsWalkedAtDeath(std::vector<RouteLegSpan> const& legs,
+                                            std::vector<RoutePoint> const& route,
+                                            std::uint32_t cursorAt, std::time_t steppedAt,
+                                            std::time_t now, float x, float y,
+                                            DiedOnLegLimits const& limits)
+{
+    std::vector<RouteLegSpan> out;
+    if (!DiedOnLegLimitsSane(limits) || !(limits.walkedWithinSeconds >= 0) || legs.empty())
+        return out;
+    if (steppedAt <= 0 || now < steppedAt ||
+        static_cast<std::int64_t>(now - steppedAt) > limits.walkedWithinSeconds)
+        return out;
+    // The leg the cursor is on: the one whose points hold it, or, past the
+    // last of them, the last leg that starts at or before it.
+    std::size_t walked = legs.size();
+    for (std::size_t i = 0; i < legs.size(); ++i)
+    {
+        if (legs[i].firstPoint <= cursorAt)
+            walked = i;
+        if (legs[i].firstPoint <= cursorAt && cursorAt < legs[i].endPoint)
+            break;
+    }
+    if (walked == legs.size())
+        return out;
+    std::size_t const first = walked == 0 ? 0 : walked - 1;
+    std::size_t const last = std::min(walked + 1, legs.size() - 1);
+    std::vector<RouteLegSpan> const near(legs.begin() + static_cast<std::ptrdiff_t>(first),
+                                         legs.begin() + static_cast<std::ptrdiff_t>(last) + 1);
+    return LegsOfDeath(near, route, x, y, limits);
+}
+
+float DiedOnLegPrice(std::uint32_t from, std::uint32_t to, std::vector<DiedOnLeg> const& died,
+                     std::time_t now, DiedOnLegLimits const& limits)
+{
+    if (!DiedOnLegLimitsSane(limits))
+        return 0.f;
+    for (DiedOnLeg const& leg : died)
+        if (leg.until > now && SameLeg(from, to, leg.from, leg.to))
+            return limits.priceYards;
+    return 0.f;
+}
+
+std::uint32_t DiedOnLegsHeld(std::vector<DiedOnLeg> const& died, std::time_t now)
+{
+    std::uint32_t count = 0;
+    for (DiedOnLeg const& leg : died)
+        if (leg.until > now)
+            ++count;
+    return count;
+}
+
+bool SteerCreatureWalkAlongRoute(bool creatureAim, std::uint32_t diedOnLegsHeld)
+{
+    return creatureAim && diedOnLegsHeld > 0;
+}
+
+std::uint32_t DiedOnLegsOnRoute(std::vector<RouteLegSpan> const& legs,
+                                std::vector<DiedOnLeg> const& died, std::time_t now)
+{
+    std::uint32_t count = 0;
+    for (RouteLegSpan const& span : legs)
+        for (DiedOnLeg const& leg : died)
+            if (leg.until > now && SameLeg(span.from, span.to, leg.from, leg.to))
+            {
+                ++count;
+                break;
+            }
+    return count;
+}
+
 FlightLoanStep ReadFlightLoan(bool lent, bool sawFlying, bool inFlight, time_t since,
                               time_t now, time_t boardLimit)
 {
@@ -15569,6 +15644,11 @@ char const* RaidRunPhaseName(RaidRunPhase phase)
     return "IDLE";
 }
 
+bool RaidReleaseDisbandsAnyway(std::time_t endingSince, std::time_t now)
+{
+    return endingSince != 0 && now - endingSince >= RAID_RELEASE_WAIT_SECONDS;
+}
+
 bool RaidWiped(RaidRunFacts const& facts)
 {
     unsigned const total = facts.insideAlive + facts.insideDead;
@@ -15607,6 +15687,7 @@ bool DungeonWipeBookEndsAttempt(DungeonWipeBook& book, std::uint32_t mapId, std:
         book.endedAt = now;
         book.endedMap = mapId;
         book.holdSaid = false;
+        book.adoptionHoldSaid = false;
     }
     return repeat;
 }
@@ -15620,6 +15701,14 @@ bool DungeonWipeHoldsRunStart(DungeonWipeBook const& book, std::uint32_t mapId,
     if (since < WIPE_LOOP_SECONDS)
         return true;
     return membersSick && since < WIPE_SICK_HOLD_MAX_SECONDS;
+}
+
+bool DungeonWipeHoldsAdoption(DungeonWipeBook const& book, std::uint32_t mapId,
+                              bool membersSick, std::time_t now,
+                              DungeonRunAdoptPhase adoptAt)
+{
+    return adoptAt != DungeonRunAdoptPhase::Exiting &&
+           DungeonWipeHoldsRunStart(book, mapId, membersSick, now);
 }
 
 bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct)
@@ -18677,11 +18766,20 @@ RouteLimits FarWalkRoadLimits()
     return RouteLimits{FAR_WALK_ROAD_LEVEL_GAP, FAR_WALK_ROAD_LETHAL_RUN_YARDS};
 }
 
+bool ErrandRoadJudges(ErrandRoadFacts const& facts)
+{
+    if (!facts.placeAim && !facts.spawnAim)
+        return false;
+    if (facts.liveRun)
+        return false;
+    if (facts.catchUp && !facts.leaderFetch)
+        return false;
+    return facts.walkYards >= ERRAND_ROAD_MIN_YARDS;
+}
+
 ErrandRoadStep DecideErrandRoad(ErrandRoadFacts const& facts)
 {
-    if (!facts.placeAim || facts.catchUp || facts.liveRun)
-        return ErrandRoadStep::Walk;
-    if (facts.walkYards < ERRAND_ROAD_MIN_YARDS)
+    if (!ErrandRoadJudges(facts))
         return ErrandRoadStep::Walk;
     if (facts.road.survivable)
         return ErrandRoadStep::Walk;
@@ -18690,6 +18788,15 @@ ErrandRoadStep DecideErrandRoad(ErrandRoadFacts const& facts)
     if (bindBesideAim && facts.carriesStone)
         return facts.hearthReady ? ErrandRoadStep::Hearth : ErrandRoadStep::WaitForHearth;
     return ErrandRoadStep::Refuse;
+}
+
+char const* ErrandRoadWalkWord(ErrandRoadFacts const& facts)
+{
+    if (facts.catchUp && facts.leaderFetch)
+        return "the leader going back for a member";
+    if (facts.spawnAim)
+        return "a walk to a spawn";
+    return "a walk to a place";
 }
 
 char const* ErrandRoadStepWord(ErrandRoadStep step)
@@ -23721,6 +23828,12 @@ bool AcrossTeldrassilShore(std::uint32_t mapId, std::uint32_t fromZone, std::uin
 {
     return mapId == TELDRASSIL_MAP &&
            OnTeldrassilIsland(mapId, fromZone) != OnTeldrassilIsland(mapId, toZone);
+}
+
+bool NearTeldrassil(std::uint32_t mapId, float x, float y)
+{
+    return mapId == TELDRASSIL_MAP && x >= TELDRASSIL_BOX_MIN_X && x <= TELDRASSIL_BOX_MAX_X &&
+           y >= TELDRASSIL_BOX_MIN_Y && y <= TELDRASSIL_BOX_MAX_Y;
 }
 
 IslandFirstLeg CrossIslandFirst(std::uint32_t mapId, std::uint32_t zoneId,
