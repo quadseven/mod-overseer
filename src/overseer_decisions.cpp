@@ -2078,6 +2078,42 @@ std::string TravelAimAtPosition(std::uint32_t mapId, float x, float y, float z)
     return {};
 }
 
+std::size_t Utf8CharCount(std::string const& text)
+{
+    std::size_t count = 0;
+    for (unsigned char const byte : text)
+        if ((byte & 0xC0u) != 0x80u)
+            ++count;
+    return count;
+}
+
+bool TravelAimFitsColumn(std::string const& aim)
+{
+    return Utf8CharCount(aim) <= TRAVEL_AIM_MAX_CHARS;
+}
+
+std::string FitEndedReasonColumn(std::string const& reason)
+{
+    if (Utf8CharCount(reason) <= DUNGEON_RUN_ENDED_REASON_CHARS)
+        return reason;
+    static char const mark[] = "...";
+    std::size_t const keep = DUNGEON_RUN_ENDED_REASON_CHARS - (sizeof(mark) - 1);
+    // Walk to the lead byte of character number keep + 1; everything before it
+    // is exactly `keep` whole characters, the way Utf8CharCount counts them.
+    std::size_t seen = 0;
+    std::size_t cut = 0;
+    for (; cut < reason.size(); ++cut)
+    {
+        if ((static_cast<unsigned char>(reason[cut]) & 0xC0u) != 0x80u)
+        {
+            if (seen == keep)
+                break;
+            ++seen;
+        }
+    }
+    return reason.substr(0, cut) + mark;
+}
+
 DoorAimHeight DoorAimOnTheFloor(float triggerZ, bool haveGround, float groundZ,
                                 float arrivalYards, float triggerRadiusYards)
 {
@@ -3011,8 +3047,9 @@ std::string RunRecoveryHeuristicWhy(RunFailureFacts const& facts, RunRecovery ch
             break;
         case RunRecovery::DungeonFinder:
             why = std::to_string(facts.streak) +
-                  " attempts in a row never got inside and the summon rung has had its "
-                  "turn, so the family queues for its own dungeon in the dungeon finder "
+                  " attempts in a row never got inside and " +
+                  OverseerDecisions::FinderLastResortReason(facts) +
+                  ", so the family queues for its own dungeon in the dungeon finder "
                   "(the last resort)";
             break;
     }
@@ -3541,6 +3578,75 @@ std::string TravelGuardPlace(std::string const& aim)
     if (place.empty())
         return std::string();
     return "at:" + place;
+}
+
+bool TravelGuardMap(std::string const& aim, std::uint32_t& map)
+{
+    if (!IsTravelGuardAim(aim))
+        return false;
+    std::size_t const start = sizeof(TRAVEL_GUARD_PREFIX) - 1;
+    std::size_t const colon = aim.find(':', start);
+    if (colon == std::string::npos || colon == start || colon - start > 9)
+        return false;
+    std::uint32_t parsed = 0;
+    for (std::size_t i = start; i < colon; ++i)
+    {
+        char const c = aim[i];
+        if (c < '0' || c > '9')
+            return false;
+        parsed = parsed * 10 + static_cast<std::uint32_t>(c - '0');
+    }
+    map = parsed;
+    return true;
+}
+
+char const* GuardWalkName(GuardWalk walk)
+{
+    switch (walk)
+    {
+        case GuardWalk::OwnPlace:     return "its own guard place";
+        case GuardWalk::LeadersPlace: return "its leader's guard place";
+        case GuardWalk::OtherMap:     return "a guard place on another map";
+        case GuardWalk::NoPlace:      return "no place";
+    }
+    return "no place";
+}
+
+GuardWalkVerdict ReadGuardWalk(GuardWalkFacts const& facts)
+{
+    GuardWalkVerdict verdict;
+    std::string const own = TravelGuardPlace(facts.guard);
+    if (own.empty())
+        return verdict;  // NoPlace
+    // A map that cannot be read, or a character whose map is not known, keeps
+    // the answer the guard had before this existed: the drive walks the place
+    // as written and its own resolve says whether it can.
+    std::uint32_t guardMap = 0;
+    if (!facts.mapKnown || !TravelGuardMap(facts.guard, guardMap) ||
+        guardMap == facts.currentMap)
+    {
+        verdict.walk = GuardWalk::OwnPlace;
+        verdict.place = own;
+        return verdict;
+    }
+    // ON ANOTHER MAP. The leader's guard is where the rest of the family is
+    // being taken, so it is the one place on this map that means "out" too.
+    std::uint32_t leaderMap = 0;
+    std::string const leaderPlace = TravelGuardPlace(facts.leaderColumn);
+    if (!leaderPlace.empty() && TravelGuardMap(facts.leaderColumn, leaderMap) &&
+        leaderMap == facts.currentMap)
+    {
+        verdict.walk = GuardWalk::LeadersPlace;
+        verdict.place = leaderPlace;
+        return verdict;
+    }
+    verdict.walk = GuardWalk::OtherMap;
+    return verdict;
+}
+
+bool GuardWalkSteers(GuardWalk walk)
+{
+    return walk == GuardWalk::OwnPlace || walk == GuardWalk::LeadersPlace;
 }
 
 LandedErrand LandedErrandStep(std::string const& landedAim,
@@ -7013,6 +7119,25 @@ FallAccount AccountForFall(float recordedYardsFallen, float safeFallYards,
     return FallDamageShare(recordedYardsFallen, safeFallYards, rate) >= 1.f
                ? FallAccount::EnoughToKill
                : FallAccount::Survivable;
+}
+
+bool FallStartedBelowWorld(float lastZ, bool surfaceAboveFound,
+                           float surfaceAboveZ, bool groundBelowFound,
+                           float groundBelowZ, float toleranceYards)
+{
+    // Nothing over it, so there is nothing for it to be below.
+    if (!surfaceAboveFound)
+        return false;
+    // Within the tolerance of the surface is standing on it. Written as a
+    // negated < so a NaN reading falls out as "not below" rather than
+    // recording a void fall nobody could check.
+    if (!(lastZ < surfaceAboveZ - toleranceYards))
+        return false;
+    // Ground under its feet (at or below the probe start) means the surface
+    // above is a roof, a canopy or a ceiling, not the world it fell through.
+    if (groundBelowFound && groundBelowZ <= lastZ + toleranceYards)
+        return false;
+    return true;
 }
 
 char const* FallAccountName(FallAccount account)
@@ -11412,6 +11537,114 @@ LoneGreyDensity ScoreLoneGreyDensity(std::vector<DangerSpawn> const& spawns,
     return out;
 }
 
+namespace
+{
+bool DiedOnLegLimitsSane(DiedOnLegLimits const& limits)
+{
+    return limits.nearYards > 0.f && limits.holdSeconds > 0 && limits.priceYards >= 0.f &&
+           std::isfinite(limits.priceYards);
+}
+
+bool SameLeg(std::uint32_t aFrom, std::uint32_t aTo, std::uint32_t bFrom, std::uint32_t bTo)
+{
+    return (aFrom == bFrom && aTo == bTo) || (aFrom == bTo && aTo == bFrom);
+}
+
+void ForgetExpired(std::vector<DiedOnLeg>& died, std::time_t now)
+{
+    died.erase(std::remove_if(died.begin(), died.end(),
+                              [now](DiedOnLeg const& leg) { return leg.until <= now; }),
+               died.end());
+}
+}  // namespace
+
+std::vector<RouteLegSpan> LegsOfDeath(std::vector<RouteLegSpan> const& legs,
+                                      std::vector<RoutePoint> const& route, float x, float y,
+                                      DiedOnLegLimits const& limits)
+{
+    std::vector<RouteLegSpan> out;
+    if (!DiedOnLegLimitsSane(limits) || !std::isfinite(x) || !std::isfinite(y))
+        return out;
+    float const nearSquared = limits.nearYards * limits.nearYards;
+    for (RouteLegSpan const& leg : legs)
+    {
+        std::size_t const end = std::min(leg.endPoint, route.size());
+        for (std::size_t i = leg.firstPoint; i < end; ++i)
+        {
+            float const dx = route[i].x - x;
+            float const dy = route[i].y - y;
+            if (dx * dx + dy * dy <= nearSquared)
+            {
+                out.push_back(leg);
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+void RememberDiedOnLeg(std::vector<DiedOnLeg>& died, std::uint32_t from, std::uint32_t to,
+                       std::time_t now, DiedOnLegLimits const& limits)
+{
+    if (!DiedOnLegLimitsSane(limits))
+        return;
+    ForgetExpired(died, now);
+    std::time_t const until = now + static_cast<std::time_t>(limits.holdSeconds);
+    for (DiedOnLeg& leg : died)
+        if (SameLeg(leg.from, leg.to, from, to))
+        {
+            leg.until = until;
+            return;
+        }
+    DiedOnLeg leg;
+    leg.from = from;
+    leg.to = to;
+    leg.until = until;
+    died.push_back(leg);
+}
+
+std::uint32_t PriceDiedOnLegs(std::vector<RouteLink>& links, std::vector<DiedOnLeg>& died,
+                              std::time_t now, DiedOnLegLimits const& limits)
+{
+    ForgetExpired(died, now);
+    if (!DiedOnLegLimitsSane(limits) || died.empty())
+        return 0;
+    for (RouteLink& link : links)
+    {
+        if (!link.onFoot || !(link.yards >= 0.f))
+            continue;
+        for (DiedOnLeg const& leg : died)
+            if (SameLeg(link.from, link.to, leg.from, leg.to))
+            {
+                link.yards += limits.priceYards;
+                break;
+            }
+    }
+    return static_cast<std::uint32_t>(died.size());
+}
+
+std::uint32_t DiedOnLegsOnPlan(std::vector<std::uint32_t> const& nodes,
+                               std::vector<DiedOnLeg> const& died, std::time_t now)
+{
+    std::uint32_t count = 0;
+    for (std::size_t i = 0; i + 1 < nodes.size(); ++i)
+        for (DiedOnLeg const& leg : died)
+            if (leg.until > now && SameLeg(nodes[i], nodes[i + 1], leg.from, leg.to))
+            {
+                ++count;
+                break;
+            }
+    return count;
+}
+
+bool PlanErrandRouteAgain(bool planned, std::uint32_t plannedAtDeaths,
+                          std::uint32_t deathsNow, bool alive)
+{
+    if (!planned)
+        return true;
+    return alive && plannedAtDeaths != deathsNow;
+}
+
 FlightLoanStep ReadFlightLoan(bool lent, bool sawFlying, bool inFlight, time_t since,
                               time_t now, time_t boardLimit)
 {
@@ -15317,6 +15550,49 @@ bool RaidWiped(RaidRunFacts const& facts)
     return !facts.insideCombat && facts.insideDead * 100 >= total * RAID_WIPE_PCT;
 }
 
+void RaidWipeFacts(RaidRunFacts& facts, unsigned wipes, std::time_t lastWipeAt,
+                   std::uint32_t lastWipeMap, std::uint32_t doorMap, std::time_t now)
+{
+    facts.wipes = wipes;
+    facts.lastWipeAt = lastWipeAt;
+    facts.now = now;
+    facts.samePlace = wipes >= 1 && lastWipeMap == doorMap;
+}
+
+bool RaidRunCountsWipe(RaidRunPhase current, RaidRunStep const& step,
+                       RaidRunFacts const& facts)
+{
+    return step.phase == RaidRunPhase::Recover && current != RaidRunPhase::Recover &&
+           RaidWiped(facts);
+}
+
+bool DungeonWipeBookEndsAttempt(DungeonWipeBook& book, std::uint32_t mapId, std::time_t now)
+{
+    bool const repeat = book.wipes >= 1 && book.lastWipeAt != 0 && now != 0 &&
+                        book.lastWipeMap == mapId && now - book.lastWipeAt < WIPE_LOOP_SECONDS;
+    ++book.wipes;
+    book.lastWipeAt = now;
+    book.lastWipeMap = mapId;
+    if (repeat)
+    {
+        book.endedAt = now;
+        book.endedMap = mapId;
+        book.holdSaid = false;
+    }
+    return repeat;
+}
+
+bool DungeonWipeHoldsRunStart(DungeonWipeBook const& book, std::uint32_t mapId,
+                              bool membersSick, std::time_t now)
+{
+    if (book.endedAt == 0 || book.endedMap != mapId || now == 0)
+        return false;
+    std::time_t const since = now - book.endedAt;
+    if (since < WIPE_LOOP_SECONDS)
+        return true;
+    return membersSick && since < WIPE_SICK_HOLD_MAX_SECONDS;
+}
+
 bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct)
 {
     return lowestDurabilityPct < floorPct;
@@ -15464,6 +15740,37 @@ RaidRunStep StepRaidRunRecover(RaidRunPhase current, RaidRunFacts const& facts)
     bool const wiped = RaidWiped(facts);
     // The dead inside are released only when nobody standing can raise them.
     step.releaseDead = wiped;
+
+    // A second wipe of the same run at the same place inside 600 s ends the
+    // attempt rather than starting a third (#1165). Only a NEW wipe counts: the
+    // poll that moves the run into RECOVER. A later RECOVER poll that still
+    // sees the corpses of the wipe already on the book is the same wipe, and
+    // ending there would end the run after its first one. releaseDead stays
+    // set, so the corpses are released before the order is let go.
+    if (wiped && current != RaidRunPhase::Recover && facts.wipes >= 1 && facts.samePlace &&
+        facts.lastWipeAt != 0 && facts.now != 0 &&
+        facts.now - facts.lastWipeAt < WIPE_LOOP_SECONDS)
+    {
+        step.phase = RaidRunPhase::Idle;
+        step.release = true;
+        step.runBack = false;
+        step.knockMembers = false;
+        step.why = "the same run wiped at the same place within 600 s; ending the attempt";
+        return step;
+    }
+
+    // While members still carry Resurrection Sickness after a wipe, do not
+    // walk the party back in; wait it out instead of risking another wipe
+    // (#1165). The sickness comes from the spirit healer, who revives a member
+    // alive at the graveyard outside, so this is read whether or not corpses
+    // are still inside: by the time anybody is sick, usually none are.
+    if (facts.wipes >= 1 && facts.membersSick)
+    {
+        step.runBack = false;
+        step.why = "members still carry Resurrection Sickness; waiting it out before the run-back";
+        return step;
+    }
+
     // Every ghost is walked back, with the head's client attached (nothing
     // walks for a door the operator cannot watch); the bound is per ghost
     // (RaidGhostMayBeWalked).
@@ -15525,6 +15832,18 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
         return step;
     }
 
+    // AN ENDED ATTEMPT STAYS ENDED WHILE ITS RELEASE WAITS (#1201). The release
+    // keeps the raid while a living member is inside, so it can take more than
+    // one poll; every one of them releases again, and none walks anybody back.
+    if (facts.attemptEnding)
+    {
+        step.phase = RaidRunPhase::Idle;
+        step.release = true;
+        step.releaseDead = true;
+        step.why = "the attempt was ended; letting go of the raid once nobody is inside";
+        return step;
+    }
+
     // INSIDE, in the order of what overrides what (see StepRaidRun's header).
     bool const wasInside = RaidRunIsInside(current);
     if (wasInside || facts.headInside)
@@ -15558,6 +15877,18 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
     switch (current)
     {
         case RaidRunPhase::Idle:
+            // THE SICKNESS HOLD OUTLIVES THE RELEASE (#1201). An attempt ended
+            // by a wipe is let go and the order still stands, so the next poll
+            // is here; the wipe book is carried across the release, and the
+            // next attempt waits out the sickness instead of forming at once.
+            if (facts.wipes >= 1 && facts.membersSick && facts.lastWipeAt != 0 &&
+                facts.now != 0 && facts.now - facts.lastWipeAt < WIPE_SICK_HOLD_MAX_SECONDS)
+            {
+                step.phase = RaidRunPhase::Idle;
+                step.why = "members still carry Resurrection Sickness from the last wipe; "
+                           "the next attempt waits it out";
+                return step;
+            }
             step.phase = RaidRunPhase::Form;
             step.form = true;
             step.why = "a raid is ordered; forming it from the seats";
@@ -17016,7 +17347,8 @@ bool MailWalkRefusalRetryable(std::string const& reason)
         || reason == R::HeldByAnother || reason == R::GroundRefused
         || reason == R::EnteredCombat || reason == R::Died || reason == R::LeftWorld
         || reason == R::LeftMap || reason == R::TookFlight || reason == R::TimedOut
-        || reason == R::Stalled || reason == R::ExpansionContinent;
+        || reason == R::Stalled || reason == R::ExpansionContinent
+        || reason == R::AcrossTheWater;
 }
 
 char const* MailWalkGate(MailWalkGateFacts const& facts)
@@ -17661,6 +17993,52 @@ bool MayCraftNow(std::string const& job, bool inDungeonRun, bool alive, bool inC
     return campaignJob && !inDungeonRun && alive && !inCombat && !moving;
 }
 
+unsigned CraftLoneDeathsInZone(std::vector<CraftLoneDeath> const& deaths, uint32_t mapId,
+                               uint32_t zoneId, int64_t now, CraftLoneDeathLimits const& limits)
+{
+    unsigned count = 0;
+    for (CraftLoneDeath const& d : deaths)
+        if (d.craftJob && !d.grouped && d.mapId == mapId && d.zoneId == zoneId &&
+            d.at <= now && now - d.at <= limits.windowSeconds)
+            ++count;
+    return count;
+}
+
+void PruneCraftLoneDeaths(std::vector<CraftLoneDeath>& deaths, int64_t now,
+                          CraftLoneDeathLimits const& limits)
+{
+    deaths.erase(std::remove_if(deaths.begin(), deaths.end(),
+                                [&](CraftLoneDeath const& d)
+                                { return now - d.at > limits.windowSeconds; }),
+                 deaths.end());
+}
+
+CraftLoneDeathStep DecideCraftLoneDeaths(CraftLoneDeathFacts const& facts,
+                                         CraftLoneDeathLimits const& limits)
+{
+    if (facts.job != "craft" || facts.grouped || facts.deathsHere < limits.deaths)
+        return CraftLoneDeathStep::Stay;
+    if (facts.resting)
+        return CraftLoneDeathStep::Stay;
+    if (!facts.alive)
+        return CraftLoneDeathStep::Defer;
+    return facts.hearthReady ? CraftLoneDeathStep::Hearth : CraftLoneDeathStep::Defer;
+}
+
+char const* CraftLoneDeathStepWord(CraftLoneDeathStep step)
+{
+    switch (step)
+    {
+        case CraftLoneDeathStep::Hearth:
+            return "hearthing to its bind, an inn under guards";
+        case CraftLoneDeathStep::Defer:
+            return "its craft step is deferred until it can hearth out";
+        case CraftLoneDeathStep::Stay:
+            break;
+    }
+    return "staying";
+}
+
 bool CraftDismountsFirst(bool mounted, bool inFlight)
 {
     return mounted && !inFlight;
@@ -17679,6 +18057,41 @@ bool FocusIsWalkedTo(unsigned requiresSpellFocus)
 unsigned ToolItemForTotemCategory(unsigned totemCategory)
 {
     return totemCategory == TOTEM_CATEGORY_BLACKSMITH_HAMMER ? ITEM_BLACKSMITH_HAMMER : 0;
+}
+
+unsigned ReagentShortBy(unsigned need, unsigned have)
+{
+    return have >= need ? 0 : need - have;
+}
+
+std::string MaterialRequestDetail(unsigned need, unsigned have, std::string const& itemName)
+{
+    std::string detail = "short ";
+    detail += std::to_string(ReagentShortBy(need, have));
+    detail += "x ";
+    detail += itemName;
+    detail += " (needs ";
+    detail += std::to_string(need);
+    detail += ", has ";
+    detail += std::to_string(have);
+    detail += ")";
+    return detail;
+}
+
+bool OpenMaterialRequests::Open(std::string const& character, unsigned recipe, unsigned reagent)
+{
+    return _open.emplace(Key{character, recipe, reagent}, true).second;
+}
+
+void OpenMaterialRequests::Close(std::string const& character, unsigned recipe, unsigned reagent)
+{
+    _open.erase(Key{character, recipe, reagent});
+}
+
+bool OpenMaterialRequests::IsOpen(std::string const& character, unsigned recipe,
+                                  unsigned reagent) const
+{
+    return _open.count(Key{character, recipe, reagent}) > 0;
 }
 
 CraftToolStep CraftToolStepFor(CraftToolPlace place, bool bankerInReach, bool mayWalk)
@@ -18032,6 +18445,7 @@ std::vector<WalkRefusalRow> const& WalkRefusalCatalogue()
         {"mailbox", M::OtherSidesGround, false, false},
         {"mailbox", M::GroundRefused, false, false},
         {"mailbox", M::ExpansionContinent, false, false},
+        {"mailbox", M::AcrossTheWater, false, false},
         {"mailbox", M::EnteredCombat, true, true},
         {"mailbox", M::Died, true, false},
         {"mailbox", M::LeftWorld, true, true},
@@ -18444,6 +18858,11 @@ std::vector<RunTimelineEvent> RaidTimelineEvents(RaidTimelineSnapshot const& bef
         std::string detail = before.phase + " -> " + after.phase;
         if (!after.why.empty())
             detail += ": " + after.why;
+        // The walk to the door, measured: a 40-seat order with 38 at the door
+        // and one with 12 are told apart here rather than in a log line.
+        if (before.phase == "ASSEMBLE" && after.phase == "ENTER" && after.inRaid > 0)
+            detail += (after.why.empty() ? ": " : "; ") + std::to_string(after.atDoor) +
+                      " of " + std::to_string(after.inRaid) + " raiders at the door";
         add("phase", detail);
     }
     return events;
@@ -18589,10 +19008,46 @@ bool WarriorNeedsMeleePursuit(uint8_t classId, bool tanks, bool inCombat,
 
 bool TankMayPursue(TankPursuitFacts const& facts)
 {
-    if (facts.onInstanceMap || facts.heldStill || facts.mounted || !facts.alive)
+    if (facts.onInstanceMap || facts.heldStill || facts.mounted || !facts.alive ||
+        !facts.hasVictim)
         return false;
     return WarriorNeedsMeleePursuit(facts.classId, facts.tanks, facts.inCombat,
                                     facts.inMeleeRange);
+}
+
+std::string TankStrategyListedName(uint8_t classId)
+{
+    switch (classId)
+    {
+        case 1:   // warrior: TankWarriorStrategy
+        case 2:   // paladin: TankPaladinStrategy
+            return "prot";
+        case 6:   // death knight: BloodDKStrategy
+            return "blood";
+        case 11:  // druid: BearTankDruidStrategy
+            return "bear";
+        default:
+            return "tank";
+    }
+}
+
+std::string TankPursuitWithheld(TankPursuitFacts const& facts)
+{
+    if (facts.classId != 1 || !facts.tanks || !facts.inCombat || facts.onInstanceMap)
+        return "";
+    if (facts.hasVictim && facts.inMeleeRange)
+        return "";
+    if (TankMayPursue(facts))
+        return "";
+    if (!facts.alive)
+        return "it is dead";
+    if (facts.mounted)
+        return "it is mounted or in flight";
+    if (facts.heldStill)
+        return "an overseer hold has it standing still";
+    if (!facts.hasVictim)
+        return "it has no victim or selection it may attack";
+    return "the pursuit gate refused it";
 }
 
 GearVerdict GearShieldPair(GearVerdict const& oneHand, GearVerdict const& shield)
@@ -18723,6 +19178,7 @@ bool IsStartingLand(uint32_t mapId, uint32_t zoneId)
         case AZUREMYST_ISLE_ZONE_ID:
         case BLOODMYST_ISLE_ZONE_ID:
         case THE_EXODAR_ZONE_ID:
+        case VEILED_SEA_ZONE_ID:
             return true;
         default:
             return false;
@@ -18759,7 +19215,7 @@ ExitHearthStep ExitFailureHearthStep(ExitHearthFacts const& facts, unsigned maxA
     // its own cast is what puts the cooldown on.
     if (facts.pending)
         return ExitHearthStep::Waiting;
-    if (*ExitHearthImpossibleReason(facts, maxAttempts))
+    if (!ExitHearthImpossibleReason(facts, maxAttempts).empty())
         return ExitHearthStep::Impossible;
     // The executor refuses both of these, and both pass on their own.
     if (facts.inCombat)
@@ -18817,7 +19273,7 @@ char const* ExitHearthStepWord(ExitHearthStep step)
     return "unknown";
 }
 
-char const* ExitHearthImpossibleReason(ExitHearthFacts const& facts, unsigned maxAttempts)
+std::string ExitHearthImpossibleReason(ExitHearthFacts const& facts, unsigned maxAttempts)
 {
     if (!facts.inWorld || !facts.onInsideMap)
         return "";
@@ -18829,6 +19285,12 @@ char const* ExitHearthImpossibleReason(ExitHearthFacts const& facts, unsigned ma
         return "hearthstone on cooldown";
     if (facts.attempts >= maxAttempts)
         return "hearth attempts spent";
+    // A hearth to another continent splits the family (#1142): the stone is
+    // withheld and the member stays on the walk-out path the episode bounds.
+    if (facts.doorMapKnown && facts.bindMapId != facts.doorMapId)
+        return "hearthstone bound on map " + std::to_string(facts.bindMapId) +
+               ", not on map " + std::to_string(facts.doorMapId) +
+               " where the exit door lets out, so the stone is withheld";
     return "";
 }
 
@@ -19629,6 +20091,91 @@ std::string TrainerPurchaseLine(std::string const& member, char const* kind,
            " paid_copper=" + std::to_string(paidCopper);
 }
 
+namespace
+{
+
+// Plain decimal digits that fit a uint32 and are not zero.
+bool ParseEntryDigits(std::string const& text, uint32_t& out)
+{
+    if (text.empty() || text.size() > 10)
+        return false;
+    uint64_t value = 0;
+    for (char ch : text)
+    {
+        if (ch < '0' || ch > '9')
+            return false;
+        value = value * 10 + static_cast<uint64_t>(ch - '0');
+    }
+    if (value == 0 || value > UINT32_MAX)
+        return false;
+    out = static_cast<uint32_t>(value);
+    return true;
+}
+
+}  // namespace
+
+bool ParseRecipeManualErrand(std::string const& column, RecipeManualErrand& out)
+{
+    out = RecipeManualErrand();
+    std::string::size_type const colon = column.find(':');
+    if (colon == std::string::npos)
+        return false;
+    RecipeManualErrand parsed;
+    if (!ParseEntryDigits(column.substr(0, colon), parsed.itemEntry) ||
+        !ParseEntryDigits(column.substr(colon + 1), parsed.vendorEntry))
+        return false;
+    out = parsed;
+    return true;
+}
+
+RecipeManualPlan PlanRecipeManual(RecipeManualFacts const& facts)
+{
+    namespace R = RecipeManualRefusal;
+    if (facts.knowsRecipe)
+        return {RecipeManualStep::Learned, ""};
+    if (!facts.teachesRecipe)
+        return {RecipeManualStep::Refuse, R::NotARecipe};
+    if (facts.learning)
+        return {RecipeManualStep::Wait, ""};
+    if (facts.usesTried >= RECIPE_MANUAL_MAX_USES ||
+        (facts.usesTried > 0 && !facts.carriesManual))
+        return {RecipeManualStep::Refuse, R::UsedAndNotLearned};
+    if (facts.carriesManual)
+        return {RecipeManualStep::Use, ""};
+    if (!facts.vendorNearby)
+        return {RecipeManualStep::Walk, ""};
+    if (!facts.vendorInReach)
+        return {RecipeManualStep::Approach, ""};
+    if (!facts.vendorSells)
+        return {RecipeManualStep::Refuse, R::NotSold};
+    if (facts.price > facts.purse)
+        return {RecipeManualStep::Refuse, R::TooPoor};
+    return {RecipeManualStep::Buy, ""};
+}
+
+bool ManualBuyRefusalReleases(std::string const& detail)
+{
+    return BuyRefusalRetry(detail) == TownRetry::Never ||
+           detail == "vendor does not stock the item" ||
+           detail == "cannot afford the purchase";
+}
+
+bool ManualUseRefusalReleases(std::string const& detail)
+{
+    return LearnRefusalRetry(detail) != TownRetry::Later;
+}
+
+std::string ManualPurchaseLine(std::string const& member, uint32_t itemEntry,
+                               std::string const& itemName, uint32_t vendorEntry,
+                               uint32_t spellId, std::string const& spellName,
+                               uint64_t paidCopper)
+{
+    return "overseer: manual_purchase member='" + member + "' item=" +
+           std::to_string(itemEntry) + " '" + itemName + "' vendor=" +
+           std::to_string(vendorEntry) + " spell=" + std::to_string(spellId) + " '" +
+           spellName + "' paid_copper=" + std::to_string(paidCopper);
+}
+
 char const* NamedRecipeStepWord(NamedRecipeStep step)
 {
     switch (step)
@@ -19707,6 +20254,21 @@ bool RunRecoveryFinderOpen(RunFailureFacts const& facts)
     // on wow-dev, the Horde family (levels 13 to 17, no warlock) was on its
     // ninth failure in a row with the stone 25 yards from the door.
     return SummonsTriedThisStreak(facts) > 0 || !facts.summonReady || !facts.summonerReady;
+}
+
+std::string FinderLastResortReason(RunFailureFacts const& facts)
+{
+    unsigned const tries = SummonsTriedThisStreak(facts);
+    if (tries > 0)
+        return "the summon rung has had its turn (" +
+               std::to_string(tries) +
+               " summon recovery(s) this streak)";
+    if (!facts.summonReady)
+        return "no summon was possible here: " + facts.summonNote;
+    // The stone stands at the door, but nobody in the family qualifies to
+    // click it: the summon rung could never run here either.
+    return "the stone stands at the door but no summoner qualifies to click it: " +
+           facts.summonNote;
 }
 
 bool FinderIsTheWayIn(bool finderIsDefault, bool familyCanQueue, std::uint32_t runNumber,
@@ -22732,9 +23294,14 @@ bool SitsOutOfRuns(FamilyStandin const* standin, std::string const& name)
     return standin && standin->Active() && !name.empty() && standin->outName == name;
 }
 
-bool MayOpenRunFor(bool sittingOut)
+bool MayOpenRunFor(bool sittingOut, bool lentToAGuildRun)
 {
-    return !sittingOut;
+    return !sittingOut && !lentToAGuildRun;
+}
+
+bool CountsAsInADungeonRun(bool onDungeonMap, bool activeRunOnMap, bool namedByAGuildRun)
+{
+    return onDungeonMap && (activeRunOnMap || namedByAGuildRun);
 }
 
 std::string SitOutRunEndedReason(std::string const& leader)
@@ -23119,6 +23686,12 @@ CrossRequest ParseCrossRequest(std::string const& command)
 bool OnTeldrassilIsland(std::uint32_t mapId, std::uint32_t zoneId)
 {
     return mapId == TELDRASSIL_MAP && (zoneId == TELDRASSIL_ZONE || zoneId == DARNASSUS_ZONE);
+}
+
+bool AcrossTeldrassilShore(std::uint32_t mapId, std::uint32_t fromZone, std::uint32_t toZone)
+{
+    return mapId == TELDRASSIL_MAP &&
+           OnTeldrassilIsland(mapId, fromZone) != OnTeldrassilIsland(mapId, toZone);
 }
 
 IslandFirstLeg CrossIslandFirst(std::uint32_t mapId, std::uint32_t zoneId,

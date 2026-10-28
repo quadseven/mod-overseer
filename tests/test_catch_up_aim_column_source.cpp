@@ -14,6 +14,8 @@
  *  - TravelAimBook::Claim refuses a target longer than TRAVEL_AIM_COLUMN_CHARS
  *    before it reads a fence or runs the UPDATE, says the refused value, and
  *    answers false, so it writes nothing.
+ *  - The refusal counts characters through TravelAimFitsColumn, not bytes,
+ *    and its LOG_ERROR is said once per name and target (wow-overseer#1517).
  *  - FenceRefuses predicts that refusal.
  *  - The catch-up walk start sizes its aim with TravelAimAtPosition, and an
  *    empty answer returns before TravelAimBook::Claim is called.
@@ -57,7 +59,9 @@ int main()
     std::string const claim = Body(text, "    bool Claim(std::string const& name, std::string const& target,");
     if (claim.empty())
         return Fail("cannot find TravelAimBook::Claim");
-    std::size_t const guard = claim.find("if (target.size() > TRAVEL_AIM_COLUMN_CHARS)");
+    if (claim.find("target.size() > TRAVEL_AIM_COLUMN_CHARS") != std::string::npos)
+        return Fail("Claim must not count the aim in bytes (wow-overseer#1517)");
+    std::size_t const guard = claim.find("if (!OverseerDecisions::TravelAimFitsColumn(target))");
     if (guard == std::string::npos)
         return Fail("Claim must refuse a target longer than TRAVEL_AIM_COLUMN_CHARS");
     std::size_t const firstFence = claim.find("_state.find(name)");
@@ -75,6 +79,16 @@ int main()
     if (refusal.find("LOG_ERROR") == std::string::npos || refusal.find("target") ==
                                                               std::string::npos)
         return Fail("the width refusal must log the refused value");
+    // Said once per name and target: the error sits behind a check of the
+    // last refused aim for this name, which is recorded before it is said.
+    std::size_t const onceCheck = refusal.find("said->second != target");
+    std::size_t const remember = refusal.find("_aimTooLongSaid[name] = target;");
+    std::size_t const logged = refusal.find("LOG_ERROR");
+    if (onceCheck == std::string::npos || remember == std::string::npos ||
+        !(onceCheck < remember && remember < logged))
+        return Fail("the width refusal must be said once per name and target");
+    if (claim.find("_aimTooLongSaid.erase(name);") == std::string::npos)
+        return Fail("a written aim must forget the last width refusal");
     if (refusal.find("Execute") != std::string::npos ||
         refusal.find("UPDATE") != std::string::npos)
         return Fail("the width refusal must write nothing");
@@ -83,7 +97,8 @@ int main()
     std::string const fence = Body(text, "    bool FenceRefuses(std::string const& name, std::string const& target,");
     if (fence.empty())
         return Fail("cannot find TravelAimBook::FenceRefuses");
-    if (fence.find("target.size() > TRAVEL_AIM_COLUMN_CHARS") == std::string::npos)
+    if (fence.find("target.size() > TRAVEL_AIM_COLUMN_CHARS") != std::string::npos ||
+        fence.find("!OverseerDecisions::TravelAimFitsColumn(target)") == std::string::npos)
         return Fail("FenceRefuses must predict the width refusal");
 
     // --- the catch-up walk start ----------------------------------------------
