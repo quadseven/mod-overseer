@@ -8425,6 +8425,8 @@ public:
         if (_craftTimer >= CRAFT_POLL_MS)
         {
             _craftTimer = 0;
+            // First, so a crafter it holds is not cast for this poll (#1208).
+            DriveCraftLoneDeaths();
             DriveCraft();
             ReturnCraftTools();
             DriveHeadTrades();
@@ -16678,6 +16680,88 @@ private:
         } while (result->NextRow());
     }
 
+    // A LONE CRAFTER'S OWN DEATHS, by name (#1208). Written by FlushDeaths for
+    // every death on job 'craft', grouped or not (the count filters), and
+    // pruned to CRAFT_LONE_DEATH_LIMITS.windowSeconds on every poll. Lost on a
+    // restart, which costs the count and no correctness. World thread only.
+    std::map<std::string, std::vector<OverseerDecisions::CraftLoneDeath>> _craftLoneDeaths;
+    // The step last said for each name, so the log line is one per decision.
+    std::map<std::string, OverseerDecisions::CraftLoneDeathStep> _craftLoneSaid;
+    // Who DriveCraft leaves alone this poll: hearthing out, or deferred.
+    std::set<std::string> _craftLoneHeld;
+
+    // NOT LEFT IDLE IN A ZONE THAT KEEPS KILLING IT (#1208). Asked before
+    // DriveCraft on the same clock, so a crafter this holds is not cast for in
+    // the same poll. See OverseerDecisions::DecideCraftLoneDeaths.
+    void DriveCraftLoneDeaths()
+    {
+        _craftLoneHeld.clear();
+        int64_t const now = static_cast<int64_t>(std::time(nullptr));
+        for (auto it = _craftLoneDeaths.begin(); it != _craftLoneDeaths.end();)
+        {
+            OverseerDecisions::PruneCraftLoneDeaths(it->second, now);
+            if (it->second.empty())
+            {
+                _craftLoneSaid.erase(it->first);
+                it = _craftLoneDeaths.erase(it);
+            }
+            else
+                ++it;
+        }
+        if (_craftLoneDeaths.empty())
+            return;
+        std::map<std::string, std::string> const jobs = LoadJobs();
+        for (auto const& entry : _craftLoneDeaths)
+        {
+            std::string const& name = entry.first;
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            if (!bot || !bot->IsInWorld() || !Steerable(bot))
+                continue;
+            auto const jobIt = jobs.find(name);
+            OverseerDecisions::CraftLoneDeathFacts facts;
+            facts.job = jobIt == jobs.end() ? std::string("quest") : jobIt->second;
+            facts.grouped = bot->GetGroup() != nullptr;
+            facts.alive = bot->IsAlive();
+            facts.resting = bot->HasPlayerFlag(PLAYER_FLAGS_RESTING);
+            uint32 const stone = HearthstoneSpellOf(bot);
+            bool const hearthPending = HearthPendingFor(name);
+            facts.hearthReady = stone && !bot->HasSpellCooldown(stone) && !hearthPending;
+            facts.deathsHere = OverseerDecisions::CraftLoneDeathsInZone(
+                entry.second, bot->GetMapId(), bot->GetZoneId(), now);
+            OverseerDecisions::CraftLoneDeathStep const step =
+                OverseerDecisions::DecideCraftLoneDeaths(facts);
+            if (step == OverseerDecisions::CraftLoneDeathStep::Stay && !hearthPending)
+            {
+                _craftLoneSaid.erase(name);
+                continue;
+            }
+            // A cast already in flight holds the crafter as a Hearth would.
+            _craftLoneHeld.insert(name);
+            if (step == OverseerDecisions::CraftLoneDeathStep::Stay)
+                continue;
+            auto const said = _craftLoneSaid.find(name);
+            if (said == _craftLoneSaid.end() || said->second != step)
+            {
+                _craftLoneSaid[name] = step;
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' on job 'craft' died alone {} time(s) in zone {} on "
+                         "map {} within {} minutes, and is not left idle there - {} (#1208)",
+                         name, facts.deathsHere, bot->GetZoneId(), bot->GetMapId(),
+                         static_cast<uint32>(
+                             OverseerDecisions::CRAFT_LONE_DEATH_LIMITS.windowSeconds / 60),
+                         OverseerDecisions::CraftLoneDeathStepWord(step));
+            }
+            if (step != OverseerDecisions::CraftLoneDeathStep::Hearth)
+                continue;
+            // A refusal is a reason the cast cannot start this poll (a fight,
+            // or moving, which DoHearth answers with its own hold); the next
+            // poll asks again, and the craft waits meanwhile.
+            char const* status = "error";
+            std::string evidence;
+            DoHearth(bot, "use", status, evidence, _pendingHearths, 0);
+        }
+    }
+
     void DriveCraft()
     {
         std::map<std::string, std::string> const jobs = LoadJobs();
@@ -16701,6 +16785,11 @@ private:
             Player* bot = ObjectAccessor::FindPlayerByName(name);
             if (!bot || !bot->IsInWorld())
                 continue;   // same "read on its own" discipline as every other drive
+
+            // Hearthing out of, or deferred in, a zone that keeps killing it
+            // alone (#1208, DriveCraftLoneDeaths): no cast, no walk to an Anvil.
+            if (_craftLoneHeld.count(name))
+                continue;
 
             // BETWEEN RUNS TOO (OverseerDecisions::MayCraftNow): a family on a
             // campaign job crafts while it waits in town, never inside a run,
@@ -58182,6 +58271,20 @@ private:
                          d.characterName, FamilyLegDeaths(d.characterName),
                          static_cast<uint32>(LONE_LEG_LIMITS.windowSeconds / 60),
                          LONE_LEG_LIMITS.deaths);
+            }
+
+        // A DEATH ON JOB 'craft' IS COUNTED FOR THE LONE-CRAFTER RULE (#1208),
+        // grouped or not: CraftLoneDeathsInZone counts only the lone ones.
+        for (PendingDeath const& d : batch)
+            if (d.job == "craft")
+            {
+                OverseerDecisions::CraftLoneDeath death;
+                death.at = static_cast<int64_t>(std::time(nullptr));
+                death.mapId = d.mapId;
+                death.zoneId = d.zoneId;
+                death.craftJob = true;
+                death.grouped = d.grouped != 0;
+                _craftLoneDeaths[d.characterName].push_back(death);
             }
 
         // The four hit columns ship in a migration that may land in a later

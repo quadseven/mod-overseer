@@ -20624,6 +20624,73 @@ char const* SpawnWalkFirstLegRefusal(bool creatureSpawn, bool probeFoundStep, bo
 bool MayCraftNow(std::string const& job, bool inDungeonRun, bool alive, bool inCombat,
                  bool moving);
 
+// A LONE CRAFTER IN A ZONE THAT KEEPS KILLING IT (#1208). A character on job
+// 'craft' is away from its family and nothing walks it anywhere: on wow-dev,
+// in the 24 hours to 2026-10-27 23:52 UTC, Og (43) died 13 times alone in
+// Stranglethorn on that job, every row in combat with nothing moving it, and
+// was left standing there after each revival. So its own solo deaths are
+// counted per zone, and at CRAFT_LONE_DEATH_LIMITS.deaths inside the window it
+// is not left idle there: it hearths to its bind (an innkeeper, so a town with
+// guards), and while it cannot, its craft step is deferred. A death while
+// grouped is the family's to answer, not this rule's, and is not counted.
+struct CraftLoneDeath
+{
+    int64_t at{0};
+    uint32_t mapId{0};
+    uint32_t zoneId{0};
+    bool craftJob{false};
+    bool grouped{false};
+};
+
+struct CraftLoneDeathLimits
+{
+    unsigned deaths{2};
+    int64_t windowSeconds{60 * 60};
+};
+constexpr CraftLoneDeathLimits CRAFT_LONE_DEATH_LIMITS{};
+
+// How many of `deaths` were on job 'craft', not grouped, in this zone of this
+// map, inside the window ending at `now`.
+unsigned CraftLoneDeathsInZone(std::vector<CraftLoneDeath> const& deaths, uint32_t mapId,
+                               uint32_t zoneId, int64_t now,
+                               CraftLoneDeathLimits const& limits = CRAFT_LONE_DEATH_LIMITS);
+
+// Drop every death older than the window, so the record stays the size of the
+// deaths that can still count.
+void PruneCraftLoneDeaths(std::vector<CraftLoneDeath>& deaths, int64_t now,
+                          CraftLoneDeathLimits const& limits = CRAFT_LONE_DEATH_LIMITS);
+
+enum class CraftLoneDeathStep : uint8_t
+{
+    Stay,    // not this rule's: another job, grouped, too few deaths, or safe
+    Hearth,  // use the hearthstone: its bind is an inn, under guards
+    Defer,   // no hearth to use now: the craft step waits, nothing is cast
+};
+
+struct CraftLoneDeathFacts
+{
+    std::string job;
+    bool grouped{false};
+    bool alive{true};
+    // In an inn or a city (the core's resting flag): under guards already.
+    bool resting{false};
+    // A hearthstone, off cooldown, with no cast of it already in flight.
+    bool hearthReady{false};
+    // CraftLoneDeathsInZone for the zone it stands in now.
+    unsigned deathsHere{0};
+};
+
+// RULES, IN THIS ORDER: another job, grouped, or fewer than `limits.deaths`
+// deaths here is Stay. Resting is Stay: it is already somewhere safe. Dead is
+// Defer: nothing can be cast, and the craft waits for the revival. A ready
+// hearthstone is Hearth. Otherwise Defer, and the next poll asks again.
+CraftLoneDeathStep DecideCraftLoneDeaths(CraftLoneDeathFacts const& facts,
+                                         CraftLoneDeathLimits const& limits =
+                                             CRAFT_LONE_DEATH_LIMITS);
+
+// The reason the log line names, one short phrase per step.
+char const* CraftLoneDeathStepWord(CraftLoneDeathStep step);
+
 // A MOUNTED CRAFTER IS TAKEN OFF ITS MOUNT FIRST. Spell::CheckCast refuses a
 // tradeskill cast on a ground mount with SPELL_FAILED_NOT_MOUNTED (64); a
 // client sends CMSG_CANCEL_MOUNT_AURA before the cast, a bot does not. On
