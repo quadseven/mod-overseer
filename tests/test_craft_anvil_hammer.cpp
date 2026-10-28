@@ -75,11 +75,18 @@ void TheTool()
           CraftToolStepFor(CraftToolPlace::Missing, true, true) == CraftToolStep::Request);
     Check("the steps are named", std::string(CraftToolStepWord(CraftToolStep::Withdraw)) == "withdraw");
 
-    Check("a hammer no errand needs goes back at a banker", CraftToolGoesBack(true, false, true, true));
-    Check("a hammer an errand still needs stays in the bags", !CraftToolGoesBack(true, true, true, true));
-    Check("nobody is walked to a banker to put it back", !CraftToolGoesBack(true, false, false, true));
-    Check("not while unable to bank", !CraftToolGoesBack(true, false, true, false));
-    Check("a hammer that is not in the bags is left alone", !CraftToolGoesBack(false, false, true, true));
+    // CraftToolGoesBack(inBags, planned, stillNeeded, bankerInReach, able).
+    Check("a hammer a planned recipe used goes back at a banker once no errand needs it",
+          CraftToolGoesBack(true, true, false, true, true));
+    Check("a hammer an errand still needs stays in the bags", !CraftToolGoesBack(true, true, true, true, true));
+    Check("nobody is walked to a banker to put it back", !CraftToolGoesBack(true, true, false, false, true));
+    Check("not while unable to bank", !CraftToolGoesBack(true, true, false, true, false));
+    Check("a hammer that is not in the bags is left alone", !CraftToolGoesBack(false, true, false, true, true));
+    // wow-overseer#1515: no recipe on this member's plan has needed the tool
+    // (the planner skips every Anvil recipe today, or the hammer is an
+    // engineer's), so it is not the craft drive's to bank.
+    Check("a hammer no planned recipe needed stays in the bags, banker or not",
+          !CraftToolGoesBack(true, false, false, true, true));
 }
 
 void TheAnvil()
@@ -144,6 +151,22 @@ void TheAdapterIsWired()
     Check("a missing hammer is a material request for the tool item",
           body.find("OverseerDecisions::ToolItemForTotemCategory(") != std::string::npos);
 
+    // ONCE PER STATE, NOT EVERY POLL (wow-overseer#1516). Nothing buys from a
+    // tool material-request yet (the planner buy is wow-overseer#1477), so the
+    // row is written once when the crafter enters the "no tool" state, under
+    // the same SayCraftPrepOnce gate as its log line, not on every poll.
+    std::size_t const request = body.find("if (toolStep == OverseerDecisions::CraftToolStep::Request)");
+    std::size_t const requestEnd = body.find("OverseerDecisions::CraftDismountsFirst(", request);
+    std::string const requestBody =
+        request == std::string::npos || requestEnd == std::string::npos
+            ? std::string()
+            : body.substr(request, requestEnd - request);
+    std::size_t const once = requestBody.find("if (SayCraftPrepOnce(name, \"no tool\"))");
+    std::size_t const written = requestBody.find("RecordEvent(bot, \"material-request\"");
+    Check("the tool request branch exists", !requestBody.empty());
+    Check("the tool material-request is written once per state, inside the said-once gate",
+          once != std::string::npos && written != std::string::npos && written > once);
+
     std::size_t const refusal = body.find("if (result == SPELL_FAILED_REQUIRES_SPELL_FOCUS)");
     std::size_t const walked = body.find("OverseerDecisions::CraftFocusStepFor(");
     Check("a focus refusal asks whether to walk to an Anvil",
@@ -160,6 +183,17 @@ void TheAdapterIsWired()
           source.find("void ReturnCraftTools()") != std::string::npos &&
               source.find("OverseerDecisions::CraftToolGoesBack(") != std::string::npos &&
               source.find("DoBank(bot, \"deposit guid:\"") != std::string::npos);
+    std::size_t const back = source.find("void ReturnCraftTools()");
+    std::size_t const backEnd = back == std::string::npos ? back : source.find("void DriveCraft()", back);
+    std::string const ret = back == std::string::npos || backEnd == std::string::npos
+                                ? std::string()
+                                : source.substr(back, backEnd - back);
+    Check("only a member whose planned recipe needed the tool has it banked (wow-overseer#1515)",
+          ret.find("_craftToolPlanned.insert(name)") != std::string::npos &&
+              ret.find("CraftToolGoesBack(true, planned, stillNeeded") != std::string::npos);
+    Check("a deposit that fails is said once per state, not every poll (wow-overseer#1515)",
+          ret.find("SayCraftPrepOnce(name, ") != std::string::npos &&
+              ret.find("\"delivered\"") != std::string::npos);
     Check("and that pass runs on the craft poll",
           source.find("DriveCraft();\n            ReturnCraftTools();") != std::string::npos);
     Check("no weapon swap: the hammer is never equipped by the craft drive",

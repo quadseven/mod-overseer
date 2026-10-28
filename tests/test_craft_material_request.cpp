@@ -1,19 +1,26 @@
 /*
- * DriveCraft writes a material-request event when a craft is skipped due to
- * insufficient reagents, with at most one open request per character, recipe,
- * and reagent combination.
+ * DriveCraft writes a material-request event when a craft is skipped for a
+ * reagent the crafter is short of (#1099): one event naming the character, the
+ * recipe, the reagent item and the count SHORT, and no second one while the
+ * first is open for that character, recipe and reagent.
  *
- * Compiles against the pure decision file and nothing from AzerothCore.
+ * The decisions are pure (OverseerDecisions::ReagentShortBy,
+ * MaterialRequestDetail, OpenMaterialRequests); the adapter half is pinned by
+ * reading DriveCraft as text, the way test_craft_anvil_hammer.cpp pins the
+ * tool request. Run from the repo root.
  */
 
 #include "overseer_decisions.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
 
-using OverseerDecisions::FocusLighterSpell;
+using OverseerDecisions::MaterialRequestDetail;
+using OverseerDecisions::OpenMaterialRequests;
+using OverseerDecisions::ReagentShortBy;
 
 namespace
 {
@@ -28,17 +35,57 @@ void Check(char const* what, bool ok)
     ++failures;
 }
 
-void TheDecision()
+bool Has(std::string const& hay, char const* needle)
 {
-    // FocusLighterSpell is a pure decision function we can test
-    Check("a Cooking Fire is lit with Basic Campfire", FocusLighterSpell(4) == 818);
-    Check("no focus needs nothing lit", FocusLighterSpell(0) == 0);
-    Check("an Anvil is a world spawn, not conjured", FocusLighterSpell(1) == 0);
-    Check("a Forge is a world spawn, not conjured", FocusLighterSpell(3) == 0);
-    Check("an unknown focus is not guessed at", FocusLighterSpell(999) == 0);
+    return hay.find(needle) != std::string::npos;
 }
 
-void TheAdapterWritesMaterialRequest()
+constexpr unsigned RECIPE = 2666;
+constexpr unsigned COPPER_BAR = 2840;
+constexpr unsigned LINEN_CLOTH = 2589;
+
+void TheCountShort()
+{
+    Check("holding 2 of 6 is 4 short", ReagentShortBy(6, 2) == 4);
+    Check("holding none of 6 is 6 short", ReagentShortBy(6, 0) == 6);
+    Check("holding exactly enough is not short", ReagentShortBy(6, 6) == 0);
+    Check("holding more than enough is not short, never a wrap-around",
+          ReagentShortBy(6, 40) == 0);
+
+    std::string const detail = MaterialRequestDetail(6, 2, "Copper Bar");
+    Check("the detail says the count short, not the count needed",
+          detail == "short 4x Copper Bar (needs 6, has 2)");
+}
+
+void OneRequestWhileOpen()
+{
+    OpenMaterialRequests open;
+    Check("the first skip writes the event", open.Open("Alpha", RECIPE, COPPER_BAR));
+    Check("the request is now open", open.IsOpen("Alpha", RECIPE, COPPER_BAR));
+    Check("the next skip for the same reagent writes nothing",
+          !open.Open("Alpha", RECIPE, COPPER_BAR));
+    Check("nor the hundredth", !open.Open("Alpha", RECIPE, COPPER_BAR));
+    Check("still one open request", open.Size() == 1);
+
+    Check("another reagent of the same recipe is its own request",
+          open.Open("Alpha", RECIPE, LINEN_CLOTH));
+    Check("another recipe short of the same reagent is its own request",
+          open.Open("Alpha", RECIPE + 1, COPPER_BAR));
+    Check("another character short of the same reagent is its own request",
+          open.Open("Bravo", RECIPE, COPPER_BAR));
+    Check("four open requests", open.Size() == 4);
+
+    open.Close("Alpha", RECIPE, COPPER_BAR);
+    Check("holding enough closes that request", !open.IsOpen("Alpha", RECIPE, COPPER_BAR));
+    Check("and only that one", open.IsOpen("Alpha", RECIPE, LINEN_CLOTH) &&
+                                   open.IsOpen("Bravo", RECIPE, COPPER_BAR));
+    Check("short again after it closed asks again", open.Open("Alpha", RECIPE, COPPER_BAR));
+
+    open.Close("Charlie", RECIPE, COPPER_BAR);
+    Check("closing a request that was never open changes nothing", open.Size() == 4);
+}
+
+void TheAdapterUsesTheGate()
 {
     std::ifstream in("src/mod_overseer.cpp");
     std::stringstream text;
@@ -48,75 +95,40 @@ void TheAdapterWritesMaterialRequest()
 
     std::size_t const drive = source.find("void DriveCraft()");
     Check("DriveCraft exists", drive != std::string::npos);
-    std::size_t const end = source.find("// ----", drive);
-    std::string const body =
-        drive == std::string::npos ? std::string() : source.substr(drive, end - drive);
+    std::size_t const end = source.find("// THE TOOL A RECIPE NEEDS", drive);
+    Check("the reagent pre-filter ends before the tool step", end != std::string::npos);
+    std::string const body = (drive == std::string::npos || end == std::string::npos)
+                                 ? std::string()
+                                 : source.substr(drive, end - drive);
 
-    // Check that the reagent pre-filter loop writes a material-request event
-    // when a reagent is missing
-    std::size_t const reagentLoop = body.find("for (uint32 x = 0; x < MAX_SPELL_REAGENTS; ++x)");
-    Check("reagent pre-filter loop exists", reagentLoop != std::string::npos);
+    Check("a reagent held in full closes its request",
+          Has(body, "_materialRequests.Close(name, spellId, reagentId);"));
+    Check("a short reagent writes only when its request was not open",
+          Has(body, "_materialRequests.Open(name, spellId, reagentId)"));
+    Check("the detail is the count short, read from what the bags hold",
+          Has(body, "bot->GetItemCount(reagentId, false)") &&
+              Has(body, "OverseerDecisions::MaterialRequestDetail(reagentCount, have"));
+    Check("the event is material-request on the recipe, keyed on the reagent item",
+          Has(body, "extra.itemGuid = reagentId;") &&
+              Has(body, "RecordEvent(bot, \"material-request\", spellId"));
+    Check("the old count-needed detail is gone", !Has(body, "\"need \""));
 
-    // Check that RecordEvent is called with "material-request" kind
-    std::size_t const recordEvent = body.find("RecordEvent");
-    Check("RecordEvent is called somewhere in DriveCraft", recordEvent != std::string::npos);
+    std::size_t const gate = body.find("_materialRequests.Open(");
+    std::size_t const record = body.find("RecordEvent(bot, \"material-request\"");
+    Check("the event is written inside the open-request gate, not before it",
+          gate != std::string::npos && record != std::string::npos && gate < record);
 
-    // Check that "material-request" string literal appears in the DriveCraft body
-    std::size_t const materialRequest = body.find("material-request");
-    Check("material-request event kind is used", materialRequest != std::string::npos);
-
-    // Check that itemGuid (reagent item ID) is used for deduplication
-    std::size_t const itemGuid = body.find("extra.itemGuid");
-    Check("itemGuid is set for material-request deduplication", itemGuid != std::string::npos);
-
-    // Check that the event includes the reagent item ID in the key
-    std::size_t const reagentId = body.find("info->Reagent[x]");
-    Check("reagent item ID is referenced", reagentId != std::string::npos);
-
-    // Check that the event detail includes the reagent name or count
-    std::size_t const detail = body.find("detail");
-    Check("detail is set for material-request", detail != std::string::npos);
-}
-
-void TheAdapterDeduplicatesMaterialRequests()
-{
-    std::ifstream in("src/mod_overseer.cpp");
-    std::stringstream text;
-    text << in.rdbuf();
-    std::string const source = text.str();
-
-    std::size_t const drive = source.find("void DriveCraft()");
-    std::size_t const end = source.find("// ----", drive);
-    std::string const body =
-        drive == std::string::npos ? std::string() : source.substr(drive, end - drive);
-
-    // The deduplication happens automatically via the EventKey which includes
-    // characterName, kind, subjectId, bucket, and itemGuid.
-    // By setting itemGuid to the reagent item ID, we get per-reagent deduplication.
-    // Verify the event key structure supports this.
-
-    // Check that EventKey includes itemGuid
-    std::size_t const eventKey = source.find("struct EventKey");
-    Check("EventKey struct exists", eventKey != std::string::npos);
-
-    std::size_t const itemGuidInKey = source.find("uint32 itemGuid = 0;");
-    Check("EventKey has itemGuid field", itemGuidInKey != std::string::npos);
-
-    // Check that QueueEvent uses itemGuid in the key
-    std::size_t const queueEvent = source.find("void QueueEvent");
-    Check("QueueEvent exists", queueEvent != std::string::npos);
-
-    std::size_t const keyConstruction = source.find("key.itemGuid = extra.itemGuid;");
-    Check("QueueEvent sets itemGuid from extra", keyConstruction != std::string::npos);
+    Check("the gate is a member of the world script, one per realm",
+          Has(source, "OverseerDecisions::OpenMaterialRequests _materialRequests;"));
 }
 
 }  // namespace
 
 int main()
 {
-    TheDecision();
-    TheAdapterWritesMaterialRequest();
-    TheAdapterDeduplicatesMaterialRequests();
+    TheCountShort();
+    OneRequestWhileOpen();
+    TheAdapterUsesTheGate();
 
     if (failures)
     {

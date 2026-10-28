@@ -59,7 +59,7 @@ void TheAdapterIsWired()
     std::string const source = text.str();
     Check("the module source is readable (run from the repo root)", !source.empty());
     Check("DriveCraft asks the decision",
-          source.find("OverseerDecisions::MayCraftNow(jobIt->second, InDungeonRun(bot),")
+          source.find("OverseerDecisions::MayCraftNow(jobIt->second, InAnyDungeonRun(bot),")
               != std::string::npos);
     Check("and no longer requires job craft alone",
           source.find("if (jobIt == jobs.end() || jobIt->second != \"craft\")")

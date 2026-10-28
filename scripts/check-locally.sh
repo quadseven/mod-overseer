@@ -31,6 +31,14 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+# Every scratch folder this run makes goes on this list and is removed when
+# the script exits, however it exits. A RETURN trap alone never fires when
+# set -e ends the script mid-function (a failed compile or test), and those
+# runs left a build folder of several hundred MB in TMPDIR each time.
+scratch_dirs=()
+cleanup_scratch() { [ "${#scratch_dirs[@]}" -eq 0 ] || rm -rf "${scratch_dirs[@]}"; }
+trap cleanup_scratch EXIT
+
 run_decisions() {
   echo "== decisions: version strings agree"
   local file header
@@ -50,7 +58,7 @@ run_decisions() {
   local found=0 test_src name
   local workdir
   workdir="$(mktemp -d)"
-  trap 'rm -rf "$workdir"' RETURN
+  scratch_dirs+=("$workdir")
   # Compiled once and linked into every test, as check.decisions.yml does.
   g++ -std=c++17 -Wall -Wextra -Isrc -c src/overseer_decisions.cpp -o "$workdir/overseer_decisions.o"
   for test_src in tests/test_*.cpp; do
@@ -84,7 +92,7 @@ run_adapter() {
 
   local work
   work="$(mktemp -d)"
-  trap 'rm -rf "$work"' RETURN
+  scratch_dirs+=("$work")
 
   echo "== adapter: laying out the pinned tree"
   git init -q "$work/acore"
