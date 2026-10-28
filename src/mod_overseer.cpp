@@ -9895,6 +9895,7 @@ private:
         bool addedStay{false};
         bool removedFollow{false};
         bool removedNewRpg{false};
+        bool removedMount{false};  // #1229: the re-mount source, suspended
         bool stoodItUp{false};
         bool dismountedIt{false};
         time_t until{0};
@@ -10338,6 +10339,8 @@ private:
         facts.hasStay = botAI->HasStrategy("stay", BOT_STATE_NON_COMBAT);
         facts.hasFollow = botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT);
         facts.hasNewRpg = botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT);
+        facts.hasMount = botAI->HasStrategy("mount", BOT_STATE_NON_COMBAT);
+        facts.readyToCast = readyToCast;
         OverseerDecisions::CastHoldPlan const plan = OverseerDecisions::PlanCastHold(facts);
 
         // THE CALLS ARE MADE OFF WHAT IS THERE NOW; THE DEBT IS WHAT WAS THERE
@@ -10351,6 +10354,13 @@ private:
             botAI->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
         if (plan.dropNewRpg)
             botAI->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+        // THE RE-MOUNT IS STOPPED WHERE IT STARTS (#1229). The dismount below
+        // undoes a mount after it lands; CheckMountStateAction, which re-mounts
+        // a bot whose travel target is far away, is not useful to an unmounted
+        // bot without `mount`, so a casting hold takes `mount` off for its
+        // duration and the release puts it back.
+        if (plan.dropMount)
+            botAI->ChangeStrategy("-mount", BOT_STATE_NON_COMBAT);
 
         who->StopMoving();
         who->ClearUnitState(UNIT_STATE_CHASE);
@@ -10447,6 +10457,7 @@ private:
             record.addedStay = plan.addStay;
             record.removedFollow = plan.dropFollow;
             record.removedNewRpg = plan.dropNewRpg;
+            record.removedMount = plan.dropMount;
             // AN EXPIRED HOLD'S UNDO IS CARRIED, NOT OVERWRITTEN
             // (wow-overseer#335 follow-up). A hold past its ceiling that no
             // release has reached yet still has its `+stay` on, so the plan
@@ -10460,6 +10471,7 @@ private:
                 record.addedStay = record.addedStay || existing->second.addedStay;
                 record.removedFollow = record.removedFollow || existing->second.removedFollow;
                 record.removedNewRpg = record.removedNewRpg || existing->second.removedNewRpg;
+                record.removedMount = record.removedMount || existing->second.removedMount;
             }
             record.until = time(nullptr) + ceilingSeconds;
             record.verb = verb ? verb : "";
@@ -10527,6 +10539,10 @@ private:
         // cancel the errand that says so (#163).
         if (wasMounted)
             existing->second.dismountedIt = true;
+        // A `mount` handed back mid-hold (a relog, an operator) is taken off
+        // again, and the release owes it back only if this hold took it.
+        if (plan.dropMount)
+            existing->second.removedMount = true;
 
         // AN EXTENDED HOLD IS STILL BOUNDED BY THE CEILING FROM WHEN IT STARTED.
         // The deadline is not pushed out by re-assertion, or a verb that polls
@@ -10622,6 +10638,8 @@ private:
             botAI->ChangeStrategy("+follow", BOT_STATE_NON_COMBAT);
         if (record.removedNewRpg)
             botAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+        if (record.removedMount)
+            botAI->ChangeStrategy("+mount", BOT_STATE_NON_COMBAT);
         LOG_INFO("module.overseer",
                  "overseer: '{}' is released from its {} hold - {} (stay {}, follow {}, "
                  "new rpg {}); the motion slot had to be taken over {} time(s) while it stood",
@@ -10768,8 +10786,33 @@ private:
             if (now >= hold.second.until && !ARowStillOwnsTheHold(hold.first))
                 due.push_back(hold.first);
         for (std::string const& name : due)
+        {
+            // A HEARTH HOLD THAT ENDS HERE ENDED WITH NO CAST (#1229). A cast
+            // that started is a parked hearth row, which ARowStillOwnsTheHold
+            // answers for, and the row's own verdict releases it. So a hearth
+            // hold reaching this line was placed, fought (a re-mount, a walk)
+            // and never cast. It is counted for the death-spot episode, so a
+            // member is not held again and again for a cast that does not come,
+            // and the last refusal is said, so the line names why.
+            auto const hold = holds.find(name);
+            if (hold != holds.end() && hold->second.verb == "hearth")
+            {
+                unsigned released = 0;
+                if (_guildDeathSpotTries.count(name))
+                    released = ++_guildDeathSpotCeilings[name];
+                auto const said = _guildDeathSpotRefusal.find(name);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' reached its hearth hold's ceiling without going home - "
+                         "last refusal: {}; {} such hold(s) in a row this episode",
+                         name,
+                         said != _guildDeathSpotRefusal.end() && !said->second.empty()
+                             ? said->second
+                             : std::string("none recorded"),
+                         released);
+            }
             ReleaseHold(name, ObjectAccessor::FindPlayerByName(name, false),
                         "its hold reached the ceiling and nothing came back for it");
+        }
     }
 
     // AND THE THING THAT MAKES A HOLD LAST LONGER THAN THE INSTANT IT IS TAKEN
@@ -32382,6 +32425,7 @@ private:
             // The member left the death zone: forget how many times we asked.
             _guildDeathSpotTries.erase(name);
             _guildDeathSpotRefusal.erase(name);
+            _guildDeathSpotCeilings.erase(name);
             return false;
         }
 
@@ -32410,14 +32454,32 @@ private:
             bot->StopMoving();
             CastHoldReport hold;
             HoldStillAndReport(bot, name, "hearth", hold);
+            return hold.placed;
+        };
+
+        // THE HEARTH-CANNOT-SUCCEED LINE (#1229), said each time the keep-out
+        // places a fresh hold, so every `is held still to hearth` is followed
+        // by `is using its hearthstone` or by this.
+        unsigned const ceilings = _guildDeathSpotCeilings.count(name)
+                                      ? _guildDeathSpotCeilings[name]
+                                      : 0;
+        auto sayCannotSucceed = [&]()
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' (level {}) cannot hearth out (stone {}, tries {}/{}, "
+                     "{} hold(s) ended at the ceiling with no cast) and is kept out of the "
+                     "death zone where it stands",
+                     name, bot->GetLevel(),
+                     !stone ? "missing" : stoneOnCooldown ? "on cooldown" : "ready", tries,
+                     boundTries, ceilings);
         };
 
         auto keepMemberOut = [&]()
         {
             bool const keepOut = OverseerDecisions::KeepOutOfDeathZone(
                 true, outmatchedHere, guildMovedIt);
-            if (keepOut)
-                holdStill();
+            if (keepOut && holdStill())
+                sayCannotSucceed();
             return keepOut;
         };
 
@@ -32430,10 +32492,11 @@ private:
         if (!inCombat &&
             OverseerDecisions::KeepOutOfDeathZone(
                 OverseerDecisions::HearthOutCannotSucceed(stone != 0, stoneOnCooldown, tries,
-                                                          boundTries),
+                                                          boundTries, ceilings),
                 outmatchedHere, guildMovedIt))
         {
-            holdStill();
+            if (holdStill())
+                sayCannotSucceed();
             return true;
         }
 
@@ -32473,6 +32536,8 @@ private:
                          name, bot->GetLevel(), deathsHere, GHOST_REPEAT_RADIUS,
                          GHOST_REPEAT_MINUTES);
             ++tries;
+            // A cast started: the run of holds that ended with none is over.
+            _guildDeathSpotCeilings.erase(name);
             return true;
         }
 
@@ -80291,6 +80356,11 @@ private:
     // name. Bounded so a member whose hearth-out cannot succeed is not asked
     // every poll for ever; reset when the member leaves the death zone.
     std::map<std::string, unsigned> _guildDeathSpotTries;
+    // How many hearth holds in a row reached their ceiling with no cast for a
+    // member in a death-spot episode (#1229), by name. Bumped by
+    // ReleaseExpiredHolds, cleared when a cast starts or the member leaves the
+    // death zone; HearthOutCannotSucceed sends it to the keep-out at the bound.
+    std::map<std::string, unsigned> _guildDeathSpotCeilings;
     // DriveGuildTraining: every class trainer spawn by the class it serves, the
     // entry each spot is, the trainer each member was last sent to, and when
     // the drive last ran.
