@@ -216,9 +216,14 @@ int main()
         Check("walk started recently does not time out",
               Is(PlanRecipeManual(f), RecipeManualStep::Walk, ""));
     }
-    // Note: timeout case (walkStartedAt older than RECIPE_MANUAL_WALK_TIMEOUT_SECONDS)
-    // cannot be reliably tested without mocking std::time(nullptr), but the logic
-    // is compiled and exercised by the module at runtime.
+    {
+        RecipeManualFacts f = AtTheVendor();
+        f.vendorNearby = false;
+        f.vendorInReach = false;
+        f.walkStartedAt = std::time(nullptr) - RECIPE_MANUAL_WALK_TIMEOUT_SECONDS - 1;
+        Check("walk older than RECIPE_MANUAL_WALK_TIMEOUT_SECONDS times out",
+              Is(PlanRecipeManual(f), RecipeManualStep::Refuse, Refusal::WalkTimeout));
+    }
 
     // ---- vendor nearby with walk started does not re-walk -----------------
     {
