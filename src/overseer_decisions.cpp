@@ -15547,6 +15547,33 @@ bool RaidRunCountsWipe(RaidRunPhase current, RaidRunStep const& step,
            RaidWiped(facts);
 }
 
+bool DungeonWipeBookEndsAttempt(DungeonWipeBook& book, std::uint32_t mapId, std::time_t now)
+{
+    bool const repeat = book.wipes >= 1 && book.lastWipeAt != 0 && now != 0 &&
+                        book.lastWipeMap == mapId && now - book.lastWipeAt < WIPE_LOOP_SECONDS;
+    ++book.wipes;
+    book.lastWipeAt = now;
+    book.lastWipeMap = mapId;
+    if (repeat)
+    {
+        book.endedAt = now;
+        book.endedMap = mapId;
+        book.holdSaid = false;
+    }
+    return repeat;
+}
+
+bool DungeonWipeHoldsRunStart(DungeonWipeBook const& book, std::uint32_t mapId,
+                              bool membersSick, std::time_t now)
+{
+    if (book.endedAt == 0 || book.endedMap != mapId || now == 0)
+        return false;
+    std::time_t const since = now - book.endedAt;
+    if (since < WIPE_LOOP_SECONDS)
+        return true;
+    return membersSick && since < WIPE_SICK_HOLD_MAX_SECONDS;
+}
+
 bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct)
 {
     return lowestDurabilityPct < floorPct;
@@ -15702,7 +15729,8 @@ RaidRunStep StepRaidRunRecover(RaidRunPhase current, RaidRunFacts const& facts)
     // ending there would end the run after its first one. releaseDead stays
     // set, so the corpses are released before the order is let go.
     if (wiped && current != RaidRunPhase::Recover && facts.wipes >= 1 && facts.samePlace &&
-        facts.lastWipeAt != 0 && facts.now != 0 && facts.now - facts.lastWipeAt < 600)
+        facts.lastWipeAt != 0 && facts.now != 0 &&
+        facts.now - facts.lastWipeAt < WIPE_LOOP_SECONDS)
     {
         step.phase = RaidRunPhase::Idle;
         step.release = true;
@@ -15785,6 +15813,18 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
         return step;
     }
 
+    // AN ENDED ATTEMPT STAYS ENDED WHILE ITS RELEASE WAITS (#1201). The release
+    // keeps the raid while a living member is inside, so it can take more than
+    // one poll; every one of them releases again, and none walks anybody back.
+    if (facts.attemptEnding)
+    {
+        step.phase = RaidRunPhase::Idle;
+        step.release = true;
+        step.releaseDead = true;
+        step.why = "the attempt was ended; letting go of the raid once nobody is inside";
+        return step;
+    }
+
     // INSIDE, in the order of what overrides what (see StepRaidRun's header).
     bool const wasInside = RaidRunIsInside(current);
     if (wasInside || facts.headInside)
@@ -15818,6 +15858,18 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
     switch (current)
     {
         case RaidRunPhase::Idle:
+            // THE SICKNESS HOLD OUTLIVES THE RELEASE (#1201). An attempt ended
+            // by a wipe is let go and the order still stands, so the next poll
+            // is here; the wipe book is carried across the release, and the
+            // next attempt waits out the sickness instead of forming at once.
+            if (facts.wipes >= 1 && facts.membersSick && facts.lastWipeAt != 0 &&
+                facts.now != 0 && facts.now - facts.lastWipeAt < WIPE_SICK_HOLD_MAX_SECONDS)
+            {
+                step.phase = RaidRunPhase::Idle;
+                step.why = "members still carry Resurrection Sickness from the last wipe; "
+                           "the next attempt waits it out";
+                return step;
+            }
             step.phase = RaidRunPhase::Form;
             step.form = true;
             step.why = "a raid is ordered; forming it from the seats";

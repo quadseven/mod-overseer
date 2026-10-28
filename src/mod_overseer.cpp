@@ -35949,6 +35949,11 @@ private:
     // row, staging point, members, clocks and evacuation here, and nothing in
     // one entry is read or written on behalf of another family.
     std::map<std::string, DungeonRunCoordinatorState> _dungeonRunCoordinators;
+    // EACH LEADER'S WIPE BOOK (#1201), kept apart from the coordinator because
+    // the coordinator is replaced wholesale at the end of every run, and the
+    // book is about the runs before this one. World thread only, lost on a
+    // restart like the coordinator itself.
+    std::map<std::string, OverseerDecisions::DungeonWipeBook> _dungeonWipeBooks;
     // EACH LEADER'S CROSSING ATTEMPTS (#926), kept apart from the coordinator
     // because a coordinator's crossing memo is dropped on a refusal and the
     // whole state is replaced when a run opens, and the count has to outlive
@@ -44763,6 +44768,12 @@ private:
                 Esc(portal.keyword), runId);
         CloseRun(runId, outcome, reason);
         WriteRunEnded(coord, leaderName, runId, outcome, reason);
+        // Every wipe goes on the leader's book, whatever is decided below.
+        bool const wipeEndsAttempt =
+            std::string(outcome) == "wipe" &&
+            OverseerDecisions::DungeonWipeBookEndsAttempt(_dungeonWipeBooks[leaderName],
+                                                          portal.insideMapId,
+                                                          std::time(nullptr));
 
         // WHERE THE CAMPAIGN STANDS NOW, AND WHETHER THIS RUN MOVED IT (#225).
         // The arithmetic is in the pure decisions because it is the part that
@@ -44891,6 +44902,25 @@ private:
                      "until a named item drops (#150) - do not exist yet; this loop stops "
                      "on the count and on nothing else",
                      runId, outcome, reason, finished, wanted, campaignId);
+            coord = DungeonRunCoordinatorState();
+            return;
+        }
+
+        // A SECOND WIPE AT THE SAME PLACE INSIDE 600 S ENDS THE ATTEMPT (#1201).
+        // Re-arming here is what walked a wiped family back in: REPAIRING,
+        // RESETTING and the walk to the same door, and the same pull wiped it
+        // again roughly every nine minutes. The coordinator goes to IDLE
+        // instead, where DungeonWipeHoldsRunStart keeps the next attempt shut
+        // for the window and while anybody is still sick.
+        if (wipeEndsAttempt)
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: dungeon run {} ended '{}' - {}. That is wipe {} for '{}' on "
+                     "map {}, the second there inside {} s, so the attempt ends: the run "
+                     "does not go again now, and IDLE holds the next one while anybody "
+                     "carries Resurrection Sickness",
+                     runId, outcome, reason, _dungeonWipeBooks[leaderName].wipes, leaderName,
+                     portal.insideMapId, uint32(OverseerDecisions::WIPE_LOOP_SECONDS));
             coord = DungeonRunCoordinatorState();
             return;
         }
@@ -49936,6 +49966,10 @@ private:
         unsigned wipes{0};
         time_t lastWipeAt{0};       // epoch seconds of the most recent wipe
         uint32_t lastWipeMap{0};    // the map it wiped on, for the same-place test
+        // A release that did not finish (a living member still inside): the
+        // attempt is over, and every poll until the release finishes lets go
+        // again rather than walking anybody back in (#1201).
+        bool attemptEnding{false};
         unsigned released{0};
         unsigned regroups{0};
         unsigned skips{0};
@@ -51341,6 +51375,22 @@ private:
             OverseerDecisions::RaidWipeFacts(facts, run.wipes, run.lastWipeAt, run.lastWipeMap,
                                              door ? door->insideMapId : 0,
                                              std::time(nullptr));
+            facts.attemptEnding = run.attemptEnding;
+            // THE SICKNESS IS READ OFF THE SEATS TOO (#1201). Once an ended
+            // attempt has disbanded the raid there is no raid to read it from,
+            // and IDLE's hold on the next attempt asks the same question.
+            if (!facts.membersSick)
+                for (auto const& [name, subgroup] : seats)
+                {
+                    (void)subgroup;
+                    Player* seat = ObjectAccessor::FindPlayerByName(name);
+                    if (seat && seat->IsInWorld() &&
+                        seat->HasAura(OverseerDecisions::RESURRECTION_SICKNESS_AURA))
+                    {
+                        facts.membersSick = true;
+                        break;
+                    }
+                }
             if (door)
             {
                 if (head && head->IsInWorld())
@@ -51367,9 +51417,31 @@ private:
                              "overseer: raid run for family '{}' released at {} - {}",
                              roster.family, OverseerDecisions::RaidRunPhaseName(run.phase),
                              step.why);
+                    // THE WIPE BOOK IS CARRIED ACROSS THE RELEASE (#1201). The
+                    // order can still stand, and the next attempt is judged on
+                    // it: the sickness hold needs a wipe on the book, and the
+                    // same-place rule needs the last one's time and map.
+                    unsigned const wipes = run.wipes;
+                    time_t const lastWipeAt = run.lastWipeAt;
+                    uint32_t const lastWipeMap = run.lastWipeMap;
                     run = RaidRunState();
+                    run.wipes = wipes;
+                    run.lastWipeAt = lastWipeAt;
+                    run.lastWipeMap = lastWipeMap;
                     run.lastWhy = step.why;
                     WriteRaidTimeline(roster, run, door);
+                }
+                else if (!run.attemptEnding)
+                {
+                    // The attempt is over even though the raid is kept: the
+                    // next poll lets go again instead of walking back in.
+                    run.attemptEnding = true;
+                    LOG_INFO("module.overseer",
+                             "overseer: raid run for family '{}' ended its attempt at {} - "
+                             "{}; the release waits for the living still inside, and "
+                             "nobody is walked back in meanwhile",
+                             roster.family, OverseerDecisions::RaidRunPhaseName(run.phase),
+                             step.why);
                 }
                 continue;
             }
@@ -53340,6 +53412,47 @@ private:
                              leaderName, cap.done, cap.wanted);
                 }
                 return;
+            }
+
+            // AN ATTEMPT ENDED BY A REPEAT WIPE IS NOT OPENED AGAIN AT ONCE
+            // (#1201). See EndRunAndDecide. Asked before anything is paid for:
+            // RESETTING and the walk to the door are the walk back in.
+            {
+                auto const book = _dungeonWipeBooks.find(leaderName);
+                DungeonPortal const* const heldDoor =
+                    book == _dungeonWipeBooks.end()
+                        ? nullptr
+                        : FindDungeonPortal(DungeonKeywordForJob(leaderJob));
+                if (heldDoor)
+                {
+                    bool sick = false;
+                    for (std::string const& name : members)
+                    {
+                        Player* member = ObjectAccessor::FindPlayerByName(name);
+                        if (member && member->IsInWorld() &&
+                            member->HasAura(OverseerDecisions::RESURRECTION_SICKNESS_AURA))
+                        {
+                            sick = true;
+                            break;
+                        }
+                    }
+                    if (OverseerDecisions::DungeonWipeHoldsRunStart(
+                            book->second, heldDoor->insideMapId, sick, std::time(nullptr)))
+                    {
+                        if (!book->second.holdSaid)
+                        {
+                            book->second.holdSaid = true;
+                            LOG_INFO("module.overseer",
+                                     "overseer: the next dungeon run for '{}' on map {} "
+                                     "waits - the last attempt there ended on a second "
+                                     "wipe inside {} s, and it opens once that window has "
+                                     "passed and nobody carries Resurrection Sickness",
+                                     leaderName, heldDoor->insideMapId,
+                                     uint32(OverseerDecisions::WIPE_LOOP_SECONDS));
+                        }
+                        return;
+                    }
+                }
             }
 
 
