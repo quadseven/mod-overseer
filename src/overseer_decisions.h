@@ -7900,6 +7900,33 @@ FallAccount AccountForFall(float recordedYardsFallen, float safeFallYards = 0.f,
                            bool startedBelowSurface = false);
 char const* FallAccountName(FallAccount account);
 
+// DID THE LAST SAMPLE START UNDER THE WORLD, OR JUST UNDER SOMETHING (#1211).
+//
+// RecordDeath used to call a death a void fall whenever the last sampled
+// position was below the highest surface a long probe found over it. That
+// probe returns the HIGHEST surface at the character's x and y, so a roof, a
+// bridge, a tree canopy, a cave ceiling or an overhang above a character
+// standing on ordinary ground read as "below the surface". Measured on the dev
+// realm after #1107 went live: 33 of the 47 rows written as void falls were
+// surface deaths that fell 0 to 2.1 yards, 21 of them creature kills in combat.
+//
+// SO TWO READINGS ARE ASKED FOR, NOT ONE. `surfaceAbove*` is that long probe,
+// unchanged. `groundBelow*` is a second probe started `toleranceYards` over
+// the sample and searching down from there. A character with ground under its
+// own feet is standing on the world, whatever is over its head, and is never
+// below it. Under the world there is nothing to find: the terrain height only
+// counts from above it, and a downward ray from under the map hits nothing.
+//
+// THE TOLERANCE IS THE OTHER HALF. A character a few yards under the sampled
+// surface is float jitter on the ground it stands on, not a body that has gone
+// through it, so it is not below the surface either.
+constexpr float FALL_START_SURFACE_TOLERANCE_YARDS = 5.0f;
+
+bool FallStartedBelowWorld(float lastZ, bool surfaceAboveFound,
+                           float surfaceAboveZ, bool groundBelowFound,
+                           float groundBelowZ,
+                           float toleranceYards = FALL_START_SURFACE_TOLERANCE_YARDS);
+
 // ------------------------------------------------- a revival and a party --
 //
 // A REVIVAL MAY NOT PUT A CHARACTER ON A MAP ITS PARTY IS NOT ON, unless there
@@ -18575,6 +18602,14 @@ struct RaidRunFacts
     bool membersSick{false};         // members still carry Resurrection Sickness
     std::string graveyard;           // the graveyard the party would revive at
     std::time_t now{0};              // this poll's epoch seconds
+
+    // AN ATTEMPT ALREADY ENDED, STILL LETTING GO (#1201). The wipe rule above
+    // ends an attempt with a release, and the release keeps the raid while a
+    // living member is still inside (up to 10% can be, RAID_WIPE_PCT being
+    // 90). Without this the next poll saw RECOVER again and walked the dead
+    // back in. Set by the adapter from the poll whose release did not finish
+    // until the one whose release does.
+    bool attemptEnding{false};
 };
 
 struct RaidRunStep
@@ -18611,6 +18646,41 @@ void RaidWipeFacts(RaidRunFacts& facts, unsigned wipes, std::time_t lastWipeAt,
                    std::uint32_t lastWipeMap, std::uint32_t doorMap, std::time_t now);
 bool RaidRunCountsWipe(RaidRunPhase current, RaidRunStep const& step,
                        RaidRunFacts const& facts);
+
+// THE SAME RULE, AND THE SAME HOLD, FOR BOTH COORDINATORS (#1201). A run that
+// wipes twice at the same place inside WIPE_LOOP_SECONDS ends the attempt
+// rather than walking back in, and the next attempt does not open while a
+// member still carries Resurrection Sickness after a wipe. The sickness hold
+// outside RECOVER is bounded by WIPE_SICK_HOLD_MAX_SECONDS from the last wipe,
+// so a sickness picked up somewhere else long after cannot hold a run.
+constexpr std::time_t WIPE_LOOP_SECONDS = 600;
+constexpr std::time_t WIPE_SICK_HOLD_MAX_SECONDS = 1800;
+constexpr std::uint32_t RESURRECTION_SICKNESS_AURA = 15007;
+
+// The family coordinator's wipe book (#1201). The raid run keeps its book on
+// its own state; a family's coordinator state is replaced wholesale at the end
+// of every run, so this book is kept beside it, per leader, and survives that.
+struct DungeonWipeBook
+{
+    unsigned wipes{0};               // runs ended 'wipe', in all
+    std::time_t lastWipeAt{0};       // when the last of them ended (0 = none)
+    std::uint32_t lastWipeMap{0};    // and on which map
+    std::time_t endedAt{0};          // when a repeat wipe ended the attempt (0 = never)
+    std::uint32_t endedMap{0};       // and on which map
+    bool holdSaid{false};            // the IDLE hold line was said for this ending
+};
+
+// Books a family run that ended 'wipe' on `mapId` at `now`. True when it is a
+// second wipe on the same map inside WIPE_LOOP_SECONDS of the one before: the
+// attempt ends and the campaign does not walk straight back in.
+bool DungeonWipeBookEndsAttempt(DungeonWipeBook& book, std::uint32_t mapId, std::time_t now);
+
+// Whether IDLE holds a new run on `mapId` after an attempt there was ended by a
+// repeat wipe: for WIPE_LOOP_SECONDS from that ending, and after it for as long
+// as a member still carries Resurrection Sickness, up to
+// WIPE_SICK_HOLD_MAX_SECONDS. Another dungeon is never held.
+bool DungeonWipeHoldsRunStart(DungeonWipeBook const& book, std::uint32_t mapId,
+                              bool membersSick, std::time_t now);
 
 // A raid seat is due for repair when its lowest wearable item is below the
 // configured floor. An item with no maximum durability is not part of the
