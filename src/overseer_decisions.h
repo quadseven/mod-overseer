@@ -15233,6 +15233,16 @@ struct CastHoldFacts
     bool hasStay{false};    // the strategy whose action stands a bot still
     bool hasFollow{false};  // moved by the party rather than by its own drive
     bool hasNewRpg{false};  // the self-drive: relevance 11, outranks everything
+    // The strategy that lets CheckMountStateAction act at all (its isUseful
+    // returns false for an unmounted bot without it), and so the SOURCE of
+    // every re-mount mid-hold (#1229). Undoing a mount after it lands, every
+    // poll, lost a hearth cast every time: the member was back on the mount
+    // before the next cast could be driven.
+    bool hasMount{false};
+    // The hold is for a cast. A staging hold leaves the mount alone, the
+    // same way it leaves the stand state alone, because a party waiting at a
+    // door is not about to cast anything.
+    bool readyToCast{false};
 };
 
 // What the hold changes, and therefore exactly what the release owes back. A
@@ -15245,6 +15255,7 @@ struct CastHoldPlan
     bool addStay{false};
     bool dropFollow{false};
     bool dropNewRpg{false};
+    bool dropMount{false};  // suspended for the hold, restored by the release
 };
 
 // The plan, given what is there.
@@ -22688,8 +22699,19 @@ bool KeepOutOfDeathZone(bool hearthOutFailed, bool stillInDeathZone,
 // Its answer is the `hearthOutFailed` that KeepOutOfDeathZone takes, so a
 // member killed far above its level is held where it stands rather than
 // handed back to the drives that walk it toward the killer again.
+//
+// AND A HOLD THAT KEEPS ENDING AT ITS CEILING WITHOUT A CAST (#1229). Each hold
+// placed for this hearth-out that reached its ceiling with no cast started is
+// counted, and `ceilingReleases` in a row at or past `ceilingBound` is a
+// hearth-out that cannot succeed either: the member goes to the keep-out
+// instead of a new hold that ends the same way. Measured before this, one
+// member was held, re-mounted, released at the ceiling and held again eleven
+// times in five minutes and never cast once.
+constexpr unsigned HEARTH_HOLD_CEILING_RELEASES = 3;
+
 bool HearthOutCannotSucceed(bool hasStone, bool stoneOnCooldown, unsigned tries,
-                            unsigned boundTries);
+                            unsigned boundTries, unsigned ceilingReleases = 0,
+                            unsigned ceilingBound = HEARTH_HOLD_CEILING_RELEASES);
 
 // "corpse_run", "spirit_healer", "wait", "ladder": the words written to
 // overseer_death.ghost_recovery and to the log.
