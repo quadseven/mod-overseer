@@ -50125,6 +50125,9 @@ private:
         // attempt is over, and every poll until the release finishes lets go
         // again rather than walking anybody back in (#1201).
         bool attemptEnding{false};
+        // When that release first did not finish, so the wait for the living
+        // still inside is bounded (#1222, RaidReleaseDisbandsAnyway).
+        time_t attemptEndingSince{0};
         unsigned released{0};
         unsigned regroups{0};
         unsigned skips{0};
@@ -50382,9 +50385,12 @@ private:
     // this run converted. The group is disbanded (the core's own call; a raid
     // cannot be turned back into a party) only when nobody in it is inside the
     // raid map, because a disband there is a forced eviction from the instance.
+    // That wait is bounded (#1222): once RaidReleaseDisbandsAnyway says so, the
+    // raid is disbanded with the survivor inside and the core puts him out. The
+    // wait is said once, on the poll that first finds somebody inside.
     // KeepRosterGrouped re-forms the family's party on its next poll.
     bool ReleaseRaidRun(std::string const& family, RaidRunState& run,
-                        OverseerDecisions::RaidDoor const* door)
+                        OverseerDecisions::RaidDoor const* door, time_t now)
     {
         if (!run.head.empty())
             _travelAims.Release(run.head);
@@ -50406,11 +50412,24 @@ private:
                 Player* member = ref->GetSource();
                 if (member && door && member->GetMapId() == door->insideMapId)
                 {
-                    LOG_INFO("module.overseer",
-                             "overseer: raid run for family '{}' ended but '{}' is still "
-                             "inside {} - the raid is kept until nobody is, and the "
-                             "release is tried again next poll",
-                             family, member->GetName(), door->name);
+                    if (OverseerDecisions::RaidReleaseDisbandsAnyway(run.attemptEndingSince,
+                                                                     now))
+                    {
+                        LOG_INFO("module.overseer",
+                                 "overseer: raid run for family '{}' waited {} s for '{}' "
+                                 "to leave {} - the raid is disbanded anyway and the "
+                                 "instance puts the survivor out",
+                                 family, long(now - run.attemptEndingSince),
+                                 member->GetName(), door->name);
+                        break;
+                    }
+                    if (!run.attemptEnding)
+                        LOG_INFO("module.overseer",
+                                 "overseer: raid run for family '{}' ended but '{}' is still "
+                                 "inside {} - the raid is kept until nobody is, for at most "
+                                 "{} s, and the release is tried again every poll",
+                                 family, member->GetName(), door->name,
+                                 OverseerDecisions::RAID_RELEASE_WAIT_SECONDS);
                     return false;
                 }
             }
@@ -51566,7 +51585,7 @@ private:
                 // they are released first, or the run would never let go.
                 if (step.releaseDead && door && group && group->isRaidGroup())
                     run.released += ReleaseRaidDead(group, door);
-                if (ReleaseRaidRun(roster.family, run, door))
+                if (ReleaseRaidRun(roster.family, run, door, std::time(nullptr)))
                 {
                     LOG_INFO("module.overseer",
                              "overseer: raid run for family '{}' released at {} - {}",
@@ -51591,6 +51610,7 @@ private:
                     // The attempt is over even though the raid is kept: the
                     // next poll lets go again instead of walking back in.
                     run.attemptEnding = true;
+                    run.attemptEndingSince = std::time(nullptr);
                     LOG_INFO("module.overseer",
                              "overseer: raid run for family '{}' ended its attempt at {} - "
                              "{}; the release waits for the living still inside, and "
@@ -53398,6 +53418,56 @@ private:
                     OverseerDecisions::DungeonRunAdoptAt(
                         OverseerDecisions::DungeonRunAllThrough(adoptedStates),
                         adoptedCompletion);
+
+                // A REPEAT WIPE'S HOLD STANDS OVER ADOPTION TOO (#1223). The
+                // hold below is asked only by a leader outside, but a member
+                // who comes back inside during it - a ghost running its corpse
+                // back through the portal is revived at the entrance - was
+                // adopted here at STAGED_INSIDE or CLEARING and the run went
+                // on at the same pull, which is the loop #1201/#1215 ended. So
+                // the book is asked before the run is adopted, and a held run
+                // is not adopted until the hold lifts. EXIT is still adopted:
+                // it only walks the member out. The refusal keeps its own
+                // once-per-ending flag: the run-start line may already have
+                // been said for this ending, and that must not silence it.
+                {
+                    auto const book = _dungeonWipeBooks.find(leaderName);
+                    if (book != _dungeonWipeBooks.end())
+                    {
+                        bool sick = false;
+                        for (std::string const& name : members)
+                        {
+                            Player* member = ObjectAccessor::FindPlayerByName(name);
+                            if (member && member->IsInWorld() &&
+                                member->HasAura(
+                                    OverseerDecisions::RESURRECTION_SICKNESS_AURA))
+                            {
+                                sick = true;
+                                break;
+                            }
+                        }
+                        if (OverseerDecisions::DungeonWipeHoldsAdoption(
+                                book->second, inside->insideMapId, sick, std::time(nullptr),
+                                adoptAt))
+                        {
+                            if (!book->second.adoptionHoldSaid)
+                            {
+                                book->second.adoptionHoldSaid = true;
+                                LOG_INFO("module.overseer",
+                                         "overseer: the next dungeon run for '{}' on map {} "
+                                         "waits - the last attempt there ended on a second "
+                                         "wipe inside {} s, and it opens once that window "
+                                         "has passed and nobody carries Resurrection "
+                                         "Sickness. The {} member(s) found inside are not "
+                                         "adopted until then",
+                                         leaderName, inside->insideMapId,
+                                         uint32(OverseerDecisions::WIPE_LOOP_SECONDS),
+                                         adoptedInside);
+                            }
+                            return;
+                        }
+                    }
+                }
 
                 coord = DungeonRunCoordinatorState();
                 switch (adoptAt)

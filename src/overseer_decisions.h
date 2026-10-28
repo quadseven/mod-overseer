@@ -18636,6 +18636,17 @@ struct RaidRunStep
 // Is the raid wiped, by RAID_WIPE_PCT? See that constant.
 bool RaidWiped(RaidRunFacts const& facts);
 
+// THE RELEASE OF AN ENDED ATTEMPT WAITS, BUT NOT FOREVER (#1222). The release
+// keeps the raid while anybody is on the raid map, because a disband there is
+// a forced eviction from the instance. Nothing walks a living survivor out (up
+// to 10% can be standing, RAID_WIPE_PCT being 90, a feign-death hunter for
+// one), so without a bound the order stalls until that member dies or leaves.
+// From the poll whose release first did not finish (endingSince, 0 = none), the
+// wait is RAID_RELEASE_WAIT_SECONDS; after that the raid is disbanded with the
+// survivor inside, and the core's eviction puts the survivor out.
+constexpr long RAID_RELEASE_WAIT_SECONDS = 2 * 60;
+bool RaidReleaseDisbandsAnyway(std::time_t endingSince, std::time_t now);
+
 // THE WIPE BOOK (#1165). The adapter keeps three things about a run's wipes:
 // how many, when the last one was, and on which map. RaidWipeFacts copies them
 // into a poll's facts (samePlace: a wipe is on the book and it was on the
@@ -18668,6 +18679,7 @@ struct DungeonWipeBook
     std::time_t endedAt{0};          // when a repeat wipe ended the attempt (0 = never)
     std::uint32_t endedMap{0};       // and on which map
     bool holdSaid{false};            // the IDLE hold line was said for this ending
+    bool adoptionHoldSaid{false};    // and the refused-adoption line (#1223), on its own
 };
 
 // Books a family run that ended 'wipe' on `mapId` at `now`. True when it is a
@@ -18681,6 +18693,17 @@ bool DungeonWipeBookEndsAttempt(DungeonWipeBook& book, std::uint32_t mapId, std:
 // WIPE_SICK_HOLD_MAX_SECONDS. Another dungeon is never held.
 bool DungeonWipeHoldsRunStart(DungeonWipeBook const& book, std::uint32_t mapId,
                               bool membersSick, std::time_t now);
+
+// Whether IDLE refuses to ADOPT a run it finds a member already inside on
+// `mapId` (#1223). Adoption is the other way back into a held attempt: a ghost
+// that runs its corpse back through the portal is revived inside, and adopting
+// it at STAGED_INSIDE or CLEARING resumes the run at the same pull, which is
+// the loop the hold exists to end. So the same hold refuses it. A cleared
+// instance (EXIT) is still adopted, because that adoption only walks the
+// member out and starts nothing.
+bool DungeonWipeHoldsAdoption(DungeonWipeBook const& book, std::uint32_t mapId,
+                              bool membersSick, std::time_t now,
+                              DungeonRunAdoptPhase adoptAt);
 
 // A raid seat is due for repair when its lowest wearable item is below the
 // configured floor. An item with no maximum durability is not part of the
