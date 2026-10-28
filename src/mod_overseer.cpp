@@ -21716,7 +21716,37 @@ private:
         // planned before a newer death is planned again (PlanRouteOnce), so an
         // errand to a fixed place is not walked down the old route.
         std::uint32_t deathsOnLegs{0};
+        // WHETHER THE WALKER IS STILL WALKING THAT ROUTE (#1228). The route
+        // this plan was handed to (TravelState::routeSerial), the point its
+        // cursor last stood at and when, written by RouteLeg each step. A death
+        // is charged only to a route stepped along a moment ago, and only to
+        // the leg the cursor was on, never to a road the walker has left.
+        std::uint32_t routeSerial{0};
+        std::uint32_t cursorAt{0};
+        std::time_t steppedAt{0};
     };
+
+    // How many legs this walker died on are still priced at `now` (#1228).
+    static std::uint32_t DiedOnLegsHeldBy(std::string const& name, std::time_t now)
+    {
+        auto const it = DiedOnLegBook().find(name);
+        return it == DiedOnLegBook().end()
+                   ? 0
+                   : OverseerDecisions::DiedOnLegsHeld(it->second.died, now);
+    }
+
+    // RouteLeg's step along a plan, for the death reading above (#1228).
+    // Written only for the plan the memory holds, so a step along some other
+    // drive's older route cannot make this one look walked.
+    static void NoteRouteStep(std::string const& name, std::uint32_t routeSerial,
+                              std::uint32_t cursorAt)
+    {
+        auto const it = DiedOnLegBook().find(name);
+        if (it == DiedOnLegBook().end() || it->second.routeSerial != routeSerial)
+            return;
+        it->second.cursorAt = cursorAt;
+        it->second.steppedAt = std::time(nullptr);
+    }
 
     // The walker's count of remembered deaths on a leg; 0 if never routed.
     static std::uint32_t DeathsOnLegsOf(std::string const& name)
@@ -21768,9 +21798,23 @@ private:
             }
             if (mapId != memory.mapId)
                 continue;
+            // CHARGED ONLY TO THE LEG IT WAS WALKING (#1228): see
+            // OverseerDecisions::LegsWalkedAtDeath. A death beside a route the
+            // walker had already left is said and not charged.
             std::vector<OverseerDecisions::RouteLegSpan> const on =
-                OverseerDecisions::LegsOfDeath(memory.legs, memory.points, x, y,
-                                               DIED_ON_LEG_LIMITS);
+                OverseerDecisions::LegsWalkedAtDeath(memory.legs, memory.points,
+                                                     memory.cursorAt, memory.steppedAt, now,
+                                                     x, y, DIED_ON_LEG_LIMITS);
+            if (on.empty() &&
+                !OverseerDecisions::LegsOfDeath(memory.legs, memory.points, x, y,
+                                                DIED_ON_LEG_LIMITS).empty())
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' died beside the route it was last planned but was "
+                         "not walking it (last stepped along it {} seconds before) - no leg "
+                         "of it is priced for this death (#1228)",
+                         name,
+                         memory.steppedAt > 0 ? static_cast<int64>(now - memory.steppedAt)
+                                              : static_cast<int64>(-1));
             // A death on the route plans every errand of this walker again once
             // it lives, whether or not its aim moves (PlanErrandRouteAgain).
             if (!on.empty())
@@ -22515,8 +22559,16 @@ private:
     // the choice between walking up it and down it is made here, on the whole
     // journey, and never on which end is nearer. Reads points only for the few
     // links that pass the cheap ellipse test, and only once per errand.
+    //
+    // AND PRICED FOR THIS WALKER LIKE ANY PLANNED LEG (#1228). `links` is the
+    // walker's own priced copy of the survey's links, and a joined road it died
+    // on pays the same price on its remaining yards. A walker revived at its
+    // corpse stands on the leg that killed it, so before this the road join was
+    // exactly how a trainer walk went straight back down it.
     static SurveyedRoadJoin JoinSurveyedRoad(
         Player* bot, TravelSurvey const& survey,
+        std::vector<OverseerDecisions::RouteLink> const& links,
+        std::vector<OverseerDecisions::DiedOnLeg> const& died, std::time_t now,
         std::map<uint32, OverseerDecisions::RouteNode const*> const& byId,
         float aimX, float aimY, OverseerDecisions::RoutePlanLimits const& limits)
     {
@@ -22524,7 +22576,7 @@ private:
         float const y = bot->GetPositionY();
         std::vector<SurveyedRoadJoin> joins;
         std::vector<OverseerDecisions::RoadJoinOption> options;
-        for (OverseerDecisions::RouteLink const& link : survey.links)
+        for (OverseerDecisions::RouteLink const& link : links)
         {
             if (!link.onFoot)
                 continue;
@@ -22549,10 +22601,13 @@ private:
             if (NavmeshRefusesEntry(bot, at.x, at.y, at.z))
                 continue;
             OverseerDecisions::RoutePlan const onward = OverseerDecisions::PlanFootRoute(
-                survey.nodes, survey.links, bot->GetMapId(), b->second->x, b->second->y,
+                survey.nodes, links, bot->GetMapId(), b->second->x, b->second->y,
                 aimX, aimY, limits);
             OverseerDecisions::RoadJoinOption option;
-            option.remainingYards = candidate.join.remainingYards;
+            option.remainingYards =
+                candidate.join.remainingYards +
+                OverseerDecisions::DiedOnLegPrice(link.from, link.to, died, now,
+                                                  DIED_ON_LEG_LIMITS);
             if (onward.verdict == OverseerDecisions::RoutePlanVerdict::Planned)
             {
                 candidate.onward = true;
@@ -22599,6 +22654,9 @@ private:
         diedOn.points.clear();
         diedOn.legs.clear();
         diedOn.plannedAlive = bot->IsAlive();
+        diedOn.routeSerial = 0;
+        diedOn.cursorAt = 0;
+        diedOn.steppedAt = 0;
         StagingCorridorAnswer const corridor =
             StagingCorridorRoute(bot, want, name, target, route);
         if (corridor.walkIt)
@@ -22781,7 +22839,8 @@ private:
                 roadAsked = true;
                 OverseerDecisions::RoutePlanLimits joinLimits = limits;
                 joinLimits.refusedEntries.clear();
-                road = JoinSurveyedRoad(bot, survey, byId, aimX, aimY, joinLimits);
+                road = JoinSurveyedRoad(bot, survey, linksForThisWalker(), diedOn.died,
+                                        plannedAt, byId, aimX, aimY, joinLimits);
                 if (road.found)
                 {
                     auto const farEnd = byId.find(road.to);
@@ -22868,6 +22927,7 @@ private:
             diedOn.points = route;
             diedOn.legs.assign(1, span);
             joinsCorridor = corridor.joinFirst && !route.empty();
+            SayDiedOnLegs(name, target, diedOn, diedOnHeld, plannedAt);
             return route;
         }
 
@@ -23001,30 +23061,39 @@ private:
                      plan.detourBudgetYards,
                      plan.wentRound ? "came in under that and was taken"
                                     : "still cost more than that, so it was not");
-        // AND WHAT THIS WALKER DIED ON, SAID WHEN IT MATTERED (#502). When the
-        // plan still walks such a leg there was no way round cheaper than the
-        // price, and it is said, so a second death there reads as a known risk
-        // and not as the same mistake made twice.
-        if (diedOnHeld > 0)
-        {
-            std::uint32_t const stillWalked =
-                OverseerDecisions::DiedOnLegsOnPlan(plan.nodes, diedOn.died, plannedAt);
-            if (stillWalked > 0)
-                LOG_WARN("module.overseer",
-                         "overseer: '{}' is sent to '{}' and its route still walks {} leg(s) "
-                         "it died on in the last {} minutes - no way round costs less than "
-                         "{:.0f} more yards per leg. It walks them (#502)",
-                         name, target, stillWalked,
-                         static_cast<uint32>(DIED_ON_LEG_LIMITS.holdSeconds / 60),
-                         DIED_ON_LEG_LIMITS.priceYards);
-            else
-                LOG_INFO("module.overseer",
-                         "overseer: '{}' is sent to '{}' and its route avoids the {} leg(s) "
-                         "it died on in the last {} minutes (#502)",
-                         name, target, diedOnHeld,
-                         static_cast<uint32>(DIED_ON_LEG_LIMITS.holdSeconds / 60));
-        }
+        SayDiedOnLegs(name, target, diedOn, diedOnHeld, plannedAt);
         return route;
+    }
+
+    // AND WHAT THIS WALKER DIED ON, SAID WHEN IT MATTERED (#502). When the
+    // route still walks such a leg there was no way round cheaper than the
+    // price, and it is said, so a second death there reads as a known risk
+    // and not as the same mistake made twice. Counted over every leg of the
+    // route returned, the joined road included, and said from every return
+    // that keeps a surveyed leg (#1228): a walk that joined the road it died on
+    // used to return before this line and say nothing.
+    static void SayDiedOnLegs(std::string const& name, std::string const& target,
+                              DiedOnLegMemory const& diedOn, std::uint32_t diedOnHeld,
+                              std::time_t plannedAt)
+    {
+        if (diedOnHeld == 0)
+            return;
+        std::uint32_t const stillWalked =
+            OverseerDecisions::DiedOnLegsOnRoute(diedOn.legs, diedOn.died, plannedAt);
+        if (stillWalked > 0)
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' is sent to '{}' and its route still walks {} leg(s) "
+                     "it died on in the last {} minutes - no way round costs less than "
+                     "{:.0f} more yards per leg. It walks them (#502)",
+                     name, target, stillWalked,
+                     static_cast<uint32>(DIED_ON_LEG_LIMITS.holdSeconds / 60),
+                     DIED_ON_LEG_LIMITS.priceYards);
+        else
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is sent to '{}' and its route avoids the {} leg(s) "
+                     "it died on in the last {} minutes (#502)",
+                     name, target, diedOnHeld,
+                     static_cast<uint32>(DIED_ON_LEG_LIMITS.holdSeconds / 60));
     }
 
     // The stepping limits a route is walked under. ONE POINT AT A TIME FOR A
@@ -23120,6 +23189,8 @@ private:
                                 state.routeJoinsCorridor);
         state.routeCursor = OverseerDecisions::RouteCursor{};
         state.routeSerial = TravelAimBook::NextRouteSerial();
+        // The plan PlanRoute just remembered belongs to this route (#1228).
+        DiedOnLegBook()[bot->GetName()].routeSerial = state.routeSerial;
     }
 
     // THE ROAD A LONG ERRAND TO A PLACE WAS PLANNED ALONG, JUDGED (#836). The
@@ -23308,6 +23379,9 @@ private:
                 return want;
             }
             state.routeAimIndex = static_cast<long>(aim.index);
+            // Walking this route now: a death in the next moments is on it
+            // (#1228).
+            NoteRouteStep(bot->GetName(), state.routeSerial, state.routeCursor.at);
             return WorldPosition(want.GetMapId(), aim.x, aim.y, aim.z);
         }
         return want;
@@ -28975,13 +29049,29 @@ private:
             // `pos` is untouched and stays the errand: arrival, the ratchet and
             // the backstop all still measure against it, because it is still
             // where this character is going. See RouteLeg.
-            WorldPosition const leg = entry ? pos : RouteLeg(bot, pos, state, name, target);
+            //
+            // AND A WALK TO A CREATURE IS STEERED TOO WHILE ITS WALKER HOLDS A LEG
+            // IT DIED ON (#1228). A creature walk is otherwise handed whole to
+            // upstream's mover, which knows nothing of the survey or its prices,
+            // so a trainer walk after a death went straight back down the road
+            // that killed. While a died-on leg is held, it follows the walker's
+            // priced route as a place walk, and the creature is handed over
+            // when the route is spent (RouteLeg answers `pos` itself then).
+            bool const steered = OverseerDecisions::SteerCreatureWalkAlongRoute(
+                entry != 0, DiedOnLegsHeldBy(bot->GetName(), std::time(nullptr)));
+            WorldPosition const leg =
+                entry && !steered ? pos : RouteLeg(bot, pos, state, name, target);
+            // The creature the mover is handed: none while a steered walk is
+            // still on its route, so it walks to the route point.
+            bool const onRoute = steered && (leg.GetPositionX() != pos.GetPositionX() ||
+                                             leg.GetPositionY() != pos.GetPositionY());
+            uint32 const moverEntry = onRoute ? 0 : entry;
             WorldPosition aimAt = leg;
             // AND A REFUSED ROUTE POINT GIVES WAY TO A NEARER ONE BEFORE THE
             // CONE IS DECLARED REFUSED (#592). See RetreatAlongRoute: the cone
             // belongs pointed at the next stretch of the surveyed road, not at a
             // waypoint 250 yards off across a layered city.
-            bool const stepped = entry || GroundedStep(bot, leg, aimAt) ||
+            bool const stepped = moverEntry || GroundedStep(bot, leg, aimAt) ||
                                  RetreatAlongRoute(bot, pos, state, aimAt);
             if (!stepped)
             {
@@ -29048,7 +29138,7 @@ private:
             OverseerDecisions::FootingHeld(state.footing);
             // And a measured corridor leg whose walk leaves the leg says
             // which point and which walk (#759).
-            if (!entry)
+            if (!moverEntry)
                 ReportCorridorLegPath(bot, state, aimAt, name, target);
 
             // IS THE WALK THIS POLL WOULD ISSUE ALREADY RUNNING? Three
@@ -29106,8 +29196,9 @@ private:
                             wander->pos.GetPositionX(), wander->pos.GetPositionY(),
                             aimAt.GetPositionX(), aimAt.GetPositionY(), bot->GetPositionX(),
                             bot->GetPositionY(), WALK_RETARGET_LIMITS);
-                    bool const samePlace = entry || (ddx * ddx + ddy * ddy) <= 1.0f || sameWalk;
-                    atSameDestination = wander->npcEntry == entry && samePlace;
+                    bool const samePlace =
+                        moverEntry || (ddx * ddx + ddy * ddy) <= 1.0f || sameWalk;
+                    atSameDestination = wander->npcEntry == moverEntry && samePlace;
                 }
             }
             if (OverseerDecisions::WalkAlreadyInFlight(
@@ -29233,7 +29324,7 @@ private:
             // patches/mod-playerbots/0005-wander-npc-can-be-aimed.patch adds this
             // overload. The no-argument ChangeToWanderNpc() upstream ships takes
             // no target, which is the entire reason this feature did not exist.
-            botAI->rpgInfo.ChangeToWanderNpc(entry, aimAt);
+            botAI->rpgInfo.ChangeToWanderNpc(moverEntry, aimAt);
             // Spent. One poll's exception, not a mode - see TravelState.
             state.reissue = false;
 

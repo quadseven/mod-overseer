@@ -92,7 +92,7 @@ int main()
         return Fail("PlanRoute must price the walker's died-on legs on a copy");
     if (plan.find("diedOn.legs = std::move(spans);") == std::string::npos)
         return Fail("PlanRoute must keep which legs own which points");
-    if (plan.find("OverseerDecisions::DiedOnLegsOnPlan(") == std::string::npos ||
+    if (plan.find("OverseerDecisions::DiedOnLegsOnRoute(diedOn.legs") == std::string::npos ||
         plan.find("its route still walks {} leg(s)") == std::string::npos)
         return Fail("a plan that still walks a died-on leg must say so");
 
