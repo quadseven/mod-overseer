@@ -7312,6 +7312,11 @@ bool LeaderCarriesNewRpg(std::string const& job, bool onAnErrand)
     return onAnErrand || !HoldsInTown(job);
 }
 
+bool RunHoldsNewRpgOff(bool runStagedInsideOrClearing, bool onTheRunsMap)
+{
+    return runStagedInsideOrClearing && onTheRunsMap;
+}
+
 UnissuedFlightStep TownLeaderUnissuedFlight(bool mayCarryNewRpg, bool statusIsTravelFlight,
                                             bool moduleIssuedFlight, bool inFlight)
 {

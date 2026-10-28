@@ -8315,6 +8315,21 @@ bool FamilyHoldsInTown(std::vector<std::string> const& jobs);
 // status (a flight, a far grind spot, a camp) and the family is left behind.
 bool LeaderCarriesNewRpg(std::string const& job, bool onAnErrand);
 
+// A RUN INSIDE ITS DUNGEON HOLDS `new rpg` OFF EVERY MEMBER IN THERE (#1210).
+// Measured on the dev realm 2026-10-25: the dungeon finder took a family into
+// map 90, all five of it, and within seconds the leader was outside again and
+// the run ended 'emptied'. He had been handed `new rpg` back one poll before
+// the finder queue, his rpg stuck counters were stale from before the run, and
+// on the first rpg tick inside upstream's MoveFarTo judged him stuck and
+// teleported him to his old rpg destination outside. Nothing inside a run walks
+// under `new rpg`: STAGED_INSIDE waits for the census and CLEARING is the
+// dungeon brain's. So while the run is STAGED_INSIDE or CLEARING, a member
+// standing on the run's own map does not carry `new rpg`, and gets it back only
+// once the run has moved on (EXITING walks out under its own aim, and a run
+// that ended holds nothing). A member outside the map is left alone: the walk
+// back in for a stranded member is an escort under `new rpg`.
+bool RunHoldsNewRpgOff(bool runStagedInsideOrClearing, bool onTheRunsMap);
+
 // A FLIGHT THE LEADER DID NOT ASK FOR TAKES THE FAMILY'S LEADER AWAY (#697).
 // Measured on the dev realm 2026-09-24: the Horde family waited in Orgrimmar
 // on its Ragefire campaign. At 11:49:06 the regroup hold on the leader ended
