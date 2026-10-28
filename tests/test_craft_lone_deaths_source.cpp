@@ -64,6 +64,10 @@ int main()
     Check("the drive counts deaths in the zone it stands in now",
           Has(drive, "bot->GetMapId(), bot->GetZoneId(), now"));
     Check("the drive hearths through DoHearth", Has(drive, "DoHearth(bot, \"use\""));
+    Check("a hearth DoHearth refuses is named, once per refusal",
+          Has(drive, "std::string const refusal =") &&
+              Has(drive, "_craftLoneHearthRefused[name] != refusal") &&
+              Has(drive, "cannot hearth out of zone"));
     Check("the drive names the reason in a log line", Has(drive, "CraftLoneDeathStepWord(step)") && Has(drive, "(#1208)"));
 
     std::size_t const lone = src.find("            DriveCraftLoneDeaths();\n");

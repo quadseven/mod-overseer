@@ -16689,6 +16689,8 @@ private:
     std::map<std::string, OverseerDecisions::CraftLoneDeathStep> _craftLoneSaid;
     // Who DriveCraft leaves alone this poll: hearthing out, or deferred.
     std::set<std::string> _craftLoneHeld;
+    // The last hearth refusal said for each name, so it is said once (#1208).
+    std::map<std::string, std::string> _craftLoneHearthRefused;
 
     // NOT LEFT IDLE IN A ZONE THAT KEEPS KILLING IT (#1208). Asked before
     // DriveCraft on the same clock, so a crafter this holds is not cast for in
@@ -16703,6 +16705,7 @@ private:
             if (it->second.empty())
             {
                 _craftLoneSaid.erase(it->first);
+                _craftLoneHearthRefused.erase(it->first);
                 it = _craftLoneDeaths.erase(it);
             }
             else
@@ -16755,10 +16758,23 @@ private:
                 continue;
             // A refusal is a reason the cast cannot start this poll (a fight,
             // or moving, which DoHearth answers with its own hold); the next
-            // poll asks again, and the craft waits meanwhile.
+            // poll asks again, and the craft waits meanwhile. The refusal is
+            // named once per distinct reason, so a stone that will not fly for
+            // a fault no poll can wait out is not silent.
             char const* status = "error";
             std::string evidence;
-            DoHearth(bot, "use", status, evidence, _pendingHearths, 0);
+            std::string const refusal =
+                DoHearth(bot, "use", status, evidence, _pendingHearths, 0);
+            if (refusal.empty())
+                _craftLoneHearthRefused.erase(name);
+            else if (_craftLoneHearthRefused[name] != refusal)
+            {
+                _craftLoneHearthRefused[name] = refusal;
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' on job 'craft' cannot hearth out of zone {} on map "
+                         "{} this poll - {} ({}); its craft step stays deferred (#1208)",
+                         name, bot->GetZoneId(), bot->GetMapId(), refusal, evidence);
+            }
         }
     }
 
