@@ -7121,6 +7121,25 @@ FallAccount AccountForFall(float recordedYardsFallen, float safeFallYards,
                : FallAccount::Survivable;
 }
 
+bool FallStartedBelowWorld(float lastZ, bool surfaceAboveFound,
+                           float surfaceAboveZ, bool groundBelowFound,
+                           float groundBelowZ, float toleranceYards)
+{
+    // Nothing over it, so there is nothing for it to be below.
+    if (!surfaceAboveFound)
+        return false;
+    // Within the tolerance of the surface is standing on it. Written as a
+    // negated < so a NaN reading falls out as "not below" rather than
+    // recording a void fall nobody could check.
+    if (!(lastZ < surfaceAboveZ - toleranceYards))
+        return false;
+    // Ground under its feet (at or below the probe start) means the surface
+    // above is a roof, a canopy or a ceiling, not the world it fell through.
+    if (groundBelowFound && groundBelowZ <= lastZ + toleranceYards)
+        return false;
+    return true;
+}
+
 char const* FallAccountName(FallAccount account)
 {
     switch (account)
@@ -17328,7 +17347,8 @@ bool MailWalkRefusalRetryable(std::string const& reason)
         || reason == R::HeldByAnother || reason == R::GroundRefused
         || reason == R::EnteredCombat || reason == R::Died || reason == R::LeftWorld
         || reason == R::LeftMap || reason == R::TookFlight || reason == R::TimedOut
-        || reason == R::Stalled || reason == R::ExpansionContinent;
+        || reason == R::Stalled || reason == R::ExpansionContinent
+        || reason == R::AcrossTheWater;
 }
 
 char const* MailWalkGate(MailWalkGateFacts const& facts)
@@ -18425,6 +18445,7 @@ std::vector<WalkRefusalRow> const& WalkRefusalCatalogue()
         {"mailbox", M::OtherSidesGround, false, false},
         {"mailbox", M::GroundRefused, false, false},
         {"mailbox", M::ExpansionContinent, false, false},
+        {"mailbox", M::AcrossTheWater, false, false},
         {"mailbox", M::EnteredCombat, true, true},
         {"mailbox", M::Died, true, false},
         {"mailbox", M::LeftWorld, true, true},
@@ -23624,6 +23645,12 @@ CrossRequest ParseCrossRequest(std::string const& command)
 bool OnTeldrassilIsland(std::uint32_t mapId, std::uint32_t zoneId)
 {
     return mapId == TELDRASSIL_MAP && (zoneId == TELDRASSIL_ZONE || zoneId == DARNASSUS_ZONE);
+}
+
+bool AcrossTeldrassilShore(std::uint32_t mapId, std::uint32_t fromZone, std::uint32_t toZone)
+{
+    return mapId == TELDRASSIL_MAP &&
+           OnTeldrassilIsland(mapId, fromZone) != OnTeldrassilIsland(mapId, toZone);
 }
 
 IslandFirstLeg CrossIslandFirst(std::uint32_t mapId, std::uint32_t zoneId,
