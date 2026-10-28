@@ -196,6 +196,20 @@ void TheBrainHoldsWhileTheGroupRests()
     ExpectHold("a fight is the dungeon brain's", fighting, GuildRunHoldStep::Nothing,
                GuildRunHoldWhy::None);
 
+    // A held brain with a member stuck in combat (a land mine, an unreachable
+    // mob) is not held in silence past the rest ceiling (#1185).
+    GuildRunHoldFacts heldFight = FiveAliveAt(GuildRunRestNeed::Low);
+    heldFight.held = true;
+    heldFight.anyFighting = true;
+    heldFight.secondsResting = GUILD_RUN_REST_MAX_SECONDS - 1;
+    ExpectHold("a normal pull under the ceiling stays held", heldFight, GuildRunHoldStep::Nothing,
+               GuildRunHoldWhy::None);
+    heldFight.secondsResting = GUILD_RUN_REST_MAX_SECONDS;
+    ExpectHold("a held brain with a member in combat past the ceiling is released", heldFight,
+               GuildRunHoldStep::Release, GuildRunHoldWhy::InCombat);
+    Check("and the reason word says combat",
+          std::string(GuildRunHoldWhyWord(GuildRunHoldWhy::InCombat)) == "member in combat");
+
     GuildRunHoldFacts resting = FiveAliveAt(GuildRunRestNeed::Partial);
     resting.held = true;
     resting.secondsResting = 30;

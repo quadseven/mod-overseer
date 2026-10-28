@@ -21375,8 +21375,16 @@ GuildRunHold GuildRunHoldNext(GuildRunHoldFacts const& facts)
     GuildRunHold hold;
     // Nobody for the brain to drive, not armed yet, or a fight it owns. A held
     // brain stays held through a wipe: the first member raised waits.
-    if (!facts.armed || facts.aliveInside == 0 || facts.anyFighting)
+    if (!facts.armed || facts.aliveInside == 0)
         return hold;
+    if (facts.anyFighting)
+    {
+        // A member held in combat (a land mine, an unreachable mob) never
+        // rests, so the rest's own bound would never fire (#1185).
+        if (facts.held && facts.secondsResting >= facts.restMaxSeconds)
+            hold = {GuildRunHoldStep::Release, GuildRunHoldWhy::InCombat};
+        return hold;
+    }
     if (facts.deadInside > 0)
     {
         // Rest before the rez: a low group holds (or stays held) as any rest,
@@ -21465,6 +21473,7 @@ char const* GuildRunHoldWhyWord(GuildRunHoldWhy why)
         case GuildRunHoldWhy::Rested:       return "rested";
         case GuildRunHoldWhy::RestTimedOut: return "rest timed out";
         case GuildRunHoldWhy::Dead:         return "a body inside";
+        case GuildRunHoldWhy::InCombat:     return "member in combat";
     }
     return "unknown";
 }
