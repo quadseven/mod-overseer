@@ -53399,6 +53399,56 @@ private:
                         OverseerDecisions::DungeonRunAllThrough(adoptedStates),
                         adoptedCompletion);
 
+                // A REPEAT WIPE'S HOLD STANDS OVER ADOPTION TOO (#1223). The
+                // hold below is asked only by a leader outside, but a member
+                // who comes back inside during it - a ghost running its corpse
+                // back through the portal is revived at the entrance - was
+                // adopted here at STAGED_INSIDE or CLEARING and the run went
+                // on at the same pull, which is the loop #1201/#1215 ended. So
+                // the book is asked before the run is adopted, and a held run
+                // is not adopted until the hold lifts. EXIT is still adopted:
+                // it only walks the member out. The refusal keeps its own
+                // once-per-ending flag: the run-start line may already have
+                // been said for this ending, and that must not silence it.
+                {
+                    auto const book = _dungeonWipeBooks.find(leaderName);
+                    if (book != _dungeonWipeBooks.end())
+                    {
+                        bool sick = false;
+                        for (std::string const& name : members)
+                        {
+                            Player* member = ObjectAccessor::FindPlayerByName(name);
+                            if (member && member->IsInWorld() &&
+                                member->HasAura(
+                                    OverseerDecisions::RESURRECTION_SICKNESS_AURA))
+                            {
+                                sick = true;
+                                break;
+                            }
+                        }
+                        if (OverseerDecisions::DungeonWipeHoldsAdoption(
+                                book->second, inside->insideMapId, sick, std::time(nullptr),
+                                adoptAt))
+                        {
+                            if (!book->second.adoptionHoldSaid)
+                            {
+                                book->second.adoptionHoldSaid = true;
+                                LOG_INFO("module.overseer",
+                                         "overseer: the next dungeon run for '{}' on map {} "
+                                         "waits - the last attempt there ended on a second "
+                                         "wipe inside {} s, and it opens once that window "
+                                         "has passed and nobody carries Resurrection "
+                                         "Sickness. The {} member(s) found inside are not "
+                                         "adopted until then",
+                                         leaderName, inside->insideMapId,
+                                         uint32(OverseerDecisions::WIPE_LOOP_SECONDS),
+                                         adoptedInside);
+                            }
+                            return;
+                        }
+                    }
+                }
+
                 coord = DungeonRunCoordinatorState();
                 switch (adoptAt)
                 {

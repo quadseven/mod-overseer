@@ -18668,6 +18668,7 @@ struct DungeonWipeBook
     std::time_t endedAt{0};          // when a repeat wipe ended the attempt (0 = never)
     std::uint32_t endedMap{0};       // and on which map
     bool holdSaid{false};            // the IDLE hold line was said for this ending
+    bool adoptionHoldSaid{false};    // and the refused-adoption line (#1223), on its own
 };
 
 // Books a family run that ended 'wipe' on `mapId` at `now`. True when it is a
@@ -18681,6 +18682,17 @@ bool DungeonWipeBookEndsAttempt(DungeonWipeBook& book, std::uint32_t mapId, std:
 // WIPE_SICK_HOLD_MAX_SECONDS. Another dungeon is never held.
 bool DungeonWipeHoldsRunStart(DungeonWipeBook const& book, std::uint32_t mapId,
                               bool membersSick, std::time_t now);
+
+// Whether IDLE refuses to ADOPT a run it finds a member already inside on
+// `mapId` (#1223). Adoption is the other way back into a held attempt: a ghost
+// that runs its corpse back through the portal is revived inside, and adopting
+// it at STAGED_INSIDE or CLEARING resumes the run at the same pull, which is
+// the loop the hold exists to end. So the same hold refuses it. A cleared
+// instance (EXIT) is still adopted, because that adoption only walks the
+// member out and starts nothing.
+bool DungeonWipeHoldsAdoption(DungeonWipeBook const& book, std::uint32_t mapId,
+                              bool membersSick, std::time_t now,
+                              DungeonRunAdoptPhase adoptAt);
 
 // A raid seat is due for repair when its lowest wearable item is below the
 // configured floor. An item with no maximum durability is not part of the
