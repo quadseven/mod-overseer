@@ -16753,6 +16753,35 @@ private:
             _craftLoneHeld.insert(name);
             if (step == OverseerDecisions::CraftLoneDeathStep::Stay)
                 continue;
+            // THE CAST COMES FIRST, THE PROOF LINE AFTER IT (#1225). The line
+            // below is what a roll is read by, so it says "hearthing" only once
+            // DoHearth has returned with no refusal. A refusal is a reason the
+            // cast cannot start this poll (a fight, or moving, which DoHearth
+            // answers with its own hold); the next poll asks again, and the
+            // craft waits meanwhile. The refusal is named once per distinct
+            // reason, so a stone that will not fly for a fault no poll can wait
+            // out is not silent, and the step is not marked said, so the proof
+            // line is still written on the poll whose cast does start.
+            if (step == OverseerDecisions::CraftLoneDeathStep::Hearth)
+            {
+                char const* status = "error";
+                std::string evidence;
+                std::string const refusal =
+                    DoHearth(bot, "use", status, evidence, _pendingHearths, 0);
+                if (!refusal.empty())
+                {
+                    if (_craftLoneHearthRefused[name] != refusal)
+                    {
+                        _craftLoneHearthRefused[name] = refusal;
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' on job 'craft' cannot hearth out of zone {} on "
+                                 "map {} this poll - {} ({}); its craft step stays deferred (#1208)",
+                                 name, bot->GetZoneId(), bot->GetMapId(), refusal, evidence);
+                    }
+                    continue;
+                }
+                _craftLoneHearthRefused.erase(name);
+            }
             auto const said = _craftLoneSaid.find(name);
             if (said == _craftLoneSaid.end() || said->second != step)
             {
@@ -16764,27 +16793,6 @@ private:
                          static_cast<uint32>(
                              OverseerDecisions::CRAFT_LONE_DEATH_LIMITS.windowSeconds / 60),
                          OverseerDecisions::CraftLoneDeathStepWord(step));
-            }
-            if (step != OverseerDecisions::CraftLoneDeathStep::Hearth)
-                continue;
-            // A refusal is a reason the cast cannot start this poll (a fight,
-            // or moving, which DoHearth answers with its own hold); the next
-            // poll asks again, and the craft waits meanwhile. The refusal is
-            // named once per distinct reason, so a stone that will not fly for
-            // a fault no poll can wait out is not silent.
-            char const* status = "error";
-            std::string evidence;
-            std::string const refusal =
-                DoHearth(bot, "use", status, evidence, _pendingHearths, 0);
-            if (refusal.empty())
-                _craftLoneHearthRefused.erase(name);
-            else if (_craftLoneHearthRefused[name] != refusal)
-            {
-                _craftLoneHearthRefused[name] = refusal;
-                LOG_WARN("module.overseer",
-                         "overseer: '{}' on job 'craft' cannot hearth out of zone {} on map "
-                         "{} this poll - {} ({}); its craft step stays deferred (#1208)",
-                         name, bot->GetZoneId(), bot->GetMapId(), refusal, evidence);
             }
         }
     }
