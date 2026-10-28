@@ -21014,10 +21014,28 @@ RouteLimits FarWalkRoadLimits();
 //     held where it stands with the family, and ask again;
 //   * otherwise the errand is refused, and the writer of the aim learns why.
 //
-// NOT JUDGED HERE, ON PURPOSE. A catch-up walk has its own leg rule (#697) and a
-// live dungeon run's walks are the run's; neither is this decision's to stop.
-// An aim at a creature is not judged either: ResolveTravelTarget already reads
-// the line to it before it is chosen (#300), and it has no planned road.
+// NOT JUDGED HERE, ON PURPOSE. A member's own catch-up walk has its own leg rule
+// (#697) and a live dungeon run's walks are the run's; neither is this
+// decision's to stop.
+//
+// AND WHAT #1209 ADDED, MEASURED 2026-10-18 TO 2026-10-27. The road check held
+// for a day and then 55 family deaths came back on the same road, levels 41 to
+// 48, nearly all of them members the check never judged. Two walks were let
+// through:
+//
+//   * THE LEADER GOING BACK FOR A MEMBER. That walk rides the catch-up lease,
+//     so the catch-up exclusion above let it through, and it is the walk the
+//     whole family follows: on 2026-10-25 the leader was sent back 13,044
+//     yards for a member in the south, the family behind him, and twelve deaths
+//     in Burning Steppes followed in sixteen minutes. It is the family's walk,
+//     not a lone member's, so it is judged here like any other (`leaderFetch`).
+//   * AN AIM AT A SPAWN (a vendor, a trainer). ResolveTravelTarget reads the
+//     line to it at the WALKER's level when it is chosen (#300), but the family
+//     behind the walker is younger. A long one is judged here too, along the
+//     straight line it is walked, at the youngest member's level (`spawnAim`).
+//
+// A follower is never judged on its own: it walks where its leader walks, so
+// judging every walk the leader is sent down is what holds the follower to it.
 
 // A walk shorter than this is not a journey and is walked as before.
 // TRAVEL_FLIGHT_MIN_YARDS: the distance at which this module already calls a
@@ -21034,8 +21052,14 @@ struct ErrandRoadFacts
     float walkYards{0.f};
     // The aim is a place (`at:` or `trigger:`), which is what has a planned road.
     bool placeAim{false};
+    // The aim is a spawn (a vendor, a trainer): its road is the straight line
+    // it is walked along (#1209).
+    bool spawnAim{false};
     // A catch-up walk (#697 judges it) or a live run's walk (the run's).
     bool catchUp{false};
+    // The catch-up walk is the LEADER going back for a member, with the family
+    // behind him. Judged, because it is the family's walk (#1209).
+    bool leaderFetch{false};
     bool liveRun{false};
     // JudgeRoute of the planned road from where the walker stands, read at the
     // youngest walking member's level under FarWalkRoadLimits. Unread is
@@ -21057,12 +21081,22 @@ enum class ErrandRoadStep : std::uint8_t
     Refuse,         // nothing carries it there but the road: the errand is refused
 };
 
+// Whether this walk is one the road decision judges at all, before its road is
+// read: a long walk to a place or a spawn, not a member's own catch-up (unless
+// it is the leader going back for a member), not a live run's walk. The module
+// reads the road only when this says yes; the road itself is not consulted.
+bool ErrandRoadJudges(ErrandRoadFacts const& facts);
+
 // THE ORDER IS THE PREFERENCE, and a flight is not in it because it is asked
 // before this is.
 ErrandRoadStep DecideErrandRoad(ErrandRoadFacts const& facts);
 
 // "walk", "hearth", "wait for hearth", "refuse".
 char const* ErrandRoadStepWord(ErrandRoadStep step);
+
+// Which walk was judged, for the log line that says the answer: "the leader
+// going back for a member", "a walk to a spawn", or "a walk to a place".
+char const* ErrandRoadWalkWord(ErrandRoadFacts const& facts);
 
 // The refusal recorded against the aim, and said to whoever wrote it.
 constexpr char const* ErrandLethalRoad =

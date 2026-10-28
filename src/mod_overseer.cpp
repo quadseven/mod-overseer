@@ -6082,6 +6082,9 @@ public:
         std::uint64_t roadReadSerial{0};
         OverseerDecisions::RouteVerdict road;
         int roadSaid{-1};
+        // A spawn aim's road is the straight line to the one spawn this errand
+        // is pinned to, read once per errand into `road` (#1209).
+        bool lineRead{false};
         // "Already said that upstream's stuck teleport was about to fire", so a
         // walk that keeps failing to get nearer is reported once per errand
         // rather than every poll it is held on the ground (#138). See the
@@ -23015,6 +23018,53 @@ private:
         if (road.points.empty())
             return state.road;
 
+        std::vector<std::pair<float, float>> points;
+        points.reserve(road.points.size());
+        for (OverseerDecisions::RoutePoint const& p : road.points)
+            points.emplace_back(p.x, p.y);
+        state.road = JudgeFamilyRoad(bot, points, road.spacingYards);
+        return state.road;
+    }
+
+    // THE STRAIGHT LINE A LONG ERRAND TO A SPAWN IS WALKED ALONG, JUDGED
+    // (#1209). A spawn aim has no planned road: the travel drive walks it at the
+    // spawn itself. So the line is what is read, at the youngest member's level
+    // under the same rule as a place's road, once per errand since the errand is
+    // pinned to one spawn. ResolveTravelTarget read this line when it chose the
+    // spawn, but at the walker's own level; the family behind it is younger.
+    static OverseerDecisions::RouteVerdict ReadErrandLine(Player* bot, WorldPosition const& want,
+                                                          TravelAimBook::TravelState& state)
+    {
+        if (state.lineRead)
+            return state.road;
+        state.lineRead = true;
+        state.road = OverseerDecisions::RouteVerdict{};
+        float const fromX = bot->GetPositionX();
+        float const fromY = bot->GetPositionY();
+        float const dx = want.GetPositionX() - fromX;
+        float const dy = want.GetPositionY() - fromY;
+        float const span = std::sqrt(dx * dx + dy * dy);
+        OverseerDecisions::RouteSampling const plan = OverseerDecisions::PlanRouteSamples(
+            span, TRAVEL_WALK_SAMPLE_YARDS, TRAVEL_WALK_MAX_YARDS);
+        if (!plan.samples || !(span > 0.f))
+            return state.road;
+        std::vector<std::pair<float, float>> points;
+        points.reserve(plan.samples);
+        for (std::size_t n = 0; n < plan.samples; ++n)
+        {
+            float const t = OverseerDecisions::RouteSampleAt(plan, n) / span;
+            points.emplace_back(fromX + dx * t, fromY + dy * t);
+        }
+        state.road = JudgeFamilyRoad(bot, points, plan.spacingYards);
+        return state.road;
+    }
+
+    // The worst creature within the threat radius of each point, judged by
+    // FarWalkRoadLimits at the level of the youngest member of the walker's
+    // party on its map, since the family walks the road behind its leader.
+    static OverseerDecisions::RouteVerdict JudgeFamilyRoad(
+        Player* bot, std::vector<std::pair<float, float>> const& points, float spacingYards)
+    {
         uint32 level = bot->GetLevel();
         if (Group* group = bot->GetGroup())
             for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
@@ -23025,22 +23075,17 @@ private:
                     level = member->GetLevel();
             }
 
-        std::vector<std::pair<float, float>> points;
-        points.reserve(road.points.size());
-        for (OverseerDecisions::RoutePoint const& p : road.points)
-            points.emplace_back(p.x, p.y);
         OverseerDecisions::RouteLimits const limits = OverseerDecisions::FarWalkRoadLimits();
         std::vector<NearbyThreat> ground;
         HostileSpawnsNearEach(bot, bot->GetMapId(), points, TRAVEL_THREAT_RADIUS,
                               level + limits.unknownLevelDiff - 1, false, ground);
         OverseerDecisions::RouteReading reading;
         reading.characterLevel = level;
-        reading.sampleSpacingYards = road.spacingYards;
+        reading.sampleSpacingYards = spacingYards;
         reading.worstLevelAtSample.reserve(ground.size());
         for (NearbyThreat const& threat : ground)
             reading.worstLevelAtSample.push_back(threat.level);
-        state.road = OverseerDecisions::JudgeRoute(reading, limits);
-        return state.road;
+        return OverseerDecisions::JudgeRoute(reading, limits);
     }
 
     // WHERE TO SEND THIS CHARACTER THIS POLL, given the errand it is on. `want`
@@ -28600,15 +28645,18 @@ private:
                 OverseerDecisions::ErrandRoadFacts road;
                 road.walkYards = distance;
                 road.placeAim = entry == 0;
+                // AND A SPAWN, AND THE LEADER GOING BACK FOR A MEMBER (#1209):
+                // the two walks the family died on after this check went live.
+                road.spawnAim = entry != 0;
                 road.catchUp = IsCatchingUp(name);
+                road.leaderFetch = road.catchUp && LeaderIsFetching(name);
                 OverseerDecisions::TravelOwner owner = OverseerDecisions::TravelOwner::TownTrip;
                 road.liveRun = _travelAims.ClaimedBy(name, target, owner) &&
                                OverseerDecisions::TravelOwnerIsALiveRun(owner);
-                bool const judged = road.placeAim && !road.catchUp && !road.liveRun &&
-                                    distance >= OverseerDecisions::ERRAND_ROAD_MIN_YARDS;
-                if (judged)
+                if (OverseerDecisions::ErrandRoadJudges(road))
                 {
-                    road.road = ReadErrandRoad(bot, pos, state, name, target);
+                    road.road = road.spawnAim ? ReadErrandLine(bot, pos, state)
+                                              : ReadErrandRoad(bot, pos, state, name, target);
                     uint32 const stone = HearthstoneSpellOf(bot);
                     road.carriesStone = stone != 0;
                     road.hearthReady = stone && !bot->HasSpellCooldown(stone);
@@ -28625,15 +28673,33 @@ private:
                 state.roadSaid = static_cast<int>(step);
                 if (step != OverseerDecisions::ErrandRoadStep::Walk && sayIt)
                     LOG_WARN("module.overseer",
-                             "overseer: '{}' is sent to '{}', {} yards off, and no flight "
-                             "carried it. The road it was planned along crosses {} unbroken "
+                             "overseer: '{}' is sent to '{}', {} yards off ({}), and no "
+                             "flight carried it. The road it would walk crosses {} unbroken "
                              "yards of ground holding creatures ten or more levels above its "
                              "party's youngest member (worst {}), so it is not walked - {} "
-                             "(#836)",
+                             "(#836, #1209)",
                              name, target, static_cast<uint32>(distance),
+                             OverseerDecisions::ErrandRoadWalkWord(road),
                              static_cast<uint32>(road.road.longestLethalRunYards),
                              road.road.worstLevel,
                              OverseerDecisions::ErrandRoadStepWord(step));
+                if (step == OverseerDecisions::ErrandRoadStep::Refuse && road.leaderFetch)
+                {
+                    // THE LEADER DOES NOT GO BACK DOWN IT (#1209). The fetch is
+                    // ended on its one terminal path, which ends his catch-up
+                    // escort and stands the member down, so he is not sent back
+                    // down the same road the next poll. `state` IS DEAD AFTER
+                    // THIS: the escort's errand is released with it.
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' has no bind beside '{}' to hearth to and no flight "
+                             "there - it does not go back for '{}' down that road, because {} "
+                             "(#1209)",
+                             name, target, FetchTargetOf(name),
+                             OverseerDecisions::ErrandLethalRoad);
+                    EndFetch(name, std::string("the road back crosses ground far above the "
+                                               "family's level (#1209)"));
+                    continue;
+                }
                 if (step == OverseerDecisions::ErrandRoadStep::Refuse)
                 {
                     LOG_WARN("module.overseer",
