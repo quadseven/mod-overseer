@@ -20,7 +20,9 @@
 #include <ctime>
 
 using OverseerDecisions::DungeonWipeBook;
+using OverseerDecisions::DungeonRunAdoptPhase;
 using OverseerDecisions::DungeonWipeBookEndsAttempt;
+using OverseerDecisions::DungeonWipeHoldsAdoption;
 using OverseerDecisions::DungeonWipeHoldsRunStart;
 using OverseerDecisions::RaidRunFacts;
 using OverseerDecisions::RaidRunPhase;
@@ -83,6 +85,38 @@ void AFamilyThatWipesTwiceAtOnePlaceEndsTheAttempt()
           !DungeonWipeHoldsRunStart(book, RAZORFEN, true, 10525 + WIPE_SICK_HOLD_MAX_SECONDS));
     Check("another dungeon is never held",
           !DungeonWipeHoldsRunStart(book, DEADMINES, true, 10530));
+}
+
+// A ghost that runs its corpse back through the portal during the hold is
+// revived inside, and IDLE finds it there (#1223). Adopting it at
+// STAGED_INSIDE or CLEARING would resume the run at the same pull.
+void TheHoldRefusesAdoptionInside()
+{
+    DungeonWipeBook book;
+    DungeonWipeBookEndsAttempt(book, RAZORFEN, 10000);
+    Check("one wipe: a member inside is adopted",
+          !DungeonWipeHoldsAdoption(book, RAZORFEN, true, 10010,
+                                    DungeonRunAdoptPhase::StagedInside));
+    DungeonWipeBookEndsAttempt(book, RAZORFEN, 10525);
+
+    Check("a held run is not adopted at STAGED_INSIDE",
+          DungeonWipeHoldsAdoption(book, RAZORFEN, false, 10530,
+                                   DungeonRunAdoptPhase::StagedInside));
+    Check("nor at CLEARING",
+          DungeonWipeHoldsAdoption(book, RAZORFEN, false, 10530,
+                                   DungeonRunAdoptPhase::Clearing));
+    Check("a cleared instance is still adopted, to walk the member out",
+          !DungeonWipeHoldsAdoption(book, RAZORFEN, false, 10530,
+                                    DungeonRunAdoptPhase::Exiting));
+    Check("a sick member past the window still holds adoption",
+          DungeonWipeHoldsAdoption(book, RAZORFEN, true, 10525 + WIPE_LOOP_SECONDS + 60,
+                                   DungeonRunAdoptPhase::Clearing));
+    Check("past the window with nobody sick, the run is adopted",
+          !DungeonWipeHoldsAdoption(book, RAZORFEN, false, 10525 + WIPE_LOOP_SECONDS,
+                                    DungeonRunAdoptPhase::Clearing));
+    Check("a run inside another dungeon is adopted",
+          !DungeonWipeHoldsAdoption(book, DEADMINES, true, 10530,
+                                    DungeonRunAdoptPhase::Clearing));
 }
 
 void WipesFarApartOrElsewhereDoNotEndIt()
@@ -208,6 +242,7 @@ void AReleaseThatLeavesTheLivingInsideStillEndsTheAttempt()
 int main()
 {
     AFamilyThatWipesTwiceAtOnePlaceEndsTheAttempt();
+    TheHoldRefusesAdoptionInside();
     WipesFarApartOrElsewhereDoNotEndIt();
     TheRaidSicknessHoldOutlivesTheRelease();
     AReleaseThatLeavesTheLivingInsideStillEndsTheAttempt();

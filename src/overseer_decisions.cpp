@@ -15593,6 +15593,14 @@ bool DungeonWipeHoldsRunStart(DungeonWipeBook const& book, std::uint32_t mapId,
     return membersSick && since < WIPE_SICK_HOLD_MAX_SECONDS;
 }
 
+bool DungeonWipeHoldsAdoption(DungeonWipeBook const& book, std::uint32_t mapId,
+                              bool membersSick, std::time_t now,
+                              DungeonRunAdoptPhase adoptAt)
+{
+    return adoptAt != DungeonRunAdoptPhase::Exiting &&
+           DungeonWipeHoldsRunStart(book, mapId, membersSick, now);
+}
+
 bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct)
 {
     return lowestDurabilityPct < floorPct;
