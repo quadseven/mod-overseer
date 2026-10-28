@@ -26492,6 +26492,38 @@ bool OnTeldrassilIsland(std::uint32_t mapId, std::uint32_t zoneId);
 // the water. A zone the map could not name (0) is not on the island.
 bool AcrossTeldrassilShore(std::uint32_t mapId, std::uint32_t fromZone, std::uint32_t toZone);
 
+// THE SHORE CHECK READS A ZONE ONLY NEAR THE ISLAND (#1224). Reading the zone
+// of a point (Map::GetZoneId) loads that point's grid on the world thread:
+// terrain, vmap and mmap tiles. Asked of every mailbox, vendor or spawn
+// candidate on map 1, one Kalimdor walk loaded grids all over the continent.
+// The box is the island zone's own world map rectangle (WorldMapArea for zone
+// 141: x 8437.5 to 11831.25, y -1277.08 to 3814.58), widened by a margin so
+// every point of the island, its shore and the Rut'theran dock is inside it.
+// It reaches no mainland zone: Darkshore ends at x 7133, Winterspring at x
+// 8223, and Moonglade lies south of y -1381. A point outside it is off the
+// island without asking the map, which is what a zone of 0 already meant.
+constexpr float TELDRASSIL_BOX_MIN_X = 8437.5f - 250.0f;
+constexpr float TELDRASSIL_BOX_MAX_X = 11831.25f + 250.0f;
+constexpr float TELDRASSIL_BOX_MIN_Y = -1277.08f - 250.0f;
+constexpr float TELDRASSIL_BOX_MAX_Y = 3814.58f + 250.0f;
+
+// Whether (x, y) on this map lies in the box around Teldrassil.
+bool NearTeldrassil(std::uint32_t mapId, float x, float y);
+
+// AcrossTeldrassilShore for a destination at (x, y), calling `zoneAt()` for its
+// zone only when the destination is near the island. `fromZone` is the
+// walker's own zone, which the walker already carries and costs nothing.
+template <typename ZoneAt>
+bool AcrossTeldrassilShoreAt(std::uint32_t mapId, std::uint32_t fromZone, float x, float y,
+                             ZoneAt&& zoneAt)
+{
+    if (mapId != TELDRASSIL_MAP)
+        return false;
+    if (!NearTeldrassil(mapId, x, y))
+        return OnTeldrassilIsland(mapId, fromZone);
+    return AcrossTeldrassilShore(mapId, fromZone, zoneAt());
+}
+
 // The ride a `cross-to-map` row must take first: `first` is false for every
 // member off the island, for a ride row, and for a row naming the island's own
 // map, and the rest of the struct is then the request unchanged.
