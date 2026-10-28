@@ -13,6 +13,10 @@
  *   3. The raid release carries the wipe book into the fresh state, and a
  *      release that did not finish marks the attempt as ending, which the next
  *      poll's facts carry.
+ *   4. (#1223) IDLE's adoption of a run a member is already inside asks the
+ *      same book before the coordinator state is replaced, so a ghost revived
+ *      inside during the hold does not resume the run at the same pull, and
+ *      the refusal still says the hold line.
  */
 
 #include <cstdlib>
@@ -78,6 +82,36 @@ int CheckTheIdleHold(std::string const& text)
     return EXIT_SUCCESS;
 }
 
+int CheckTheAdoptionHold(std::string const& text)
+{
+    std::size_t const adoptAt = text.find("OverseerDecisions::DungeonRunAdoptAt(");
+    if (adoptAt == std::string::npos)
+        return Fail("cannot find IDLE's adoption");
+    std::size_t const adopted = text.find("coord = DungeonRunCoordinatorState();", adoptAt);
+    if (adopted == std::string::npos)
+        return Fail("cannot find where adoption replaces the coordinator state");
+    std::size_t const hold = text.find("OverseerDecisions::DungeonWipeHoldsAdoption(", adoptAt);
+    if (hold == std::string::npos || hold > adopted)
+        return Fail("adoption must ask the wipe book before it adopts the run");
+    if (text.find("_dungeonWipeBooks.find(leaderName)", adoptAt) > hold)
+        return Fail("adoption must read the leader's wipe book");
+    if (text.find("RESURRECTION_SICKNESS_AURA", adoptAt) > hold)
+        return Fail("adoption must read the members' Resurrection Sickness");
+    // Its own once-per-ending flag, not the run-start line's: that one may
+    // already be set for this ending and would silence the refusal.
+    std::size_t const said = text.find("book->second.adoptionHoldSaid = true;", hold);
+    if (said == std::string::npos || said > adopted ||
+        text.find("if (!book->second.adoptionHoldSaid)", hold) > said)
+        return Fail("a refused adoption must say its line once per ending, on its own flag");
+    std::size_t const line = text.find("waits - the last attempt there ended on a second", hold);
+    if (said == std::string::npos || line == std::string::npos || line > adopted)
+        return Fail("a refused adoption must still say the hold line");
+    std::size_t const back = text.find("return;", hold);
+    if (back == std::string::npos || back > adopted)
+        return Fail("a held adoption must return before the run is adopted");
+    return EXIT_SUCCESS;
+}
+
 int CheckTheRaidRelease(std::string const& text)
 {
     std::string const drive = Body(text, "void DriveRaidRun()");
@@ -114,6 +148,8 @@ int main()
     if (CheckTheFamilyEnding(text) != EXIT_SUCCESS)
         return EXIT_FAILURE;
     if (CheckTheIdleHold(text) != EXIT_SUCCESS)
+        return EXIT_FAILURE;
+    if (CheckTheAdoptionHold(text) != EXIT_SUCCESS)
         return EXIT_FAILURE;
     if (CheckTheRaidRelease(text) != EXIT_SUCCESS)
         return EXIT_FAILURE;

@@ -70,6 +70,17 @@ int main()
               Has(drive, "cannot hearth out of zone"));
     Check("the drive names the reason in a log line", Has(drive, "CraftLoneDeathStepWord(step)") && Has(drive, "(#1208)"));
 
+    // THE PROOF LINE FOLLOWS THE CAST (#1225). "is not left idle there -
+    // hearthing to its bind" is the line a roll is read by, so it is written
+    // only once DoHearth has returned with no refusal; a refused cast says its
+    // reason instead and the proof line waits for the poll whose cast starts.
+    std::size_t const cast = drive.find("DoHearth(bot, \"use\"");
+    std::size_t const proof = drive.find("is not left idle there");
+    Check("the proof line is logged after DoHearth, not before it",
+          cast != std::string::npos && proof != std::string::npos && cast < proof);
+    Check("the proof line is guarded by a cast with no refusal",
+          Has(drive, "if (!refusal.empty())") && Has(drive, "_craftLoneHearthRefused.erase(name);\n            }\n            auto const said"));
+
     std::size_t const lone = src.find("            DriveCraftLoneDeaths();\n");
     std::size_t const craft = src.find("            DriveCraft();\n");
     Check("the rule is asked before the craft drive on its clock",

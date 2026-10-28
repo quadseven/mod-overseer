@@ -15583,6 +15583,7 @@ bool DungeonWipeBookEndsAttempt(DungeonWipeBook& book, std::uint32_t mapId, std:
         book.endedAt = now;
         book.endedMap = mapId;
         book.holdSaid = false;
+        book.adoptionHoldSaid = false;
     }
     return repeat;
 }
@@ -15596,6 +15597,14 @@ bool DungeonWipeHoldsRunStart(DungeonWipeBook const& book, std::uint32_t mapId,
     if (since < WIPE_LOOP_SECONDS)
         return true;
     return membersSick && since < WIPE_SICK_HOLD_MAX_SECONDS;
+}
+
+bool DungeonWipeHoldsAdoption(DungeonWipeBook const& book, std::uint32_t mapId,
+                              bool membersSick, std::time_t now,
+                              DungeonRunAdoptPhase adoptAt)
+{
+    return adoptAt != DungeonRunAdoptPhase::Exiting &&
+           DungeonWipeHoldsRunStart(book, mapId, membersSick, now);
 }
 
 bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct)
