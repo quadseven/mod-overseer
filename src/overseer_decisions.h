@@ -20045,6 +20045,11 @@ constexpr char const* GroundRefused    = "the ground toward the mailbox does not
 // served, and a character leaves on its own feet, its hearthstone or a boat.
 // A random teleport is not counted on: a natural guild member never gets one.
 constexpr char const* ExpansionContinent = "character stands in Outland or Northrend, outside the classic world";
+// Teldrassil is an island on map 1 (AcrossTeldrassilShore): every destination
+// left was across the water from where the walker stands, and a walk does not
+// take the Rut'theran boat, so it holds rather than swim (#1206). Worth asking
+// again: a cross-to-map row takes the boat, and then the walk is on one shore.
+constexpr char const* AcrossTheWater   = "the destination is across the water from Teldrassil; the walk holds for the Rut'theran boat rather than swim";
 
 // Endings of a walk that started.
 constexpr char const* EnteredCombat    = "entered combat on the way to the mailbox";
@@ -26357,6 +26362,16 @@ constexpr float AUBERDINE_STOP_Y = 557.68f;
 
 // Whether this map and zone are on the island.
 bool OnTeldrassilIsland(std::uint32_t mapId, std::uint32_t zoneId);
+
+// A SAME-MAP WALK DOES NOT CROSS THE ISLAND'S SHORE (#1206). Teldrassil and the
+// Kalimdor mainland are both map 1, so a guild far walk, spawn walk or vendor
+// walk from the island to the mainland, or back, never becomes a cross-to-map
+// row and never takes the boat: it headed straight at its aim and swam until
+// fatigue drowned it, off the island's west coast, about twenty times a day.
+// True when `fromZone` (where the walker stands) and `toZone` (the
+// destination's zone, read off the map's area data) are on different sides of
+// the water. A zone the map could not name (0) is not on the island.
+bool AcrossTeldrassilShore(std::uint32_t mapId, std::uint32_t fromZone, std::uint32_t toZone);
 
 // The ride a `cross-to-map` row must take first: `first` is false for every
 // member off the island, for a ride row, and for a row naming the island's own

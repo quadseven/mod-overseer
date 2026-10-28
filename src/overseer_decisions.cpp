@@ -17347,7 +17347,8 @@ bool MailWalkRefusalRetryable(std::string const& reason)
         || reason == R::HeldByAnother || reason == R::GroundRefused
         || reason == R::EnteredCombat || reason == R::Died || reason == R::LeftWorld
         || reason == R::LeftMap || reason == R::TookFlight || reason == R::TimedOut
-        || reason == R::Stalled || reason == R::ExpansionContinent;
+        || reason == R::Stalled || reason == R::ExpansionContinent
+        || reason == R::AcrossTheWater;
 }
 
 char const* MailWalkGate(MailWalkGateFacts const& facts)
@@ -18398,6 +18399,7 @@ std::vector<WalkRefusalRow> const& WalkRefusalCatalogue()
         {"mailbox", M::OtherSidesGround, false, false},
         {"mailbox", M::GroundRefused, false, false},
         {"mailbox", M::ExpansionContinent, false, false},
+        {"mailbox", M::AcrossTheWater, false, false},
         {"mailbox", M::EnteredCombat, true, true},
         {"mailbox", M::Died, true, false},
         {"mailbox", M::LeftWorld, true, true},
@@ -23597,6 +23599,12 @@ CrossRequest ParseCrossRequest(std::string const& command)
 bool OnTeldrassilIsland(std::uint32_t mapId, std::uint32_t zoneId)
 {
     return mapId == TELDRASSIL_MAP && (zoneId == TELDRASSIL_ZONE || zoneId == DARNASSUS_ZONE);
+}
+
+bool AcrossTeldrassilShore(std::uint32_t mapId, std::uint32_t fromZone, std::uint32_t toZone)
+{
+    return mapId == TELDRASSIL_MAP &&
+           OnTeldrassilIsland(mapId, fromZone) != OnTeldrassilIsland(mapId, toZone);
 }
 
 IslandFirstLeg CrossIslandFirst(std::uint32_t mapId, std::uint32_t zoneId,
