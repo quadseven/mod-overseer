@@ -18737,11 +18737,20 @@ RouteLimits FarWalkRoadLimits()
     return RouteLimits{FAR_WALK_ROAD_LEVEL_GAP, FAR_WALK_ROAD_LETHAL_RUN_YARDS};
 }
 
+bool ErrandRoadJudges(ErrandRoadFacts const& facts)
+{
+    if (!facts.placeAim && !facts.spawnAim)
+        return false;
+    if (facts.liveRun)
+        return false;
+    if (facts.catchUp && !facts.leaderFetch)
+        return false;
+    return facts.walkYards >= ERRAND_ROAD_MIN_YARDS;
+}
+
 ErrandRoadStep DecideErrandRoad(ErrandRoadFacts const& facts)
 {
-    if (!facts.placeAim || facts.catchUp || facts.liveRun)
-        return ErrandRoadStep::Walk;
-    if (facts.walkYards < ERRAND_ROAD_MIN_YARDS)
+    if (!ErrandRoadJudges(facts))
         return ErrandRoadStep::Walk;
     if (facts.road.survivable)
         return ErrandRoadStep::Walk;
@@ -18750,6 +18759,15 @@ ErrandRoadStep DecideErrandRoad(ErrandRoadFacts const& facts)
     if (bindBesideAim && facts.carriesStone)
         return facts.hearthReady ? ErrandRoadStep::Hearth : ErrandRoadStep::WaitForHearth;
     return ErrandRoadStep::Refuse;
+}
+
+char const* ErrandRoadWalkWord(ErrandRoadFacts const& facts)
+{
+    if (facts.catchUp && facts.leaderFetch)
+        return "the leader going back for a member";
+    if (facts.spawnAim)
+        return "a walk to a spawn";
+    return "a walk to a place";
 }
 
 char const* ErrandRoadStepWord(ErrandRoadStep step)
