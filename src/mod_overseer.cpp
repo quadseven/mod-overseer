@@ -5617,8 +5617,11 @@ void RecordDeath(Player* player)
             d.lastZ = it->second.z;
             d.yardsFallen = OverseerDecisions::YardsFallen(true, it->second.z, d.z);
             // Sample the terrain/VMAP surface at the previous position. A
-            // character already below it was in an ongoing void fall before
-            // this poll-to-death slice began.
+            // character already below it, with no ground of its own under
+            // it, was in an ongoing void fall before this poll-to-death slice
+            // began. The second probe is what tells a roof or a canopy over a
+            // character on open ground from the world over a character under
+            // it (#1211); see OverseerDecisions::FallStartedBelowWorld.
             if (Map* map = player->GetMap())
             {
                 float const probeZ = it->second.z +
@@ -5626,7 +5629,15 @@ void RecordDeath(Player* player)
                 float const surface = map->GetHeight(
                     player->GetPhaseMask(), it->second.x, it->second.y, probeZ,
                     true, TERRAIN_RECOVERY_VOID_PROBE_YARDS);
-                if (surface > INVALID_HEIGHT && it->second.z < surface)
+                float const groundProbeZ =
+                    it->second.z +
+                    OverseerDecisions::FALL_START_SURFACE_TOLERANCE_YARDS;
+                float const ground = map->GetHeight(
+                    player->GetPhaseMask(), it->second.x, it->second.y,
+                    groundProbeZ, true, TERRAIN_RECOVERY_VOID_PROBE_YARDS);
+                if (OverseerDecisions::FallStartedBelowWorld(
+                        it->second.z, surface > INVALID_HEIGHT, surface,
+                        ground > INVALID_HEIGHT, ground))
                 {
                     d.fallStartedBelowSurface = true;
                     d.fallStartSeen = true;

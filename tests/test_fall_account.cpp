@@ -28,6 +28,7 @@ using OverseerDecisions::FALL_DAMAGE_MIN_YARDS;
 using OverseerDecisions::FallAccount;
 using OverseerDecisions::FallAccountName;
 using OverseerDecisions::FallDamageShare;
+using OverseerDecisions::FallStartedBelowWorld;
 using OverseerDecisions::LethalFallYards;
 using OverseerDecisions::VOID_PLANE_Z;
 
@@ -161,6 +162,52 @@ void ADropStartingBelowTheSurfaceIsAVoidFall()
        FallAccount::VoidPlane);
 }
 
+void Flag(char const* what, bool got, bool want)
+{
+    if (got != want)
+    {
+        std::printf("FAIL %s: got %s, want %s\n", what, got ? "true" : "false",
+                    want ? "true" : "false");
+        ++failures;
+    }
+}
+
+// #1211. Row 151758 was a creature kill in combat at z 171.2 that fell 0.0
+// yards, recorded as a void fall because the long probe found a surface over
+// it. A character on open ground under a roof or a canopy is on the world.
+void ARoofOverOpenGroundIsNotTheWorld()
+{
+    Flag("a creature kill on open ground, a canopy 10 yards above",
+         FallStartedBelowWorld(171.2f, true, 181.2f, true, 171.2f), false);
+    Is("and so the row accounts as the drop it was",
+       AccountForFall(0.f, 0.f, 1.f, 171.2f, VOID_PLANE_Z,
+                      FallStartedBelowWorld(171.2f, true, 181.2f, true, 171.2f)),
+       FallAccount::NoDrop);
+    Flag("float jitter just under the ground it stands on",
+         FallStartedBelowWorld(42.9f, true, 44.0f, false, 0.f), false);
+    Flag("a cave floor with the hillside 60 yards over it",
+         FallStartedBelowWorld(-12.f, true, 48.f, true, -12.4f), false);
+    Flag("nothing over it at all",
+         FallStartedBelowWorld(-300.f, false, 0.f, false, 0.f), false);
+}
+
+// The other half: a start already far under the terrain, with nothing under
+// it, is still the void fall #1107 wrote the sentence for.
+void AStartUnderTheTerrainIsStillAVoidFall()
+{
+    bool const below = FallStartedBelowWorld(-250.f, true, 50.f, false, 0.f);
+    Flag("300 yards under the terrain, no ground beneath", below, true);
+    FallAccount const account =
+        AccountForFall(90.f, 0.f, 1.f, -340.f, VOID_PLANE_Z, below);
+    Is("and accounts as a void fall", account, FallAccount::VoidFall);
+    if (std::string(FallAccountName(account)) !=
+        "not a fall at all: it crossed the void plane and the core killed it outright")
+    {
+        std::printf("FAIL the void fall sentence changed\n");
+        ++failures;
+    }
+}
+
 // The plane beats the unsampled marker, and it has to: 9 of the 59 measured
 // void deaths carried no sample at all, and "unsampled" would have hidden the
 // only fact about them that matters.
@@ -204,6 +251,8 @@ int main()
     UnsampledIsNotNoDrop();
     AVoidDeathIsNotAFallHoweverFarTheColumnSaysItFell();
     ADropStartingBelowTheSurfaceIsAVoidFall();
+    ARoofOverOpenGroundIsNotTheWorld();
+    AStartUnderTheTerrainIsStillAVoidFall();
     ThePlaneIsAnAnswerEvenWithNoSample();
     NotAskingAboutThePlaneChangesNothing();
     ThePlaneIsTheCoresOwnConstant();
