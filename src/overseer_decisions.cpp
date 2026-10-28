@@ -19008,10 +19008,46 @@ bool WarriorNeedsMeleePursuit(uint8_t classId, bool tanks, bool inCombat,
 
 bool TankMayPursue(TankPursuitFacts const& facts)
 {
-    if (facts.onInstanceMap || facts.heldStill || facts.mounted || !facts.alive)
+    if (facts.onInstanceMap || facts.heldStill || facts.mounted || !facts.alive ||
+        !facts.hasVictim)
         return false;
     return WarriorNeedsMeleePursuit(facts.classId, facts.tanks, facts.inCombat,
                                     facts.inMeleeRange);
+}
+
+std::string TankStrategyListedName(uint8_t classId)
+{
+    switch (classId)
+    {
+        case 1:   // warrior: TankWarriorStrategy
+        case 2:   // paladin: TankPaladinStrategy
+            return "prot";
+        case 6:   // death knight: BloodDKStrategy
+            return "blood";
+        case 11:  // druid: BearTankDruidStrategy
+            return "bear";
+        default:
+            return "tank";
+    }
+}
+
+std::string TankPursuitWithheld(TankPursuitFacts const& facts)
+{
+    if (facts.classId != 1 || !facts.tanks || !facts.inCombat || facts.onInstanceMap)
+        return "";
+    if (facts.hasVictim && facts.inMeleeRange)
+        return "";
+    if (TankMayPursue(facts))
+        return "";
+    if (!facts.alive)
+        return "it is dead";
+    if (facts.mounted)
+        return "it is mounted or in flight";
+    if (facts.heldStill)
+        return "an overseer hold has it standing still";
+    if (!facts.hasVictim)
+        return "it has no victim or selection it may attack";
+    return "the pursuit gate refused it";
 }
 
 GearVerdict GearShieldPair(GearVerdict const& oneHand, GearVerdict const& shield)
