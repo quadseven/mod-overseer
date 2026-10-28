@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdio>
 #include <ctime>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -24,6 +25,7 @@ using OverseerDecisions::AvoidDangerousZone;
 using OverseerDecisions::CreatureDanger;
 using OverseerDecisions::CreaturePullIsSuppressed;
 using OverseerDecisions::DeathRecord;
+using OverseerDecisions::RememberSuppressedEntries;
 using OverseerDecisions::ScoreCreatureDanger;
 using OverseerDecisions::ScoreZoneDanger;
 using OverseerDecisions::TravelAvoidance;
@@ -136,6 +138,21 @@ void TwoDeathsOutsideTheWindowDoNotSuppressThePull()
     CheckUInt("one death in the window", scored[0].deaths, 1);
     Check("the pull is not suppressed outside the window",
           CreaturePullIsSuppressed(scored[0], 2), false);
+}
+
+// AC1 "for the rest of the session": once two deaths within the hour suppress
+// an entry, it stays suppressed after the hour has rolled the deaths out of
+// the scoring window.
+void ASuppressedEntryStaysSuppressedForTheSession()
+{
+    std::set<uint32_t> session;
+    RememberSuppressedEntries(session, {CreatureDanger{12345, 2}, CreatureDanger{777, 1}}, 2);
+    Check("the twice-deadly entry is remembered", session.count(12345) == 1, true);
+    Check("a once-deadly entry is not", session.count(777) == 0, true);
+
+    // An hour later the window holds nothing for the entry.
+    RememberSuppressedEntries(session, {}, 2);
+    Check("the entry is still suppressed an hour later", session.count(12345) == 1, true);
 }
 
 // An environmental death and a player kill never count as a creature entry.
@@ -345,6 +362,7 @@ int main()
 {
     TwoDeathsToAnEntryWithinAnHourSuppressThePull();
     TwoDeathsOutsideTheWindowDoNotSuppressThePull();
+    ASuppressedEntryStaysSuppressedForTheSession();
     NonCreatureDeathsAreNotScored();
     ThreeLethalDeathsInADayRouteTheZoneAround();
     TwoLethalDeathsAreNotAboveThreshold();

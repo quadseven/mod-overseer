@@ -24725,6 +24725,15 @@ bool CreaturePullIsSuppressed(CreatureDanger const& creature, unsigned threshold
     return creature.deaths >= threshold;
 }
 
+void RememberSuppressedEntries(std::set<uint32_t>& session,
+                               std::vector<CreatureDanger> const& creatures,
+                               unsigned threshold)
+{
+    for (CreatureDanger const& c : creatures)
+        if (CreaturePullIsSuppressed(c, threshold))
+            session.insert(c.entry);
+}
+
 TravelAvoidance AvoidDangerousZone(std::vector<TravelLeg> const& legs,
                                    std::vector<ZoneDanger> const& danger,
                                    unsigned threshold)

@@ -3333,10 +3333,14 @@ constexpr uint32 DEATH_FLUSH_MS = 3000;
 // there is a cohort's worth of rows to look at.
 constexpr uint32 DEATH_RETENTION_DAYS = 90;
 
-// How far back the death danger memory looks when scoring zones and creature
-// entries from overseer_death. 24 hours matches the zone criterion; creature
-// pulls are scored from the same stream, so the same window serves both.
+// How far back the death danger memory looks when scoring zones from
+// overseer_death. 24 hours matches the zone criterion.
 constexpr int64 DEATH_DANGER_WINDOW_SECONDS = 86400;
+
+// How far back creature entries are scored: two deaths to one entry within an
+// hour suppress its pulls, which matches the creature criterion. The rows come
+// from the same 24-hour read; this narrower window is applied when scoring.
+constexpr int64 CREATURE_DANGER_WINDOW_SECONDS = 3600;
 
 // How many levels above the party a creature must be for a death to count as
 // lethal when scoring a zone. Eight matches the zone criterion.
@@ -15852,13 +15856,17 @@ private:
         return result->Fetch()[0].Get<std::string>();
     }
 
-    // The last scored zone and creature danger from overseer_death, refreshed by
-    // ReportDeathDanger on the death flush timer. ReportDeathDanger, DriveTravel
-    // and DoHunt are all members of OverseerWorldScript, so these members are the
-    // shared state between them. They are lost on restart, which costs nothing:
-    // the next flush repopulates them.
+    // The zone danger and suppressed creature entries learned from
+    // overseer_death, refreshed by ReportDeathDanger on the death flush timer.
+    // ReportDeathDanger, DriveTravel and DoHunt are all members of
+    // OverseerWorldScript, so these members are the shared state between them.
+    // They are lost on restart, which ends the session the suppression is for;
+    // the next flush repopulates them from the deaths still in the window.
     std::vector<OverseerDecisions::ZoneDanger> g_zoneDanger;
-    std::vector<OverseerDecisions::CreatureDanger> g_creatureDanger;
+    // Entries that killed a party member twice within the hour at some flush
+    // this session. Only grows: the creature scores are rebuilt every flush and
+    // their hour window would let a deadly entry be pulled again an hour later.
+    std::set<uint32_t> g_suppressedEntries;
 
     // The result of reading `overseer_death`: the deaths in the window, and
     // whether the table was read at all. A query failure is not the same as an
@@ -15944,18 +15952,17 @@ private:
         std::vector<OverseerDecisions::ZoneDanger> const zones =
             OverseerDecisions::ScoreZoneDanger(deaths, now, partyLevel, windowSeconds, levelGap);
         std::vector<OverseerDecisions::CreatureDanger> const creatures =
-            OverseerDecisions::ScoreCreatureDanger(deaths, now, windowSeconds);
+            OverseerDecisions::ScoreCreatureDanger(deaths, now, CREATURE_DANGER_WINDOW_SECONDS);
         // Publish the scores so DriveTravel can steer around lethal zones and
         // DoHunt can refuse pulls against entries that have killed a party
-        // member. Stale scores are harmless: the next flush replaces them.
+        // member twice within the hour. Stale zone scores are harmless: the
+        // next flush replaces them. Suppressed entries are kept for the session.
         g_zoneDanger = zones;
-        g_creatureDanger = creatures;
+        OverseerDecisions::RememberSuppressedEntries(g_suppressedEntries, creatures, 2u);
         unsigned const dangerousZones = std::count_if(zones.begin(), zones.end(),
             [](OverseerDecisions::ZoneDanger const& z)
             { return OverseerDecisions::ZoneIsTooDangerous(z, 3u); });
-        unsigned const suppressedEntries = std::count_if(creatures.begin(), creatures.end(),
-            [](OverseerDecisions::CreatureDanger const& c)
-            { return OverseerDecisions::CreaturePullIsSuppressed(c, 2u); });
+        std::size_t const suppressedEntries = g_suppressedEntries.size();
         std::string dangerousZoneIds;
         for (OverseerDecisions::ZoneDanger const& zone : zones)
         {
@@ -15967,7 +15974,7 @@ private:
         }
         LOG_INFO("module.overseer",
                  "overseer: death danger - {} death(s) in the last {}s, {} zone(s) above "
-                 "threshold [{}], {} entry(ies) with two or more kills",
+                 "threshold [{}], {} entry(ies) suppressed this session",
                  deaths.size(), windowSeconds, dangerousZones, dangerousZoneIds, suppressedEntries);
     }
 
@@ -79708,14 +79715,10 @@ private:
             return refuse(wall);
 
         // LEARN FROM DEATHS (#151): a creature entry that has killed a party
-        // member twice in the window is not pulled voluntarily until the party
-        // has levelled past it. Fighting back when attacked is unchanged, so
-        // only the voluntary hunt pull is refused here.
-        auto const hunted = std::find_if(g_creatureDanger.begin(), g_creatureDanger.end(),
-                                         [&](OverseerDecisions::CreatureDanger const& c)
-                                         { return c.entry == hunt.entry; });
-        if (hunted != g_creatureDanger.end() &&
-            OverseerDecisions::CreaturePullIsSuppressed(*hunted, 2u))
+        // member twice within an hour is not pulled voluntarily for the rest of
+        // the session. Fighting back when attacked is unchanged, so only the
+        // voluntary hunt pull is refused here.
+        if (g_suppressedEntries.count(hunt.entry) != 0)
         {
             return refuse("the creature has killed a party member twice - pulls are suppressed");
         }

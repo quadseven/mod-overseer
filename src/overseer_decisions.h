@@ -51,6 +51,7 @@
 #include <cstdio>
 #include <ctime>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -27185,6 +27186,14 @@ std::vector<CreatureDanger> ScoreCreatureDanger(std::vector<DeathRecord> const& 
 // window: do not pull it voluntarily. Fighting back when attacked is not a
 // pull and is unchanged by this.
 bool CreaturePullIsSuppressed(CreatureDanger const& creature, unsigned threshold);
+
+// Add every entry the window suppresses to `session`, the set of entries no
+// member pulls for the rest of the session. Nothing is ever removed: an entry
+// that killed twice within the hour stays refused after those deaths age out
+// of the scoring window.
+void RememberSuppressedEntries(std::set<uint32_t>& session,
+                               std::vector<CreatureDanger> const& creatures,
+                               unsigned threshold);
 
 // A route offered to the party, each leg naming the zone it enters; one leg is
 // the current (already aimed) choice and the rest are alternatives to the same
