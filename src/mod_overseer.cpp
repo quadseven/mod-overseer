@@ -53399,7 +53399,9 @@ private:
                 // on at the same pull, which is the loop #1201/#1215 ended. So
                 // the book is asked before the run is adopted, and a held run
                 // is not adopted until the hold lifts. EXIT is still adopted:
-                // it only walks the member out.
+                // it only walks the member out. The refusal keeps its own
+                // once-per-ending flag: the run-start line may already have
+                // been said for this ending, and that must not silence it.
                 {
                     auto const book = _dungeonWipeBooks.find(leaderName);
                     if (book != _dungeonWipeBooks.end())
@@ -53420,9 +53422,9 @@ private:
                                 book->second, inside->insideMapId, sick, std::time(nullptr),
                                 adoptAt))
                         {
-                            if (!book->second.holdSaid)
+                            if (!book->second.adoptionHoldSaid)
                             {
-                                book->second.holdSaid = true;
+                                book->second.adoptionHoldSaid = true;
                                 LOG_INFO("module.overseer",
                                          "overseer: the next dungeon run for '{}' on map {} "
                                          "waits - the last attempt there ended on a second "

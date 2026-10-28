@@ -15578,6 +15578,7 @@ bool DungeonWipeBookEndsAttempt(DungeonWipeBook& book, std::uint32_t mapId, std:
         book.endedAt = now;
         book.endedMap = mapId;
         book.holdSaid = false;
+        book.adoptionHoldSaid = false;
     }
     return repeat;
 }

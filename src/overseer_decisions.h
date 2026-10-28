@@ -18668,6 +18668,7 @@ struct DungeonWipeBook
     std::time_t endedAt{0};          // when a repeat wipe ended the attempt (0 = never)
     std::uint32_t endedMap{0};       // and on which map
     bool holdSaid{false};            // the IDLE hold line was said for this ending
+    bool adoptionHoldSaid{false};    // and the refused-adoption line (#1223), on its own
 };
 
 // Books a family run that ended 'wipe' on `mapId` at `now`. True when it is a

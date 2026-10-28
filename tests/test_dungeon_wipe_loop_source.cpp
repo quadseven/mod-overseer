@@ -97,7 +97,12 @@ int CheckTheAdoptionHold(std::string const& text)
         return Fail("adoption must read the leader's wipe book");
     if (text.find("RESURRECTION_SICKNESS_AURA", adoptAt) > hold)
         return Fail("adoption must read the members' Resurrection Sickness");
-    std::size_t const said = text.find("holdSaid = true;", hold);
+    // Its own once-per-ending flag, not the run-start line's: that one may
+    // already be set for this ending and would silence the refusal.
+    std::size_t const said = text.find("book->second.adoptionHoldSaid = true;", hold);
+    if (said == std::string::npos || said > adopted ||
+        text.find("if (!book->second.adoptionHoldSaid)", hold) > said)
+        return Fail("a refused adoption must say its line once per ending, on its own flag");
     std::size_t const line = text.find("waits - the last attempt there ended on a second", hold);
     if (said == std::string::npos || line == std::string::npos || line > adopted)
         return Fail("a refused adoption must still say the hold line");

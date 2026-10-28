@@ -119,6 +119,28 @@ void TheHoldRefusesAdoptionInside()
                                     DungeonRunAdoptPhase::Clearing));
 }
 
+// The refused adoption says its line once per ending, apart from the run-start
+// line (#1223): the leader outside may have said the run-start line already,
+// and a ghost revived inside later in the same ending must still be heard.
+void EachEndingSaysTheAdoptionLineAgain()
+{
+    DungeonWipeBook book;
+    DungeonWipeBookEndsAttempt(book, RAZORFEN, 10000);
+    DungeonWipeBookEndsAttempt(book, RAZORFEN, 10100);
+    Check("a fresh ending has said neither line",
+          !book.holdSaid && !book.adoptionHoldSaid);
+    book.holdSaid = true;
+    Check("the run-start line does not count as the adoption line",
+          !book.adoptionHoldSaid);
+    book.adoptionHoldSaid = true;
+    DungeonWipeBookEndsAttempt(book, RAZORFEN, 20000);
+    Check("a lone later wipe is not a new ending, so neither line is said again",
+          book.holdSaid && book.adoptionHoldSaid);
+    DungeonWipeBookEndsAttempt(book, RAZORFEN, 20100);
+    Check("the next ending says the run-start line again", !book.holdSaid);
+    Check("the next ending says the adoption line again", !book.adoptionHoldSaid);
+}
+
 void WipesFarApartOrElsewhereDoNotEndIt()
 {
     DungeonWipeBook book;
@@ -243,6 +265,7 @@ int main()
 {
     AFamilyThatWipesTwiceAtOnePlaceEndsTheAttempt();
     TheHoldRefusesAdoptionInside();
+    EachEndingSaysTheAdoptionLineAgain();
     WipesFarApartOrElsewhereDoNotEndIt();
     TheRaidSicknessHoldOutlivesTheRelease();
     AReleaseThatLeavesTheLivingInsideStillEndsTheAttempt();
