@@ -7312,6 +7312,11 @@ bool LeaderCarriesNewRpg(std::string const& job, bool onAnErrand)
     return onAnErrand || !HoldsInTown(job);
 }
 
+bool RunHoldsNewRpgOff(bool runStagedInsideOrClearing, bool onTheRunsMap)
+{
+    return runStagedInsideOrClearing && onTheRunsMap;
+}
+
 UnissuedFlightStep TownLeaderUnissuedFlight(bool mayCarryNewRpg, bool statusIsTravelFlight,
                                             bool moduleIssuedFlight, bool inFlight)
 {
@@ -11645,6 +11650,76 @@ bool PlanErrandRouteAgain(bool planned, std::uint32_t plannedAtDeaths,
     return alive && plannedAtDeaths != deathsNow;
 }
 
+std::vector<RouteLegSpan> LegsWalkedAtDeath(std::vector<RouteLegSpan> const& legs,
+                                            std::vector<RoutePoint> const& route,
+                                            std::uint32_t cursorAt, std::time_t steppedAt,
+                                            std::time_t now, float x, float y,
+                                            DiedOnLegLimits const& limits)
+{
+    std::vector<RouteLegSpan> out;
+    if (!DiedOnLegLimitsSane(limits) || !(limits.walkedWithinSeconds >= 0) || legs.empty())
+        return out;
+    if (steppedAt <= 0 || now < steppedAt ||
+        static_cast<std::int64_t>(now - steppedAt) > limits.walkedWithinSeconds)
+        return out;
+    // The leg the cursor is on: the one whose points hold it, or, past the
+    // last of them, the last leg that starts at or before it.
+    std::size_t walked = legs.size();
+    for (std::size_t i = 0; i < legs.size(); ++i)
+    {
+        if (legs[i].firstPoint <= cursorAt)
+            walked = i;
+        if (legs[i].firstPoint <= cursorAt && cursorAt < legs[i].endPoint)
+            break;
+    }
+    if (walked == legs.size())
+        return out;
+    std::size_t const first = walked == 0 ? 0 : walked - 1;
+    std::size_t const last = std::min(walked + 1, legs.size() - 1);
+    std::vector<RouteLegSpan> const near(legs.begin() + static_cast<std::ptrdiff_t>(first),
+                                         legs.begin() + static_cast<std::ptrdiff_t>(last) + 1);
+    return LegsOfDeath(near, route, x, y, limits);
+}
+
+float DiedOnLegPrice(std::uint32_t from, std::uint32_t to, std::vector<DiedOnLeg> const& died,
+                     std::time_t now, DiedOnLegLimits const& limits)
+{
+    if (!DiedOnLegLimitsSane(limits))
+        return 0.f;
+    for (DiedOnLeg const& leg : died)
+        if (leg.until > now && SameLeg(from, to, leg.from, leg.to))
+            return limits.priceYards;
+    return 0.f;
+}
+
+std::uint32_t DiedOnLegsHeld(std::vector<DiedOnLeg> const& died, std::time_t now)
+{
+    std::uint32_t count = 0;
+    for (DiedOnLeg const& leg : died)
+        if (leg.until > now)
+            ++count;
+    return count;
+}
+
+bool SteerCreatureWalkAlongRoute(bool creatureAim, std::uint32_t diedOnLegsHeld)
+{
+    return creatureAim && diedOnLegsHeld > 0;
+}
+
+std::uint32_t DiedOnLegsOnRoute(std::vector<RouteLegSpan> const& legs,
+                                std::vector<DiedOnLeg> const& died, std::time_t now)
+{
+    std::uint32_t count = 0;
+    for (RouteLegSpan const& span : legs)
+        for (DiedOnLeg const& leg : died)
+            if (leg.until > now && SameLeg(span.from, span.to, leg.from, leg.to))
+            {
+                ++count;
+                break;
+            }
+    return count;
+}
+
 FlightLoanStep ReadFlightLoan(bool lent, bool sawFlying, bool inFlight, time_t since,
                               time_t now, time_t boardLimit)
 {
@@ -15540,6 +15615,11 @@ char const* RaidRunPhaseName(RaidRunPhase phase)
     return "IDLE";
 }
 
+bool RaidReleaseDisbandsAnyway(std::time_t endingSince, std::time_t now)
+{
+    return endingSince != 0 && now - endingSince >= RAID_RELEASE_WAIT_SECONDS;
+}
+
 bool RaidWiped(RaidRunFacts const& facts)
 {
     unsigned const total = facts.insideAlive + facts.insideDead;
@@ -15578,6 +15658,7 @@ bool DungeonWipeBookEndsAttempt(DungeonWipeBook& book, std::uint32_t mapId, std:
         book.endedAt = now;
         book.endedMap = mapId;
         book.holdSaid = false;
+        book.adoptionHoldSaid = false;
     }
     return repeat;
 }
@@ -15591,6 +15672,14 @@ bool DungeonWipeHoldsRunStart(DungeonWipeBook const& book, std::uint32_t mapId,
     if (since < WIPE_LOOP_SECONDS)
         return true;
     return membersSick && since < WIPE_SICK_HOLD_MAX_SECONDS;
+}
+
+bool DungeonWipeHoldsAdoption(DungeonWipeBook const& book, std::uint32_t mapId,
+                              bool membersSick, std::time_t now,
+                              DungeonRunAdoptPhase adoptAt)
+{
+    return adoptAt != DungeonRunAdoptPhase::Exiting &&
+           DungeonWipeHoldsRunStart(book, mapId, membersSick, now);
 }
 
 bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct)
@@ -17993,6 +18082,52 @@ bool MayCraftNow(std::string const& job, bool inDungeonRun, bool alive, bool inC
     return campaignJob && !inDungeonRun && alive && !inCombat && !moving;
 }
 
+unsigned CraftLoneDeathsInZone(std::vector<CraftLoneDeath> const& deaths, uint32_t mapId,
+                               uint32_t zoneId, int64_t now, CraftLoneDeathLimits const& limits)
+{
+    unsigned count = 0;
+    for (CraftLoneDeath const& d : deaths)
+        if (d.craftJob && !d.grouped && d.mapId == mapId && d.zoneId == zoneId &&
+            d.at <= now && now - d.at <= limits.windowSeconds)
+            ++count;
+    return count;
+}
+
+void PruneCraftLoneDeaths(std::vector<CraftLoneDeath>& deaths, int64_t now,
+                          CraftLoneDeathLimits const& limits)
+{
+    deaths.erase(std::remove_if(deaths.begin(), deaths.end(),
+                                [&](CraftLoneDeath const& d)
+                                { return now - d.at > limits.windowSeconds; }),
+                 deaths.end());
+}
+
+CraftLoneDeathStep DecideCraftLoneDeaths(CraftLoneDeathFacts const& facts,
+                                         CraftLoneDeathLimits const& limits)
+{
+    if (facts.job != "craft" || facts.grouped || facts.deathsHere < limits.deaths)
+        return CraftLoneDeathStep::Stay;
+    if (facts.resting)
+        return CraftLoneDeathStep::Stay;
+    if (!facts.alive)
+        return CraftLoneDeathStep::Defer;
+    return facts.hearthReady ? CraftLoneDeathStep::Hearth : CraftLoneDeathStep::Defer;
+}
+
+char const* CraftLoneDeathStepWord(CraftLoneDeathStep step)
+{
+    switch (step)
+    {
+        case CraftLoneDeathStep::Hearth:
+            return "hearthing to its bind, an inn under guards";
+        case CraftLoneDeathStep::Defer:
+            return "its craft step is deferred until it can hearth out";
+        case CraftLoneDeathStep::Stay:
+            break;
+    }
+    return "staying";
+}
+
 bool CraftDismountsFirst(bool mounted, bool inFlight)
 {
     return mounted && !inFlight;
@@ -18830,6 +18965,11 @@ std::vector<RunTimelineEvent> RaidTimelineEvents(RaidTimelineSnapshot const& bef
         std::string detail = before.phase + " -> " + after.phase;
         if (!after.why.empty())
             detail += ": " + after.why;
+        // The walk to the door, measured: a 40-seat order with 38 at the door
+        // and one with 12 are told apart here rather than in a log line.
+        if (before.phase == "ASSEMBLE" && after.phase == "ENTER" && after.inRaid > 0)
+            detail += (after.why.empty() ? ": " : "; ") + std::to_string(after.atDoor) +
+                      " of " + std::to_string(after.inRaid) + " raiders at the door";
         add("phase", detail);
     }
     return events;
@@ -18975,10 +19115,46 @@ bool WarriorNeedsMeleePursuit(uint8_t classId, bool tanks, bool inCombat,
 
 bool TankMayPursue(TankPursuitFacts const& facts)
 {
-    if (facts.onInstanceMap || facts.heldStill || facts.mounted || !facts.alive)
+    if (facts.onInstanceMap || facts.heldStill || facts.mounted || !facts.alive ||
+        !facts.hasVictim)
         return false;
     return WarriorNeedsMeleePursuit(facts.classId, facts.tanks, facts.inCombat,
                                     facts.inMeleeRange);
+}
+
+std::string TankStrategyListedName(uint8_t classId)
+{
+    switch (classId)
+    {
+        case 1:   // warrior: TankWarriorStrategy
+        case 2:   // paladin: TankPaladinStrategy
+            return "prot";
+        case 6:   // death knight: BloodDKStrategy
+            return "blood";
+        case 11:  // druid: BearTankDruidStrategy
+            return "bear";
+        default:
+            return "tank";
+    }
+}
+
+std::string TankPursuitWithheld(TankPursuitFacts const& facts)
+{
+    if (facts.classId != 1 || !facts.tanks || !facts.inCombat || facts.onInstanceMap)
+        return "";
+    if (facts.hasVictim && facts.inMeleeRange)
+        return "";
+    if (TankMayPursue(facts))
+        return "";
+    if (!facts.alive)
+        return "it is dead";
+    if (facts.mounted)
+        return "it is mounted or in flight";
+    if (facts.heldStill)
+        return "an overseer hold has it standing still";
+    if (!facts.hasVictim)
+        return "it has no victim or selection it may attack";
+    return "the pursuit gate refused it";
 }
 
 GearVerdict GearShieldPair(GearVerdict const& oneHand, GearVerdict const& shield)
@@ -23623,6 +23799,12 @@ bool AcrossTeldrassilShore(std::uint32_t mapId, std::uint32_t fromZone, std::uin
 {
     return mapId == TELDRASSIL_MAP &&
            OnTeldrassilIsland(mapId, fromZone) != OnTeldrassilIsland(mapId, toZone);
+}
+
+bool NearTeldrassil(std::uint32_t mapId, float x, float y)
+{
+    return mapId == TELDRASSIL_MAP && x >= TELDRASSIL_BOX_MIN_X && x <= TELDRASSIL_BOX_MAX_X &&
+           y >= TELDRASSIL_BOX_MIN_Y && y <= TELDRASSIL_BOX_MAX_Y;
 }
 
 IslandFirstLeg CrossIslandFirst(std::uint32_t mapId, std::uint32_t zoneId,

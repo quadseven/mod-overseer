@@ -270,7 +270,7 @@ void TheTravelDriveAsksBeforeItWalks()
     std::size_t const drive = source.find("    void DriveTravel()");
     std::size_t const asked = source.find("OverseerDecisions::DecideErrandRoad(", drive);
     std::size_t const walked =
-        source.find("WorldPosition const leg = entry ? pos : RouteLeg(", drive);
+        source.find("entry && !steered ? pos : RouteLeg(", drive);
     Check("DriveTravel exists", drive != std::string::npos, true);
     Check("DriveTravel asks the road decision", asked != std::string::npos, true);
     Check("and asks it before the walk is issued",
