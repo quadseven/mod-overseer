@@ -18739,6 +18739,11 @@ std::vector<RunTimelineEvent> RaidTimelineEvents(RaidTimelineSnapshot const& bef
         std::string detail = before.phase + " -> " + after.phase;
         if (!after.why.empty())
             detail += ": " + after.why;
+        // The walk to the door, measured: a 40-seat order with 38 at the door
+        // and one with 12 are told apart here rather than in a log line.
+        if (before.phase == "ASSEMBLE" && after.phase == "ENTER" && after.inRaid > 0)
+            detail += (after.why.empty() ? ": " : "; ") + std::to_string(after.atDoor) +
+                      " of " + std::to_string(after.inRaid) + " raiders at the door";
         add("phase", detail);
     }
     return events;
