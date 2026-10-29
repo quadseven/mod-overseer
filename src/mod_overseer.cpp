@@ -36207,9 +36207,14 @@ private:
         // the position is recorded here. The next IDLE poll refuses to re-open a
         // run while the leader is still at or near that position. Cleared when
         // the leader reaches a walkable approach (ApproachShape != Overhead).
+        // Mirrored to overseer_approach_quarantine so a restart keeps it.
         bool quarantined{false};
         float quarantineX{0.f}, quarantineY{0.f}, quarantineZ{0.f};
         time_t quarantineSince{0};
+        // Whether overseer_approach_quarantine has been read for this
+        // coordinator. A fresh struct reads it again, which is what carries
+        // the hold across a restart.
+        bool quarantineLoaded{false};
 
         // --- the trip that follows this run (#391) ---------------------
         //
@@ -40164,7 +40169,8 @@ private:
     // refuses to re-open a run while the leader is still at or near that
     // position. Cleared when the leader reaches a walkable approach
     // (ApproachShape != Overhead).
-    void FailApproach(DungeonRunCoordinatorState& coord, std::string const& leaderName,
+    void FailApproach(DungeonRunCoordinatorState& coord, std::string const& family,
+                      std::string const& leaderName,
                       std::vector<std::string> const& members,
                       DungeonPortal const& portal, char const* phase,
                       std::string const& blockers, bool stillWanted,
@@ -40187,11 +40193,14 @@ private:
         coord.quarantineY = leaderY;
         coord.quarantineZ = leaderZ;
         coord.quarantineSince = time(nullptr);
+        PersistApproachQuarantine(family, leaderName, coord);
 
         LOG_WARN("module.overseer",
-                 "overseer: dungeon run {} of campaign {} QUARANTINED at `{} {} {}` - "
+                 "overseer: dungeon run {} of campaign {} QUARANTINED at {} - "
+                 "`staging_failed` recorded in `overseer_approach_quarantine`: "
                  "leader was above the staging point and not descending",
-                 coord.runNumber, coord.campaignId, leaderX, leaderY, leaderZ);
+                 coord.runNumber, coord.campaignId,
+                 OverseerDecisions::BacktickedPosition(leaderX, leaderY, leaderZ));
 
         EndRunAndDecide(coord, leaderName, portal,
                         coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId),
@@ -40344,6 +40353,85 @@ private:
                          "own heuristic and nothing asks the bridge");
         }
         return _runRecoveryColumns == SchemaColumns::Present;
+    }
+
+    // THE QUARANTINE OUTLIVES THE PROCESS (#396). FailApproach's hold lives on
+    // the coordinator, and a restart between the failure and the next IDLE poll
+    // used to forget it and re-open the run from the same rim. The row is the
+    // copy that survives; the coordinator fields stay the working copy.
+    SchemaColumns _approachQuarantineColumns{SchemaColumns::Unknown};
+    bool ApproachQuarantinePresent()
+    {
+        if (_approachQuarantineColumns == SchemaColumns::Unknown)
+        {
+            bool const present = SchemaHasColumns(
+                "overseer_approach_quarantine", "'family','x','y','z'", 4);
+            _approachQuarantineColumns =
+                present ? SchemaColumns::Present : SchemaColumns::Absent;
+            if (!present)
+                LOG_WARN("module.overseer",
+                         "overseer: overseer_approach_quarantine is missing "
+                         "(2026_10_25_00_overseer_approach_quarantine.sql has not been "
+                         "applied), so a failed approach's quarantine holds in memory "
+                         "only and a restart forgets it");
+        }
+        return _approachQuarantineColumns == SchemaColumns::Present;
+    }
+
+    void PersistApproachQuarantine(std::string const& family, std::string const& leaderName,
+                                   DungeonRunCoordinatorState const& coord)
+    {
+        if (!ApproachQuarantinePresent())
+            return;
+        CharacterDatabase.Execute(
+            "INSERT INTO overseer_approach_quarantine "
+            "(family, leader_name, campaign_id, x, y, z, since) "
+            "VALUES ('{}', '{}', {}, {}, {}, {}, {}) "
+            "ON DUPLICATE KEY UPDATE leader_name = VALUES(leader_name), "
+            "campaign_id = VALUES(campaign_id), x = VALUES(x), y = VALUES(y), "
+            "z = VALUES(z), since = VALUES(since)",
+            Esc(family), Esc(leaderName), coord.campaignId, coord.quarantineX, coord.quarantineY,
+            coord.quarantineZ, static_cast<int64>(coord.quarantineSince));
+    }
+
+    // Read once per coordinator struct; a row found re-arms the hold exactly
+    // as FailApproach left it.
+    void LoadApproachQuarantine(std::string const& family, DungeonRunCoordinatorState& coord)
+    {
+        if (coord.quarantineLoaded)
+            return;
+        coord.quarantineLoaded = true;
+        if (coord.quarantined || !ApproachQuarantinePresent())
+            return;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT x, y, z, since FROM overseer_approach_quarantine WHERE family = '{}'",
+            Esc(family));
+        if (!result)
+            return;
+        Field* fields = result->Fetch();
+        coord.quarantined = true;
+        coord.quarantineX = fields[0].Get<float>();
+        coord.quarantineY = fields[1].Get<float>();
+        coord.quarantineZ = fields[2].Get<float>();
+        coord.quarantineSince = static_cast<time_t>(fields[3].Get<int64>());
+        LOG_INFO("module.overseer",
+                 "overseer: family '{}' carries a quarantine from a failed approach at {} "
+                 "across a restart - the next run waits until the leader leaves it",
+                 family,
+                 OverseerDecisions::BacktickedPosition(coord.quarantineX, coord.quarantineY,
+                                                       coord.quarantineZ));
+    }
+
+    void ClearApproachQuarantine(std::string const& family, DungeonRunCoordinatorState& coord)
+    {
+        coord.quarantined = false;
+        coord.quarantineX = 0.f;
+        coord.quarantineY = 0.f;
+        coord.quarantineZ = 0.f;
+        coord.quarantineSince = 0;
+        if (ApproachQuarantinePresent())
+            CharacterDatabase.Execute(
+                "DELETE FROM overseer_approach_quarantine WHERE family = '{}'", Esc(family));
     }
 
     void WriteRecoveryRequest(std::string const& family, std::string const& leaderName,
@@ -54406,53 +54494,46 @@ private:
             // before the run exists is exactly the drift #220 is about.
             if (!finderWay)
             {
-                // QUARANTINE AFTER FAILED APPROACH (#396). If the coordinator
-                // has a quarantine position from a previous failed approach,
-                // check if the leader is still at or near that position. If so,
-                // refuse to open a new run. The quarantine is cleared when the
-                // leader reaches a walkable approach (ApproachShape != Overhead).
-                if (coord.quarantined)
-                {
-                    float const dx = leader->GetPositionX() - coord.quarantineX;
-                    float const dy = leader->GetPositionY() - coord.quarantineY;
-                    float const dz = leader->GetPositionZ() - coord.quarantineZ;
-                    float const distSq = dx * dx + dy * dy + dz * dz;
-                    // Consider "at or near" as within 10 yards of the quarantined position
-                    if (distSq <= 100.0f) // 10^2 = 100
-                    {
-                        LOG_WARN("module.overseer",
-                                 "overseer: dungeon run QUARANTINED - leader '{}' at `{} {} {}` "
-                                 "is still near the refused position `{} {} {}`. "
-                                 "Run will not open until leader moves to a walkable approach.",
-                                 leaderName,
-                                 leader->GetPositionX(), leader->GetPositionY(), leader->GetPositionZ(),
-                                 coord.quarantineX, coord.quarantineY, coord.quarantineZ);
-                        return;
-                    }
-                    else
-                    {
-                        // Leader has moved away from quarantined position, clear quarantine
-                        coord.quarantined = false;
-                        coord.quarantineX = 0.f;
-                        coord.quarantineY = 0.f;
-                        coord.quarantineZ = 0.f;
-                        coord.quarantineSince = 0;
-                    }
-                }
-
                 OverseerDecisions::ApproachRouteState scratch;
                 DungeonApproachAim const first = DungeonApproachAimFor(
                     *portal, scratch, leader, stageX, stageY, stageZ);
                 OverseerDecisions::ApproachGap const gap = first.gap;
-                if (OverseerDecisions::ApproachShapeOf(gap, DUNGEON_APPROACH_LIMITS) ==
-                    OverseerDecisions::ApproachShape::Overhead)
+                OverseerDecisions::ApproachShape const shape =
+                    OverseerDecisions::ApproachShapeOf(gap, DUNGEON_APPROACH_LIMITS);
+                LoadApproachQuarantine(family, coord);
+                if (coord.quarantined)
+                {
+                    OverseerDecisions::ApproachQuarantineState const quarantine{
+                        true, coord.quarantineX, coord.quarantineY, coord.quarantineZ};
+                    OverseerDecisions::ApproachQuarantineAction const action =
+                        OverseerDecisions::ApproachQuarantineDecision(
+                            quarantine, shape, leader->GetPositionX(),
+                            leader->GetPositionY(), leader->GetPositionZ());
+                    if (action == OverseerDecisions::ApproachQuarantineAction::Block)
+                    {
+                        LOG_WARN("module.overseer",
+                                 "overseer: dungeon run QUARANTINED `staging_failed` - leader '{}' at {} "
+                                 "is still near the refused position {} held in "
+                                 "`overseer_approach_quarantine`. "
+                                 "Run will not open until leader moves to a walkable approach.",
+                                 leaderName,
+                                 OverseerDecisions::BacktickedPosition(
+                                     leader->GetPositionX(), leader->GetPositionY(),
+                                     leader->GetPositionZ()),
+                                 OverseerDecisions::BacktickedPosition(
+                                     coord.quarantineX, coord.quarantineY, coord.quarantineZ));
+                        return;
+                    }
+                    ClearApproachQuarantine(family, coord);
+                }
+                if (shape == OverseerDecisions::ApproachShape::Overhead)
                 {
                     if (!coord.loggedAboveTheDoor)
                     {
                         coord.loggedAboveTheDoor = true;
                         LOG_WARN("module.overseer",
-                                 "overseer: dungeon run held - the '{}' {} is "
-                                 "({:.1f}, {:.1f}, {:.1f}) and the leader '{}' is {}. That "
+                                 "overseer: dungeon run held - the '{}' {} is {} and the "
+                                 "leader '{}' at {} is {}. That "
                                  "is above it, not near it: no walk toward it from there "
                                  "descends, and the last-step footing check would refuse "
                                  "every direction that closed the gap. Nothing is reset, "
@@ -54463,23 +54544,17 @@ private:
                                  first.leg == OverseerDecisions::ApproachLeg::ToWaypoint
                                      ? "approach corridor starts at"
                                      : "staging point is",
-                                 first.x, first.y, first.z, leaderName,
+                                 OverseerDecisions::BacktickedPosition(first.x, first.y, first.z),
+                                 leaderName,
+                                 OverseerDecisions::BacktickedPosition(
+                                     leader->GetPositionX(), leader->GetPositionY(),
+                                     leader->GetPositionZ()),
                                  OverseerDecisions::ApproachWhere(gap));
                     }
                     return;
                 }
                 coord.loggedAboveTheDoor = false;
 
-                // QUARANTINE AFTER FAILED APPROACH (#396). Clear quarantine
-                // when the approach is walkable (not Overhead).
-                if (coord.quarantined)
-                {
-                    coord.quarantined = false;
-                    coord.quarantineX = 0.f;
-                    coord.quarantineY = 0.f;
-                    coord.quarantineZ = 0.f;
-                    coord.quarantineSince = 0;
-                }
             }
 
             // THERE IS NO `loggedCampaignOver = false` BETWEEN THE TWO STOP
@@ -55607,7 +55682,7 @@ private:
                 // fixes, and a line that said only "the staging point" for both
                 // would send the next reader to the wrong one.
                 if (RunStagingWatchdog(coord, leaderName, leader, gap))
-                    FailApproach(coord, leaderName, members, *portal, "GATHERING",
+                    FailApproach(coord, family, leaderName, members, *portal, "GATHERING",
                                  leaderName + " (" +
                                      OverseerDecisions::ApproachWhere(gap) +
                                      (onTheCorridor
@@ -56798,7 +56873,7 @@ private:
                 // achieve, and every minute of it is a minute the party spends
                 // standing beside a drop. The watchdog has already said which
                 // character and how far above.
-                FailApproach(coord, leaderName, members, *portal, "BARRIER",
+                FailApproach(coord, family, leaderName, members, *portal, "BARRIER",
                              name + " (" + OverseerDecisions::ApproachWhere(legGap) +
                                  (onTheCorridor
                                       ? ", walking to the start of the approach corridor"

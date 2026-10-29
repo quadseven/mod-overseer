@@ -1756,6 +1756,35 @@ ApproachShape ApproachShapeOf(ApproachGap const& gap, ApproachLimits const& limi
                                              : ApproachShape::Closing;
 }
 
+ApproachQuarantineAction ApproachQuarantineDecision(
+    ApproachQuarantineState const& quarantine, ApproachShape shape,
+    float leaderX, float leaderY, float leaderZ)
+{
+    if (!quarantine.active)
+        return ApproachQuarantineAction::Inactive;
+    if (shape == ApproachShape::Unmeasured)
+        return ApproachQuarantineAction::Block;
+    if (shape == ApproachShape::Arrived || shape == ApproachShape::Closing)
+        return ApproachQuarantineAction::Clear;
+
+    float const dx = leaderX - quarantine.x;
+    float const dy = leaderY - quarantine.y;
+    float const dz = leaderZ - quarantine.z;
+    return dx * dx + dy * dy + dz * dz <= 100.f
+               ? ApproachQuarantineAction::Block
+               : ApproachQuarantineAction::Clear;
+}
+
+std::string BacktickedPosition(float x, float y, float z)
+{
+    if (!FiniteReading(x) || !FiniteReading(y) || !FiniteReading(z))
+        return "`(unmeasured)`";
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(1) << "`(" << x << ", " << y << ", " << z
+        << ")`";
+    return out.str();
+}
+
 float ApproachDistance(ApproachGap const& gap)
 {
     if (!gap.measured || !FiniteReading(gap.horizontalYards) ||
