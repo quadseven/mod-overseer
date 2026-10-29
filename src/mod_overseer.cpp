@@ -44165,6 +44165,7 @@ private:
         facts.deadInside = poll.inside - poll.aliveInside;
         facts.ghostsComingBack = ghostsWalking;
         bool resurrector = false;
+        std::string fighter;
         std::vector<OverseerDecisions::GuildRunMemberShape> living;
         for (std::size_t i = 0; i < run.names.size(); ++i)
         {
@@ -44172,7 +44173,11 @@ private:
             if (!GuildRunAliveInside(run, p))
                 continue;
             if (p->IsInCombat())
+            {
                 facts.anyFighting = true;
+                if (fighter.empty())
+                    fighter = run.names[i];
+            }
             if (IsResurrectorClass(p))
                 resurrector = true;
             living.push_back(GuildRunShapeOf(
@@ -44226,6 +44231,8 @@ private:
                      OverseerDecisions::GuildRunHoldWhyWord(hold.why),
                      hold.why == GuildRunHoldWhy::RestTimedOut
                          ? "; still waiting on " + GuildRunRestWaitsOn(run)
+                     : hold.why == GuildRunHoldWhy::InCombat
+                         ? "; '" + fighter + "' is still in combat"
                          : std::string());
             run.brainHeld = false;
             run.heldSince = 0;
@@ -44245,7 +44252,7 @@ private:
         // nothing on a run that is still paused.
         if (hold.why == GuildRunHoldWhy::Regroup)
             run.restSince = 0;
-        else if (hold.why == GuildRunHoldWhy::Rest && !run.restSince)
+        else if ((hold.why == GuildRunHoldWhy::Rest || facts.anyFighting) && !run.restSince)
             run.restSince = now;
         // A body inside that nobody alive can raise keeps the hold (#1140):
         // said once per hold, and the corpse run's release ends it.

@@ -24566,6 +24566,7 @@ enum class GuildRunHoldWhy : std::uint8_t
     Rested,        // every member is over its bar (or nothing is left to wait for)
     RestTimedOut,  // a rest ran GUILD_RUN_REST_MAX_SECONDS
     Dead,          // a body lies inside: the dungeon module's rez needs the brain
+    InCombat,      // a member stayed in combat for a rest's bound while held
 };
 
 struct GuildRunHold
@@ -24576,7 +24577,8 @@ struct GuildRunHold
 
 // ONE POLL of the hold. Nothing while the brain is not armed, while nobody is
 // alive inside (a hold outlives a wipe, so the first member raised does not
-// walk on alone), or while anybody fights. Hold while the living wait for
+// walk on alone), or while anybody fights (a held brain whose member stays in
+// combat for restMaxSeconds is released, why InCombat: #1185). Hold while the living wait for
 // ghosts (bounded), or when a member is under a trigger outside a timed-out
 // rest's cooldown; release when rested, or when the rest has run its bound.
 //
