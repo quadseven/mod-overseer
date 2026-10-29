@@ -11639,6 +11639,10 @@ bool AuctionRefusalRetryable(std::string const& reason);
 //     AUCTION_RELIST_DROP_PERCENT of `lastListPrice`, at most
 //     AUCTION_RELIST_MAX times; after that, or when the lower price would no
 //     longer beat `vendorPrice`, or when no last price was recorded, Vendor.
+//   - The cut TRUNCATES (integer percent), on purpose. A cut that reaches 0
+//     (only a last price of 1 copper) is Vendor by design, never rounded up to
+//     1: a relist must be strictly lower than the last price and must still
+//     beat `vendorPrice`, and rounding up would relist at the same price.
 constexpr uint32_t AUCTION_RELIST_MAX = 2;
 constexpr uint32_t AUCTION_RELIST_DROP_PERCENT = 10;
 

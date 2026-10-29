@@ -405,6 +405,33 @@ void TheSellRule()
     CheckSell("a relist that would fall to vendor price is vendored", floor,
               AuctionSellVerdict::Vendor, 0);
 
+    // The cut truncates: 1 copper cuts to 0 and is vendored, never rounded up
+    // to a relist at the same 1 copper. Mutation check: rounding up makes the
+    // first case a RelistLower at 1.
+    AuctionSellInput tiny = green;
+    tiny.unsoldExpired = true;
+    tiny.relistCount = 0;
+    tiny.vendorPrice = 0;
+    tiny.lastListPrice = 1;
+    CheckSell("a 1 copper listing cuts to 0 and is vendored", tiny, AuctionSellVerdict::Vendor, 0);
+    tiny.lastListPrice = 5;
+    tiny.vendorPrice = 4;
+    CheckSell("5 cuts to 4, which does not beat a vendor price of 4", tiny,
+              AuctionSellVerdict::Vendor, 0);
+    tiny.vendorPrice = 3;
+    CheckSell("5 cuts to 4, which beats a vendor price of 3", tiny,
+              AuctionSellVerdict::RelistLower, 4);
+    tiny.lastListPrice = 9;
+    tiny.vendorPrice = 7;
+    CheckSell("9 cuts to 8, which beats a vendor price of 7", tiny,
+              AuctionSellVerdict::RelistLower, 8);
+    tiny.vendorPrice = 8;
+    CheckSell("9 cuts to 8, which does not beat a vendor price of 8", tiny,
+              AuctionSellVerdict::Vendor, 0);
+    tiny.lastListPrice = 10;
+    tiny.vendorPrice = 0;
+    CheckSell("10 cuts to 9 and relists at 9", tiny, AuctionSellVerdict::RelistLower, 9);
+
     AuctionSellInput nolast = green;
     nolast.unsoldExpired = true;
     nolast.lastListPrice = 0;
