@@ -225,6 +225,17 @@ jobs:
         # transitional package resolves to on 24.04. The runner image already
         # ships several of the rest; apt does not mind being told twice.
         #
+        # A FOURTH DIFFERENCE, AND THE ONE THAT MATTERS FOR SPEED (#1172):
+        # `libboost-all-dev` is replaced by the boost pieces the core links. The
+        # pinned core's deps/boost/CMakeLists.txt asks find_package for
+        # filesystem, program_options, iostreams, regex and thread (system is
+        # header-only), and every other boost header comes with libboost-dev.
+        # The all-dev metapackage also drags in the ROCm/HIP and MPI stacks,
+        # which this compile never touches, and on a slow mirror (about 50 kB/s
+        # was measured) those extra megabytes are what ran past the step
+        # timeout. When the pins move, re-read that file and keep this list in
+        # step with its BOOST_COMPONENTS.
+        #
         # AND THE INDEX REFRESH IS NOT ALLOWED TO FAIL THIS JOB OVER A
         # REPOSITORY NOTHING HERE INSTALLS FROM.
         #
@@ -265,7 +276,9 @@ jobs:
               -o Acquire::http::Timeout=30 -o Acquire::Retries=3 \
               build-essential libtool cmake-data ninja-build cmake clang \
               git curl unzip openssl \
-              default-libmysqlclient-dev libboost-all-dev libssl-dev libmysql++-dev \
+              default-libmysqlclient-dev libboost-dev \
+              libboost-filesystem-dev libboost-program-options-dev \
+              libboost-iostreams-dev libboost-regex-dev libboost-thread-dev libssl-dev libmysql++-dev \
               libreadline-dev zlib1g-dev libbz2-dev libncurses-dev liblzma-dev; then
               break
             fi
