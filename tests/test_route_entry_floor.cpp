@@ -168,6 +168,38 @@ void ARefusedLevelNodeDoesNotCount()
           plan.verdict == RoutePlanVerdict::NoNearerNode);
 }
 
+void TheRouteLineNamesTheSameFloorNodesInReach()
+{
+    // Sanctum start: 1690 and 1434 are on the floor and in reach, the roof
+    // nodes 1689 and 1435 are in reach but 119 yards up.
+    RoutePlan const plan = PlanFootRoute(nodes, links, 0, FROM_X, FROM_Y, AIM_X, AIM_Y,
+                                         KnownHeight(FROM_Z));
+    Check("two floor nodes are in reach of the Sanctum", plan.sameFloorNodesInReach == 2);
+    Check("the line names the entry, the gap and the count",
+          OverseerDecisions::RouteEntryNote(plan.nodes.front(), plan.entryHeightGapYards,
+                                            plan.sameFloorNodesInReach) ==
+              "It enters at node 1690, 0 yards above or below where the plan starts (#925), "
+              "with 2 same-floor nodes in reach");
+    Check("a count of one keeps the same wording",
+          OverseerDecisions::RouteEntryNote(7, 12.f, 1) ==
+              "It enters at node 7, 12 yards above or below where the plan starts (#925), "
+              "with 1 same-floor nodes in reach");
+    Check("a count of none is said as none",
+          OverseerDecisions::RouteEntryNote(1689, 119.f, 0) ==
+              "It enters at node 1689, 119 yards above or below where the plan starts (#925), "
+              "with 0 same-floor nodes in reach");
+    // A refused floor node is not in reach; unknown height counts nothing.
+    RoutePlanLimits refused = KnownHeight(FROM_Z);
+    refused.refusedEntries.push_back(1690);
+    Check("a refused floor node is not counted",
+          PlanFootRoute(nodes, links, 0, FROM_X, FROM_Y, AIM_X, AIM_Y, refused)
+                  .sameFloorNodesInReach == 1);
+    RoutePlanLimits unknown;
+    Check("an unknown height counts nothing",
+          PlanFootRoute(nodes, links, 0, FROM_X, FROM_Y, AIM_X, AIM_Y, unknown)
+                  .sameFloorNodesInReach == 0);
+}
+
 void BadHeightLimitsAreRefused()
 {
     RoutePlanLimits limits = KnownHeight(FROM_Z);
@@ -192,6 +224,7 @@ int main()
     NoLevelNodeNearFallsBackToTheNearest();
     ALevelNodeOutOfReachDoesNotCount();
     ARefusedLevelNodeDoesNotCount();
+    TheRouteLineNamesTheSameFloorNodesInReach();
     BadHeightLimitsAreRefused();
     if (failures)
     {
