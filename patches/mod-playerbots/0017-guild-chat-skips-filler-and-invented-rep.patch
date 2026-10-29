@@ -1,0 +1,98 @@
+Subject: [PATCH] guild chat skips filler and invented reputation claims
+
+WHY THIS PATCH EXISTS
+
+BroadcastHelper (src/Util/BroadcastHelper.cpp at the pin below) sends
+every template broadcast to a per-broadcast list of channels. Four of
+its broadcasts are not about anything the speaker did, and all four
+could land in the guild channel:
+
+  - BroadcastSuggestSomething, BroadcastSuggestSomethingToxic and
+    BroadcastSuggestToxicLinks pick a random row from the
+    suggest_something (134 rows), suggest_something_toxic (102) and
+    suggest_toxic_links text classes - ambient filler - and listed
+    {TO_GUILD, 10} first. One suggest_something row is "%my_role is
+    looking for guild." (text id 741), so a bot that is already in a
+    guild advertised for one in its own guild channel, with %my_role
+    expanding through ChatHelper::FormatClass to the premade spec
+    link, which arrived as fragmented colour spans.
+  - BroadcastSuggestGrindReputation chooses %faction at random from a
+    list and %rep_level at random from three levels; neither is read
+    from the speaker's actual standings. Its suggest_faction lines
+    ("Need just a bit to be %rep_level with %faction.") are claims
+    about a grind the speaker may not have, and its list carried
+    {TO_GUILD, 50}.
+
+Measured in the relayed guild feed over one evening in October 2026:
+modern-slang filler, the broken recruitment line, and reputation
+boasts for factions the speakers had no standing with made up most of
+what a reader saw. Full trace: the guild-chat realism ticket in the
+companion website/bridge tracker.
+
+This patch removes the guild entry from those four broadcasts and
+changes nothing else. Broadcasts grounded in the speaker's own
+activity (loot, quest accepted/progress/turn-in, kills, level-ups)
+and genuine asks (suggest_instance, suggest_quest, suggest_trade for
+grind materials) keep their guild entry - a guild hearing what its
+members did and what they need is the point of the channel. The
+filler keeps its world and general entries; only the toxic classes
+also default to chance 0 in the shipped conf, and this patch does not
+change that.
+
+WHAT WOULD LET THIS PATCH BE DELETED
+
+Upstream (or the operator's fork, which is where this tree comes
+from) doing any one of: gating the suggest broadcasts on the
+speaker's guild membership and actual standings, dropping the guild
+entry from these four channel lists, or adding a per-speaker guild
+broadcast cooldown that makes the filler rare enough to read as a
+person rather than a rotation.
+
+APPLIES TO
+
+mod-playerbots @ 40884e9c135c1daf27ffd894a6047502a5701130 (the
+deployment pin read 2026-10-28), on top of local patches 0001-0016.
+Touches only the channel lists of BroadcastSuggestGrindReputation,
+BroadcastSuggestSomething, BroadcastSuggestSomethingToxic and
+BroadcastSuggestToxicLinks in src/Util/BroadcastHelper.cpp.
+
+diff --git a/src/Util/BroadcastHelper.cpp b/src/Util/BroadcastHelper.cpp
+index e005aab..0c296c7 100644
+--- a/src/Util/BroadcastHelper.cpp
++++ b/src/Util/BroadcastHelper.cpp
+@@ -793,7 +793,7 @@ bool BroadcastHelper::BroadcastSuggestGrindReputation(PlayerbotAI* botAI, std::v
+         return BroadcastToChannelWithGlobalChance(
+             botAI,
+             PlayerbotTextMgr::instance().GetBotText("suggest_faction", placeholders),
+-            { {TO_LOOKING_FOR_GROUP, 50}, {TO_GUILD, 50}, {TO_WORLD, 50}, {TO_GENERAL, 100} }
++            { {TO_LOOKING_FOR_GROUP, 50}, {TO_WORLD, 50}, {TO_GENERAL, 100} }
+         );
+     }
+ 
+@@ -847,7 +847,7 @@ bool BroadcastHelper::BroadcastSuggestSomething(PlayerbotAI* botAI, Player* bot)
+         return BroadcastToChannelWithGlobalChance(
+             botAI,
+             PlayerbotTextMgr::instance().GetBotText("suggest_something", placeholders),
+-            { {TO_GUILD, 10}, {TO_WORLD, 70}, {TO_GENERAL, 100} }
++            { {TO_WORLD, 70}, {TO_GENERAL, 100} }
+         );
+     }
+ 
+@@ -879,7 +879,7 @@ bool BroadcastHelper::BroadcastSuggestSomethingToxic(PlayerbotAI* botAI, Player*
+         return BroadcastToChannelWithGlobalChance(
+             botAI,
+             PlayerbotTextMgr::instance().GetBotText("suggest_something_toxic", placeholders),
+-            { {TO_GUILD, 10}, {TO_WORLD, 70}, {TO_GENERAL, 100} }
++            { {TO_WORLD, 70}, {TO_GENERAL, 100} }
+         );
+     }
+ 
+@@ -938,7 +938,7 @@ bool BroadcastHelper::BroadcastSuggestToxicLinks(PlayerbotAI* botAI, Player* bot
+         return BroadcastToChannelWithGlobalChance(
+             botAI,
+             PlayerbotTextMgr::instance().GetBotText("suggest_toxic_links", placeholders),
+-            { {TO_GUILD, 10}, {TO_WORLD, 70}, {TO_GENERAL, 100} }
++            { {TO_WORLD, 70}, {TO_GENERAL, 100} }
+         );
+     }
+ 
