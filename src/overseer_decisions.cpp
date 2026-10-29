@@ -9960,6 +9960,44 @@ bool AuctionRefusalRetryable(std::string const& reason)
     return false;
 }
 
+AuctionSellPlanResult AuctionSellPlan(AuctionSellInput const& in)
+{
+    AuctionSellPlanResult plan;
+    if (in.onSiblingWantList)
+        return plan;  // Keep
+
+    if (in.quality == 0)
+    {
+        plan.verdict = AuctionSellVerdict::Vendor;
+        return plan;
+    }
+    if (in.quality < 2)
+        return plan;  // Keep
+
+    uint32_t price = in.marketPrice;
+    bool relist = false;
+    if (in.unsoldExpired)
+    {
+        if (in.relistCount >= AUCTION_RELIST_MAX || in.lastListPrice == 0)
+        {
+            plan.verdict = AuctionSellVerdict::Vendor;
+            return plan;
+        }
+        price = static_cast<uint32_t>(static_cast<uint64_t>(in.lastListPrice) *
+                                      (100 - AUCTION_RELIST_DROP_PERCENT) / 100);
+        relist = true;
+    }
+
+    if (price == 0 || price <= in.vendorPrice)
+    {
+        plan.verdict = AuctionSellVerdict::Vendor;
+        return plan;
+    }
+    plan.verdict = relist ? AuctionSellVerdict::RelistLower : AuctionSellVerdict::List;
+    plan.price = price;
+    return plan;
+}
+
 // ----------------------------------------- a home somebody chose (#274) --
 
 BindRequest ParseBindRequest(std::string const& command)
