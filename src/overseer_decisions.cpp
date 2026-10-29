@@ -22726,7 +22726,8 @@ LeaderIntentVerdict AskLeaderIntent(LeaderIntentState& state,
 
     bool const urgent = LeaderIntentNeverWaits(request.kind);
     auto const cooling = state.cooldownUntil.find(static_cast<std::uint8_t>(request.kind));
-    if (!urgent && cooling != state.cooldownUntil.end() && now < cooling->second)
+    if (request.kind != LeaderIntentKind::OperatorOrder &&
+        cooling != state.cooldownUntil.end() && now < cooling->second)
         return defer(live ? state.owner : std::string(), cooling->second - now,
                      std::string("it gave up '") + LeaderIntentKindWord(request.kind) +
                          "' inside its dwell a moment ago");
@@ -22768,7 +22769,11 @@ bool EndLeaderIntent(LeaderIntentState& state, LeaderIntentKind kind,
 {
     if (state.kind == LeaderIntentKind::None || state.kind != kind || state.owner != owner)
         return false;
-    if (how == LeaderIntentEnd::Abandoned && now - state.since < limits.dwellSeconds)
+    bool const failedRun = kind == LeaderIntentKind::DungeonRun &&
+                           how == LeaderIntentEnd::Failed;
+    bool const earlyAbandon = kind != LeaderIntentKind::DungeonRun &&
+                              how == LeaderIntentEnd::Abandoned;
+    if ((failedRun || earlyAbandon) && now - state.since < limits.dwellSeconds)
         state.cooldownUntil[static_cast<std::uint8_t>(kind)] = now + limits.flapCooldownSeconds;
     ClearLeaderIntent(state);
     return true;

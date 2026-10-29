@@ -49183,6 +49183,22 @@ private:
                     break;
 
                 case OverseerDecisions::RepairLegStep::Walk:
+                {
+                    int64 const refusedFor = _travelAims.SecondsSinceRefused(name, "repair");
+                    std::string const refusal = _travelAims.RefusedReason(name, "repair");
+                    if (refusedFor >= 0 &&
+                        refusedFor < ERRAND_DEATH_LIMITS.cooloffSeconds && !refusal.empty())
+                    {
+                        if (SayRepairLegOnce(coord, name, "repair aim refused: " + refusal))
+                            LOG_WARN("module.overseer",
+                                     "overseer: repair leg gives up walking '{}' to a repairer - "
+                                     "the travel drive refused this repair aim because {}. It "
+                                     "will not write the refused aim again during its {}s "
+                                     "cool-off; this member's repair is left for a later run",
+                                     name, refusal, ERRAND_DEATH_LIMITS.cooloffSeconds);
+                        SettleRepair(coord, name);
+                        break;
+                    }
                     ++outstanding;
                     if (!owed.empty())
                         owed += ", ";
@@ -49226,6 +49242,7 @@ private:
                     // asserting something about a run that is over.
                     EscortToward(name, "repair", "REPAIR", EscortPurpose::Assemble);
                     break;
+                }
             }
         }
 
