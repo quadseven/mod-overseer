@@ -13060,6 +13060,12 @@ struct RoutePlan
     // the route line can name it. Negative when the character's height was
     // not given or nothing was planned.
     float entryHeightGapYards{-1.f};
+    // HOW MANY SURVEYED NODES WITHIN `entryNodeYards` SIT INSIDE THE ENTRY-RISE
+    // LIMIT (#925), not counting refused entries: the nodes that were on the
+    // character's own floor and in reach when the way in was chosen. Zero when
+    // the height was not given or nothing was planned. It is read only for the
+    // route line; it changes no decision.
+    std::uint32_t sameFloorNodesInReach{0};
 };
 
 struct RoutePlanLimits
@@ -13137,6 +13143,14 @@ struct RoutePlanLimits
     float fromZ{0.f};
     float maxEntryRiseYards{40.f};
 };
+
+// THE SENTENCE THE ROUTE LINE ENDS WITH (#925): the entry node, how far it
+// stands above or below the character, and how many surveyed nodes in reach
+// were on the character's own floor. Pure, so the wording is tested as text.
+// The count reads "N same-floor nodes in reach" for every N, so one search
+// of the log finds them all.
+std::string RouteEntryNote(std::uint32_t entryNode, float entryHeightGapYards,
+                           std::uint32_t sameFloorNodesInReach);
 
 // THE NODE SEQUENCE, AND THE ONE CHOICE THAT MAKES IT WORK.
 //

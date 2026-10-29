@@ -23055,11 +23055,11 @@ private:
                  "overseer: '{}' is sent to '{}' and is routed round it - {} surveyed nodes, "
                  "{:.0f} yards of walking legs and {} waypoints, finishing {:.0f} yards from "
                  "the aim where the ordinary step takes over. No leg of it is a flight, a "
-                 "boat or a portal, because the party walks together (#316). It enters at "
-                 "node {}, {:.0f} yards above or below where the plan starts (#925)",
+                 "boat or a portal, because the party walks together (#316). {}",
                  name, target, static_cast<uint32>(plan.nodes.size()), plan.yards,
                  static_cast<uint32>(route.size()), plan.endsFromAimYards,
-                 plan.nodes.front(), plan.entryHeightGapYards);
+                 OverseerDecisions::RouteEntryNote(plan.nodes.front(), plan.entryHeightGapYards,
+                                                   plan.sameFloorNodesInReach));
         // AND SAID SEPARATELY WHEN THAT ROUTE IS ONLY THE FIRST HALF (#356), for
         // the same reason the guarded note below is separate: the line above has
         // meant one thing since #316 and an operator reading it for a death must

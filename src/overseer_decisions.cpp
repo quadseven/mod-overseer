@@ -11902,6 +11902,18 @@ std::size_t ChooseRoadJoin(std::vector<RoadJoinOption> const& options,
     return best;
 }
 
+std::string RouteEntryNote(std::uint32_t entryNode, float entryHeightGapYards,
+                           std::uint32_t sameFloorNodesInReach)
+{
+    char text[200];
+    std::snprintf(text, sizeof text,
+                  "It enters at node %u, %.0f yards above or below where the plan starts "
+                  "(#925), with %u same-floor nodes in reach",
+                  static_cast<unsigned>(entryNode), static_cast<double>(entryHeightGapYards),
+                  static_cast<unsigned>(sameFloorNodesInReach));
+    return text;
+}
+
 RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
                         std::vector<RouteLink> const& links,
                         std::uint32_t mapId, float fromX, float fromY,
@@ -11947,6 +11959,7 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
     // within reach is inside the height limit, every node outside it is passed
     // over as the way in; if none is, the nearest is taken as it always was.
     bool floorOnly = false;
+    std::uint32_t sameFloorInReach = 0;
     if (limits.fromZKnown)
     {
         for (RouteNode const& node : here)
@@ -11958,7 +11971,7 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
                 std::fabs(node.z - limits.fromZ) <= limits.maxEntryRiseYards)
             {
                 floorOnly = true;
-                break;
+                ++sameFloorInReach;
             }
         }
     }
@@ -12148,7 +12161,10 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
     plan.endsFromAimYards = goalDistance;
     plan.guardedLegs = guardedOnPlan;
     if (limits.fromZKnown)
+    {
         plan.entryHeightGapYards = std::fabs(here[entry].z - limits.fromZ);
+        plan.sameFloorNodesInReach = sameFloorInReach;
+    }
     return plan;
 }
 
