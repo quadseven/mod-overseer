@@ -79,14 +79,48 @@ void OtherEntriesAndSlowDeathsDoNotCount()
     Check("one death each is not a repeat", !D::CreaturePullIsSuppressed(book, ENTRY) &&
                                                 !D::CreaturePullIsSuppressed(book, 4321));
 
-    D::CreatureDeathNote(book, ENTRY, 1000 + D::REPEAT_KILLER_WINDOW_SECONDS + 1);
-    Check("two deaths over an hour apart are not a repeat",
+    D::CreatureDeathNote(book, ENTRY, 1000 + 3601);
+    Check("two deaths 3601 s apart are not a repeat",
           !D::CreaturePullIsSuppressed(book, ENTRY));
-    D::CreatureDeathNote(book, ENTRY, 1000 + D::REPEAT_KILLER_WINDOW_SECONDS + 60);
+    D::CreatureDeathNote(book, ENTRY, 1000 + 3601 + 60);
     Check("the newer pair inside the hour is", D::CreaturePullIsSuppressed(book, ENTRY));
 
     Check("entry 0 is never a creature", !D::CreatureDeathNote(book, 0, 5000) &&
                                              !D::CreaturePullIsSuppressed(book, 0));
+}
+
+void TheHourIsPinnedWithLiterals()
+{
+    Check("the window is 3600 s", D::REPEAT_KILLER_WINDOW_SECONDS == 3600);
+    Check("the count is 2", D::REPEAT_KILLER_DEATHS == 2);
+
+    D::CreatureDeathBook exact;
+    D::CreatureDeathNote(exact, ENTRY, 5000);
+    D::CreatureDeathNote(exact, ENTRY, 5000 + 3600);
+    Check("a pair exactly 3600 s apart counts", D::CreaturePullIsSuppressed(exact, ENTRY));
+
+    D::CreatureDeathBook over;
+    D::CreatureDeathNote(over, ENTRY, 5000);
+    D::CreatureDeathNote(over, ENTRY, 5000 + 3601);
+    Check("a pair 3601 s apart does not", !D::CreaturePullIsSuppressed(over, ENTRY));
+
+    D::CreatureDeathBook far;
+    D::CreatureDeathNote(far, ENTRY, 5000);
+    D::CreatureDeathNote(far, ENTRY, 5000 + 7200);
+    Check("a pair 7200 s apart does not", !D::CreaturePullIsSuppressed(far, ENTRY));
+
+    D::CreatureDeathBook same;
+    D::CreatureDeathNote(same, ENTRY, 5000);
+    D::CreatureDeathNote(same, ENTRY, 5000);
+    Check("two deaths at one timestamp count", D::CreaturePullIsSuppressed(same, ENTRY));
+
+    // Deaths are counted per entry, not per member: the book is not told which
+    // member died, so one member dying twice and two members dying once each
+    // are the same two notes.
+    D::CreatureDeathBook two;
+    D::CreatureDeathNote(two, ENTRY, 100);
+    D::CreatureDeathNote(two, ENTRY, 200);
+    Check("two notes list the entry whoever died", D::CreaturePullIsSuppressed(two, ENTRY));
 }
 
 void AttackBackIsUnchanged()
@@ -124,6 +158,7 @@ int main()
 {
     TwoDeathsWithinTheHourStopTheVoluntaryPull();
     OtherEntriesAndSlowDeathsDoNotCount();
+    TheHourIsPinnedWithLiterals();
     AttackBackIsUnchanged();
     TheAdapterRecordsDeathsAndReadsTheBookAtTheGate();
     if (failures)
