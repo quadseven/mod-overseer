@@ -352,6 +352,22 @@ void AMandateEndsOnlyInTheNamedHands()
            "a cancelled mandate stays stopped over later cycles");
     Expect(MandateNextStep(false, "", others) == MandateStep::Stopped,
            "a mandate with no named character never repeats");
+    Expect(MandateNextStep(true, "Ugga", named) == MandateStep::Stopped,
+           "a cancelled mandate stops even when the named character holds the item");
+    Expect(MandateNextStep(false, "Ugg", {"Ugga2"}) == MandateStep::Repeat,
+           "a longer holder name that starts with the intended name does not match");
+    Expect(MandateNextStep(false, "Ugga", {"Uggar"}) == MandateStep::Repeat,
+           "a holder name that merely begins with the intended name does not match");
+    Expect(MandateNextStep(false, "Ugga2", {"Ugga"}) == MandateStep::Repeat,
+           "a holder name that is a prefix of the intended name does not match");
+    Expect(MandateNextStep(false, "gga", {"Ugga"}) == MandateStep::Repeat,
+           "a holder name that contains the intended name does not match");
+    Expect(MandateNextStep(false, "Ugga", {"", "Grug"}) == MandateStep::Repeat,
+           "an empty holder name is not a match");
+    Expect(MandateNextStep(false, "Ugga", {"Ugga "}) == MandateStep::Repeat,
+           "a holder name with trailing whitespace does not match");
+    Expect(MandateNextStep(false, "Ugga", {" Ugga"}) == MandateStep::Repeat,
+           "a holder name with leading whitespace does not match");
     Expect(MandateNextStep(false, "", none) == MandateStep::Stopped,
            "a nameless mandate stops even with nothing held");
 }
