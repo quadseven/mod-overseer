@@ -89,6 +89,22 @@ void AFreeLeaderIsGrantedAndRenewed()
     Check("the retarget is recorded", state.target == "vendor");
 }
 
+void AFailedDungeonRepairGrantIsNotReissuedDuringTheFlapCooldown()
+{
+    LeaderIntentState state;
+    LeaderIntentRequest const repair =
+        Req(LeaderIntentKind::DungeonRun, "dungeon run", "repair");
+    LeaderIntentVerdict v = AskLeaderIntent(state, repair, 2000, LIMITS);
+    Check("repair intent is granted", v.answer == LeaderIntentAnswer::Granted);
+    Check("a failed repair intent ends", EndLeaderIntent(
+              state, LeaderIntentKind::DungeonRun, "dungeon run", LeaderIntentEnd::Failed,
+              2005, LIMITS));
+    v = AskLeaderIntent(state, repair, 2010, LIMITS);
+    Check("the refused repair is deferred inside flap cooldown",
+          v.answer == LeaderIntentAnswer::Deferred);
+    Check("the next poll does not add another intent change", state.changes == 1);
+}
+
 void ALowerRuleWaitsForTheCurrentOne()
 {
     LeaderIntentState state;
@@ -422,6 +438,7 @@ void TheMeasuredWindowSettles()
 
 int main()
 {
+    AFailedDungeonRepairGrantIsNotReissuedDuringTheFlapCooldown();
     AFreeLeaderIsGrantedAndRenewed();
     ALowerRuleWaitsForTheCurrentOne();
     AHigherRuleWaitsForTheDwell();

@@ -51,6 +51,7 @@
 #include <cstdio>
 #include <ctime>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -1727,6 +1728,33 @@ struct ApproachLimits
 };
 
 ApproachShape ApproachShapeOf(ApproachGap const& gap, ApproachLimits const& limits);
+
+// The retry hold captured when a staging approach fails. The adapter stores
+// this state with the run coordinator; the transition itself stays pure so the
+// retry gate and its ten-yard release boundary can be tested without a world.
+struct ApproachQuarantineState
+{
+    bool active{false};
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+};
+
+enum class ApproachQuarantineAction : std::uint8_t
+{
+    Inactive,
+    Block,
+    Clear,
+};
+
+ApproachQuarantineAction ApproachQuarantineDecision(
+    ApproachQuarantineState const& quarantine, ApproachShape shape,
+    float leaderX, float leaderY, float leaderZ);
+
+// THE PLACE A REFUSAL NAMES, in backticks (#396). The held and quarantine
+// warnings print positions through this so an operator can copy the exact spot
+// the gate turned down; a non-finite reading says so instead of printing nan.
+std::string BacktickedPosition(float x, float y, float z);
 
 // HOW FAR AWAY IT REALLY IS - the three-dimensional distance, for the ratchet
 // that asks whether an approach is closing and for the line an operator reads.
@@ -6592,6 +6620,20 @@ LootCouncilVote LootCouncilVoteFor(bool decided, std::string const& recipient,
 LootCouncilVote MandatedLootVote(bool active, bool bindOnPickup,
                                 std::string const& intended,
                                 std::string const& voter);
+
+// The next step of an item mandate after a run. Done only when the NAMED
+// character holds the item (`holders` are the names of the characters that
+// hold it now); Stopped when the mandate is cancelled or names nobody, so a
+// broken or cancelled mandate never repeats; otherwise Repeat the source run.
+enum class MandateStep
+{
+    Repeat,
+    Done,
+    Stopped,
+};
+
+MandateStep MandateNextStep(bool cancelled, std::string const& intended,
+                            std::vector<std::string> const& holders);
 
 // The row key: "roll:<roll item guid>" for a group-loot roll, and
 // "ml:<creature raw guid>:<loot slot>" for a master-loot drop.
@@ -11594,6 +11636,57 @@ constexpr char const* NotReadBack        = "the transaction did not read back";
 // (mod-overseer#169) is what happens when a sender cannot tell the two apart.
 bool AuctionRefusalRetryable(std::string const& reason);
 
+// ----------------------------------------------------- the sell rule -------
+//
+// WHAT TO DO WITH ONE ITEM A MEMBER CARRIES, as far as the auction house is
+// concerned (mod-overseer#974). Pure: the caller reads quality, prices and the
+// relist count from the world and the transaction rows, and does what the plan
+// says through the `list`, `cancel` and vendor paths that already exist.
+//
+//   - An item on ANY sibling's want list is Keep, always. It is never listed
+//     and never vendored.
+//   - A grey (quality 0) is Vendor. A white (quality 1) is Keep.
+//   - Green and above (quality >= 2) is sold at a market-derived price: List
+//     at `marketPrice`, but only when that beats `vendorPrice`; otherwise
+//     Vendor (no market price counts as not beating it).
+//   - A listing that expired unsold (`unsoldExpired`) is relisted lower by
+//     AUCTION_RELIST_DROP_PERCENT of `lastListPrice`, at most
+//     AUCTION_RELIST_MAX times; after that, or when the lower price would no
+//     longer beat `vendorPrice`, or when no last price was recorded, Vendor.
+//   - The cut TRUNCATES (integer percent), on purpose. A cut that reaches 0
+//     (only a last price of 1 copper) is Vendor by design, never rounded up to
+//     1: a relist must be strictly lower than the last price and must still
+//     beat `vendorPrice`, and rounding up would relist at the same price.
+constexpr uint32_t AUCTION_RELIST_MAX = 2;
+constexpr uint32_t AUCTION_RELIST_DROP_PERCENT = 10;
+
+enum class AuctionSellVerdict : std::uint8_t
+{
+    Keep,
+    List,
+    RelistLower,
+    Vendor,
+};
+
+struct AuctionSellInput
+{
+    uint32_t quality{0};
+    bool onSiblingWantList{false};
+    bool unsoldExpired{false};
+    uint32_t relistCount{0};
+    uint32_t marketPrice{0};    // copper, 0 when unknown
+    uint32_t lastListPrice{0};  // copper, the price of the expired listing
+    uint32_t vendorPrice{0};    // copper
+};
+
+struct AuctionSellPlanResult
+{
+    AuctionSellVerdict verdict{AuctionSellVerdict::Keep};
+    uint32_t price{0};  // the buyout to list at; 0 unless List or RelistLower
+};
+
+AuctionSellPlanResult AuctionSellPlan(AuctionSellInput const& in);
+
 // --------------------------------------------- trade WTB (want to buy) -----------
 //
 // A WTB CANDIDATE is an item the family wants (appears in FamilyWants.wantList)
@@ -15233,6 +15326,16 @@ struct CastHoldFacts
     bool hasStay{false};    // the strategy whose action stands a bot still
     bool hasFollow{false};  // moved by the party rather than by its own drive
     bool hasNewRpg{false};  // the self-drive: relevance 11, outranks everything
+    // The strategy that lets CheckMountStateAction act at all (its isUseful
+    // returns false for an unmounted bot without it), and so the SOURCE of
+    // every re-mount mid-hold (#1229). Undoing a mount after it lands, every
+    // poll, lost a hearth cast every time: the member was back on the mount
+    // before the next cast could be driven.
+    bool hasMount{false};
+    // The hold is for a cast. A staging hold leaves the mount alone, the
+    // same way it leaves the stand state alone, because a party waiting at a
+    // door is not about to cast anything.
+    bool readyToCast{false};
 };
 
 // What the hold changes, and therefore exactly what the release owes back. A
@@ -15245,6 +15348,7 @@ struct CastHoldPlan
     bool addStay{false};
     bool dropFollow{false};
     bool dropNewRpg{false};
+    bool dropMount{false};  // suspended for the hold, restored by the release
 };
 
 // The plan, given what is there.
@@ -22688,8 +22792,19 @@ bool KeepOutOfDeathZone(bool hearthOutFailed, bool stillInDeathZone,
 // Its answer is the `hearthOutFailed` that KeepOutOfDeathZone takes, so a
 // member killed far above its level is held where it stands rather than
 // handed back to the drives that walk it toward the killer again.
+//
+// AND A HOLD THAT KEEPS ENDING AT ITS CEILING WITHOUT A CAST (#1229). Each hold
+// placed for this hearth-out that reached its ceiling with no cast started is
+// counted, and `ceilingReleases` in a row at or past `ceilingBound` is a
+// hearth-out that cannot succeed either: the member goes to the keep-out
+// instead of a new hold that ends the same way. Measured before this, one
+// member was held, re-mounted, released at the ceiling and held again eleven
+// times in five minutes and never cast once.
+constexpr unsigned HEARTH_HOLD_CEILING_RELEASES = 3;
+
 bool HearthOutCannotSucceed(bool hasStone, bool stoneOnCooldown, unsigned tries,
-                            unsigned boundTries);
+                            unsigned boundTries, unsigned ceilingReleases = 0,
+                            unsigned ceilingBound = HEARTH_HOLD_CEILING_RELEASES);
 
 // "corpse_run", "spirit_healer", "wait", "ladder": the words written to
 // overseer_death.ghost_recovery and to the log.
@@ -24526,6 +24641,7 @@ enum class GuildRunHoldWhy : std::uint8_t
     Rested,        // every member is over its bar (or nothing is left to wait for)
     RestTimedOut,  // a rest ran GUILD_RUN_REST_MAX_SECONDS
     Dead,          // a body lies inside: the dungeon module's rez needs the brain
+    InCombat,      // a member stayed in combat for a rest's bound while held
 };
 
 struct GuildRunHold
@@ -24536,7 +24652,8 @@ struct GuildRunHold
 
 // ONE POLL of the hold. Nothing while the brain is not armed, while nobody is
 // alive inside (a hold outlives a wipe, so the first member raised does not
-// walk on alone), or while anybody fights. Hold while the living wait for
+// walk on alone), or while anybody fights (a held brain whose member stays in
+// combat for restMaxSeconds is released, why InCombat: #1185). Hold while the living wait for
 // ghosts (bounded), or when a member is under a trigger outside a timed-out
 // rest's cooldown; release when rested, or when the rest has run its bound.
 //
@@ -26720,6 +26837,31 @@ constexpr uint32_t HUNT_MAX_ATTACKERS = 2;
 // A hunt needs this many free bag slots to take a drop at all.
 constexpr uint32_t HUNT_MIN_FREE_BAG_SLOTS = 1;
 
+
+// DEATH MEMORY FOR VOLUNTARY PULLS (mod-overseer#151). Deaths were recorded
+// with their killer but nothing read them back, so a creature entry that had
+// killed a member twice in an hour was pulled again. This book holds the
+// session's creature deaths per entry. An entry that killed two members
+// (REPEAT_KILLER_DEATHS) within REPEAT_KILLER_WINDOW_SECONDS of each other is
+// listed, and stays listed for the rest of the session. It only decides
+// whether the module STARTS a fight; a member attacked by the entry fights
+// back as before, because nothing here is read on that path.
+constexpr uint32_t REPEAT_KILLER_DEATHS = 2;
+constexpr int64_t REPEAT_KILLER_WINDOW_SECONDS = 3600;
+
+struct CreatureDeathBook
+{
+    std::map<uint32_t, std::vector<int64_t>> deaths;  // entry -> death times
+    std::set<uint32_t> suppressed;
+};
+
+// Notes a death to `entry` at `now`. Entry 0 (a player or the environment) is
+// not a creature kind and is ignored. Returns true when the entry is listed.
+bool CreatureDeathNote(CreatureDeathBook& book, uint32_t entry, int64_t now);
+
+// True when `entry` is listed: the module does not start a fight with it.
+bool CreaturePullIsSuppressed(CreatureDeathBook const& book, uint32_t entry);
+
 bool IsHuntRow(std::string const& command);
 
 struct HuntRequest
@@ -26754,6 +26896,9 @@ constexpr char const* NoTarget      = "no living creature of the entry within re
 constexpr char const* TooHighLevel  = "the creature is too many levels above the character";
 constexpr char const* LowHealth     = "the character is below the health floor";
 constexpr char const* TooManyAdds   = "too many hostiles are already on the character";
+// The creature entry has killed a family member twice within an hour this
+// session (mod-overseer#151); the hunt does not pull it again.
+constexpr char const* RepeatKiller  = "the creature entry has killed a member twice within the hour";
 // The ending of a hunt nothing more can come of before its clock.
 constexpr char const* NoDrop        = "nothing respawns before the clock runs out";
 }  // namespace HuntRefusal
@@ -26778,12 +26923,14 @@ struct HuntFacts
     int levelsAbove{0};
     uint32_t healthPct{100};
     uint32_t attackers{0};  // hostiles attacking the character right now
+    // The entry is on the session's repeat-killer list (CreatureDeathBook).
+    bool entrySuppressed{false};
 };
 
 // "" when a pull may start, else a HuntRefusal literal. First wall wins, in
 // this order: not a bot, not in world, dead, instance, flight, bags full, a hunt already
-// running, the realm at its hunt ceiling, no target, level gap, health floor,
-// adds.
+// running, the realm at its hunt ceiling, no target, level gap, repeat killer,
+// health floor, adds.
 char const* HuntGate(HuntFacts const& facts);
 
 // Worth asking again: Later for the ones a minute fixes, Elsewhere for an

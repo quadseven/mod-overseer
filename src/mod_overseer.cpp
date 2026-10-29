@@ -4966,6 +4966,9 @@ std::map<std::string, PendingKill> g_pendingKill;  // key: lowercased victim nam
 // recovery's threat count (wow-overseer#599). Kept past RecordDeath, which
 // consumes g_pendingKill. Same mutex. Key: lowercased victim name.
 std::map<std::string, OverseerDecisions::CreatureKillMark> g_creatureKill;
+// Creature deaths of this session by entry, behind g_killMutex (#151). An entry
+// that killed a member twice within the hour is not pulled by a hunt again.
+OverseerDecisions::CreatureDeathBook g_creatureDeathBook;
 
 // Called from WriteSnapshot, world thread only - see that function.
 void RememberHealth(std::string const& name, uint32 health, uint32 maxHealth)
@@ -5115,6 +5118,8 @@ void RememberKiller(Player* killed, std::string const& killerType,
         mark.x = killed->GetPositionX();
         mark.y = killed->GetPositionY();
         mark.at = now;
+        // The session's repeat-killer memory (#151), same lock as the mark.
+        OverseerDecisions::CreatureDeathNote(g_creatureDeathBook, killerEntry, now);
     }
 }
 
@@ -9895,6 +9900,7 @@ private:
         bool addedStay{false};
         bool removedFollow{false};
         bool removedNewRpg{false};
+        bool removedMount{false};  // #1229: the re-mount source, suspended
         bool stoodItUp{false};
         bool dismountedIt{false};
         time_t until{0};
@@ -10338,6 +10344,8 @@ private:
         facts.hasStay = botAI->HasStrategy("stay", BOT_STATE_NON_COMBAT);
         facts.hasFollow = botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT);
         facts.hasNewRpg = botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT);
+        facts.hasMount = botAI->HasStrategy("mount", BOT_STATE_NON_COMBAT);
+        facts.readyToCast = readyToCast;
         OverseerDecisions::CastHoldPlan const plan = OverseerDecisions::PlanCastHold(facts);
 
         // THE CALLS ARE MADE OFF WHAT IS THERE NOW; THE DEBT IS WHAT WAS THERE
@@ -10351,6 +10359,13 @@ private:
             botAI->ChangeStrategy("-follow", BOT_STATE_NON_COMBAT);
         if (plan.dropNewRpg)
             botAI->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+        // THE RE-MOUNT IS STOPPED WHERE IT STARTS (#1229). The dismount below
+        // undoes a mount after it lands; CheckMountStateAction, which re-mounts
+        // a bot whose travel target is far away, is not useful to an unmounted
+        // bot without `mount`, so a casting hold takes `mount` off for its
+        // duration and the release puts it back.
+        if (plan.dropMount)
+            botAI->ChangeStrategy("-mount", BOT_STATE_NON_COMBAT);
 
         who->StopMoving();
         who->ClearUnitState(UNIT_STATE_CHASE);
@@ -10447,6 +10462,7 @@ private:
             record.addedStay = plan.addStay;
             record.removedFollow = plan.dropFollow;
             record.removedNewRpg = plan.dropNewRpg;
+            record.removedMount = plan.dropMount;
             // AN EXPIRED HOLD'S UNDO IS CARRIED, NOT OVERWRITTEN
             // (wow-overseer#335 follow-up). A hold past its ceiling that no
             // release has reached yet still has its `+stay` on, so the plan
@@ -10460,6 +10476,7 @@ private:
                 record.addedStay = record.addedStay || existing->second.addedStay;
                 record.removedFollow = record.removedFollow || existing->second.removedFollow;
                 record.removedNewRpg = record.removedNewRpg || existing->second.removedNewRpg;
+                record.removedMount = record.removedMount || existing->second.removedMount;
             }
             record.until = time(nullptr) + ceilingSeconds;
             record.verb = verb ? verb : "";
@@ -10527,6 +10544,10 @@ private:
         // cancel the errand that says so (#163).
         if (wasMounted)
             existing->second.dismountedIt = true;
+        // A `mount` handed back mid-hold (a relog, an operator) is taken off
+        // again, and the release owes it back only if this hold took it.
+        if (plan.dropMount)
+            existing->second.removedMount = true;
 
         // AN EXTENDED HOLD IS STILL BOUNDED BY THE CEILING FROM WHEN IT STARTED.
         // The deadline is not pushed out by re-assertion, or a verb that polls
@@ -10622,6 +10643,8 @@ private:
             botAI->ChangeStrategy("+follow", BOT_STATE_NON_COMBAT);
         if (record.removedNewRpg)
             botAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+        if (record.removedMount)
+            botAI->ChangeStrategy("+mount", BOT_STATE_NON_COMBAT);
         LOG_INFO("module.overseer",
                  "overseer: '{}' is released from its {} hold - {} (stay {}, follow {}, "
                  "new rpg {}); the motion slot had to be taken over {} time(s) while it stood",
@@ -10768,8 +10791,33 @@ private:
             if (now >= hold.second.until && !ARowStillOwnsTheHold(hold.first))
                 due.push_back(hold.first);
         for (std::string const& name : due)
+        {
+            // A HEARTH HOLD THAT ENDS HERE ENDED WITH NO CAST (#1229). A cast
+            // that started is a parked hearth row, which ARowStillOwnsTheHold
+            // answers for, and the row's own verdict releases it. So a hearth
+            // hold reaching this line was placed, fought (a re-mount, a walk)
+            // and never cast. It is counted for the death-spot episode, so a
+            // member is not held again and again for a cast that does not come,
+            // and the last refusal is said, so the line names why.
+            auto const hold = holds.find(name);
+            if (hold != holds.end() && hold->second.verb == "hearth")
+            {
+                unsigned released = 0;
+                if (_guildDeathSpotTries.count(name))
+                    released = ++_guildDeathSpotCeilings[name];
+                auto const said = _guildDeathSpotRefusal.find(name);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' reached its hearth hold's ceiling without going home - "
+                         "last refusal: {}; {} such hold(s) in a row this episode",
+                         name,
+                         said != _guildDeathSpotRefusal.end() && !said->second.empty()
+                             ? said->second
+                             : std::string("none recorded"),
+                         released);
+            }
             ReleaseHold(name, ObjectAccessor::FindPlayerByName(name, false),
                         "its hold reached the ceiling and nothing came back for it");
+        }
     }
 
     // AND THE THING THAT MAKES A HOLD LAST LONGER THAN THE INSTANT IT IS TAKEN
@@ -32395,6 +32443,7 @@ void DriveRecipeManual(Player* bot, std::string const& name, std::string const& 
             // The member left the death zone: forget how many times we asked.
             _guildDeathSpotTries.erase(name);
             _guildDeathSpotRefusal.erase(name);
+            _guildDeathSpotCeilings.erase(name);
             return false;
         }
 
@@ -32423,14 +32472,32 @@ void DriveRecipeManual(Player* bot, std::string const& name, std::string const& 
             bot->StopMoving();
             CastHoldReport hold;
             HoldStillAndReport(bot, name, "hearth", hold);
+            return hold.placed;
+        };
+
+        // THE HEARTH-CANNOT-SUCCEED LINE (#1229), said each time the keep-out
+        // places a fresh hold, so every `is held still to hearth` is followed
+        // by `is using its hearthstone` or by this.
+        unsigned const ceilings = _guildDeathSpotCeilings.count(name)
+                                      ? _guildDeathSpotCeilings[name]
+                                      : 0;
+        auto sayCannotSucceed = [&]()
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' (level {}) cannot hearth out (stone {}, tries {}/{}, "
+                     "{} hold(s) ended at the ceiling with no cast) and is kept out of the "
+                     "death zone where it stands",
+                     name, bot->GetLevel(),
+                     !stone ? "missing" : stoneOnCooldown ? "on cooldown" : "ready", tries,
+                     boundTries, ceilings);
         };
 
         auto keepMemberOut = [&]()
         {
             bool const keepOut = OverseerDecisions::KeepOutOfDeathZone(
                 true, outmatchedHere, guildMovedIt);
-            if (keepOut)
-                holdStill();
+            if (keepOut && holdStill())
+                sayCannotSucceed();
             return keepOut;
         };
 
@@ -32443,10 +32510,11 @@ void DriveRecipeManual(Player* bot, std::string const& name, std::string const& 
         if (!inCombat &&
             OverseerDecisions::KeepOutOfDeathZone(
                 OverseerDecisions::HearthOutCannotSucceed(stone != 0, stoneOnCooldown, tries,
-                                                          boundTries),
+                                                          boundTries, ceilings),
                 outmatchedHere, guildMovedIt))
         {
-            holdStill();
+            if (holdStill())
+                sayCannotSucceed();
             return true;
         }
 
@@ -32486,6 +32554,8 @@ void DriveRecipeManual(Player* bot, std::string const& name, std::string const& 
                          name, bot->GetLevel(), deathsHere, GHOST_REPEAT_RADIUS,
                          GHOST_REPEAT_MINUTES);
             ++tries;
+            // A cast started: the run of holds that ended with none is over.
+            _guildDeathSpotCeilings.erase(name);
             return true;
         }
 
@@ -36155,9 +36225,14 @@ void DriveRecipeManual(Player* bot, std::string const& name, std::string const& 
         // the position is recorded here. The next IDLE poll refuses to re-open a
         // run while the leader is still at or near that position. Cleared when
         // the leader reaches a walkable approach (ApproachShape != Overhead).
+        // Mirrored to overseer_approach_quarantine so a restart keeps it.
         bool quarantined{false};
         float quarantineX{0.f}, quarantineY{0.f}, quarantineZ{0.f};
         time_t quarantineSince{0};
+        // Whether overseer_approach_quarantine has been read for this
+        // coordinator. A fresh struct reads it again, which is what carries
+        // the hold across a restart.
+        bool quarantineLoaded{false};
 
         // --- the trip that follows this run (#391) ---------------------
         //
@@ -40112,7 +40187,8 @@ private:
     // refuses to re-open a run while the leader is still at or near that
     // position. Cleared when the leader reaches a walkable approach
     // (ApproachShape != Overhead).
-    void FailApproach(DungeonRunCoordinatorState& coord, std::string const& leaderName,
+    void FailApproach(DungeonRunCoordinatorState& coord, std::string const& family,
+                      std::string const& leaderName,
                       std::vector<std::string> const& members,
                       DungeonPortal const& portal, char const* phase,
                       std::string const& blockers, bool stillWanted,
@@ -40135,11 +40211,14 @@ private:
         coord.quarantineY = leaderY;
         coord.quarantineZ = leaderZ;
         coord.quarantineSince = time(nullptr);
+        PersistApproachQuarantine(family, leaderName, coord);
 
         LOG_WARN("module.overseer",
-                 "overseer: dungeon run {} of campaign {} QUARANTINED at `{} {} {}` - "
+                 "overseer: dungeon run {} of campaign {} QUARANTINED at {} - "
+                 "`staging_failed` recorded in `overseer_approach_quarantine`: "
                  "leader was above the staging point and not descending",
-                 coord.runNumber, coord.campaignId, leaderX, leaderY, leaderZ);
+                 coord.runNumber, coord.campaignId,
+                 OverseerDecisions::BacktickedPosition(leaderX, leaderY, leaderZ));
 
         EndRunAndDecide(coord, leaderName, portal,
                         coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId),
@@ -40292,6 +40371,85 @@ private:
                          "own heuristic and nothing asks the bridge");
         }
         return _runRecoveryColumns == SchemaColumns::Present;
+    }
+
+    // THE QUARANTINE OUTLIVES THE PROCESS (#396). FailApproach's hold lives on
+    // the coordinator, and a restart between the failure and the next IDLE poll
+    // used to forget it and re-open the run from the same rim. The row is the
+    // copy that survives; the coordinator fields stay the working copy.
+    SchemaColumns _approachQuarantineColumns{SchemaColumns::Unknown};
+    bool ApproachQuarantinePresent()
+    {
+        if (_approachQuarantineColumns == SchemaColumns::Unknown)
+        {
+            bool const present = SchemaHasColumns(
+                "overseer_approach_quarantine", "'family','x','y','z'", 4);
+            _approachQuarantineColumns =
+                present ? SchemaColumns::Present : SchemaColumns::Absent;
+            if (!present)
+                LOG_WARN("module.overseer",
+                         "overseer: overseer_approach_quarantine is missing "
+                         "(2026_10_25_00_overseer_approach_quarantine.sql has not been "
+                         "applied), so a failed approach's quarantine holds in memory "
+                         "only and a restart forgets it");
+        }
+        return _approachQuarantineColumns == SchemaColumns::Present;
+    }
+
+    void PersistApproachQuarantine(std::string const& family, std::string const& leaderName,
+                                   DungeonRunCoordinatorState const& coord)
+    {
+        if (!ApproachQuarantinePresent())
+            return;
+        CharacterDatabase.Execute(
+            "INSERT INTO overseer_approach_quarantine "
+            "(family, leader_name, campaign_id, x, y, z, since) "
+            "VALUES ('{}', '{}', {}, {}, {}, {}, {}) "
+            "ON DUPLICATE KEY UPDATE leader_name = VALUES(leader_name), "
+            "campaign_id = VALUES(campaign_id), x = VALUES(x), y = VALUES(y), "
+            "z = VALUES(z), since = VALUES(since)",
+            Esc(family), Esc(leaderName), coord.campaignId, coord.quarantineX, coord.quarantineY,
+            coord.quarantineZ, static_cast<int64>(coord.quarantineSince));
+    }
+
+    // Read once per coordinator struct; a row found re-arms the hold exactly
+    // as FailApproach left it.
+    void LoadApproachQuarantine(std::string const& family, DungeonRunCoordinatorState& coord)
+    {
+        if (coord.quarantineLoaded)
+            return;
+        coord.quarantineLoaded = true;
+        if (coord.quarantined || !ApproachQuarantinePresent())
+            return;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT x, y, z, since FROM overseer_approach_quarantine WHERE family = '{}'",
+            Esc(family));
+        if (!result)
+            return;
+        Field* fields = result->Fetch();
+        coord.quarantined = true;
+        coord.quarantineX = fields[0].Get<float>();
+        coord.quarantineY = fields[1].Get<float>();
+        coord.quarantineZ = fields[2].Get<float>();
+        coord.quarantineSince = static_cast<time_t>(fields[3].Get<int64>());
+        LOG_INFO("module.overseer",
+                 "overseer: family '{}' carries a quarantine from a failed approach at {} "
+                 "across a restart - the next run waits until the leader leaves it",
+                 family,
+                 OverseerDecisions::BacktickedPosition(coord.quarantineX, coord.quarantineY,
+                                                       coord.quarantineZ));
+    }
+
+    void ClearApproachQuarantine(std::string const& family, DungeonRunCoordinatorState& coord)
+    {
+        coord.quarantined = false;
+        coord.quarantineX = 0.f;
+        coord.quarantineY = 0.f;
+        coord.quarantineZ = 0.f;
+        coord.quarantineSince = 0;
+        if (ApproachQuarantinePresent())
+            CharacterDatabase.Execute(
+                "DELETE FROM overseer_approach_quarantine WHERE family = '{}'", Esc(family));
     }
 
     void WriteRecoveryRequest(std::string const& family, std::string const& leaderName,
@@ -44025,6 +44183,7 @@ private:
         facts.deadInside = poll.inside - poll.aliveInside;
         facts.ghostsComingBack = ghostsWalking;
         bool resurrector = false;
+        std::string fighter;
         std::vector<OverseerDecisions::GuildRunMemberShape> living;
         for (std::size_t i = 0; i < run.names.size(); ++i)
         {
@@ -44032,7 +44191,11 @@ private:
             if (!GuildRunAliveInside(run, p))
                 continue;
             if (p->IsInCombat())
+            {
                 facts.anyFighting = true;
+                if (fighter.empty())
+                    fighter = run.names[i];
+            }
             if (IsResurrectorClass(p))
                 resurrector = true;
             living.push_back(GuildRunShapeOf(
@@ -44086,6 +44249,8 @@ private:
                      OverseerDecisions::GuildRunHoldWhyWord(hold.why),
                      hold.why == GuildRunHoldWhy::RestTimedOut
                          ? "; still waiting on " + GuildRunRestWaitsOn(run)
+                     : hold.why == GuildRunHoldWhy::InCombat
+                         ? "; '" + fighter + "' is still in combat"
                          : std::string());
             run.brainHeld = false;
             run.heldSince = 0;
@@ -44105,7 +44270,7 @@ private:
         // nothing on a run that is still paused.
         if (hold.why == GuildRunHoldWhy::Regroup)
             run.restSince = 0;
-        else if (hold.why == GuildRunHoldWhy::Rest && !run.restSince)
+        else if ((hold.why == GuildRunHoldWhy::Rest || facts.anyFighting) && !run.restSince)
             run.restSince = now;
         // A body inside that nobody alive can raise keeps the hold (#1140):
         // said once per hold, and the corpse run's release ends it.
@@ -49036,6 +49201,22 @@ private:
                     break;
 
                 case OverseerDecisions::RepairLegStep::Walk:
+                {
+                    int64 const refusedFor = _travelAims.SecondsSinceRefused(name, "repair");
+                    std::string const refusal = _travelAims.RefusedReason(name, "repair");
+                    if (refusedFor >= 0 &&
+                        refusedFor < ERRAND_DEATH_LIMITS.cooloffSeconds && !refusal.empty())
+                    {
+                        if (SayRepairLegOnce(coord, name, "repair aim refused: " + refusal))
+                            LOG_WARN("module.overseer",
+                                     "overseer: repair leg gives up walking '{}' to a repairer - "
+                                     "the travel drive refused this repair aim because {}. It "
+                                     "will not write the refused aim again during its {}s "
+                                     "cool-off; this member's repair is left for a later run",
+                                     name, refusal, ERRAND_DEATH_LIMITS.cooloffSeconds);
+                        SettleRepair(coord, name);
+                        break;
+                    }
                     ++outstanding;
                     if (!owed.empty())
                         owed += ", ";
@@ -49079,6 +49260,7 @@ private:
                     // asserting something about a run that is over.
                     EscortToward(name, "repair", "REPAIR", EscortPurpose::Assemble);
                     break;
+                }
             }
         }
 
@@ -54347,53 +54529,46 @@ private:
             // before the run exists is exactly the drift #220 is about.
             if (!finderWay)
             {
-                // QUARANTINE AFTER FAILED APPROACH (#396). If the coordinator
-                // has a quarantine position from a previous failed approach,
-                // check if the leader is still at or near that position. If so,
-                // refuse to open a new run. The quarantine is cleared when the
-                // leader reaches a walkable approach (ApproachShape != Overhead).
-                if (coord.quarantined)
-                {
-                    float const dx = leader->GetPositionX() - coord.quarantineX;
-                    float const dy = leader->GetPositionY() - coord.quarantineY;
-                    float const dz = leader->GetPositionZ() - coord.quarantineZ;
-                    float const distSq = dx * dx + dy * dy + dz * dz;
-                    // Consider "at or near" as within 10 yards of the quarantined position
-                    if (distSq <= 100.0f) // 10^2 = 100
-                    {
-                        LOG_WARN("module.overseer",
-                                 "overseer: dungeon run QUARANTINED - leader '{}' at `{} {} {}` "
-                                 "is still near the refused position `{} {} {}`. "
-                                 "Run will not open until leader moves to a walkable approach.",
-                                 leaderName,
-                                 leader->GetPositionX(), leader->GetPositionY(), leader->GetPositionZ(),
-                                 coord.quarantineX, coord.quarantineY, coord.quarantineZ);
-                        return;
-                    }
-                    else
-                    {
-                        // Leader has moved away from quarantined position, clear quarantine
-                        coord.quarantined = false;
-                        coord.quarantineX = 0.f;
-                        coord.quarantineY = 0.f;
-                        coord.quarantineZ = 0.f;
-                        coord.quarantineSince = 0;
-                    }
-                }
-
                 OverseerDecisions::ApproachRouteState scratch;
                 DungeonApproachAim const first = DungeonApproachAimFor(
                     *portal, scratch, leader, stageX, stageY, stageZ);
                 OverseerDecisions::ApproachGap const gap = first.gap;
-                if (OverseerDecisions::ApproachShapeOf(gap, DUNGEON_APPROACH_LIMITS) ==
-                    OverseerDecisions::ApproachShape::Overhead)
+                OverseerDecisions::ApproachShape const shape =
+                    OverseerDecisions::ApproachShapeOf(gap, DUNGEON_APPROACH_LIMITS);
+                LoadApproachQuarantine(family, coord);
+                if (coord.quarantined)
+                {
+                    OverseerDecisions::ApproachQuarantineState const quarantine{
+                        true, coord.quarantineX, coord.quarantineY, coord.quarantineZ};
+                    OverseerDecisions::ApproachQuarantineAction const action =
+                        OverseerDecisions::ApproachQuarantineDecision(
+                            quarantine, shape, leader->GetPositionX(),
+                            leader->GetPositionY(), leader->GetPositionZ());
+                    if (action == OverseerDecisions::ApproachQuarantineAction::Block)
+                    {
+                        LOG_WARN("module.overseer",
+                                 "overseer: dungeon run QUARANTINED `staging_failed` - leader '{}' at {} "
+                                 "is still near the refused position {} held in "
+                                 "`overseer_approach_quarantine`. "
+                                 "Run will not open until leader moves to a walkable approach.",
+                                 leaderName,
+                                 OverseerDecisions::BacktickedPosition(
+                                     leader->GetPositionX(), leader->GetPositionY(),
+                                     leader->GetPositionZ()),
+                                 OverseerDecisions::BacktickedPosition(
+                                     coord.quarantineX, coord.quarantineY, coord.quarantineZ));
+                        return;
+                    }
+                    ClearApproachQuarantine(family, coord);
+                }
+                if (shape == OverseerDecisions::ApproachShape::Overhead)
                 {
                     if (!coord.loggedAboveTheDoor)
                     {
                         coord.loggedAboveTheDoor = true;
                         LOG_WARN("module.overseer",
-                                 "overseer: dungeon run held - the '{}' {} is "
-                                 "({:.1f}, {:.1f}, {:.1f}) and the leader '{}' is {}. That "
+                                 "overseer: dungeon run held - the '{}' {} is {} and the "
+                                 "leader '{}' at {} is {}. That "
                                  "is above it, not near it: no walk toward it from there "
                                  "descends, and the last-step footing check would refuse "
                                  "every direction that closed the gap. Nothing is reset, "
@@ -54404,23 +54579,17 @@ private:
                                  first.leg == OverseerDecisions::ApproachLeg::ToWaypoint
                                      ? "approach corridor starts at"
                                      : "staging point is",
-                                 first.x, first.y, first.z, leaderName,
+                                 OverseerDecisions::BacktickedPosition(first.x, first.y, first.z),
+                                 leaderName,
+                                 OverseerDecisions::BacktickedPosition(
+                                     leader->GetPositionX(), leader->GetPositionY(),
+                                     leader->GetPositionZ()),
                                  OverseerDecisions::ApproachWhere(gap));
                     }
                     return;
                 }
                 coord.loggedAboveTheDoor = false;
 
-                // QUARANTINE AFTER FAILED APPROACH (#396). Clear quarantine
-                // when the approach is walkable (not Overhead).
-                if (coord.quarantined)
-                {
-                    coord.quarantined = false;
-                    coord.quarantineX = 0.f;
-                    coord.quarantineY = 0.f;
-                    coord.quarantineZ = 0.f;
-                    coord.quarantineSince = 0;
-                }
             }
 
             // THERE IS NO `loggedCampaignOver = false` BETWEEN THE TWO STOP
@@ -55548,7 +55717,7 @@ private:
                 // fixes, and a line that said only "the staging point" for both
                 // would send the next reader to the wrong one.
                 if (RunStagingWatchdog(coord, leaderName, leader, gap))
-                    FailApproach(coord, leaderName, members, *portal, "GATHERING",
+                    FailApproach(coord, family, leaderName, members, *portal, "GATHERING",
                                  leaderName + " (" +
                                      OverseerDecisions::ApproachWhere(gap) +
                                      (onTheCorridor
@@ -56739,7 +56908,7 @@ private:
                 // achieve, and every minute of it is a minute the party spends
                 // standing beside a drop. The watchdog has already said which
                 // character and how far above.
-                FailApproach(coord, leaderName, members, *portal, "BARRIER",
+                FailApproach(coord, family, leaderName, members, *portal, "BARRIER",
                              name + " (" + OverseerDecisions::ApproachWhere(legGap) +
                                  (onTheCorridor
                                       ? ", walking to the start of the approach corridor"
@@ -79826,6 +79995,11 @@ private:
         facts.targetFound = target != nullptr;
         if (target)
             facts.levelsAbove = int(target->GetLevel()) - int(who->GetLevel());
+        {
+            std::lock_guard<std::mutex> guard(g_killMutex);
+            facts.entrySuppressed =
+                OverseerDecisions::CreaturePullIsSuppressed(g_creatureDeathBook, entry);
+        }
         return facts;
     }
 
@@ -80304,6 +80478,11 @@ private:
     // name. Bounded so a member whose hearth-out cannot succeed is not asked
     // every poll for ever; reset when the member leaves the death zone.
     std::map<std::string, unsigned> _guildDeathSpotTries;
+    // How many hearth holds in a row reached their ceiling with no cast for a
+    // member in a death-spot episode (#1229), by name. Bumped by
+    // ReleaseExpiredHolds, cleared when a cast starts or the member leaves the
+    // death zone; HearthOutCannotSucceed sends it to the keep-out at the bound.
+    std::map<std::string, unsigned> _guildDeathSpotCeilings;
     // DriveGuildTraining: every class trainer spawn by the class it serves, the
     // entry each spot is, the trainer each member was last sent to, and when
     // the drive last ran.

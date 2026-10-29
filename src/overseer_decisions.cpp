@@ -1756,6 +1756,35 @@ ApproachShape ApproachShapeOf(ApproachGap const& gap, ApproachLimits const& limi
                                              : ApproachShape::Closing;
 }
 
+ApproachQuarantineAction ApproachQuarantineDecision(
+    ApproachQuarantineState const& quarantine, ApproachShape shape,
+    float leaderX, float leaderY, float leaderZ)
+{
+    if (!quarantine.active)
+        return ApproachQuarantineAction::Inactive;
+    if (shape == ApproachShape::Unmeasured)
+        return ApproachQuarantineAction::Block;
+    if (shape == ApproachShape::Arrived || shape == ApproachShape::Closing)
+        return ApproachQuarantineAction::Clear;
+
+    float const dx = leaderX - quarantine.x;
+    float const dy = leaderY - quarantine.y;
+    float const dz = leaderZ - quarantine.z;
+    return dx * dx + dy * dy + dz * dz <= 100.f
+               ? ApproachQuarantineAction::Block
+               : ApproachQuarantineAction::Clear;
+}
+
+std::string BacktickedPosition(float x, float y, float z)
+{
+    if (!FiniteReading(x) || !FiniteReading(y) || !FiniteReading(z))
+        return "`(unmeasured)`";
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(1) << "`(" << x << ", " << y << ", " << z
+        << ")`";
+    return out.str();
+}
+
 float ApproachDistance(ApproachGap const& gap)
 {
     if (!gap.measured || !FiniteReading(gap.horizontalYards) ||
@@ -5801,6 +5830,17 @@ LootCouncilVote MandatedLootVote(bool active, bool bindOnPickup,
     if (!intended.empty() && intended == voter)
         return LootCouncilVote::Need;
     return LootCouncilVote::Pass;
+}
+
+MandateStep MandateNextStep(bool cancelled, std::string const& intended,
+                            std::vector<std::string> const& holders)
+{
+    if (cancelled || intended.empty())
+        return MandateStep::Stopped;
+    for (std::string const& holder : holders)
+        if (holder == intended)
+            return MandateStep::Done;
+    return MandateStep::Repeat;
 }
 
 std::string LootCouncilRollKey(std::uint64_t rollItemGuid)
@@ -9920,6 +9960,44 @@ bool AuctionRefusalRetryable(std::string const& reason)
     return false;
 }
 
+AuctionSellPlanResult AuctionSellPlan(AuctionSellInput const& in)
+{
+    AuctionSellPlanResult plan;
+    if (in.onSiblingWantList)
+        return plan;  // Keep
+
+    if (in.quality == 0)
+    {
+        plan.verdict = AuctionSellVerdict::Vendor;
+        return plan;
+    }
+    if (in.quality < 2)
+        return plan;  // Keep
+
+    uint32_t price = in.marketPrice;
+    bool relist = false;
+    if (in.unsoldExpired)
+    {
+        if (in.relistCount >= AUCTION_RELIST_MAX || in.lastListPrice == 0)
+        {
+            plan.verdict = AuctionSellVerdict::Vendor;
+            return plan;
+        }
+        price = static_cast<uint32_t>(static_cast<uint64_t>(in.lastListPrice) *
+                                      (100 - AUCTION_RELIST_DROP_PERCENT) / 100);
+        relist = true;
+    }
+
+    if (price == 0 || price <= in.vendorPrice)
+    {
+        plan.verdict = AuctionSellVerdict::Vendor;
+        return plan;
+    }
+    plan.verdict = relist ? AuctionSellVerdict::RelistLower : AuctionSellVerdict::List;
+    plan.price = price;
+    return plan;
+}
+
 // ----------------------------------------- a home somebody chose (#274) --
 
 BindRequest ParseBindRequest(std::string const& command)
@@ -13175,6 +13253,12 @@ CastHoldPlan PlanCastHold(CastHoldFacts const& facts)
     // hold that leaves `follow` on has stopped nothing.
     plan.dropFollow = facts.hasFollow;
     plan.dropNewRpg = facts.hasNewRpg;
+    // AND THE RE-MOUNT IS STOPPED AT ITS SOURCE FOR A CAST (#1229). The hold
+    // takes a casting character off its mount, and CheckMountStateAction put
+    // it straight back every few seconds while its travel target was far away.
+    // Without `mount` that action is not useful for an unmounted bot, so the
+    // dismount stays done. Removed only if present, for the reason above.
+    plan.dropMount = facts.readyToCast && facts.hasMount;
     return plan;
 }
 
@@ -18351,9 +18435,11 @@ bool KeepOutOfDeathZone(bool hearthOutFailed, bool stillInDeathZone,
 }
 
 bool HearthOutCannotSucceed(bool hasStone, bool stoneOnCooldown, unsigned tries,
-                            unsigned boundTries)
+                            unsigned boundTries, unsigned ceilingReleases,
+                            unsigned ceilingBound)
 {
-    return !hasStone || stoneOnCooldown || tries >= boundTries;
+    return !hasStone || stoneOnCooldown || tries >= boundTries ||
+           ceilingReleases >= ceilingBound;
 }
 
 HeadTradeAnswer AnswerTradeAtHead(bool traderIsKin, uint32_t theyOffer, uint32_t theirCopper,
@@ -21490,8 +21576,16 @@ GuildRunHold GuildRunHoldNext(GuildRunHoldFacts const& facts)
     GuildRunHold hold;
     // Nobody for the brain to drive, not armed yet, or a fight it owns. A held
     // brain stays held through a wipe: the first member raised waits.
-    if (!facts.armed || facts.aliveInside == 0 || facts.anyFighting)
+    if (!facts.armed || facts.aliveInside == 0)
         return hold;
+    if (facts.anyFighting)
+    {
+        // A member held in combat (a land mine, an unreachable mob) never
+        // rests, so the rest's own bound would never fire (#1185).
+        if (facts.held && facts.secondsResting >= facts.restMaxSeconds)
+            hold = {GuildRunHoldStep::Release, GuildRunHoldWhy::InCombat};
+        return hold;
+    }
     if (facts.deadInside > 0)
     {
         // Rest before the rez: a low group holds (or stays held) as any rest,
@@ -21580,6 +21674,7 @@ char const* GuildRunHoldWhyWord(GuildRunHoldWhy why)
         case GuildRunHoldWhy::Rested:       return "rested";
         case GuildRunHoldWhy::RestTimedOut: return "rest timed out";
         case GuildRunHoldWhy::Dead:         return "a body inside";
+        case GuildRunHoldWhy::InCombat:     return "member in combat";
     }
     return "unknown";
 }
@@ -22688,7 +22783,8 @@ LeaderIntentVerdict AskLeaderIntent(LeaderIntentState& state,
 
     bool const urgent = LeaderIntentNeverWaits(request.kind);
     auto const cooling = state.cooldownUntil.find(static_cast<std::uint8_t>(request.kind));
-    if (!urgent && cooling != state.cooldownUntil.end() && now < cooling->second)
+    if (request.kind != LeaderIntentKind::OperatorOrder &&
+        cooling != state.cooldownUntil.end() && now < cooling->second)
         return defer(live ? state.owner : std::string(), cooling->second - now,
                      std::string("it gave up '") + LeaderIntentKindWord(request.kind) +
                          "' inside its dwell a moment ago");
@@ -22730,7 +22826,11 @@ bool EndLeaderIntent(LeaderIntentState& state, LeaderIntentKind kind,
 {
     if (state.kind == LeaderIntentKind::None || state.kind != kind || state.owner != owner)
         return false;
-    if (how == LeaderIntentEnd::Abandoned && now - state.since < limits.dwellSeconds)
+    bool const failedRun = kind == LeaderIntentKind::DungeonRun &&
+                           how == LeaderIntentEnd::Failed;
+    bool const earlyAbandon = kind != LeaderIntentKind::DungeonRun &&
+                              how == LeaderIntentEnd::Abandoned;
+    if ((failedRun || earlyAbandon) && now - state.since < limits.dwellSeconds)
         state.cooldownUntil[static_cast<std::uint8_t>(kind)] = now + limits.flapCooldownSeconds;
     ClearLeaderIntent(state);
     return true;
@@ -24241,6 +24341,26 @@ HuntRequest ParseHuntRequest(std::string const& command)
     return request;
 }
 
+bool CreatureDeathNote(CreatureDeathBook& book, uint32_t entry, int64_t now)
+{
+    if (!entry)
+        return false;
+    std::vector<int64_t>& times = book.deaths[entry];
+    times.push_back(now);
+    // Only deaths inside the window of the newest one can still make a pair.
+    times.erase(std::remove_if(times.begin(), times.end(),
+                               [&](int64_t t) { return now - t > REPEAT_KILLER_WINDOW_SECONDS; }),
+                times.end());
+    if (times.size() >= REPEAT_KILLER_DEATHS)
+        book.suppressed.insert(entry);
+    return book.suppressed.count(entry) != 0;
+}
+
+bool CreaturePullIsSuppressed(CreatureDeathBook const& book, uint32_t entry)
+{
+    return entry && book.suppressed.count(entry) != 0;
+}
+
 char const* HuntGate(HuntFacts const& f)
 {
     namespace R = HuntRefusal;
@@ -24264,6 +24384,8 @@ char const* HuntGate(HuntFacts const& f)
         return R::NoTarget;
     if (f.levelsAbove >= static_cast<int>(HUNT_LEVEL_GAP))
         return R::TooHighLevel;
+    if (f.entrySuppressed)
+        return R::RepeatKiller;
     if (f.healthPct < HUNT_HEALTH_FLOOR_PCT)
         return R::LowHealth;
     if (f.attackers > HUNT_MAX_ATTACKERS)
