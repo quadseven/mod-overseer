@@ -11622,6 +11622,53 @@ constexpr char const* NotReadBack        = "the transaction did not read back";
 // (mod-overseer#169) is what happens when a sender cannot tell the two apart.
 bool AuctionRefusalRetryable(std::string const& reason);
 
+// ----------------------------------------------------- the sell rule -------
+//
+// WHAT TO DO WITH ONE ITEM A MEMBER CARRIES, as far as the auction house is
+// concerned (mod-overseer#974). Pure: the caller reads quality, prices and the
+// relist count from the world and the transaction rows, and does what the plan
+// says through the `list`, `cancel` and vendor paths that already exist.
+//
+//   - An item on ANY sibling's want list is Keep, always. It is never listed
+//     and never vendored.
+//   - A grey (quality 0) is Vendor. A white (quality 1) is Keep.
+//   - Green and above (quality >= 2) is sold at a market-derived price: List
+//     at `marketPrice`, but only when that beats `vendorPrice`; otherwise
+//     Vendor (no market price counts as not beating it).
+//   - A listing that expired unsold (`unsoldExpired`) is relisted lower by
+//     AUCTION_RELIST_DROP_PERCENT of `lastListPrice`, at most
+//     AUCTION_RELIST_MAX times; after that, or when the lower price would no
+//     longer beat `vendorPrice`, or when no last price was recorded, Vendor.
+constexpr uint32_t AUCTION_RELIST_MAX = 2;
+constexpr uint32_t AUCTION_RELIST_DROP_PERCENT = 10;
+
+enum class AuctionSellVerdict : std::uint8_t
+{
+    Keep,
+    List,
+    RelistLower,
+    Vendor,
+};
+
+struct AuctionSellInput
+{
+    uint32_t quality{0};
+    bool onSiblingWantList{false};
+    bool unsoldExpired{false};
+    uint32_t relistCount{0};
+    uint32_t marketPrice{0};    // copper, 0 when unknown
+    uint32_t lastListPrice{0};  // copper, the price of the expired listing
+    uint32_t vendorPrice{0};    // copper
+};
+
+struct AuctionSellPlanResult
+{
+    AuctionSellVerdict verdict{AuctionSellVerdict::Keep};
+    uint32_t price{0};  // the buyout to list at; 0 unless List or RelistLower
+};
+
+AuctionSellPlanResult AuctionSellPlan(AuctionSellInput const& in);
+
 // --------------------------------------------- trade WTB (want to buy) -----------
 //
 // A WTB CANDIDATE is an item the family wants (appears in FamilyWants.wantList)
