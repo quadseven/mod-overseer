@@ -112,6 +112,47 @@ void TheHearthThatCannotSucceed()
           KeepOutOfDeathZone(HearthOutCannotSucceed(true, true, 1, 3), false, false), false);
 }
 
+// #1229: a member held to hearth was released at the 45 s ceiling with no cast
+// and held again at once, eleven times in five minutes. After the bound of
+// ceiling releases in a row with no cast, the hearth-out cannot succeed and the
+// member goes to the keep-out instead of a new hold.
+void TheHoldThatKeepsEndingAtItsCeiling()
+{
+    unsigned const bound = OverseerDecisions::HEARTH_HOLD_CEILING_RELEASES;
+    Check("the bound is a few holds, not one and not many", bound >= 2 && bound <= 5, true);
+    Check("one release short of the bound still holds for a cast",
+          HearthOutCannotSucceed(true, false, 0, 3, bound - 1, bound), false);
+    Check("the bound of ceiling releases with no cast cannot succeed",
+          HearthOutCannotSucceed(true, false, 0, 3, bound, bound), true);
+    Check("past the bound too",
+          HearthOutCannotSucceed(true, false, 0, 3, bound + 4, bound), true);
+    Check("an outmatched member past the bound goes to the keep-out",
+          KeepOutOfDeathZone(HearthOutCannotSucceed(true, false, 0, 3, bound, bound), true,
+                             false),
+          true);
+}
+
+void TheCeilingCountIsWired()
+{
+    std::ifstream in("src/mod_overseer.cpp");
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    std::string const source = buffer.str();
+    std::size_t const spot = source.find("bool LeaveGuildDeathSpot(");
+    std::size_t const cannot = source.find("OverseerDecisions::HearthOutCannotSucceed(", spot);
+    std::size_t const counted = source.find("boundTries, ceilings)", cannot);
+    std::size_t const gate = source.find("OverseerDecisions::GuildLeavesDeathSpot(", spot);
+    Check("the keep-out is asked with the ceiling count",
+          spot != std::string::npos && cannot != std::string::npos &&
+              counted != std::string::npos && gate != std::string::npos && counted < gate,
+          true);
+    std::size_t const sweep = source.find("void ReleaseExpiredHolds()");
+    std::size_t const bump = source.find("++_guildDeathSpotCeilings", sweep);
+    std::size_t const sweepEnd = source.find("\n    }\n", sweep);
+    Check("the ceiling sweep counts a hearth hold that ended with no cast",
+          sweep != std::string::npos && bump != std::string::npos && bump < sweepEnd, true);
+}
+
 void TheAdapterIsWired()
 {
     std::ifstream in("src/mod_overseer.cpp");
@@ -176,6 +217,52 @@ void TheAdapterIsWired()
           true);
 }
 
+
+// wow-overseer#1514: mod-overseer#1144 stopped erasing the outmatched mark at
+// cast start and erased it nowhere else, so a member whose hearth landed in
+// the zone it died in, or one with no stone, was held still every poll for the
+// whole window. The mark goes when the hearth read-back says Arrived, and a
+// summon of the member (the guild moving it) frees it from the hold.
+void TheMarkEndsOnArrival()
+{
+    std::ifstream in("src/mod_overseer.cpp");
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    std::string const source = buffer.str();
+
+    std::size_t const resolve = source.find("void ResolveHearthChecks(uint32 elapsedMs)");
+    std::size_t const arrived = source.find("case HearthOutcome::Arrived:", resolve);
+    std::size_t const stayed = source.find("case HearthOutcome::Stayed:", arrived);
+    std::size_t const erase = source.find("g_guildOutmatched.erase(", arrived);
+    Check("an arrived hearth erases the outmatched mark",
+          resolve != std::string::npos && arrived != std::string::npos &&
+              stayed != std::string::npos && erase != std::string::npos && erase < stayed,
+          true);
+
+    // Searched in [LeaveGuildDeathSpot, ResolveHearthChecks) rather than in a
+    // slice cut at one closing-brace pattern: a brace added inside the
+    // function (a lambda, an inner block) would end such a slice early.
+    std::size_t const spot = source.find("bool LeaveGuildDeathSpot(");
+    bool const ordered = spot != std::string::npos && resolve != std::string::npos &&
+                         spot < resolve;
+    auto inRange = [&](std::size_t at) { return ordered && at != std::string::npos && at < resolve; };
+    std::size_t const moved =
+        ordered ? source.find("bool const guildMovedIt = SummonPendingFor(name);", spot)
+                : std::string::npos;
+    std::size_t const firstKeepOut =
+        ordered ? source.find("KeepOutOfDeathZone(", spot) : std::string::npos;
+    Check("the guild move is read in LeaveGuildDeathSpot",
+          inRange(moved), true);
+    Check("the guild move is read before the first keep-out decision",
+          inRange(moved) && inRange(firstKeepOut) && moved < firstKeepOut, true);
+    Check("no keep-out in LeaveGuildDeathSpot is told the guild never moves it",
+          ordered && !inRange(source.find("outmatchedHere, false)", spot)), true);
+    Check("a summon in flight is looked up by the summoned name",
+          source.find("bool SummonPendingFor(std::string const& name) const") !=
+              std::string::npos,
+          true);
+}
+
 }  // namespace
 
 int main()
@@ -184,6 +271,9 @@ int main()
     TheKeepOutDecision();
     TheHearthThatCannotSucceed();
     TheAdapterIsWired();
+    TheMarkEndsOnArrival();
+    TheHoldThatKeepsEndingAtItsCeiling();
+    TheCeilingCountIsWired();
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);
