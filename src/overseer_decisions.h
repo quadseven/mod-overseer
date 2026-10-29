@@ -6621,6 +6621,20 @@ LootCouncilVote MandatedLootVote(bool active, bool bindOnPickup,
                                 std::string const& intended,
                                 std::string const& voter);
 
+// The next step of an item mandate after a run. Done only when the NAMED
+// character holds the item (`holders` are the names of the characters that
+// hold it now); Stopped when the mandate is cancelled or names nobody, so a
+// broken or cancelled mandate never repeats; otherwise Repeat the source run.
+enum class MandateStep
+{
+    Repeat,
+    Done,
+    Stopped,
+};
+
+MandateStep MandateNextStep(bool cancelled, std::string const& intended,
+                            std::vector<std::string> const& holders);
+
 // The row key: "roll:<roll item guid>" for a group-loot roll, and
 // "ml:<creature raw guid>:<loot slot>" for a master-loot drop.
 std::string LootCouncilRollKey(std::uint64_t rollItemGuid);

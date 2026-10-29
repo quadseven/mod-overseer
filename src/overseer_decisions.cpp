@@ -5832,6 +5832,17 @@ LootCouncilVote MandatedLootVote(bool active, bool bindOnPickup,
     return LootCouncilVote::Pass;
 }
 
+MandateStep MandateNextStep(bool cancelled, std::string const& intended,
+                            std::vector<std::string> const& holders)
+{
+    if (cancelled || intended.empty())
+        return MandateStep::Stopped;
+    for (std::string const& holder : holders)
+        if (holder == intended)
+            return MandateStep::Done;
+    return MandateStep::Repeat;
+}
+
 std::string LootCouncilRollKey(std::uint64_t rollItemGuid)
 {
     return "roll:" + std::to_string(rollItemGuid);
