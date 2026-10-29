@@ -27,7 +27,7 @@ Measured in the relayed guild feed over one evening in October 2026:
 modern-slang filler, the broken recruitment line, and reputation
 boasts for factions the speakers had no standing with made up most of
 what a reader saw. Full trace: the guild-chat realism ticket in the
-companion website/bridge tracker (quadseven/wow-overseer#1637).
+companion website/bridge tracker.
 
 This patch removes the guild entry from those four broadcasts and
 changes nothing else. Broadcasts grounded in the speaker's own

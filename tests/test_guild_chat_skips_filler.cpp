@@ -6,7 +6,7 @@
  * October 2026): the guild channel carried modern-slang filler, a
  * recruitment line ("<spec link> priest is looking for guild") from a
  * bot already in the guild, and reputation boasts for factions the
- * speaker had no standing with. Traced in quadseven/wow-overseer#1637:
+ * speaker had no standing with. Traced in the guild-chat realism ticket:
  *
  *   - Every template broadcast in the playerbots tree goes through
  *     BroadcastHelper::BroadcastToChannelWithGlobalChance
