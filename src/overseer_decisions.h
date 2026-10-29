@@ -51,6 +51,7 @@
 #include <cstdio>
 #include <ctime>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -26762,6 +26763,31 @@ constexpr uint32_t HUNT_MAX_ATTACKERS = 2;
 // A hunt needs this many free bag slots to take a drop at all.
 constexpr uint32_t HUNT_MIN_FREE_BAG_SLOTS = 1;
 
+
+// DEATH MEMORY FOR VOLUNTARY PULLS (mod-overseer#151). Deaths were recorded
+// with their killer but nothing read them back, so a creature entry that had
+// killed a member twice in an hour was pulled again. This book holds the
+// session's creature deaths per entry. An entry that killed two members
+// (REPEAT_KILLER_DEATHS) within REPEAT_KILLER_WINDOW_SECONDS of each other is
+// listed, and stays listed for the rest of the session. It only decides
+// whether the module STARTS a fight; a member attacked by the entry fights
+// back as before, because nothing here is read on that path.
+constexpr uint32_t REPEAT_KILLER_DEATHS = 2;
+constexpr int64_t REPEAT_KILLER_WINDOW_SECONDS = 3600;
+
+struct CreatureDeathBook
+{
+    std::map<uint32_t, std::vector<int64_t>> deaths;  // entry -> death times
+    std::set<uint32_t> suppressed;
+};
+
+// Notes a death to `entry` at `now`. Entry 0 (a player or the environment) is
+// not a creature kind and is ignored. Returns true when the entry is listed.
+bool CreatureDeathNote(CreatureDeathBook& book, uint32_t entry, int64_t now);
+
+// True when `entry` is listed: the module does not start a fight with it.
+bool CreaturePullIsSuppressed(CreatureDeathBook const& book, uint32_t entry);
+
 bool IsHuntRow(std::string const& command);
 
 struct HuntRequest
@@ -26796,6 +26822,9 @@ constexpr char const* NoTarget      = "no living creature of the entry within re
 constexpr char const* TooHighLevel  = "the creature is too many levels above the character";
 constexpr char const* LowHealth     = "the character is below the health floor";
 constexpr char const* TooManyAdds   = "too many hostiles are already on the character";
+// The creature entry has killed a family member twice within an hour this
+// session (mod-overseer#151); the hunt does not pull it again.
+constexpr char const* RepeatKiller  = "the creature entry has killed a member twice within the hour";
 // The ending of a hunt nothing more can come of before its clock.
 constexpr char const* NoDrop        = "nothing respawns before the clock runs out";
 }  // namespace HuntRefusal
@@ -26820,12 +26849,14 @@ struct HuntFacts
     int levelsAbove{0};
     uint32_t healthPct{100};
     uint32_t attackers{0};  // hostiles attacking the character right now
+    // The entry is on the session's repeat-killer list (CreatureDeathBook).
+    bool entrySuppressed{false};
 };
 
 // "" when a pull may start, else a HuntRefusal literal. First wall wins, in
 // this order: not a bot, not in world, dead, instance, flight, bags full, a hunt already
-// running, the realm at its hunt ceiling, no target, level gap, health floor,
-// adds.
+// running, the realm at its hunt ceiling, no target, level gap, repeat killer,
+// health floor, adds.
 char const* HuntGate(HuntFacts const& facts);
 
 // Worth asking again: Later for the ones a minute fixes, Elsewhere for an

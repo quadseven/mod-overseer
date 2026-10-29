@@ -24284,6 +24284,26 @@ HuntRequest ParseHuntRequest(std::string const& command)
     return request;
 }
 
+bool CreatureDeathNote(CreatureDeathBook& book, uint32_t entry, int64_t now)
+{
+    if (!entry)
+        return false;
+    std::vector<int64_t>& times = book.deaths[entry];
+    times.push_back(now);
+    // Only deaths inside the window of the newest one can still make a pair.
+    times.erase(std::remove_if(times.begin(), times.end(),
+                               [&](int64_t t) { return now - t > REPEAT_KILLER_WINDOW_SECONDS; }),
+                times.end());
+    if (times.size() >= REPEAT_KILLER_DEATHS)
+        book.suppressed.insert(entry);
+    return book.suppressed.count(entry) != 0;
+}
+
+bool CreaturePullIsSuppressed(CreatureDeathBook const& book, uint32_t entry)
+{
+    return entry && book.suppressed.count(entry) != 0;
+}
+
 char const* HuntGate(HuntFacts const& f)
 {
     namespace R = HuntRefusal;
@@ -24307,6 +24327,8 @@ char const* HuntGate(HuntFacts const& f)
         return R::NoTarget;
     if (f.levelsAbove >= static_cast<int>(HUNT_LEVEL_GAP))
         return R::TooHighLevel;
+    if (f.entrySuppressed)
+        return R::RepeatKiller;
     if (f.healthPct < HUNT_HEALTH_FLOOR_PCT)
         return R::LowHealth;
     if (f.attackers > HUNT_MAX_ATTACKERS)

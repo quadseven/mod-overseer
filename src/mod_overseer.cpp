@@ -4966,6 +4966,9 @@ std::map<std::string, PendingKill> g_pendingKill;  // key: lowercased victim nam
 // recovery's threat count (wow-overseer#599). Kept past RecordDeath, which
 // consumes g_pendingKill. Same mutex. Key: lowercased victim name.
 std::map<std::string, OverseerDecisions::CreatureKillMark> g_creatureKill;
+// Creature deaths of this session by entry, behind g_killMutex (#151). An entry
+// that killed a member twice within the hour is not pulled by a hunt again.
+OverseerDecisions::CreatureDeathBook g_creatureDeathBook;
 
 // Called from WriteSnapshot, world thread only - see that function.
 void RememberHealth(std::string const& name, uint32 health, uint32 maxHealth)
@@ -5115,6 +5118,8 @@ void RememberKiller(Player* killed, std::string const& killerType,
         mark.x = killed->GetPositionX();
         mark.y = killed->GetPositionY();
         mark.at = now;
+        // The session's repeat-killer memory (#151), same lock as the mark.
+        OverseerDecisions::CreatureDeathNote(g_creatureDeathBook, killerEntry, now);
     }
 }
 
@@ -79977,6 +79982,11 @@ private:
         facts.targetFound = target != nullptr;
         if (target)
             facts.levelsAbove = int(target->GetLevel()) - int(who->GetLevel());
+        {
+            std::lock_guard<std::mutex> guard(g_killMutex);
+            facts.entrySuppressed =
+                OverseerDecisions::CreaturePullIsSuppressed(g_creatureDeathBook, entry);
+        }
         return facts;
     }
 
