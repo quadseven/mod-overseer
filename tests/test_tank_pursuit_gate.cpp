@@ -16,8 +16,13 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include <string>
+#include <vector>
+
 using OverseerDecisions::TankMayPursue;
 using OverseerDecisions::TankPursuitFacts;
+using OverseerDecisions::TankPursuitWithheld;
+using OverseerDecisions::TankStrategyListedName;
 
 namespace
 {
@@ -99,6 +104,79 @@ void MountedOrDeadDoesNotChase()
     Check("a dead tank does not chase", !TankMayPursue(facts));
 }
 
+// THE LIVE CASE (#1212). After AiFactory hands a protection warrior `tank`,
+// its combat engine lists `prot`: the warrior factory maps `tank` to
+// TankWarriorStrategy, whose getName() is "prot". This is the list a live
+// open-world warrior tank had while it failed melee abilities out of range,
+// and the pursuit has to read it as a tank.
+bool Lists(std::vector<std::string> const& live, std::string const& name)
+{
+    for (std::string const& s : live)
+        if (s == name)
+            return true;
+    return false;
+}
+
+void TheTankIsFoundByTheNameItIsListedUnder()
+{
+    std::vector<std::string> const warriorLive = {"aoe", "mark rti", "prot", "pull",
+                                                  "pull back", "racials", "tank assist"};
+    Check("a protection warrior's live list is read as a tank",
+          Lists(warriorLive, TankStrategyListedName(1)));
+    Check("a warrior is not asked for the word 'tank', which it never lists",
+          TankStrategyListedName(1) != "tank");
+    Check("a paladin's tank strategy is listed as 'prot'", TankStrategyListedName(2) == "prot");
+    Check("a death knight's tank strategy is listed as 'blood'",
+          TankStrategyListedName(6) == "blood");
+    Check("a druid's tank strategy is listed as 'bear'", TankStrategyListedName(11) == "bear");
+
+    // Fed from that list, the open-world tank out of reach chases.
+    TankPursuitFacts facts = TankOutOfReachInTheOpen();
+    facts.tanks = Lists(warriorLive, TankStrategyListedName(facts.classId));
+    Check("the live open-world warrior tank out of reach chases", TankMayPursue(facts));
+    Check("and nothing is said about withholding it", TankPursuitWithheld(facts).empty());
+}
+
+void ARefusalIsSaid()
+{
+    TankPursuitFacts facts = TankOutOfReachInTheOpen();
+    facts.heldStill = true;
+    Check("a held tank out of reach says it is held",
+          TankPursuitWithheld(facts) == "an overseer hold has it standing still");
+
+    facts = TankOutOfReachInTheOpen();
+    facts.mounted = true;
+    Check("a mounted tank says so", TankPursuitWithheld(facts) == "it is mounted or in flight");
+
+    facts = TankOutOfReachInTheOpen();
+    facts.alive = false;
+    Check("a dead tank says so", TankPursuitWithheld(facts) == "it is dead");
+
+    facts = TankOutOfReachInTheOpen();
+    facts.hasVictim = false;
+    Check("a tank in combat with no victim does not chase", !TankMayPursue(facts));
+    Check("and says it has nothing to chase",
+          TankPursuitWithheld(facts) == "it has no victim or selection it may attack");
+
+    // Nothing to say: the dungeon gate as meant, in reach, idle, not a tank.
+    facts = TankOutOfReachInTheOpen();
+    facts.onInstanceMap = true;
+    Check("an instance map is the #1055 gate working, not a line per fight",
+          TankPursuitWithheld(facts).empty());
+    facts = TankOutOfReachInTheOpen();
+    facts.inMeleeRange = true;
+    Check("a tank in reach has nothing withheld", TankPursuitWithheld(facts).empty());
+    facts = TankOutOfReachInTheOpen();
+    facts.inCombat = false;
+    Check("an idle tank has nothing withheld", TankPursuitWithheld(facts).empty());
+    facts = TankOutOfReachInTheOpen();
+    facts.tanks = false;
+    Check("a warrior that is not a tank is not talked about", TankPursuitWithheld(facts).empty());
+    facts = TankOutOfReachInTheOpen();
+    facts.classId = 2;
+    Check("another class is not talked about", TankPursuitWithheld(facts).empty());
+}
+
 }  // namespace
 
 int main()
@@ -107,6 +185,8 @@ int main()
     ADungeonRunOwnsTheTank();
     AHoldKeepsTheTankStill();
     MountedOrDeadDoesNotChase();
+    TheTankIsFoundByTheNameItIsListedUnder();
+    ARefusalIsSaid();
 
     if (failures)
     {

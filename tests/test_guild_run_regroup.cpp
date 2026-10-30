@@ -33,13 +33,20 @@
 #include <string>
 #include <vector>
 
+using OverseerDecisions::GUILD_RUN_HOLD_RETRY_MAX_SECONDS;
+using OverseerDecisions::GUILD_RUN_HOLD_RETRY_SECONDS;
 using OverseerDecisions::GUILD_RUN_REGROUP_WAIT_SECONDS;
 using OverseerDecisions::GUILD_RUN_REST_MAX_SECONDS;
 using OverseerDecisions::GuildRunDoorFacts;
 using OverseerDecisions::GuildRunEnterTogether;
 using OverseerDecisions::GuildRunHold;
 using OverseerDecisions::GuildRunHoldFacts;
+using OverseerDecisions::GuildRunHoldAccepted;
+using OverseerDecisions::GuildRunHoldMayAsk;
 using OverseerDecisions::GuildRunHoldNext;
+using OverseerDecisions::GuildRunHoldRefused;
+using OverseerDecisions::GuildRunHoldRetry;
+using OverseerDecisions::GuildRunHoldRetrySeconds;
 using OverseerDecisions::GuildRunHoldStep;
 using OverseerDecisions::GuildRunHoldWhy;
 using OverseerDecisions::GuildRunHoldWhyWord;
@@ -189,6 +196,20 @@ void TheBrainHoldsWhileTheGroupRests()
     ExpectHold("a fight is the dungeon brain's", fighting, GuildRunHoldStep::Nothing,
                GuildRunHoldWhy::None);
 
+    // A held brain with a member stuck in combat (a land mine, an unreachable
+    // mob) is not held in silence past the rest ceiling (#1185).
+    GuildRunHoldFacts heldFight = FiveAliveAt(GuildRunRestNeed::Low);
+    heldFight.held = true;
+    heldFight.anyFighting = true;
+    heldFight.secondsResting = GUILD_RUN_REST_MAX_SECONDS - 1;
+    ExpectHold("a normal pull under the ceiling stays held", heldFight, GuildRunHoldStep::Nothing,
+               GuildRunHoldWhy::None);
+    heldFight.secondsResting = GUILD_RUN_REST_MAX_SECONDS;
+    ExpectHold("a held brain with a member in combat past the ceiling is released", heldFight,
+               GuildRunHoldStep::Release, GuildRunHoldWhy::InCombat);
+    Check("and the reason word says combat",
+          std::string(GuildRunHoldWhyWord(GuildRunHoldWhy::InCombat)) == "member in combat");
+
     GuildRunHoldFacts resting = FiveAliveAt(GuildRunRestNeed::Partial);
     resting.held = true;
     resting.secondsResting = 30;
@@ -259,6 +280,108 @@ void TheGroupWaitsForItsGhostsBeforeItPulls()
     ExpectHold("and is not held for", body, GuildRunHoldStep::Nothing, GuildRunHoldWhy::None);
 }
 
+// ------------------------------------- a body nobody can raise (#1140) --
+
+// Blackfathom run 1189170, 2026-10-24 19:35Z: the brain held, one member dead
+// inside, and the four alive inside none of them a Priest, Paladin, Shaman or
+// Druid. The dungeon module refused `dc pause resume` 89 times in 82 minutes
+// ("Alaaen is dead - rez and try again"), asked every 15 s.
+GuildRunHoldFacts Run1189170()
+{
+    GuildRunHoldFacts facts;
+    facts.armed = true;
+    facts.held = true;
+    facts.aliveInside = 4;
+    facts.deadInside = 1;
+    facts.need = GuildRunRestNeed::Rested;
+    facts.livingResurrector = false;
+    return facts;
+}
+
+void ABodyNobodyCanRaiseKeepsTheHold()
+{
+    GuildRunHoldFacts facts = Run1189170();
+    ExpectHold("no living resurrector: the hold is kept for the body, no resume to refuse",
+               facts, GuildRunHoldStep::Nothing, GuildRunHoldWhy::Dead);
+
+    facts.need = GuildRunRestNeed::Partial;
+    ExpectHold("over the triggers but nobody to raise the body: still held", facts,
+               GuildRunHoldStep::Nothing, GuildRunHoldWhy::Dead);
+
+    facts.need = GuildRunRestNeed::Low;
+    facts.secondsResting = 30;
+    ExpectHold("a rest under way is still a rest", facts, GuildRunHoldStep::Nothing,
+               GuildRunHoldWhy::Rest);
+    facts.secondsResting = GUILD_RUN_REST_MAX_SECONDS - 1;
+    ExpectHold("one second under the bound the rest still wins over the body", facts,
+               GuildRunHoldStep::Nothing, GuildRunHoldWhy::Rest);
+    facts.secondsResting = GUILD_RUN_REST_MAX_SECONDS;
+    ExpectHold("a timed-out rest does not ask a resume nobody can take either", facts,
+               GuildRunHoldStep::Nothing, GuildRunHoldWhy::Dead);
+
+    GuildRunHoldFacts healer = Run1189170();
+    healer.livingResurrector = true;
+    ExpectHold("with a living resurrector the body is still why it is let go", healer,
+               GuildRunHoldStep::Release, GuildRunHoldWhy::Dead);
+
+    GuildRunHoldFacts back = Run1189170();
+    back.deadInside = 0;
+    back.aliveInside = 5;
+    ExpectHold("the ghost back inside and alive: the rested group goes on", back,
+               GuildRunHoldStep::Release, GuildRunHoldWhy::Rested);
+
+    GuildRunHoldFacts loose = Run1189170();
+    loose.held = false;
+    ExpectHold("an unheld brain is not held for a body it cannot raise", loose,
+               GuildRunHoldStep::Nothing, GuildRunHoldWhy::None);
+}
+
+void ARefusedHoldWaitsLongerEachTime()
+{
+    Check("no refusal, no wait", GuildRunHoldRetrySeconds(0) == 0);
+    Check("the first refusal waits the old 15 s",
+          GuildRunHoldRetrySeconds(1) == GUILD_RUN_HOLD_RETRY_SECONDS);
+    Check("each refusal in a row doubles it",
+          GuildRunHoldRetrySeconds(2) == 2 * GUILD_RUN_HOLD_RETRY_SECONDS &&
+              GuildRunHoldRetrySeconds(3) == 4 * GUILD_RUN_HOLD_RETRY_SECONDS &&
+              GuildRunHoldRetrySeconds(4) == 8 * GUILD_RUN_HOLD_RETRY_SECONDS);
+    Check("up to the cap", GuildRunHoldRetrySeconds(5) == GUILD_RUN_HOLD_RETRY_MAX_SECONDS &&
+                               GuildRunHoldRetrySeconds(6) == GUILD_RUN_HOLD_RETRY_MAX_SECONDS &&
+                               GuildRunHoldRetrySeconds(1000) == GUILD_RUN_HOLD_RETRY_MAX_SECONDS);
+
+    GuildRunHoldRetry retry;
+    std::time_t const t0 = 1000000;
+    Check("asked at once when nothing was refused", GuildRunHoldMayAsk(retry, t0));
+    Check("the first refusal is the one whose reason is said", GuildRunHoldRefused(retry, t0));
+    Check("not asked again inside 15 s", !GuildRunHoldMayAsk(retry, t0 + 14));
+    Check("asked again at 15 s", GuildRunHoldMayAsk(retry, t0 + 15));
+    Check("a second refusal is not said again", !GuildRunHoldRefused(retry, t0 + 15));
+    Check("and widens the wait to 30 s", !GuildRunHoldMayAsk(retry, t0 + 15 + 29) &&
+                                             GuildRunHoldMayAsk(retry, t0 + 15 + 30));
+    GuildRunHoldRefused(retry, t0 + 45);
+    Check("a third refusal widens it to 60 s", !GuildRunHoldMayAsk(retry, t0 + 45 + 59) &&
+                                                   GuildRunHoldMayAsk(retry, t0 + 45 + 60));
+
+    // Asked as often as the clock allows for the 82 minutes of run 1189170,
+    // every refusal: 89 asks at a flat 15 s, far fewer with the backoff.
+    GuildRunHoldRetry stretch;
+    unsigned asks = 0;
+    for (std::time_t t = t0; t < t0 + 82 * 60; ++t)
+        if (GuildRunHoldMayAsk(stretch, t))
+        {
+            ++asks;
+            GuildRunHoldRefused(stretch, t);
+        }
+    Check("82 minutes of refusals ask at most a third as often as 15 s did", asks <= 89 / 3);
+
+    Check("an accepted resume reports the refusals before it", GuildRunHoldAccepted(retry) == 3);
+    Check("and resets the clock: asked at once", GuildRunHoldMayAsk(retry, t0 + 46) &&
+                                                     retry.refusals == 0);
+    Check("the next refusal is said again and waits 15 s",
+          GuildRunHoldRefused(retry, t0 + 46) && !GuildRunHoldMayAsk(retry, t0 + 46 + 14) &&
+              GuildRunHoldMayAsk(retry, t0 + 46 + 15));
+}
+
 // ---------------------------------------------------------- the wiring --
 
 std::string ReadModule()
@@ -301,6 +424,18 @@ void TheAdapterIsWired()
         "DoSpecificAction(\"dc pause\", Event(\"dc\", hold ? \"pause\" : \"resume\", tank), true)");
     has("the door's deploy proof is said", recovery, "step through the '{}' door together");
     has("the rest's deploy proof is said", recovery, "overseer: guild run rest {} - ");
+    has("the hold reads whether anyone alive inside can resurrect", recovery,
+        "facts.livingResurrector = resurrector;");
+    has("with the stuck-revival drive's own class read", recovery, "if (IsResurrectorClass(p))");
+    has("a refused hold waits on the doubling clock", recovery,
+        "OverseerDecisions::GuildRunHoldMayAsk(run.holdRetry, now)");
+    has("a refusal is counted on it", recovery,
+        "OverseerDecisions::GuildRunHoldRefused(run.holdRetry, now)");
+    has("an accepted one resets it", recovery,
+        "OverseerDecisions::GuildRunHoldAccepted(run.holdRetry)");
+    has("the refusal is said in the dungeon module's words", recovery,
+        "dead + \" is dead - rez and try again\"");
+    Check("no flat 15 s retry is left", recovery.find("holdRefusedAt") == std::string::npos);
     Check("nothing is teleported", recovery.find("TeleportTo") == std::string::npos);
     Check("and nobody is raised by hand", recovery.find("ResurrectPlayer") == std::string::npos);
 
@@ -328,6 +463,8 @@ int main()
     TheBrainHoldsWhileTheGroupRests();
     ARestCannotStallTheRun();
     TheGroupWaitsForItsGhostsBeforeItPulls();
+    ABodyNobodyCanRaiseKeepsTheHold();
+    ARefusedHoldWaitsLongerEachTime();
     TheAdapterIsWired();
     if (failures)
     {

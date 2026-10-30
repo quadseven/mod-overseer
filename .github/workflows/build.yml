@@ -79,6 +79,8 @@ on:
       - 'src/**'
       - 'patches/**'
       - 'apply-patches.sh'
+      - 'realm-pins.env'
+      - 'scripts/read-realm-pins.sh'
       - '.github/workflows/build.yml'
       - 'VERSION'
   workflow_dispatch: {}
@@ -133,22 +135,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CORE_SHA: 7f12e89ee5f467a50e62eba1d525eac7dc953d03
-  MODULE_SHA: 7bae1b5c58c76a0aa20381155edc08096d1485b2
   GHCR_IMAGE: ghcr.io/quadseven/mod-overseer
-  # THE UPSTREAM HEADS THE NEXT ROLL MOVES TO (wow-overseer#826, infra#5655).
-  # Nothing in THIS workflow reads these: the image above is built at the pins
-  # above, unchanged. check.adapter.yml greps them out of this file, as it does
-  # the pins, and compiles the adapter against them in a second leg, so the
-  # adapter is proved against both before the pins move. The heads' copies of
-  # the two patches that stopped applying there live in patches-heads/. When
-  # the roll lands, these become CORE_SHA/MODULE_SHA (and the two clone URLs
-  # below), patches-heads/ replaces the matching files in patches/, and these
-  # four lines go.
-  HEADS_CORE_SHA: 8a4e76eac8c4ccebf547113afe7b51d6c3e91641
-  HEADS_CORE_REPO: https://github.com/mod-playerbots/azerothcore-wotlk.git
-  HEADS_MODULE_SHA: 40884e9c135c1daf27ffd894a6047502a5701130
-  HEADS_MODULE_REPO: https://github.com/quadseven/mod-playerbots.git
 
 jobs:
   build:
@@ -164,13 +151,19 @@ jobs:
         with:
           path: mod-overseer
 
+      - name: Read the pins out of realm-pins.env
+        # The one copy of the pins, shared with check.adapter.yml and the
+        # deployment build (#574). The script fails, naming the file, when it
+        # is missing, a key is absent or a SHA is malformed; there is no
+        # built-in fallback pin.
+        working-directory: mod-overseer
+        run: |
+          set -euo pipefail
+          bash scripts/read-realm-pins.sh realm-pins.env > "$RUNNER_TEMP/realm-pins.out"
+          cat "$RUNNER_TEMP/realm-pins.out" >> "$GITHUB_ENV"
+          cat "$RUNNER_TEMP/realm-pins.out"
+
       - name: Clone the pinned core + mod-playerbots
-        env:
-          # Same pins quadseven/infra's UPSTREAM-PINS.env carries. Kept here
-          # rather than fetched from that (private-adjacent) repo at runtime,
-          # so this workflow has zero dependency on it - the whole point.
-          CORE_REPO: https://github.com/mod-playerbots/azerothcore-wotlk.git
-          MODULE_REPO: https://github.com/mod-playerbots/mod-playerbots.git
         run: |
           set -euo pipefail
           git clone -q "$CORE_REPO" acore

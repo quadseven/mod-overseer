@@ -51,6 +51,7 @@
 #include <cstdio>
 #include <ctime>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -1728,6 +1729,33 @@ struct ApproachLimits
 
 ApproachShape ApproachShapeOf(ApproachGap const& gap, ApproachLimits const& limits);
 
+// The retry hold captured when a staging approach fails. The adapter stores
+// this state with the run coordinator; the transition itself stays pure so the
+// retry gate and its ten-yard release boundary can be tested without a world.
+struct ApproachQuarantineState
+{
+    bool active{false};
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+};
+
+enum class ApproachQuarantineAction : std::uint8_t
+{
+    Inactive,
+    Block,
+    Clear,
+};
+
+ApproachQuarantineAction ApproachQuarantineDecision(
+    ApproachQuarantineState const& quarantine, ApproachShape shape,
+    float leaderX, float leaderY, float leaderZ);
+
+// THE PLACE A REFUSAL NAMES, in backticks (#396). The held and quarantine
+// warnings print positions through this so an operator can copy the exact spot
+// the gate turned down; a non-finite reading says so instead of printing nan.
+std::string BacktickedPosition(float x, float y, float z);
+
 // HOW FAR AWAY IT REALLY IS - the three-dimensional distance, for the ratchet
 // that asks whether an approach is closing and for the line an operator reads.
 //
@@ -2273,6 +2301,18 @@ bool DungeonRunBarrierMet(std::vector<DungeonRunMemberState> const& members,
 // about a character standing on a cliff.
 std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& members,
                                       ApproachLimits const& limits);
+
+// THE MEMBERS ALREADY THROUGH THE DOOR THAT THE BARRIER COUNTS AS STAGED (#165):
+// inside, seen, alive and out of combat, comma separated, empty when none. The
+// blockers line above leaves them out, because they are not what it is waiting
+// on; this is what names them, so "inside already" and "not seen" are never
+// confused for the same member again.
+std::string DungeonRunBarrierInsideAlready(std::vector<DungeonRunMemberState> const& members);
+
+// THE WHOLE "BARRIER holds - ..." SENTENCE: the blockers, then
+// "; inside already, counted as staged: <names>" when anybody is.
+std::string DungeonRunBarrierHolds(std::vector<DungeonRunMemberState> const& members,
+                                   ApproachLimits const& limits);
 
 // SHOULD THIS MEMBER BE HELD WHERE IT STANDS UNTIL THE BARRIER OPENS (#346)?
 //
@@ -2935,6 +2975,34 @@ DoorAimHeight DoorAimOnTheFloor(bool haveGround, float groundZ, float arrivalYar
 // map id and coordinates allow it.
 constexpr std::size_t TRAVEL_AIM_MAX_CHARS = 32;
 std::string TravelAimAtPosition(std::uint32_t mapId, float x, float y, float z);
+
+// HOW MANY CHARACTERS AN AIM IS, AS THE COLUMN COUNTS THEM (wow-overseer#1517).
+// `overseer_roster.travel_npc` is VARCHAR(32) in a UTF-8 table, and VARCHAR
+// counts characters, not bytes. std::string::size() counts bytes, so an aim
+// that names an NPC with an accented or non-Latin name is longer in bytes than
+// the column measures it, and a byte guard refuses an aim MySQL would store.
+// This counts every byte that does not continue a multibyte sequence: each
+// well-formed UTF-8 character is one, a stray continuation byte counts nothing,
+// and an invalid lead byte (0xC0, 0xFF) counts as one. It does not validate;
+// MySQL refuses invalid UTF-8 on write anyway.
+std::size_t Utf8CharCount(std::string const& text);
+
+// Does this aim fit the travel column? The one question every guard on that
+// column asks, in the column's own unit.
+bool TravelAimFitsColumn(std::string const& aim);
+
+// THE WIDTH OF A DUNGEON RUN'S ended_reason, AND THE CUT THAT RESPECTS IT
+// (#1186). `overseer_dungeon_run.ended_reason` is VARCHAR(200) in a UTF-8
+// table and the realm runs in strict mode, so a longer reason is refused with
+// errno 1406 and the whole UPDATE goes with it: state, ended_at and outcome
+// stay as they were and the run is left active, which is what breaks the next
+// run on that map. A stalled run's reason carries the dungeon module's own stop
+// reason and can run past the column. So every writer passes its reason
+// through this first: 200 characters or fewer come back unchanged; a longer
+// one keeps its start, is cut on a character boundary, and ends in "..." so a
+// reader can tell, the whole within the column counted in characters.
+constexpr std::size_t DUNGEON_RUN_ENDED_REASON_CHARS = 200;
+std::string FitEndedReasonColumn(std::string const& reason);
 
 // HOW FAR BACK FROM THIS DOOR THE PARTY GATHERS. The staging standoff is
 // measured from the door's centre, and for a sphere it is `standoffYards`
@@ -4424,6 +4492,75 @@ bool IsTravelGuardAim(std::string const& aim);
 // is `at:0:1,2,3`. Empty for anything that is not a guard, and for a guard
 // that names no place at all.
 std::string TravelGuardPlace(std::string const& aim);
+
+// The map a guard names: `guard:1:-1048,-3665,24` is map 1. False for anything
+// that is not a guard, and for a guard whose map is not a plain number.
+bool TravelGuardMap(std::string const& aim, std::uint32_t& map);
+
+// ------------- where a guard walks the character it is written on (#163) ------
+//
+// MEASURED ON THE DEV REALM, 2026-10-26: the operator wrote a guard into all
+// five roster rows while the family was dying in one zone. The column held for
+// the whole fifteen minutes, and still one of the five never left:
+//
+//   * the guard walked none of the four followers. Each was refused as "does
+//     not carry `new rpg` - nothing walks it anywhere", and three got out only
+//     because they followed the leader onto a flight and an errand outside the
+//     module hearthed them;
+//   * the fifth's guard named its own homebind, on map 1, while it stood on
+//     map 0. The travel drive released it as "no such spawn on map 0", and the
+//     guard, still in the column, refused the catch-up walk that would have
+//     taken it out with the leader. It died three more times while guarded.
+//
+// So a guard is resolved to a place on the map the character stands on before
+// it is walked, and a resolved guard steers its character itself, follower or
+// leader (GuardWalkSteers): the guard is the person saying "get out", and a
+// follower standing in formation on the ground that is killing it is the
+// opposite of out.
+enum class GuardWalk : std::uint8_t
+{
+    // The guard names a place on the map the character stands on, or the map
+    // is not known: walked to the place the guard names, as before.
+    OwnPlace,
+    // The guard names a place on another map, and the character's leader
+    // carries a guard on the map the character stands on: walked to the
+    // leader's guard place, which is where the rest of the family is going.
+    LeadersPlace,
+    // The guard names a place on another map and nothing on this map stands in
+    // for it. Nothing walks the character; said once, loudly, rather than
+    // released every poll as a missing spawn while the column says guarded.
+    OtherMap,
+    // The guard names no place at all.
+    NoPlace,
+};
+
+char const* GuardWalkName(GuardWalk walk);
+
+struct GuardWalkFacts
+{
+    // This character's `travel_npc`, a guard.
+    std::string guard;
+    // Where the character stands. Unknown (not in the world this poll) is
+    // answered as OwnPlace: the drive finds nobody to walk anyway.
+    bool mapKnown{false};
+    std::uint32_t currentMap{0};
+    // The `travel_npc` of the character's group leader, or empty when it leads,
+    // has no group, or the leader's column is empty.
+    std::string leaderColumn;
+};
+
+struct GuardWalkVerdict
+{
+    GuardWalk walk{GuardWalk::NoPlace};
+    // The `at:` aim to walk, empty for OtherMap and NoPlace.
+    std::string place;
+};
+
+GuardWalkVerdict ReadGuardWalk(GuardWalkFacts const& facts);
+
+// Does a guard resolved this way walk its character itself, follower or not?
+// True exactly when there is a place to walk to.
+bool GuardWalkSteers(GuardWalk walk);
 
 // WHAT THE TRAVEL DRIVE DOES WITH AN AIM IT LET GO OF AND COULD NOT CLEAR
 // (#558).
@@ -6484,6 +6621,20 @@ LootCouncilVote MandatedLootVote(bool active, bool bindOnPickup,
                                 std::string const& intended,
                                 std::string const& voter);
 
+// The next step of an item mandate after a run. Done only when the NAMED
+// character holds the item (`holders` are the names of the characters that
+// hold it now); Stopped when the mandate is cancelled or names nobody, so a
+// broken or cancelled mandate never repeats; otherwise Repeat the source run.
+enum class MandateStep
+{
+    Repeat,
+    Done,
+    Stopped,
+};
+
+MandateStep MandateNextStep(bool cancelled, std::string const& intended,
+                            std::vector<std::string> const& holders);
+
 // The row key: "roll:<roll item guid>" for a group-loot roll, and
 // "ml:<creature raw guid>:<loot slot>" for a master-loot drop.
 std::string LootCouncilRollKey(std::uint64_t rollItemGuid);
@@ -7791,6 +7942,33 @@ FallAccount AccountForFall(float recordedYardsFallen, float safeFallYards = 0.f,
                            bool startedBelowSurface = false);
 char const* FallAccountName(FallAccount account);
 
+// DID THE LAST SAMPLE START UNDER THE WORLD, OR JUST UNDER SOMETHING (#1211).
+//
+// RecordDeath used to call a death a void fall whenever the last sampled
+// position was below the highest surface a long probe found over it. That
+// probe returns the HIGHEST surface at the character's x and y, so a roof, a
+// bridge, a tree canopy, a cave ceiling or an overhang above a character
+// standing on ordinary ground read as "below the surface". Measured on the dev
+// realm after #1107 went live: 33 of the 47 rows written as void falls were
+// surface deaths that fell 0 to 2.1 yards, 21 of them creature kills in combat.
+//
+// SO TWO READINGS ARE ASKED FOR, NOT ONE. `surfaceAbove*` is that long probe,
+// unchanged. `groundBelow*` is a second probe started `toleranceYards` over
+// the sample and searching down from there. A character with ground under its
+// own feet is standing on the world, whatever is over its head, and is never
+// below it. Under the world there is nothing to find: the terrain height only
+// counts from above it, and a downward ray from under the map hits nothing.
+//
+// THE TOLERANCE IS THE OTHER HALF. A character a few yards under the sampled
+// surface is float jitter on the ground it stands on, not a body that has gone
+// through it, so it is not below the surface either.
+constexpr float FALL_START_SURFACE_TOLERANCE_YARDS = 5.0f;
+
+bool FallStartedBelowWorld(float lastZ, bool surfaceAboveFound,
+                           float surfaceAboveZ, bool groundBelowFound,
+                           float groundBelowZ,
+                           float toleranceYards = FALL_START_SURFACE_TOLERANCE_YARDS);
+
 // ------------------------------------------------- a revival and a party --
 //
 // A REVIVAL MAY NOT PUT A CHARACTER ON A MAP ITS PARTY IS NOT ON, unless there
@@ -8178,6 +8356,21 @@ bool FamilyHoldsInTown(std::vector<std::string> const& jobs);
 // an escort to walk: with neither, upstream turns the strategy into a random
 // status (a flight, a far grind spot, a camp) and the family is left behind.
 bool LeaderCarriesNewRpg(std::string const& job, bool onAnErrand);
+
+// A RUN INSIDE ITS DUNGEON HOLDS `new rpg` OFF EVERY MEMBER IN THERE (#1210).
+// Measured on the dev realm 2026-10-25: the dungeon finder took a family into
+// map 90, all five of it, and within seconds the leader was outside again and
+// the run ended 'emptied'. He had been handed `new rpg` back one poll before
+// the finder queue, his rpg stuck counters were stale from before the run, and
+// on the first rpg tick inside upstream's MoveFarTo judged him stuck and
+// teleported him to his old rpg destination outside. Nothing inside a run walks
+// under `new rpg`: STAGED_INSIDE waits for the census and CLEARING is the
+// dungeon brain's. So while the run is STAGED_INSIDE or CLEARING, a member
+// standing on the run's own map does not carry `new rpg`, and gets it back only
+// once the run has moved on (EXITING walks out under its own aim, and a run
+// that ended holds nothing). A member outside the map is left alone: the walk
+// back in for a stranded member is an escort under `new rpg`.
+bool RunHoldsNewRpgOff(bool runStagedInsideOrClearing, bool onTheRunsMap);
 
 // A FLIGHT THE LEADER DID NOT ASK FOR TAKES THE FAMILY'S LEADER AWAY (#697).
 // Measured on the dev realm 2026-09-24: the Horde family waited in Orgrimmar
@@ -9353,9 +9546,25 @@ struct BoardApproachLimits
 // step from it, however many polls that takes, so that case never boards. The
 // distance is bounded by `maxApproaches`. Waiting for the boat (Hold) asks
 // with `approachesSoFar` zero, so the walker is already close when it docks.
+//
+// A STEP ABOARD TAKEN THIS STOP IS NOT UNDONE (#758). The step walks the
+// walker from the berth onto the nearest deck edge the map confirms, and that
+// edge is not always within `fromBerthYards` of the berth: at the Azuremyst
+// dock (map 530) it is 9.2 yards out, at the Kalimdor docks 3.9. The bot AI
+// does not always attach a walker the moment he stands on the deck (a 3.9-yard
+// step missed twice before it sailed), so the next Board poll can find him on
+// the deck edge, not aboard, and more than `fromBerthYards` from the berth.
+// Reading that as "close on the berth" walked him back off the deck with a
+// pathed step: four times in twelve minutes on 2026-10-24 he read 28 yards out
+// fifteen seconds later, the crossing said Walk, and his cross hold was
+// released with the ship still docked. So while `steppedAboardThisStop` holds
+// (the caller clears it when the reading leaves Board), a level walker is
+// stepped aboard again from where he stands. A walker no longer level with the
+// berth (in the water) still closes on it first.
 BoardApproach BoardApproachFrom(bool levelWithBerth, float berthYards,
                                 std::uint32_t approachesSoFar,
-                                BoardApproachLimits const& limits);
+                                BoardApproachLimits const& limits,
+                                bool steppedAboardThisStop = false);
 
 // ------------------- a crossing's hold that no crossing read this poll (#758) --
 //
@@ -11427,6 +11636,120 @@ constexpr char const* NotReadBack        = "the transaction did not read back";
 // (mod-overseer#169) is what happens when a sender cannot tell the two apart.
 bool AuctionRefusalRetryable(std::string const& reason);
 
+// ----------------------------------------------------- the sell rule -------
+//
+// WHAT TO DO WITH ONE ITEM A MEMBER CARRIES, as far as the auction house is
+// concerned (mod-overseer#974). Pure: the caller reads quality, prices and the
+// relist count from the world and the transaction rows, and does what the plan
+// says through the `list`, `cancel` and vendor paths that already exist.
+//
+//   - An item on ANY sibling's want list is Keep, always. It is never listed
+//     and never vendored.
+//   - A grey (quality 0) is Vendor. A white (quality 1) is Keep.
+//   - Green and above (quality >= 2) is sold at a market-derived price: List
+//     at `marketPrice`, but only when that beats `vendorPrice`; otherwise
+//     Vendor (no market price counts as not beating it).
+//   - A listing that expired unsold (`unsoldExpired`) is relisted lower by
+//     AUCTION_RELIST_DROP_PERCENT of `lastListPrice`, at most
+//     AUCTION_RELIST_MAX times; after that, or when the lower price would no
+//     longer beat `vendorPrice`, or when no last price was recorded, Vendor.
+//   - The cut TRUNCATES (integer percent), on purpose. A cut that reaches 0
+//     (only a last price of 1 copper) is Vendor by design, never rounded up to
+//     1: a relist must be strictly lower than the last price and must still
+//     beat `vendorPrice`, and rounding up would relist at the same price.
+constexpr uint32_t AUCTION_RELIST_MAX = 2;
+constexpr uint32_t AUCTION_RELIST_DROP_PERCENT = 10;
+
+enum class AuctionSellVerdict : std::uint8_t
+{
+    Keep,
+    List,
+    RelistLower,
+    Vendor,
+};
+
+struct AuctionSellInput
+{
+    uint32_t quality{0};
+    bool onSiblingWantList{false};
+    bool unsoldExpired{false};
+    uint32_t relistCount{0};
+    uint32_t marketPrice{0};    // copper, 0 when unknown
+    uint32_t lastListPrice{0};  // copper, the price of the expired listing
+    uint32_t vendorPrice{0};    // copper
+};
+
+struct AuctionSellPlanResult
+{
+    AuctionSellVerdict verdict{AuctionSellVerdict::Keep};
+    uint32_t price{0};  // the buyout to list at; 0 unless List or RelistLower
+};
+
+AuctionSellPlanResult AuctionSellPlan(AuctionSellInput const& in);
+
+// --------------------------------------------- trade WTB (want to buy) -----------
+//
+// A WTB CANDIDATE is an item the family wants (appears in FamilyWants.wantList)
+// that is NOT currently listed on the auction house (ahPrice == 0) AND whose
+// price is within the family's auction budget (AuctionBudgetAllows). The
+// cooldown ledger prevents spamming the same item: after an offer is made for
+// an item, a 10-minute (configurable) cooldown applies per item entry before
+// another offer for that item may be made. The offer log records every offer
+// attempt with the member name, result (Accepted/Declined), and a reason string.
+
+enum class WtbOfferResult : std::uint8_t
+{
+    Accepted,
+    Declined,
+};
+
+// One WTB offer recorded in the log.
+struct WtbOfferEntry
+{
+    uint32_t itemEntry{0};
+    std::string member;
+    WtbOfferResult result{WtbOfferResult::Declined};
+    std::string reason;
+    time_t time{0};
+};
+
+// Log of WTB offers.
+struct WtbOfferLog
+{
+    std::vector<WtbOfferEntry> entries;
+};
+
+// Record a WTB offer outcome in the log.
+void WtbOfferLogRecord(WtbOfferLog& log, uint32_t itemEntry,
+                       std::string const& member, WtbOfferResult result,
+                       std::string const& reason, time_t now);
+
+// Per-item cooldown ledger: maps item entry to the last time an offer was made.
+using WtbCooldownLedger = std::map<uint32_t, time_t>;
+
+// Check if an offer for `itemEntry` is allowed under the cooldown. Returns
+// true if enough time has passed since the last offer for this item (or if
+// there was no previous offer). `cooldownSeconds` is the minimum interval
+// between offers for the same item (typically 600 = 10 minutes).
+bool WtbCooldownCheck(WtbCooldownLedger const& ledger, uint32_t itemEntry,
+                      time_t now, time_t cooldownSeconds);
+
+// Record that an offer for `itemEntry` was made at `now`. Updates the ledger
+// so subsequent WtbCooldownCheck calls will enforce the cooldown.
+void WtbCooldownRecord(WtbCooldownLedger& ledger, uint32_t itemEntry, time_t now);
+
+// Is this item a WTB candidate right now?
+//   - `wants`: the family's want list (from FamilyWants)
+//   - `itemEntry`: the item being considered
+//   - `ahPrice`: current lowest buyout price on the AH for this item, or 0 if not listed
+//   - `money`, `reserve`, `sharePercent`: budget parameters passed to AuctionBudgetAllows
+//   - `candidatePrice`: the price we would offer (must pass AuctionBudgetAllows)
+// Returns true if the item is wanted, not on AH (ahPrice == 0), and the
+// candidatePrice passes the budget check.
+bool WtbCandidate(FamilyWants const& wants, uint32_t itemEntry, uint32_t ahPrice,
+                  uint32_t money, uint32_t reserve, uint32_t sharePercent,
+                  uint32_t candidatePrice);
+
 // ----------------------------------------- a home somebody chose (#274) --
 //
 // WHAT A kind='bind' ROW MAY SAY.
@@ -12737,6 +13060,12 @@ struct RoutePlan
     // the route line can name it. Negative when the character's height was
     // not given or nothing was planned.
     float entryHeightGapYards{-1.f};
+    // HOW MANY SURVEYED NODES WITHIN `entryNodeYards` SIT INSIDE THE ENTRY-RISE
+    // LIMIT (#925), not counting refused entries: the nodes that were on the
+    // character's own floor and in reach when the way in was chosen. Zero when
+    // the height was not given or nothing was planned. It is read only for the
+    // route line; it changes no decision.
+    std::uint32_t sameFloorNodesInReach{0};
 };
 
 struct RoutePlanLimits
@@ -12814,6 +13143,14 @@ struct RoutePlanLimits
     float fromZ{0.f};
     float maxEntryRiseYards{40.f};
 };
+
+// THE SENTENCE THE ROUTE LINE ENDS WITH (#925): the entry node, how far it
+// stands above or below the character, and how many surveyed nodes in reach
+// were on the character's own floor. Pure, so the wording is tested as text.
+// The count reads "N same-floor nodes in reach" for every N, so one search
+// of the log finds them all.
+std::string RouteEntryNote(std::uint32_t entryNode, float entryHeightGapYards,
+                           std::uint32_t sameFloorNodesInReach);
 
 // THE NODE SEQUENCE, AND THE ONE CHOICE THAT MAKES IT WORK.
 //
@@ -13609,6 +13946,157 @@ LoneGreyDensity ScoreLoneGreyDensity(std::vector<DangerSpawn> const& spawns,
                                      std::vector<RoutePoint> const& path,
                                      bool walkerHasGroup, LoneGreyDensityRule const& rule,
                                      DangerLimits const& limits);
+
+// ------------- a leg a walker died on is not walked again at once (#502) ----
+//
+// THE BORK SEQUENCE. A level 60 walker died 13 yards from survey node 3487 in
+// Tanaris, on a leg of the route PlanFootRoute had planned for it, revived at
+// node 199 two legs back, and was released down the same legs again. Nothing
+// about the plan had changed: the planner had learned nothing from the death,
+// so the same search over the same graph gave the same answer.
+//
+// THE RULE. When a walker dies within `nearYards` of a leg of the route it was
+// last planned, every such leg is remembered for that walker for
+// `holdSeconds`. While it is remembered, the walker's own plans price the leg
+// (both directions, because the ground does not care which way it is walked)
+// at `priceYards` more than its survey cost. A way round that costs less than
+// that is taken; when there is none, the leg is still walked and the caller can
+// say so, which is better than no route at all.
+//
+// PRICED, NOT DELETED, on purpose. Deleting the leg can leave a walker with no
+// route, and then it walks at its aim unaided, which is how #316 started. And
+// PER WALKER, not on the shared survey: a death says what this walker could
+// not survive, and the next character down that road may be twenty levels
+// higher.
+struct RouteLegSpan
+{
+    std::uint32_t from{0};
+    std::uint32_t to{0};
+    // The leg's points in the route: [firstPoint, endPoint).
+    std::size_t firstPoint{0};
+    std::size_t endPoint{0};
+};
+
+struct DiedOnLeg
+{
+    std::uint32_t from{0};
+    std::uint32_t to{0};
+    // Remembered until this moment, and forgotten at it.
+    std::time_t until{0};
+};
+
+struct DiedOnLegLimits
+{
+    // How far from a point of a leg a death may be and still be ON that leg.
+    // Bork died 13 yards from the node; a leg's recorded points are about five
+    // yards apart, so forty is wide enough to cover a fight that drifted off
+    // the path and narrow enough not to reach the next road over.
+    float nearYards{40.f};
+    // How long a death on a leg is remembered. Long enough to cover the corpse
+    // run, the revive and the re-release that #502 measured, and bounded so a
+    // walker that has levelled past the danger gets its road back.
+    std::int64_t holdSeconds{2 * 60 * 60};
+    // What walking a remembered leg costs on top of its survey distance. A way
+    // round up to this much longer is taken. Two thousand yards is about the
+    // longest single walk link the survey holds (1906 yards), so a detour of a
+    // leg or two is always preferred to the leg the walker died on.
+    float priceYards{2000.f};
+    // How recently a walker must have been stepped along its planned route
+    // for a death to be charged to a leg of it (#1228). The route memory
+    // outlives the walk: an errand ends, its route is dropped in the last
+    // yards, the walker goes questing beside the road. A death there is not a
+    // death on the route, and charging it priced a road the walker had left.
+    // Four travel polls, so the poll that finds the body is always inside it.
+    std::int64_t walkedWithinSeconds{60};
+};
+
+// Which legs of the route the walker died on: every leg with a point within
+// `nearYards` of (x, y). A death beside a node is on both legs that meet
+// there, which is right: it is the place that killed, not the direction. Empty
+// for a death off the route, an empty route, or limits that are nonsense.
+std::vector<RouteLegSpan> LegsOfDeath(std::vector<RouteLegSpan> const& legs,
+                                      std::vector<RoutePoint> const& route, float x, float y,
+                                      DiedOnLegLimits const& limits);
+
+// Remember a death on the leg `from`-`to` at `now`. Forgets what has expired,
+// refreshes a leg already remembered in either direction, and adds one that is
+// not. Does nothing when the limits are nonsense.
+void RememberDiedOnLeg(std::vector<DiedOnLeg>& died, std::uint32_t from, std::uint32_t to,
+                       std::time_t now, DiedOnLegLimits const& limits);
+
+// Price the remembered legs on a copy of the survey's links: every walk link
+// matching a remembered leg in either direction costs `priceYards` more.
+// Forgets what has expired at `now`, and returns how many legs are still
+// remembered. A link the survey refused (negative cost) stays refused.
+std::uint32_t PriceDiedOnLegs(std::vector<RouteLink>& links, std::vector<DiedOnLeg>& died,
+                              std::time_t now, DiedOnLegLimits const& limits);
+
+// How many legs of a planned node sequence are remembered deaths at `now`, so
+// a plan that still walks one (there was no cheaper way round) can say so.
+std::uint32_t DiedOnLegsOnPlan(std::vector<std::uint32_t> const& nodes,
+                               std::vector<DiedOnLeg> const& died, std::time_t now);
+
+// WHETHER AN ERRAND'S ROUTE IS PLANNED AGAIN AFTER A DEATH ON IT (#502). A
+// route is planned once per errand and kept until the aim changes. A catch-up
+// walk rewrites its aim with the leader's position, so it gets a new plan, and
+// the new plan prices the died-on leg; an errand to a fixed place (a trainer, a
+// vendor, a mailbox) keeps its aim through the death and would walk the old
+// route again, down the leg that killed it. So each plan records how many
+// deaths its walker had had remembered (`plannedAtDeaths`), and a plan made
+// before a newer one (`deathsNow`) is made again: but only once the walker is
+// alive, because a ghost's route ends at its corpse and is not the errand's.
+// True also for a route never planned, which is today's rule.
+bool PlanErrandRouteAgain(bool planned, std::uint32_t plannedAtDeaths,
+                          std::uint32_t deathsNow, bool alive);
+
+// ------------- a death is charged to the leg actually walked (#1228) --------
+//
+// THE #1228 SEQUENCE. After #502 shipped, one member logged three deaths on the
+// same leg inside its 120-minute price window. Two things let that happen.
+//
+// The memory of a walker's route outlived the walking of it, so a death near
+// a remembered road was charged to it whether or not the walker was still on
+// it. LegsWalkedAtDeath charges a death only while the walker was stepped
+// along that plan within `walkedWithinSeconds`, and only to the leg its cursor
+// was on and the legs either side of it (a death at a node is on both legs
+// that meet there), each still within `nearYards` of the body.
+//
+// And a walk that starts between two nodes joins the surveyed road it stands
+// on before any plan is priced. A walker revived at its corpse stands on the
+// leg that killed it, so its next walk (a trainer walk, in the measured case)
+// joined that very road, walked it unpriced, and said nothing. The road join
+// now pays DiedOnLegPrice for a remembered leg like any planned leg does, and
+// DiedOnLegsOnRoute counts every leg of the route actually returned, the
+// joined road included, so a walk that still has to take one says so.
+std::vector<RouteLegSpan> LegsWalkedAtDeath(std::vector<RouteLegSpan> const& legs,
+                                            std::vector<RoutePoint> const& route,
+                                            std::uint32_t cursorAt, std::time_t steppedAt,
+                                            std::time_t now, float x, float y,
+                                            DiedOnLegLimits const& limits);
+
+// What walking the leg `from`-`to` (either direction) costs this walker on top
+// of its distance at `now`: `priceYards` while it is remembered, else 0.
+float DiedOnLegPrice(std::uint32_t from, std::uint32_t to, std::vector<DiedOnLeg> const& died,
+                     std::time_t now, DiedOnLegLimits const& limits);
+
+// How many legs of a returned route (its spans, joined road included) are
+// remembered deaths at `now`.
+std::uint32_t DiedOnLegsOnRoute(std::vector<RouteLegSpan> const& legs,
+                                std::vector<DiedOnLeg> const& died, std::time_t now);
+
+// How many remembered legs are still priced at `now`.
+std::uint32_t DiedOnLegsHeld(std::vector<DiedOnLeg> const& died, std::time_t now);
+
+// WHETHER A WALK TO A CREATURE FOLLOWS THE WALKER'S PRICED ROUTE (#1228). A
+// walk to a creature (a trainer, a vendor) is handed whole to upstream's
+// mover, which walks its own path and never asks the survey or its prices, so
+// the trainer walk after a death went back down the leg that killed. While the
+// walker holds any died-on leg it is stepped along the survey route planned
+// for it, which prices that leg, and the creature is handed over when the
+// route is spent. A place walk is always routed, so this is false for it, and
+// false for a walker that holds nothing, which keeps every other creature walk
+// exactly as it was.
+bool SteerCreatureWalkAlongRoute(bool creatureAim, std::uint32_t diedOnLegsHeld);
 
 // ------------------ a staging walk that is measured rather than routed (#342) --
 //
@@ -14852,6 +15340,16 @@ struct CastHoldFacts
     bool hasStay{false};    // the strategy whose action stands a bot still
     bool hasFollow{false};  // moved by the party rather than by its own drive
     bool hasNewRpg{false};  // the self-drive: relevance 11, outranks everything
+    // The strategy that lets CheckMountStateAction act at all (its isUseful
+    // returns false for an unmounted bot without it), and so the SOURCE of
+    // every re-mount mid-hold (#1229). Undoing a mount after it lands, every
+    // poll, lost a hearth cast every time: the member was back on the mount
+    // before the next cast could be driven.
+    bool hasMount{false};
+    // The hold is for a cast. A staging hold leaves the mount alone, the
+    // same way it leaves the stand state alone, because a party waiting at a
+    // door is not about to cast anything.
+    bool readyToCast{false};
 };
 
 // What the hold changes, and therefore exactly what the release owes back. A
@@ -14864,6 +15362,7 @@ struct CastHoldPlan
     bool addStay{false};
     bool dropFollow{false};
     bool dropNewRpg{false};
+    bool dropMount{false};  // suspended for the hold, restored by the release
 };
 
 // The plan, given what is there.
@@ -18156,6 +18655,12 @@ constexpr float RAID_ASSEMBLE_YARDS = 40.f;
 // wait the raid goes with whoever is there, and the log names who was not.
 constexpr long RAID_FORM_WAIT_SECONDS = 2 * 60;
 constexpr long RAID_ASSEMBLE_WAIT_SECONDS = 15 * 60;
+// A raider still on another continent is on a boat or a zeppelin with a long
+// road behind it, so ASSEMBLE waits this much longer while any raid member in
+// the world stands on a map that is neither the door's outside map nor its
+// inside map (wow-overseer#765). Bounded, so one lost seat cannot hold forty.
+constexpr long RAID_ASSEMBLE_CROSSING_EXTRA_SECONDS = 30 * 60;
+long RaidAssembleWaitSeconds(unsigned awayOnOtherMap);
 constexpr long RAID_ENTER_WAIT_SECONDS = 3 * 60;
 
 // -- inside: HOLD, CLEAR, RECOVER (#640) --------------------------------------
@@ -18245,6 +18750,9 @@ struct RaidRunFacts
     // The same count without the head, taken in the same pass, so ENTER's
     // "everyone else has crossed" never subtracts a head that was not counted.
     unsigned othersAssembled{0};
+    // Raid members in the world on a map that is neither the door's outside
+    // map nor its inside map: they still have a crossing to make (#765).
+    unsigned awayOnOtherMap{0};
     // Raid members on the inside map.
     unsigned inside{0};
     bool headAssembled{false};
@@ -18271,6 +18779,26 @@ struct RaidRunFacts
     bool stallRegroup{false};
     // Every encounter the instance script keeps is done.
     bool cleared{false};
+
+    // THE WIPE LOOP GUARD (#1165). After a wipe the run does not walk the party
+    // back in while members still carry Resurrection Sickness (they only carry
+    // it once the spirit healer revived them outside, so the hold is read in
+    // RECOVER with nobody dead inside), and a second wipe of the same run at
+    // the same place inside 600 s ends the attempt instead of a third walk-in.
+    std::uint32_t wipes{0};          // wipes already on the run's book
+    std::time_t lastWipeAt{0};       // epoch seconds of the previous wipe (0 = none)
+    bool samePlace{false};           // this wipe is at the same place as the last
+    bool membersSick{false};         // members still carry Resurrection Sickness
+    std::string graveyard;           // the graveyard the party would revive at
+    std::time_t now{0};              // this poll's epoch seconds
+
+    // AN ATTEMPT ALREADY ENDED, STILL LETTING GO (#1201). The wipe rule above
+    // ends an attempt with a release, and the release keeps the raid while a
+    // living member is still inside (up to 10% can be, RAID_WIPE_PCT being
+    // 90). Without this the next poll saw RECOVER again and walked the dead
+    // back in. Set by the adapter from the poll whose release did not finish
+    // until the one whose release does.
+    bool attemptEnding{false};
 };
 
 struct RaidRunStep
@@ -18278,6 +18806,7 @@ struct RaidRunStep
     RaidRunPhase phase{RaidRunPhase::Idle};
     bool form{false};         // convert, invite and seat this poll
     bool aimStaging{false};   // the head walks to the staging point
+    bool aimSeats{false};     // every other raider in the world walks there too (#765)
     bool aimDoor{false};      // the head walks onto the door
     bool knockMembers{false}; // knock every member standing in the door
     bool knockHead{false};    // and the head, who goes last
@@ -18295,6 +18824,75 @@ struct RaidRunStep
 
 // Is the raid wiped, by RAID_WIPE_PCT? See that constant.
 bool RaidWiped(RaidRunFacts const& facts);
+
+// THE RELEASE OF AN ENDED ATTEMPT WAITS, BUT NOT FOREVER (#1222). The release
+// keeps the raid while anybody is on the raid map, because a disband there is
+// a forced eviction from the instance. Nothing walks a living survivor out (up
+// to 10% can be standing, RAID_WIPE_PCT being 90, a feign-death hunter for
+// one), so without a bound the order stalls until that member dies or leaves.
+// From the poll whose release first did not finish (endingSince, 0 = none), the
+// wait is RAID_RELEASE_WAIT_SECONDS; after that the raid is disbanded with the
+// survivor inside, and the core's eviction puts the survivor out.
+constexpr long RAID_RELEASE_WAIT_SECONDS = 2 * 60;
+bool RaidReleaseDisbandsAnyway(std::time_t endingSince, std::time_t now);
+
+// THE WIPE BOOK (#1165). The adapter keeps three things about a run's wipes:
+// how many, when the last one was, and on which map. RaidWipeFacts copies them
+// into a poll's facts (samePlace: a wipe is on the book and it was on the
+// door's map); RaidRunCountsWipe says whether this poll's step is a NEW wipe,
+// which is only the move into RECOVER, never a later RECOVER poll that still
+// sees the same corpses inside.
+void RaidWipeFacts(RaidRunFacts& facts, unsigned wipes, std::time_t lastWipeAt,
+                   std::uint32_t lastWipeMap, std::uint32_t doorMap, std::time_t now);
+bool RaidRunCountsWipe(RaidRunPhase current, RaidRunStep const& step,
+                       RaidRunFacts const& facts);
+
+// THE SAME RULE, AND THE SAME HOLD, FOR BOTH COORDINATORS (#1201). A run that
+// wipes twice at the same place inside WIPE_LOOP_SECONDS ends the attempt
+// rather than walking back in, and the next attempt does not open while a
+// member still carries Resurrection Sickness after a wipe. The sickness hold
+// outside RECOVER is bounded by WIPE_SICK_HOLD_MAX_SECONDS from the last wipe,
+// so a sickness picked up somewhere else long after cannot hold a run.
+constexpr std::time_t WIPE_LOOP_SECONDS = 600;
+constexpr std::time_t WIPE_SICK_HOLD_MAX_SECONDS = 1800;
+constexpr std::uint32_t RESURRECTION_SICKNESS_AURA = 15007;
+
+// The family coordinator's wipe book (#1201). The raid run keeps its book on
+// its own state; a family's coordinator state is replaced wholesale at the end
+// of every run, so this book is kept beside it, per leader, and survives that.
+struct DungeonWipeBook
+{
+    unsigned wipes{0};               // runs ended 'wipe', in all
+    std::time_t lastWipeAt{0};       // when the last of them ended (0 = none)
+    std::uint32_t lastWipeMap{0};    // and on which map
+    std::time_t endedAt{0};          // when a repeat wipe ended the attempt (0 = never)
+    std::uint32_t endedMap{0};       // and on which map
+    bool holdSaid{false};            // the IDLE hold line was said for this ending
+    bool adoptionHoldSaid{false};    // and the refused-adoption line (#1223), on its own
+};
+
+// Books a family run that ended 'wipe' on `mapId` at `now`. True when it is a
+// second wipe on the same map inside WIPE_LOOP_SECONDS of the one before: the
+// attempt ends and the campaign does not walk straight back in.
+bool DungeonWipeBookEndsAttempt(DungeonWipeBook& book, std::uint32_t mapId, std::time_t now);
+
+// Whether IDLE holds a new run on `mapId` after an attempt there was ended by a
+// repeat wipe: for WIPE_LOOP_SECONDS from that ending, and after it for as long
+// as a member still carries Resurrection Sickness, up to
+// WIPE_SICK_HOLD_MAX_SECONDS. Another dungeon is never held.
+bool DungeonWipeHoldsRunStart(DungeonWipeBook const& book, std::uint32_t mapId,
+                              bool membersSick, std::time_t now);
+
+// Whether IDLE refuses to ADOPT a run it finds a member already inside on
+// `mapId` (#1223). Adoption is the other way back into a held attempt: a ghost
+// that runs its corpse back through the portal is revived inside, and adopting
+// it at STAGED_INSIDE or CLEARING resumes the run at the same pull, which is
+// the loop the hold exists to end. So the same hold refuses it. A cleared
+// instance (EXIT) is still adopted, because that adoption only walks the
+// member out and starts nothing.
+bool DungeonWipeHoldsAdoption(DungeonWipeBook const& book, std::uint32_t mapId,
+                              bool membersSick, std::time_t now,
+                              DungeonRunAdoptPhase adoptAt);
 
 // A raid seat is due for repair when its lowest wearable item is below the
 // configured floor. An item with no maximum durability is not part of the
@@ -19659,6 +20257,11 @@ constexpr char const* GroundRefused    = "the ground toward the mailbox does not
 // served, and a character leaves on its own feet, its hearthstone or a boat.
 // A random teleport is not counted on: a natural guild member never gets one.
 constexpr char const* ExpansionContinent = "character stands in Outland or Northrend, outside the classic world";
+// Teldrassil is an island on map 1 (AcrossTeldrassilShore): every destination
+// left was across the water from where the walker stands, and a walk does not
+// take the Rut'theran boat, so it holds rather than swim (#1206). Worth asking
+// again: a cross-to-map row takes the boat, and then the walk is on one shore.
+constexpr char const* AcrossTheWater   = "the destination is across the water from Teldrassil; the walk holds for the Rut'theran boat rather than swim";
 
 // Endings of a walk that started.
 constexpr char const* EnteredCombat    = "entered combat on the way to the mailbox";
@@ -20308,6 +20911,73 @@ char const* SpawnWalkFirstLegRefusal(bool creatureSpawn, bool probeFoundStep, bo
 bool MayCraftNow(std::string const& job, bool inDungeonRun, bool alive, bool inCombat,
                  bool moving);
 
+// A LONE CRAFTER IN A ZONE THAT KEEPS KILLING IT (#1208). A character on job
+// 'craft' is away from its family and nothing walks it anywhere: on wow-dev,
+// in the 24 hours to 2026-10-27 23:52 UTC, Og (43) died 13 times alone in
+// Stranglethorn on that job, every row in combat with nothing moving it, and
+// was left standing there after each revival. So its own solo deaths are
+// counted per zone, and at CRAFT_LONE_DEATH_LIMITS.deaths inside the window it
+// is not left idle there: it hearths to its bind (an innkeeper, so a town with
+// guards), and while it cannot, its craft step is deferred. A death while
+// grouped is the family's to answer, not this rule's, and is not counted.
+struct CraftLoneDeath
+{
+    int64_t at{0};
+    uint32_t mapId{0};
+    uint32_t zoneId{0};
+    bool craftJob{false};
+    bool grouped{false};
+};
+
+struct CraftLoneDeathLimits
+{
+    unsigned deaths{2};
+    int64_t windowSeconds{60 * 60};
+};
+constexpr CraftLoneDeathLimits CRAFT_LONE_DEATH_LIMITS{};
+
+// How many of `deaths` were on job 'craft', not grouped, in this zone of this
+// map, inside the window ending at `now`.
+unsigned CraftLoneDeathsInZone(std::vector<CraftLoneDeath> const& deaths, uint32_t mapId,
+                               uint32_t zoneId, int64_t now,
+                               CraftLoneDeathLimits const& limits = CRAFT_LONE_DEATH_LIMITS);
+
+// Drop every death older than the window, so the record stays the size of the
+// deaths that can still count.
+void PruneCraftLoneDeaths(std::vector<CraftLoneDeath>& deaths, int64_t now,
+                          CraftLoneDeathLimits const& limits = CRAFT_LONE_DEATH_LIMITS);
+
+enum class CraftLoneDeathStep : uint8_t
+{
+    Stay,    // not this rule's: another job, grouped, too few deaths, or safe
+    Hearth,  // use the hearthstone: its bind is an inn, under guards
+    Defer,   // no hearth to use now: the craft step waits, nothing is cast
+};
+
+struct CraftLoneDeathFacts
+{
+    std::string job;
+    bool grouped{false};
+    bool alive{true};
+    // In an inn or a city (the core's resting flag): under guards already.
+    bool resting{false};
+    // A hearthstone, off cooldown, with no cast of it already in flight.
+    bool hearthReady{false};
+    // CraftLoneDeathsInZone for the zone it stands in now.
+    unsigned deathsHere{0};
+};
+
+// RULES, IN THIS ORDER: another job, grouped, or fewer than `limits.deaths`
+// deaths here is Stay. Resting is Stay: it is already somewhere safe. Dead is
+// Defer: nothing can be cast, and the craft waits for the revival. A ready
+// hearthstone is Hearth. Otherwise Defer, and the next poll asks again.
+CraftLoneDeathStep DecideCraftLoneDeaths(CraftLoneDeathFacts const& facts,
+                                         CraftLoneDeathLimits const& limits =
+                                             CRAFT_LONE_DEATH_LIMITS);
+
+// The reason the log line names, one short phrase per step.
+char const* CraftLoneDeathStepWord(CraftLoneDeathStep step);
+
 // A MOUNTED CRAFTER IS TAKEN OFF ITS MOUNT FIRST. Spell::CheckCast refuses a
 // tradeskill cast on a ground mount with SPELL_FAILED_NOT_MOUNTED (64); a
 // client sends CMSG_CANCEL_MOUNT_AURA before the cast, a bot does not. On
@@ -20332,6 +21002,157 @@ bool CraftDismountsFirst(bool mounted, bool inFlight);
 constexpr unsigned SPELL_FOCUS_COOKING_FIRE = 4;
 constexpr unsigned SPELL_BASIC_CAMPFIRE = 818;
 unsigned FocusLighterSpell(unsigned requiresSpellFocus);
+
+// ANVIL, HAMMER: THE TWO THINGS A WORN BLACKSMITHING RECIPE NEEDS (#524).
+//
+// Read from the spell data, not from a guide: Runed Copper Belt (2666) and
+// every worn recipe after it carry RequiresSpellFocus 1, "Anvil", and
+// RequiredTotemCategoryID 162, "Blacksmith Hammer". Neither is an equipped
+// weapon: the core's CheckCast asks Player::HasItemTotemCategory, which
+// looks at what is worn AND what is in the bags (PlayerStorage.cpp), so a
+// hammer in a bag is enough and nothing the character wields is touched.
+// No worn recipe carries an EquippedItemClass. An Anvil is a world spawn,
+// gameobject type 8 (GAMEOBJECT_TYPE_SPELL_FOCUS) with Data0 (focusId) 1;
+// Data1 is the 10 yard reach of the focus, not its id.
+constexpr unsigned SPELL_FOCUS_ANVIL = 1;
+constexpr unsigned TOTEM_CATEGORY_BLACKSMITH_HAMMER = 162;
+constexpr unsigned ITEM_BLACKSMITH_HAMMER = 5956;
+
+// Is this focus a world object the crafter is WALKED to? An Anvil only. A
+// Cooking Fire is lit where the crafter stands (FocusLighterSpell); a Forge
+// and everything else is left to the refusal it always got.
+bool FocusIsWalkedTo(unsigned requiresSpellFocus);
+
+// The item a family buys for a tool category, or 0 when none is known. The
+// operator's decision (#524): the Blacksmith Hammer is bought, kept in the
+// crafter's own bank, and taken out to craft.
+unsigned ToolItemForTotemCategory(unsigned totemCategory);
+
+// A MATERIAL REQUEST FOR A REAGENT (#1099). DriveCraft skips a craft whose
+// reagents the crafter does not hold; the skip is the only moment anything
+// knows a crafter is short, so it writes a `material-request` event the site
+// routes to a gatherer or a buyer. The event says how many the crafter is
+// SHORT, not how many the recipe needs: a crafter holding 2 of 6 bars asks
+// for 4. 0 means not short, and nothing is asked.
+unsigned ReagentShortBy(unsigned need, unsigned have);
+
+// The event's detail: "short 4x Copper Bar (needs 6, has 2)".
+std::string MaterialRequestDetail(unsigned need, unsigned have, std::string const& itemName);
+
+// AT MOST ONE OPEN REQUEST per character, recipe and reagent. A request opens
+// when a skip for that reagent writes its event and stays open while the
+// crafter is still short, so the poll that skips the same craft a minute later
+// writes nothing. It closes the first time the crafter holds enough of that
+// reagent for that recipe; a crafter short again after that asks again. Kept
+// in memory on the world thread: a restart forgets what is open, which fails
+// toward asking once more rather than never.
+class OpenMaterialRequests
+{
+public:
+    // True when no request is open for this key: the caller writes the event
+    // and the request is now open. False while one is already open.
+    bool Open(std::string const& character, unsigned recipe, unsigned reagent);
+    // The crafter holds enough of this reagent for this recipe again.
+    void Close(std::string const& character, unsigned recipe, unsigned reagent);
+    bool IsOpen(std::string const& character, unsigned recipe, unsigned reagent) const;
+    std::size_t Size() const { return _open.size(); }
+
+private:
+    struct Key
+    {
+        std::string character;
+        unsigned recipe = 0;
+        unsigned reagent = 0;
+        bool operator<(Key const& other) const
+        {
+            if (character != other.character)
+                return character < other.character;
+            if (recipe != other.recipe)
+                return recipe < other.recipe;
+            return reagent < other.reagent;
+        }
+    };
+    std::map<Key, bool> _open;
+};
+
+// WHERE THE TOOL A RECIPE NEEDS IS, AND WHAT THE CRAFT DRIVE DOES ABOUT IT.
+//   NotNeeded / Carried  -> Cast: nothing to fetch.
+//   Banked, banker here  -> Withdraw, through the bank verb's own executor.
+//   Banked, no banker    -> WalkToBanker, only on job 'craft': a family on a
+//                           campaign job crafts where it waits and is never
+//                           walked off by the craft drive. Otherwise Wait.
+//   Missing              -> Request: a material request for the tool, which
+//                           the planner answers by buying it. Never conjured.
+enum class CraftToolPlace : uint8_t
+{
+    NotNeeded,
+    Carried,
+    Banked,
+    Missing,
+};
+enum class CraftToolStep : uint8_t
+{
+    Cast,
+    Withdraw,
+    WalkToBanker,
+    Wait,
+    Request,
+};
+CraftToolStep CraftToolStepFor(CraftToolPlace place, bool bankerInReach, bool mayWalk);
+char const* CraftToolStepWord(CraftToolStep step);
+
+// IS THE TOOL PUT BACK IN THE BANK NOW? Only a tool in the bags (never one that
+// is worn), only for a member a planned recipe has needed it for (a craft
+// errand of theirs named a recipe that needs the tool, wow-overseer#1515),
+// only when no standing craft errand still needs it, only with a banker in
+// reach and the character able to bank (alive, out of combat, not in flight,
+// not trading). Nobody is walked to a banker to put it back: it goes back the
+// next time the character stands at one. A tool no planned recipe needed is
+// not the craft drive's: the planner skips every Anvil recipe today, and an
+// engineer's hammer is not banked out from under the next errand.
+bool CraftToolGoesBack(bool inBags, bool planned, bool stillNeeded, bool bankerInReach, bool able);
+
+// A WORLD SPAWN OF A SPELL FOCUS, as the adapter reads it out of the
+// gameobject spawn table.
+struct FocusSpawn
+{
+    unsigned mapId{0};
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+};
+
+// How far the craft drive walks a crafter to an Anvil: a town, not a journey.
+// Zones are not levels and travel does not know that (AGENTS.md), so an Anvil
+// further than this is not walked to and the refusal stands.
+constexpr float CRAFT_FOCUS_WALK_LIMIT_YARDS = 400.f;
+// Within this of the nearest Anvil's spawn the crafter is already at it: the
+// focus reaches 10 yards and arrival at a place is 5. A refusal there is not
+// fixed by walking again, so it stands rather than looping a walk.
+constexpr float CRAFT_FOCUS_STANDING_YARDS = 8.f;
+
+// The index of the nearest spawn on `mapId` within `limitYards` (in the plane)
+// of (x, y), or -1 when there is none.
+int NearestFocusSpawn(std::vector<FocusSpawn> const& spawns, unsigned mapId, float x, float y,
+                      float limitYards);
+
+// WHAT A FOCUS REFUSAL LEADS TO. `nearestYards` is the plane distance to the
+// nearest spawn within the walk limit, negative when there is none.
+//   not walked to, or not job 'craft'   -> Stand (the refusal stands)
+//   no spawn within the limit           -> NoneNear
+//   within CRAFT_FOCUS_STANDING_YARDS   -> Stand (already there)
+//   otherwise                           -> Walk
+enum class CraftFocusStep : uint8_t
+{
+    Stand,
+    NoneNear,
+    Walk,
+};
+CraftFocusStep CraftFocusStepFor(bool walkedTo, bool mayWalk, float nearestYards);
+
+// The travel aim for a focus spawn, `at:<map>:<x>,<y>,<z>` in whole yards so it
+// fits the 32 character travel column.
+std::string FocusSpawnAim(FocusSpawn const& spawn);
 
 
 // A TRADE OPENED TO A SELFBOT HEAD IS ANSWERED LIKE A PERSON WOULD. mod-playerbots'
@@ -20394,6 +21215,38 @@ constexpr char const* RealmFull       = "the realm has as many far walks under w
 // Worth asking again later: the budget and the realm ceiling move with the
 // clock; the map does not.
 bool FarWalkRefusalRetryable(std::string const& reason);
+
+// ----------------------- transient or permanent: the field the bridge reads --
+//
+// `retryable` on a walk row is true for walls that merely move with the
+// character (too far, the ground, every ending), which is not the same as
+// "worth asking again soon": the bridge string-matched reasons to tell a wait
+// from a stop. `transient` is that answer, decided here and written on the row
+// beside `retryable` (which stays, for compatibility). True only for a wall
+// that clears by itself within moments: the character is mid-logout, not yet
+// in the world, on a flight path, in combat (before or on the way), or held by
+// a walk or a verb that will end. False for everything else, including a
+// reason this table does not know, so a new refusal is permanent until someone
+// decides otherwise.
+struct WalkRefusalRow
+{
+    char const* family;   // "mailbox", "errand", "spawn" or "far"
+    char const* reason;   // the literal the module writes
+    bool ending;          // true for a walk that started and was abandoned
+    bool transient;
+};
+
+// Every walk refusal and abandonment literal the module can write. A test
+// scrapes the namespaces above and fails when a literal is missing here.
+std::vector<WalkRefusalRow> const& WalkRefusalCatalogue();
+
+// The row's `transient`; false for a reason the catalogue does not hold.
+bool WalkRefusalTransient(std::string const& reason);
+
+// The checked-in fixture, byte for byte: every row shape and reason with its
+// flags. fixtures/walk_refusals.json is this text; a test fails when it is
+// stale. ASCII only, stable order.
+std::string WalkRefusalFixturesJson();
 
 // THE BUDGET GATE. `startsForBot` are the times (seconds) this bot started a far
 // walk, `now` the time now, `underWay` the far walks the realm has running.
@@ -20515,10 +21368,28 @@ RouteLimits FarWalkRoadLimits();
 //     held where it stands with the family, and ask again;
 //   * otherwise the errand is refused, and the writer of the aim learns why.
 //
-// NOT JUDGED HERE, ON PURPOSE. A catch-up walk has its own leg rule (#697) and a
-// live dungeon run's walks are the run's; neither is this decision's to stop.
-// An aim at a creature is not judged either: ResolveTravelTarget already reads
-// the line to it before it is chosen (#300), and it has no planned road.
+// NOT JUDGED HERE, ON PURPOSE. A member's own catch-up walk has its own leg rule
+// (#697) and a live dungeon run's walks are the run's; neither is this
+// decision's to stop.
+//
+// AND WHAT #1209 ADDED, MEASURED 2026-10-18 TO 2026-10-27. The road check held
+// for a day and then 55 family deaths came back on the same road, levels 41 to
+// 48, nearly all of them members the check never judged. Two walks were let
+// through:
+//
+//   * THE LEADER GOING BACK FOR A MEMBER. That walk rides the catch-up lease,
+//     so the catch-up exclusion above let it through, and it is the walk the
+//     whole family follows: on 2026-10-25 the leader was sent back 13,044
+//     yards for a member in the south, the family behind him, and twelve deaths
+//     in Burning Steppes followed in sixteen minutes. It is the family's walk,
+//     not a lone member's, so it is judged here like any other (`leaderFetch`).
+//   * AN AIM AT A SPAWN (a vendor, a trainer). ResolveTravelTarget reads the
+//     line to it at the WALKER's level when it is chosen (#300), but the family
+//     behind the walker is younger. A long one is judged here too, along the
+//     straight line it is walked, at the youngest member's level (`spawnAim`).
+//
+// A follower is never judged on its own: it walks where its leader walks, so
+// judging every walk the leader is sent down is what holds the follower to it.
 
 // A walk shorter than this is not a journey and is walked as before.
 // TRAVEL_FLIGHT_MIN_YARDS: the distance at which this module already calls a
@@ -20535,8 +21406,14 @@ struct ErrandRoadFacts
     float walkYards{0.f};
     // The aim is a place (`at:` or `trigger:`), which is what has a planned road.
     bool placeAim{false};
+    // The aim is a spawn (a vendor, a trainer): its road is the straight line
+    // it is walked along (#1209).
+    bool spawnAim{false};
     // A catch-up walk (#697 judges it) or a live run's walk (the run's).
     bool catchUp{false};
+    // The catch-up walk is the LEADER going back for a member, with the family
+    // behind him. Judged, because it is the family's walk (#1209).
+    bool leaderFetch{false};
     bool liveRun{false};
     // JudgeRoute of the planned road from where the walker stands, read at the
     // youngest walking member's level under FarWalkRoadLimits. Unread is
@@ -20558,12 +21435,22 @@ enum class ErrandRoadStep : std::uint8_t
     Refuse,         // nothing carries it there but the road: the errand is refused
 };
 
+// Whether this walk is one the road decision judges at all, before its road is
+// read: a long walk to a place or a spawn, not a member's own catch-up (unless
+// it is the leader going back for a member), not a live run's walk. The module
+// reads the road only when this says yes; the road itself is not consulted.
+bool ErrandRoadJudges(ErrandRoadFacts const& facts);
+
 // THE ORDER IS THE PREFERENCE, and a flight is not in it because it is asked
 // before this is.
 ErrandRoadStep DecideErrandRoad(ErrandRoadFacts const& facts);
 
 // "walk", "hearth", "wait for hearth", "refuse".
 char const* ErrandRoadStepWord(ErrandRoadStep step);
+
+// Which walk was judged, for the log line that says the answer: "the leader
+// going back for a member", "a walk to a spawn", or "a walk to a place".
+char const* ErrandRoadWalkWord(ErrandRoadFacts const& facts);
 
 // The refusal recorded against the aim, and said to whoever wrote it.
 constexpr char const* ErrandLethalRoad =
@@ -20696,6 +21583,13 @@ struct RaidTimelineSnapshot
     unsigned skips{0};        // `dc skip`s, in all
     bool mainTankMarked{false};
     bool cleared{false};
+    // WHO REACHED THE DOOR (wow-overseer#765, #1207): taken on the poll that
+    // ends ASSEMBLE, so the ASSEMBLE -> ENTER row says "N of M raiders at the
+    // door". `atDoor` is the raid members within RAID_ASSEMBLE_YARDS of the
+    // staging point, the head included; `inRaid` is the raid's members. Both
+    // zero until ASSEMBLE has ended, and then the row says nothing extra.
+    unsigned atDoor{0};
+    unsigned inRaid{0};
 };
 
 std::vector<RunTimelineEvent> RaidTimelineEvents(RaidTimelineSnapshot const& before,
@@ -20868,16 +21762,38 @@ bool WarriorNeedsMeleePursuit(uint8_t classId, bool tanks, bool inCombat,
 struct TankPursuitFacts
 {
     uint8_t classId{0};
-    bool tanks{false};          // "tank" is in the combat engine
+    bool tanks{false};          // TankStrategyListedName is in the combat engine
     bool inCombat{false};
     bool inMeleeRange{false};   // of its victim, or its selection with none
     bool onInstanceMap{false};  // Map::Instanceable (dungeon, raid, battleground)
     bool heldStill{false};      // any overseer hold, revival hold included
     bool mounted{false};
     bool alive{true};
+    bool hasVictim{true};       // a victim, or a selection, it may attack (#1212)
 };
 
 bool TankMayPursue(TankPursuitFacts const& facts);
+
+// THE NAME A CLASS'S TANK STRATEGY IS LISTED UNDER (#1212). `tank` is what the
+// combat engine is ASKED for, and mod-playerbots resolves it per class: its
+// strategy factories map `tank` to the class's own tank strategy, and the
+// engine lists a strategy by that strategy's getName(), not by the word that
+// created it. So after `+tank` a warrior or a paladin lists `prot`, a death
+// knight `blood` and a druid `bear`; only a class whose tank strategy is itself
+// called `tank` lists `tank`. Asking the live list for `tank` therefore answered
+// no for every warrior tank there is, which kept the #1049 pursuit from ever
+// running and had the tank-strategy drive hand `+tank` to protection warriors
+// on every poll and report that it did not take.
+std::string TankStrategyListedName(uint8_t classId);
+
+// WHY A WARRIOR TANK OUT OF REACH IN THE OPEN WORLD IS NOT CHASED (#1212). Empty
+// when there is nothing to say: the pursuit runs, the character is not a warrior
+// tank, is out of combat, is in melee reach, or is on an instance map (that one
+// is #1055's gate working as meant, and a line per dungeon fight would bury the
+// rest). Otherwise the reason, so the drive can say once per fight why a tank in
+// combat out of reach is left where it is, and a silence in the log means "never
+// out of reach" rather than "asked and refused".
+std::string TankPursuitWithheld(TankPursuitFacts const& facts);
 
 // A TANK HOLDING A TWO-HANDER IS MEASURED THE OTHER WAY ROUND. The sweep scores
 // a two-hander against the PAIR it would replace (#14), and it scores a shield
@@ -21114,17 +22030,20 @@ constexpr uint32_t OUTLAND_MAP_ID = 530;
 constexpr uint32_t NORTHREND_MAP_ID = 571;
 
 // THE BLOOD ELF AND DRAENEI STARTING LANDS (#765). They stand on map 530,
-// but they are where those two races level from 1 to about 20, as a player
-// who rolls one does before taking the boat or the orb to the old world.
-// Reading the whole map as Outland left 42 guild members on the starting isles
-// at level 8, refused every errand. The zones, with their two capitals, where
-// those races' trainers are.
-constexpr uint32_t EVERSONG_WOODS_ZONE_ID = 3430;
-constexpr uint32_t GHOSTLANDS_ZONE_ID = 3433;
-constexpr uint32_t SILVERMOON_CITY_ZONE_ID = 3487;
-constexpr uint32_t AZUREMYST_ISLE_ZONE_ID = 3524;
-constexpr uint32_t BLOODMYST_ISLE_ZONE_ID = 3525;
-constexpr uint32_t THE_EXODAR_ZONE_ID = 3557;
+ // but they are where those two races level from 1 to about 20, as a player
+ // who rolls one does before taking the boat or the orb to the old world.
+ // Reading the whole map as Outland left 42 guild members on the starting isles
+ // at level 8, refused every errand. The zones, with their two capitals, where
+ // those races' trainers are.
+ constexpr uint32_t EVERSONG_WOODS_ZONE_ID = 3430;
+ constexpr uint32_t GHOSTLANDS_ZONE_ID = 3433;
+ constexpr uint32_t SILVERMOON_CITY_ZONE_ID = 3487;
+ constexpr uint32_t AZUREMYST_ISLE_ZONE_ID = 3524;
+ constexpr uint32_t BLOODMYST_ISLE_ZONE_ID = 3525;
+ constexpr uint32_t THE_EXODAR_ZONE_ID = 3557;
+ // The sea zones next to the starting isles on map 530. Members who cross to
+ // or from Azuremyst by boat stand on that shore and berth (#1157).
+ constexpr uint32_t VEILED_SEA_ZONE_ID = 3479;
 
 // Outland or Northrend, by the map alone. True for the starting lands too, so a
 // question that has a zone asks IsOutsideClassic instead.
@@ -21189,6 +22108,19 @@ struct ExitHearthFacts
     bool moving{false};
     bool pending{false};
     unsigned attempts{0};
+    // WHERE THE STONE LEADS (#1142). Measured on the dev realm 2026-10-20: a
+    // member hearthed out of Uldaman (map 70) to its bind on map 1 while the
+    // family stood on map 0, the continent the door lets out on; the bridge
+    // logged the family split for 76475 seconds. `doorMapId` is the map the
+    // exit door lets out on (the portal's outsideMapId) and `bindMapId` the
+    // member's hearthstone bind map. A stone bound on another map is withheld,
+    // the rule #1060 applied to HeldGroundFacts. `doorMapKnown` is false for the
+    // callers that are not leaving by a door (crossing, regroup, stranded),
+    // whose own rules already decided where the stone leads; they keep the old
+    // behaviour.
+    bool doorMapKnown{false};
+    uint32_t doorMapId{0};
+    uint32_t bindMapId{0};
 };
 
 enum class ExitHearthStep
@@ -21197,7 +22129,8 @@ enum class ExitHearthStep
     Cast,        // drive the hearth executor now
     StopFirst,   // moving: hold it still this poll, cast on a later one
     Waiting,     // a hearth is in flight, or combat has to end first
-    Impossible   // dead, no stone, stone on cooldown, or the attempts are spent
+    Impossible   // dead, no stone, stone on cooldown, the attempts are spent,
+                 // or the stone is bound off the door's map (#1142)
 };
 
 // How many casts one episode may ask of one character. A cast that never
@@ -21233,8 +22166,9 @@ ExitHearthStep ExitFailureHearthStep(ExitHearthFacts const& facts,
 char const* ExitHearthStepWord(ExitHearthStep step);
 
 // Why a member cannot hearth, in the words the log and the timeline use; empty
-// for a member that can, or is not inside.
-char const* ExitHearthImpossibleReason(ExitHearthFacts const& facts,
+// for a member that can, or is not inside. A stone bound off the door's map
+// names both maps and says it is withheld.
+std::string ExitHearthImpossibleReason(ExitHearthFacts const& facts,
                                        unsigned maxAttempts = EXIT_HEARTH_ATTEMPTS);
 
 // Whether a hearth is in play for the family: some member inside is being
@@ -21846,6 +22780,46 @@ struct GuildOutmatchedMark
 bool OutmatchedHere(GuildOutmatchedMark const& mark, int64_t now, uint32_t mapId,
                     uint32_t zoneId, uint32_t windowMinutes);
 
+// A guild death-spot hearth-out that was refused because the character was
+// moving, or that ended with the character still on the death map, is retried
+// with the character held still. `tries` counts retries already asked this
+// episode; `boundTries` is the ceiling. Returns Retry while a retry is in
+// order and tries < boundTries; GiveUp once the bound is spent or the refusal
+// cannot be waited out.
+enum class HearthOutRetry
+{
+    Retry,
+    GiveUp,
+};
+
+HearthOutRetry DecideHearthOutRetry(char const* refusal, bool stillOnDeathMap,
+                                    unsigned tries, unsigned boundTries);
+
+// A member whose hearth-out failed is kept out of the zone it died in until
+// it has left the map or the guild moves it. True when the hearth-out failed,
+// the member still stands in the death zone, and the guild has not moved it.
+bool KeepOutOfDeathZone(bool hearthOutFailed, bool stillInDeathZone,
+                        bool guildMovedIt);
+
+// A death-spot hearth-out that cannot be driven now: the member carries no
+// hearthstone, its stone is on cooldown, or this episode's tries are spent.
+// Its answer is the `hearthOutFailed` that KeepOutOfDeathZone takes, so a
+// member killed far above its level is held where it stands rather than
+// handed back to the drives that walk it toward the killer again.
+//
+// AND A HOLD THAT KEEPS ENDING AT ITS CEILING WITHOUT A CAST (#1229). Each hold
+// placed for this hearth-out that reached its ceiling with no cast started is
+// counted, and `ceilingReleases` in a row at or past `ceilingBound` is a
+// hearth-out that cannot succeed either: the member goes to the keep-out
+// instead of a new hold that ends the same way. Measured before this, one
+// member was held, re-mounted, released at the ceiling and held again eleven
+// times in five minutes and never cast once.
+constexpr unsigned HEARTH_HOLD_CEILING_RELEASES = 3;
+
+bool HearthOutCannotSucceed(bool hasStone, bool stoneOnCooldown, unsigned tries,
+                            unsigned boundTries, unsigned ceilingReleases = 0,
+                            unsigned ceilingBound = HEARTH_HOLD_CEILING_RELEASES);
+
 // "corpse_run", "spirit_healer", "wait", "ladder": the words written to
 // overseer_death.ghost_recovery and to the log.
 char const* GhostRecoveryWord(GhostRecovery choice);
@@ -22327,6 +23301,127 @@ NamedRecipeStep PlanNamedRecipe(bool known, bool onTrainerList, bool canTeach, u
 // "not_sold", "too_poor" ... for the log line.
 char const* NamedRecipeStepWord(NamedRecipeStep step);
 
+// THE PROOF LINE FOR A BOUGHT RANK OR RECIPE (mod-overseer#1124).
+// Written only after the read-back shows the character now holds what it paid
+// for, never when a walk is planned and never on a refusal. One shape for the
+// rank, the recipe bought with it and the recipe the roster names, so a search
+// for "trainer_purchase" finds every purchase and one check pins the wording:
+//
+//   overseer: trainer_purchase member='<name>' kind=<rank|recipe>
+//       skill=<trade> (<id>) spell=<id> '<spell name>' max_skill=<n>
+//       paid_copper=<n>
+//
+// `max_skill` is the character's ceiling in that trade after the sale and
+// `paid_copper` is what the purse lost, so a free grant reads as 0 and cannot
+// pass for a purchase. The refusal words above (not_sold, too_poor ...) are the
+// other half of the same story; docs/training-proof-lines.md lists both.
+std::string TrainerPurchaseLine(std::string const& member, char const* kind,
+                                std::string const& skillName, uint32_t skillId,
+                                uint32_t spellId, std::string const& spellName,
+                                uint32_t maxSkill, uint64_t paidCopper);
+
+// ------------------------------- a recipe manual bought from a vendor (#1098) --
+//
+// Some secondary-trade recipes are taught by a manual item a vendor sells (First
+// Aid's Heavy Silk Bandage, Cooking's Smoked Bear Meat), not by a trainer. The
+// roster names the manual and the vendor in `buy_recipe_item`, and
+// DriveRecipeManuals walks the character there, buys the manual through the buy
+// verb, uses it through the learn verb, and reads HasSpell back on a later poll,
+// because the learn is a 3000ms cast. These are the parts of that with no world
+// in them.
+
+// The `buy_recipe_item` column, "<item_template entry>:<creature_template
+// entry>". The vendor is part of the instruction: the character is sent to THAT
+// vendor for THAT manual, not to whichever vendor happens to stand nearest.
+struct RecipeManualErrand
+{
+    uint32_t itemEntry{0};
+    uint32_t vendorEntry{0};
+};
+
+// False for an empty column and for a malformed one (a side missing, not plain
+// digits, zero, or past uint32), with `out` reset either way. Digits are read
+// by hand rather than through std::stoul, so nothing here can throw.
+bool ParseRecipeManualErrand(std::string const& column, RecipeManualErrand& out);
+
+// How many times one manual is used before the errand is refused. A use the
+// learn verb refused for a passing reason (moving, mid-cast) never reached the
+// core and is tried again; a second that still teaches nothing is the item, and
+// asking a third time every poll is the retry loop the column exists to end.
+constexpr uint32_t RECIPE_MANUAL_MAX_USES = 2;
+
+// The refusal literals, written into the log line. No quote characters.
+namespace RecipeManualRefusal
+{
+constexpr char const* Malformed = "malformed buy_recipe_item: want <item entry>:<vendor entry>";
+constexpr char const* NotARecipe = "the item teaches no recipe when it is used";
+constexpr char const* NotSold = "the vendor does not sell the manual";
+constexpr char const* TooPoor = "the character cannot afford the manual";
+constexpr char const* UsedAndNotLearned =
+    "the manual was used and the recipe is still not known";
+}  // namespace RecipeManualRefusal
+
+// Everything the plan reads, as the adapter measured it this poll.
+struct RecipeManualFacts
+{
+    bool teachesRecipe{false};  // the item template teaches a recipe on use
+    bool knowsRecipe{false};    // HasSpell on that recipe
+    bool learning{false};       // a use is still casting or waiting to be read back
+    bool carriesManual{false};  // the manual is in the bags
+    uint32_t usesTried{0};      // uses this errand has asked for so far
+    bool vendorNearby{false};   // the named vendor is alive inside the arrival radius
+    bool vendorInReach{false};  // and inside the interact gate the core sells through
+    bool vendorSells{false};    // its list carries the manual for gold
+    uint64_t price{0};          // copper, reputation discount applied
+    uint64_t purse{0};          // copper the character holds
+};
+
+enum class RecipeManualStep : uint8_t
+{
+    Learned,  // the recipe is known: the errand is done
+    Refuse,   // say why and clear the column
+    Wait,     // a use is in flight; read it back next poll
+    Use,      // use the manual from the bags
+    Walk,     // claim a walk to the vendor
+    Approach, // close the last yards from the arrival radius to the interact gate
+    Buy,      // buy one manual from the vendor
+};
+
+struct RecipeManualPlan
+{
+    RecipeManualStep step{RecipeManualStep::Wait};
+    char const* refusal{""};  // one of RecipeManualRefusal when step is Refuse
+};
+
+// One poll of the errand. A known recipe ends it before anything else is asked;
+// a manual already in the bags is used rather than bought again; the vendor is
+// walked to, and then stepped up to, before its stock or price is judged,
+// because the core sells only inside the interact gate; and a manual that has been used and still taught nothing
+// is refused rather than bought again with the character's money.
+RecipeManualPlan PlanRecipeManual(RecipeManualFacts const& facts);
+
+// Does this refusal from the buy verb release the errand? Every refusal
+// BuyRefusalRetry calls Never, and two it calls otherwise that the errand cannot
+// outwait: a vendor that does not stock the manual, and a purse the core finds
+// short. Full bags, an out-of-stock vendor and a vendor out of range stand.
+bool ManualBuyRefusalReleases(std::string const& detail);
+
+// Does this refusal from the learn verb release the errand? Anything
+// LearnRefusalRetry does not call Later: the item, the skill and the bind are
+// not answered by waiting another poll.
+bool ManualUseRefusalReleases(std::string const& detail);
+
+// THE PROOF LINE FOR A MANUAL BOUGHT AND LEARNED, written once, only after
+// HasSpell reads the recipe back, and in the same family as
+// TrainerPurchaseLine so docs/training-proof-lines.md can list both:
+//
+//   overseer: manual_purchase member='<name>' item=<id> '<item name>'
+//       vendor=<entry> spell=<id> '<spell name>' paid_copper=<n>
+std::string ManualPurchaseLine(std::string const& member, uint32_t itemEntry,
+                               std::string const& itemName, uint32_t vendorEntry,
+                               uint32_t spellId, std::string const& spellName,
+                               uint64_t paidCopper);
+
 // "walk", "resting" ... for the log line.
 char const* TrainingStopStepWord(TrainingStopStep step);
 
@@ -22487,6 +23582,14 @@ bool RunRecoverySummonOpen(RunFailureFacts const& facts);
 // has reached `summonAfter`, and the summon rung has already been tried this
 // streak - or cannot be, because the door has no stone.
 bool RunRecoveryFinderOpen(RunFailureFacts const& facts);
+
+// THE LAST RESORT'S WORDS, FROM THE FACTS ALONE (issue 1141). The
+// module line and the heuristic text that names the same fact both build from
+// this, so they cannot drift: if the summon rung ran this streak it says so
+// with the count; if the door has no stone it says no summon was possible
+// here and carries the summonNote; if a stone stands but nobody qualifies to
+// click it, it says that.
+std::string FinderLastResortReason(RunFailureFacts const& facts);
 
 // -- rung two: the summon at the door ----------------------------------------
 
@@ -23473,8 +24576,10 @@ constexpr float GUILD_RUN_RESTED_MANA_PCT = 80.f;
 constexpr unsigned GUILD_RUN_REST_MAX_SECONDS = 120;
 constexpr unsigned GUILD_RUN_REST_REARM_SECONDS = 45;
 constexpr unsigned GUILD_RUN_REGROUP_WAIT_SECONDS = 180;
-// A pause or resume the dungeon module refused is asked again after this long.
+// A pause or resume the dungeon module refused is asked again after this long,
+// and each refusal in a row doubles the wait, up to the cap (GuildRunHoldRetry).
 constexpr unsigned GUILD_RUN_HOLD_RETRY_SECONDS = 15;
+constexpr unsigned GUILD_RUN_HOLD_RETRY_MAX_SECONDS = 240;
 
 // One living member inside, read for the rest.
 struct GuildRunMemberShape
@@ -23519,6 +24624,11 @@ struct GuildRunHoldFacts
     unsigned restMaxSeconds{GUILD_RUN_REST_MAX_SECONDS};
     // False inside GUILD_RUN_REST_REARM_SECONDS of a rest that timed out.
     bool restRearmed{true};
+    // A living Priest, Paladin, Shaman or Druid of the run is inside: the read
+    // the stuck-revival drive makes for a corpse run (LivingResurrectorFor),
+    // and the dungeon module's own (DcRezRecovery::CanRecover). Without one the
+    // dungeon module refuses `dc pause resume` while a member lies dead.
+    bool livingResurrector{true};
 };
 
 enum class GuildRunHoldStep : std::uint8_t
@@ -23536,6 +24646,7 @@ enum class GuildRunHoldWhy : std::uint8_t
     Rested,        // every member is over its bar (or nothing is left to wait for)
     RestTimedOut,  // a rest ran GUILD_RUN_REST_MAX_SECONDS
     Dead,          // a body lies inside: the dungeon module's rez needs the brain
+    InCombat,      // a member stayed in combat for a rest's bound while held
 };
 
 struct GuildRunHold
@@ -23546,7 +24657,8 @@ struct GuildRunHold
 
 // ONE POLL of the hold. Nothing while the brain is not armed, while nobody is
 // alive inside (a hold outlives a wipe, so the first member raised does not
-// walk on alone), or while anybody fights. Hold while the living wait for
+// walk on alone), or while anybody fights (a held brain whose member stays in
+// combat for restMaxSeconds is released, why InCombat: #1185). Hold while the living wait for
 // ghosts (bounded), or when a member is under a trigger outside a timed-out
 // rest's cooldown; release when rested, or when the rest has run its bound.
 //
@@ -23559,7 +24671,36 @@ struct GuildRunHold
 // players drinks first, then raises its dead, then pulls. So with a body
 // inside, a group under a trigger rests (bounded as any rest), and the hold is
 // let go for the rez once the living are over their triggers.
+//
+// NO RESUME NOBODY CAN TAKE (mod-overseer#1140). The dungeon module refuses a
+// resume while a member lies dead and no living member can resurrect them. In
+// Blackfathom run 1189170 (2026-10-24) the hold let go for the body anyway and
+// the resume was refused 89 times in 82 minutes, every 15 s, while the corpse
+// run released the same member to a ghost about every 14 minutes. So with a
+// body inside and no living resurrector the hold is kept (why Dead) until the
+// corpse run's release takes the body out (its rez budget) and the ghost walks
+// back in. A rest under way is still a rest until its bound.
 GuildRunHold GuildRunHoldNext(GuildRunHoldFacts const& facts);
+
+// THE HOLD'S RETRY CLOCK. A refused pause or resume is not asked again for
+// GUILD_RUN_HOLD_RETRY_SECONDS, doubled for each refusal in a row up to
+// GUILD_RUN_HOLD_RETRY_MAX_SECONDS; an accepted one starts it again.
+struct GuildRunHoldRetry
+{
+    unsigned refusals{0};
+    std::time_t refusedAt{0};
+};
+
+// The wait after `refusals` refusals in a row: 0 for none, then 15, 30, 60,
+// 120, 240, 240, ...
+unsigned GuildRunHoldRetrySeconds(unsigned refusals);
+// May the hold be asked at `now`?
+bool GuildRunHoldMayAsk(GuildRunHoldRetry const& retry, std::time_t now);
+// A refusal at `now`: true when it is the first of a run of refusals, so the
+// reason is said once.
+bool GuildRunHoldRefused(GuildRunHoldRetry& retry, std::time_t now);
+// An accepted pause or resume: the refusals before it, and the clock is reset.
+unsigned GuildRunHoldAccepted(GuildRunHoldRetry& retry);
 
 // FOCUS FIRE ON A SKULL. In 39 of 45 Deadmines first wipes (2026-10-08 to
 // 2026-10-10) the group went down in one fight, and the tank died first in 32.
@@ -23665,6 +24806,27 @@ GuildRunResume ReadGuildRunResume(std::string const& result);
 // How long the next worldserver waits for a run's members to log back in.
 // The same quarter hour the stray pass has always given a leftover group.
 constexpr unsigned GUILD_RUN_ADOPT_SECONDS = 15 * 60;
+
+// HOW FAR BACK THE RESTART READS REACH (#1138). Both restart reads of a guild
+// finder row, RestoreGuildRunFinderDungeons and the DriveGuildRunStrays
+// adoption read, used to take only rows created in the last 3 hours. That
+// predates the boss-scaled ceiling: at the roll of 2026-10-24 a Blackfathom run
+// 12263 s inside, 4 of 7 bosses down and well inside its 14400 s ceiling, was
+// never read, and the claim sweep ended it. A run may live its map's ceiling
+// plus GUILD_RUN_PROGRESS_EXTENSION_SECONDS (the longest extension), and its
+// row is created before the group is formed and goes in, so the window is the
+// largest ceiling, plus that extension, plus GUILD_RUN_RESTART_MARGIN_SECONDS
+// for the time before it is inside. A row older than that is past every
+// ceiling and is not read.
+//
+// The largest ceiling: a seven-boss Blackfathom, 7 * 1800 + 1800 = 14400 s
+// (GuildRunCeilingForMap). The fifteen-boss Blackrock Depths wing row gets
+// 15 * GUILD_RUN_SECONDS_PER_BOSS = 13500 s. The test holds both under it.
+constexpr unsigned GUILD_RUN_LONGEST_CEILING_SECONDS = 7 * 30 * 60 + GUILD_RUN_CEILING_MARGIN_SECONDS;
+constexpr unsigned GUILD_RUN_RESTART_MARGIN_SECONDS = 30 * 60;
+constexpr unsigned GUILD_RUN_RESTART_WINDOW_SECONDS = GUILD_RUN_LONGEST_CEILING_SECONDS +
+                                                      GUILD_RUN_PROGRESS_EXTENSION_SECONDS +
+                                                      GUILD_RUN_RESTART_MARGIN_SECONDS;
 
 struct GuildRunAdoptFacts
 {
@@ -25123,7 +26285,26 @@ bool SitsOutOfRuns(FamilyStandin const* standin, std::string const& name);
 
 // May the arming drive open or touch a dungeon run on behalf of this character.
 // Never for the member sitting out: it is not the family's party any more.
-bool MayOpenRunFor(bool sittingOut);
+//
+// NOR FOR A MEMBER LENT TO A GUILD RUN (#1092). Measured 2026-10-23 to
+// 2026-10-27: every family dungeon run that stayed active with an empty member
+// list for over an hour was a healer its family had lent to a guild finder
+// run. The arming drive saw a roster character on an instance map and opened
+// a family run for it; the guild run's own clear was that run's heartbeat, so
+// it stayed active for the whole guild run (68 to 136 minutes) and ended
+// 'emptied' only when the member left. The guild run arms and ends its own
+// group, so the family's run table has nothing to say about it.
+bool MayOpenRunFor(bool sittingOut, bool lentToAGuildRun);
+
+// Does a character count as inside a dungeon run, for every drive that stands
+// down for one? Only on a dungeon map, and then when a family run row is open
+// on that map, or when the character is named by a guild run. A guild run
+// keeps its state in memory and writes no run row, so before #1092 the only
+// thing that stood the craft, lockpick, recipe-manual, quest and profession
+// drives down for a member lent to one was the empty family run the arming
+// drive wrongly opened for it. That run is no longer opened, so the guild run
+// has to be counted here instead.
+bool CountsAsInADungeonRun(bool onDungeonMap, bool activeRunOnMap, bool namedByAGuildRun);
 
 // The ended_reason of an open run whose leader sits out, naming the sit-out.
 std::string SitOutRunEndedReason(std::string const& leader);
@@ -25519,6 +26700,77 @@ struct CrossFacts
     unsigned atOnce{CROSS_AT_ONCE};
 };
 
+// TELDRASSIL IS AN ISLAND (wow-overseer#1401). It stands on map 1 with the rest
+// of Kalimdor, but the only road off it is the Rut'theran to Auberdine boat.
+// A `cross-to-map` row for a member on it was priced against the nearest
+// boat that names the destination map, the Menethil to Auberdine one, whose
+// berth lies across the water: the berth walk left the west shore, swam, and
+// the member drowned about once a minute. So the first leg of such a crossing
+// is the Rut'theran boat, as a same-map ride to the Auberdine stop, and the
+// asked-for map is crossed once the member is ashore there.
+constexpr std::uint32_t TELDRASSIL_MAP = 1;
+constexpr std::uint32_t TELDRASSIL_ZONE = 141;
+constexpr std::uint32_t DARNASSUS_ZONE = 1657;
+// The Auberdine stop, as a point of it (the flight master's, taxinodes node 26).
+constexpr float AUBERDINE_STOP_X = 6341.38f;
+constexpr float AUBERDINE_STOP_Y = 557.68f;
+
+// Whether this map and zone are on the island.
+bool OnTeldrassilIsland(std::uint32_t mapId, std::uint32_t zoneId);
+
+// A SAME-MAP WALK DOES NOT CROSS THE ISLAND'S SHORE (#1206). Teldrassil and the
+// Kalimdor mainland are both map 1, so a guild far walk, spawn walk or vendor
+// walk from the island to the mainland, or back, never becomes a cross-to-map
+// row and never takes the boat: it headed straight at its aim and swam until
+// fatigue drowned it, off the island's west coast, about twenty times a day.
+// True when `fromZone` (where the walker stands) and `toZone` (the
+// destination's zone, read off the map's area data) are on different sides of
+// the water. A zone the map could not name (0) is not on the island.
+bool AcrossTeldrassilShore(std::uint32_t mapId, std::uint32_t fromZone, std::uint32_t toZone);
+
+// THE SHORE CHECK READS A ZONE ONLY NEAR THE ISLAND (#1224). Reading the zone
+// of a point (Map::GetZoneId) loads that point's grid on the world thread:
+// terrain, vmap and mmap tiles. Asked of every mailbox, vendor or spawn
+// candidate on map 1, one Kalimdor walk loaded grids all over the continent.
+// The box is the island zone's own world map rectangle (WorldMapArea for zone
+// 141: x 8437.5 to 11831.25, y -1277.08 to 3814.58), widened by a margin so
+// every point of the island, its shore and the Rut'theran dock is inside it.
+// It reaches no mainland zone: Darkshore ends at x 7133, Winterspring at x
+// 8223, and Moonglade lies south of y -1381. A point outside it is off the
+// island without asking the map, which is what a zone of 0 already meant.
+constexpr float TELDRASSIL_BOX_MIN_X = 8437.5f - 250.0f;
+constexpr float TELDRASSIL_BOX_MAX_X = 11831.25f + 250.0f;
+constexpr float TELDRASSIL_BOX_MIN_Y = -1277.08f - 250.0f;
+constexpr float TELDRASSIL_BOX_MAX_Y = 3814.58f + 250.0f;
+
+// Whether (x, y) on this map lies in the box around Teldrassil.
+bool NearTeldrassil(std::uint32_t mapId, float x, float y);
+
+// AcrossTeldrassilShore for a destination at (x, y), calling `zoneAt()` for its
+// zone only when the destination is near the island. `fromZone` is the
+// walker's own zone, which the walker already carries and costs nothing.
+template <typename ZoneAt>
+bool AcrossTeldrassilShoreAt(std::uint32_t mapId, std::uint32_t fromZone, float x, float y,
+                             ZoneAt&& zoneAt)
+{
+    if (mapId != TELDRASSIL_MAP)
+        return false;
+    if (!NearTeldrassil(mapId, x, y))
+        return OnTeldrassilIsland(mapId, fromZone);
+    return AcrossTeldrassilShore(mapId, fromZone, zoneAt());
+}
+
+// The ride a `cross-to-map` row must take first: `first` is false for every
+// member off the island, for a ride row, and for a row naming the island's own
+// map, and the rest of the struct is then the request unchanged.
+struct IslandFirstLeg
+{
+    bool first{false};
+    CrossRequest leg;
+};
+IslandFirstLeg CrossIslandFirst(std::uint32_t mapId, std::uint32_t zoneId,
+                                CrossRequest const& request);
+
 // "" when the crossing may start; otherwise a CrossRefusal literal, the first
 // wall in the order the fields above are declared, the realm's cap last.
 char const* CrossGate(CrossFacts const& facts);
@@ -25590,6 +26842,31 @@ constexpr uint32_t HUNT_MAX_ATTACKERS = 2;
 // A hunt needs this many free bag slots to take a drop at all.
 constexpr uint32_t HUNT_MIN_FREE_BAG_SLOTS = 1;
 
+
+// DEATH MEMORY FOR VOLUNTARY PULLS (mod-overseer#151). Deaths were recorded
+// with their killer but nothing read them back, so a creature entry that had
+// killed a member twice in an hour was pulled again. This book holds the
+// session's creature deaths per entry. An entry that killed two members
+// (REPEAT_KILLER_DEATHS) within REPEAT_KILLER_WINDOW_SECONDS of each other is
+// listed, and stays listed for the rest of the session. It only decides
+// whether the module STARTS a fight; a member attacked by the entry fights
+// back as before, because nothing here is read on that path.
+constexpr uint32_t REPEAT_KILLER_DEATHS = 2;
+constexpr int64_t REPEAT_KILLER_WINDOW_SECONDS = 3600;
+
+struct CreatureDeathBook
+{
+    std::map<uint32_t, std::vector<int64_t>> deaths;  // entry -> death times
+    std::set<uint32_t> suppressed;
+};
+
+// Notes a death to `entry` at `now`. Entry 0 (a player or the environment) is
+// not a creature kind and is ignored. Returns true when the entry is listed.
+bool CreatureDeathNote(CreatureDeathBook& book, uint32_t entry, int64_t now);
+
+// True when `entry` is listed: the module does not start a fight with it.
+bool CreaturePullIsSuppressed(CreatureDeathBook const& book, uint32_t entry);
+
 bool IsHuntRow(std::string const& command);
 
 struct HuntRequest
@@ -25624,6 +26901,9 @@ constexpr char const* NoTarget      = "no living creature of the entry within re
 constexpr char const* TooHighLevel  = "the creature is too many levels above the character";
 constexpr char const* LowHealth     = "the character is below the health floor";
 constexpr char const* TooManyAdds   = "too many hostiles are already on the character";
+// The creature entry has killed a family member twice within an hour this
+// session (mod-overseer#151); the hunt does not pull it again.
+constexpr char const* RepeatKiller  = "the creature entry has killed a member twice within the hour";
 // The ending of a hunt nothing more can come of before its clock.
 constexpr char const* NoDrop        = "nothing respawns before the clock runs out";
 }  // namespace HuntRefusal
@@ -25648,12 +26928,14 @@ struct HuntFacts
     int levelsAbove{0};
     uint32_t healthPct{100};
     uint32_t attackers{0};  // hostiles attacking the character right now
+    // The entry is on the session's repeat-killer list (CreatureDeathBook).
+    bool entrySuppressed{false};
 };
 
 // "" when a pull may start, else a HuntRefusal literal. First wall wins, in
 // this order: not a bot, not in world, dead, instance, flight, bags full, a hunt already
-// running, the realm at its hunt ceiling, no target, level gap, health floor,
-// adds.
+// running, the realm at its hunt ceiling, no target, level gap, repeat killer,
+// health floor, adds.
 char const* HuntGate(HuntFacts const& facts);
 
 // Worth asking again: Later for the ones a minute fixes, Elsewhere for an
@@ -26228,6 +27510,14 @@ std::size_t RecoveriesPerHour(std::vector<time_t> const& remedyTimes,
 // (the 1-100 open-world bracket, entries from the pinned world database).
 bool IsLockpickTargetEntry(std::uint32_t entry);
 
+// Whether a lockbox makes a lockpick target: a matching entry that is spawned,
+// in the bot's zone and within reach. The adapter feeds this three of its four
+// inputs - isSpawned, same zone, in range - and the entry match is the pure
+// predicate above, so this one is pure too and a test can exercise it without
+// a world, a bot, or a gameobject.
+bool IsLockpickTargetCandidate(std::uint32_t entry, bool spawned, bool sameZone,
+                               bool withinRange);
+
 // Whether a standing lockpick errand should be cleared because Lockpicking has
 // reached the level cap: the max achievable skill at a level is 5 * level.
 bool ShouldClearLockpickErrand(std::uint32_t skill, std::uint32_t level);
@@ -26244,6 +27534,68 @@ enum class LockpickErrandStep : std::uint8_t
 
 LockpickErrandStep DecideLockpickErrand(bool hasTarget, bool inReach,
                                         bool inCombat, bool moving);
+
+// -- Stratholme exit yard way out (#645) --------------------------------------
+// What a family does once it stands in the exit yard after a run. Walk: the
+// Service Entrance is open. Button: press gameobject 175432, then walk. Hearth:
+// each member uses its own hearthstone. None: no way out is available.
+enum class StratholmeExitWay : std::uint8_t
+{
+    Walk,
+    Button,
+    Hearth,
+    None,
+};
+
+struct StratholmeExitFacts
+{
+    bool doorOpen{false};
+    bool buttonInReach{false};
+    bool hearthAvailable{false};
+};
+
+StratholmeExitWay DecideStratholmeExit(StratholmeExitFacts const& facts);
+
+char const* StratholmeExitWayWord(StratholmeExitWay way);
+
+// The run's exit trigger whose landing is the yard, and the two gameobjects in
+// it: the Elders' Square Service Entrance and the button that opens it.
+constexpr std::uint32_t STRATHOLME_YARD_EXIT_TRIGGER = 2221;
+constexpr std::uint32_t STRATHOLME_SERVICE_ENTRANCE_ENTRY = 175369;
+constexpr std::uint32_t STRATHOLME_SERVICE_BUTTON_ENTRY = 175432;
+// The yard as the navmesh closes it (the stratholme-undead row in
+// mod_overseer.cpp): five polygons from x 3200 to 3241 and y -4057 to -4032,
+// and the gateway polygon from x 3180 to 3200 that the door stands in, on map
+// 0. West of x 3180 is Elders' Square, which is outside.
+constexpr float STRATHOLME_YARD_WEST_X = 3180.f;
+constexpr float STRATHOLME_YARD_EAST_X = 3241.f;
+constexpr float STRATHOLME_YARD_SOUTH_Y = -4057.f;
+constexpr float STRATHOLME_YARD_NORTH_Y = -4032.f;
+// How far from the one walking out the door and the button are looked for:
+// 2221's landing stands 51 yards from the door.
+constexpr float STRATHOLME_YARD_SEARCH_YARDS = 80.f;
+// How far past the door, west, the leader is walked once it is open.
+constexpr float STRATHOLME_WALK_OUT_YARDS = 20.f;
+// The button counts as out of reach once it has been pressed this many times
+// with the door still shut, or the leader has not got to it in this long.
+constexpr unsigned STRATHOLME_BUTTON_PRESSES = 3;
+constexpr std::uint32_t STRATHOLME_BUTTON_WALK_SECONDS = 3 * 60;
+// The whole way out gives up after this long and leaves the family to the
+// ordinary drives, said in the log.
+constexpr std::uint32_t STRATHOLME_YARD_EPISODE_SECONDS = 15 * 60;
+
+// Whether a point on `mapId` stands in the exit yard.
+bool InStratholmeExitYard(std::uint32_t mapId, float x, float y);
+
+// Whether the button is still worth walking to: it is spawned, it has not
+// been pressed STRATHOLME_BUTTON_PRESSES times already, and the walk to it has
+// not run past STRATHOLME_BUTTON_WALK_SECONDS.
+bool StratholmeButtonInReach(bool spawned, unsigned presses, std::uint32_t secondsWalking);
+
+// Whether a member's own hearthstone takes it out of the yard: it carries one
+// off cooldown and its bind is not in the yard itself.
+bool StratholmeHearthLeavesTheYard(bool stoneReady, std::uint32_t bindMap, float bindX,
+                                   float bindY);
 
 }  // namespace OverseerDecisions
 

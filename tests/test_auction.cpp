@@ -45,6 +45,9 @@ using OverseerDecisions::AuctionBidVerdict;
 using OverseerDecisions::AuctionBudgetAllows;
 using OverseerDecisions::AuctionDurationMinutes;
 using OverseerDecisions::AuctionRefusalRetryable;
+using OverseerDecisions::AuctionSellInput;
+using OverseerDecisions::AuctionSellPlan;
+using OverseerDecisions::AuctionSellVerdict;
 using OverseerDecisions::AuctionRequest;
 using OverseerDecisions::AuctionVerb;
 using OverseerDecisions::ParseAuctionRequest;
@@ -332,6 +335,110 @@ void WhichRefusalsMove()
     Check("nor is an empty one", AuctionRefusalRetryable(""), false);
 }
 
+void CheckSell(char const* what, AuctionSellInput const& in, AuctionSellVerdict verdict,
+               uint32_t price)
+{
+    auto const plan = AuctionSellPlan(in);
+    if (plan.verdict == verdict && plan.price == price)
+        return;
+    ++failures;
+    std::printf("FAIL %s: verdict %d price %u, want %d price %u\n", what,
+                static_cast<int>(plan.verdict), plan.price, static_cast<int>(verdict), price);
+}
+
+void TheSellRule()
+{
+    AuctionSellInput green;
+    green.quality = 2;
+    green.marketPrice = 1000;
+    green.vendorPrice = 100;
+
+    CheckSell("a fresh green lists at the market price", green, AuctionSellVerdict::List, 1000);
+
+    AuctionSellInput wanted = green;
+    wanted.onSiblingWantList = true;
+    CheckSell("a sibling's want is never listed", wanted, AuctionSellVerdict::Keep, 0);
+    wanted.quality = 0;
+    CheckSell("nor is a wanted grey vendored", wanted, AuctionSellVerdict::Keep, 0);
+    wanted.quality = 3;
+    wanted.relistCount = 2;
+    wanted.lastListPrice = 500;
+    CheckSell("nor a wanted item mid-relist", wanted, AuctionSellVerdict::Keep, 0);
+
+    AuctionSellInput grey = green;
+    grey.quality = 0;
+    CheckSell("a grey goes to the vendor", grey, AuctionSellVerdict::Vendor, 0);
+
+    AuctionSellInput white = green;
+    white.quality = 1;
+    CheckSell("a white is left alone", white, AuctionSellVerdict::Keep, 0);
+
+    AuctionSellInput blue = green;
+    blue.quality = 3;
+    CheckSell("a drop above green lists too", blue, AuctionSellVerdict::List, 1000);
+
+    AuctionSellInput nomarket = green;
+    nomarket.marketPrice = 0;
+    CheckSell("no market price means vendor", nomarket, AuctionSellVerdict::Vendor, 0);
+
+    AuctionSellInput cheap = green;
+    cheap.marketPrice = 100;
+    CheckSell("a price not above vendor means vendor", cheap, AuctionSellVerdict::Vendor, 0);
+
+    AuctionSellInput unsold = green;
+    unsold.unsoldExpired = true;
+    unsold.lastListPrice = 1000;
+    unsold.relistCount = 0;
+    CheckSell("first relist is 10 percent lower", unsold, AuctionSellVerdict::RelistLower, 900);
+    unsold.relistCount = 1;
+    unsold.lastListPrice = 900;
+    CheckSell("second relist is lower again", unsold, AuctionSellVerdict::RelistLower, 810);
+    unsold.relistCount = 2;
+    unsold.lastListPrice = 810;
+    CheckSell("after two relists it is vendored", unsold, AuctionSellVerdict::Vendor, 0);
+    unsold.relistCount = 7;
+    CheckSell("and stays vendored", unsold, AuctionSellVerdict::Vendor, 0);
+
+    AuctionSellInput floor = unsold;
+    floor.relistCount = 1;
+    floor.lastListPrice = 105;
+    CheckSell("a relist that would fall to vendor price is vendored", floor,
+              AuctionSellVerdict::Vendor, 0);
+
+    // The cut truncates: 1 copper cuts to 0 and is vendored, never rounded up
+    // to a relist at the same 1 copper. Mutation check: rounding up makes the
+    // first case a RelistLower at 1.
+    AuctionSellInput tiny = green;
+    tiny.unsoldExpired = true;
+    tiny.relistCount = 0;
+    tiny.vendorPrice = 0;
+    tiny.lastListPrice = 1;
+    CheckSell("a 1 copper listing cuts to 0 and is vendored", tiny, AuctionSellVerdict::Vendor, 0);
+    tiny.lastListPrice = 5;
+    tiny.vendorPrice = 4;
+    CheckSell("5 cuts to 4, which does not beat a vendor price of 4", tiny,
+              AuctionSellVerdict::Vendor, 0);
+    tiny.vendorPrice = 3;
+    CheckSell("5 cuts to 4, which beats a vendor price of 3", tiny,
+              AuctionSellVerdict::RelistLower, 4);
+    tiny.lastListPrice = 9;
+    tiny.vendorPrice = 7;
+    CheckSell("9 cuts to 8, which beats a vendor price of 7", tiny,
+              AuctionSellVerdict::RelistLower, 8);
+    tiny.vendorPrice = 8;
+    CheckSell("9 cuts to 8, which does not beat a vendor price of 8", tiny,
+              AuctionSellVerdict::Vendor, 0);
+    tiny.lastListPrice = 10;
+    tiny.vendorPrice = 0;
+    CheckSell("10 cuts to 9 and relists at 9", tiny, AuctionSellVerdict::RelistLower, 9);
+
+    AuctionSellInput nolast = green;
+    nolast.unsoldExpired = true;
+    nolast.lastListPrice = 0;
+    CheckSell("an expired listing with no recorded price is vendored", nolast,
+              AuctionSellVerdict::Vendor, 0);
+}
+
 }  // namespace
 
 int main()
@@ -350,6 +457,7 @@ int main()
     TheBidRuleInTheCoresOrder();
     WhatABidCosts();
     WhichRefusalsMove();
+    TheSellRule();
 
     if (failures)
     {

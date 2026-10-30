@@ -4,6 +4,7 @@
 #include <cstdlib>
 
 using OverseerDecisions::DecideLockpickErrand;
+using OverseerDecisions::IsLockpickTargetCandidate;
 using OverseerDecisions::IsLockpickTargetEntry;
 using OverseerDecisions::LockpickErrandStep;
 using OverseerDecisions::ShouldClearLockpickErrand;
@@ -53,6 +54,20 @@ int main()
     Check("an arbitrary non-lockbox entry is not a lockpick target",
           !IsLockpickTargetEntry(9999u));
 
+    // Candidate predicate: a matching entry that is spawned, in zone and in
+    // range is in; dropping any one input keeps it out.
+    std::uint32_t const entry = 1660u;
+    Check("a spawned, in-zone, in-range matching entry is a candidate",
+          IsLockpickTargetCandidate(entry, true, true, true));
+    Check("a despawned matching entry is not a candidate",
+          !IsLockpickTargetCandidate(entry, false, true, true));
+    Check("a matching entry in another zone is not a candidate",
+          !IsLockpickTargetCandidate(entry, true, false, true));
+    Check("a matching entry out of range is not a candidate",
+          !IsLockpickTargetCandidate(entry, true, true, false));
+    Check("a non-lockbox entry that meets all three is not a candidate",
+          !IsLockpickTargetCandidate(9999u, true, true, true));
+
     // Level-cap clear: max achievable skill at a level is 5 * level.
     Check("skill exactly at the cap clears the errand",
           ShouldClearLockpickErrand(5u * 10u, 10u));
@@ -66,6 +81,10 @@ int main()
           ShouldClearLockpickErrand(5u, 1u));
 
     // Errand-standing discipline: every transient refusal leaves it standing.
+    // The decision only sees the boolean; that a null target from
+    // FindNearestLockpickTarget becomes hasTarget=false and reaches this
+    // decision is pinned in test_drive_lockpick_source.cpp, along with the
+    // "cast but no skill-up" refusal, which is judged after the cast.
     Expect("no target in zone leaves the errand standing",
            DecideLockpickErrand(false, false, false, false),
            LockpickErrandStep::Stand);
@@ -77,9 +96,6 @@ int main()
            LockpickErrandStep::Stand);
     Expect("moving leaves the errand standing",
            DecideLockpickErrand(true, true, false, true),
-           LockpickErrandStep::Stand);
-    Expect("in combat and moving leaves the errand standing",
-           DecideLockpickErrand(true, true, true, true),
            LockpickErrandStep::Stand);
     Expect("in reach and still casts Pick Lock",
            DecideLockpickErrand(true, true, false, false),

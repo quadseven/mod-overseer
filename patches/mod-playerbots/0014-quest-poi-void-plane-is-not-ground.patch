@@ -161,20 +161,19 @@ index 9f4df925..17edeb72 100644
  
              // THE SAME-ZONE FILTER IS GONE. It is what stranded every bot with
              // an out-of-zone turn-in: the POI was discarded, poiInfo came back
-@@ -1024,6 +1031,16 @@ bool NewRpgBaseAction::GetQuestPOIPosAndObjectiveIdx(uint32 questId, std::vector
+@@ -1024,6 +1031,15 @@ bool NewRpgBaseAction::GetQuestPOIPosAndObjectiveIdx(uint32 questId, std::vector
          if (dz == INVALID_HEIGHT || dz == VMAP_INVALID_HEIGHT_VALUE)
              continue;
  
 +        // infra: THE VOID PLANE IS NOT GROUND. `GetWaterLevel` returns the
-+        // liquid map's filler where there is no liquid, and on a shipped
-+        // tile that filler is -500.0f - numerically MIN_HEIGHT, the plane
-+        // the core kills at. So where `GetHeight` fails over a terrain
-+        // hole, `std::max` of the two hands back exactly -500.0f, which is
-+        // neither sentinel above and passes the test as if it were ground.
-+        // Measured: 86% of tile 0012738's liquid cells hold -500.0f.
-+        if (dz <= MIN_HEIGHT)
++        // liquid map's filler where there is no liquid, and on a shipped tile
++        // that filler is -500.0f - numerically MIN_HEIGHT, the plane the core
++        // kills at. So where `GetHeight` fails over a terrain hole, `std::max`
++        // of the two hands back exactly -500.0f, which is neither sentinel
++        // above and passes as if it were ground. `else` so the unloaded-grid
++        // forgiveness keeps its substituted z.
++        else if (dz <= MIN_HEIGHT)
 +            continue;
-+
          if (bot->GetZoneId() != bot->GetMap()->GetZoneId(bot->GetPhaseMask(), dx, dy, dz))
              continue;
  

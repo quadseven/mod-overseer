@@ -179,6 +179,42 @@ void TheReleaseUndoesTheHoldAndNothingElse()
     }
 }
 
+// THE RE-MOUNT IS STOPPED AT ITS SOURCE FOR THE HOLD (#1229). A member held to
+// hearth was taken off its mount and put back on it by CheckMountStateAction
+// every eight seconds, 33 times in eleven holds, and never cast. That action is
+// not useful for an unmounted bot without `mount`, so a casting hold suspends
+// `mount` for its duration and the release owes it back.
+void ACastingHoldSuspendsTheRemount()
+{
+    CastHoldFacts facts = Facts(false, true, false);
+    facts.hasMount = true;
+    facts.readyToCast = true;
+    CastHoldPlan const plan = PlanCastHold(facts);
+    Check("a casting hold suspends mount", plan.dropMount, true);
+
+    // A staging hold waits at a door and casts nothing: the mount is left.
+    facts.readyToCast = false;
+    Check("a staging hold leaves mount alone", PlanCastHold(facts).dropMount, false);
+
+    // Nothing to take off, nothing owed back.
+    facts.readyToCast = true;
+    facts.hasMount = false;
+    Check("no mount strategy, nothing suspended", PlanCastHold(facts).dropMount, false);
+
+    // And the release reads it backwards: restored exactly when taken.
+    for (int bits = 0; bits < 4; ++bits)
+    {
+        CastHoldFacts f;
+        f.hasMount = (bits & 1) != 0;
+        f.readyToCast = (bits & 2) != 0;
+        CastHoldPlan const p = PlanCastHold(f);
+        bool const held = f.hasMount && !p.dropMount;
+        bool const back = held || p.dropMount;
+        Check("a casting hold carries no mount", f.readyToCast && held, false);
+        Check("mount comes back to where it was", back, f.hasMount);
+    }
+}
+
 // ------------------------------------------- keeping the hold, tick by tick --
 
 // The slack the adapter actually passes, spelled here so a case that means "a
@@ -321,6 +357,7 @@ int main()
     BothMoversComeOffTogether();
     NothingKnownStillHolds();
     TheReleaseUndoesTheHoldAndNothingElse();
+    ACastingHoldSuspendsTheRemount();
     ADraggedFollowerHasItsHoldRetaken();
     TheHoldsOwnFootprintIsNotDrift();
     AWalkAVerbAskedForIsLeftAlone();
