@@ -299,6 +299,31 @@ void TheFinderLastResortReasonSaysWhatIsTrue()
           noSummoner.find("no summon was possible here") == std::string::npos);
     Check("no summoner: still carries the summonNote",
           noSummoner.find(f.summonNote) != std::string::npos);
+
+    // The finder is this realm's way in, so its rung opens at the first
+    // failure with a stone and a summoner both ready and no summon tried:
+    // nothing failed and nothing was missing, and the words must say that.
+    f = AllianceFourthFailure();
+    f.finderIsDefault = true;
+    f.dungeonFinderReady = true;
+    f.summonReady = true;
+    f.summonerReady = true;
+    f.summonNote = "the door's meeting stone stands 25y from its trigger (summon opens at 3 "
+                   "in a row)";
+    f.streak = 1;
+    f.tried.clear();
+    Check("default finder: the rung really is open", RunRecoveryFinderOpen(f));
+    std::string const notWaited = FinderLastResortReason(f);
+    Check("default finder: never says the rung had its turn",
+          notWaited.find("had its turn") == std::string::npos);
+    Check("default finder: never says no summoner qualifies",
+          notWaited.find("no summoner qualifies") == std::string::npos);
+    Check("default finder: never says no summon was possible",
+          notWaited.find("no summon was possible here") == std::string::npos);
+    Check("default finder: says the rung was not waited for",
+          notWaited.find("the summon rung was not waited for") != std::string::npos);
+    Check("default finder: still carries the summonNote",
+          notWaited.find(f.summonNote) != std::string::npos);
 }
 
 SummonRungMember Member(char const* name, bool atStone, bool leader = false)
