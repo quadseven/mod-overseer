@@ -20498,7 +20498,13 @@ std::string FinderLastResortReason(RunFailureFacts const& facts)
         return "no summon was possible here: " + facts.summonNote;
     // The stone stands at the door, but nobody in the family qualifies to
     // click it: the summon rung could never run here either.
-    return "the stone stands at the door but no summoner qualifies to click it: " +
+    if (!facts.summonerReady)
+        return "the stone stands at the door but no summoner qualifies to click it: " +
+               facts.summonNote;
+    // Stone and summoner are both ready and no summon ran: only the finder as
+    // the realm's way in opens its rung here (RunRecoveryFinderOpen).
+    return "the summon rung was not waited for, because the dungeon finder is this "
+           "realm's way in: " +
            facts.summonNote;
 }
 

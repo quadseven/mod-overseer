@@ -23621,7 +23621,8 @@ bool RunRecoveryFinderOpen(RunFailureFacts const& facts);
 // this, so they cannot drift: if the summon rung ran this streak it says so
 // with the count; if the door has no stone it says no summon was possible
 // here and carries the summonNote; if a stone stands but nobody qualifies to
-// click it, it says that.
+// click it, it says that; if the finder is the realm's way in and nothing
+// stopped a summon, it says the rung was not waited for.
 std::string FinderLastResortReason(RunFailureFacts const& facts);
 
 // -- rung two: the summon at the door ----------------------------------------
