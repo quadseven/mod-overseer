@@ -210,7 +210,7 @@ void TheDriveIsWired()
     Check("and called", src.find("DriveRebuff();") != std::string::npos);
     if (def == std::string::npos)
         return;
-    std::size_t const end = src.find("\n    }\n", def);
+    std::size_t const end = src.find("\n    // THIS REALM SAYS WHAT IT IS AND WHAT IT IS RUNNING", def);
     std::string const body = src.substr(def, end == std::string::npos ? std::string::npos : end - def);
     Check("it decides with DecideRebuff", body.find("OverseerDecisions::DecideRebuff(") != std::string::npos);
     Check("it asks the AI's own action", body.find("DoSpecificAction(spell.action") != std::string::npos);
