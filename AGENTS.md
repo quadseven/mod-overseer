@@ -295,6 +295,13 @@ was abandoned 15s in by the full-bags gate. Five of those six were not this
 case at all: the dungeon finder took part of a family in and the rest never
 entered, so nobody had died inside.
 
+The line counts for that window, by the text matched:
+
+- `stranded outside map <map> - <n> went back in this poll`: 0
+- `walked into area trigger`: 0
+- `is short a member and is WALKING IT BACK`: 7, one per walk started
+- `cannot assemble its census`: 6
+
 The one that was this case, 2026-10-22 12:17 to 12:34 UTC (run 2 of campaign
 101, map 90, areatrigger 324): a member died inside at 12:19:27, was released
 on its behalf at 12:21:34, and the walk began at 12:21:35 under its own lease
