@@ -43062,6 +43062,9 @@ private:
         std::time_t regroupSince{0};
         std::time_t restSince{0};
         std::time_t restRearmAt{0};
+        std::time_t casterRestRearmAt{0};
+        // When a poll first read the run cleared (GuildRunClearedLootWaits).
+        std::time_t clearedAt{0};
         // THE STALL LADDER (OverseerDecisions::GuildRunStallNext, #1086): the
         // tank's last mark, when the run last credited a boss, covered the
         // yards, was held or skipped (`stillSince`), when it last credited a
@@ -44222,6 +44225,7 @@ private:
                 p, i < run.seats.size() && run.seats[i] == OverseerDecisions::GuildSeat::Healer));
         }
         facts.need = OverseerDecisions::GuildRunRestNeedOf(living);
+        facts.vitalLow = OverseerDecisions::GuildRunRestVitalLow(living);
         facts.livingResurrector = resurrector;
         run.regroupSince =
             poll.aliveInside && ghostsWalking ? (run.regroupSince ? run.regroupSince : now) : 0;
@@ -44229,6 +44233,7 @@ private:
             run.regroupSince ? static_cast<unsigned>(now - run.regroupSince) : 0;
         facts.secondsResting = run.restSince ? static_cast<unsigned>(now - run.restSince) : 0;
         facts.restRearmed = now >= run.restRearmAt;
+        facts.casterRestRearmed = now >= run.casterRestRearmAt;
         OverseerDecisions::GuildRunHold const hold = OverseerDecisions::GuildRunHoldNext(facts);
 
         if (hold.step == GuildRunHoldStep::Hold)
@@ -44262,7 +44267,11 @@ private:
             if (!IssueGuildRunHold(run, false, now))
                 return;
             if (hold.why == GuildRunHoldWhy::RestTimedOut)
+            {
                 run.restRearmAt = now + OverseerDecisions::GUILD_RUN_REST_REARM_SECONDS;
+                run.casterRestRearmAt =
+                    now + OverseerDecisions::GUILD_RUN_CASTER_REST_REARM_SECONDS;
+            }
             LOG_INFO("module.overseer",
                      "overseer: guild run rest {} - the dungeon brain goes on after {}s ({}){}",
                      run.id, static_cast<unsigned>(now - run.heldSince),
@@ -44766,6 +44775,30 @@ private:
             StepGuildRunHold(run, poll, ghostsWalking, now);
 
             OverseerDecisions::GuildRunVerdict const verdict = OverseerDecisions::GuildRunNext(poll);
+            // THE LAST BOSS IS LOOTED BEFORE THE GROUP LEAVES.
+            if (verdict == OverseerDecisions::GuildRunVerdict::Cleared)
+            {
+                if (!run.clearedAt)
+                {
+                    run.clearedAt = now;
+                    LOG_INFO("module.overseer",
+                             "overseer: guild finder run {} - cleared; the group loots before "
+                             "it leaves, at most {}s",
+                             run.id, OverseerDecisions::GUILD_RUN_CLEARED_LOOT_MAX_SECONDS);
+                }
+                OverseerDecisions::GuildRunClearedLootFacts loot;
+                loot.secondsSinceCleared = static_cast<unsigned>(now - run.clearedAt);
+                loot.aliveInside = poll.aliveInside;
+                loot.rollsOpen = ourGroup && group->isRollLootActive();
+                for (std::string const& name : run.names)
+                {
+                    Player* const p = ObjectAccessor::FindPlayerByName(name);
+                    if (GuildRunAliveInside(run, p) && p->IsInCombat())
+                        loot.anyFighting = true;
+                }
+                if (OverseerDecisions::GuildRunClearedLootWaits(loot))
+                    return true;
+            }
             if (verdict != OverseerDecisions::GuildRunVerdict::Running)
             {
                 std::string why;
