@@ -19482,6 +19482,20 @@ char const* ExitHearthStepWord(ExitHearthStep step)
     return "unknown";
 }
 
+bool OffContinentHearthLetThrough(ExitHearthFacts const& facts)
+{
+    return facts.doorMapKnown && facts.bindMapId != facts.doorMapId &&
+           facts.failedWalkSeconds >= OFF_CONTINENT_HEARTH_AFTER_SECONDS;
+}
+
+std::int64_t ExitWalkFailingSince(std::int64_t failingSince, std::int64_t lastFailedAt,
+                                  bool sameMap, std::int64_t now)
+{
+    if (failingSince > 0 && sameMap && now - lastFailedAt <= EXIT_WALK_FAILING_GAP_SECONDS)
+        return failingSince;
+    return now;
+}
+
 std::string ExitHearthImpossibleReason(ExitHearthFacts const& facts, unsigned maxAttempts)
 {
     if (!facts.inWorld || !facts.onInsideMap)
@@ -19495,8 +19509,10 @@ std::string ExitHearthImpossibleReason(ExitHearthFacts const& facts, unsigned ma
     if (facts.attempts >= maxAttempts)
         return "hearth attempts spent";
     // A hearth to another continent splits the family (#1142): the stone is
-    // withheld and the member stays on the walk-out path the episode bounds.
-    if (facts.doorMapKnown && facts.bindMapId != facts.doorMapId)
+    // withheld and the member stays on the walk-out path, until that walk has
+    // failed for the whole bound and the stone is the only way left (#1202).
+    if (facts.doorMapKnown && facts.bindMapId != facts.doorMapId &&
+        !OffContinentHearthLetThrough(facts))
         return "hearthstone bound on map " + std::to_string(facts.bindMapId) +
                ", not on map " + std::to_string(facts.doorMapId) +
                " where the exit door lets out, so the stone is withheld";

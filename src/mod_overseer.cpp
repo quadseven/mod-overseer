@@ -36833,6 +36833,9 @@ private:
         // set, and then the old rule holds.
         bool doorMapKnown{false};
         uint32 doorMapId{0};
+        // When the walk out began failing, for the off-continent bound (#1202).
+        // Zero until a caller knows it, and then the stone stays withheld.
+        std::time_t walkFailingSince{0};
         uint32 runId{0};
         uint32 campaignId{0};
         uint32 runNumber{0};
@@ -36842,6 +36845,16 @@ private:
         std::map<std::string, std::string> lastStep;
     };
     std::map<std::string, ExitHearthEpisode> _exitHearths;
+    // A failed EXIT ends its coordinator and the next poll adopts the same party
+    // at the same door, so the failing walk is clocked per family across them
+    // (#1202). One entry per family, overwritten by the next failure.
+    struct ExitWalkFailing
+    {
+        uint32 mapId{0};
+        std::time_t since{0};
+        std::time_t lastFailedAt{0};
+    };
+    std::map<std::string, ExitWalkFailing> _exitWalkFailing;
     // The hearth episode of an EVACUATION whose walk the ground refused, per
     // family (WalkStragglersOut). Kept apart from _exitHearths: that one holds the
     // run a failed EXIT left behind and IDLE reads it to finalize that run, and an
@@ -37012,6 +37025,9 @@ private:
                 facts.doorMapKnown = episode.doorMapKnown;
                 facts.doorMapId = episode.doorMapId;
                 facts.bindMapId = static_cast<uint32_t>(bot->m_homebindMapId);
+                facts.failedWalkSeconds = episode.walkFailingSince
+                    ? std::time(nullptr) - episode.walkFailingSince
+                    : 0;
             }
 
             ExitHearthStep const step = OverseerDecisions::ExitFailureHearthStep(facts);
@@ -37043,6 +37059,14 @@ private:
                                  "starts normally",
                                  name, episode.mapId, episode.attempts[name],
                                  OverseerDecisions::EXIT_HEARTH_ATTEMPTS);
+                        if (OverseerDecisions::OffContinentHearthLetThrough(facts))
+                            LOG_WARN("module.overseer",
+                                     "overseer: EXIT HEARTH - '{}' is let through to its bind "
+                                     "on map {}, off map {} where the door lets out, because "
+                                     "the walk out has failed for {} seconds and the stone is "
+                                     "the only way left (#1202)",
+                                     name, facts.bindMapId, facts.doorMapId,
+                                     static_cast<int64>(facts.failedWalkSeconds));
                         WriteExitHearthEvent(
                             family, leaderName, name, episode, phase, "exit_hearth",
                             "hearth cast for " + name + " on map " +
@@ -37144,6 +37168,7 @@ private:
         yard.hearth.portal = portal.keyword;
         yard.hearth.doorMapKnown = true;
         yard.hearth.doorMapId = portal.outsideMapId;
+        yard.hearth.walkFailingSince = yard.since;
         _stratholmeYards[family] = yard;
         LOG_INFO("module.overseer",
                  "overseer: family '{}' left '{}' by areatrigger {} into the exit yard; "
@@ -39183,6 +39208,9 @@ private:
             episode.doorMapKnown = true;
             episode.doorMapId = portal.outsideMapId;
             episode.since = std::time(nullptr);
+            // The episode outlives each failed run at this door, which the
+            // coordinator's own walk clock does not (#1202).
+            episode.walkFailingSince = episode.since;
         }
         time_t const now = std::time(nullptr);
         std::vector<std::string> hearthers;
@@ -39226,6 +39254,7 @@ private:
                     facts.doorMapKnown = episode.doorMapKnown;
                     facts.doorMapId = episode.doorMapId;
                     facts.bindMapId = static_cast<uint32_t>(bot->m_homebindMapId);
+                    facts.failedWalkSeconds = now - episode.walkFailingSince;
                 }
                 way = OverseerDecisions::DecideEvacuationWay(
                     true, OverseerDecisions::ExitFailureHearthStep(facts));
@@ -56007,6 +56036,16 @@ private:
                             episode.mapId = portal->insideMapId;
                             episode.doorMapKnown = true;
                             episode.doorMapId = portal->outsideMapId;
+                            {
+                                ExitWalkFailing& failing = _exitWalkFailing[family];
+                                std::time_t const now = std::time(nullptr);
+                                failing.since = OverseerDecisions::ExitWalkFailingSince(
+                                    failing.since, failing.lastFailedAt,
+                                    failing.mapId == portal->insideMapId, now);
+                                failing.lastFailedAt = now;
+                                failing.mapId = portal->insideMapId;
+                                episode.walkFailingSince = failing.since;
+                            }
                             episode.runId = coord.runId ? coord.runId
                                                         : ActiveRunIdOnMap(portal->insideMapId);
                             episode.campaignId = coord.campaignId;
