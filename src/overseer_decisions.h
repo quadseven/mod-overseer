@@ -22122,8 +22122,27 @@ struct ExitHearthFacts
     bool doorMapKnown{false};
     uint32_t doorMapId{0};
     uint32_t bindMapId{0};
+    // HOW LONG THE WALK OUT HAS BEEN FAILING (#1202). The withhold above is a
+    // preference for the walk, so it holds only while the walk can still
+    // succeed. Past OFF_CONTINENT_HEARTH_AFTER_SECONDS the stone is the only way
+    // out left: a split family is recovered by the crossing, and a member kept
+    // inside holds the instance for its whole party without bound.
+    std::int64_t failedWalkSeconds{0};
 };
 
+// How long a walk out must have failed before a stone bound off the door's
+// continent is let through. The same ten minutes EVACUATION_WALK_BOUND_SECONDS
+// gives a walk, which is the module's measure of a walk that is not coming back.
+constexpr std::int64_t OFF_CONTINENT_HEARTH_AFTER_SECONDS = 10 * 60;
+
+// A failed EXIT ends its coordinator and the next poll adopts the same party at
+// the same door, so one coordinator's clock never reaches the bound above. This
+// is the longest gap between two failures that still counts as the same walk.
+constexpr std::int64_t EXIT_WALK_FAILING_GAP_SECONDS = 15 * 60;
+
+// A member sitting out walks out on its own (#1092), outside the run party the
+// EXIT and RESET hearths cover. Its walk gets the same bound, and then its own
+// stone, until the attempts are spent. See SitOutHearthDue.
 enum class ExitHearthStep
 {
     NotInside,   // not on the instance map (or not in the world): nothing to do
@@ -22169,6 +22188,20 @@ char const* ExitHearthStepWord(ExitHearthStep step);
 // Why a member cannot hearth, in the words the log and the timeline use; empty
 // for a member that can, or is not inside. A stone bound off the door's map
 // names both maps and says it is withheld.
+// True when the stone leads off the door's continent and the walk has failed
+// for long enough to allow it anyway (#1202). The cast path logs this rule.
+bool OffContinentHearthLetThrough(ExitHearthFacts const& facts);
+
+// True when a member sitting out has walked for the whole bound and has hearth
+// attempts left, so its stone is asked for in place of another walk.
+bool SitOutHearthDue(std::int64_t walkingSeconds, unsigned attempts);
+
+// When the failing walk began: `failingSince` while this failure continues the
+// last one, on the same map and inside the gap, and `now` otherwise. Zero means
+// no failure has been recorded.
+std::int64_t ExitWalkFailingSince(std::int64_t failingSince, std::int64_t lastFailedAt,
+                                  bool sameMap, std::int64_t now);
+
 std::string ExitHearthImpossibleReason(ExitHearthFacts const& facts,
                                        unsigned maxAttempts = EXIT_HEARTH_ATTEMPTS);
 
