@@ -24697,10 +24697,24 @@ RebuffSpell RebuffSpellFor(unsigned classId)
 RebuffDecision DecideRebuff(RebuffFacts const& facts)
 {
     RebuffDecision decision;
+    bool casterCanCast = facts.knowsSpell && facts.alive && !facts.inCombat &&
+                         !facts.casting && !facts.mounted && facts.mana >= facts.cost &&
+                         static_cast<std::uint64_t>(facts.mana - facts.cost) * 100 >=
+                             static_cast<std::uint64_t>(facts.maxMana) * REBUFF_MANA_RESERVE_PERCENT;
+    float nearest = REBUFF_REACH_YARDS + 1.0f;
     // Counted before any refusal, so a step that does not cast still says how
     // many were missing and how many were in reach.
     for (RebuffMember const& member : facts.members)
     {
+        if (facts.inRaid && member.subgroup != facts.casterSubgroup && member.alive &&
+            member.sameMap && !member.hasBuff && !member.hasBuffer && member.inSight &&
+            member.yards <= REBUFF_REACH_YARDS && member.yards < nearest)
+        {
+            nearest = member.yards;
+            decision.crossPartyTarget = member;
+        }
+        if (facts.inRaid && member.subgroup != facts.casterSubgroup)
+            continue;
         if (!member.alive || !member.sameMap || member.hasBuff)
             continue;
         ++decision.missing;
@@ -24728,6 +24742,8 @@ RebuffDecision DecideRebuff(RebuffFacts const& facts)
         decision.step = RebuffStep::LowMana;
     else
         decision.step = RebuffStep::Cast;
+    if (!casterCanCast)
+        decision.crossPartyTarget.reset();
     return decision;
 }
 

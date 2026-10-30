@@ -54,6 +54,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <optional>
 #include <vector>
 
 namespace OverseerDecisions
@@ -27281,6 +27282,9 @@ RebuffSpell RebuffSpellFor(unsigned classId);
 // One member of the caster's group, the caster included, as the caster sees it.
 struct RebuffMember
 {
+    std::string name;
+    unsigned subgroup{0};
+    bool hasBuffer{false};   // a living member of this subgroup can cast this buff
     bool alive{true};
     bool sameMap{true};       // in the world, on the caster's map
     bool hasBuff{false};      // the aura or its group variant, from any caster
@@ -27290,6 +27294,8 @@ struct RebuffMember
 
 struct RebuffFacts
 {
+    bool inRaid{false};
+    unsigned casterSubgroup{0};
     bool knowsSpell{false};   // the caster has learned a rank of the buff
     bool alive{true};
     bool inCombat{false};
@@ -27326,6 +27332,7 @@ struct RebuffDecision
     RebuffStep step{RebuffStep::NoSpell};
     std::size_t missing{0};   // living members on the map without the buff
     std::size_t inReach{0};   // of those, within reach and sight
+    std::optional<RebuffMember> crossPartyTarget;
 };
 
 RebuffDecision DecideRebuff(RebuffFacts const& facts);

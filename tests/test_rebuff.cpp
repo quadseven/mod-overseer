@@ -214,7 +214,10 @@ void TheDriveIsWired()
     std::string const body = src.substr(def, end == std::string::npos ? std::string::npos : end - def);
     Check("it decides with DecideRebuff", body.find("OverseerDecisions::DecideRebuff(") != std::string::npos);
     Check("it asks the AI's own action", body.find("DoSpecificAction(spell.action") != std::string::npos);
-    Check("it never casts a spell itself", body.find("CastSpell(") == std::string::npos);
+    Check("raid casts are queued as named cast rows",
+          body.find("'cast', '', '{}'") != std::string::npos &&
+          body.find(" on:\" +") != std::string::npos &&
+          body.find("decision.crossPartyTarget->name") != std::string::npos);
     Check("it never adds an aura itself", body.find("AddAura(") == std::string::npos);
 }
 
@@ -226,6 +229,8 @@ void CasterOwnSubgroupOnlyWhenInRaid()
     facts.mana = 2000;
     facts.maxMana = 2000;
     facts.cost = 300;
+    facts.inRaid = true;
+    facts.casterSubgroup = 0;
     
     // One group: 2 subgroups with 5 each
     for (int i = 0; i < 5; ++i)
@@ -274,8 +279,8 @@ void CrossPartyTargetChosenWhenNoBufferInSubgroup()
         facts.members.push_back(m);
     }
     
-    // Other subgroup: one with no buffer, one with buffer
-    for (int i = 0; i < 3; ++i)
+    // Other subgroup has no living caster able to provide this buff.
+    for (int i = 0; i < 4; ++i)
     {
         RebuffMember m;
         m.hasBuff = false;
@@ -286,18 +291,20 @@ void CrossPartyTargetChosenWhenNoBufferInSubgroup()
         m.sameMap = true;
         facts.members.push_back(m);
     }
-    RebuffMember m;
-    m.hasBuff = false;
-    m.yards = 20.0f;
-    m.subgroup = 1;
-    m.hasBuffer = true;
-    m.alive = true;
-    m.sameMap = true;
-    facts.members.push_back(m);
-    
     RebuffDecision const d = DecideRebuff(facts);
     Check("cross-party target chosen only if subgroup has no buffer",
           d.crossPartyTarget.has_value() && d.crossPartyTarget->subgroup == 1);
+}
+
+void OutsideRaidKeepsWholePartyCount()
+{
+    RebuffFacts facts = TownTrip();
+    RebuffMember other = Member(false, 12.0f);
+    other.subgroup = 1;
+    facts.members.push_back(other);
+    RebuffDecision const d = DecideRebuff(facts);
+    Check("outside a raid all party members still count", d.missing == 6 && d.inReach == 6);
+    Check("outside a raid there is no cross-party target", !d.crossPartyTarget.has_value());
 }
 
 void CrossPartyTargetRejectedIfBufferInSubgroup()
@@ -365,7 +372,7 @@ void CrossPartyTargetRejectedIfOutofReach()
     // Other subgroup: one member at exactly REBUFF_REACH_YARDS
     RebuffMember m;
     m.hasBuff = false;
-    m.yards = REBUFF_REACH_YARDS + 0.1f;
+    m.yards = OverseerDecisions::REBUFF_REACH_YARDS + 0.1f;
     m.subgroup = 1;
     m.hasBuffer = false;
     m.alive = true;
@@ -585,6 +592,16 @@ int main()
     TheClassTable();
     EveryStepHasAWord();
     TheDriveIsWired();
+    CasterOwnSubgroupOnlyWhenInRaid();
+    CrossPartyTargetChosenWhenNoBufferInSubgroup();
+    CrossPartyTargetRejectedIfBufferInSubgroup();
+    CrossPartyTargetRejectedIfOutofReach();
+    CrossPartyTargetRejectedIfOutOfSight();
+    CrossPartyTargetRejectedIfDead();
+    CrossPartyTargetRejectedIfNotSameMap();
+    CrossPartyTargetIsNearest();
+    CrossPartyTargetAtMostOnePerPoll();
+    OutsideRaidKeepsWholePartyCount();
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);
