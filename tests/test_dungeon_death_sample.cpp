@@ -221,7 +221,11 @@ void TheAdapterIsWired()
     Check("the prior position is checked against its local surface",
           record.find("TERRAIN_RECOVERY_VOID_PROBE_YARDS") != std::string::npos &&
               record.find("it->second.x, it->second.y, probeZ") != std::string::npos &&
-              record.find("it->second.z < surface") != std::string::npos);
+              record.find("OverseerDecisions::FallStartedBelowWorld(") != std::string::npos);
+    Check("and against the ground under its own feet, not just the highest surface (#1211)",
+          record.find("groundProbeZ, true, TERRAIN_RECOVERY_VOID_PROBE_YARDS)") != std::string::npos &&
+              record.find("ground > INVALID_HEIGHT, ground)") != std::string::npos &&
+              record.find("it->second.z < surface") == std::string::npos);
     Check("a void fall keeps its starting sample in the death row",
           record.find("d.fallStartedBelowSurface = true;") != std::string::npos &&
               record.find("d.fallStartZ = it->second.z;") != std::string::npos &&

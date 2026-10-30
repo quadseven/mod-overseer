@@ -333,6 +333,45 @@ void WhoCanDisenchantADrop()
     Expect(!CanDisenchantDrop(41, 0, 0), "a character without Enchanting cannot");
 }
 
+void AMandateEndsOnlyInTheNamedHands()
+{
+    std::vector<std::string> const none;
+    std::vector<std::string> const others = {"Grug", "Mog"};
+    std::vector<std::string> const named = {"Grug", "Ugga"};
+    Expect(MandateNextStep(false, "Ugga", none) == MandateStep::Repeat,
+           "a dropless run repeats");
+    Expect(MandateNextStep(false, "Ugga", others) == MandateStep::Repeat,
+           "the item in other hands does not complete the mandate");
+    Expect(MandateNextStep(false, "Ugga", named) == MandateStep::Done,
+           "the named character holding the item completes it");
+    Expect(MandateNextStep(false, "ugga", named) == MandateStep::Repeat,
+           "the name is matched exactly");
+    Expect(MandateNextStep(true, "Ugga", none) == MandateStep::Stopped,
+           "a cancelled mandate stops repeating");
+    Expect(MandateNextStep(true, "Ugga", others) == MandateStep::Stopped,
+           "a cancelled mandate stays stopped over later cycles");
+    Expect(MandateNextStep(false, "", others) == MandateStep::Stopped,
+           "a mandate with no named character never repeats");
+    Expect(MandateNextStep(true, "Ugga", named) == MandateStep::Stopped,
+           "a cancelled mandate stops even when the named character holds the item");
+    Expect(MandateNextStep(false, "Ugg", {"Ugga2"}) == MandateStep::Repeat,
+           "a longer holder name that starts with the intended name does not match");
+    Expect(MandateNextStep(false, "Ugga", {"Uggar"}) == MandateStep::Repeat,
+           "a holder name that merely begins with the intended name does not match");
+    Expect(MandateNextStep(false, "Ugga2", {"Ugga"}) == MandateStep::Repeat,
+           "a holder name that is a prefix of the intended name does not match");
+    Expect(MandateNextStep(false, "gga", {"Ugga"}) == MandateStep::Repeat,
+           "a holder name that contains the intended name does not match");
+    Expect(MandateNextStep(false, "Ugga", {"", "Grug"}) == MandateStep::Repeat,
+           "an empty holder name is not a match");
+    Expect(MandateNextStep(false, "Ugga", {"Ugga "}) == MandateStep::Repeat,
+           "a holder name with trailing whitespace does not match");
+    Expect(MandateNextStep(false, "Ugga", {" Ugga"}) == MandateStep::Repeat,
+           "a holder name with leading whitespace does not match");
+    Expect(MandateNextStep(false, "", none) == MandateStep::Stopped,
+           "a nameless mandate stops even with nothing held");
+}
+
 void MandatedBindOnPickupRollsAreExclusive()
 {
     Expect(MandatedLootVote(true, true, "Ugga", "Ugga") == LootCouncilVote::Need,
@@ -500,6 +539,7 @@ int main()
     AnUnwantedDropGoesToTheEnchanter();
     WhoCanDisenchantADrop();
     MandatedBindOnPickupRollsAreExclusive();
+    AMandateEndsOnlyInTheNamedHands();
     SeatRoles();
     KeysAndJson();
     TheAdapterSeams();
