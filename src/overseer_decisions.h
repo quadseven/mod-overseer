@@ -22139,6 +22139,9 @@ constexpr std::int64_t OFF_CONTINENT_HEARTH_AFTER_SECONDS = 10 * 60;
 // is the longest gap between two failures that still counts as the same walk.
 constexpr std::int64_t EXIT_WALK_FAILING_GAP_SECONDS = 15 * 60;
 
+// A member sitting out walks out on its own (#1092), outside the run party the
+// EXIT and RESET hearths cover. Its walk gets the same bound, and then its own
+// stone, until the attempts are spent. See SitOutHearthDue.
 enum class ExitHearthStep
 {
     NotInside,   // not on the instance map (or not in the world): nothing to do
@@ -22187,6 +22190,10 @@ char const* ExitHearthStepWord(ExitHearthStep step);
 // True when the stone leads off the door's continent and the walk has failed
 // for long enough to allow it anyway (#1202). The cast path logs this rule.
 bool OffContinentHearthLetThrough(ExitHearthFacts const& facts);
+
+// True when a member sitting out has walked for the whole bound and has hearth
+// attempts left, so its stone is asked for in place of another walk.
+bool SitOutHearthDue(std::int64_t walkingSeconds, unsigned attempts);
 
 // When the failing walk began: `failingSince` while this failure continues the
 // last one, on the same map and inside the gap, and `now` otherwise. Zero means

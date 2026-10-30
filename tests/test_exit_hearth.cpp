@@ -36,6 +36,7 @@ using OverseerDecisions::EXIT_WALK_FAILING_GAP_SECONDS;
 using OverseerDecisions::ExitWalkFailingSince;
 using OverseerDecisions::OFF_CONTINENT_HEARTH_AFTER_SECONDS;
 using OverseerDecisions::OffContinentHearthLetThrough;
+using OverseerDecisions::SitOutHearthDue;
 
 namespace
 {
@@ -241,6 +242,16 @@ int main()
         std::int64_t const later = start + EXIT_WALK_FAILING_GAP_SECONDS + 1;
         CheckBool("a failure long after the last starts it again",
                   ExitWalkFailingSince(start, start, true, later) == later, true);
+
+        // A member sitting out is outside the run party, so neither hearth names
+        // it, and left inside it keeps the next reset from ever being possible.
+        CheckBool("a member sitting out keeps walking inside the bound",
+                  SitOutHearthDue(OFF_CONTINENT_HEARTH_AFTER_SECONDS - 1, 0), false);
+        CheckBool("its stone is asked for at the bound",
+                  SitOutHearthDue(OFF_CONTINENT_HEARTH_AFTER_SECONDS, 0), true);
+        CheckBool("and no longer once its attempts are spent",
+                  SitOutHearthDue(OFF_CONTINENT_HEARTH_AFTER_SECONDS, EXIT_HEARTH_ATTEMPTS),
+                  false);
 
         // The attempts bound is unchanged by the new rule.
         CheckBool("the attempts bound is still three", EXIT_HEARTH_ATTEMPTS == 3u, true);

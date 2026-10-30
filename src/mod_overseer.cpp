@@ -36855,6 +36855,10 @@ private:
         std::time_t lastFailedAt{0};
     };
     std::map<std::string, ExitWalkFailing> _exitWalkFailing;
+    // The walk out of a member sitting out, per name (DriveSittingOutLeave). It
+    // is outside the run party, so neither hearth above ever names it, and one
+    // left inside holds the map empty-check InstanceMap::Reset needs (#1202).
+    std::map<std::string, ExitHearthEpisode> _sitOutHearths;
     // The hearth episode of an EVACUATION whose walk the ground refused, per
     // family (WalkStragglersOut). Kept apart from _exitHearths: that one holds the
     // run a failed EXIT left behind and IDLE reads it to finalize that run, and an
@@ -52436,7 +52440,10 @@ private:
                 continue;
             Map* const map = out->GetMap();
             if (!map || !map->IsDungeon())
+            {
+                _sitOutHearths.erase(standin.outName);
                 continue;
+            }
             DungeonPortal const* const portal =
                 FindDungeonPortalByInsideMap(out->GetMapId(), std::string());
             if (!portal)
@@ -52455,6 +52462,26 @@ private:
                          portal->exitTriggerId,
                          standin.reason.empty() ? std::string("what it sits out for")
                                                 : standin.reason);
+            }
+            // THE WALK IS BOUNDED AND THEN THE STONE IS USED (#1202). The escort
+            // is simply not marked while the stone is asked for, so the sweep
+            // ends it, the way WalkStragglersOut treats a member it hearths.
+            ExitHearthEpisode& episode = _sitOutHearths[standin.outName];
+            if (episode.mapId != out->GetMapId())
+            {
+                episode = ExitHearthEpisode();
+                episode.mapId = out->GetMapId();
+                episode.doorMapKnown = true;
+                episode.doorMapId = portal->outsideMapId;
+                episode.since = std::time(nullptr);
+                episode.walkFailingSince = episode.since;
+            }
+            if (OverseerDecisions::SitOutHearthDue(std::time(nullptr) - episode.since,
+                                                   episode.attempts[standin.outName]))
+            {
+                DriveExitHearths(standin.family, standin.outName, {standin.outName}, episode,
+                                 "SIT-OUT");
+                continue;
             }
             std::ostringstream aim;
             aim << "trigger:" << portal->exitTriggerId;

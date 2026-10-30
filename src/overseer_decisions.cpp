@@ -19488,6 +19488,12 @@ bool OffContinentHearthLetThrough(ExitHearthFacts const& facts)
            facts.failedWalkSeconds >= OFF_CONTINENT_HEARTH_AFTER_SECONDS;
 }
 
+bool SitOutHearthDue(std::int64_t walkingSeconds, unsigned attempts)
+{
+    return walkingSeconds >= OFF_CONTINENT_HEARTH_AFTER_SECONDS &&
+           attempts < EXIT_HEARTH_ATTEMPTS;
+}
+
 std::int64_t ExitWalkFailingSince(std::int64_t failingSince, std::int64_t lastFailedAt,
                                   bool sameMap, std::int64_t now)
 {
