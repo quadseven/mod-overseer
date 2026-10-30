@@ -24953,6 +24953,7 @@ private:
         {
             _partySplitSaid.erase(name);
             _partySplitLineSaid.erase(name);
+            _strandedSplitSince.erase(name);
             _strandedReasonSaid.erase(name);
         }
 
@@ -47718,6 +47719,26 @@ private:
         return false;
     }
 
+    // NO SPLIT IS SILENT PAST ITS BOUND (#1143), whatever the verdict: a member
+    // that is crossing, standing down or refused is named here, on its own
+    // clock, where the lines beside each verdict are said once per change.
+    void SayStrandedReason(std::string const& name, Player* p, Player* leader,
+                           std::string const& verdict, std::string const& why)
+    {
+        time_t const now = std::time(nullptr);
+        auto const since = _strandedSplitSince.find(name);
+        std::int64_t const splitSeconds =
+            since == _strandedSplitSince.end() ? 0 : now - since->second;
+        auto const said = _strandedReasonSaid.find(name);
+        std::int64_t const sinceSaid = said == _strandedReasonSaid.end() ? -1 : now - said->second;
+        if (!OverseerDecisions::StrandedReasonDue(splitSeconds, sinceSaid))
+            return;
+        _strandedReasonSaid[name] = now;
+        LOG_WARN("module.overseer", "overseer: {}",
+                 OverseerDecisions::StrandedReasonLine(name, p->GetMapId(), leader->GetMapId(),
+                                                       verdict, why, splitSeconds));
+    }
+
     // ONE STRANDED MEMBER, ONE PARTY POLL. Answers true when this took the
     // member (a hearth, or a crossing of its own), so DriveCatchUp does nothing
     // else with it on this poll; false leaves the member to the drive as before,
@@ -47725,12 +47746,18 @@ private:
     bool DriveStrandedMember(Player* p, Player* leader, std::string const& name, bool split)
     {
         auto memo = _loneCrossings.find(name);
+        if (split)
+            _strandedSplitSince.emplace(name, std::time(nullptr));
         // A `cross-to-map` ROW OWNS THIS MEMBER until it ends: the party poll
         // neither prices a boat home for it nor ends the crossing the row asked for.
-        // BUG FIX: Removed gate that prevented DriveStrandedMember from deciding for
-        // stranded members who have jobRow. A member stranded on another continent
-        // should cross (hearthstone or boat/zeppelin) regardless of whether they
-        // have a job - the decision to cross should be made.
+        // Its own clock bounds it (StepCrossJobClock), and its reason is still said.
+        if (memo != _loneCrossings.end() && memo->second.jobRow)
+        {
+            if (split)
+                SayStrandedReason(name, p, leader, "cross-to-map row",
+                                  "its cross-to-map row owns this crossing until it ends");
+            return true;
+        }
         // THE CHEAP QUESTION FIRST: a member beside its leader with no crossing
         // of its own is every member on every ordinary poll.
         if (!split && memo == _loneCrossings.end())
@@ -47768,11 +47795,20 @@ private:
         // and which the family walks to: the family is coming here, and sailing
         // away from it is the ping-pong this must not start. A family that
         // goes in by the finder walks to no door, so it is not one of these.
+        // That last one is a job, not a movement, so it lapses (#1143); the
+        // rules are FamilyOwnsStrandedWay and EscortOwnsStrandedWay.
         std::string const family = FamilyOfCharacter(name);
         auto const escort = _dungeonEscorts.find(name);
-        bool const runEscort = escort != _dungeonEscorts.end() && !escort->second.catchUp &&
-                               !escort->second.crossing;
-        bool familyComesHere = false;
+        OverseerDecisions::StrandedOwners owners;
+        owners.familyCrossing = FamilyCrossing(family);
+        owners.runEscort = escort != _dungeonEscorts.end() &&
+                           OverseerDecisions::EscortOwnsStrandedWay(
+                               escort->second.catchUp, escort->second.crossing,
+                               escort->second.rejoin, escort->second.homeBind);
+        owners.inRun = InDungeonRun(p);
+        auto const since = _strandedSplitSince.find(name);
+        owners.splitSeconds =
+            since == _strandedSplitSince.end() ? 0 : std::time(nullptr) - since->second;
         if (split && !FinderIsDefault())
             if (QueryResult job = CharacterDatabase.Query(
                     "SELECT job FROM overseer_roster WHERE name = '{}'", Esc(leader->GetName())))
@@ -47781,10 +47817,9 @@ private:
                 if (IsDungeonJob(leaderJob))
                     if (DungeonPortal const* portal =
                             FindDungeonPortal(DungeonKeywordForJob(leaderJob)))
-                        familyComesHere = portal->outsideMapId == p->GetMapId();
+                        owners.familyComesHere = portal->outsideMapId == p->GetMapId();
             }
-        facts.familyOwnsTheWay =
-            FamilyCrossing(family) || runEscort || InDungeonRun(p) || familyComesHere;
+        facts.familyOwnsTheWay = OverseerDecisions::FamilyOwnsStrandedWay(owners);
 
         facts.boundOnLeaderMap = p->m_homebindMapId == facts.leaderMap;
         facts.boundOnMemberMap = p->m_homebindMapId == p->GetMapId();
@@ -47844,19 +47879,8 @@ private:
         bool const fresh = _strandedWaySaid[name] != word;
         _strandedWaySaid[name] = word;
 
-        // A split can outlive any one verdict, including an active crossing
-        // or a deliberate stand-down. Repeat the member's current reason on a
-        // fixed cadence so none of those states can stay silent indefinitely.
-        time_t const now = std::time(nullptr);
-        auto const lastReason = _strandedReasonSaid.find(name);
-        if (split && (lastReason == _strandedReasonSaid.end() ||
-                      now - lastReason->second >= STRANDED_REASON_REPEAT_SECONDS))
-        {
-            _strandedReasonSaid[name] = now;
-            LOG_INFO("module.overseer",
-                     "overseer: '{}' remains split across maps {} and {} - stranded way {}: {}",
-                     name, facts.memberMap, facts.leaderMap, word, why);
-        }
+        if (split)
+            SayStrandedReason(name, p, leader, word, why);
 
         switch (way)
         {
@@ -80530,9 +80554,9 @@ private:
     };
     std::map<std::string, FollowStallState> _followStall;
 
-    static constexpr time_t STRANDED_REASON_REPEAT_SECONDS = 15 * 60;
-    // The last time each split member's stranded verdict and reason were
-    // logged; renewed every fifteen minutes while the maps remain split.
+    // When each split member's split began, and when its verdict and reason
+    // were last logged (SayStrandedReason). World thread only, like the rest.
+    std::map<std::string, time_t> _strandedSplitSince;
     std::map<std::string, time_t> _strandedReasonSaid;
 
     // Which map this follower's leader was on when the split was last said

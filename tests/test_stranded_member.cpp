@@ -30,9 +30,15 @@ using OverseerDecisions::CrossingMember;
 using OverseerDecisions::CrossingStep;
 using OverseerDecisions::CrossingWorld;
 using OverseerDecisions::DecideStrandedWay;
+using OverseerDecisions::EscortOwnsStrandedWay;
+using OverseerDecisions::FamilyOwnsStrandedWay;
 using OverseerDecisions::ShouldLeaveDeck;
 using OverseerDecisions::ReadCrossing;
+using OverseerDecisions::STRANDED_SPLIT_BOUND_SECONDS;
 using OverseerDecisions::StrandedFacts;
+using OverseerDecisions::StrandedOwners;
+using OverseerDecisions::StrandedReasonDue;
+using OverseerDecisions::StrandedReasonLine;
 using OverseerDecisions::StrandedWay;
 using OverseerDecisions::StrandedWayExplanation;
 using OverseerDecisions::StrandedWayName;
@@ -57,6 +63,14 @@ void CheckAction(char const* what, CrossingAction got, CrossingAction want)
         return;
     std::printf("FAIL %s: got '%s', wanted '%s'\n", what, CrossingActionName(got),
                 CrossingActionName(want));
+    ++failures;
+}
+
+void CheckCondition(char const* what, bool holds)
+{
+    if (holds)
+        return;
+    std::printf("FAIL %s\n", what);
     ++failures;
 }
 
@@ -202,19 +216,96 @@ void WhatComesFirst()
     CheckWay("a default reading decides nothing", DecideStrandedWay(blank), StrandedWay::Wait);
 }
 
+// Who owns the way, read as the party poll reads it, then decided.
+StrandedFacts OwnedBy(StrandedOwners const& owners)
+{
+    StrandedFacts facts = Stranded();
+    facts.familyOwnsTheWay = FamilyOwnsStrandedWay(owners);
+    return facts;
+}
+
 void ExitEpisodeDoesNotOwnTheCrossing()
 {
-    // A quest or town job and a crossing record left by the exit episode do
-    // not mean that the family is bringing this member back. The member must
-    // still decide its own way across.
-    StrandedFacts facts = Stranded();
-    facts.crossingUnderWay = true;
-    CheckWay("an exit-episode crossing record does not suppress a boat decision",
-             DecideStrandedWay(facts), StrandedWay::Sail);
+    // THE LIVE STATE (#1143): alive on map 1, leader on map 0, a town or quest
+    // job, and an escort left from the exit. None of those is the family
+    // deciding where the member goes.
+    StrandedOwners rejoin;
+    rejoin.runEscort = EscortOwnsStrandedWay(false, false, true, false);
+    CheckWay("a walk back in left from the exit does not hold the boat",
+             DecideStrandedWay(OwnedBy(rejoin)), StrandedWay::Sail);
 
-    facts.boundOnLeaderMap = true;
-    CheckWay("a ready bind on the leader's map still wins over the stale crossing record",
-             DecideStrandedWay(facts), StrandedWay::Hearth);
+    StrandedOwners home;
+    home.runEscort = EscortOwnsStrandedWay(false, false, false, true);
+    StrandedFacts bound = OwnedBy(home);
+    bound.boundOnLeaderMap = true;
+    CheckWay("a home errand does not hold a ready hearth to the leader's map",
+             DecideStrandedWay(bound), StrandedWay::Hearth);
+
+    CheckCondition("a run's own walk still owns the way",
+                   EscortOwnsStrandedWay(false, false, false, false));
+    CheckCondition("a catch-up walk never owned it",
+                   !EscortOwnsStrandedWay(true, false, false, false));
+    CheckCondition("nor does its own walk to a berth",
+                   !EscortOwnsStrandedWay(false, true, false, false));
+
+    // THE PROMISE THAT THE FAMILY IS COMING lasted as long as the leader's job
+    // did: 11 h 50 min on the dev realm, with the family on a town trip on the
+    // other continent.
+    StrandedOwners coming;
+    coming.familyComesHere = true;
+    coming.splitSeconds = STRANDED_SPLIT_BOUND_SECONDS - 1;
+    CheckWay("inside the bound the family's walk to this door still holds it",
+             DecideStrandedWay(OwnedBy(coming)), StrandedWay::StandDown);
+    coming.splitSeconds = STRANDED_SPLIT_BOUND_SECONDS;
+    CheckWay("past the bound a family that never came no longer holds it",
+             DecideStrandedWay(OwnedBy(coming)), StrandedWay::Sail);
+
+    // What really moves the family has no such bound.
+    StrandedOwners crossing;
+    crossing.familyCrossing = true;
+    crossing.splitSeconds = STRANDED_SPLIT_BOUND_SECONDS * 8;
+    CheckWay("a family crossing under way holds it however long the split",
+             DecideStrandedWay(OwnedBy(crossing)), StrandedWay::StandDown);
+    StrandedOwners run;
+    run.inRun = true;
+    run.splitSeconds = STRANDED_SPLIT_BOUND_SECONDS * 8;
+    CheckWay("so does a run the member is inside",
+             DecideStrandedWay(OwnedBy(run)), StrandedWay::StandDown);
+    StrandedOwners walk;
+    walk.runEscort = true;
+    walk.splitSeconds = STRANDED_SPLIT_BOUND_SECONDS * 8;
+    CheckWay("so does a run's own escort, which its sweep ends",
+             DecideStrandedWay(OwnedBy(walk)), StrandedWay::StandDown);
+}
+
+void ASplitIsNeverSilent()
+{
+    std::int64_t const bound = STRANDED_SPLIT_BOUND_SECONDS;
+    CheckCondition("a fresh split says nothing yet", !StrandedReasonDue(0, -1));
+    CheckCondition("nor just inside the bound", !StrandedReasonDue(bound - 1, -1));
+    CheckCondition("at the bound it says why", StrandedReasonDue(bound, -1));
+    CheckCondition("said, it is not said again at once", !StrandedReasonDue(bound + 5, 5));
+    CheckCondition("nor a second short of the next", !StrandedReasonDue(bound * 2 - 1, bound - 1));
+    CheckCondition("fifteen minutes on it is said again", StrandedReasonDue(bound * 2, bound));
+    CheckCondition("and on for as long as the split lasts", StrandedReasonDue(bound * 48, bound));
+
+    // ANY VERDICT: the line reads the name and the sentence the decision gave,
+    // and every verdict has both.
+    for (StrandedWay way :
+         {StrandedWay::NotStranded, StrandedWay::StandDown, StrandedWay::Wait, StrandedWay::Hearth,
+          StrandedWay::Sail, StrandedWay::WaitForStone, StrandedWay::Refuse, StrandedWay::Portal})
+    {
+        std::string const line =
+            StrandedReasonLine("Member", 1, 0, StrandedWayName(way),
+                               StrandedWayExplanation(Stranded(), way), bound);
+        CheckSays("the line names the member", line, "'Member'");
+        CheckSays("the line names both maps", line, "maps 1 and 0");
+        CheckSays("the line names the verdict", line, StrandedWayName(way));
+        CheckSays("the line says how long", line, "for 15 minutes");
+        CheckCondition("the line says what held it",
+                       !StrandedWayExplanation(Stranded(), way).empty() &&
+                           line.find(StrandedWayExplanation(Stranded(), way)) != std::string::npos);
+    }
 }
 
 // The stranded member, read as the one member of its own crossing.
@@ -339,6 +430,7 @@ int main()
     TheWayAcross();
     WhatComesFirst();
     ExitEpisodeDoesNotOwnTheCrossing();
+    ASplitIsNeverSilent();
     TheLoneCrossing();
     if (failures)
     {

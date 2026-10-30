@@ -8672,6 +8672,34 @@ StrandedWay DecideStrandedWay(StrandedFacts const& f)
     return StrandedWay::Refuse;
 }
 
+bool EscortOwnsStrandedWay(bool catchUp, bool crossing, bool rejoin, bool homeBind)
+{
+    return !catchUp && !crossing && !rejoin && !homeBind;
+}
+
+bool FamilyOwnsStrandedWay(StrandedOwners const& o)
+{
+    if (o.familyCrossing || o.runEscort || o.inRun)
+        return true;
+    return o.familyComesHere && o.splitSeconds < STRANDED_SPLIT_BOUND_SECONDS;
+}
+
+bool StrandedReasonDue(std::int64_t splitSeconds, std::int64_t secondsSinceSaid)
+{
+    if (splitSeconds < STRANDED_SPLIT_BOUND_SECONDS)
+        return false;
+    return secondsSinceSaid < 0 || secondsSinceSaid >= STRANDED_SPLIT_BOUND_SECONDS;
+}
+
+std::string StrandedReasonLine(std::string const& name, std::uint32_t memberMap,
+                               std::uint32_t leaderMap, std::string const& verdict,
+                               std::string const& why, std::int64_t splitSeconds)
+{
+    return "'" + name + "' has been split across maps " + std::to_string(memberMap) + " and " +
+           std::to_string(leaderMap) + " for " + std::to_string(splitSeconds / 60) +
+           " minutes - stranded way '" + verdict + "': " + why;
+}
+
 StrandedGoal StrandedCrossingGoal(std::uint32_t leaderMap, bool leaderInsideKnownDoor,
                                   std::uint32_t doorOutsideMap)
 {
@@ -8738,8 +8766,8 @@ std::string StrandedWayExplanation(StrandedFacts const& f, StrandedWay way)
             return "it is on its leader's map and no crossing of its own is under way";
         case StrandedWay::StandDown:
             return "a dungeon run, the family's own crossing, or a dungeon door on this "
-                   "member's continent that the family is walking to decides where it goes, so "
-                   "it does not cross on its own";
+                   "member's continent that the family has not yet had fifteen minutes to walk "
+                   "to decides where it goes, so it does not cross on its own";
         case StrandedWay::Wait:
             if (!f.readable)
                 return "it could not be read this poll";

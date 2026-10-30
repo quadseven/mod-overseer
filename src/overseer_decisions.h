@@ -10133,9 +10133,7 @@ struct StrandedFacts
     // landed it has anything left to do on its leader's map: one whose leader
     // came to it instead is over, not sailing it away from him.
     bool crossingLanded{false};
-    // A dungeon run's escort or the family's continent crossing is under way,
-    // or the family's dungeon door is on this member's continent and the
-    // family walks to it: the family is coming here.
+    // Somebody else decides where it goes (FamilyOwnsStrandedWay).
     bool familyOwnsTheWay{false};
     // The hearthstone's bind is on the leader's map.
     bool boundOnLeaderMap{false};
@@ -10158,6 +10156,47 @@ struct StrandedFacts
 };
 
 StrandedWay DecideStrandedWay(StrandedFacts const& facts);
+
+// HOW LONG A SPLIT MAY GO UNEXPLAINED, AND HOW LONG A PROMISE OF THE FAMILY
+// COMING MAY HOLD A MEMBER (#1143). A member stayed on map 1 for 11 h 50 min on
+// the dev realm with no crossing and no reason line, and crossed 8 minutes after
+// a restart cleared what the module remembered.
+constexpr std::int64_t STRANDED_SPLIT_BOUND_SECONDS = 15 * 60;
+
+// IS AN ESCORT A RUN'S WALK? Only that decides where a member goes. A catch-up
+// and its own walk to a berth are the crossing's to take over, and a walk back
+// in or a home errand left from the exit is the member's own errand: neither is
+// the family moving, and counting them held the member silently.
+bool EscortOwnsStrandedWay(bool catchUp, bool crossing, bool rejoin, bool homeBind);
+
+// WHO ELSE DECIDES WHERE A STRANDED MEMBER GOES, read by the party poll.
+struct StrandedOwners
+{
+    // The family's own continent crossing is under way.
+    bool familyCrossing{false};
+    // A run's escort holds it (EscortOwnsStrandedWay).
+    bool runEscort{false};
+    // It is inside a dungeon a run has open.
+    bool inRun{false};
+    // The leader's dungeon job has a door on this member's continent and the
+    // family walks to doors. A job is a plan, not a movement: this is the one
+    // owner nothing ends, so it alone lapses at the bound.
+    bool familyComesHere{false};
+    // How long the member has been split from its leader.
+    std::int64_t splitSeconds{0};
+};
+
+bool FamilyOwnsStrandedWay(StrandedOwners const& owners);
+
+// IS THE SPLIT'S REASON DUE? Nothing inside the bound, then once at it and once
+// per bound for as long as the split lasts. `secondsSinceSaid` is negative when
+// this split has not been explained yet.
+bool StrandedReasonDue(std::int64_t splitSeconds, std::int64_t secondsSinceSaid);
+
+// The line itself: the member, both maps, the verdict and what held it.
+std::string StrandedReasonLine(std::string const& name, std::uint32_t memberMap,
+                               std::uint32_t leaderMap, std::string const& verdict,
+                               std::string const& why, std::int64_t splitSeconds);
 
 // STEPPING OFF A DOCKED DECK MEANS LEAVING THE TRANSPORT (#274). The walk-off
 // counted a passenger within its landed distance of surveyed ground as off and
