@@ -37243,7 +37243,7 @@ private:
     // hearth is in play, which is what holds adoption back.
     bool DriveExitHearths(std::string const& family, std::string const& leaderName,
                           std::vector<std::string> const& members, ExitHearthEpisode& episode,
-                          char const* phase)
+                          char const* phase, char const* reason)
     {
         using OverseerDecisions::ExitHearthStep;
 
@@ -37296,10 +37296,10 @@ private:
                     {
                         LOG_WARN("module.overseer",
                                  "overseer: EXIT HEARTH - '{}' is hearthing out of map {} "
-                                 "(attempt {} of {}) because the walk to the exit door "
-                                 "failed; the campaign stays as it is and the next run "
+                                 "(attempt {} of {}) because {}; the campaign stays as it is "
+                                 "and the next run "
                                  "starts normally",
-                                 name, episode.mapId, episode.attempts[name],
+                                 name, episode.mapId, episode.attempts[name], reason,
                                  OverseerDecisions::EXIT_HEARTH_ATTEMPTS);
                         if (OverseerDecisions::OffContinentHearthLetThrough(facts))
                             LOG_WARN("module.overseer",
@@ -37313,7 +37313,7 @@ private:
                             family, leaderName, name, episode, phase, "exit_hearth",
                             "hearth cast for " + name + " on map " +
                                 std::to_string(episode.mapId) +
-                                " after EXIT could not walk the party out (attempt " +
+                                " after " + reason + " (attempt " +
                                 std::to_string(episode.attempts[name]) + ")");
                     }
                     else
@@ -37408,6 +37408,7 @@ private:
         yard.hearth.campaignId = run.campaignId;
         yard.hearth.runNumber = run.runNumber;
         yard.hearth.portal = portal.keyword;
+        yard.hearth.mapId = OverseerDecisions::STRATHOLME_EXIT_YARD_MAP_ID;
         yard.hearth.doorMapKnown = true;
         yard.hearth.doorMapId = portal.outsideMapId;
         yard.hearth.walkFailingSince = yard.since;
@@ -37571,7 +37572,7 @@ private:
                 if (!yard.hearth.since)
                     yard.hearth.since = now;
                 if (DriveExitHearths(family, leaderName, hearthers, yard.hearth,
-                                     "STRATHOLME_YARD"))
+                                     "STRATHOLME_YARD", "leaving the Stratholme exit yard"))
                     return true;
                 LOG_WARN("module.overseer",
                          "overseer: stratholme exit: no hearth is left in play for the {} of "
@@ -39588,7 +39589,8 @@ private:
             episode.campaignId = coord.campaignId;
             episode.runNumber = coord.runNumber;
             episode.portal = coord.portalKeyword;
-            DriveExitHearths(family, leaderName, hearthers, episode, splitCopy ? "SPLIT" : "RESET");
+            DriveExitHearths(family, leaderName, hearthers, episode,
+                             splitCopy ? "SPLIT" : "RESET", "the walk out failed");
         }
 
         // AND THE DOOR IS KNOCKED ON AT POLL RATE, NOT ONLY ON ARRIVAL, which
@@ -52787,7 +52789,7 @@ private:
                                                    episode.attempts[standin.outName]))
             {
                 DriveExitHearths(standin.family, standin.outName, {standin.outName}, episode,
-                                 "SIT-OUT");
+                                 "SIT-OUT", "the walk out failed");
                 continue;
             }
             std::ostringstream aim;
@@ -54067,7 +54069,8 @@ private:
                     if (!activeInside)
                         return;  // an unseen member is not proof of an exit
                     if (activeInside && activeInside->GetMapId() == episode->second.mapId &&
-                        DriveExitHearths(family, leaderName, members, episode->second, "IDLE"))
+                        DriveExitHearths(family, leaderName, members, episode->second, "IDLE",
+                                         "the walk out failed"))
                         return;
                     if (activeInside && activeInside->GetMapId() == episode->second.mapId)
                         LOG_WARN("module.overseer",
@@ -56384,8 +56387,9 @@ private:
                             episode.runNumber = coord.runNumber;
                             episode.portal = coord.portalKeyword;
                             episode.since = std::time(nullptr);
-                            bool const inPlay =
-                                DriveExitHearths(family, leaderName, members, episode, "EXIT");
+                            bool const inPlay = DriveExitHearths(
+                                family, leaderName, members, episode, "EXIT",
+                                "the walk to the exit door failed");
                             if (inPlay)
                             {
                                 LOG_WARN("module.overseer",
