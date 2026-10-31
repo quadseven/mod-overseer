@@ -91,6 +91,8 @@ commands from the repo root with the runner's own `g++` and `python3`:
 
 ```sh
 python3 -B tests/replay_exit_hearth_finalization.py
+python3 -B tests/replay_travel_claim_cache.py
+python3 -B tests/replay_main_tank_cache.py
 g++ -std=c++17 -Wall -Wextra -Isrc -c src/overseer_decisions.cpp -o overseer_decisions.o
 for test in tests/test_*.cpp; do
   name="$(basename "$test" .cpp)"
@@ -98,6 +100,10 @@ for test in tests/test_*.cpp; do
   "./$name"
 done
 ```
+
+The main-tank replay applies the carried playerbots patch to pinned source
+fixtures and compiles the actual cache and threat-consumer path. It needs git
+and a C++17 compiler; it uses no realm, database or network.
 
 `scripts/check-locally.sh decisions` runs the same steps (plus the check that
 `VERSION` matches the constant in `src/overseer_decisions.h`) in a scratch
