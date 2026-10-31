@@ -58401,8 +58401,8 @@ private:
     // (mod-overseer#823). The decision and why it is shaped this way are
     // OverseerDecisions::DecideRebuff; this reads the caster and its group,
     // and on Cast asks the caster's OWN party buff action, which picks the
-    // target and the rank and spends the caster's own mana as its trigger
-    // would. Nothing here casts a spell itself.
+    // target and rank within its subgroup. In a raid, one eligible member in
+    // another subgroup is separately queued through the named cast command.
     //
     // SAID ON A CHANGE, AND EVERY ASK IS READ BACK. A step other than Cast is
     // said when it differs from the last one said for that caster, so a priest
@@ -58448,8 +58448,15 @@ private:
                 facts.cost = cost > 0 ? static_cast<uint32>(cost) : 0;
             }
 
+            Group* group = bot->GetGroup();
+            facts.inRaid = group && group->isRaidGroup();
+            if (facts.inRaid)
+                facts.casterSubgroup = group->GetMemberGroup(bot->GetGUID());
+
             auto readMember = [&](Player* member) {
                 OverseerDecisions::RebuffMember seen;
+                seen.name = member->GetName();
+                seen.subgroup = facts.inRaid ? group->GetMemberGroup(member->GetGUID()) : 0;
                 seen.alive = member->IsAlive();
                 seen.sameMap = member->IsInWorld() && member->GetMap() == bot->GetMap();
                 seen.hasBuff = botAI->HasAura(spell.aura, member) ||
@@ -58461,7 +58468,7 @@ private:
                 }
                 facts.members.push_back(seen);
             };
-            if (Group* group = bot->GetGroup())
+            if (group)
             {
                 for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
                     if (Player* member = ref->GetSource())
@@ -58470,7 +58477,55 @@ private:
             else
                 readMember(bot);
 
+            if (facts.inRaid)
+            {
+                for (OverseerDecisions::RebuffMember& member : facts.members)
+                {
+                    if (!member.alive || !member.sameMap)
+                        continue;
+                    Player* candidate = ObjectAccessor::FindPlayerByName(member.name);
+                    if (!candidate)
+                        continue;
+                    if (candidate->getClass() != bot->getClass() ||
+                        !candidate->HasSpell(spellId))
+                        continue;
+                    if (!candidate->IsAlive() || candidate->IsInCombat() ||
+                        candidate->IsNonMeleeSpellCast(false) ||
+                        candidate->IsMounted() || candidate->IsInFlight())
+                        continue;
+                    int32 const candidateCost = info
+                        ? info->CalcPowerCost(candidate, info->GetSchoolMask()) : 0;
+                    uint32 const candidateMana = candidate->GetPower(POWER_MANA);
+                    uint32 const candidateMaxMana = candidate->GetMaxPower(POWER_MANA);
+                    uint32 const normalizedCost = candidateCost > 0
+                        ? static_cast<uint32>(candidateCost) : 0;
+                    if (candidateMana < normalizedCost ||
+                        static_cast<uint64>(candidateMana - normalizedCost) * 100 <
+                            static_cast<uint64>(candidateMaxMana) *
+                                OverseerDecisions::REBUFF_MANA_RESERVE_PERCENT)
+                        continue;
+                    member.hasBuffer = true;
+                }
+                for (OverseerDecisions::RebuffMember& member : facts.members)
+                    for (OverseerDecisions::RebuffMember const& candidate : facts.members)
+                        if (candidate.subgroup == member.subgroup && candidate.hasBuffer)
+                            member.hasBuffer = true;
+            }
+
             OverseerDecisions::RebuffDecision const decision = OverseerDecisions::DecideRebuff(facts);
+
+            auto const crossAsked = _rebuffCrossAsked.find(name);
+            if (crossAsked != _rebuffCrossAsked.end())
+            {
+                Player* target = ObjectAccessor::FindPlayerByName(crossAsked->second);
+                bool const hasAura = target &&
+                    (botAI->HasAura(spell.aura, target) || botAI->HasAura(spell.groupAura, target));
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' asked for '{}' on raid member '{}' last poll - {}",
+                         name, spell.aura, crossAsked->second,
+                         hasAura ? "aura read back" : "aura not observed yet");
+                _rebuffCrossAsked.erase(crossAsked);
+            }
 
             auto const asked = _rebuffAsked.find(name);
             if (asked != _rebuffAsked.end())
@@ -58486,35 +58541,60 @@ private:
             if (decision.step != OverseerDecisions::RebuffStep::Cast)
             {
                 auto const said = _rebuffSaid.find(name);
-                if (said != _rebuffSaid.end() && said->second == decision.step)
+                if (!decision.crossPartyTarget && said != _rebuffSaid.end() &&
+                    said->second == decision.step)
                     continue;
                 _rebuffSaid[name] = decision.step;
                 // The two ordinary states are remembered but not said.
                 if (decision.step == OverseerDecisions::RebuffStep::NoSpell ||
                     decision.step == OverseerDecisions::RebuffStep::NothingMissing)
-                    continue;
+                {
+                    if (!decision.crossPartyTarget)
+                        continue;
+                }
+                else
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' does not rebuff '{}' - {} ({} member(s) missing it, "
+                             "{} within {} yards and sight; mana {} of {}, the cast costs {})",
+                             name, spell.aura, OverseerDecisions::RebuffStepWord(decision.step),
+                             static_cast<uint32>(decision.missing), static_cast<uint32>(decision.inReach),
+                             static_cast<uint32>(OverseerDecisions::REBUFF_REACH_YARDS), facts.mana,
+                             facts.maxMana, facts.cost);
+            }
+            else
+            {
+                _rebuffSaid[name] = decision.step;
+                bool const took = botAI->DoSpecificAction(spell.action, Event(), true);
+                if (took)
+                    _rebuffAsked[name] = decision.missing;
                 LOG_INFO("module.overseer",
-                         "overseer: '{}' does not rebuff '{}' - {} ({} member(s) missing it, "
-                         "{} within {} yards and sight; mana {} of {}, the cast costs {})",
-                         name, spell.aura, OverseerDecisions::RebuffStepWord(decision.step),
-                         static_cast<uint32>(decision.missing), static_cast<uint32>(decision.inReach),
+                         "overseer: '{}' is asked for '{}' - {} member(s) missing '{}', {} within "
+                         "{} yards and sight, mana {} of {} for a cost of {}; the action {}",
+                         name, spell.action, static_cast<uint32>(decision.missing), spell.aura,
+                         static_cast<uint32>(decision.inReach),
                          static_cast<uint32>(OverseerDecisions::REBUFF_REACH_YARDS), facts.mana,
-                         facts.maxMana, facts.cost);
-                continue;
+                         facts.maxMana, facts.cost,
+                         took ? "ran" : "refused (useless, impossible or failed)");
             }
 
-            _rebuffSaid[name] = decision.step;
-            bool const took = botAI->DoSpecificAction(spell.action, Event(), true);
-            if (took)
-                _rebuffAsked[name] = decision.missing;
-            LOG_INFO("module.overseer",
-                     "overseer: '{}' is asked for '{}' - {} member(s) missing '{}', {} within "
-                     "{} yards and sight, mana {} of {} for a cost of {}; the action {}",
-                     name, spell.action, static_cast<uint32>(decision.missing), spell.aura,
-                     static_cast<uint32>(decision.inReach),
-                     static_cast<uint32>(OverseerDecisions::REBUFF_REACH_YARDS), facts.mana,
-                     facts.maxMana, facts.cost,
-                     took ? "ran" : "refused (useless, impossible or failed)");
+            if (decision.crossPartyTarget)
+            {
+                std::string command = std::to_string(spellId) + " on:" +
+                                      decision.crossPartyTarget->name;
+                std::string source = "rebuff raid " + name + " " +
+                                     decision.crossPartyTarget->name + " " +
+                                     std::to_string(std::time(nullptr));
+                if (source.size() > 64)
+                    source.resize(64);
+                CharacterDatabase.Execute(
+                    "INSERT INTO overseer_command (target_name, command, kind, target_arg, source) "
+                    "VALUES ('{}', '{}', 'cast', '', '{}')",
+                    Esc(name), Esc(command), Esc(source));
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' asked to cast '{}' on raid member '{}' through kind='cast'",
+                         name, spell.aura, decision.crossPartyTarget->name);
+                _rebuffCrossAsked[name] = decision.crossPartyTarget->name;
+            }
         } while (result->NextRow());
     }
 
@@ -80809,6 +80889,7 @@ private:
     // missing the buff when its party buff action was last asked to run.
     std::map<std::string, OverseerDecisions::RebuffStep> _rebuffSaid;
     std::map<std::string, std::size_t> _rebuffAsked;
+    std::map<std::string, std::string> _rebuffCrossAsked;
 
     // The unlearn this module has already refused for each character, so a
     // standing disagreement about the price is said once rather than twice a
