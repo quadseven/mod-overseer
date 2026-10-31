@@ -25348,4 +25348,159 @@ bool StratholmeHearthLeavesTheYard(bool stoneReady, std::uint32_t bindMap, float
     return stoneReady && !InStratholmeExitYard(bindMap, bindX, bindY);
 }
 
+// ------------------- a family mage's way to a capital instead of a walk (#1161)
+
+namespace
+{
+float MageLandingYards(MageTravelSpell const& spell, MageTravelFacts const& facts)
+{
+    float const dx = spell.x - facts.destX;
+    float const dy = spell.y - facts.destY;
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+// The nearest spell of this kind that lands within reach of the destination.
+MageTravelSpell const* MageSpellTo(MageTravelFacts const& facts, bool portal)
+{
+    MageTravelSpell const* best = nullptr;
+    for (MageTravelSpell const& spell : facts.spells)
+    {
+        if (spell.makesPortal != portal || spell.map != facts.destMap)
+            continue;
+        float const yards = MageLandingYards(spell, facts);
+        if (yards > MAGE_TRAVEL_LANDING_REACH_YARDS)
+            continue;
+        if (!best || yards < MageLandingYards(*best, facts))
+            best = &spell;
+    }
+    return best;
+}
+
+MageSpellLanding const* MageLandingOf(std::uint32_t spellId,
+                                      std::vector<MageSpellLanding> const& landings)
+{
+    for (MageSpellLanding const& landing : landings)
+        if (spellId && landing.spellId == spellId)
+            return &landing;
+    return nullptr;
+}
+}  // namespace
+
+std::vector<MageTravelSpell> MageTravelSpellsFrom(std::vector<MageKnownSpell> const& known,
+                                                  std::vector<MageSpellLanding> const& landings)
+{
+    std::vector<MageTravelSpell> spells;
+    for (MageKnownSpell const& spell : known)
+    {
+        if (!spell.mageFamily)
+            continue;
+        MageSpellLanding const* const own = MageLandingOf(spell.spellId, landings);
+        MageSpellLanding const* const landing =
+            own ? own : MageLandingOf(spell.portalObjectSpell, landings);
+        if (!landing || Classic::IsOutsideClassic(landing->map, 0))
+            continue;
+        MageTravelSpell read;
+        read.spellId = spell.spellId;
+        read.makesPortal = !own;
+        read.map = landing->map;
+        read.x = landing->x;
+        read.y = landing->y;
+        read.reagentEntry = spell.reagentEntry;
+        read.reagentNeeded = spell.reagentNeeded;
+        read.reagentCarried = spell.reagentCarried;
+        spells.push_back(read);
+    }
+    return spells;
+}
+
+char const* MageTravelWayWord(MageTravelWay way)
+{
+    switch (way)
+    {
+        case MageTravelWay::Teleport: return "teleport";
+        case MageTravelWay::Portal:   return "portal";
+        case MageTravelWay::Walk:     break;
+    }
+    return "walk";
+}
+
+MageTravelVerdict DecideMageTravel(MageTravelFacts const& facts)
+{
+    MageTravelVerdict verdict;
+    if (facts.sameMap && facts.walkYards < MAGE_TRAVEL_MIN_SAVED_YARDS)
+        return verdict;
+
+    bool const forTheParty = !facts.casterIsTraveller || facts.othersPresent > 0;
+    MageTravelSpell const* const teleport = MageSpellTo(facts, false);
+    MageTravelSpell const* const portal = MageSpellTo(facts, true);
+    MageTravelSpell const* const landing = teleport ? teleport : portal;
+    if (!landing)
+    {
+        verdict.reason = MageTravelRefusal::NoSpellForThatPlace;
+        return verdict;
+    }
+    if (facts.sameMap &&
+        facts.walkYards - MageLandingYards(*landing, facts) < MAGE_TRAVEL_MIN_SAVED_YARDS)
+        return verdict;
+
+    MageTravelSpell const* const spell = forTheParty ? portal : teleport;
+    if (!spell)
+    {
+        verdict.reason = forTheParty ? MageTravelRefusal::NoPortalForTheParty
+                                     : MageTravelRefusal::NoSpellForThatPlace;
+        return verdict;
+    }
+    verdict.spellId = spell->spellId;
+    if (spell->reagentCarried < spell->reagentNeeded)
+    {
+        verdict.reason = forTheParty ? MageTravelRefusal::NoRuneOfPortals
+                                     : MageTravelRefusal::NoRuneOfTeleportation;
+        return verdict;
+    }
+    verdict.way = forTheParty ? MageTravelWay::Portal : MageTravelWay::Teleport;
+    return verdict;
+}
+
+bool MageTravelCastRetries(std::string const& detail, std::uint32_t tries)
+{
+    return tries < MAGE_TRAVEL_CAST_TRIES && CastRefusalRetry(detail) == TownRetry::Later;
+}
+
+bool MageTravelCalledOff(bool travellerClicked, bool aimPresent, bool aimIsGuard,
+                         bool aimIsTheRuns)
+{
+    return !travellerClicked && (!aimPresent || aimIsGuard || !aimIsTheRuns);
+}
+
+std::vector<std::size_t> NextPortalClickers(std::vector<MageTravelClicker> const& party)
+{
+    for (std::size_t i = 0; i < party.size(); ++i)
+    {
+        if (!party[i].traveller || party[i].mage)
+            continue;
+        if (party[i].underWay)
+            return {};
+        if (party[i].waiting)
+            return {i};
+    }
+
+    std::vector<std::size_t> rest;
+    bool stillGoing = false;
+    for (std::size_t i = 0; i < party.size(); ++i)
+    {
+        if (party[i].mage)
+            continue;
+        stillGoing = stillGoing || party[i].underWay;
+        if (party[i].waiting)
+            rest.push_back(i);
+    }
+    if (!rest.empty() || stillGoing)
+        return rest;
+
+    for (std::size_t i = 0; i < party.size(); ++i)
+        if (party[i].mage && party[i].waiting)
+            return {i};
+    return {};
+}
+
 }  // namespace OverseerDecisions
