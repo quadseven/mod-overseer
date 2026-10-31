@@ -121,6 +121,12 @@ on the wrong floor. The session boundary refuses crossings outside the trigger.
 This replay needs a C++17 compiler and does not include client map data. Live
 walking and repeated campaigns still require realm verification.
 
+The bag-purchase replay executes the actual buy preflight, packet dispatch
+and inventory readback against explicit inventory and session boundaries.
+It checks a full backpack with an empty bag position, refusal cases, and
+the existing ordinary storage path. Native adapter CI checks the SDK calls;
+live vendor purchases still require realm verification.
+
 The family-run replay compiles the actual ledger adapters against SQLite.
 It needs the SQLite development library as well as a C++17 compiler. It checks
 independent families on one map, repeated members, adoption, ownership after

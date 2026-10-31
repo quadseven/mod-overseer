@@ -64732,10 +64732,39 @@ private:
 
         // Where it will go, asked with the same call and the same count the
         // core will use, so this answer and the core's are the same answer.
+        uint8 equipSlot = NULL_SLOT;
         {
             ItemPosCountVec dest;
-            InventoryResult const msg = buyer->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest,
-                                                              request.entry, uint32(ev.itemsWanted));
+            InventoryResult msg = buyer->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest,
+                                                         request.entry, uint32(ev.itemsWanted));
+            // A bag cures a full inventory without landing in it first (#1278).
+            // Only an empty general-bag position is considered; the core still
+            // decides whether this character can equip the purchased item.
+            if (msg == EQUIP_ERR_INVENTORY_FULL && ev.itemsWanted == 1 &&
+                proto->Class == ITEM_CLASS_CONTAINER &&
+                proto->SubClass == ITEM_SUBCLASS_CONTAINER &&
+                proto->InventoryType == INVTYPE_BAG && proto->ContainerSlots > 0)
+            {
+                for (uint8 slot = INVENTORY_SLOT_BAG_START; slot < INVENTORY_SLOT_BAG_END; ++slot)
+                {
+                    if (buyer->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                        continue;
+                    uint16 position = 0;
+                    msg = buyer->CanEquipNewItem(slot, position, request.entry, false);
+                    if (msg == EQUIP_ERR_OK)
+                    {
+                        if (position == uint16((uint16(INVENTORY_SLOT_BAG_0) << 8) | slot))
+                        {
+                            equipSlot = slot;
+                            // AI-REVIEW 2026-10-31 [poolside/laguna-s-2.1] C4431594205
+                            // (single-model review, PR #1279): only stop at a legal position.
+                            break;
+                        }
+                        else
+                            msg = EQUIP_ERR_ITEM_DOESNT_GO_TO_SLOT;
+                    }
+                }
+            }
             ev.haveInventoryResult = true;
             ev.inventoryResult = msg;
             if (msg != EQUIP_ERR_OK)
@@ -64759,6 +64788,20 @@ private:
         // reads (ItemPackets.cpp). THE SLOT IS SENT PLUS ONE: the client
         // numbers vendor slots from 1 and HandleBuyItemOpcode decrements before
         // it does anything, treating a 0 as a cheat and returning.
+        if (equipSlot != NULL_SLOT)
+        {
+            WorldPacket raw(CMSG_BUY_ITEM_IN_SLOT, 8 + 4 + 4 + 8 + 1 + 4);
+            raw << vendor->GetGUID();
+            raw << uint32(request.entry);
+            raw << uint32(uint32(ev.vendorSlot) + 1);
+            raw << buyer->GetGUID();
+            raw << equipSlot;
+            raw << uint32(request.count);
+            WorldPackets::Item::BuyItemInSlot packet(std::move(raw));
+            packet.Read();
+            session->HandleBuyItemInSlotOpcode(packet);
+        }
+        else
         {
             WorldPacket raw(CMSG_BUY_ITEM, 8 + 4 + 4 + 4 + 1);
             raw << vendor->GetGUID();
@@ -64779,6 +64822,15 @@ private:
         if (line->maxcount != 0)
             ev.stockLeft = int32(vendor->GetVendorItemCurrentCount(line));
 
+        if (equipSlot != NULL_SLOT)
+        {
+            Item const* worn = buyer->GetItemByPos(INVENTORY_SLOT_BAG_0, equipSlot);
+            if (!worn || worn->GetEntry() != request.entry)
+            {
+                describe("refused", "the purchased bag did not arrive in its equipment slot");
+                return "the purchased bag did not arrive in its equipment slot";
+            }
+        }
         if (ev.carriedAfter == ev.carriedBefore && ev.moneyAfter == ev.moneyBefore)
         {
             describe("refused", "the core refused the purchase");
