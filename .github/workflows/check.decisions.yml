@@ -93,6 +93,8 @@ jobs:
         run: python3 -B tests/replay_door_floor.py
       - name: Replay long-route walking and physical trigger crossing
         run: python3 -B tests/replay_long_navmesh.py
+      - name: Replay buying into an empty bag position
+        run: python3 -B tests/replay_buy_bag.py
       - name: Install ledger replay database clients
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev default-mysql-client
       - name: Replay independent family run ledgers
