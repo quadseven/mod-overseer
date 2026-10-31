@@ -7305,6 +7305,7 @@ char const* TownRetryWord(TownRetry retry);
 //
 //   kind='quest'  use-item-on creature:<entry> item:<entry>
 //   kind='quest'  use-gameobject <entry>
+//   kind='quest'  cast-spell-on-mainhand spell:<id>
 //
 // `use-item-on` is a player selecting a creature and using a carried item at
 // it: the hunter's taming and pet quests, the warlock's pet-chain items, a
@@ -7313,6 +7314,8 @@ char const* TownRetryWord(TownRetry retry);
 // player clicking the nearest gameobject of an entry (CMSG_GAMEOBJ_USE), which
 // is how an altar or a lever is operated; a quest chest is opened with the
 // spell its lock names instead (ChestOpeningSpell), as a client opens one.
+// `cast-spell-on-mainhand` casts a known spell at the main-hand weapon; the
+// character must be within the spell's range of a Runeforge (focus 1552).
 //
 // THE WALK IS THE BRIDGE'S. These verbs never move the character: they fire
 // when it already stands within reach of the target, and refuse with `the
@@ -7354,6 +7357,8 @@ constexpr char const* USE_ITEM_HERE_VERB = "use-item-here";
 // done (QuestUseReadBack::petGained). Nothing here makes a pet: the core's
 // own TAME_CREATURE effect does, when the channel ends with the beast alive.
 constexpr char const* USE_SPELL_ON_VERB = "use-spell-on";
+// Cast a known spell at the equipped main-hand item beside focus 1552.
+constexpr char const* CAST_SPELL_ON_MAINHAND_VERB = "cast-spell-on-mainhand";
 
 // Reach for a creature target. The item's own spell range is checked again by
 // the core, so this is the near edge of what any quest item allows.
@@ -7393,12 +7398,15 @@ struct QuestUseRequest
     std::uint32_t target{0};  // creature entry, or gameobject entry
     std::uint32_t item{0};    // item entry; 0 for a gameobject or spell use
     std::uint32_t spell{0};   // use-spell-on: the spell cast at the creature
+    bool mainHand{false};
     char const* error{""};    // a QuestUseRefusal literal; empty when it parsed
 };
 
 // `use-item-on creature:<entry> item:<entry>` (both keys, each once, any
 // order, non-zero digits) and `use-gameobject <entry>` (one non-zero entry).
 QuestUseRequest ParseQuestUseRequest(std::string const& command);
+struct MainHandSpellFacts { bool spellKnown{false}; bool mainHandEquipped{false}; bool focusInRange{false}; bool spellOnCooldown{false}; };
+char const* MainHandSpellGate(MainHandSpellFacts const& facts);
 
 namespace QuestUseRefusal
 {
@@ -7406,6 +7414,11 @@ constexpr char const* MalformedItem = "malformed use-item-on command";
 constexpr char const* MalformedObject = "malformed use-gameobject command";
 constexpr char const* MalformedHere = "malformed use-item-here command";
 constexpr char const* MalformedSpell = "malformed use-spell-on command";
+constexpr char const* MalformedMainHandSpell = "malformed cast-spell-on-mainhand command";
+constexpr char const* MainHandSpellUnknown = "the character does not know the main-hand spell";
+constexpr char const* MainHandMissing = "the character has no main-hand weapon";
+constexpr char const* MainHandFocusMissing = "no Runeforge is within spell range";
+constexpr char const* MainHandSpellOnCooldown = "the main-hand spell is on cooldown";
 constexpr char const* SpellUnknown = "the character does not know that spell";
 constexpr char const* NoCreatureSpell = "that spell takes no creature target";
 constexpr char const* SpellOnCooldown = "the spell is on cooldown";
