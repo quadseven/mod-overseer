@@ -11784,6 +11784,169 @@ bool SteerCreatureWalkAlongRoute(bool creatureAim, std::uint32_t diedOnLegsHeld)
     return creatureAim && diedOnLegsHeld > 0;
 }
 
+std::uint32_t LowestPartyLevel(std::vector<std::uint32_t> const& partyLevels)
+{
+    std::uint32_t lowest = 0;
+    for (std::uint32_t const level : partyLevels)
+        if (level && (!lowest || level < lowest))
+            lowest = level;
+    return lowest;
+}
+
+namespace
+{
+bool CountsAgainstParty(ZoneDeath const& death, std::uint32_t partyLevel, std::time_t now,
+                        ZoneDangerLimits const& limits)
+{
+    return partyLevel && death.killerLevel >= partyLevel + limits.levelGap && death.at <= now &&
+           static_cast<std::int64_t>(now - death.at) < limits.windowSeconds;
+}
+
+std::string ZoneNames(std::vector<DangerZone> const& zones, ZoneDangerLimits const& limits)
+{
+    std::string out;
+    for (std::size_t i = 0; i < zones.size(); ++i)
+    {
+        if (i)
+            out += ", ";
+        out += "zone " + std::to_string(zones[i].zoneId);
+        if (!zones[i].name.empty())
+            out += " (" + zones[i].name + ")";
+        out += ", " + std::to_string(zones[i].deaths) + " death(s) in " +
+               std::to_string(limits.windowSeconds / 3600) + " hours to creatures up to level " +
+               std::to_string(zones[i].strongestKiller);
+    }
+    return out;
+}
+
+bool WalksZone(std::vector<std::uint32_t> const& nodes, NodeZones const& nodeZones,
+               std::uint32_t zoneId)
+{
+    for (std::uint32_t const node : nodes)
+    {
+        NodeZones::const_iterator const at = nodeZones.find(node);
+        if (at != nodeZones.end() && at->second == zoneId)
+            return true;
+    }
+    return false;
+}
+}  // namespace
+
+std::uint32_t ZoneDangerScore(std::vector<ZoneDeath> const& deaths, std::uint32_t mapId,
+                              std::uint32_t zoneId, std::uint32_t partyLevel, std::time_t now,
+                              ZoneDangerLimits const& limits)
+{
+    std::uint32_t score = 0;
+    for (ZoneDeath const& death : deaths)
+        if (death.mapId == mapId && death.zoneId == zoneId &&
+            CountsAgainstParty(death, partyLevel, now, limits))
+            ++score;
+    return score;
+}
+
+std::vector<DangerZone> DangerZonesOn(std::vector<ZoneDeath> const& deaths, std::uint32_t mapId,
+                                      std::uint32_t partyLevel, std::time_t now,
+                                      ZoneDangerLimits const& limits)
+{
+    std::map<std::uint32_t, DangerZone> counted;
+    for (ZoneDeath const& death : deaths)
+    {
+        if (death.mapId != mapId || !CountsAgainstParty(death, partyLevel, now, limits))
+            continue;
+        DangerZone& zone = counted[death.zoneId];
+        zone.zoneId = death.zoneId;
+        ++zone.deaths;
+        zone.strongestKiller = std::max(zone.strongestKiller, death.killerLevel);
+    }
+    std::vector<DangerZone> out;
+    for (std::pair<std::uint32_t const, DangerZone> const& entry : counted)
+        if (limits.deaths && entry.second.deaths >= limits.deaths)
+            out.push_back(entry.second);
+    return out;
+}
+
+void ForgetOldZoneDeaths(std::vector<ZoneDeath>& deaths, std::time_t now,
+                         ZoneDangerLimits const& limits)
+{
+    deaths.erase(std::remove_if(deaths.begin(), deaths.end(),
+                                [&](ZoneDeath const& death)
+                                {
+                                    return static_cast<std::int64_t>(now - death.at) >=
+                                           limits.windowSeconds;
+                                }),
+                 deaths.end());
+}
+
+float DangerZonePrice(std::uint32_t from, std::uint32_t to, NodeZones const& nodeZones,
+                      std::vector<DangerZone> const& zones, ZoneDangerLimits const& limits)
+{
+    if (!(limits.priceYards >= 0.f) || !std::isfinite(limits.priceYards))
+        return 0.f;
+    NodeZones::const_iterator const a = nodeZones.find(from);
+    NodeZones::const_iterator const b = nodeZones.find(to);
+    for (DangerZone const& zone : zones)
+        if ((a != nodeZones.end() && a->second == zone.zoneId) ||
+            (b != nodeZones.end() && b->second == zone.zoneId))
+            return limits.priceYards;
+    return 0.f;
+}
+
+std::uint32_t PriceDangerZones(std::vector<RouteLink>& links, NodeZones const& nodeZones,
+                               std::vector<DangerZone> const& zones,
+                               ZoneDangerLimits const& limits)
+{
+    std::uint32_t priced = 0;
+    if (zones.empty())
+        return priced;
+    for (RouteLink& link : links)
+    {
+        if (!link.onFoot || !(link.yards >= 0.f))
+            continue;
+        float const price = DangerZonePrice(link.from, link.to, nodeZones, zones, limits);
+        if (price > 0.f)
+        {
+            link.yards += price;
+            ++priced;
+        }
+    }
+    return priced;
+}
+
+ZoneRouteReading ReadZoneRoute(std::vector<std::uint32_t> const& walked,
+                               std::vector<std::uint32_t> const& wayThrough,
+                               NodeZones const& nodeZones,
+                               std::vector<DangerZone> const& zones)
+{
+    ZoneRouteReading reading;
+    for (DangerZone const& zone : zones)
+    {
+        if (WalksZone(walked, nodeZones, zone.zoneId))
+            reading.stillWalked.push_back(zone);
+        else if (WalksZone(wayThrough, nodeZones, zone.zoneId))
+            reading.avoided.push_back(zone);
+    }
+    return reading;
+}
+
+std::string ZoneAvoidedLine(std::string const& name, std::string const& target,
+                            std::vector<DangerZone> const& avoided,
+                            ZoneDangerLimits const& limits)
+{
+    return "overseer: '" + name + "' is sent to '" + target + "' and its route avoids " +
+           ZoneNames(avoided, limits) + ", " + std::to_string(limits.levelGap) +
+           " or more levels above this party (#1243)";
+}
+
+std::string ZoneNoWayRoundLine(std::string const& name, std::string const& target,
+                               std::vector<DangerZone> const& stillWalked,
+                               ZoneDangerLimits const& limits)
+{
+    return "overseer: '" + name + "' is sent to '" + target +
+           "' and no alternative route exists round " + ZoneNames(stillWalked, limits) + ", " +
+           std::to_string(limits.levelGap) +
+           " or more levels above this party. It walks the fewest legs there it can (#1243)";
+}
+
 std::uint32_t DiedOnLegsOnRoute(std::vector<RouteLegSpan> const& legs,
                                 std::vector<DiedOnLeg> const& died, std::time_t now)
 {

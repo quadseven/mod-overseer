@@ -21763,6 +21763,11 @@ private:
         // else and is thrown away rather than reused.
         std::set<std::uint64_t> measuredLegs;
         uint32 forOurMask{0};
+        // WHICH ZONE EACH SURVEY NODE STANDS IN (#1243), read off the map once
+        // per map per process, and only once some zone on that map is dangerous
+        // to somebody. A node's zone never changes.
+        OverseerDecisions::NodeZones nodeZones;
+        std::set<uint32> zonedMaps;
     };
 
     // World thread only - DriveTravel runs from OnUpdate - so unguarded, in the
@@ -21814,6 +21819,8 @@ private:
         std::uint32_t routeSerial{0};
         std::uint32_t cursorAt{0};
         std::time_t steppedAt{0};
+        // How many dangerous zones the last plan went round (#1243).
+        std::uint32_t zonesAvoided{0};
     };
 
     // How many legs this walker died on are still priced at `now` (#1228).
@@ -21921,6 +21928,123 @@ private:
                          static_cast<uint32>(DIED_ON_LEG_LIMITS.holdSeconds / 60));
             }
         }
+    }
+
+    // THE DEATHS EVERY ZONE'S DANGER IS SCORED FROM (#1243).
+    //
+    // One row per creature kill in the window, with the killer's faction kept
+    // beside it so a city guard's kills are not held against that city's own
+    // side. Read at most once per ZONE_DEATH_READ_SECONDS, and only rows past
+    // the last id read, so only the first read costs a scan of the table. A
+    // world without `overseer_death` answers null, which reads as nobody having
+    // died: the safe direction, since nothing is then routed round.
+    //
+    // World thread only, like Survey().
+    struct ZoneDeathRow
+    {
+        OverseerDecisions::ZoneDeath death;
+        uint32 killerFaction{0};
+    };
+
+    struct ZoneDeathLedger
+    {
+        std::vector<ZoneDeathRow> rows;
+        uint64 lastId{0};
+        std::time_t readAt{0};
+    };
+
+    static constexpr OverseerDecisions::ZoneDangerLimits ZONE_DANGER_LIMITS{};
+    static constexpr std::time_t ZONE_DEATH_READ_SECONDS = 300;
+
+    static ZoneDeathLedger& ZoneDeaths()
+    {
+        static ZoneDeathLedger ledger;
+        return ledger;
+    }
+
+    static void ReadZoneDeaths(std::time_t now)
+    {
+        ZoneDeathLedger& ledger = ZoneDeaths();
+        if (ledger.readAt && now - ledger.readAt < ZONE_DEATH_READ_SECONDS)
+            return;
+        ledger.readAt = now;
+        std::time_t const window = static_cast<std::time_t>(ZONE_DANGER_LIMITS.windowSeconds);
+        ledger.rows.erase(std::remove_if(ledger.rows.begin(), ledger.rows.end(),
+                                         [&](ZoneDeathRow const& row)
+                                         { return now - row.death.at >= window; }),
+                          ledger.rows.end());
+        // The id bound first, because it is the primary key; killer_type and
+        // the window narrow what is left. UNIX_TIMESTAMP is safe to compare
+        // with time(nullptr) whatever the session time zone is.
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT id, map, zone, killer_entry, CAST(UNIX_TIMESTAMP(created_at) AS SIGNED) "
+            "FROM overseer_death WHERE id > {} AND killer_type = 'creature' "
+            "AND created_at >= NOW() - INTERVAL {} SECOND",
+            ledger.lastId, ZONE_DANGER_LIMITS.windowSeconds);
+        if (!result)
+            return;
+        do
+        {
+            Field* fields = result->Fetch();
+            ledger.lastId = std::max(ledger.lastId, fields[0].Get<uint64>());
+            CreatureTemplate const* const killer =
+                sObjectMgr->GetCreatureTemplate(fields[3].Get<uint32>());
+            if (!killer)
+                continue;
+            ZoneDeathRow row;
+            row.death.mapId = fields[1].Get<uint16>();
+            row.death.zoneId = fields[2].Get<uint32>();
+            row.death.killerLevel = killer->maxlevel;
+            row.death.at = static_cast<std::time_t>(fields[4].Get<int64>());
+            row.killerFaction = killer->faction;
+            ledger.rows.push_back(row);
+        } while (result->NextRow());
+    }
+
+    // THE ZONES ON THIS MAP THAT ARE DANGEROUS TO THIS WALKER'S PARTY (#1243).
+    // A kill by something friendly to the walker says nothing about what the
+    // walker meets there: an Alliance member killed by Orgrimmar's guards does
+    // not make Orgrimmar a danger to the Horde.
+    static std::vector<OverseerDecisions::DangerZone> DangerZonesFor(Player* bot, std::time_t now)
+    {
+        ReadZoneDeaths(now);
+        FactionTemplateEntry const* const mine = bot->GetFactionTemplateEntry();
+        std::vector<OverseerDecisions::ZoneDeath> deaths;
+        for (ZoneDeathRow const& row : ZoneDeaths().rows)
+        {
+            if (row.death.mapId != bot->GetMapId())
+                continue;
+            FactionTemplateEntry const* const theirs =
+                sFactionTemplateStore.LookupEntry(row.killerFaction);
+            if (mine && theirs && mine->IsFriendlyTo(*theirs))
+                continue;
+            deaths.push_back(row.death);
+        }
+        std::vector<OverseerDecisions::DangerZone> zones = OverseerDecisions::DangerZonesOn(
+            deaths, bot->GetMapId(), OverseerDecisions::LowestPartyLevel(PartyLevelsFor(bot)),
+            now, ZONE_DANGER_LIMITS);
+        uint8 const locale = sWorld->GetDefaultDbcLocale();
+        for (OverseerDecisions::DangerZone& zone : zones)
+            if (AreaTableEntry const* const area = sAreaTableStore.LookupEntry(zone.zoneId))
+            {
+                if (area->area_name[locale] && *area->area_name[locale])
+                    zone.name = area->area_name[locale];
+                else if (area->area_name[LOCALE_enUS])
+                    zone.name = area->area_name[LOCALE_enUS];
+            }
+        return zones;
+    }
+
+    // Each survey node on the walker's map, placed in its zone once.
+    static void ReadNodeZones(Player* bot, TravelSurvey& survey)
+    {
+        Map* const map = bot->GetMap();
+        if (!map || !survey.zonedMaps.insert(bot->GetMapId()).second)
+            return;
+        for (OverseerDecisions::RouteNode const& node : survey.nodes)
+            if (node.mapId == bot->GetMapId())
+                survey.nodeZones[node.id] =
+                    map->GetZoneId(bot->GetPhaseMask(), node.x, node.y, node.z);
     }
 
     // READ ONCE, AND `read` IS SET BEFORE THE QUERIES RUN. A realm without these
@@ -22659,6 +22783,7 @@ private:
         Player* bot, TravelSurvey const& survey,
         std::vector<OverseerDecisions::RouteLink> const& links,
         std::vector<OverseerDecisions::DiedOnLeg> const& died, std::time_t now,
+        std::vector<OverseerDecisions::DangerZone> const& dangerZones,
         std::map<uint32, OverseerDecisions::RouteNode const*> const& byId,
         float aimX, float aimY, OverseerDecisions::RoutePlanLimits const& limits)
     {
@@ -22697,7 +22822,9 @@ private:
             option.remainingYards =
                 candidate.join.remainingYards +
                 OverseerDecisions::DiedOnLegPrice(link.from, link.to, died, now,
-                                                  DIED_ON_LEG_LIMITS);
+                                                  DIED_ON_LEG_LIMITS) +
+                OverseerDecisions::DangerZonePrice(link.from, link.to, survey.nodeZones,
+                                                   dangerZones, ZONE_DANGER_LIMITS);
             if (onward.verdict == OverseerDecisions::RoutePlanVerdict::Planned)
             {
                 candidate.onward = true;
@@ -22747,6 +22874,7 @@ private:
         diedOn.routeSerial = 0;
         diedOn.cursorAt = 0;
         diedOn.steppedAt = 0;
+        diedOn.zonesAvoided = 0;
         StagingCorridorAnswer const corridor =
             StagingCorridorRoute(bot, want, name, target, route);
         if (corridor.walkIt)
@@ -22901,16 +23029,26 @@ private:
         // survey itself and pays nothing for this.
         std::time_t const plannedAt = std::time(nullptr);
         std::uint32_t diedOnHeld = 0;
+        // AND A ZONE THAT KEEPS KILLING PARTIES LIKE THIS ONE COSTS MORE STILL
+        // (#1243), on the same copy, so any way round is taken and a walker
+        // with none still gets a route. A walker with no dangerous zone on this
+        // map and nothing it died on still plans on the survey itself.
+        std::vector<OverseerDecisions::DangerZone> const dangerZones =
+            DangerZonesFor(bot, plannedAt);
+        if (!dangerZones.empty())
+            ReadNodeZones(bot, survey);
         std::vector<OverseerDecisions::RouteLink> pricedLinks;
         auto const linksForThisWalker =
             [&]() -> std::vector<OverseerDecisions::RouteLink> const&
         {
             diedOnHeld = 0;
-            if (diedOn.died.empty())
+            if (diedOn.died.empty() && dangerZones.empty())
                 return survey.links;
             pricedLinks = survey.links;
             diedOnHeld = OverseerDecisions::PriceDiedOnLegs(pricedLinks, diedOn.died,
                                                             plannedAt, DIED_ON_LEG_LIMITS);
+            OverseerDecisions::PriceDangerZones(pricedLinks, survey.nodeZones, dangerZones,
+                                                ZONE_DANGER_LIMITS);
             return pricedLinks;
         };
         for (unsigned pass = 0; pass <= TRAVEL_ROUTE_GUARDED_PASSES;)
@@ -22930,7 +23068,7 @@ private:
                 OverseerDecisions::RoutePlanLimits joinLimits = limits;
                 joinLimits.refusedEntries.clear();
                 road = JoinSurveyedRoad(bot, survey, linksForThisWalker(), diedOn.died,
-                                        plannedAt, byId, aimX, aimY, joinLimits);
+                                        plannedAt, dangerZones, byId, aimX, aimY, joinLimits);
                 if (road.found)
                 {
                     auto const farEnd = byId.find(road.to);
@@ -23018,6 +23156,8 @@ private:
             diedOn.legs.assign(1, span);
             joinsCorridor = corridor.joinFirst && !route.empty();
             SayDiedOnLegs(name, target, diedOn, diedOnHeld, plannedAt);
+            SayDangerZones(bot, survey, name, target, diedOn, dangerZones, planFromX, planFromY,
+                           aimX, aimY, limits, plannedAt);
             return route;
         }
 
@@ -23152,7 +23292,61 @@ private:
                      plan.wentRound ? "came in under that and was taken"
                                     : "still cost more than that, so it was not");
         SayDiedOnLegs(name, target, diedOn, diedOnHeld, plannedAt);
+        SayDangerZones(bot, survey, name, target, diedOn, dangerZones, planFromX, planFromY,
+                       aimX, aimY, limits, plannedAt);
         return route;
+    }
+
+    // WHAT THE PLAN DID ABOUT THE DANGEROUS ZONES, SAID BY NAME (#1243). The
+    // way through is planned once more with the walker's died-on legs and
+    // without the zones' prices, so `avoided` names only a zone this walk would
+    // have crossed. A zone the route still touches has no way round.
+    static void SayDangerZones(Player* bot, TravelSurvey const& survey, std::string const& name,
+                               std::string const& target, DiedOnLegMemory& diedOn,
+                               std::vector<OverseerDecisions::DangerZone> const& dangerZones,
+                               float planFromX, float planFromY, float aimX, float aimY,
+                               OverseerDecisions::RoutePlanLimits const& limits,
+                               std::time_t plannedAt)
+    {
+        if (dangerZones.empty())
+            return;
+        std::vector<OverseerDecisions::RouteLink> links = survey.links;
+        OverseerDecisions::PriceDiedOnLegs(links, diedOn.died, plannedAt, DIED_ON_LEG_LIMITS);
+        OverseerDecisions::RoutePlan const through = OverseerDecisions::PlanFootRoute(
+            survey.nodes, links, bot->GetMapId(), planFromX, planFromY, aimX, aimY, limits);
+        std::vector<std::uint32_t> walked;
+        for (OverseerDecisions::RouteLegSpan const& leg : diedOn.legs)
+        {
+            walked.push_back(leg.from);
+            walked.push_back(leg.to);
+        }
+        OverseerDecisions::ZoneRouteReading const reading = OverseerDecisions::ReadZoneRoute(
+            walked, through.nodes, survey.nodeZones, dangerZones);
+        diedOn.zonesAvoided = static_cast<std::uint32_t>(reading.avoided.size());
+        if (!reading.avoided.empty())
+            LOG_INFO("module.overseer", "{}",
+                     OverseerDecisions::ZoneAvoidedLine(name, target, reading.avoided,
+                                                        ZONE_DANGER_LIMITS));
+        if (!reading.stillWalked.empty())
+            LOG_WARN("module.overseer", "{}",
+                     OverseerDecisions::ZoneNoWayRoundLine(name, target, reading.stillWalked,
+                                                           ZONE_DANGER_LIMITS));
+    }
+
+    // HOW MANY DANGEROUS ZONES THIS CREATURE WALK'S ROUTE GOES ROUND (#1243). A
+    // creature walk is handed to upstream's mover, which knows no zone, so the
+    // route is planned and, if it went round one, the walk is steered along it.
+    // Nothing is planned on a map with no zone dangerous to this walker, which
+    // keeps those creature walks exactly as they were.
+    static std::uint32_t ZonesCreatureWalkGoesRound(Player* bot, WorldPosition const& want,
+                                                    TravelAimBook::TravelState& state,
+                                                    std::string const& name,
+                                                    std::string const& target)
+    {
+        if (DangerZonesFor(bot, std::time(nullptr)).empty())
+            return 0;
+        PlanRouteOnce(bot, want, state, name, target);
+        return DiedOnLegBook()[bot->GetName()].zonesAvoided;
     }
 
     // AND WHAT THIS WALKER DIED ON, SAID WHEN IT MATTERED (#502). When the
@@ -29210,8 +29404,13 @@ private:
             // that killed. While a died-on leg is held, it follows the walker's
             // priced route as a place walk, and the creature is handed over
             // when the route is spent (RouteLeg answers `pos` itself then).
+            //
+            // AND WHILE ITS ROUTE GOES ROUND A DANGEROUS ZONE (#1243), for the
+            // same reason: upstream's mover would walk straight across it.
+            std::uint32_t const zonesRound =
+                entry ? ZonesCreatureWalkGoesRound(bot, pos, state, name, target) : 0;
             bool const steered = OverseerDecisions::SteerCreatureWalkAlongRoute(
-                entry != 0, DiedOnLegsHeldBy(bot->GetName(), std::time(nullptr)));
+                entry != 0, DiedOnLegsHeldBy(bot->GetName(), std::time(nullptr)) + zonesRound);
             WorldPosition const leg =
                 entry && !steered ? pos : RouteLeg(bot, pos, state, name, target);
             // The creature the mover is handed: none while a steered walk is
