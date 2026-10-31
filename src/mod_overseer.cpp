@@ -21690,6 +21690,59 @@ private:
             actualEnd.z, z, TRAVEL_ROUTE_ENDPOINT_YARDS);
     }
 
+    // Corners describe the route without exhausting the mover's smoothed-point
+    // buffer. They are a plan, never a spline handed directly to the mover.
+    static bool PlanNavmeshRoute(
+        Player* bot, float x, float y, float z,
+        std::vector<OverseerDecisions::MailWalkPoint>* points = nullptr)
+    {
+        PathGenerator path(bot);
+        path.SetUseStraightPath(true);
+        if (!path.CalculatePath(x, y, z))
+            return false;
+        PathType const type = path.GetPathType();
+        G3D::Vector3 const& end = path.GetActualEndPosition();
+        if (!OverseerDecisions::RoutedPathGoesWhereAsked(
+                (type & PATHFIND_NOPATH) != 0,
+                (type & PATHFIND_FARFROMPOLY_END) != 0,
+                path.GetPath().size() < 2 ||
+                    (type & (PATHFIND_NOT_USING_PATH | PATHFIND_SHORT)) != 0,
+                end.z, z, TRAVEL_ROUTE_ENDPOINT_YARDS))
+            return false;
+        if (points)
+            for (G3D::Vector3 const& point : path.GetPath())
+                points->push_back({point.x, point.y, point.z});
+        return true;
+    }
+
+    static bool NavmeshWalkingLeg(Player* bot, WorldPosition const& want,
+                                   WorldPosition& step)
+    {
+        std::vector<OverseerDecisions::MailWalkPoint> points;
+        if (!PlanNavmeshRoute(bot, want.GetPositionX(), want.GetPositionY(),
+                              want.GetPositionZ(), &points) || points.empty())
+            return false;
+        float const dx = points.front().x - bot->GetPositionX();
+        float const dy = points.front().y - bot->GetPositionY();
+        float const dz = points.front().z - bot->GetPositionZ();
+        if (dx * dx + dy * dy + dz * dz >
+            TRAVEL_ROUTE_ENDPOINT_YARDS * TRAVEL_ROUTE_ENDPOINT_YARDS)
+            return false;
+        OverseerDecisions::FirstLegPick const pick =
+            OverseerDecisions::PickFirstLegWaypoint(
+                points, TRAVEL_STEP_YARDS, TRAVEL_FIRST_LEG_STRIDE_YARDS,
+                TRAVEL_GROUND_DROP_YARDS);
+        if (!pick.found ||
+            !OverseerDecisions::StepMayBridgeGap(
+                bot->GetExactDist2d(pick.point.x, pick.point.y),
+                pick.point.z - bot->GetPositionZ(), TRAVEL_STEP_YARDS,
+                TRAVEL_STEP_VERTICAL_YARDS) ||
+            !NavmeshRoutes(bot, pick.point.x, pick.point.y, pick.point.z))
+            return false;
+        step = WorldPosition(want.GetMapId(), pick.point.x, pick.point.y, pick.point.z);
+        return true;
+    }
+
     // ------------------------------------ THE WAY ROUND AN OBSTACLE (#316) --
     //
     // Everything above this line is about ONE step. GroundedStep asks whether
@@ -23827,6 +23880,11 @@ private:
             step = WorldPosition(want.GetMapId(), wx, wy, wz);
             return true;
         }
+
+        // A winding route can exceed the native smoothing buffer even when
+        // the destination is nearby. Walk a short, natively checked leg of it.
+        if (NavmeshWalkingLeg(bot, WorldPosition(want.GetMapId(), wx, wy, wz), step))
+            return true;
 
         // Standing on it already. Nothing to step toward and nothing to check;
         // the arrival branches in DriveTravel are what act on this.
@@ -38893,6 +38951,9 @@ private:
                 // AreaTrigger::y  ObjectMgr.h:427  float y
                 // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
                 state.distanceFromDoor = member->GetDistance2d(door->x, door->y);
+                state.insideDoor = OverseerDecisions::InsideAreaTrigger(
+                    TriggerShapeOf(*door), member->GetPositionX(), member->GetPositionY(),
+                    member->GetPositionZ(), 0.f);
             }
 
             states.push_back(state);
@@ -39009,10 +39070,12 @@ private:
         // A surface can be above the routed floor (#1269). Keep the original
         // x/y and arrival radius; a nearby mesh height is usable only when its
         // nearest point is inside this trigger, the arrival still fits, and the
-        // ordinary route check accepts the resulting aim. The query only reads
-        // this member's actual instance. Missing mesh keeps the surface answer.
+        // checked route plan accepts the resulting aim. Each walking leg still
+        // passes the ordinary mover check. The query only reads this member's
+        // actual instance. Missing mesh keeps the surface answer.
         OverseerDecisions::AreaTriggerShape const shape = TriggerShapeOf(*door);
-        if (haveGround && !NavmeshRoutes(onDoorMap, door->x, door->y, ground))
+        if (haveGround && !NavmeshRoutes(onDoorMap, door->x, door->y, ground) &&
+            !PlanNavmeshRoute(onDoorMap, door->x, door->y, ground))
         {
             auto const* query = map->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
             if (query)
@@ -39033,7 +39096,8 @@ private:
                         OverseerDecisions::DoorAimOnTheFloor(
                             true, nearest[1], arrivalYards, shape);
                     if (routed.grounded &&
-                        NavmeshRoutes(onDoorMap, door->x, door->y, routed.z))
+                        (NavmeshRoutes(onDoorMap, door->x, door->y, routed.z) ||
+                         PlanNavmeshRoute(onDoorMap, door->x, door->y, routed.z)))
                         return routed;
                 }
             }
@@ -47994,6 +48058,8 @@ private:
                                    coord->second.phase == DungeonRunPhase::Clearing;
         // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
         facts.yardsFromDoor = p->GetDistance2d(door->x, door->y);
+        facts.insideDoor = OverseerDecisions::InsideAreaTrigger(
+            shape, p->GetPositionX(), p->GetPositionY(), p->GetPositionZ(), 0.f);
         OverseerDecisions::DoorRejoinStep const step = OverseerDecisions::DecideDoorRejoin(
             facts, std::max(DUNGEON_DOORSTEP_RADIUS_YARDS, arriveWithin));
 
