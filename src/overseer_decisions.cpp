@@ -25319,9 +25319,30 @@ bool InStratholmeExitYard(std::uint32_t mapId, float x, float y)
            y >= STRATHOLME_YARD_SOUTH_Y && y <= STRATHOLME_YARD_NORTH_Y;
 }
 
-bool ShouldOpenStratholmeYardEpisode(bool memberInYard, bool episodeOpen)
+bool StratholmeYardGiveUpHolds(bool memberInYard, std::uint32_t secondsSinceGaveUp)
 {
-    return memberInYard && !episodeOpen;
+    return memberInYard && secondsSinceGaveUp < STRATHOLME_YARD_RECOVERY_COOLDOWN_SECONDS;
+}
+
+bool ShouldOpenStratholmeYardEpisode(bool memberInYard, bool episodeOpen, bool gaveUp,
+                                     std::uint32_t secondsSinceGaveUp)
+{
+    if (!memberInYard || episodeOpen)
+        return false;
+    return !gaveUp || !StratholmeYardGiveUpHolds(memberInYard, secondsSinceGaveUp);
+}
+
+bool StratholmeMemberInYard(StratholmeMemberPlace const& place)
+{
+    return place.found && place.inWorld && InStratholmeExitYard(place.mapId, place.x, place.y);
+}
+
+int StratholmeYardPortalIndex(std::vector<std::uint32_t> const& exitTriggerIds)
+{
+    for (std::size_t i = 0; i < exitTriggerIds.size(); ++i)
+        if (exitTriggerIds[i] == STRATHOLME_YARD_EXIT_TRIGGER)
+            return static_cast<int>(i);
+    return -1;
 }
 
 bool StratholmeButtonInReach(bool spawned, unsigned presses, std::uint32_t secondsWalking)

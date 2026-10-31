@@ -27868,8 +27868,40 @@ constexpr std::uint32_t STRATHOLME_YARD_EPISODE_SECONDS = 15 * 60;
 // Whether a point on `mapId` stands in the exit yard.
 bool InStratholmeExitYard(std::uint32_t mapId, float x, float y);
 
+// How long a yard episode that gave up keeps the IDLE recovery from opening
+// it again while members are still in the yard. Longer than one episode, so a
+// family the way out could not move is left to the ordinary drives rather than
+// cycled through a fresh episode every poll or every ceiling.
+constexpr std::uint32_t STRATHOLME_YARD_RECOVERY_COOLDOWN_SECONDS = 60 * 60;
+
 // Whether an IDLE poll should open the missing yard episode for a member.
-bool ShouldOpenStratholmeYardEpisode(bool memberInYard, bool episodeOpen);
+// `gaveUp` says this family's last episode gave up (ceiling, or no way out
+// left) and has not been cleared since; it holds the recovery off until
+// STRATHOLME_YARD_RECOVERY_COOLDOWN_SECONDS have passed.
+bool ShouldOpenStratholmeYardEpisode(bool memberInYard, bool episodeOpen, bool gaveUp,
+                                     std::uint32_t secondsSinceGaveUp);
+
+// Whether a recorded give-up still stands: a member is still in the yard and
+// the cool-down has not passed. Once every member is out, the next family to
+// land in the yard is a new episode and is recovered as one.
+bool StratholmeYardGiveUpHolds(bool memberInYard, std::uint32_t secondsSinceGaveUp);
+
+// Where one member stands, as the yard member scan reads it.
+struct StratholmeMemberPlace
+{
+    bool found{false};     // the player is online
+    bool inWorld{false};
+    std::uint32_t mapId{0};
+    float x{0.f};
+    float y{0.f};
+};
+
+// Whether that member is one the yard episode is for.
+bool StratholmeMemberInYard(StratholmeMemberPlace const& place);
+
+// The index of the first portal whose exit trigger is
+// STRATHOLME_YARD_EXIT_TRIGGER, or -1 when the table has none.
+int StratholmeYardPortalIndex(std::vector<std::uint32_t> const& exitTriggerIds);
 
 // Whether the button is still worth walking to: it is spawned, it has not
 // been pressed STRATHOLME_BUTTON_PRESSES times already, and the walk to it has
