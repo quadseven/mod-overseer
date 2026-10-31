@@ -24110,7 +24110,8 @@ bool IsQuestUseRow(std::string const& command)
 {
     std::vector<std::string> const words = QuestUseWords(command);
     return !words.empty() && (words[0] == USE_ITEM_ON_VERB || words[0] == USE_GAMEOBJECT_VERB ||
-                              words[0] == USE_ITEM_HERE_VERB || words[0] == USE_SPELL_ON_VERB);
+                              words[0] == USE_ITEM_HERE_VERB || words[0] == USE_SPELL_ON_VERB ||
+                              words[0] == CAST_SPELL_ON_MAINHAND_VERB);
 }
 
 QuestUseRequest ParseQuestUseRequest(std::string const& command)
@@ -24149,6 +24150,14 @@ QuestUseRequest ParseQuestUseRequest(std::string const& command)
         return request;
     }
 
+    if (words[0] == CAST_SPELL_ON_MAINHAND_VERB)
+    {
+        request.mainHand = true;
+        if (words.size() != 2 || !QuestUseKeyed(words[1], "spell", request.spell))
+            request.error = QuestUseRefusal::MalformedMainHandSpell;
+        return request;
+    }
+
     // use-item-on creature:<entry> item:<entry>, or use-spell-on
     // creature:<entry> spell:<id>: the same shape, keyed by what is used.
     bool const bySpell = words[0] == USE_SPELL_ON_VERB;
@@ -24182,6 +24191,16 @@ QuestUseRequest ParseQuestUseRequest(std::string const& command)
     request.target = creature;
     (bySpell ? request.spell : request.item) = used;
     return request;
+}
+
+char const* MainHandSpellGate(MainHandSpellFacts const& facts)
+{
+    namespace R = QuestUseRefusal;
+    if (!facts.spellKnown) return R::MainHandSpellUnknown;
+    if (!facts.mainHandEquipped) return R::MainHandMissing;
+    if (!facts.focusInRange) return R::MainHandFocusMissing;
+    if (facts.spellOnCooldown) return R::MainHandSpellOnCooldown;
+    return "";
 }
 
 char const* QuestUseGate(QuestUseGateFacts const& facts)

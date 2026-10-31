@@ -72,9 +72,28 @@ void TheRowIsRecognisedByItsFirstWord()
     Expect(IsQuestUseRow("use-item-on creature:1 item:2"), "use-item-on is a use row");
     Expect(IsQuestUseRow("use-gameobject 5"), "use-gameobject is a use row");
     Expect(IsQuestUseRow("use-item-on"), "a malformed one still routes to its parser");
+    Expect(IsQuestUseRow("cast-spell-on-mainhand spell:53341"), "main-hand cast routes");
     Expect(!IsQuestUseRow("take quest:5"), "take is not a use row");
     Expect(!IsQuestUseRow("turnin quest:5"), "turnin is not a use row");
     Expect(!IsQuestUseRow(""), "empty is not a use row");
+}
+
+void TheMainHandSpellGrammarAndGate()
+{
+    QuestUseRequest r = ParseQuestUseRequest("cast-spell-on-mainhand spell:53341");
+    Expect(*r.error == 0 && r.mainHand && r.spell == 53341, "main-hand spell parses");
+    ExpectText("bad main-hand row", ParseQuestUseRequest("cast-spell-on-mainhand spell:0").error,
+               R::MalformedMainHandSpell);
+    MainHandSpellFacts f{true, true, true, false};
+    ExpectText("accepted main-hand cast", MainHandSpellGate(f), "");
+    f.spellKnown = false;
+    ExpectText("unknown spell", MainHandSpellGate(f), R::MainHandSpellUnknown);
+    f = {true, false, true, false};
+    ExpectText("missing weapon", MainHandSpellGate(f), R::MainHandMissing);
+    f = {true, true, false, false};
+    ExpectText("missing focus", MainHandSpellGate(f), R::MainHandFocusMissing);
+    f = {true, true, true, true};
+    ExpectText("cooldown", MainHandSpellGate(f), R::MainHandSpellOnCooldown);
 }
 
 void TheItemGrammar()
@@ -341,6 +360,7 @@ int main()
     TheHereVerbParses();
     TheRowIsRecognisedByItsFirstWord();
     TheItemGrammar();
+    TheMainHandSpellGrammarAndGate();
     TheObjectGrammar();
     TheGateAnswersEachWallInOrder();
     AGameObjectUseAsksNothingOfAnItemOrALife();
