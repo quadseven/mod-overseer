@@ -27868,6 +27868,34 @@ struct MageTravelSpell
     std::uint32_t reagentCarried{0};
 };
 
+// ONE SPELL ON THE MAGE'S OWN LIST, as the world describes it. Teleports and
+// portals are told apart here and nowhere else: a portal is a spell that opens
+// an object, and portalObjectSpell is the spell that object casts.
+struct MageKnownSpell
+{
+    std::uint32_t spellId{0};
+    bool mageFamily{false};
+    std::uint32_t portalObjectSpell{0};
+    std::uint32_t reagentEntry{0};
+    std::uint32_t reagentNeeded{0};
+    std::uint32_t reagentCarried{0};
+};
+
+// One spell_target_position row, cut to the fields decided on.
+struct MageSpellLanding
+{
+    std::uint32_t spellId{0};
+    std::uint32_t map{0};
+    float x{0.f};
+    float y{0.f};
+};
+
+// The ways this mage knows, in list order: a mage's spell with a landing of its
+// own or through its portal object, in the classic world. Everything else on
+// the list moves nobody this module may send.
+std::vector<MageTravelSpell> MageTravelSpellsFrom(std::vector<MageKnownSpell> const& known,
+                                                  std::vector<MageSpellLanding> const& landings);
+
 struct MageTravelFacts
 {
     // The mage is the one who was sent. False when it casts for its leader.

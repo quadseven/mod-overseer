@@ -73194,49 +73194,56 @@ private:
                std::string(spell->SpellName[LOCALE_enUS]) + ")";
     }
 
-    // The landing of a mage's spell: its own target row, or for a portal the row
-    // of the spell its object casts. False for any spell that moves nobody, and
-    // for one that lands outside the classic world.
-    static bool ReadMageSpellLanding(SpellInfo const* spell,
-                                     OverseerDecisions::MageTravelSpell& out)
+    // The spell a portal's object casts, or 0 for a spell that opens no portal.
+    static uint32 MagePortalObjectSpell(SpellInfo const* spell)
     {
-        bool landed = SpellLanding(spell->Id, out.map, out.x, out.y);
-        for (uint8 i = 0; i < MAX_SPELL_EFFECTS && !landed; ++i)
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
         {
             if (spell->Effects[i].Effect != SPELL_EFFECT_TRANS_DOOR ||
                 spell->Effects[i].MiscValue <= 0)
                 continue;
             GameObjectTemplate const* object =
                 sObjectMgr->GetGameObjectTemplate(uint32(spell->Effects[i].MiscValue));
-            if (!object || object->type != GAMEOBJECT_TYPE_SPELLCASTER)
-                continue;
-            landed = SpellLanding(object->spellcaster.spellId, out.map, out.x, out.y);
-            out.makesPortal = landed;
+            if (object && object->type == GAMEOBJECT_TYPE_SPELLCASTER)
+                return object->spellcaster.spellId;
         }
-        return landed && !OverseerDecisions::Classic::IsOutsideClassic(out.map, 0);
+        return 0;
+    }
+
+    static void ReadMageLanding(uint32 spellId,
+                                std::vector<OverseerDecisions::MageSpellLanding>& landings)
+    {
+        OverseerDecisions::MageSpellLanding landing;
+        landing.spellId = spellId;
+        if (spellId && SpellLanding(spellId, landing.map, landing.x, landing.y))
+            landings.push_back(landing);
     }
 
     // Everything this mage knows that moves somebody, off its own spell list.
+    // MageTravelSpellsFrom is what chooses, so a test can run this world's rows.
     static std::vector<OverseerDecisions::MageTravelSpell> ReadMageTravelSpells(Player* mage)
     {
-        std::vector<OverseerDecisions::MageTravelSpell> spells;
+        std::vector<OverseerDecisions::MageKnownSpell> knownSpells;
+        std::vector<OverseerDecisions::MageSpellLanding> landings;
         for (auto const& known : mage->GetSpellMap())
         {
             if (known.second->State == PLAYERSPELL_REMOVED || !known.second->Active)
                 continue;
             SpellInfo const* spell = sSpellMgr->GetSpellInfo(known.first);
-            if (!spell || spell->SpellFamilyName != SPELLFAMILY_MAGE)
+            if (!spell)
                 continue;
-            OverseerDecisions::MageTravelSpell read;
+            OverseerDecisions::MageKnownSpell read;
             read.spellId = known.first;
-            if (!ReadMageSpellLanding(spell, read))
-                continue;
+            read.mageFamily = spell->SpellFamilyName == SPELLFAMILY_MAGE;
+            read.portalObjectSpell = MagePortalObjectSpell(spell);
             ReadFirstReagent(spell, read.reagentEntry, read.reagentNeeded);
             if (read.reagentEntry)
                 read.reagentCarried = mage->GetItemCount(read.reagentEntry, false);
-            spells.push_back(read);
+            ReadMageLanding(read.spellId, landings);
+            ReadMageLanding(read.portalObjectSpell, landings);
+            knownSpells.push_back(read);
         }
-        return spells;
+        return OverseerDecisions::MageTravelSpellsFrom(knownSpells, landings);
     }
 
     using MageTravelAims = std::map<std::string, std::string>;

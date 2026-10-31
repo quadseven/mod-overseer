@@ -51,6 +51,8 @@ int main()
         return Fail("the spells must come from the character's own spell list");
     if (section.find("SPELLFAMILY_MAGE") == std::string::npos)
         return Fail("only a mage's spells are read as a way to a capital");
+    if (section.find("MageTravelSpellsFrom(") == std::string::npos)
+        return Fail("the spells must go through the tested reader");
     if (section.find("SpellLanding(") == std::string::npos)
         return Fail("the landing must come from spell_target_position");
     if (section.find("spellcaster.spellId") == std::string::npos)

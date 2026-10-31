@@ -12,8 +12,12 @@
  *     those two rows land on the same points as teleports 3561 and 3562.
  *   - Which ids exist to be known: npc_trainer in the same tree, whose rows
  *     teach exactly these ids at levels 20 and 40.
- * The adapter reads all of this off the character and the world at runtime, so
- * these ids are written down only here, where a test pins them.
+ *   - Rune entries: item_template in the same tree gives 17031 Rune of
+ *     Teleportation and 17032 Rune of Portals. Which spell burns which rune is
+ *     Spell.dbc, which that tree does not carry, so the fixture pairs them by
+ *     the item's name; the adapter reads the pair off SpellInfo.
+ * The adapter feeds these same rows to MageTravelSpellsFrom at runtime, so these
+ * ids are written down only here, where a test pins them.
  *
  * Compiled against src/overseer_decisions.cpp and nothing else.
  */
@@ -31,9 +35,12 @@ using OverseerDecisions::MAGE_TRAVEL_LANDING_REACH_YARDS;
 using OverseerDecisions::MAGE_TRAVEL_MIN_SAVED_YARDS;
 using OverseerDecisions::MageTravelCalledOff;
 using OverseerDecisions::MageTravelCastRetries;
+using OverseerDecisions::MageKnownSpell;
+using OverseerDecisions::MageSpellLanding;
 using OverseerDecisions::MageTravelClicker;
 using OverseerDecisions::MageTravelFacts;
 using OverseerDecisions::MageTravelSpell;
+using OverseerDecisions::MageTravelSpellsFrom;
 using OverseerDecisions::MageTravelVerdict;
 using OverseerDecisions::MageTravelWay;
 using OverseerDecisions::MageTravelWayWord;
@@ -66,9 +73,10 @@ void CheckVerdict(char const* what, MageTravelVerdict const& got, MageTravelWay 
     ++failures;
 }
 
-// Rune entries are carried by value on the fixture; the adapter reads them off
-// SpellInfo. What the decision reads is the count, so one entry serves.
-constexpr uint32_t ANY_RUNE = 1;
+// item_template's own entries. Each rune is counted on its own, so a bag of one
+// kind must not pay for a spell that burns the other.
+constexpr uint32_t RUNE_OF_TELEPORTATION = 17031;
+constexpr uint32_t RUNE_OF_PORTALS = 17032;
 
 MageTravelSpell Spell(uint32_t id, bool portal, uint32_t map, float x, float y,
                       uint32_t carried = 1)
@@ -79,7 +87,7 @@ MageTravelSpell Spell(uint32_t id, bool portal, uint32_t map, float x, float y,
     s.map = map;
     s.x = x;
     s.y = y;
-    s.reagentEntry = ANY_RUNE;
+    s.reagentEntry = portal ? RUNE_OF_PORTALS : RUNE_OF_TELEPORTATION;
     s.reagentNeeded = 1;
     s.reagentCarried = carried;
     return s;
@@ -112,6 +120,82 @@ MageTravelFacts ToStormwind(std::vector<MageTravelSpell> spells)
     f.destY = 800.f;
     f.spells = std::move(spells);
     return f;
+}
+
+// spell_target_position in the pinned core, cut to the fields read, with the
+// rows of the two portal objects' spells and of spells that must not be taken.
+std::vector<MageSpellLanding> LandingRows()
+{
+    return {{3561, 0, -9003.46f, 870.031f},   {3562, 0, -4613.62f, -915.38f},
+            {3563, 0, 1773.47f, 61.121f},     {3566, 1, -964.98f, 283.433f},
+            {3567, 1, 1469.85f, -4221.52f},   {17334, 0, -9003.46f, 870.031f},
+            {44089, 0, -4613.62f, -915.38f},  {18960, 1, 7991.88f, -2679.84f},
+            {33690, 530, -1800.75f, 5408.09f}, {53140, 571, 5807.75f, 588.347f}};
+}
+
+MageKnownSpell Known(uint32_t id, uint32_t portalObjectSpell = 0, bool mageFamily = true)
+{
+    MageKnownSpell k;
+    k.spellId = id;
+    k.mageFamily = mageFamily;
+    k.portalObjectSpell = portalObjectSpell;
+    k.reagentEntry = portalObjectSpell ? RUNE_OF_PORTALS : RUNE_OF_TELEPORTATION;
+    k.reagentNeeded = 1;
+    k.reagentCarried = 1;
+    return k;
+}
+
+std::vector<uint32_t> Ids(std::vector<MageTravelSpell> const& spells)
+{
+    std::vector<uint32_t> ids;
+    for (MageTravelSpell const& spell : spells)
+        ids.push_back(spell.spellId);
+    return ids;
+}
+
+void TestTheIdsAreTheOnesTheWorldGives()
+{
+    // Og's list on the read quoted above, with Frostbolt (116), which moves
+    // nobody, and the Druid's Teleport: Moonglade (18960), which is no mage's.
+    std::vector<MageTravelSpell> const og = MageTravelSpellsFrom(
+        {Known(116), Known(3561), Known(3562), Known(10059, 17334), Known(11416, 44089),
+         Known(18960, 0, false)},
+        LandingRows());
+    Check("Og's ways are these four ids and no others",
+          Ids(og) == std::vector<uint32_t>({3561, 3562, 10059, 11416}));
+    Check("the teleports are teleports", og.size() == 4 && !og[0].makesPortal && !og[1].makesPortal);
+    Check("the portals are portals", og.size() == 4 && og[2].makesPortal && og[3].makesPortal);
+    Check("a portal lands where its object's spell lands",
+          og.size() == 4 && og[2].map == 0 && og[2].x == -9003.46f && og[3].y == -915.38f);
+    Check("a portal keeps its own rune", og.size() == 4 && og[2].reagentEntry == RUNE_OF_PORTALS);
+
+    std::vector<MageTravelSpell> const oz =
+        MageTravelSpellsFrom({Known(3567), Known(3563), Known(3566)}, LandingRows());
+    Check("Oz's ways are these three ids", Ids(oz) == std::vector<uint32_t>({3567, 3563, 3566}));
+    Check("a teleport lands on its own row", oz.size() == 3 && oz[0].map == 1 && oz[1].map == 0);
+}
+
+void TestALandingPastTheClassicWorldIsNoWay()
+{
+    Check("Shattrath and Dalaran are not ways to a capital here",
+          MageTravelSpellsFrom({Known(33690), Known(53140)}, LandingRows()).empty());
+}
+
+void TestAPortalWhoseObjectLandsNowhereIsNoWay()
+{
+    Check("an object spell with no row is no way",
+          MageTravelSpellsFrom({Known(10059, 999999)}, LandingRows()).empty());
+}
+
+void TestTheWorldsIdsDriveTheChoice()
+{
+    MageTravelFacts f = ToStormwind(MageTravelSpellsFrom(
+        {Known(3561), Known(10059, 17334), Known(3562), Known(11416, 44089)}, LandingRows()));
+    CheckVerdict("a lone mage teleports on the id the world gave", DecideMageTravel(f),
+                 MageTravelWay::Teleport, 3561, "");
+    f.othersPresent = 1;
+    CheckVerdict("a party takes the portal the world gave", DecideMageTravel(f),
+                 MageTravelWay::Portal, 10059, "");
 }
 
 void TestTheMageAloneTeleports()
@@ -155,6 +239,17 @@ void TestNoRuneForATeleportIsANamedRefusal()
     CheckVerdict("a teleport short of its reagent is refused by name",
                  DecideMageTravel(ToStormwind(OgSpells(0))), MageTravelWay::Walk, 3561,
                  Refusal::NoRuneOfTeleportation);
+}
+
+void TestTheOtherRuneDoesNotPayForAPortal()
+{
+    std::vector<MageTravelSpell> spells = OgSpells(0);
+    spells[0].reagentCarried = 3;
+    spells[1].reagentCarried = 3;
+    MageTravelFacts f = ToStormwind(spells);
+    f.othersPresent = 2;
+    CheckVerdict("Runes of Teleportation do not open a portal", DecideMageTravel(f),
+                 MageTravelWay::Walk, 10059, Refusal::NoRuneOfPortals);
 }
 
 void TestATeleportNeedsNoReagentOnASpellThatTakesNone()
@@ -311,11 +406,16 @@ void TestAMageTravellerIsStillLast()
 
 int main()
 {
+    TestTheIdsAreTheOnesTheWorldGives();
+    TestALandingPastTheClassicWorldIsNoWay();
+    TestAPortalWhoseObjectLandsNowhereIsNoWay();
+    TestTheWorldsIdsDriveTheChoice();
     TestTheMageAloneTeleports();
     TestThePartyTakesAPortal();
     TestTheRightCapitalIsPicked();
     TestNoRuneOfPortalsIsANamedRefusal();
     TestNoRuneForATeleportIsANamedRefusal();
+    TestTheOtherRuneDoesNotPayForAPortal();
     TestATeleportNeedsNoReagentOnASpellThatTakesNone();
     TestAnUnknownSpellWalks();
     TestAShortWalkWalksSilently();

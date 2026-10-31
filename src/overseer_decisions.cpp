@@ -25326,7 +25326,43 @@ MageTravelSpell const* MageSpellTo(MageTravelFacts const& facts, bool portal)
     }
     return best;
 }
+
+MageSpellLanding const* MageLandingOf(std::uint32_t spellId,
+                                      std::vector<MageSpellLanding> const& landings)
+{
+    for (MageSpellLanding const& landing : landings)
+        if (spellId && landing.spellId == spellId)
+            return &landing;
+    return nullptr;
+}
 }  // namespace
+
+std::vector<MageTravelSpell> MageTravelSpellsFrom(std::vector<MageKnownSpell> const& known,
+                                                  std::vector<MageSpellLanding> const& landings)
+{
+    std::vector<MageTravelSpell> spells;
+    for (MageKnownSpell const& spell : known)
+    {
+        if (!spell.mageFamily)
+            continue;
+        MageSpellLanding const* const own = MageLandingOf(spell.spellId, landings);
+        MageSpellLanding const* const landing =
+            own ? own : MageLandingOf(spell.portalObjectSpell, landings);
+        if (!landing || Classic::IsOutsideClassic(landing->map, 0))
+            continue;
+        MageTravelSpell read;
+        read.spellId = spell.spellId;
+        read.makesPortal = !own;
+        read.map = landing->map;
+        read.x = landing->x;
+        read.y = landing->y;
+        read.reagentEntry = spell.reagentEntry;
+        read.reagentNeeded = spell.reagentNeeded;
+        read.reagentCarried = spell.reagentCarried;
+        spells.push_back(read);
+    }
+    return spells;
+}
 
 char const* MageTravelWayWord(MageTravelWay way)
 {
