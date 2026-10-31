@@ -34,7 +34,7 @@ index 1396f7f3..2af7dcb8 100644
 +++ b/src/Ai/Base/Value/PartyMemberValue.cpp
 @@ -5,6 +5,7 @@
   */
- 
+
  #include "PartyMemberValue.h"
 +#include "AiObjectContext.h"
  #include "Corpse.h"
@@ -95,5 +95,5 @@ index bdde26d0..972a296d 100644
 +private:
 +    ObjectGuid tankGuid;
  };
- 
+
  #endif
