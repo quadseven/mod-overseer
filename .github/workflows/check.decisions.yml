@@ -33,6 +33,16 @@ jobs:
   decisions:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --silent"
+          --health-interval=10s --health-timeout=5s --health-retries=6
     # Least privilege, and it is genuinely the least: this job clones the
     # repository, compiles two files and runs the binary. It writes nothing
     # anywhere, so contents: read is the whole of what it needs. Named
@@ -75,6 +85,18 @@ jobs:
           printf '%s\n' "$file" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::not semver: $file"; exit 1; }
       - name: Replay exit-hearth finalization
         run: python3 -B tests/replay_exit_hearth_finalization.py
+      - name: Replay cached travel claim ownership
+        run: python3 -B tests/replay_travel_claim_cache.py
+      - name: Replay main-tank cache lifetime
+        run: python3 -B tests/replay_main_tank_cache.py
+      - name: Replay routed door floor selection
+        run: python3 -B tests/replay_door_floor.py
+      - name: Install ledger replay database clients
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev default-mysql-client
+      - name: Replay independent family run ledgers
+        run: python3 -B tests/replay_run_family.py
+      - name: Replay the family ledger migration twice on MySQL
+        run: python3 -B tests/replay_run_family_migration.py
       - name: Compile and run
         run: |
           set -euo pipefail

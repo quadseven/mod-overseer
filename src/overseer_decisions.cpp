@@ -2382,6 +2382,11 @@ time_t TravelBackstopSeconds(std::string const& target,
                : ordinarySeconds;
 }
 
+float DungeonClearWatchdogYards(float yardsFromMark, std::string const& stopReason)
+{
+    return stopReason.empty() ? yardsFromMark : 0.f;
+}
+
 DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
                                                   bool partyBusy,
                                                   bool movementProgress,
@@ -20498,7 +20503,13 @@ std::string FinderLastResortReason(RunFailureFacts const& facts)
         return "no summon was possible here: " + facts.summonNote;
     // The stone stands at the door, but nobody in the family qualifies to
     // click it: the summon rung could never run here either.
-    return "the stone stands at the door but no summoner qualifies to click it: " +
+    if (!facts.summonerReady)
+        return "the stone stands at the door but no summoner qualifies to click it: " +
+               facts.summonNote;
+    // Stone and summoner are both ready and no summon ran: only the finder as
+    // the realm's way in opens its rung here (RunRecoveryFinderOpen).
+    return "the summon rung was not waited for, because the dungeon finder is this "
+           "realm's way in: " +
            facts.summonNote;
 }
 
@@ -21558,6 +21569,14 @@ GuildRunVerdict GuildRunNext(GuildRunPoll const& poll)
     return GuildRunSeats(poll);
 }
 
+bool GuildRunClearedLootWaits(GuildRunClearedLootFacts const& facts)
+{
+    if (facts.aliveInside == 0 || facts.secondsSinceCleared >= GUILD_RUN_CLEARED_LOOT_MAX_SECONDS)
+        return false;
+    return facts.secondsSinceCleared < GUILD_RUN_CLEARED_LOOT_MIN_SECONDS || facts.rollsOpen ||
+           facts.anyFighting;
+}
+
 bool GuildRunRecovering(unsigned aliveInside, unsigned deadInside, unsigned ghostsComingBack)
 {
     return ghostsComingBack > 0 || (aliveInside == 0 && deadInside > 0);
@@ -21601,9 +21620,20 @@ GuildRunRestNeed GuildRunRestNeedOf(std::vector<GuildRunMemberShape> const& livi
     return rested ? GuildRunRestNeed::Rested : GuildRunRestNeed::Partial;
 }
 
+bool GuildRunRestVitalLow(std::vector<GuildRunMemberShape> const& living)
+{
+    for (GuildRunMemberShape const& m : living)
+        if (m.healthPct < GUILD_RUN_REST_HEALTH_PCT ||
+            (m.healer && m.usesMana && m.manaPct < GUILD_RUN_REST_HEALER_MANA_PCT))
+            return true;
+    return false;
+}
+
 GuildRunHold GuildRunHoldNext(GuildRunHoldFacts const& facts)
 {
     GuildRunHold hold;
+    bool const restMayStart = facts.need == GuildRunRestNeed::Low && facts.restRearmed &&
+                              (facts.vitalLow || facts.casterRestRearmed);
     // Nobody for the brain to drive, not armed yet, or a fight it owns. A held
     // brain stays held through a wipe: the first member raised waits.
     if (!facts.armed || facts.aliveInside == 0)
@@ -21623,7 +21653,7 @@ GuildRunHold GuildRunHoldNext(GuildRunHoldFacts const& facts)
         bool const low = facts.need == GuildRunRestNeed::Low;
         if (!facts.held)
         {
-            if (low && facts.restRearmed)
+            if (restMayStart)
                 hold = {GuildRunHoldStep::Hold, GuildRunHoldWhy::Rest};
             return hold;
         }
@@ -21643,7 +21673,7 @@ GuildRunHold GuildRunHoldNext(GuildRunHoldFacts const& facts)
     {
         if (regroup)
             hold = {GuildRunHoldStep::Hold, GuildRunHoldWhy::Regroup};
-        else if (facts.need == GuildRunRestNeed::Low && facts.restRearmed)
+        else if (restMayStart)
             hold = {GuildRunHoldStep::Hold, GuildRunHoldWhy::Rest};
         return hold;
     }

@@ -6442,7 +6442,10 @@ public:
         }
 
         auto const it = _state.find(name);
-        if (it != _state.end() && it->second.target == target)
+        // A cached drive can outlive another owner's change to the column.
+        std::string const column = CurrentTravelNpc(name);
+        bool const cachedDrive = it != _state.end() && it->second.target == target;
+        if (cachedDrive && column == target)
             return true;
 
         // TWO FENCES, EACH READ ONCE (#435, #497, #560). A STANDING
@@ -6466,7 +6469,7 @@ public:
         // run's next leg replace the book's previous `at:` aim.
         OverseerDecisions::TravelClaimFacts facts(owner);
         facts.learnSkill = LearnSkillPending(name);
-        facts.column = CurrentTravelNpc(name);
+        facts.column = column;
         auto const ours = _claimed.find(name);
         facts.columnIsOurs = ours != _claimed.end() && ours->second == facts.column;
         facts.target = target;
@@ -6491,9 +6494,9 @@ public:
                 _claimRefusalSaid[name] = why;
                 LOG_INFO("module.overseer",
                          "overseer: travel aim '{}' for '{}' refused - {} is outstanding "
-                         "and this book did not issue it. Said once until the fence "
+                         "and this book did not issue it (cached drive: {}). Said once until the fence "
                          "changes or an aim is written",
-                         target, name, why);
+                         target, name, why, cachedDrive);
             }
             return false;
         }
@@ -6593,12 +6596,15 @@ public:
         // counted the same way, in characters (wow-overseer#1517).
         if (!OverseerDecisions::TravelAimFitsColumn(target))
             return true;
+        // AI-REVIEW 2026-10-31 [codex/in-process/runtime-trace] T1 (PR #1263):
+        // The forecast must not accept the same stale cache that Claim rejects.
         auto const it = _state.find(name);
-        if (it != _state.end() && it->second.target == target)
+        std::string const column = CurrentTravelNpc(name);
+        if (it != _state.end() && it->second.target == target && column == target)
             return false;
         OverseerDecisions::TravelClaimFacts facts(owner);
         facts.learnSkill = LearnSkillPending(name);
-        facts.column = CurrentTravelNpc(name);
+        facts.column = column;
         auto const ours = _claimed.find(name);
         facts.columnIsOurs = ours != _claimed.end() && ours->second == facts.column;
         facts.target = target;
@@ -12861,7 +12867,7 @@ private:
         if (!map || !map->IsDungeon())
             return false;
 
-        return ActiveRunOnMap(bot->GetMapId());
+        return ActiveRunOnMap(bot->GetMapId(), bot->GetName());
     }
 
     // IS THIS CHARACTER IN ANY DUNGEON RUN, the family's or a guild run's
@@ -12879,18 +12885,31 @@ private:
         Map* map = bot->GetMap();
         bool const onDungeonMap = map && map->IsDungeon();
         return OverseerDecisions::CountsAsInADungeonRun(
-            onDungeonMap, onDungeonMap && ActiveRunOnMap(bot->GetMapId()),
+            onDungeonMap, onDungeonMap && ActiveRunOnMap(bot->GetMapId(), bot->GetName()),
             onDungeonMap && NamedByAGuildRun(bot->GetName()));
     }
 
-    // Is a run open on this map? Cached for the length of a tick because every
-    // steering drive asks the same question about the same handful of
-    // characters, and the answer cannot change between two drives in one tick.
-    static bool ActiveRunOnMap(uint32 mapId)
+    // The paired importer supplies family ownership. An older schema retains
+    // its original map-wide behavior and the coordinator's serialization gate.
+    static bool RunFamilyColumnsPresent()
     {
+        static bool const present = SchemaHasColumns("overseer_dungeon_run", "'family'", 1);
+        return present;
+    }
+
+    static bool ActiveRunOnMap(uint32 mapId, std::string const& memberName)
+    {
+        if (!RunFamilyColumnsPresent())
+        {
+            QueryResult legacy = CharacterDatabase.Query(
+                "SELECT 1 FROM overseer_dungeon_run WHERE state = 'active' AND map_id = {} LIMIT 1",
+                mapId);
+            return legacy != nullptr;
+        }
         QueryResult result = CharacterDatabase.Query(
-            "SELECT 1 FROM overseer_dungeon_run WHERE state = 'active' AND map_id = {} LIMIT 1",
-            mapId);
+            "SELECT 1 FROM overseer_dungeon_run WHERE state = 'active' AND map_id = {} "
+            "AND family = (SELECT family FROM overseer_roster WHERE name = '{}' "
+            "AND enabled = 1) LIMIT 1", mapId, Esc(memberName));
         return result != nullptr;
     }
 
@@ -12898,7 +12917,7 @@ private:
     // answer for a STAGING aim, which is the case this exists for: a run
     // stages its party outdoors, so the claim sits on a character standing on
     // a continent while the run it belongs to is keyed to an instance map.
-    // Asking `ActiveRunOnMap(bot->GetMapId())` there returns false for a run
+    // Asking `ActiveRunOnMap(bot->GetMapId(), bot->GetName())` there returns false for a run
     // that is perfectly real, and asking nothing at all returns true for a run
     // that ended ten days ago.
     static bool AnyActiveRun()
@@ -12908,15 +12927,22 @@ private:
         return result != nullptr;
     }
 
-    // The id of the active run on this map, or 0 when there is none. The
+    // The family's active run on this map, or 0 when there is none. The
     // arming drive keys "has `dc on` been issued" on it (#140) and the run
     // coordinator asks the same question of the same key, so both read it
     // from here rather than from two queries that could disagree.
-    static uint32 ActiveRunIdOnMap(uint32 mapId)
+    static uint32 ActiveRunIdOnMap(uint32 mapId, std::string const& family)
     {
+        if (!RunFamilyColumnsPresent())
+        {
+            QueryResult legacy = CharacterDatabase.Query(
+                "SELECT id FROM overseer_dungeon_run WHERE state = 'active' AND map_id = {} LIMIT 1",
+                mapId);
+            return legacy ? legacy->Fetch()[0].Get<uint32>() : 0;
+        }
         QueryResult result = CharacterDatabase.Query(
-            "SELECT id FROM overseer_dungeon_run WHERE state = 'active' AND map_id = {} LIMIT 1",
-            mapId);
+            "SELECT id FROM overseer_dungeon_run WHERE state = 'active' AND map_id = {} "
+            "AND family = '{}' LIMIT 1", mapId, Esc(family));
         return result ? result->Fetch()[0].Get<uint32>() : 0;
     }
 
@@ -12925,9 +12951,8 @@ private:
     // run's id, which is what the arming drive remembers having issued `dc on`
     // for (#140); 0 only if the row vanished between the two statements.
     //
-    // ONE RUN PER MAP, not per character: the five of them share an instance and
-    // a run is the thing they share. A second character walking in joins the
-    // run that exists rather than starting a rival one.
+    // One run per family and map. Members share their family's row; another
+    // family in a separate instance has its own row, even on the same map.
     static uint32 OpenOrTouchRun(std::string const& leaderName, uint32 mapId)
     {
         // ONE STATEMENT, BECAUSE TWO WOULD BE A RACE. The first draft asked
@@ -12943,11 +12968,20 @@ private:
         // run ever can. This insert is therefore atomic in both directions: the
         // winner opens the run, the loser touches its heartbeat, and neither
         // needs to know which it was.
-        CharacterDatabase.Execute(
-            "INSERT INTO overseer_dungeon_run (leader_name, map_id, state) "
-            "VALUES ('{}', {}, 'active') "
-            "ON DUPLICATE KEY UPDATE last_progress_at = NOW()",
-            Esc(leaderName), mapId);
+        std::string const family = FamilyOfCharacter(leaderName);
+        bool const scoped = RunFamilyColumnsPresent();
+        if (scoped)
+            CharacterDatabase.Execute(
+                "INSERT INTO overseer_dungeon_run (family, leader_name, map_id, state) "
+                "VALUES ('{}', '{}', {}, 'active') "
+                "ON DUPLICATE KEY UPDATE last_progress_at = NOW()",
+                Esc(family), Esc(leaderName), mapId);
+        else
+            CharacterDatabase.Execute(
+                "INSERT INTO overseer_dungeon_run (leader_name, map_id, state) "
+                "VALUES ('{}', {}, 'active') "
+                "ON DUPLICATE KEY UPDATE last_progress_at = NOW()",
+                Esc(leaderName), mapId);
 
         // SAYING WHICH IT WAS, WITHOUT ASKING THE INSERT. The statement above
         // is deliberately atomic, which means it cannot report whether it
@@ -12960,9 +12994,14 @@ private:
         // this call. One query answers both "which run" and "was it just
         // opened", on a path that runs once per ENGAGEMENT_POLL_MS per
         // character inside.
-        QueryResult row = CharacterDatabase.Query(
-            "SELECT id, last_progress_at = started_at FROM overseer_dungeon_run "
-            "WHERE state = 'active' AND map_id = {} LIMIT 1", mapId);
+        QueryResult row = scoped
+            ? CharacterDatabase.Query(
+                "SELECT id, last_progress_at = started_at FROM overseer_dungeon_run "
+                "WHERE state = 'active' AND map_id = {} AND family = '{}' LIMIT 1",
+                mapId, Esc(family))
+            : CharacterDatabase.Query(
+                "SELECT id, last_progress_at = started_at FROM overseer_dungeon_run "
+                "WHERE state = 'active' AND map_id = {} LIMIT 1", mapId);
         if (!row)
             return 0;
 
@@ -12973,8 +13012,8 @@ private:
         {
             LOG_INFO("module.overseer",
                      "overseer: opened dungeon run {} on map {} - '{}' is the first of "
-                     "the roster inside, so the run now owns whoever is in there",
-                     runId, mapId, leaderName);
+                     "the roster inside, so the run now owns its family inside (family '{}')",
+                     runId, mapId, leaderName, family);
         }
         return runId;
     }
@@ -37166,7 +37205,7 @@ private:
         StratholmeYardEpisode yard;
         yard.since = std::time(nullptr);
         // The hearth leg's timeline rows are the run's own.
-        yard.hearth.runId = run.runId ? run.runId : ActiveRunIdOnMap(portal.insideMapId);
+        yard.hearth.runId = run.runId ? run.runId : ActiveRunIdOnMap(portal.insideMapId, family);
         yard.hearth.campaignId = run.campaignId;
         yard.hearth.runNumber = run.runNumber;
         yard.hearth.portal = portal.keyword;
@@ -38083,7 +38122,10 @@ private:
         float const movedFromMark =
             coord.clearMarked ? leader->GetExactDist2d(coord.clearX, coord.clearY) : 0.f;
         OverseerDecisions::RatchetVerdict const progress = OverseerDecisions::Ratchet(
-            coord.clearProgress, movedFromMark, now, DUNGEON_CLEAR_RATCHET);
+            coord.clearProgress,
+            OverseerDecisions::DungeonClearWatchdogYards(movedFromMark,
+                                                         DungeonBrainStopReason(leader)),
+            now, DUNGEON_CLEAR_RATCHET);
 
         if (!coord.clearMarked || progress.progressed)
         {
@@ -38765,10 +38807,43 @@ private:
                                    door->z + DUNGEON_STAGING_Z_PROBE_LIFT_YARDS,
                                    ground);
 
+        // A surface can be above the routed floor (#1269). Keep the original
+        // x/y and arrival radius; a nearby mesh height is usable only when its
+        // nearest point is inside this trigger, the arrival still fits, and the
+        // ordinary route check accepts the resulting aim. The query only reads
+        // this member's actual instance. Missing mesh keeps the surface answer.
+        OverseerDecisions::AreaTriggerShape const shape = TriggerShapeOf(*door);
+        if (haveGround && !NavmeshRoutes(onDoorMap, door->x, door->y, ground))
+        {
+            auto const* query = map->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
+            if (query)
+            {
+                // The pinned core's nearest-polygon search uses this box:
+                // three horizontal yards, then up to fifty vertically.
+                float const point[3] = {door->y, door->z, door->x};
+                float const extents[3] = {3.f, 50.f, 3.f};
+                float nearest[3] = {};
+                dtPolyRef polygon = 0;
+                dtQueryFilter filter;
+                if (!dtStatusFailed(query->findNearestPoly(point, extents, &filter,
+                                                           &polygon, nearest)) && polygon &&
+                    OverseerDecisions::InsideAreaTrigger(
+                        shape, nearest[2], nearest[0], nearest[1], 0.f))
+                {
+                    OverseerDecisions::DoorAimHeight const routed =
+                        OverseerDecisions::DoorAimOnTheFloor(
+                            true, nearest[1], arrivalYards, shape);
+                    if (routed.grounded &&
+                        NavmeshRoutes(onDoorMap, door->x, door->y, routed.z))
+                        return routed;
+                }
+            }
+        }
+
         // THE WHOLE ROW, NOT ITS RADIUS (#577): a box grounds on its own
         // vertical half-extent, which the radius of 0 it carries cannot say.
         return OverseerDecisions::DoorAimOnTheFloor(haveGround, ground, arrivalYards,
-                                                    TriggerShapeOf(*door));
+                                                    shape);
     }
 
     // What one poll of a crossing decided. Named rather than returned as a pair
@@ -39310,7 +39385,7 @@ private:
                              OverseerDecisions::EVACUATION_WALK_BOUND_SECONDS / 60));
             }
             if (!episode.runId)
-                episode.runId = coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId);
+                episode.runId = coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId, FamilyOfCoordinator(coord));
             episode.campaignId = coord.campaignId;
             episode.runNumber = coord.runNumber;
             episode.portal = coord.portalKeyword;
@@ -40147,7 +40222,7 @@ private:
         std::string const reason = std::string(phase) + " held for more than " + minutes +
                                    " minutes and never opened - " + blockers;
         uint32 const runId =
-            coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId);
+            coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId, FamilyOfCoordinator(coord));
 
         LOG_ERROR("module.overseer",
                   "overseer: dungeon run {} of campaign {} cannot be staged - {} has held "
@@ -40241,7 +40316,7 @@ private:
                  OverseerDecisions::BacktickedPosition(leaderX, leaderY, leaderZ));
 
         EndRunAndDecide(coord, leaderName, portal,
-                        coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId),
+                        coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId, FamilyOfCoordinator(coord)),
                         "staging_failed",
                         std::string(phase) +
                             " was refused: the party is above the staging point, not "
@@ -40312,7 +40387,7 @@ private:
             std::to_string(roster) + " on map " + std::to_string(portal.insideMapId) +
             " and nobody else got in for " + minutes + " minutes - " + blockers;
         uint32 const runId =
-            coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId);
+            coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId, FamilyOfCoordinator(coord));
 
         LOG_ERROR("module.overseer",
                   "overseer: dungeon run {} of campaign {} cannot assemble its census - {} "
@@ -43062,6 +43137,9 @@ private:
         std::time_t regroupSince{0};
         std::time_t restSince{0};
         std::time_t restRearmAt{0};
+        std::time_t casterRestRearmAt{0};
+        // When a poll first read the run cleared (GuildRunClearedLootWaits).
+        std::time_t clearedAt{0};
         // THE STALL LADDER (OverseerDecisions::GuildRunStallNext, #1086): the
         // tank's last mark, when the run last credited a boss, covered the
         // yards, was held or skipped (`stillSince`), when it last credited a
@@ -44222,6 +44300,7 @@ private:
                 p, i < run.seats.size() && run.seats[i] == OverseerDecisions::GuildSeat::Healer));
         }
         facts.need = OverseerDecisions::GuildRunRestNeedOf(living);
+        facts.vitalLow = OverseerDecisions::GuildRunRestVitalLow(living);
         facts.livingResurrector = resurrector;
         run.regroupSince =
             poll.aliveInside && ghostsWalking ? (run.regroupSince ? run.regroupSince : now) : 0;
@@ -44229,6 +44308,7 @@ private:
             run.regroupSince ? static_cast<unsigned>(now - run.regroupSince) : 0;
         facts.secondsResting = run.restSince ? static_cast<unsigned>(now - run.restSince) : 0;
         facts.restRearmed = now >= run.restRearmAt;
+        facts.casterRestRearmed = now >= run.casterRestRearmAt;
         OverseerDecisions::GuildRunHold const hold = OverseerDecisions::GuildRunHoldNext(facts);
 
         if (hold.step == GuildRunHoldStep::Hold)
@@ -44262,7 +44342,11 @@ private:
             if (!IssueGuildRunHold(run, false, now))
                 return;
             if (hold.why == GuildRunHoldWhy::RestTimedOut)
+            {
                 run.restRearmAt = now + OverseerDecisions::GUILD_RUN_REST_REARM_SECONDS;
+                run.casterRestRearmAt =
+                    now + OverseerDecisions::GUILD_RUN_CASTER_REST_REARM_SECONDS;
+            }
             LOG_INFO("module.overseer",
                      "overseer: guild run rest {} - the dungeon brain goes on after {}s ({}){}",
                      run.id, static_cast<unsigned>(now - run.heldSince),
@@ -44766,6 +44850,30 @@ private:
             StepGuildRunHold(run, poll, ghostsWalking, now);
 
             OverseerDecisions::GuildRunVerdict const verdict = OverseerDecisions::GuildRunNext(poll);
+            // THE LAST BOSS IS LOOTED BEFORE THE GROUP LEAVES.
+            if (verdict == OverseerDecisions::GuildRunVerdict::Cleared)
+            {
+                if (!run.clearedAt)
+                {
+                    run.clearedAt = now;
+                    LOG_INFO("module.overseer",
+                             "overseer: guild finder run {} - cleared; the group loots before "
+                             "it leaves, at most {}s",
+                             run.id, OverseerDecisions::GUILD_RUN_CLEARED_LOOT_MAX_SECONDS);
+                }
+                OverseerDecisions::GuildRunClearedLootFacts loot;
+                loot.secondsSinceCleared = static_cast<unsigned>(now - run.clearedAt);
+                loot.aliveInside = poll.aliveInside;
+                loot.rollsOpen = ourGroup && group->isRollLootActive();
+                for (std::string const& name : run.names)
+                {
+                    Player* const p = ObjectAccessor::FindPlayerByName(name);
+                    if (GuildRunAliveInside(run, p) && p->IsInCombat())
+                        loot.anyFighting = true;
+                }
+                if (OverseerDecisions::GuildRunClearedLootWaits(loot))
+                    return true;
+            }
             if (verdict != OverseerDecisions::GuildRunVerdict::Running)
             {
                 std::string why;
@@ -45293,7 +45401,7 @@ private:
                   "overseer: dungeon run {} of campaign {} staging stall - {}. The attempt "
                   "is closed and the campaign RECOVERS; it is not stopped",
                   coord.runNumber, coord.campaignId, reason);
-        uint32 const runId = coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId);
+        uint32 const runId = coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId, FamilyOfCoordinator(coord));
         if (runId)
             StampRunIntoCampaign(runId, coord.campaignId, coord.runNumber, JoinNames(members));
         else
@@ -50508,7 +50616,7 @@ private:
     {
         coord = DungeonRunCoordinatorState();
         coord.portalKeyword = portal.keyword;
-        coord.runId = ActiveRunIdOnMap(portal.insideMapId);
+        coord.runId = ActiveRunIdOnMap(portal.insideMapId, FamilyOfCoordinator(coord));
         AlignRunLeader(coord.runId, leaderName);
         ReadRunCampaign(coord.runId, coord.campaignId, coord.runNumber);
         DungeonCampaignCap const cap = LoadCampaignCap(leaderName);
@@ -51510,7 +51618,7 @@ private:
         {
             // The dungeon run row the arming drive opened for the raid map, when
             // there is one: CLEAR opens it, HOLD and RECOVER write 0.
-            uint32 const runId = door ? ActiveRunIdOnMap(door->insideMapId) : 0;
+            uint32 const runId = door ? ActiveRunIdOnMap(door->insideMapId, roster.family) : 0;
             for (OverseerDecisions::RunTimelineEvent& event : events)
             {
                 event.runId = runId;
@@ -53980,7 +54088,7 @@ private:
                 // somebody walked in by another path - and it stays 0, because
                 // putting a number on a run nobody drove would be a claim about
                 // a series that never happened.
-                coord.runId = ActiveRunIdOnMap(inside->insideMapId);
+                coord.runId = ActiveRunIdOnMap(inside->insideMapId, FamilyOfCoordinator(coord));
                 // THE ROW NAMES THE HEAD FROM THE MOMENT IT IS ADOPTED (#631),
                 // not only when EXIT closes it: the arming drive opens a row
                 // under whichever member crossed first.
@@ -54313,12 +54421,10 @@ private:
                 coord.loggedDoorRefusal.clear();
             }
 
-            // ANOTHER FAMILY'S RUN IS ON THIS MAP, SO THIS ONE WAITS (#555).
-            // overseer_dungeon_run allows one active row per instance map, and
-            // a second family crossing into the same dungeon would touch the
-            // first family's row and then have its own coordinator re-attribute
-            // that row to this leader. Nobody is aimed or reset; the run opens
-            // on the first poll after the other family's run is back at IDLE.
+            // Only an older schema needs the map-wide serialization gate
+            // (#555). The family-scoped unique key permits independent groups
+            // in separate instances of the same map without sharing a row.
+            if (!RunFamilyColumnsPresent())
             {
                 std::vector<OverseerDecisions::FamilyRunClaim> claims;
                 for (auto const& [otherFamily, other] : _dungeonRunCoordinators)
@@ -55931,7 +56037,7 @@ private:
                         if (coord.questGoalFinished)
                         {
                             uint32 const id = coord.runId
-                                ? coord.runId : ActiveRunIdOnMap(portal->insideMapId);
+                                ? coord.runId : ActiveRunIdOnMap(portal->insideMapId, FamilyOfCoordinator(coord));
                             if (id)
                                 CharacterDatabase.Execute(
                                     "UPDATE overseer_dungeon_run SET last_progress_at = NOW() "
@@ -55994,7 +56100,7 @@ private:
                             EndRunAndDecide(coord, leaderName, *portal,
                                             coord.runId
                                                 ? coord.runId
-                                                : ActiveRunIdOnMap(portal->insideMapId),
+                                                : ActiveRunIdOnMap(portal->insideMapId, FamilyOfCoordinator(coord)),
                                             coord.leaderClientLostOutcome
                                                 ? "client_lost"
                                                 : OverseerDecisions::DungeonRunExitOutcome(
@@ -56074,7 +56180,7 @@ private:
                                 episode.walkFailingSince = failing.since;
                             }
                             episode.runId = coord.runId ? coord.runId
-                                                        : ActiveRunIdOnMap(portal->insideMapId);
+                                                        : ActiveRunIdOnMap(portal->insideMapId, FamilyOfCoordinator(coord));
                             episode.campaignId = coord.campaignId;
                             episode.runNumber = coord.runNumber;
                             episode.portal = coord.portalKeyword;
@@ -56186,7 +56292,7 @@ private:
             // process numbered first.
             if (!coord.runId)
             {
-                coord.runId = ActiveRunIdOnMap(portal->insideMapId);
+                coord.runId = ActiveRunIdOnMap(portal->insideMapId, FamilyOfCoordinator(coord));
                 if (coord.runId)
                     StampRunIntoCampaign(coord.runId, coord.campaignId, coord.runNumber,
                                          JoinNames(members));
@@ -56211,7 +56317,7 @@ private:
                 // who happens to be a ghost this poll - see RunEndedInAWipe.
                 uint32 const runId = coord.runId
                                          ? coord.runId
-                                         : ActiveRunIdOnMap(portal->insideMapId);
+                                         : ActiveRunIdOnMap(portal->insideMapId, FamilyOfCoordinator(coord));
                 bool const wiped =
                     RunEndedInAWipe(runId, portal->insideMapId, coord.wentIn);
                 LOG_INFO("module.overseer",
@@ -56399,10 +56505,11 @@ private:
             // "armed, then not" branch. What a worldserver restart wipes is
             // the `enabled` flag, the drive's record and this state, all
             // together; the adopted run starts at CLEARING with an empty
-            // record, the drive issues again, and this verifies again. There
-            // is no in-process event that turns the flag off while everyone
-            // stays inside, so there is nothing for such a branch to read.
-            uint32 const runId = ActiveRunIdOnMap(portal->insideMapId);
+            // record, the drive issues again, and this verifies again. The
+            // other way the flag goes off is the brain stopping itself with
+            // everyone inside; that leaves this record standing, and the
+            // watchdog answers it (DungeonClearWatchdogYards).
+            uint32 const runId = ActiveRunIdOnMap(portal->insideMapId, FamilyOfCoordinator(coord));
             uint32 accepted = 0;
             std::string notAccepted;
             for (OverseerDecisions::DungeonRunEntryState const& state : states)
