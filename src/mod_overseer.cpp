@@ -79389,6 +79389,7 @@ private:
         std::string request;
         bool gameObject{false};
         bool here{false};
+        bool mainHand{false};
         uint32 targetEntry{0};
         uint32 targetGuid{0};
         float yards{-1.0f};
@@ -79449,7 +79450,8 @@ private:
           << ",\"retry\":" << J(*reason ? TownRetryWord(QuestUseRefusalRetry(reason)) : "")
           << ",\"character\":" << J(ev.character)
           << ",\"verdict\":" << J(QuestUseOutcomeWord(ev.verdict))
-          << ",\"what\":" << J(ev.gameObject ? "gameobject" : ev.here ? "here" : "creature")
+          << ",\"what\":" << J(ev.gameObject ? "gameobject" : ev.here ? "here" : ev.mainHand ? "mainhand" : "creature")
+          << ",\"main_hand\":" << (ev.mainHand ? "true" : "false")
           << ",\"target_entry\":" << ev.targetEntry
           << ",\"target_guid\":" << ev.targetGuid
           << ",\"yards\":" << ev.yards
