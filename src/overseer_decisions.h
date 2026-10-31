@@ -3314,6 +3314,21 @@ bool ForgetDcOnRecord(bool inWorld, bool onDungeonMap);
 // A zero `awaySince` (not away) or a clock stepped backwards never ends it.
 bool LeaderAwayEndsRun(time_t awaySince, time_t now, long ceilingSeconds);
 
+// THE ARMING HOLD DOES NOT OUTLAST THE LEADER-AWAY BOUND. CLEARING held its stall
+// clock for "`dc on` not accepted" and returned before it read the leader's map.
+// A leader that died inside and revived on the outdoor map left four members
+// refused 235 times in four hours, with `LeaderAwayEndsRun` never asked, because
+// the dungeon brain will not arm a party whose tank is elsewhere. The bound is
+// asked first: a leader away past it walks the party out through EXIT.
+enum class ClearingArmGate : uint8_t
+{
+    Armed,           // accepted on everyone inside
+    HoldNotArmed,    // not yet, and the leader is here or still inside its bound
+    LeaderAwayEnds,  // not armed, and the leader is not coming back to this run
+};
+ClearingArmGate DecideClearingArmGate(bool acceptedOnEveryoneInside, time_t leaderAwaySince,
+                                      time_t now, long ceilingSeconds);
+
 // Does the CLEARING stall clock run this poll (#618)? Only while the brain can
 // actually be driven: `dc on` accepted for everyone inside, the leader
 // visible on the dungeon map, and a groupmate able to issue `dc skip`.
@@ -22174,6 +22189,14 @@ EvacuationStart DungeonEvacuationStart(bool coordinatorKnowsItsDoor, bool inside
 // crossing). A ghost is never refused: its corpse may be inside.
 bool DungeonDoorShut(bool familyBagHeld, bool enteringDungeonMap, bool alive, bool steered);
 
+// A FAMILY ALREADY INSIDE IS NOT HELD AT THE DOOR. A run with a member inside
+// makes room rather than leaving (DungeonRunBagAnswer), so no town trip follows
+// and a shut door only strands whoever is outside. On the dev realm one member
+// stood at the entrance for over two hours with four inside, and the run closed
+// `split_failed` every 15 minutes. Nobody inside, or a run walking out, stays
+// held: that is the family #631 keeps from walking back in.
+bool FamilyDoorHeldForBags(bool noBagRoom, bool runHasMembersInside);
+
 // THE CLASSIC RULESET. The operator restricts these worlds to a classic
 // level-60 feel: characters stop at level 60, professions stop at skill 300,
 // and the world is Eastern Kingdoms, Kalimdor and the classic instances, never
@@ -22863,7 +22886,8 @@ PlaceDanger JudgePlaceDanger(PlaceDangerFacts const& facts);
 //   2. Held for less than `holdSeconds`: wait out the killer as a ghost.
 //   3. Held that long: the nearest healer, refused or not, so a ghost by a
 //      spawn that never moves is not parked forever. `healerWalkFailed` says
-//      this walk was already tried and never reached a healer: keep waiting.
+//      this walk was already tried and never reached a healer: retry the
+//      natural walk while a threat remains.
 //
 // Rule 3 still never reclaims the corpse. With the default hold it costs at most
 // three deaths an hour, which is the ticket's bound of five at one spot.
@@ -27877,6 +27901,144 @@ bool StratholmeButtonInReach(bool spawned, unsigned presses, std::uint32_t secon
 // off cooldown and its bind is not in the yard itself.
 bool StratholmeHearthLeavesTheYard(bool stoneReady, std::uint32_t bindMap, float bindX,
                                    float bindY);
+
+// ------------------- a family mage's way to a capital instead of a walk (#1161)
+//
+// WHEN A CHARACTER IS SENT SOMEWHERE ITS FAMILY MAGE CAN REACH BY ONE CAST, THE
+// MAGE CASTS IT. A teleport when it travels alone, a portal when anybody is
+// beside it. A capital is not listed anywhere: it is wherever a spell the mage
+// knows lands, read off the character's spell list and spell_target_position,
+// so no id and no coordinate is written down in this module.
+//
+// A KNOWN TELEPORT DOES NOT STAND IN FOR AN UNKNOWN PORTAL. It would carry the
+// mage off and leave the party on the road with nobody to follow, so the party
+// walks and the log says why.
+
+// A spell must save this much walking, on one continent, to be worth a rune and
+// the party's time. A way onto another continent has no walk to compare.
+constexpr float MAGE_TRAVEL_MIN_SAVED_YARDS = 1000.f;
+// How far from a spell's landing a destination may stand and still be that
+// capital. Stormwind's keep is 780 yards from the mage quarter landing.
+constexpr float MAGE_TRAVEL_LANDING_REACH_YARDS = 900.f;
+// How many times one errand asks a mage that is moving or fighting. The travel
+// poll is 15 seconds, so this is most of a minute, and then the party walks.
+constexpr std::uint32_t MAGE_TRAVEL_CAST_TRIES = 3;
+
+// ONE SPELL THE MAGE KNOWS THAT MOVES SOMEBODY, as the adapter read it.
+struct MageTravelSpell
+{
+    std::uint32_t spellId{0};
+    // A portal object for the party, rather than a teleport of the caster.
+    bool makesPortal{false};
+    // Where it lands: spell_target_position, of the spell itself or, for a
+    // portal, of the spell its object casts.
+    std::uint32_t map{0};
+    float x{0.f};
+    float y{0.f};
+    std::uint32_t reagentEntry{0};
+    std::uint32_t reagentNeeded{0};
+    std::uint32_t reagentCarried{0};
+};
+
+// ONE SPELL ON THE MAGE'S OWN LIST, as the world describes it. Teleports and
+// portals are told apart here and nowhere else: a portal is a spell that opens
+// an object, and portalObjectSpell is the spell that object casts.
+struct MageKnownSpell
+{
+    std::uint32_t spellId{0};
+    bool mageFamily{false};
+    std::uint32_t portalObjectSpell{0};
+    std::uint32_t reagentEntry{0};
+    std::uint32_t reagentNeeded{0};
+    std::uint32_t reagentCarried{0};
+};
+
+// One spell_target_position row, cut to the fields decided on.
+struct MageSpellLanding
+{
+    std::uint32_t spellId{0};
+    std::uint32_t map{0};
+    float x{0.f};
+    float y{0.f};
+};
+
+// The ways this mage knows, in list order: a mage's spell with a landing of its
+// own or through its portal object, in the classic world. Everything else on
+// the list moves nobody this module may send.
+std::vector<MageTravelSpell> MageTravelSpellsFrom(std::vector<MageKnownSpell> const& known,
+                                                  std::vector<MageSpellLanding> const& landings);
+
+struct MageTravelFacts
+{
+    // The mage is the one who was sent. False when it casts for its leader.
+    bool casterIsTraveller{false};
+    // Group members beside the mage, the mage not counted.
+    std::uint32_t othersPresent{0};
+    bool sameMap{false};
+    // The walk from the traveller to the destination. Unread across maps.
+    float walkYards{0.f};
+    std::uint32_t destMap{0};
+    float destX{0.f};
+    float destY{0.f};
+    std::vector<MageTravelSpell> spells;
+};
+
+enum class MageTravelWay : std::uint8_t
+{
+    Walk,
+    Teleport,
+    Portal,
+};
+
+char const* MageTravelWayWord(MageTravelWay way);
+
+// No quote characters: these go into a log line and sit beside the cast verb's.
+namespace MageTravelRefusal
+{
+constexpr char const* NoSpellForThatPlace = "the mage knows no spell that lands there";
+constexpr char const* NoPortalForTheParty = "the mage knows no portal there and its party is beside it";
+constexpr char const* NoRuneOfPortals = "no Rune of Portals in the bags";
+constexpr char const* NoRuneOfTeleportation = "no Rune of Teleportation in the bags";
+}  // namespace MageTravelRefusal
+
+// `way` Walk with a `reason` is a refusal to log. Walk with an empty `reason`
+// is a walk too short for a mage to have any opinion about.
+struct MageTravelVerdict
+{
+    MageTravelWay way{MageTravelWay::Walk};
+    std::uint32_t spellId{0};
+    char const* reason{""};
+};
+
+MageTravelVerdict DecideMageTravel(MageTravelFacts const& facts);
+
+// IS A REFUSED CAST WORTH ASKING AGAIN? Only one the mage's own state answers,
+// by CastRefusalRetry's own table, and `tries` asks so far under the bound.
+bool MageTravelCastRetries(std::string const& detail, std::uint32_t tries);
+
+// HAS THE ERRAND BEHIND A RUN GONE? True when the column is empty, holds another
+// aim, or holds an operator's guard, while the traveller has not yet been sent
+// through. Once it has, the rest of the party still has a portal to take.
+bool MageTravelCalledOff(bool travellerClicked, bool aimPresent, bool aimIsGuard,
+                         bool aimIsTheRuns);
+
+// ONE PARTY MEMBER AT THE PORTAL.
+struct MageTravelClicker
+{
+    bool traveller{false};  // the one who was sent
+    bool mage{false};       // the portal's owner
+    // Beside the portal and not yet asked to click it.
+    bool waiting{false};
+    // Walking to it, or clicked and not yet read back.
+    bool underWay{false};
+};
+
+// WHO CLICKS THIS POLL, as indexes. The one who was sent goes first and alone,
+// because DecideStrandedWay hearths back a follower that crosses ahead of its
+// leader. The rest go together. THE MAGE GOES LAST AND ALONE, because
+// Unit::RemoveFromWorld ends in RemoveAllGameObjects: its portal closes the
+// moment it changes map.
+std::vector<std::size_t> NextPortalClickers(std::vector<MageTravelClicker> const& party);
 
 }  // namespace OverseerDecisions
 
