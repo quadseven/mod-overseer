@@ -18584,7 +18584,9 @@ GhostRecovery RefusedHealerFallback(RefusedHealerFacts const& facts,
                              facts.strongestNearCorpse >= facts.level + limits.levelGap;
     if ((!repeat && !outlevelled) || facts.liveThreatsNearCorpse == 0)
         return GhostRecovery::CorpseRun;
-    if (facts.heldSeconds < facts.holdSeconds || !facts.healerKnown || facts.healerWalkFailed)
+    if (facts.healerWalkFailed && facts.healerKnown)
+        return GhostRecovery::SpiritHealer;
+    if (facts.heldSeconds < facts.holdSeconds || !facts.healerKnown)
         return GhostRecovery::Wait;
     return GhostRecovery::SpiritHealer;
 }
