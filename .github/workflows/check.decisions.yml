@@ -75,6 +75,8 @@ jobs:
           printf '%s\n' "$file" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::not semver: $file"; exit 1; }
       - name: Replay exit-hearth finalization
         run: python3 -B tests/replay_exit_hearth_finalization.py
+      - name: Replay cached travel claim ownership
+        run: python3 -B tests/replay_travel_claim_cache.py
       - name: Compile and run
         run: |
           set -euo pipefail

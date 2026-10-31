@@ -6442,7 +6442,10 @@ public:
         }
 
         auto const it = _state.find(name);
-        if (it != _state.end() && it->second.target == target)
+        // A cached drive can outlive another owner's change to the column.
+        std::string const column = CurrentTravelNpc(name);
+        bool const cachedDrive = it != _state.end() && it->second.target == target;
+        if (cachedDrive && column == target)
             return true;
 
         // TWO FENCES, EACH READ ONCE (#435, #497, #560). A STANDING
@@ -6466,7 +6469,7 @@ public:
         // run's next leg replace the book's previous `at:` aim.
         OverseerDecisions::TravelClaimFacts facts(owner);
         facts.learnSkill = LearnSkillPending(name);
-        facts.column = CurrentTravelNpc(name);
+        facts.column = column;
         auto const ours = _claimed.find(name);
         facts.columnIsOurs = ours != _claimed.end() && ours->second == facts.column;
         facts.target = target;
@@ -6491,9 +6494,9 @@ public:
                 _claimRefusalSaid[name] = why;
                 LOG_INFO("module.overseer",
                          "overseer: travel aim '{}' for '{}' refused - {} is outstanding "
-                         "and this book did not issue it. Said once until the fence "
+                         "and this book did not issue it (cached drive: {}). Said once until the fence "
                          "changes or an aim is written",
-                         target, name, why);
+                         target, name, why, cachedDrive);
             }
             return false;
         }
@@ -6593,12 +6596,15 @@ public:
         // counted the same way, in characters (wow-overseer#1517).
         if (!OverseerDecisions::TravelAimFitsColumn(target))
             return true;
+        // AI-REVIEW 2026-10-31 [codex/in-process/runtime-trace] T1 (PR #1263):
+        // The forecast must not accept the same stale cache that Claim rejects.
         auto const it = _state.find(name);
-        if (it != _state.end() && it->second.target == target)
+        std::string const column = CurrentTravelNpc(name);
+        if (it != _state.end() && it->second.target == target && column == target)
             return false;
         OverseerDecisions::TravelClaimFacts facts(owner);
         facts.learnSkill = LearnSkillPending(name);
-        facts.column = CurrentTravelNpc(name);
+        facts.column = column;
         auto const ours = _claimed.find(name);
         facts.columnIsOurs = ours != _claimed.end() && ours->second == facts.column;
         facts.target = target;
