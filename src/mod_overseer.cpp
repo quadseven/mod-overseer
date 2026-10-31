@@ -38771,10 +38771,43 @@ private:
                                    door->z + DUNGEON_STAGING_Z_PROBE_LIFT_YARDS,
                                    ground);
 
+        // A surface can be above the routed floor (#1269). Keep the original
+        // x/y and arrival radius; a nearby mesh height is usable only when its
+        // nearest point is inside this trigger, the arrival still fits, and the
+        // ordinary route check accepts the resulting aim. The query only reads
+        // this member's actual instance. Missing mesh keeps the surface answer.
+        OverseerDecisions::AreaTriggerShape const shape = TriggerShapeOf(*door);
+        if (haveGround && !NavmeshRoutes(onDoorMap, door->x, door->y, ground))
+        {
+            auto const* query = map->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
+            if (query)
+            {
+                // The pinned core's nearest-polygon search uses this box:
+                // three horizontal yards, then up to fifty vertically.
+                float const point[3] = {door->y, door->z, door->x};
+                float const extents[3] = {3.f, 50.f, 3.f};
+                float nearest[3] = {};
+                dtPolyRef polygon = 0;
+                dtQueryFilter filter;
+                if (!dtStatusFailed(query->findNearestPoly(point, extents, &filter,
+                                                           &polygon, nearest)) && polygon &&
+                    OverseerDecisions::InsideAreaTrigger(
+                        shape, nearest[2], nearest[0], nearest[1], 0.f))
+                {
+                    OverseerDecisions::DoorAimHeight const routed =
+                        OverseerDecisions::DoorAimOnTheFloor(
+                            true, nearest[1], arrivalYards, shape);
+                    if (routed.grounded &&
+                        NavmeshRoutes(onDoorMap, door->x, door->y, routed.z))
+                        return routed;
+                }
+            }
+        }
+
         // THE WHOLE ROW, NOT ITS RADIUS (#577): a box grounds on its own
         // vertical half-extent, which the radius of 0 it carries cannot say.
         return OverseerDecisions::DoorAimOnTheFloor(haveGround, ground, arrivalYards,
-                                                    TriggerShapeOf(*door));
+                                                    shape);
     }
 
     // What one poll of a crossing decided. Named rather than returned as a pair
