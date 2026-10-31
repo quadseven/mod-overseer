@@ -3214,6 +3214,17 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
                                                   unsigned maximumSkips,
                                                   bool skipRefused = false);
 
+// YARDS WALKED WITH THE BRAIN OFF ARE NOT A RUN GOING ANYWHERE. The CLEARING
+// watchdog takes the tank's yards as progress, which is only true while the
+// dungeon module is driving. On 2026-10-31 it stopped itself at 08:21:05 ("the
+// party never became ready after 180s") with two bosses credited, and the tank
+// then drifted 50 yards back and forth for over 45 minutes: every drift reset
+// the ladder, no `dc skip` went out, and the active row held the map against
+// the next family. `stopReason` is the module's last stop text, which it keeps
+// until the next `dc on`; while it says anything the reading is 0 yards, so the
+// stall clock runs and the refused skip ends the run.
+float DungeonClearWatchdogYards(float yardsFromMark, std::string const& stopReason);
+
 // WHY THE MODULE STOPPED, NOT HOW THE EXIT WAS CLEANED UP (#1089). A run that
 // stalls after the dungeon module switched itself off used to record only that
 // a `dc skip` was refused, and then the exit's own wording ("the failed exit

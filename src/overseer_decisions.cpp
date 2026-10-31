@@ -2382,6 +2382,11 @@ time_t TravelBackstopSeconds(std::string const& target,
                : ordinarySeconds;
 }
 
+float DungeonClearWatchdogYards(float yardsFromMark, std::string const& stopReason)
+{
+    return stopReason.empty() ? yardsFromMark : 0.f;
+}
+
 DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
                                                   bool partyBusy,
                                                   bool movementProgress,

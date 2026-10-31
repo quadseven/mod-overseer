@@ -38122,7 +38122,10 @@ private:
         float const movedFromMark =
             coord.clearMarked ? leader->GetExactDist2d(coord.clearX, coord.clearY) : 0.f;
         OverseerDecisions::RatchetVerdict const progress = OverseerDecisions::Ratchet(
-            coord.clearProgress, movedFromMark, now, DUNGEON_CLEAR_RATCHET);
+            coord.clearProgress,
+            OverseerDecisions::DungeonClearWatchdogYards(movedFromMark,
+                                                         DungeonBrainStopReason(leader)),
+            now, DUNGEON_CLEAR_RATCHET);
 
         if (!coord.clearMarked || progress.progressed)
         {
@@ -56502,9 +56505,10 @@ private:
             // "armed, then not" branch. What a worldserver restart wipes is
             // the `enabled` flag, the drive's record and this state, all
             // together; the adopted run starts at CLEARING with an empty
-            // record, the drive issues again, and this verifies again. There
-            // is no in-process event that turns the flag off while everyone
-            // stays inside, so there is nothing for such a branch to read.
+            // record, the drive issues again, and this verifies again. The
+            // other way the flag goes off is the brain stopping itself with
+            // everyone inside; that leaves this record standing, and the
+            // watchdog answers it (DungeonClearWatchdogYards).
             uint32 const runId = ActiveRunIdOnMap(portal->insideMapId, FamilyOfCoordinator(coord));
             uint32 accepted = 0;
             std::string notAccepted;
