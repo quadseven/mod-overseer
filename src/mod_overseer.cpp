@@ -37666,6 +37666,25 @@ private:
             return false;
         }
 
+        // When the leader is out of the yard or dead, the stragglers take the Hearth
+        // branch or hold until the leader returns or the follow brings them out.
+        bool leaderInYard = false;
+        for (Player* member : inYard)
+            if (member->GetName() == leaderName)
+            {
+                leaderInYard = true;
+                break;
+            }
+        if (!leaderInYard)
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: stratholme exit: leader of '{}' is out of the yard or dead, "
+                     "stragglers take the Hearth branch or hold",
+                     family);
+            CloseStratholmeYard(family, yard);
+            return false;
+        }
+
         Player* walker = inYard.front();
         for (Player* member : inYard)
             if (member->GetName() == leaderName)
