@@ -24335,6 +24335,30 @@ GuildRunVerdict GuildRunNext(GuildRunPoll const& poll);
 // "running", "cleared", "wiped", "abandoned", "timed out", "stalled".
 char const* GuildRunVerdictWord(GuildRunVerdict verdict);
 
+// THE LAST BOSS'S LOOT IS LOOTED BEFORE THE GROUP LEAVES. The finder marks the
+// dungeon finished on the kill, and the run used to send its members out on the
+// next poll: Razorfen Kraul run 3390 (2026-10-30) killed Charlga Razorflank at
+// 22:22:44, was out at :45 and disbanded at :47. Over 5 days the guild runs'
+// record of notable drops named a last boss's green or better in 35 of 259
+// clears (0 of 46 in Shadowfang Keep) against 184 of 259 for a boss earlier in
+// the same dungeons. So a cleared run stays at least
+// GUILD_RUN_CLEARED_LOOT_MIN_SECONDS for the walk to the corpse, and on while a
+// group roll is open or a member fights, up to
+// GUILD_RUN_CLEARED_LOOT_MAX_SECONDS, the core's 60 s roll timer.
+constexpr unsigned GUILD_RUN_CLEARED_LOOT_MIN_SECONDS = 20;
+constexpr unsigned GUILD_RUN_CLEARED_LOOT_MAX_SECONDS = 60;
+
+struct GuildRunClearedLootFacts
+{
+    unsigned secondsSinceCleared{0};
+    unsigned aliveInside{0};
+    bool rollsOpen{false};
+    bool anyFighting{false};
+};
+
+// Does a cleared run stay inside this poll? Never with nobody alive inside.
+bool GuildRunClearedLootWaits(GuildRunClearedLootFacts const& facts);
+
 // WHERE A GUILD RUN STALLED, IN WORDS. A run row used to say only "inside for
 // 7200s", and the worldserver log holds minutes, so an older stall was lost.
 // These build the words the queued poll log, the abandoned and timed-out `why`
@@ -24609,6 +24633,15 @@ constexpr float GUILD_RUN_RESTED_MANA_PCT = 80.f;
 // GUILD_RUN_REGROUP_WAIT_SECONDS: a run back from the graveyard measured 81 s.
 constexpr unsigned GUILD_RUN_REST_MAX_SECONDS = 120;
 constexpr unsigned GUILD_RUN_REST_REARM_SECONDS = 45;
+// A DRY DAMAGE DEALER OR TANK DOES NOT STOP THE GROUP AGAIN AT ONCE. Measured
+// on the dev realm 2026-10-30 over 3 hours: 152 rests, 114 of them ran out the
+// 120 s with the member still under the bar, a median of 23% mana gained, and
+// groups stood resting for 53% to 76% of their time inside. One 117 minute
+// Razorfen Kraul rested 16 times in 43 minutes, 14 timed out, nearly all
+// waiting on a tank with nothing to drink: two minutes sitting, 45 s moving,
+// and down again. After a timed-out rest only a vital need (a member's health,
+// or the healer's mana) stops the group inside this longer window.
+constexpr unsigned GUILD_RUN_CASTER_REST_REARM_SECONDS = 240;
 constexpr unsigned GUILD_RUN_REGROUP_WAIT_SECONDS = 180;
 // A pause or resume the dungeon module refused is asked again after this long,
 // and each refusal in a row doubles the wait, up to the cap (GuildRunHoldRetry).
@@ -24633,6 +24666,9 @@ enum class GuildRunRestNeed : std::uint8_t
 };
 
 GuildRunRestNeed GuildRunRestNeedOf(std::vector<GuildRunMemberShape> const& living);
+// A member's health, or the healer's mana, is under its trigger: the need that
+// is not put off by GUILD_RUN_CASTER_REST_REARM_SECONDS.
+bool GuildRunRestVitalLow(std::vector<GuildRunMemberShape> const& living);
 
 struct GuildRunHoldFacts
 {
@@ -24656,6 +24692,10 @@ struct GuildRunHoldFacts
     // Since this hold became a rest (0 while it is a regroup or not held).
     unsigned secondsResting{0};
     unsigned restMaxSeconds{GUILD_RUN_REST_MAX_SECONDS};
+    // A need GUILD_RUN_CASTER_REST_REARM_SECONDS does not put off.
+    bool vitalLow{false};
+    // False inside GUILD_RUN_CASTER_REST_REARM_SECONDS of a rest that timed out.
+    bool casterRestRearmed{true};
     // False inside GUILD_RUN_REST_REARM_SECONDS of a rest that timed out.
     bool restRearmed{true};
     // A living Priest, Paladin, Shaman or Druid of the run is inside: the read
