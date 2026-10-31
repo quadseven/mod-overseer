@@ -87,7 +87,10 @@ void AHoldEndsAtAHealerNeverTheCorpse()
     Check("a killer that never moves ends at the nearest healer",
           RefusedHealerFallback(f) == GhostRecovery::SpiritHealer);
     f.healerWalkFailed = true;
-    Check("a healer it could not reach leaves it waiting",
+    Check("a failed walk with a live threat retries the natural healer walk",
+          RefusedHealerFallback(f) == GhostRecovery::SpiritHealer);
+    f.healerKnown = false;
+    Check("a failed walk is not retried without a healer on this map",
           RefusedHealerFallback(f) == GhostRecovery::Wait);
     f = Owlbeast();
     f.heldSeconds = 1200;
@@ -149,6 +152,10 @@ void TheAdapterIsWired()
               std::string::npos);
     Check("no reachable graveyard is logged",
           source.find("has no reachable graveyard it can stand at") != std::string::npos);
+    Check("a long healer walk hold is logged on a timer",
+          source.find("now - st.refusedStatusSince >= 300") != std::string::npos &&
+              source.find("has waited {}s with {} hostile(s) at its corpse") !=
+                  std::string::npos);
 }
 
 }  // namespace

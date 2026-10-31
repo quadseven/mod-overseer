@@ -22815,7 +22815,8 @@ PlaceDanger JudgePlaceDanger(PlaceDangerFacts const& facts);
 //   2. Held for less than `holdSeconds`: wait out the killer as a ghost.
 //   3. Held that long: the nearest healer, refused or not, so a ghost by a
 //      spawn that never moves is not parked forever. `healerWalkFailed` says
-//      this walk was already tried and never reached a healer: keep waiting.
+//      this walk was already tried and never reached a healer: retry the
+//      natural walk while a threat remains.
 //
 // Rule 3 still never reclaims the corpse. With the default hold it costs at most
 // three deaths an hour, which is the ticket's bound of five at one spot.
