@@ -184,6 +184,22 @@ int main()
                   true);
         CheckBool("an EXIT through 2221 opens the yard episode",
                   source.find("OpenStratholmeYard(family, *portal, coord)") != std::string::npos, true);
+        std::size_t const recoveryStart = source.find("void RecoverStratholmeYardInIdle(");
+        std::size_t const recoveryEnd = source.find("// ----", recoveryStart);
+        std::string const recoverySource = recoveryStart == std::string::npos || recoveryEnd == std::string::npos
+            ? std::string() : source.substr(recoveryStart, recoveryEnd - recoveryStart);
+        CheckBool("IDLE recovery opens an episode for a member in the yard",
+                  recoverySource.find("MembersInStratholmeYard(members)") != std::string::npos &&
+                      recoverySource.find("OpenStratholmeYard(family, *portal, run)") != std::string::npos,
+                  true);
+        CheckBool("IDLE recovery does not open a second episode",
+                  recoverySource.find("_stratholmeYards.find(family)") != std::string::npos &&
+                      recoverySource.find("_stratholmeYards.end()") != std::string::npos,
+                  true);
+        CheckBool("IDLE recovery requires an observed member in the yard",
+                  recoverySource.find("inYard.empty()") != std::string::npos &&
+                      recoverySource.find("STRATHOLME_YARD_EXIT_TRIGGER") != std::string::npos,
+                  true);
         std::size_t const yardStart = source.find("void OpenStratholmeYard(");
         std::size_t const yardEnd = source.find("static std::vector<Player*> MembersInStratholmeYard", yardStart);
         std::string const yardSource = yardStart == std::string::npos || yardEnd == std::string::npos
