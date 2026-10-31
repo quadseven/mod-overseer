@@ -51,6 +51,7 @@ run_decisions() {
   printf '%s\n' "$file" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "not semver: $file" >&2; return 1; }
 
   python3 -B tests/replay_exit_hearth_finalization.py
+  python3 -B tests/replay_travel_claim_cache.py
 
   echo "== decisions: compile and run"
   g++ --version | head -1
