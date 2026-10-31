@@ -27793,6 +27793,7 @@ char const* StratholmeExitWayWord(StratholmeExitWay way);
 // The run's exit trigger whose landing is the yard, and the two gameobjects in
 // it: the Elders' Square Service Entrance and the button that opens it.
 constexpr std::uint32_t STRATHOLME_YARD_EXIT_TRIGGER = 2221;
+constexpr std::uint32_t STRATHOLME_EXIT_YARD_MAP_ID = 0;
 constexpr std::uint32_t STRATHOLME_SERVICE_ENTRANCE_ENTRY = 175369;
 constexpr std::uint32_t STRATHOLME_SERVICE_BUTTON_ENTRY = 175432;
 // The yard as the navmesh closes it (the stratholme-undead row in

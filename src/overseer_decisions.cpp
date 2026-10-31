@@ -25282,7 +25282,8 @@ char const* StratholmeExitWayWord(StratholmeExitWay way)
 
 bool InStratholmeExitYard(std::uint32_t mapId, float x, float y)
 {
-    return mapId == 0 && x >= STRATHOLME_YARD_WEST_X && x <= STRATHOLME_YARD_EAST_X &&
+    return mapId == STRATHOLME_EXIT_YARD_MAP_ID &&
+           x >= STRATHOLME_YARD_WEST_X && x <= STRATHOLME_YARD_EAST_X &&
            y >= STRATHOLME_YARD_SOUTH_Y && y <= STRATHOLME_YARD_NORTH_Y;
 }
 
