@@ -284,8 +284,45 @@ leader rather than when it reached the run's map. That second one is what
 #1087 fixed, and what `tests/test_dungeon_rejoin.cpp` pins; the wiring the
 walk depends on is pinned by `tests/test_dungeon_rejoin_source.cpp`.
 
-So the check needs a member to die inside a run while somebody is watching. It
-cannot be scheduled from here: the log is on the realm and the realm is not
+The rotated logs are archived on the worldserver's node, so the window is wider
+than the live file. The search of 2026-10-24 (#1108) covered every archived
+worldserver log from 2026-10-20 02:20 to 2026-10-24 02:31 UTC, gaps between pod
+restarts aside, and **the proof line is not in it - not once**, and neither is
+the `walked into area trigger` line. The walk was started seven times after
+#1087 was deployed (2026-10-20 18:45 UTC). Six were closed by the 15-minute
+census ceiling (`cannot assemble its census ... The attempt is CLOSED`) and one
+was abandoned 15s in by the full-bags gate. Five of those six were not this
+case at all: the dungeon finder took part of a family in and the rest never
+entered, so nobody had died inside.
+
+The line counts for that window, by the text matched:
+
+- `stranded outside map <map> - <n> went back in this poll`: 0
+- `walked into area trigger`: 0
+- `is short a member and is WALKING IT BACK`: 7, one per walk started
+- `cannot assemble its census`: 6
+
+The one that was this case, 2026-10-22 12:17 to 12:34 UTC (run 2 of campaign
+101, map 90, areatrigger 324): a member died inside at 12:19:27, was released
+on its behalf at 12:21:34, and the walk began at 12:21:35 under its own lease
+as #1087 meant it to. It then took the spirit healer at 12:22:30, and the
+revived-sickness hold (#746) held it still from 12:22:47 to 12:32:34 - ten of
+the census's fifteen minutes - taking over the walk it was on. The census
+closed at 12:33:32 with that member still outside. So the walk-back has not yet
+been seen to work live, and the sickness hold is the thing that stopped it.
+
+The ordering half held: the coordinator printed no `STAGED_INSIDE satisfied`
+and no `dungeon run CLEARING` line for that family while it was short, and the
+run went to RESET, not CLEARING. Two things in the window look like counter
+examples and are not. `STAGED_INSIDE satisfied` carries no run number, and the
+ones printed in the same minutes name map 189, another family's run, so match
+on the map. And the per-member `'<name>' is inside map <map> (run <id>) -
+issuing 'dc on'` lines at 12:18:29 come from the finder-group re-entry path
+after a restart, not from the coordinator entering CLEARING.
+
+So the check still needs a member to die inside a run and walk back without
+taking the spirit healer, or with a hold short enough to leave the census time.
+It cannot be scheduled from here: the log is on the realm and the realm is not
 reachable from a repository checkout.
 
 ### The pin and the submodule move together
