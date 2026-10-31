@@ -184,6 +184,37 @@ int main()
                   true);
         CheckBool("an EXIT through 2221 opens the yard episode",
                   source.find("OpenStratholmeYard(family, *portal, coord)") != std::string::npos, true);
+        std::size_t const yardStart = source.find("void OpenStratholmeYard(");
+        std::size_t const yardEnd = source.find("static std::vector<Player*> MembersInStratholmeYard", yardStart);
+        std::string const yardSource = yardStart == std::string::npos || yardEnd == std::string::npos
+            ? std::string() : source.substr(yardStart, yardEnd - yardStart);
+        CheckBool("yard hearth names the Stratholme map constant",
+                  yardSource.find("yard.hearth.mapId = OverseerDecisions::STRATHOLME_EXIT_YARD_MAP_ID") !=
+                      std::string::npos,
+                  true);
+        std::size_t const hearthStart = source.find("bool DriveExitHearths(");
+        std::size_t const hearthEnd = source.find("// ---- a Stratholme run's way out", hearthStart);
+        std::string const hearthSource = hearthStart == std::string::npos || hearthEnd == std::string::npos
+            ? std::string() : source.substr(hearthStart, hearthEnd - hearthStart);
+        CheckBool("hearth reason is supplied by caller",
+                  hearthSource.find("char const* reason") != std::string::npos &&
+                      hearthSource.find("because the walk to the exit door failed") == std::string::npos &&
+                      hearthSource.find("after EXIT could not walk the party out") == std::string::npos,
+                  true);
+        std::size_t const yardCall = source.find(
+            "DriveExitHearths(family, leaderName, hearthers, yard.hearth,");
+        std::string const yardCallSource = yardCall == std::string::npos
+            ? std::string() : source.substr(yardCall, source.find(';', yardCall) - yardCall);
+        CheckBool("yard hearth names its own reason",
+                  yardCallSource.find("leaving the Stratholme exit yard") != std::string::npos &&
+                      yardCallSource.find("exit door") == std::string::npos &&
+                      yardCallSource.find("EXIT could not walk") == std::string::npos,
+                  true);
+        CheckBool("exit-door hearth retains its original reason",
+                  source.find("members, episode, \"EXIT\",\n") !=
+                      std::string::npos &&
+                      source.find("\"the walk to the exit door failed\"") != std::string::npos,
+                  true);
         CheckBool("the coordinator drives the yard before its phases",
                   source.find("if (DriveStratholmeYard(family, leaderName, members))") !=
                       std::string::npos,
