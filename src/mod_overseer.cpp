@@ -6596,12 +6596,15 @@ public:
         // counted the same way, in characters (wow-overseer#1517).
         if (!OverseerDecisions::TravelAimFitsColumn(target))
             return true;
+        // AI-REVIEW 2026-10-31 [codex/in-process/runtime-trace] T1 (PR #1263):
+        // The forecast must not accept the same stale cache that Claim rejects.
         auto const it = _state.find(name);
-        if (it != _state.end() && it->second.target == target)
+        std::string const column = CurrentTravelNpc(name);
+        if (it != _state.end() && it->second.target == target && column == target)
             return false;
         OverseerDecisions::TravelClaimFacts facts(owner);
         facts.learnSkill = LearnSkillPending(name);
-        facts.column = CurrentTravelNpc(name);
+        facts.column = column;
         auto const ours = _claimed.find(name);
         facts.columnIsOurs = ours != _claimed.end() && ours->second == facts.column;
         facts.target = target;

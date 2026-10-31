@@ -1,4 +1,4 @@
-"""Compile the actual Claim cache branch against changed travel columns."""
+"""Replay Claim and FenceRefuses caches against changed travel columns."""
 
 from pathlib import Path
 import subprocess
@@ -10,8 +10,11 @@ try:
     claim = source.index("    bool Claim(std::string const& name,")
     start = source.index("        auto const it = _state.find(name);", claim)
     end = source.index("        // TWO FENCES", start)
+    fence = source.index("    bool FenceRefuses(std::string const& name,")
+    fence_start = source.index("        auto const it = _state.find(name);", fence)
+    fence_end = source.index("        OverseerDecisions::TravelClaimFacts facts(owner);", fence_start)
 except ValueError as exc:
-    raise SystemExit("Claim cache branch not found; update the replay anchors") from exc
+    raise SystemExit("Travel cache branch not found; update the replay anchors") from exc
 
 # Fallthrough means Claim must consult its normal ownership policy. Extracting
 # the real branch matters: that policy already refused a foreign mailbox aim,
@@ -30,8 +33,14 @@ struct Book
     bool CachedClaim(std::string const& name, std::string const& target)
     {
 '''
-suffix = r'''
+between = r'''
         return false;
+    }
+    bool CachedFence(std::string const& name, std::string const& target)
+    {
+'''
+suffix = r'''
+        return true;
     }
 };
 int main()
@@ -42,7 +51,7 @@ int main()
         Book book;
         book._state["Leader"] = {target};
         book.column = target;
-        if (!book.CachedClaim("Leader", target))
+        if (!book.CachedClaim("Leader", target) || book.CachedFence("Leader", target))
         {
             std::cerr << "unchanged route was not reusable: " << target << '\n';
             ++failures;
@@ -52,7 +61,7 @@ int main()
             if (column == target)
                 continue;
             book.column = column;
-            if (book.CachedClaim("Leader", target))
+            if (book.CachedClaim("Leader", target) || !book.CachedFence("Leader", target))
             {
                 std::cerr << "stale cache bypassed policy: " << target
                           << " over column '" << column << "'\n";
@@ -60,7 +69,8 @@ int main()
             }
         }
         book.column = target;
-        if (book.CachedClaim("Absent", target) || book.CachedClaim("Leader", "trainer"))
+        if (book.CachedClaim("Absent", target) || book.CachedClaim("Leader", "trainer") ||
+            !book.CachedFence("Absent", target) || !book.CachedFence("Leader", "trainer"))
         {
             std::cerr << "a missing or different drive was treated as cached\n";
             ++failures;
@@ -72,7 +82,9 @@ int main()
 with tempfile.TemporaryDirectory() as directory:
     cpp = Path(directory) / "claim_cache.cpp"
     binary = Path(directory) / "claim_cache"
-    cpp.write_text(prefix + source[start:end] + suffix)
+    cpp.write_text(
+        prefix + source[start:end] + between + source[fence_start:fence_end] + suffix
+    )
     subprocess.run(
         ["g++", "-std=c++17", "-Wall", "-Wextra", str(cpp), "-o", str(binary)],
         check=True,
