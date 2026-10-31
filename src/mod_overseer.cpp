@@ -53733,6 +53733,34 @@ private:
         if (DriveStratholmeYard(family, leaderName, members))
             return;
 
+        // AFTER A RESTART, MEMBERS ALREADY IN STRATHOLME'S EXIT YARD HAVE NO
+        // EPISODE BECAUSE _stratholmeYards IS IN-MEMORY ONLY (#1254).
+        // On an IDLE poll, open a yard episode when a member stands in the
+        // exit yard and no episode exists.
+        if (coord.phase == DungeonRunPhase::Idle)
+        {
+            if (_stratholmeYards.find(family) == _stratholmeYards.end())
+            {
+                std::vector<Player*> const inYard = MembersInStratholmeYard(members);
+                if (!inYard.empty())
+                {
+                    DungeonPortal const* portal = nullptr;
+                    if (!coord.portalKeyword.empty())
+                        portal = FindDungeonPortal(coord.portalKeyword);
+                    if (!portal)
+                        portal = FindDungeonPortalByInsideMap(329, std::string());
+                    if (portal && portal->exitTriggerId == OverseerDecisions::STRATHOLME_YARD_EXIT_TRIGGER)
+                    {
+                        LOG_INFO("module.overseer",
+                                 "overseer: family '{}' has {} member(s) in the Stratholme exit "
+                                 "yard at IDLE with no episode; opening one via portal '{}'",
+                                 family, static_cast<uint32>(inYard.size()), portal->keyword);
+                        OpenStratholmeYard(family, *portal, coord);
+                    }
+                }
+            }
+        }
+
         if (coord.phase == DungeonRunPhase::Idle)
         {
             // job != 'dungeon' is the ordinary case - most polls, this drive
