@@ -11902,6 +11902,18 @@ std::size_t ChooseRoadJoin(std::vector<RoadJoinOption> const& options,
     return best;
 }
 
+std::string RouteEntryNote(std::uint32_t entryNode, float entryHeightGapYards,
+                           std::uint32_t sameFloorNodesInReach)
+{
+    char text[200];
+    std::snprintf(text, sizeof text,
+                  "It enters at node %u, %.0f yards above or below where the plan starts "
+                  "(#925), with %u same-floor nodes in reach",
+                  static_cast<unsigned>(entryNode), static_cast<double>(entryHeightGapYards),
+                  static_cast<unsigned>(sameFloorNodesInReach));
+    return text;
+}
+
 RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
                         std::vector<RouteLink> const& links,
                         std::uint32_t mapId, float fromX, float fromY,
@@ -11947,6 +11959,7 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
     // within reach is inside the height limit, every node outside it is passed
     // over as the way in; if none is, the nearest is taken as it always was.
     bool floorOnly = false;
+    std::uint32_t sameFloorInReach = 0;
     if (limits.fromZKnown)
     {
         for (RouteNode const& node : here)
@@ -11958,7 +11971,7 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
                 std::fabs(node.z - limits.fromZ) <= limits.maxEntryRiseYards)
             {
                 floorOnly = true;
-                break;
+                ++sameFloorInReach;
             }
         }
     }
@@ -12148,7 +12161,10 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
     plan.endsFromAimYards = goalDistance;
     plan.guardedLegs = guardedOnPlan;
     if (limits.fromZKnown)
+    {
         plan.entryHeightGapYards = std::fabs(here[entry].z - limits.fromZ);
+        plan.sameFloorNodesInReach = sameFloorInReach;
+    }
     return plan;
 }
 
@@ -19466,6 +19482,26 @@ char const* ExitHearthStepWord(ExitHearthStep step)
     return "unknown";
 }
 
+bool OffContinentHearthLetThrough(ExitHearthFacts const& facts)
+{
+    return facts.doorMapKnown && facts.bindMapId != facts.doorMapId &&
+           facts.failedWalkSeconds >= OFF_CONTINENT_HEARTH_AFTER_SECONDS;
+}
+
+bool SitOutHearthDue(std::int64_t walkingSeconds, unsigned attempts)
+{
+    return walkingSeconds >= OFF_CONTINENT_HEARTH_AFTER_SECONDS &&
+           attempts < EXIT_HEARTH_ATTEMPTS;
+}
+
+std::int64_t ExitWalkFailingSince(std::int64_t failingSince, std::int64_t lastFailedAt,
+                                  bool sameMap, std::int64_t now)
+{
+    if (failingSince > 0 && sameMap && now - lastFailedAt <= EXIT_WALK_FAILING_GAP_SECONDS)
+        return failingSince;
+    return now;
+}
+
 std::string ExitHearthImpossibleReason(ExitHearthFacts const& facts, unsigned maxAttempts)
 {
     if (!facts.inWorld || !facts.onInsideMap)
@@ -19479,8 +19515,10 @@ std::string ExitHearthImpossibleReason(ExitHearthFacts const& facts, unsigned ma
     if (facts.attempts >= maxAttempts)
         return "hearth attempts spent";
     // A hearth to another continent splits the family (#1142): the stone is
-    // withheld and the member stays on the walk-out path the episode bounds.
-    if (facts.doorMapKnown && facts.bindMapId != facts.doorMapId)
+    // withheld and the member stays on the walk-out path, until that walk has
+    // failed for the whole bound and the stone is the only way left (#1202).
+    if (facts.doorMapKnown && facts.bindMapId != facts.doorMapId &&
+        !OffContinentHearthLetThrough(facts))
         return "hearthstone bound on map " + std::to_string(facts.bindMapId) +
                ", not on map " + std::to_string(facts.doorMapId) +
                " where the exit door lets out, so the stone is withheld";
@@ -20468,7 +20506,13 @@ std::string FinderLastResortReason(RunFailureFacts const& facts)
         return "no summon was possible here: " + facts.summonNote;
     // The stone stands at the door, but nobody in the family qualifies to
     // click it: the summon rung could never run here either.
-    return "the stone stands at the door but no summoner qualifies to click it: " +
+    if (!facts.summonerReady)
+        return "the stone stands at the door but no summoner qualifies to click it: " +
+               facts.summonNote;
+    // Stone and summoner are both ready and no summon ran: only the finder as
+    // the realm's way in opens its rung here (RunRecoveryFinderOpen).
+    return "the summon rung was not waited for, because the dungeon finder is this "
+           "realm's way in: " +
            facts.summonNote;
 }
 
@@ -21528,6 +21572,14 @@ GuildRunVerdict GuildRunNext(GuildRunPoll const& poll)
     return GuildRunSeats(poll);
 }
 
+bool GuildRunClearedLootWaits(GuildRunClearedLootFacts const& facts)
+{
+    if (facts.aliveInside == 0 || facts.secondsSinceCleared >= GUILD_RUN_CLEARED_LOOT_MAX_SECONDS)
+        return false;
+    return facts.secondsSinceCleared < GUILD_RUN_CLEARED_LOOT_MIN_SECONDS || facts.rollsOpen ||
+           facts.anyFighting;
+}
+
 bool GuildRunRecovering(unsigned aliveInside, unsigned deadInside, unsigned ghostsComingBack)
 {
     return ghostsComingBack > 0 || (aliveInside == 0 && deadInside > 0);
@@ -21571,9 +21623,20 @@ GuildRunRestNeed GuildRunRestNeedOf(std::vector<GuildRunMemberShape> const& livi
     return rested ? GuildRunRestNeed::Rested : GuildRunRestNeed::Partial;
 }
 
+bool GuildRunRestVitalLow(std::vector<GuildRunMemberShape> const& living)
+{
+    for (GuildRunMemberShape const& m : living)
+        if (m.healthPct < GUILD_RUN_REST_HEALTH_PCT ||
+            (m.healer && m.usesMana && m.manaPct < GUILD_RUN_REST_HEALER_MANA_PCT))
+            return true;
+    return false;
+}
+
 GuildRunHold GuildRunHoldNext(GuildRunHoldFacts const& facts)
 {
     GuildRunHold hold;
+    bool const restMayStart = facts.need == GuildRunRestNeed::Low && facts.restRearmed &&
+                              (facts.vitalLow || facts.casterRestRearmed);
     // Nobody for the brain to drive, not armed yet, or a fight it owns. A held
     // brain stays held through a wipe: the first member raised waits.
     if (!facts.armed || facts.aliveInside == 0)
@@ -21593,7 +21656,7 @@ GuildRunHold GuildRunHoldNext(GuildRunHoldFacts const& facts)
         bool const low = facts.need == GuildRunRestNeed::Low;
         if (!facts.held)
         {
-            if (low && facts.restRearmed)
+            if (restMayStart)
                 hold = {GuildRunHoldStep::Hold, GuildRunHoldWhy::Rest};
             return hold;
         }
@@ -21613,7 +21676,7 @@ GuildRunHold GuildRunHoldNext(GuildRunHoldFacts const& facts)
     {
         if (regroup)
             hold = {GuildRunHoldStep::Hold, GuildRunHoldWhy::Regroup};
-        else if (facts.need == GuildRunRestNeed::Low && facts.restRearmed)
+        else if (restMayStart)
             hold = {GuildRunHoldStep::Hold, GuildRunHoldWhy::Rest};
         return hold;
     }
