@@ -6,6 +6,9 @@ from pathlib import Path
 import subprocess
 import unittest
 
+# The workflow runs this file on its MySQL service, so importing the class runs it.
+from replay_share_retention import ShareRetentionReplayTest  # noqa: F401
+
 ROOT = Path(__file__).resolve().parents[1]
 SQL = ROOT / "data/sql/characters/base"
 DATABASE_SQL = (

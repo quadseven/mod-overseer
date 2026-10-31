@@ -25553,4 +25553,45 @@ std::vector<std::size_t> NextPortalClickers(std::vector<MageTravelClicker> const
     return {};
 }
 
+static std::string ShareRetentionCandidates()
+{
+    return "SELECT id FROM ("
+           "SELECT id, updated_at <= NOW() - INTERVAL " +
+           std::to_string(SHARE_RETENTION_DAYS) +
+           " DAY AS aged, ROW_NUMBER() OVER ("
+           "PARTITION BY target_name, target_arg, command, status, "
+           "CASE WHEN JSON_VALID(result) "
+           "THEN JSON_UNQUOTE(JSON_EXTRACT(result, '$.reason')) END "
+           "ORDER BY updated_at DESC, id DESC) AS rn "
+           "FROM overseer_command "
+           "WHERE kind = 'share' AND status IN ('delivered', 'error')"
+           ") AS answered WHERE aged OR rn > " +
+           std::to_string(SHARE_RETENTION_DEPTH);
+}
+
+std::string ShareRetentionSelectSql()
+{
+    return ShareRetentionCandidates() + " LIMIT " + std::to_string(SHARE_RETENTION_BATCH);
+}
+
+std::string ShareRetentionCountSql()
+{
+    return "SELECT COUNT(*) FROM (" + ShareRetentionCandidates() + ") AS candidates";
+}
+
+std::string ShareRetentionDeleteSql(std::vector<uint32_t> const& ids)
+{
+    if (ids.empty())
+        return "";
+    std::string list;
+    for (uint32_t id : ids)
+    {
+        if (!list.empty())
+            list += ',';
+        list += std::to_string(id);
+    }
+    return "DELETE FROM overseer_command WHERE id IN (" + list +
+           ") AND kind = 'share' AND status IN ('delivered', 'error')";
+}
+
 }  // namespace OverseerDecisions
