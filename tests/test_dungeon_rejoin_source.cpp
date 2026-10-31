@@ -140,6 +140,28 @@ int CheckTheStagedHold(std::string const& text)
 
     return EXIT_SUCCESS;
 }
+int CheckClearingSplit(std::string const& text)
+{
+    std::string const guard =
+        "if (coord.phase == DungeonRunPhase::Clearing && inside &&\n"
+        "                !OverseerDecisions::DungeonRunAllThrough(states))";
+    std::size_t const split = text.find(guard);
+    std::size_t const staged = text.find("if (coord.phase == DungeonRunPhase::StagedInside)");
+    if (split == std::string::npos || staged == std::string::npos || split >= staged)
+        return Fail("a clearing run split across the door must return to assembly before "
+                    "the staged hold, not reach the unaccepted-clear clock hold");
+    std::string const transition = text.substr(split, staged - split);
+    if (transition.find("coord.phase = DungeonRunPhase::StagedInside;") == std::string::npos ||
+        transition.find("coord.assembly = {};") == std::string::npos ||
+        transition.find("coord.loggedStagedWaiting = false;") == std::string::npos)
+        return Fail("the clearing split must enter a fresh bounded assembly episode");
+    if (transition.find("return;") != std::string::npos ||
+        transition.find("EndRunAndDecide(") != std::string::npos ||
+        transition.find("coord = DungeonRunCoordinatorState") != std::string::npos)
+        return Fail("reassembly must reach the existing walk and ceiling in the same poll "
+                    "while preserving the current run and its boss progress");
+    return EXIT_SUCCESS;
+}
 }  // namespace
 
 int main()
@@ -151,6 +173,8 @@ int main()
                            std::istreambuf_iterator<char>());
 
     if (CheckTheRejoin(text) != EXIT_SUCCESS)
+        return EXIT_FAILURE;
+    if (CheckClearingSplit(text) != EXIT_SUCCESS)
         return EXIT_FAILURE;
     if (CheckTheStagedHold(text) != EXIT_SUCCESS)
         return EXIT_FAILURE;

@@ -56703,6 +56703,22 @@ private:
             if (inside > coord.wentIn)
                 coord.wentIn = inside;
 
+            // A member can leave after clearing starts. The assembly path owns
+            // its natural walk back through the door and its bounded wait.
+            // Keep this run and its credited bosses while that path reunites it.
+            if (coord.phase == DungeonRunPhase::Clearing && inside &&
+                !OverseerDecisions::DungeonRunAllThrough(states))
+            {
+                coord.phase = DungeonRunPhase::StagedInside;
+                coord.assembly = {};
+                coord.loggedStagedWaiting = false;
+                LOG_WARN("module.overseer",
+                         "overseer: dungeon run {} of campaign {} left CLEARING to "
+                         "reassemble - {} of {} members remain inside map {}",
+                         coord.runNumber, coord.campaignId, inside,
+                         static_cast<uint32>(states.size()), portal->insideMapId);
+            }
+
             if (coord.phase == DungeonRunPhase::StagedInside)
             {
                 if (!OverseerDecisions::DungeonRunAllThrough(states))
