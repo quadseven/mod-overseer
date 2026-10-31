@@ -64754,11 +64754,15 @@ private:
                     if (msg == EQUIP_ERR_OK)
                     {
                         if (position == uint16((uint16(INVENTORY_SLOT_BAG_0) << 8) | slot))
+                        {
                             equipSlot = slot;
+                            // AI-REVIEW 2026-10-31 [poolside/laguna-s-2.1] C4431594205
+                            // (single-model review, PR #1279): only stop at a legal position.
+                            break;
+                        }
                         else
                             msg = EQUIP_ERR_ITEM_DOESNT_GO_TO_SLOT;
                     }
-                    break;
                 }
             }
             ev.haveInventoryResult = true;

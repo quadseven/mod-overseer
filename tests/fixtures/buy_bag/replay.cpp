@@ -56,6 +56,7 @@ struct Player {
   int64 money = 100;
   int quantity = 0, free = 0;
   bool equipmentAllowed = true, coreRefuses = false, misdirected = false;
+  int blockedSlot = -1;
   mutable Item slotItem;
   uint32 worn[23] = {};
   Player() { worn[19] = 4496; }
@@ -74,8 +75,9 @@ struct Player {
   }
   InventoryResult CanEquipNewItem(uint8 slot, uint16 &dest, uint32, bool) {
     dest = slot;
-    return equipmentAllowed && !worn[slot] ? EQUIP_ERR_OK
-                                           : EQUIP_ERR_CANT_EQUIP;
+    return equipmentAllowed && !worn[slot] && slot != blockedSlot
+               ? EQUIP_ERR_OK
+               : EQUIP_ERR_CANT_EQUIP;
   }
 };
 struct Vendor {
@@ -163,6 +165,14 @@ int main() {
                                                 ev.moneyAfter == 80 &&
                                                 ev.carriedAfter == 1);
   check("targeted native purchase handler is used", session.targeted);
+  Player later;
+  later.blockedSlot = 20;
+  Session laterSession(&later);
+  Evidence laterRead;
+  check("a refused empty position does not hide a later legal one",
+        std::string(purchase(&later, request, &proto, &laterSession, laterRead))
+                .empty() &&
+            !later.worn[20] && later.worn[21] == request.entry);
   for (unsigned mode = 0; mode < 6; ++mode) {
     Player held;
     Request ask;
