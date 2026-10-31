@@ -20374,7 +20374,15 @@ RecipeManualPlan PlanRecipeManual(RecipeManualFacts const& facts)
     if (facts.carriesManual)
         return {RecipeManualStep::Use, ""};
     if (!facts.vendorNearby)
+    {
+        if (facts.walkStartedAt != 0)
+        {
+            time_t const now = std::time(nullptr);
+            if (now - facts.walkStartedAt >= RECIPE_MANUAL_WALK_TIMEOUT_SECONDS)
+                return {RecipeManualStep::Refuse, R::WalkTimeout};
+        }
         return {RecipeManualStep::Walk, ""};
+    }
     if (!facts.vendorInReach)
         return {RecipeManualStep::Approach, ""};
     if (!facts.vendorSells)
