@@ -52,6 +52,7 @@ run_decisions() {
 
   python3 -B tests/replay_exit_hearth_finalization.py
   python3 -B tests/replay_travel_claim_cache.py
+  python3 -B tests/replay_main_tank_cache.py
 
   echo "== decisions: compile and run"
   g++ --version | head -1
