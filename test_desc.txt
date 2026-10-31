@@ -1,0 +1,23 @@
+## Why
+- The fix was already present on main.
+
+## Summary
+- No changes were needed because the issue was already resolved on the `main` branch.
+
+## Acceptance
+- No changes made to the codebase
+- CI checks pass for the PR format
+- Followed instructions to stop and make no changes
+
+## Test plan
+- Verify CI passes
+- Verify no changes are introduced
+- Verify PR formatting rules are followed
+
+## Size
+Size: XS
+
+## Out of scope
+- Any actual code changes.
+
+Refs quadseven/mod-overseer#1141
