@@ -32461,6 +32461,7 @@ private:
         // When a ghost with no graveyard began to wait out its killer, and
         // whether that wait ended at the refused healer (#1275).
         int64 refusedHoldSince{0};
+        int64 refusedStatusSince{0};
         bool refusedHealerTaken{false};
         // How far the ghost stood from the healer's graveyard when the current
         // allowance began (-1 before the walk), and how often a walk still
@@ -33805,7 +33806,7 @@ private:
     }
 
     // One poll of a guild ghost whose healer is refused or out of reach. The
-    // hold is timed from the first poll that held it, and said once.
+    // hold is timed from the first poll that held it.
     OverseerDecisions::GhostRecovery RefusedHealerStep(
         Player* bot, std::string const& name, GhostRecoveryState& st,
         OverseerDecisions::GhostRecoveryFacts const& ghost, int64 now)
@@ -33825,6 +33826,7 @@ private:
         if (step == OverseerDecisions::GhostRecovery::Wait && !st.refusedHoldSince)
         {
             st.refusedHoldSince = now;
+            st.refusedStatusSince = now;
             LOG_WARN("module.overseer",
                      "overseer: '{}' (level {}) has no graveyard it can take and {} hostile(s) "
                      "stand at its corpse - the ghost waits them out for up to {}s instead of "
@@ -33832,9 +33834,26 @@ private:
                      name, ghost.level, ghost.liveThreatsNearCorpse, GHOST_REFUSED_HOLD_SECONDS,
                      st.healerRefused.empty() ? "its walk to a healer ran out" : st.healerRefused);
         }
-        if (step == OverseerDecisions::GhostRecovery::SpiritHealer && !st.refusedHealerTaken)
+        if (st.refusedHealerTaken && !st.healerWalkSpent &&
+            now - st.refusedStatusSince >= 300)
         {
-            // The walk starts over, to the nearest healer this time.
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' has waited {}s with {} hostile(s) at its corpse; it remains "
+                     "a ghost and is still walking to the spirit healer at '{}'",
+                     name, facts.heldSeconds, ghost.liveThreatsNearCorpse,
+                     st.healerGrave ? st.healerGrave->name : "unknown");
+            st.refusedStatusSince = now;
+        }
+        if (step == OverseerDecisions::GhostRecovery::SpiritHealer &&
+            (!st.refusedHealerTaken || st.healerWalkSpent))
+        {
+            if (st.refusedHealerTaken && st.healerWalkSpent)
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' has waited {}s with {} hostile(s) at its corpse after "
+                         "the healer walk failed; it stays a ghost and retries the walk to '{}'",
+                         name, facts.heldSeconds, ghost.liveThreatsNearCorpse,
+                         nearest ? nearest->name : "unknown");
+            // Start or retry a natural walk to the nearest healer.
             st.refusedHealerTaken = true;
             st.healerGrave = nearest;
             st.healerRerouted = false;
@@ -33843,6 +33862,8 @@ private:
             st.healerWalkIssued = false;
             st.healerWalkRenewals = 0;
             st.healerWalkFromYards = -1.f;
+            st.healerSince = 0;
+            st.refusedStatusSince = now;
             st.healerWalkSeconds = OverseerDecisions::GhostHealerWalkSeconds(
                 bot->GetExactDist2d(nearest->x, nearest->y), GHOST_HEALER_WALK_SECONDS);
             LOG_WARN("module.overseer",
