@@ -14109,6 +14109,108 @@ std::uint32_t DiedOnLegsHeld(std::vector<DiedOnLeg> const& died, std::time_t now
 // exactly as it was.
 bool SteerCreatureWalkAlongRoute(bool creatureAim, std::uint32_t diedOnLegsHeld);
 
+// ------------- a zone that keeps killing a party is routed round (#1243) ----
+//
+// Died-on-leg pricing (#502, #1228) remembers one road for one walker for two
+// hours. A level 17 party walked into a level 50 to 58 zone again and again
+// because nothing remembers a whole zone. This does, built on the same idea:
+// the walker plans on a priced copy of the survey's links, so a way round is
+// taken when one exists, the zone is never deleted from the graph, and a walker
+// with no way round still gets a route and says so.
+//
+// THE EVIDENCE IS REALM-WIDE AND THE VERDICT IS PER PARTY. A death counts for a
+// zone whoever died, because `overseer_death` says what stands in that zone. It
+// counts against a party only while the killer is `levelGap` or more levels
+// above the party's lowest level, so the score decays as the party levels, and
+// no timer is needed for a party that has outgrown the zone.
+struct ZoneDeath
+{
+    std::uint32_t mapId{0};
+    std::uint32_t zoneId{0};
+    std::uint32_t killerLevel{0};
+    std::time_t at{0};
+};
+
+struct ZoneDangerLimits
+{
+    std::int64_t windowSeconds{24 * 60 * 60};
+    // How far above the party's lowest level a killer must be to count.
+    std::uint32_t levelGap{8};
+    // How many counted deaths in the window make a zone dangerous.
+    std::uint32_t deaths{3};
+    // What each leg touching a dangerous zone costs on top of its survey cost.
+    // More than the longest walk the survey can plan across a continent, so any
+    // way round wins, however long, and only a leg with none is ever walked.
+    float priceYards{50000.f};
+};
+
+struct DangerZone
+{
+    std::uint32_t zoneId{0};
+    // Deaths counted against this party in the window: the zone's score.
+    std::uint32_t deaths{0};
+    std::uint32_t strongestKiller{0};
+    // Filled in by the caller for the log; the decisions never read it.
+    std::string name;
+};
+
+// Survey node id to the zone it stands in.
+using NodeZones = std::map<std::uint32_t, std::uint32_t>;
+
+// The party's lowest level, or 0 for an empty list. Every member walks the leg,
+// so the youngest is who the zone is judged against.
+std::uint32_t LowestPartyLevel(std::vector<std::uint32_t> const& partyLevels);
+
+// Deaths in `zoneId` on `mapId` inside the window at `now` to creatures
+// `levelGap` or more levels above `partyLevel`. A party level of 0 scores 0.
+std::uint32_t ZoneDangerScore(std::vector<ZoneDeath> const& deaths, std::uint32_t mapId,
+                              std::uint32_t zoneId, std::uint32_t partyLevel, std::time_t now,
+                              ZoneDangerLimits const& limits);
+
+// Every zone on `mapId` whose score reaches `limits.deaths`, in zone id order.
+std::vector<DangerZone> DangerZonesOn(std::vector<ZoneDeath> const& deaths, std::uint32_t mapId,
+                                      std::uint32_t partyLevel, std::time_t now,
+                                      ZoneDangerLimits const& limits);
+
+// Drop deaths older than the window at `now`.
+void ForgetOldZoneDeaths(std::vector<ZoneDeath>& deaths, std::time_t now,
+                         ZoneDangerLimits const& limits);
+
+// What walking the leg `from`-`to` costs on top of its distance: `priceYards`
+// when either end stands in a dangerous zone, else 0. Either end, because a leg
+// with one foot in the zone walks into it.
+float DangerZonePrice(std::uint32_t from, std::uint32_t to, NodeZones const& nodeZones,
+                      std::vector<DangerZone> const& zones, ZoneDangerLimits const& limits);
+
+// Price every walk link on a copy of the survey's links, and return how many
+// were priced. A link the survey refused (negative cost) stays refused.
+std::uint32_t PriceDangerZones(std::vector<RouteLink>& links, NodeZones const& nodeZones,
+                               std::vector<DangerZone> const& zones,
+                               ZoneDangerLimits const& limits);
+
+// What a priced plan did about the dangerous zones. `avoided` are the zones the
+// plan on unpriced links (`wayThrough`) walks and `walked` does not. `stillWalked`
+// are the zones `walked` still touches, because no way round exists: the walker
+// starts in the zone, its aim is in the zone, or the survey has no other road.
+struct ZoneRouteReading
+{
+    std::vector<DangerZone> avoided;
+    std::vector<DangerZone> stillWalked;
+};
+
+ZoneRouteReading ReadZoneRoute(std::vector<std::uint32_t> const& walked,
+                               std::vector<std::uint32_t> const& wayThrough,
+                               NodeZones const& nodeZones,
+                               std::vector<DangerZone> const& zones);
+
+// The travel log's two sentences, pure so the wording is tested as text.
+std::string ZoneAvoidedLine(std::string const& name, std::string const& target,
+                            std::vector<DangerZone> const& avoided,
+                            ZoneDangerLimits const& limits);
+std::string ZoneNoWayRoundLine(std::string const& name, std::string const& target,
+                               std::vector<DangerZone> const& stillWalked,
+                               ZoneDangerLimits const& limits);
+
 // ------------------ a staging walk that is measured rather than routed (#342) --
 //
 // THE ROUTE PLANNER ABOVE IS RIGHT ABOUT ITS GRAPH AND WRONG ABOUT THE WORLD,
