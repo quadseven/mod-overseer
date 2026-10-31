@@ -27637,7 +27637,7 @@ private:
 
             // ONE CAST INSTEAD OF THE WALK, asked ahead of the resolve because the
             // resolve refuses a point on another map (#1161).
-            if (!guarded && MageTravelHolds(bot, name, target, state))
+            if (!guarded && MageTravelHolds(bot, name, target, state, aims))
                 continue;
 
             // AN AIM ON A CHARACTER THAT CANNOT ACT ON IT IS NOT AN AIM, and
@@ -72904,6 +72904,39 @@ private:
         return "";
     }
 
+    // THE REFUSALS `cast` ALREADY HAS, in its order, for anybody about to click a
+    // portal. "" when none applies.
+    static char const* PortalUseStateWall(Player* who)
+    {
+        namespace Cast = OverseerDecisions::CastRefusal;
+        WorldSession* session = who->GetSession();
+        if (!session)
+            return Cast::NoSession;
+        if (!who->IsInWorld())
+            return Cast::NotInWorld;
+        if (!GET_PLAYERBOT_AI(who))
+            return Cast::NoBotAI;
+        if (who->m_mover != who)
+            return Cast::NotOwnMover;
+        if (!who->IsAlive())
+            return Cast::Dead;
+        if (who->IsInFlight())
+            return Cast::InFlight;
+        if (who->IsInCombat())
+            return Cast::InCombat;
+        if (who->HasUnitState(UNIT_STATE_STUNNED))
+            return Cast::Stunned;
+        if (SessionIsLoggingOut(session))
+            return Cast::LoggingOut;
+        if (who->GetTradeData())
+            return Cast::Trading;
+        if (who->GetTransport())
+            return Cast::OnTransport;
+        if (who->IsNonMeleeSpellCast(false))
+            return Cast::AlreadyCasting;
+        return "";
+    }
+
     // MAGE TRAVEL SECTION BEGINS ============ a family mage's way to a capital ==
     //
     // WHEN THE TRAVEL DRIVE HOLDS A LONG ERRAND, THE MAGE IS ASKED FIRST (#1161).
@@ -72996,8 +73029,25 @@ private:
         return spells;
     }
 
-    // The traveller if it is a mage, else a mage of its group standing beside it.
-    static Player* MageBeside(Player* traveller)
+    using MageTravelAims = std::map<std::string, std::string>;
+
+    // IS THIS CHARACTER THIS MODULE'S TO MOVE? Not one a person commands, not one
+    // an operator's guard pins, and not one a run or a crossing is walking.
+    bool MageTravelMaySteer(Player* member, MageTravelAims const& aims) const
+    {
+        PlayerbotAI* const ai = SteerableAI(member);
+        if (!ai || IsRealPlayer(ai->GetMaster()))
+            return false;
+        std::string const name = member->GetName();
+        auto const aim = aims.find(name);
+        if (aim != aims.end() && OverseerDecisions::IsTravelGuardAim(aim->second))
+            return false;
+        return !_dungeonEscorts.count(name) && !_loneCrossings.count(name);
+    }
+
+    // The traveller if it is a mage, else a mage of its group standing beside it
+    // that is free: another verb's hold means it is busy with something else.
+    Player* MageBeside(Player* traveller, MageTravelAims const& aims) const
     {
         if (traveller->getClass() == CLASS_MAGE)
             return traveller;
@@ -73007,15 +73057,17 @@ private:
         {
             Player* member = ref->GetSource();
             if (member && member->IsInWorld() && member->getClass() == CLASS_MAGE &&
-                member->IsWithinDistInMap(traveller, CAST_OBJECT_SWEEP_YARDS))
+                member->IsWithinDistInMap(traveller, CAST_OBJECT_SWEEP_YARDS) &&
+                MageTravelMaySteer(member, aims) &&
+                !HoldsInForce().count(member->GetName()))
                 return member;
         }
         return nullptr;
     }
 
-    // The mage's group beside it, the mage not counted: the sweep a portal is
-    // looked for in, so everybody counted can find the portal.
-    static std::vector<Player*> PartyBesideMage(Player* mage)
+    // The mage's group beside it that this module may move, the mage not counted:
+    // the sweep a portal is looked for in, so everybody counted can find it.
+    std::vector<Player*> PartyBesideMage(Player* mage, MageTravelAims const& aims) const
     {
         std::vector<Player*> party;
         Group* group = mage->GetGroup();
@@ -73024,7 +73076,8 @@ private:
         {
             Player* member = ref->GetSource();
             if (member && member != mage && member->IsInWorld() && member->IsAlive() &&
-                member->IsWithinDistInMap(mage, CAST_OBJECT_SWEEP_YARDS))
+                member->IsWithinDistInMap(mage, CAST_OBJECT_SWEEP_YARDS) &&
+                MageTravelMaySteer(member, aims))
                 party.push_back(member);
         }
         return party;
@@ -73087,7 +73140,7 @@ private:
     }
 
     void BeginMageTravel(Player* bot, std::string const& name, std::string const& target,
-                         TravelAimBook::TravelState const& state)
+                         TravelAimBook::TravelState const& state, MageTravelAims const& aims)
     {
         OverseerDecisions::MageTravelFacts facts;
         float destZ = 0.f;
@@ -73101,14 +73154,14 @@ private:
             facts.destX = state.x;
             facts.destY = state.y;
         }
-        if (!MageTravelMayAsk(bot, name, target))
+        if (!MageTravelMayAsk(bot, name, target) || !MageTravelMaySteer(bot, aims))
             return;
-        Player* const mage = MageBeside(bot);
+        Player* const mage = MageBeside(bot, aims);
         if (!mage)
             return;
 
         facts.casterIsTraveller = mage == bot;
-        facts.othersPresent = uint32(PartyBesideMage(mage).size());
+        facts.othersPresent = uint32(PartyBesideMage(mage, aims).size());
         facts.sameMap = facts.destMap == bot->GetMapId();
         facts.walkYards = facts.sameMap ? bot->GetDistance2d(facts.destX, facts.destY) : 0.f;
         facts.spells = ReadMageTravelSpells(mage);
@@ -73151,7 +73204,7 @@ private:
     // a character that is waiting on a cast or a click. Once the traveller has
     // landed, its errand goes on from there.
     bool MageTravelHolds(Player* bot, std::string const& name, std::string const& target,
-                         TravelAimBook::TravelState const& state)
+                         TravelAimBook::TravelState const& state, MageTravelAims const& aims)
     {
         auto found = _mageTravels.find(name);
         if (found != _mageTravels.end() && found->second.done && found->second.target != target)
@@ -73161,7 +73214,7 @@ private:
         }
         if (found == _mageTravels.end())
         {
-            BeginMageTravel(bot, name, target, state);
+            BeginMageTravel(bot, name, target, state, aims);
             found = _mageTravels.find(name);
         }
         if (found == _mageTravels.end() || found->second.done)
@@ -73187,7 +73240,8 @@ private:
         return false;
     }
 
-    void ReadMageCast(std::string const& traveller, MageTravelRun& run)
+    void ReadMageCast(std::string const& traveller, MageTravelRun& run,
+                      MageTravelAims const& aims)
     {
         Player* const mage = ObjectAccessor::FindPlayerByName(run.mage);
         if (run.way == OverseerDecisions::MageTravelWay::Portal && mage &&
@@ -73199,7 +73253,7 @@ private:
             HoldStillAndReport(mage, run.mage, PORTAL_HOLD_VERB, report,
                                MAGE_TRAVEL_PORTAL_SECONDS);
             // On this poll: the portal's minute is already running.
-            StepMagePortal(traveller, run);
+            StepMagePortal(traveller, run, aims);
             return;
         }
         bool const moved =
@@ -73216,13 +73270,18 @@ private:
     void ClickMagePortal(Player* member, GameObject* portal, MageTravelRun& run)
     {
         std::string const name = member->GetName();
+        char const* wall = PortalUseStateWall(member);
+        if (*wall && OverseerDecisions::MageTravelCastRetries(wall, 0))
+            return;  // fighting or casting: asked again on the next poll
         run.clicked.insert(name);
         std::vector<GameObject*> objects;
         std::vector<OverseerDecisions::PortalCandidate> candidates;
-        ReadPortals(member, objects, candidates);
-        char const* wall = "";
-        int const pick =
-            OverseerDecisions::PickPortal(candidates, portal->GetGUID().GetCounter(), wall);
+        int pick = -1;
+        if (!*wall)
+        {
+            ReadPortals(member, objects, candidates);
+            pick = OverseerDecisions::PickPortal(candidates, portal->GetGUID().GetCounter(), wall);
+        }
         if (pick >= 0)
         {
             PortalUseCheck click;
@@ -73256,7 +73315,8 @@ private:
         EndMageTravel(traveller, run);
     }
 
-    void StepMagePortal(std::string const& traveller, MageTravelRun& run)
+    void StepMagePortal(std::string const& traveller, MageTravelRun& run,
+                        MageTravelAims const& aims)
     {
         Player* const mage = ObjectAccessor::FindPlayerByName(run.mage);
         GameObject* const portal = mage ? FindObjectThisCastMade(mage, run.spellId) : nullptr;
@@ -73267,7 +73327,7 @@ private:
             return;
         }
 
-        std::vector<Player*> party = PartyBesideMage(mage);
+        std::vector<Player*> party = PartyBesideMage(mage, aims);
         party.push_back(mage);
         std::vector<OverseerDecisions::MageTravelClicker> clickers;
         bool anyoneGoing = false;
@@ -73291,9 +73351,31 @@ private:
             ClickMagePortal(party[pick], portal, run);
     }
 
+    // Asked before every step, so a cast is not sent and a party is not walked
+    // on behalf of an errand somebody has since taken back. The column can hold
+    // another aim while the campaign bind is what is being walked (HomeBindAim).
+    bool EndIfCalledOff(std::string const& traveller, MageTravelRun& run,
+                        MageTravelAims const& aims)
+    {
+        auto const aim = aims.find(traveller);
+        bool const present = aim != aims.end();
+        bool const guard = present && OverseerDecisions::IsTravelGuardAim(aim->second);
+        bool const same = present && (aim->second == run.target ||
+                                      HomeBindAim(traveller) == run.target);
+        if (!OverseerDecisions::MageTravelCalledOff(run.clicked.count(traveller) != 0, present,
+                                                    guard, same))
+            return false;
+        LOG_INFO("module.overseer",
+                 "overseer: MAGE TRAVEL RESULT - '{}' stands down from {} for '{}': the errand "
+                 "'{}' was called off",
+                 run.mage, MageSpellWord(run.spellId), traveller, run.target);
+        EndMageTravel(traveller, run);
+        return true;
+    }
+
     // ONE STEP OF EVERY RUN, on the travel poll and not inside the errand loop:
     // the leader's errand can end on landing with the party still at the portal.
-    void StepMageTravels(std::map<std::string, std::string> const& aims)
+    void StepMageTravels(MageTravelAims const& aims)
     {
         for (auto it = _mageTravels.begin(); it != _mageTravels.end();)
         {
@@ -73304,13 +73386,18 @@ private:
                 it = _mageTravels.erase(it);
                 continue;
             }
-            if (!run.done && !run.castSent)
-                SendMageCast(traveller, run);
-            else if (!run.done && !run.atThePortal && !MageCastRunning(run.mage))
-                ReadMageCast(traveller, run);
-            else if (!run.done && run.atThePortal)
-                StepMagePortal(traveller, run);
-            ++it;
+            if (run.done || EndIfCalledOff(traveller, run, aims))
+                ++it;
+            else
+            {
+                if (!run.castSent)
+                    SendMageCast(traveller, run);
+                else if (run.atThePortal)
+                    StepMagePortal(traveller, run, aims);
+                else if (!MageCastRunning(run.mage))
+                    ReadMageCast(traveller, run, aims);
+                ++it;
+            }
         }
     }
     // MAGE TRAVEL SECTION ENDS ==================================================
@@ -73318,7 +73405,6 @@ private:
     char const* DoPortalUse(Player* who, std::string const& command, char const*& status,
                             std::string& out, uint32 id)
     {
-        namespace Cast = OverseerDecisions::CastRefusal;
         namespace Refusal = OverseerDecisions::PortalUseRefusal;
 
         PortalUseCheck ev;
@@ -73338,32 +73424,8 @@ private:
         if (PortalUseUnderWay(ev.targetName))
             return refuse(Refusal::AlreadyRunning);
 
-        // THE REFUSALS `cast` ALREADY HAS, in its order.
-        WorldSession* session = who->GetSession();
-        if (!session)
-            return refuse(Cast::NoSession);
-        if (!who->IsInWorld())
-            return refuse(Cast::NotInWorld);
-        if (!GET_PLAYERBOT_AI(who))
-            return refuse(Cast::NoBotAI);
-        if (who->m_mover != who)
-            return refuse(Cast::NotOwnMover);
-        if (!who->IsAlive())
-            return refuse(Cast::Dead);
-        if (who->IsInFlight())
-            return refuse(Cast::InFlight);
-        if (who->IsInCombat())
-            return refuse(Cast::InCombat);
-        if (who->HasUnitState(UNIT_STATE_STUNNED))
-            return refuse(Cast::Stunned);
-        if (SessionIsLoggingOut(session))
-            return refuse(Cast::LoggingOut);
-        if (who->GetTradeData())
-            return refuse(Cast::Trading);
-        if (who->GetTransport())
-            return refuse(Cast::OnTransport);
-        if (who->IsNonMeleeSpellCast(false))
-            return refuse(Cast::AlreadyCasting);
+        if (char const* const wall = PortalUseStateWall(who); *wall)
+            return refuse(wall);
 
         std::vector<GameObject*> objects;
         std::vector<OverseerDecisions::PortalCandidate> candidates;

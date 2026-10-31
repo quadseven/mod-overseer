@@ -76,6 +76,19 @@ int main()
     if (section.find("FindObjectThisCastMade(") == std::string::npos)
         return Fail("a portal is believed only when the object stands there");
 
+    // Nobody is steered who is not this module's to steer.
+    if (section.find("IsRealPlayer(") == std::string::npos ||
+        section.find("IsTravelGuardAim(") == std::string::npos ||
+        section.find("_dungeonEscorts.count(name)") == std::string::npos)
+        return Fail("a person's character, a guard and a run's member are not steered");
+    if (section.find("PortalUseStateWall(member)") == std::string::npos)
+        return Fail("a click must ask the walls the use-portal row asks");
+    if (section.find("MageTravelCalledOff(") == std::string::npos)
+        return Fail("an errand called off must end the run");
+    if (Between(source, "char const* DoPortalUse(", "LEADER FIRST").find("PortalUseStateWall(who)") ==
+        std::string::npos)
+        return Fail("the row and the mage's run must share one list of walls");
+
     // The drive asks, and asks before the resolve can refuse a far map.
     std::string const drive = Between(source, "void DriveTravel()", "ARRIVAL IS THE PRIMARY RELEASE");
     std::size_t const asked = drive.find("MageTravelHolds(");

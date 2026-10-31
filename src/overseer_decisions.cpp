@@ -25350,6 +25350,12 @@ bool MageTravelCastRetries(std::string const& detail, std::uint32_t tries)
     return tries < MAGE_TRAVEL_CAST_TRIES && CastRefusalRetry(detail) == TownRetry::Later;
 }
 
+bool MageTravelCalledOff(bool travellerClicked, bool aimPresent, bool aimIsGuard,
+                         bool aimIsTheRuns)
+{
+    return !travellerClicked && (!aimPresent || aimIsGuard || !aimIsTheRuns);
+}
+
 std::vector<std::size_t> NextPortalClickers(std::vector<MageTravelClicker> const& party)
 {
     for (std::size_t i = 0; i < party.size(); ++i)

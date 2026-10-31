@@ -29,6 +29,7 @@ using OverseerDecisions::DecideMageTravel;
 using OverseerDecisions::MAGE_TRAVEL_CAST_TRIES;
 using OverseerDecisions::MAGE_TRAVEL_LANDING_REACH_YARDS;
 using OverseerDecisions::MAGE_TRAVEL_MIN_SAVED_YARDS;
+using OverseerDecisions::MageTravelCalledOff;
 using OverseerDecisions::MageTravelCastRetries;
 using OverseerDecisions::MageTravelClicker;
 using OverseerDecisions::MageTravelFacts;
@@ -239,6 +240,16 @@ void TestOnlyAWaitableRefusalIsRetried()
           !MageTravelCastRetries(CastRefusal::NotLearned, 1));
 }
 
+void TestAnErrandCalledOffEndsTheRun()
+{
+    Check("the same errand runs on", !MageTravelCalledOff(false, true, false, true));
+    Check("an emptied column ends it", MageTravelCalledOff(false, false, false, false));
+    Check("a different errand ends it", MageTravelCalledOff(false, true, false, false));
+    Check("an operator's guard ends it", MageTravelCalledOff(false, true, true, false));
+    Check("a traveller already sent through has nothing to call off",
+          !MageTravelCalledOff(true, false, false, false));
+}
+
 MageTravelClicker Clicker(bool traveller, bool mage, bool waiting, bool underWay = false)
 {
     MageTravelClicker c;
@@ -312,6 +323,7 @@ int main()
     TestALandingOutOfReachIsNotThatCapital();
     TestWayWords();
     TestOnlyAWaitableRefusalIsRetried();
+    TestAnErrandCalledOffEndsTheRun();
     TestTheTravellerStepsThroughFirst();
     TestNobodyFollowsAnUnfinishedClick();
     TestTheRestGoTogetherAndTheMageLast();

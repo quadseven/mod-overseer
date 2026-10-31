@@ -27870,6 +27870,12 @@ MageTravelVerdict DecideMageTravel(MageTravelFacts const& facts);
 // by CastRefusalRetry's own table, and `tries` asks so far under the bound.
 bool MageTravelCastRetries(std::string const& detail, std::uint32_t tries);
 
+// HAS THE ERRAND BEHIND A RUN GONE? True when the column is empty, holds another
+// aim, or holds an operator's guard, while the traveller has not yet been sent
+// through. Once it has, the rest of the party still has a portal to take.
+bool MageTravelCalledOff(bool travellerClicked, bool aimPresent, bool aimIsGuard,
+                         bool aimIsTheRuns);
+
 // ONE PARTY MEMBER AT THE PORTAL.
 struct MageTravelClicker
 {
