@@ -1937,9 +1937,12 @@ bool DungeonRunEntryReady(std::vector<DungeonRunEntryState> const& members,
             return false;
         if (!member.alive)
             return false;
+        if (member.otherCopy)
+            return false;
         if (member.inCombat)
             return false;
-        if (member.distanceFromDoor < 0.f || member.distanceFromDoor > doorstepYards)
+        if (member.distanceFromDoor < 0.f ||
+            !member.insideDoor.value_or(member.distanceFromDoor <= doorstepYards))
             return false;
     }
     return true;
@@ -1976,8 +1979,10 @@ std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& mem
             why = "in combat";
         else if (member.distanceFromDoor < 0.f)
             why = "wrong map";
-        else if (member.distanceFromDoor > doorstepYards)
-            why = std::to_string(static_cast<int>(member.distanceFromDoor)) + "y from the door";
+        else if (!member.insideDoor.value_or(member.distanceFromDoor <= doorstepYards))
+            why = member.insideDoor.has_value()
+                ? "outside the trigger"
+                : std::to_string(static_cast<int>(member.distanceFromDoor)) + "y from the door";
         else
             why = "at the door, not through";
 
@@ -8698,7 +8703,7 @@ DoorRejoinStep DecideDoorRejoin(DoorRejoinFacts const& f, float knockYards)
         return DoorRejoinStep::None;
     if (f.inCombat || f.yardsFromDoor < 0.f)
         return DoorRejoinStep::Wait;
-    if (f.yardsFromDoor > knockYards)
+    if (!f.insideDoor.value_or(f.yardsFromDoor <= knockYards))
         return DoorRejoinStep::Walk;
     return f.partyBelongsInside ? DoorRejoinStep::Knock : DoorRejoinStep::Wait;
 }

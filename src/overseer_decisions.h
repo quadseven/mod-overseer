@@ -51,6 +51,7 @@
 #include <cstdio>
 #include <ctime>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -2589,6 +2590,10 @@ struct DungeonRunEntryState
     // On the dungeon map but in a different COPY of it than the head (#620).
     // Never `through`: see InAnotherInstanceCopy.
     bool otherCopy{false};
+    // A reachable edge of the actual trigger can be beyond the center's
+    // conservative doorstep radius. The native census measures containment;
+    // an absent reading retains the legacy distance gate for older callers.
+    std::optional<bool> insideDoor;
 };
 
 
@@ -10271,6 +10276,7 @@ struct DoorRejoinFacts
     bool runEscortHoldsIt{false};
     bool partyBelongsInside{false};
     float yardsFromDoor{-1.f};
+    std::optional<bool> insideDoor;
 };
 
 DoorRejoinStep DecideDoorRejoin(DoorRejoinFacts const& facts, float knockYards);
