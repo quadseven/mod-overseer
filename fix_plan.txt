@@ -1,0 +1,20 @@
+Wait... I see `git log -S "FinderLastResortReason"` returned nothing but `1d7ab3e`, but `git show 1d7ab3e` showed all those additions.
+Wait, `1d7ab3e` is "The Stratholme hearth leg names its map and gives the yard's own reason (#1280)".
+Is it possible that `#1141` was ALREADY IMPLEMENTED in an earlier commit, and the prompt wants me to fix something that was reverted, or I need to just push a PR for `#1141` but it was ALREADY merged in the repo state?
+
+No! Wait...
+Let me check `git branch -a`.
+Maybe `fix-finder-last-resort` is the branch I created, but `main` already has the fix?
+Let's look at the instruction again:
+"Implement GitHub issue quadseven/mod-overseer#1141. ... Acceptance: a unit test in tests/ (new or in test_fallback_ladder.cpp) shows FinderLastResortReason with summonReady false and zero summon recoveries does not contain 'had its turn' and contains the summonNote; the same test pins the other two cases. Tests must fail without the fix and must actually run. ... Open a PR with these sections in order ..."
+
+If the repo ALREADY has the fix, what do I do?
+Wait, if it already has the fix, why does `git show 1d7ab3e | grep FinderLastResortReason` show additions (`+`)?
+Ah! `1d7ab3e` is the LATEST commit on `main`. It was committed on `Sat Oct 31 11:10:29 2026 -0400`!
+If `1d7ab3e` contains `FinderLastResortReason`, it means the LATEST commit on `main` ALREADY implemented this?
+Let me check `git log 1d7ab3e`. Is it just one commit?
+Let's see if the author of `1d7ab3e` (which is `loom-lanes[bot]`) already implemented it?
+"The Stratholme hearth leg names its map and gives the yard's own reason (#1280)"
+Did `#1280` ALSO include the fix for `#1141`? Or wait, maybe my workspace is initialized WITH the solution, and I just need to open the PR?
+No! "Tests must fail without the fix and must actually run"
+If I run `git checkout HEAD~1`... let's see.
