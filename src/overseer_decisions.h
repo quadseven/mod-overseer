@@ -3314,6 +3314,21 @@ bool ForgetDcOnRecord(bool inWorld, bool onDungeonMap);
 // A zero `awaySince` (not away) or a clock stepped backwards never ends it.
 bool LeaderAwayEndsRun(time_t awaySince, time_t now, long ceilingSeconds);
 
+// THE ARMING HOLD DOES NOT OUTLAST THE LEADER-AWAY BOUND. CLEARING held its stall
+// clock for "`dc on` not accepted" and returned before it read the leader's map.
+// A leader that died inside and revived on the outdoor map left four members
+// refused 235 times in four hours, with `LeaderAwayEndsRun` never asked, because
+// the dungeon brain will not arm a party whose tank is elsewhere. The bound is
+// asked first: a leader away past it walks the party out through EXIT.
+enum class ClearingArmGate : uint8_t
+{
+    Armed,           // accepted on everyone inside
+    HoldNotArmed,    // not yet, and the leader is here or still inside its bound
+    LeaderAwayEnds,  // not armed, and the leader is not coming back to this run
+};
+ClearingArmGate DecideClearingArmGate(bool acceptedOnEveryoneInside, time_t leaderAwaySince,
+                                      time_t now, long ceilingSeconds);
+
 // Does the CLEARING stall clock run this poll (#618)? Only while the brain can
 // actually be driven: `dc on` accepted for everyone inside, the leader
 // visible on the dungeon map, and a groupmate able to issue `dc skip`.
@@ -5086,6 +5101,54 @@ StagingNudge StagingWatchdog(StagingStallState& state, ApproachGap const& gap,
                              bool measurable, time_t now,
                              RatchetLimits const& limits,
                              ApproachLimits const& approach);
+
+// ------------------------ a leader giving the approach back (#1153) --
+//
+// THE WATCHDOG CLOSES A RUN FOR A LEADER ABOVE THE POINT AND NOTHING ELSE. One
+// beside it and walking away was left to the twelve-minute backstop: measured
+// on #396, 224 yards down to 26 and then 38, 154, 335, 423, 674 with the run
+// still open, and nothing steering him. So a leg remembers where it started
+// and how near it got, and closes while he is still nearer than he started.
+//
+// IT IS NOT THE LADDER'S MEMORY AND IT DOES NOT SHARE ITS LIFETIME. A re-armed
+// errand restarts the ladder, correctly, but that drift is a leader whose
+// errand keeps ending, so a measurement that restarted with it would never see
+// him leave. This one restarts with the leg and survives a re-arm.
+//
+// A STRAIGHT LINE CANNOT SEE A WAY ROUND. A surveyed route that first walks
+// away from the door is the walk asked for, so going forward on one moves the
+// mark instead of counting against it, as does any poll that was not about
+// walking at all (combat, flight, death, a town stop).
+//
+// A LEADER WITH NO HEADWAY HAS NO NEARER PLACE TO FAIL AT, so he is given
+// `wanderYards` past his start and closed there. That is the one case that
+// ends further out than it started, and it is bounded.
+struct StagingRetreatLimits
+{
+    // Less headway than this is not yet a place to retreat from. Half of it
+    // must still clear the jitter floor, or a wobble would close a run.
+    float headwayYards{0.f};
+    float wanderYards{0.f};  // how far past his start a leader with none may go
+};
+
+struct StagingRetreatState
+{
+    float startYards{-1.f};  // below zero: no reading on this leg yet
+    float bestYards{-1.f};
+    bool rebase{false};      // the next reading is a new mark, not a verdict
+};
+
+struct StagingRetreatReading
+{
+    bool measurable{false};  // false: this poll says nothing about walking
+    float yards{-1.f};       // ApproachDistance to the leg's end
+    bool walkedOnRoute{false};  // RouteMarkAdvanced's answer for this poll
+};
+
+// True on the poll the leader has given back half his headway, or wandered out
+// past `wanderYards` with none, and the run must close.
+bool StagingRetreated(StagingRetreatState& state, StagingRetreatReading const& reading,
+                      StagingRetreatLimits const& limits);
 
 // ------------ whether the staging walk is still the run's to measure (#367) --
 //
@@ -22125,6 +22188,14 @@ EvacuationStart DungeonEvacuationStart(bool coordinatorKnowsItsDoor, bool inside
 // row, and only from another map (a teleport inside the instance is not a
 // crossing). A ghost is never refused: its corpse may be inside.
 bool DungeonDoorShut(bool familyBagHeld, bool enteringDungeonMap, bool alive, bool steered);
+
+// A FAMILY ALREADY INSIDE IS NOT HELD AT THE DOOR. A run with a member inside
+// makes room rather than leaving (DungeonRunBagAnswer), so no town trip follows
+// and a shut door only strands whoever is outside. On the dev realm one member
+// stood at the entrance for over two hours with four inside, and the run closed
+// `split_failed` every 15 minutes. Nobody inside, or a run walking out, stays
+// held: that is the family #631 keeps from walking back in.
+bool FamilyDoorHeldForBags(bool noBagRoom, bool runHasMembersInside);
 
 // THE CLASSIC RULESET. The operator restricts these worlds to a classic
 // level-60 feel: characters stop at level 60, professions stop at skill 300,

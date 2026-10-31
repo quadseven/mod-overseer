@@ -2487,6 +2487,16 @@ bool LeaderAwayEndsRun(time_t awaySince, time_t now, long ceilingSeconds)
     return awaySince && now > awaySince && now - awaySince > ceilingSeconds;
 }
 
+ClearingArmGate DecideClearingArmGate(bool acceptedOnEveryoneInside, time_t leaderAwaySince,
+                                      time_t now, long ceilingSeconds)
+{
+    if (acceptedOnEveryoneInside)
+        return ClearingArmGate::Armed;
+    return LeaderAwayEndsRun(leaderAwaySince, now, ceilingSeconds)
+               ? ClearingArmGate::LeaderAwayEnds
+               : ClearingArmGate::HoldNotArmed;
+}
+
 bool ForgetDcOnRecord(bool inWorld, bool onDungeonMap)
 {
     return !inWorld || !onDungeonMap;
@@ -4064,6 +4074,38 @@ StagingNudge StagingWatchdog(StagingStallState& state, ApproachGap const& gap,
     if (rung == 1)
         return StagingNudge::Reaim;
     return StagingNudge::ClearMovement;
+}
+
+bool StagingRetreated(StagingRetreatState& state, StagingRetreatReading const& reading,
+                      StagingRetreatLimits const& limits)
+{
+    if (!reading.measurable)
+    {
+        state.rebase = true;
+        return false;
+    }
+    if (reading.yards < 0.f)
+        return false;
+    if (state.startYards < 0.f)
+    {
+        state.startYards = reading.yards;
+        state.bestYards = reading.yards;
+        state.rebase = false;
+        return false;
+    }
+    if (state.rebase || reading.walkedOnRoute)
+    {
+        state.rebase = false;
+        state.startYards = std::max(state.startYards, reading.yards);
+        state.bestYards = reading.yards;
+        return false;
+    }
+    state.bestYards = std::min(state.bestYards, reading.yards);
+    float const headway = state.startYards - state.bestYards;
+    float const limit = headway >= limits.headwayYards
+                            ? state.bestYards + headway / 2.f
+                            : state.startYards + limits.wanderYards;
+    return reading.yards > limit;
 }
 
 StagingAim StagingAimStep(bool legChanged, bool runStillOwns)
@@ -19566,6 +19608,11 @@ EvacuationStart DungeonEvacuationStart(bool coordinatorKnowsItsDoor, bool inside
 bool DungeonDoorShut(bool familyBagHeld, bool enteringDungeonMap, bool alive, bool steered)
 {
     return familyBagHeld && enteringDungeonMap && alive && steered;
+}
+
+bool FamilyDoorHeldForBags(bool noBagRoom, bool runHasMembersInside)
+{
+    return noBagRoom && !runHasMembersInside;
 }
 
 namespace Classic
