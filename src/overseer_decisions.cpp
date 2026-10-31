@@ -16950,7 +16950,7 @@ bool ShoreProbeAt(unsigned index, ShoreSearchLimits const& limits,
     return true;
 }
 
-SelfDeathReading ReadSelfDeath(SelfDeathReadingFacts const& facts,
+SelfDeathReading ReadSelfDeath(SelfDeathReadingFacts facts,
                                SelfDeathReadingLimits const& limits)
 {
     // NEVER SAMPLED IS ITS OWN ANSWER. The column's -1 means the guard did not

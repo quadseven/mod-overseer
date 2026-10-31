@@ -12445,7 +12445,7 @@ struct SelfDeathReadingLimits
     int32_t freshSeconds{0};
 };
 
-SelfDeathReading ReadSelfDeath(SelfDeathReadingFacts const& facts,
+SelfDeathReading ReadSelfDeath(SelfDeathReadingFacts facts,
                                SelfDeathReadingLimits const& limits);
 
 // The reading as the clause that goes on the end of the summary line. A
