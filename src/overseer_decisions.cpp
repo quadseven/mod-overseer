@@ -4066,6 +4066,38 @@ StagingNudge StagingWatchdog(StagingStallState& state, ApproachGap const& gap,
     return StagingNudge::ClearMovement;
 }
 
+bool StagingRetreated(StagingRetreatState& state, StagingRetreatReading const& reading,
+                      StagingRetreatLimits const& limits)
+{
+    if (!reading.measurable)
+    {
+        state.rebase = true;
+        return false;
+    }
+    if (reading.yards < 0.f)
+        return false;
+    if (state.startYards < 0.f)
+    {
+        state.startYards = reading.yards;
+        state.bestYards = reading.yards;
+        state.rebase = false;
+        return false;
+    }
+    if (state.rebase || reading.walkedOnRoute)
+    {
+        state.rebase = false;
+        state.startYards = std::max(state.startYards, reading.yards);
+        state.bestYards = reading.yards;
+        return false;
+    }
+    state.bestYards = std::min(state.bestYards, reading.yards);
+    float const headway = state.startYards - state.bestYards;
+    float const limit = headway >= limits.headwayYards
+                            ? state.bestYards + headway / 2.f
+                            : state.startYards + limits.wanderYards;
+    return reading.yards > limit;
+}
+
 StagingAim StagingAimStep(bool legChanged, bool runStillOwns)
 {
     // THE LEG FIRST, FOR THE REASON THE HEADER GIVES: both can be true on one

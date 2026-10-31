@@ -5087,6 +5087,54 @@ StagingNudge StagingWatchdog(StagingStallState& state, ApproachGap const& gap,
                              RatchetLimits const& limits,
                              ApproachLimits const& approach);
 
+// ------------------------ a leader giving the approach back (#1153) --
+//
+// THE WATCHDOG CLOSES A RUN FOR A LEADER ABOVE THE POINT AND NOTHING ELSE. One
+// beside it and walking away was left to the twelve-minute backstop: measured
+// on #396, 224 yards down to 26 and then 38, 154, 335, 423, 674 with the run
+// still open, and nothing steering him. So a leg remembers where it started
+// and how near it got, and closes while he is still nearer than he started.
+//
+// IT IS NOT THE LADDER'S MEMORY AND IT DOES NOT SHARE ITS LIFETIME. A re-armed
+// errand restarts the ladder, correctly, but that drift is a leader whose
+// errand keeps ending, so a measurement that restarted with it would never see
+// him leave. This one restarts with the leg and survives a re-arm.
+//
+// A STRAIGHT LINE CANNOT SEE A WAY ROUND. A surveyed route that first walks
+// away from the door is the walk asked for, so going forward on one moves the
+// mark instead of counting against it, as does any poll that was not about
+// walking at all (combat, flight, death, a town stop).
+//
+// A LEADER WITH NO HEADWAY HAS NO NEARER PLACE TO FAIL AT, so he is given
+// `wanderYards` past his start and closed there. That is the one case that
+// ends further out than it started, and it is bounded.
+struct StagingRetreatLimits
+{
+    // Less headway than this is not yet a place to retreat from. Half of it
+    // must still clear the jitter floor, or a wobble would close a run.
+    float headwayYards{0.f};
+    float wanderYards{0.f};  // how far past his start a leader with none may go
+};
+
+struct StagingRetreatState
+{
+    float startYards{-1.f};  // below zero: no reading on this leg yet
+    float bestYards{-1.f};
+    bool rebase{false};      // the next reading is a new mark, not a verdict
+};
+
+struct StagingRetreatReading
+{
+    bool measurable{false};  // false: this poll says nothing about walking
+    float yards{-1.f};       // ApproachDistance to the leg's end
+    bool walkedOnRoute{false};  // RouteMarkAdvanced's answer for this poll
+};
+
+// True on the poll the leader has given back half his headway, or wandered out
+// past `wanderYards` with none, and the run must close.
+bool StagingRetreated(StagingRetreatState& state, StagingRetreatReading const& reading,
+                      StagingRetreatLimits const& limits);
+
 // ------------ whether the staging walk is still the run's to measure (#367) --
 //
 // THE WATCHDOG ABOVE ANSWERS "IS THIS CHARACTER GETTING NEARER". IT CANNOT
