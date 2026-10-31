@@ -138,7 +138,9 @@ char const *purchase(Player *buyer, Request request, ItemTemplate const *proto,
   auto describe = [](char const *, char const *) {};
   ev.moneyBefore = buyer->money;
   ev.itemsWanted = request.count;
-  // PURCHASE_BODY
+  // The Python runner injects the production DoBuy tail here before compiling.
+  // A raw template build must fail rather than call an unfilled function.
+#error "Run tests/replay_buy_bag.py to inject the production purchase body"
 }
 int main() {
   int failures = 0;

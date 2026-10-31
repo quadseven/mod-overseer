@@ -8,6 +8,9 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+INJECTION_MARKER = (
+    '#error "Run tests/replay_buy_bag.py to inject the production purchase body"'
+)
 
 
 class BuyBagReplayTest(unittest.TestCase):
@@ -24,12 +27,15 @@ class BuyBagReplayTest(unittest.TestCase):
         start = source.index("        if (request.capped && price", brace)
         body = source[start : end - 1]
         harness = (ROOT / "tests/fixtures/buy_bag/replay.cpp").read_text()
+        self.assertEqual(
+            1, harness.count(INJECTION_MARKER), "one injection marker required"
+        )
         compiler = shutil.which(os.environ.get("CXX", "c++"))
         self.assertIsNotNone(compiler, "C++17 compiler required")
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)
             cpp, binary = folder / "replay.cpp", folder / "replay"
-            cpp.write_text(harness.replace("// PURCHASE_BODY", body))
+            cpp.write_text(harness.replace(INJECTION_MARKER, body))
             built = subprocess.run(  # noqa: S603 - fixed repository fixture
                 [compiler, "-std=c++17", str(cpp), "-o", str(binary)],
                 capture_output=True,
