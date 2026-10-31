@@ -37580,6 +37580,28 @@ private:
         return inYard;
     }
 
+    void RecoverStratholmeYardInIdle(std::string const& family,
+                                     std::vector<std::string> const& members)
+    {
+        if (_stratholmeYards.find(family) != _stratholmeYards.end())
+            return;
+        std::vector<Player*> const inYard = MembersInStratholmeYard(members);
+        if (inYard.empty())
+            return;
+        DungeonPortal const* portal = nullptr;
+        for (DungeonPortal const& candidate : DungeonPortals())
+            if (candidate.exitTriggerId == OverseerDecisions::STRATHOLME_YARD_EXIT_TRIGGER)
+            {
+                portal = &candidate;
+                break;
+            }
+        if (!portal)
+            return;
+        DungeonRunCoordinatorState run;
+        run.portalKeyword = portal->keyword;
+        OpenStratholmeYard(family, *portal, run);
+    }
+
     // The members whose own hearthstone takes them out of the yard, and those
     // already casting one.
     std::vector<std::string> StratholmeHearthers(std::vector<Player*> const& inYard) const
@@ -54159,6 +54181,9 @@ private:
 
         if (coord.phase == DungeonRunPhase::Idle)
         {
+            RecoverStratholmeYardInIdle(family, members);
+            if (DriveStratholmeYard(family, leaderName, members))
+                return;
             // job != 'dungeon' is the ordinary case - most polls, this drive
             // has nothing to do, same as every other job-gated drive in this
             // file when the roster is questing.
