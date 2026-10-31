@@ -10,10 +10,13 @@ the age derived from it, because the clock moves between two reads.
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 DATABASE_SQL = (
@@ -51,6 +54,24 @@ FROM (
 WHERE rn <= 8
 ORDER BY target_name, target_arg, command, status, updated_at, result;
 """
+BRIDGE_SOURCE = (
+    "https://raw.githubusercontent.com/quadseven/wow-overseer/main/bridge.py"
+)
+# What the copy above and the retention both rest on, in the bridge's words.
+BRIDGE_FRAGMENTS = (
+    "ROW_NUMBER() OVER ( PARTITION BY target_name, target_arg, command, status, "
+    "CASE WHEN JSON_VALID(result) "
+    "THEN JSON_UNQUOTE(JSON_EXTRACT(result, '$.reason')) END "
+    "ORDER BY updated_at DESC) AS rn",
+    "WHERE kind = 'share' AND status IN ('delivered', 'error') "
+    "AND updated_at > NOW() - INTERVAL %s DAY",
+    "WHERE rn <= %s",
+)
+BRIDGE_DEFAULTS = {
+    "SHARE_REFUSAL_MEMORY_DAYS": "90",
+    "SHARE_RETRY_MINUTES": "60",  # with the cap below, history_depth() is 8
+    "SHARE_BACKOFF_CAP_HOURS": "168",
+}
 REFUSED = '{"reason":"quest log full"}'
 OTHER = '{"reason":"not grouped"}'
 
@@ -58,11 +79,34 @@ OTHER = '{"reason":"not grouped"}'
 def row(name, age_hours, status="error", result=REFUSED, kind="share", arg="Taker"):
     text = "NULL" if result is None else "'%s'" % result
     return (
-        "INSERT INTO overseer_command "
+        "INSERT INTO overseer_command "  # noqa: S608 - fixed test literals, no outside input
         "(target_name, command, kind, target_arg, status, result, updated_at) "
         "VALUES ('%s', 'share 100', '%s', '%s', '%s', %s, "
         "NOW() - INTERVAL %d HOUR);\n" % (name, kind, arg, status, text, age_hours)
     )
+
+
+class BridgeReadDriftTest(unittest.TestCase):
+    """A change to the bridge's read fails here, so the copy cannot wander.
+    Only an unreachable source skips: that says nothing about the read."""
+
+    def test_the_copy_still_matches_the_bridge(self):
+        try:
+            with urllib.request.urlopen(BRIDGE_SOURCE, timeout=30) as reply:  # noqa: S310 - fixed https url
+                source = reply.read().decode()
+        except urllib.error.URLError as error:
+            self.skipTest("the bridge source is unreachable: %s" % error)
+        start = source.index("def _answered_share_rows")
+        body = source[start : source.index("def _insert_share", start)]
+        body = body[body.index("readtimeout.timed_execute") :]
+        code = "\n".join(line.split("  #")[0] for line in body.splitlines())
+        text = " ".join("".join(re.findall(r'"([^"]*)"', code)).split())
+        for fragment in BRIDGE_FRAGMENTS:
+            self.assertIn(fragment, text)
+        for name, value in BRIDGE_DEFAULTS.items():
+            self.assertRegex(
+                source, r'%s = int\(os\.environ\.get\("%s", "%s"\)\)' % (name, name, value)
+            )
 
 
 class ShareRetentionReplayTest(unittest.TestCase):
@@ -174,7 +218,7 @@ class ShareRetentionReplayTest(unittest.TestCase):
             for n in range(1, 5021)
         )
         self.mysql(
-            "INSERT INTO overseer_command "
+            "INSERT INTO overseer_command "  # noqa: S608 - fixed test literals, no outside input
             "(target_name, command, kind, target_arg, status, result, updated_at) "
             "VALUES %s;" % values
         )
