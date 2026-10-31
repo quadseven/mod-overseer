@@ -27860,9 +27860,6 @@ struct StratholmeExitFacts
 
 StratholmeExitWay DecideStratholmeExit(StratholmeExitFacts const& facts);
 
-// Only a living leader in the yard may own its walk or button aim.
-bool StratholmeYardMemberMayWalk(bool leaderInYard, bool leaderAlive, bool memberIsLeader);
-
 char const* StratholmeExitWayWord(StratholmeExitWay way);
 
 // The run's exit trigger whose landing is the yard, and the two gameobjects in
