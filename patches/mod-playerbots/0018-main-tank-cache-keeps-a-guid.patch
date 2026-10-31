@@ -1,0 +1,70 @@
+Subject: [PATCH] cache the main tank by GUID and resolve it at use
+
+WHY THIS PATCH EXISTS
+
+The main-tank value keeps a Unit pointer for two seconds. A member can leave,
+change instance or reconnect during that interval. Its cached address is not
+an identity and can outlive the player's GUID storage. The worldserver crashed
+with SIGSEGV in Object::GetGuidValue, called by ThreatManager::GetThreat from
+LowTankThreatTrigger::IsActive. The exact binary's caller offset identifies the
+second GetThreat call, the main-tank lookup.
+
+Keep the existing tank selector, refresh interval and performance measurement,
+but cache the selected GUID. Resolve it through PlayerbotAI::GetUnit on every
+Get. The pinned core's ObjectAccessor player lookup requires an in-world player
+on the caller's actual Map, including its instance. A departed tank returns no
+unit, a reconnected tank resolves its new object, and all existing main-tank
+consumers receive the same lifetime-safe lookup.
+
+WHAT WOULD LET THIS PATCH BE DELETED
+
+Upstream main-tank caching stores identity and resolves a live local-map unit
+rather than retaining a member pointer between reads.
+
+APPLIES TO
+
+quadseven/mod-playerbots @ 40884e9c135c1daf27ffd894a6047502a5701130,
+on top of local patches 0001-0035. Touches only PartyMemberMainTankValue.
+The native fixture replay executes the old and patched value path with the
+actual low-threat trigger, threat lookup and PlayerbotAI unit resolver bodies.
+
+diff --git a/src/Ai/Base/Value/PartyMemberValue.cpp b/src/Ai/Base/Value/PartyMemberValue.cpp
+index 1396f7f3..5c8c6973 100644
+--- a/src/Ai/Base/Value/PartyMemberValue.cpp
++++ b/src/Ai/Base/Value/PartyMemberValue.cpp
+@@ -170,3 +170,20 @@ Unit* PartyMemberMainTankValue::Calculate()
+     FindMainTankPlayer findMainTankPlayer;
+     return FindPartyMember(findMainTankPlayer);
+ }
++
++// Keep identity across cache reads, never a member pointer that can leave the map.
++Unit* PartyMemberMainTankValue::Get()
++{
++    uint32 const now = getMSTime();
++    if (!lastCheckTime || now - lastCheckTime >= checkInterval)
++    {
++        lastCheckTime = now;
++        PerfMonitorOperation* pmo = sPerfMonitor.start(
++            PERF_MON_VALUE, this->getName(), this->context ? &this->context->performanceStack : nullptr);
++        Unit* tank = Calculate();
++        tankGuid = tank ? tank->GetGUID() : ObjectGuid::Empty;
++        if (pmo)
++            pmo->finish();
++    }
++    return botAI->GetUnit(tankGuid);
++}
+diff --git a/src/Ai/Base/Value/PartyMemberValue.h b/src/Ai/Base/Value/PartyMemberValue.h
+index bdde26d0..2eb1b2ad 100644
+--- a/src/Ai/Base/Value/PartyMemberValue.h
++++ b/src/Ai/Base/Value/PartyMemberValue.h
+@@ -46,6 +46,10 @@ class PartyMemberMainTankValue : public PartyMemberValue
+ public:
+     PartyMemberMainTankValue(PlayerbotAI* botAI) : PartyMemberValue(botAI, "main tank member", 2 * IN_MILLISECONDS) {}
+     virtual Unit* Calculate();
++    Unit* Get() override;
++
++private:
++    ObjectGuid tankGuid;
+ };
+ 
+ #endif
