@@ -16,6 +16,7 @@ using OverseerDecisions::DecideStratholmeExit;
 using OverseerDecisions::InStratholmeExitYard;
 using OverseerDecisions::StratholmeButtonInReach;
 using OverseerDecisions::StratholmeHearthLeavesTheYard;
+using OverseerDecisions::ShouldOpenStratholmeYardEpisode;
 using OverseerDecisions::StratholmeExitFacts;
 using OverseerDecisions::StratholmeExitWay;
 using OverseerDecisions::StratholmeExitWayWord;
@@ -150,6 +151,18 @@ int main()
                   false);
     }
 
+    // A member observed inside the exit yard on an IDLE poll gets one episode.
+    {
+        bool const memberInYard = InStratholmeExitYard(0, 3235.46f, -4050.6f);
+        CheckBool("IDLE opens an episode for a member already in the yard",
+                  ShouldOpenStratholmeYardEpisode(memberInYard, false), true);
+        CheckBool("IDLE keeps the existing yard episode",
+                  ShouldOpenStratholmeYardEpisode(memberInYard, true), false);
+        bool const memberOutsideYard = InStratholmeExitYard(0, 3165.48f, -4039.1f);
+        CheckBool("IDLE does not open an episode outside the yard",
+                  ShouldOpenStratholmeYardEpisode(memberOutsideYard, false), false);
+    }
+
     // a hearth counts only when the stone is ready and the bind is not the yard
     {
         CheckBool("ready stone bound in a town leaves",
@@ -188,17 +201,18 @@ int main()
         std::size_t const recoveryEnd = source.find("// ----", recoveryStart);
         std::string const recoverySource = recoveryStart == std::string::npos || recoveryEnd == std::string::npos
             ? std::string() : source.substr(recoveryStart, recoveryEnd - recoveryStart);
-        CheckBool("IDLE recovery opens an episode for a member in the yard",
-                  recoverySource.find("MembersInStratholmeYard(members)") != std::string::npos &&
-                      recoverySource.find("OpenStratholmeYard(family, *portal, run)") != std::string::npos,
+        CheckBool("IDLE recovery uses the tested episode decision",
+                  recoverySource.find("ShouldOpenStratholmeYardEpisode(!inYard.empty(), episodeOpen)") !=
+                      std::string::npos &&
+                      recoverySource.find("OpenStratholmeYard(family, *portal, run)") !=
+                          std::string::npos,
                   true);
-        CheckBool("IDLE recovery does not open a second episode",
-                  recoverySource.find("_stratholmeYards.find(family)") != std::string::npos &&
-                      recoverySource.find("_stratholmeYards.end()") != std::string::npos,
-                  true);
-        CheckBool("IDLE recovery requires an observed member in the yard",
-                  recoverySource.find("inYard.empty()") != std::string::npos &&
-                      recoverySource.find("STRATHOLME_YARD_EXIT_TRIGGER") != std::string::npos,
+        std::size_t const idleStart = source.find("if (coord.phase == DungeonRunPhase::Idle)");
+        std::size_t const recoveryCall = source.find("RecoverStratholmeYardInIdle(family, members)", idleStart);
+        std::size_t const idleDrive = source.find("DriveStratholmeYard(family, leaderName, members)", idleStart);
+        CheckBool("IDLE poll recovers the episode before driving it",
+                  idleStart != std::string::npos && recoveryCall != std::string::npos &&
+                      idleDrive != std::string::npos && recoveryCall < idleDrive,
                   true);
         std::size_t const yardStart = source.find("void OpenStratholmeYard(");
         std::size_t const yardEnd = source.find("static std::vector<Player*> MembersInStratholmeYard", yardStart);

@@ -25319,6 +25319,11 @@ bool InStratholmeExitYard(std::uint32_t mapId, float x, float y)
            y >= STRATHOLME_YARD_SOUTH_Y && y <= STRATHOLME_YARD_NORTH_Y;
 }
 
+bool ShouldOpenStratholmeYardEpisode(bool memberInYard, bool episodeOpen)
+{
+    return memberInYard && !episodeOpen;
+}
+
 bool StratholmeButtonInReach(bool spawned, unsigned presses, std::uint32_t secondsWalking)
 {
     return spawned && presses < STRATHOLME_BUTTON_PRESSES &&

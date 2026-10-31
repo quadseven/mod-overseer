@@ -37594,10 +37594,9 @@ private:
     void RecoverStratholmeYardInIdle(std::string const& family,
                                      std::vector<std::string> const& members)
     {
-        if (_stratholmeYards.find(family) != _stratholmeYards.end())
-            return;
+        bool const episodeOpen = _stratholmeYards.find(family) != _stratholmeYards.end();
         std::vector<Player*> const inYard = MembersInStratholmeYard(members);
-        if (inYard.empty())
+        if (!OverseerDecisions::ShouldOpenStratholmeYardEpisode(!inYard.empty(), episodeOpen))
             return;
         DungeonPortal const* portal = nullptr;
         for (DungeonPortal const& candidate : DungeonPortals())

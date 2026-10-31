@@ -27868,6 +27868,9 @@ constexpr std::uint32_t STRATHOLME_YARD_EPISODE_SECONDS = 15 * 60;
 // Whether a point on `mapId` stands in the exit yard.
 bool InStratholmeExitYard(std::uint32_t mapId, float x, float y);
 
+// Whether an IDLE poll should open the missing yard episode for a member.
+bool ShouldOpenStratholmeYardEpisode(bool memberInYard, bool episodeOpen);
+
 // Whether the button is still worth walking to: it is spawned, it has not
 // been pressed STRATHOLME_BUTTON_PRESSES times already, and the walk to it has
 // not run past STRATHOLME_BUTTON_WALK_SECONDS.
