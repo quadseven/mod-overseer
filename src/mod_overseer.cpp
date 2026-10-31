@@ -56812,6 +56812,10 @@ private:
 
                 if (LeaderClientGateHolds(coord, leaderName, leaderClientGate, "CLEARING"))
                     return;
+                // AI-REVIEW 2026-10-31 [codex/in-process/pre-ship] R1 (PR #1286):
+                // a rejoin wait must not age the clearing watchdog into an immediate skip.
+                HoldClearingClock(coord, OverseerDecisions::ClearingClock::HeldNotArmed,
+                                  portal->insideMapId);
                 coord.phase = DungeonRunPhase::Clearing;
                 coord.awaitingSince = std::time(nullptr);
                 coord.anchorSet = false;

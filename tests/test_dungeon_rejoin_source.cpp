@@ -160,6 +160,12 @@ int CheckClearingSplit(std::string const& text)
         transition.find("coord = DungeonRunCoordinatorState") != std::string::npos)
         return Fail("reassembly must reach the existing walk and ceiling in the same poll "
                     "while preserving the current run and its boss progress");
+    std::size_t const resume = text.find("coord.phase = DungeonRunPhase::Clearing;", staged);
+    std::size_t const refresh = text.find(
+        "HoldClearingClock(coord, OverseerDecisions::ClearingClock::HeldNotArmed,", staged);
+    if (resume == std::string::npos || refresh == std::string::npos || refresh > resume)
+        return Fail("resuming clearing must refresh both watchdog clocks so the assembly "
+                    "wait cannot spend a skip immediately after a successful rejoin");
     return EXIT_SUCCESS;
 }
 }  // namespace
