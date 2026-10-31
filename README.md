@@ -1,98 +1,65 @@
 # mod-overseer
 
-An AzerothCore module that gives [mod-playerbots](https://github.com/mod-playerbots/mod-playerbots)
-a control plane: a `overseer_command`/`overseer_roster` database bridge that
-lets an external system (Discord, a web dashboard, whatever) drive named bot
-characters — quest aiming, travel, professions, materials, party leadership,
-job scheduling, POV streaming support, death recording, and more — without
-touching the mod-playerbots source itself.
+An AzerothCore module that gives mod-playerbots characters a control plane.
 
-## Where this came from
+It lets an outside system (a chat bot, a web dashboard, a script) drive named
+bot characters through rows in the `characters` database, without touching the
+[mod-playerbots](https://github.com/mod-playerbots/mod-playerbots) source. It
+is for operators of an AzerothCore server with mod-playerbots who want bots
+that can be told what to do and that report what they did.
 
-Extracted 2026-08-27 from its original deployment tree, with full commit
-history preserved via `git subtree split`, so it can be built and versioned the
-same way the other AzerothCore modules already are — a standalone repo, pinned
-by commit SHA, cloned into `modules/` at build time. It was always structured
-this way internally; this just makes the structure match the pin.
+## What it does
 
-## Layout
+1. An outside system writes a row to `overseer_command` naming a character and
+   a command: quest aiming, travel, professions, materials, party leadership,
+   job scheduling, dungeon and raid runs, and more.
+2. The worldserver picks the row up, carries the command out through the bot,
+   and marks the row `delivered` or `error` with a detail line.
+3. The module writes back what the world looks like: presence snapshots
+   (`overseer_snapshot`), deaths, events, dungeon run records and loot
+   decisions, in `overseer_*` tables an outside page can read.
 
-Dungeon finder returns can place members on their original continents. An exit
-and reset evacuation finish when every visible member has left the source
-dungeon map. Entry still requires the destination dungeon and the leader's copy.
+## Quick start
 
-- `include.sh` — the module's entry point; AzerothCore's build globs `modules/*/`
-  and uses this to discover a module, the same as every other module here.
-- `src/mod_overseer.cpp` — the whole module. One file, deliberately — see the
-  file's own top-of-file comments for why.
-- `data/sql/characters/base/` — dated migrations against the `characters`
-  database, applied in filename order at container startup. Each migration is
-  guarded: a schema older than a given column degrades rather than crashing,
-  so a build can run against a database that hasn't caught up yet.
-- `conf/mod_overseer.conf.dist` — the module's configuration, and the example
-  config file. See below; there is very little of it on purpose.
+There is no standalone build: the module compiles inside an AzerothCore
+worldserver, next to mod-playerbots. From a core checkout at the pinned SHA in
+`realm-pins.env`, with mod-playerbots already in `modules/`:
 
-## Configuring it
+```sh
+git clone https://github.com/quadseven/mod-overseer.git modules/mod-overseer
+git -C modules/mod-overseer checkout <commit-sha>
+bash modules/mod-overseer/apply-patches.sh "$PWD"
+```
 
-Almost nothing here is configurable, and that is deliberate: most of what this
-module decides it works out from the database at the moment it is asked, and a
-setting duplicating something the database already knows would be a second
-answer that could disagree with the first.
+Then configure and build AzerothCore as usual. Pin the module by commit SHA,
+not a branch: `main` moves. A compile is not proof it works, so check a world
+actually runs on a new pin before trusting it.
 
-What IS configuration is the handful of values that are a **decision somebody
-made about one deployment** rather than a measurement — today, two groups of
-them:
+## How it works
 
-- the guild **recruit policy**: how big the guild is recruiting toward, and the
-  two ends of the level range it will ask inside;
-- the guild **raid shape**: how many of a forty-man raid's seats tank and how
-  many heal, plus one safety catch on the irreversible half of `guild raid
-  form`.
+```mermaid
+flowchart LR
+  ext[Outside system] -->|overseer_command rows| db[(characters DB)]
+  db -->|pending commands| mod[mod-overseer in worldserver]
+  mod -->|drives| bots[mod-playerbots characters]
+  mod -->|snapshots, events, runs| db
+  db --> ext
+  dec[overseer_decisions] --> mod
+```
 
-Nothing in a character database knows any of those. Everything else about a
-raid layout (which class takes which seat, who is picked first, which of groups
-1 through 8 anybody ends up in) is derived from those two numbers and the
-guild's own roster, so it is a rule rather than a setting.
+| Part | What it owns |
+|---|---|
+| `include.sh` | The entry point. The core's build globs `modules/*/` and finds the module through it. |
+| `src/mod_overseer.cpp` | The module: the scripts hooked into the worldserver, the command poll, and the writes back. |
+| `src/overseer_decisions.{h,cpp}` | The pure decisions. They include only the C++ standard library, so tests compile them with no core behind them. |
+| `src/overseer_core_compat.h` | The seam between the module and core or playerbots APIs that move between pins. |
+| `data/sql/characters/base/` | Dated migrations against `characters`, applied in filename order by the core's `dbimport`. Each is guarded, so an older schema degrades rather than crashing. |
+| `patches/`, `apply-patches.sh` | Small patches to the pinned core and mod-playerbots, applied at build time with zero fuzz. `patches/README.md` explains the mechanics. |
+| `realm-pins.env` | The one copy of the pinned core, mod-playerbots and module SHAs that CI builds against. |
 
-Every key is optional and has a compiled default, so a worldserver that has
-never seen `conf/mod_overseer.conf.dist` behaves exactly as one that copied it
-unedited. Copy it to `mod_overseer.conf` in your worldserver's module config
-directory and uncomment a line only to disagree with a default.
-
-One setting the module reads belongs to mod-playerbots, not to this file:
-`AiPlayerbot.LootRollDisenchant` (`Playerbots.LootRollDisenchant` after the
-playerbots config rename). Set it to 1 in the playerbots config and a weapon or
-armour drop the loot council gives nobody is disenchanted by the family's
-Enchanter, while everybody else passes so the materials land in that
-character's bags. Left at its default of 0, everybody greeds such a drop as
-before.
-
-**The core does not fall back to a `.conf.dist`.** If the copy is not made, the
-worldserver logs a missing-file line at startup and the module runs on its
-compiled defaults — harmless in effect, but none of the settings are then
-visible or tunable without a rebuild.
-
-## Building it
-
-This module has no build of its own — it compiles as part of an AzerothCore
-worldserver, alongside mod-playerbots and whatever other modules are present.
-See the consuming repo's build workflow for the actual pipeline; the short
-version is: clone this repo to a pinned SHA into `modules/mod-overseer`, then
-build AzerothCore normally.
-
-## Consuming it (the pin)
-
-Pin by commit SHA, not a branch — `main` moves. Whoever consumes this should
-verify the module actually built after bumping the pin (a compile is not a
-proof it works) before trusting it in whatever the module ends up steering.
-
-## A real build dependency, not just source
-
-This module compiles against small patches to the pinned core and
-`mod-playerbots` that live under `patches/` here. `apply-patches.sh` applies
-them at build time. `patches/README.md` explains the mechanics. In particular,
-`azerothcore-wotlk/0001-send-cast-result-hook.patch` supplies the cast failure
-hook consumed by this module. Query recent failures with:
+Patches are a real build dependency, not just source. For example,
+`azerothcore-wotlk/0001-send-cast-result-hook.patch` supplies the cast
+failure hook the module records. Query recent failures with:
 
 ```sql
 SELECT character_name, subject_id, subject_name, detail, occurrences
@@ -101,22 +68,122 @@ WHERE kind = 'cast_fail' AND detail = 'SPELL_FAILED_EQUIPPED_ITEM_CLASS'
 ORDER BY last_seen DESC LIMIT 50;
 ```
 
-For `mod-playerbots`, `0005-wander-npc-can-be-aimed.patch` is the patch this module's own source
-actually calls into (`NewRpgInfo::WanderNpc::npcEntry`,
-`ChangeToWanderNpc(entry, pos)`) — upstream mod-playerbots has neither. If you
-bump the pinned `mod-playerbots` SHA and a patch stops applying, that is
-usually good news: upstream likely merged the same fix. Delete the patch, or
-rebase it — see `patches/README.md`.
+For mod-playerbots, `0005-wander-npc-can-be-aimed.patch` is the patch the
+module's own source calls into (`NewRpgInfo::WanderNpc::npcEntry`,
+`ChangeToWanderNpc(entry, pos)`); upstream mod-playerbots has neither. If a
+pin bump makes a patch stop applying, upstream has often merged the same fix:
+delete the patch, or rebase it (see `patches/README.md`).
+
+Dungeon finder returns can place members on their original continents. An
+exit and reset evacuation finish when every visible member has left the source
+dungeon map. Entry still requires the destination dungeon and the leader's
+copy.
+
+When walking out of a dungeon fails, the hearth recovery keeps the original
+run state. Once every family member is observed outside, normal run
+finalization records the outcome and advances the same campaign. An unseen
+member is not proof of an exit; a member still inside remains in recovery.
+
+## Run and test locally
+
+The pull request gate `.github/workflows/check.decisions.yml` runs these
+commands from the repo root with the runner's own `g++` and `python3`:
+
+```sh
+python3 -B tests/replay_exit_hearth_finalization.py
+python3 -B tests/replay_travel_claim_cache.py
+python3 -B tests/replay_main_tank_cache.py
+python3 -B tests/replay_door_floor.py
+python3 -B tests/replay_run_family.py
+g++ -std=c++17 -Wall -Wextra -Isrc -c src/overseer_decisions.cpp -o overseer_decisions.o
+for test in tests/test_*.cpp; do
+  name="$(basename "$test" .cpp)"
+  g++ -std=c++17 -Wall -Wextra -Isrc overseer_decisions.o "$test" -o "$name"
+  "./$name"
+done
+```
+
+The main-tank replay applies the carried playerbots patch to pinned source
+fixtures and compiles the actual cache and threat-consumer path. It needs git
+and a C++17 compiler; it uses no realm, database or network.
+
+The door-floor replay compiles the actual door-height adapter, route adapter
+and pure trigger decisions against fixed map and navigation readings. Its
+Razorfen Downs fixture models a surface above the routed floor. It requires
+a C++17 compiler, without client map files, a realm or a database.
+
+The family-run replay compiles the actual ledger adapters against SQLite.
+It needs the SQLite development library as well as a C++17 compiler. It checks
+independent families on one map, repeated members, adoption, ownership after
+one run ends, and the older single-family schema behavior.
+
+The family ledger migration keeps one active row per family and map. An active
+legacy row is adopted only when its complete recorded membership identifies
+one family; its current leader can have changed. Mixed or incomplete rows keep
+their blank legacy scope and expire normally. Historical outcomes and roster
+campaign counters are not rewritten. Stable campaign counters across borrowed
+leadership remain separate work in wow-overseer#1688.
+
+CI also runs the actual migration twice on a fresh MySQL 8.4 service. Locally,
+`scripts/check-locally.sh schema` runs that test against an isolated MySQL
+server. `MYSQL_REPLAY_COMMAND` can supply a JSON array of client arguments,
+such as `["docker","exec","-i","your-test-mysql","mysql","--user=root"]`.
+The test uses only its `overseer_run_family_replay` fixture database. It checks
+different column collations, conservative adoption, index replacement,
+idempotent reapplication, and native MySQL upserts.
+
+`scripts/check-locally.sh decisions` runs the same steps (plus the check that
+`VERSION` matches the constant in `src/overseer_decisions.h`) in a scratch
+folder. `scripts/check-locally.sh adapter` mirrors
+`.github/workflows/check.adapter.yml`, which compiles `src/mod_overseer.cpp`
+against the pinned core; it needs clang, cmake, ninja and the core's build
+packages. The full build in `.github/workflows/build.yml` runs on `main`, not
+on a pull request.
+
+## Configuration
+
+Every key is optional and has a compiled default, so a worldserver that has
+never seen `conf/mod_overseer.conf.dist` behaves exactly as one that copied it
+unedited. Copy it to `mod_overseer.conf` in the worldserver's module config
+directory and uncomment a line only to disagree with a default. The core does
+not fall back to the `.conf.dist`: without the copy, the worldserver logs a
+missing-file line and the module runs on its defaults.
+
+| Group | Keys under `Overseer.` | What it decides |
+|---|---|---|
+| Guild recruiting | `Recruit.*` | Target guild size and the level range it recruits in. |
+| Raid shape | `Raid.*` | Tank and healer seats, the repair floor, and the catch on `guild raid form`. |
+| Clients | `RequireClient`, `HeadlessRoster` | Whether roster characters need a client, and which are played headless. |
+| Recovery | `Recovery.*` | When a run that cannot get in opens the summon rung, and who summons. |
+| Group finder | `DungeonFinder.Default`, `GuildFinder.*` | Whether runs queue through the dungeon finder. |
+| Travel | `FarWalk.*`, `Route.*`, `PartyWalk.*`, `Cross.*`, `Hunt.*` | How many long walks, crossings and hunts run at once, and route safety. |
+| Leader intent | `LeaderIntent.*` | Whether rules that move a family leader go through one intent book. |
+| Roster | `Natural.*`, `Rename.*`, `Retire.*` | Irreversible naturalize modes, offline renames, and the guilds a retire keeps. |
+
+Each key is documented in `conf/mod_overseer.conf.dist`. Everything else is
+worked out from the database when it is needed, so it is not a setting.
+
+One setting the module reads belongs to mod-playerbots:
+`AiPlayerbot.LootRollDisenchant` (`Playerbots.LootRollDisenchant` after the
+playerbots config rename). Set to 1, a weapon or armour drop the loot council
+gives nobody is disenchanted by the family's Enchanter, while everybody else
+passes. Left at 0, everybody greeds such a drop.
+
+The worldserver may also set `OVERSEER_REALM`, `OVERSEER_REALM_KIND` and the
+`OVERSEER_PIN_*` environment variables. The module writes them into its build
+report at startup; none is required.
+
+What does not ship here: an AzerothCore server with mod-playerbots, its MySQL
+databases, and whatever outside system writes commands and reads the tables.
+
+## Status
+
+Open work is tracked in the epic
+[a living family: gear up in Deadmines, then live off the world](https://github.com/quadseven/mod-overseer/issues/141).
 
 ## Contributing
 
-`main` requires a pull request — direct pushes are rejected (deletion and
-force-push are blocked too). This is enforced by a GitHub Repository Ruleset,
-managed outside this repository.
-
-### Failed dungeon exits
-
-When walking out fails, the hearth recovery keeps the original run state.
-Once every family member is observed outside, normal run finalization records
-the outcome and advances the same campaign. An unseen member is not proof
-of an exit; a member still inside remains in recovery.
+Changes land through a pull request; direct pushes to `main`, deletion and
+force-push are refused by a repository ruleset. A pull request must pass the
+decisions check, the adapter compile and the leak scan. Read
+[AGENTS.md](AGENTS.md) first: this repository is public.

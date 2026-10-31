@@ -19,6 +19,7 @@
     {"family": "mailbox", "outcome": "refused", "reason": "the way to the nearest mailbox crosses the other side's ground", "retryable": false, "transient": false},
     {"family": "mailbox", "outcome": "refused", "reason": "the ground toward the mailbox does not hold", "retryable": true, "transient": false},
     {"family": "mailbox", "outcome": "refused", "reason": "character stands in Outland or Northrend, outside the classic world", "retryable": true, "transient": false},
+    {"family": "mailbox", "outcome": "refused", "reason": "the destination is across the water from Teldrassil; the walk holds for the Rut'theran boat rather than swim", "retryable": true, "transient": false},
     {"family": "mailbox", "outcome": "abandoned", "reason": "entered combat on the way to the mailbox", "retryable": true, "transient": true},
     {"family": "mailbox", "outcome": "abandoned", "reason": "died on the way to the mailbox", "retryable": true, "transient": false},
     {"family": "mailbox", "outcome": "abandoned", "reason": "left the world on the way to the mailbox", "retryable": true, "transient": true},

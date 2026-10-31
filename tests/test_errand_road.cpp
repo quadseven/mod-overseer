@@ -155,7 +155,8 @@ void OnlyALongWalkToAPlaceIsJudged()
 
     ErrandRoadFacts creature = GnomereganToStormwind();
     creature.placeAim = false;
-    CheckStep("an aim at a creature", DecideErrandRoad(creature), ErrandRoadStep::Walk);
+    CheckStep("an aim that is neither a place nor a spawn", DecideErrandRoad(creature),
+              ErrandRoadStep::Walk);
 
     ErrandRoadFacts catchUp = GnomereganToStormwind();
     catchUp.catchUp = true;
@@ -167,8 +168,89 @@ void OnlyALongWalkToAPlaceIsJudged()
     CheckStep("a live run's walk", DecideErrandRoad(run), ErrandRoadStep::Walk);
 }
 
+// THE TWO WALKS THE FAMILY DIED ON AFTER #836 WENT LIVE (#1209). Measured
+// 2026-10-18 to 2026-10-27: 55 deaths at levels 41 to 48 in Burning Steppes and
+// Searing Gorge, nearly all of them members the road check never judged. The
+// youngest member there was 42, and on 2026-10-25 the leader was sent back
+// 13,044 yards for a member, the family behind him.
+ErrandRoadFacts AtLevel(ErrandRoadFacts facts, uint32_t level)
+{
+    facts.road = Road(level, 40, 30, 54);   // the same 900 yards of Burning Steppes
+    return facts;
+}
+
+void AFollowerIsHeldToItsLeadersRoad()
+{
+    // A follower walks where its leader walks, and the one leader walk that
+    // was never judged is his going back for a member: it rides the catch-up
+    // lease, and the catch-up exclusion let it through.
+    ErrandRoadFacts fetch = AtLevel(GnomereganToStormwind(), 42);
+    fetch.catchUp = true;
+    fetch.leaderFetch = true;
+    Check("the leader going back for a member is judged", ErrandRoadJudges(fetch), true);
+    CheckStep("at 42, stone on cooldown, bound at the aim: not walked", DecideErrandRoad(fetch),
+              ErrandRoadStep::WaitForHearth);
+
+    ErrandRoadFacts unbound = fetch;
+    unbound.bindYardsFromAim = 2400.f;
+    CheckStep("at 42, bound elsewhere: refused", DecideErrandRoad(unbound),
+              ErrandRoadStep::Refuse);
+
+    ErrandRoadFacts grown = AtLevel(fetch, 55);
+    Check("at 55 the steppes are survivable", grown.road.survivable, true);
+    CheckStep("the same trip at 55 is walked", DecideErrandRoad(grown), ErrandRoadStep::Walk);
+
+    // A MEMBER'S OWN CATCH-UP IS STILL #697's, judged by its lone leg rule.
+    ErrandRoadFacts lone = fetch;
+    lone.leaderFetch = false;
+    Check("a member's own catch-up is not judged here", ErrandRoadJudges(lone), false);
+    CheckStep("and is walked as before", DecideErrandRoad(lone), ErrandRoadStep::Walk);
+}
+
+void AVendorErrandIsHeldToTheSameRoad()
+{
+    // An aim at a spawn: its line was read when it was chosen, but at the
+    // walker's level, and the family behind it is younger.
+    ErrandRoadFacts vendor = AtLevel(GnomereganToStormwind(), 42);
+    vendor.placeAim = false;
+    vendor.spawnAim = true;
+    Check("a long walk to a vendor is judged", ErrandRoadJudges(vendor), true);
+    CheckStep("at 42, stone on cooldown, bound at the aim: not walked", DecideErrandRoad(vendor),
+              ErrandRoadStep::WaitForHearth);
+
+    ErrandRoadFacts ready = vendor;
+    ready.hearthReady = true;
+    CheckStep("at 42, stone ready: hearth", DecideErrandRoad(ready), ErrandRoadStep::Hearth);
+
+    ErrandRoadFacts nowhere = vendor;
+    nowhere.carriesStone = false;
+    CheckStep("at 42, no stone: refused", DecideErrandRoad(nowhere), ErrandRoadStep::Refuse);
+
+    CheckStep("the same trip at 55 is walked", DecideErrandRoad(AtLevel(vendor, 55)),
+              ErrandRoadStep::Walk);
+
+    ErrandRoadFacts near = vendor;
+    near.walkYards = ERRAND_ROAD_MIN_YARDS - 1.f;
+    Check("a vendor across the street is not a journey", ErrandRoadJudges(near), false);
+
+    ErrandRoadFacts run = vendor;
+    run.liveRun = true;
+    CheckStep("a live run's vendor walk is the run's", DecideErrandRoad(run),
+              ErrandRoadStep::Walk);
+}
+
 void TheWordsArePinned()
 {
+    ErrandRoadFacts fetch = GnomereganToStormwind();
+    fetch.catchUp = true;
+    fetch.leaderFetch = true;
+    CheckText("fetch word", ErrandRoadWalkWord(fetch), "the leader going back for a member");
+    ErrandRoadFacts spawn = GnomereganToStormwind();
+    spawn.placeAim = false;
+    spawn.spawnAim = true;
+    CheckText("spawn word", ErrandRoadWalkWord(spawn), "a walk to a spawn");
+    CheckText("place word", ErrandRoadWalkWord(GnomereganToStormwind()), "a walk to a place");
+
     CheckText("walk", ErrandRoadStepWord(ErrandRoadStep::Walk), "walk");
     CheckText("hearth", ErrandRoadStepWord(ErrandRoadStep::Hearth), "hearth");
     CheckText("wait", ErrandRoadStepWord(ErrandRoadStep::WaitForHearth), "wait for hearth");
@@ -188,7 +270,7 @@ void TheTravelDriveAsksBeforeItWalks()
     std::size_t const drive = source.find("    void DriveTravel()");
     std::size_t const asked = source.find("OverseerDecisions::DecideErrandRoad(", drive);
     std::size_t const walked =
-        source.find("WorldPosition const leg = entry ? pos : RouteLeg(", drive);
+        source.find("entry && !steered ? pos : RouteLeg(", drive);
     Check("DriveTravel exists", drive != std::string::npos, true);
     Check("DriveTravel asks the road decision", asked != std::string::npos, true);
     Check("and asks it before the walk is issued",
@@ -203,6 +285,25 @@ void TheTravelDriveAsksBeforeItWalks()
           true);
     Check("a refused road is recorded against the aim",
           source.find("OverseerDecisions::ErrandLethalRoad") != std::string::npos, true);
+
+    // #1209: the leader's fetch and a spawn aim reach the decision, and the
+    // module asks the decision whether to read the road rather than its own copy.
+    Check("the leader going back for a member is told to the decision",
+          source.find("road.leaderFetch = road.catchUp && LeaderIsFetching(name);", drive) <
+              asked,
+          true);
+    Check("a spawn aim is told to the decision",
+          source.find("road.spawnAim = entry != 0;", drive) < asked, true);
+    Check("the module asks the decision which walks it judges",
+          source.find("if (OverseerDecisions::ErrandRoadJudges(road))", drive) < asked, true);
+    Check("a spawn aim's line is read",
+          source.find("road.spawnAim ? ReadErrandLine(bot, pos, state)", drive) < asked, true);
+    std::size_t const refusedFetch =
+        source.find("step == OverseerDecisions::ErrandRoadStep::Refuse && road.leaderFetch", drive);
+    Check("a refused fetch ends the fetch",
+          refusedFetch != std::string::npos &&
+              source.find("EndFetch(name,", refusedFetch) < walked,
+          true);
 }
 
 }  // namespace
@@ -214,6 +315,8 @@ int main()
     NothingCarriesItButTheRoad();
     ASafeRoadIsWalkedAsBefore();
     OnlyALongWalkToAPlaceIsJudged();
+    AFollowerIsHeldToItsLeadersRoad();
+    AVendorErrandIsHeldToTheSameRoad();
     TheWordsArePinned();
     TheTravelDriveAsksBeforeItWalks();
 
