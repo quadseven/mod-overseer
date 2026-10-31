@@ -2487,6 +2487,16 @@ bool LeaderAwayEndsRun(time_t awaySince, time_t now, long ceilingSeconds)
     return awaySince && now > awaySince && now - awaySince > ceilingSeconds;
 }
 
+ClearingArmGate DecideClearingArmGate(bool acceptedOnEveryoneInside, time_t leaderAwaySince,
+                                      time_t now, long ceilingSeconds)
+{
+    if (acceptedOnEveryoneInside)
+        return ClearingArmGate::Armed;
+    return LeaderAwayEndsRun(leaderAwaySince, now, ceilingSeconds)
+               ? ClearingArmGate::LeaderAwayEnds
+               : ClearingArmGate::HoldNotArmed;
+}
+
 bool ForgetDcOnRecord(bool inWorld, bool onDungeonMap)
 {
     return !inWorld || !onDungeonMap;
@@ -19596,6 +19606,11 @@ EvacuationStart DungeonEvacuationStart(bool coordinatorKnowsItsDoor, bool inside
 bool DungeonDoorShut(bool familyBagHeld, bool enteringDungeonMap, bool alive, bool steered)
 {
     return familyBagHeld && enteringDungeonMap && alive && steered;
+}
+
+bool FamilyDoorHeldForBags(bool noBagRoom, bool runHasMembersInside)
+{
+    return noBagRoom && !runHasMembersInside;
 }
 
 namespace Classic

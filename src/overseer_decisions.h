@@ -3314,6 +3314,21 @@ bool ForgetDcOnRecord(bool inWorld, bool onDungeonMap);
 // A zero `awaySince` (not away) or a clock stepped backwards never ends it.
 bool LeaderAwayEndsRun(time_t awaySince, time_t now, long ceilingSeconds);
 
+// THE ARMING HOLD DOES NOT OUTLAST THE LEADER-AWAY BOUND. CLEARING held its stall
+// clock for "`dc on` not accepted" and returned before it read the leader's map.
+// A leader that died inside and revived on the outdoor map left four members
+// refused 235 times in four hours, with `LeaderAwayEndsRun` never asked, because
+// the dungeon brain will not arm a party whose tank is elsewhere. The bound is
+// asked first: a leader away past it walks the party out through EXIT.
+enum class ClearingArmGate : uint8_t
+{
+    Armed,           // accepted on everyone inside
+    HoldNotArmed,    // not yet, and the leader is here or still inside its bound
+    LeaderAwayEnds,  // not armed, and the leader is not coming back to this run
+};
+ClearingArmGate DecideClearingArmGate(bool acceptedOnEveryoneInside, time_t leaderAwaySince,
+                                      time_t now, long ceilingSeconds);
+
 // Does the CLEARING stall clock run this poll (#618)? Only while the brain can
 // actually be driven: `dc on` accepted for everyone inside, the leader
 // visible on the dungeon map, and a groupmate able to issue `dc skip`.
@@ -22173,6 +22188,14 @@ EvacuationStart DungeonEvacuationStart(bool coordinatorKnowsItsDoor, bool inside
 // row, and only from another map (a teleport inside the instance is not a
 // crossing). A ghost is never refused: its corpse may be inside.
 bool DungeonDoorShut(bool familyBagHeld, bool enteringDungeonMap, bool alive, bool steered);
+
+// A FAMILY ALREADY INSIDE IS NOT HELD AT THE DOOR. A run with a member inside
+// makes room rather than leaving (DungeonRunBagAnswer), so no town trip follows
+// and a shut door only strands whoever is outside. On the dev realm one member
+// stood at the entrance for over two hours with four inside, and the run closed
+// `split_failed` every 15 minutes. Nobody inside, or a run walking out, stays
+// held: that is the family #631 keeps from walking back in.
+bool FamilyDoorHeldForBags(bool noBagRoom, bool runHasMembersInside);
 
 // THE CLASSIC RULESET. The operator restricts these worlds to a classic
 // level-60 feel: characters stop at level 60, professions stop at skill 300,

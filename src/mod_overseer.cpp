@@ -38398,6 +38398,27 @@ private:
                  OverseerDecisions::ClearingClockHoldReason(clock));
     }
 
+    // A LEADER THAT IS NOT COMING BACK TO THIS RUN (DUNGEON_LEADER_AWAY_SECONDS):
+    // the party is walked out through EXIT rather than left standing.
+    void EndRunForAwayLeader(DungeonRunCoordinatorState& coord, std::string const& leaderName,
+                             uint32 insideMapId, time_t now)
+    {
+        coord.stalledReason = "the leader '" + leaderName + "' was off map " +
+                              std::to_string(insideMapId) + " for more than " +
+                              std::to_string(DUNGEON_LEADER_AWAY_SECONDS) + "s";
+        LOG_ERROR("module.overseer",
+                  "overseer: dungeon run {} of campaign {} - {}. Walking the party back "
+                  "out through EXIT instead of holding the stall clock with everybody "
+                  "standing still",
+                  coord.runNumber, coord.campaignId, coord.stalledReason);
+        coord.leaderAwaySince = 0;
+        coord.phase = DungeonRunPhase::Exiting;
+        coord.crossing.best = 0.f;
+        coord.crossing.since = now;
+        coord.loggedCrossingAim = false;
+        coord.loggedCrossingWaiting = false;
+    }
+
     using DungeonRunEntryStates = std::vector<OverseerDecisions::DungeonRunEntryState>;
     bool RunClearingWatchdog(DungeonRunCoordinatorState& coord, Player* leader,
                              DungeonRunEntryStates const& states, uint32 insideMapId)
@@ -54092,11 +54113,14 @@ private:
 
             // THE DOOR IS SHUT FOR AS LONG AS ANYBODY HAS NO ROOM (#631), asked
             // without the EXIT exemption below: a family walking out for bag
-            // room is exactly the family that must not be let back in.
+            // room is exactly the family that must not be let back in. A run
+            // with a member inside is not leaving, so it is not held.
             MarkFamilyBagHeld(family, members,
-                              OverseerDecisions::DungeonRunBagPressure(
-                                  bags.freeSlots, TOWN_TRIP_LIMITS.freeBagSlotsToGo, false,
-                                  false) != OverseerDecisions::DungeonBagPressure::None);
+                              OverseerDecisions::FamilyDoorHeldForBags(
+                                  OverseerDecisions::DungeonRunBagPressure(
+                                      bags.freeSlots, TOWN_TRIP_LIMITS.freeBagSlotsToGo, false,
+                                      false) != OverseerDecisions::DungeonBagPressure::None,
+                                  runHasMembersInside));
 
             // A RUN INSIDE MAKES ROOM RATHER THAN LEAVING (2026-09-24), unless a
             // member with no room at all has an Uncommon or better item on the
@@ -56969,7 +56993,28 @@ private:
                 notAccepted += state.name;
             }
 
-            if (!accepted || accepted != inside)
+            // THE LEADER'S ABSENCE IS TIMED BEFORE THE ARMING VERDICT: the brain
+            // will not arm a party whose tank is off the map, so the verdict
+            // below would otherwise return for as long as the leader stays away.
+            Player* leader = ObjectAccessor::FindPlayerByName(leaderName);
+            bool const leaderOnMap = leader && leader->GetMapId() == portal->insideMapId;
+            time_t const clearingNow = std::time(nullptr);
+            if (leaderOnMap)
+                coord.leaderAwaySince = 0;
+            else if (!coord.leaderAwaySince)
+                coord.leaderAwaySince = clearingNow;
+
+            OverseerDecisions::ClearingArmGate const armGate =
+                OverseerDecisions::DecideClearingArmGate(accepted && accepted == inside,
+                                                         coord.leaderAwaySince, clearingNow,
+                                                         DUNGEON_LEADER_AWAY_SECONDS);
+            if (armGate == OverseerDecisions::ClearingArmGate::LeaderAwayEnds)
+            {
+                EndRunForAwayLeader(coord, leaderName, portal->insideMapId, clearingNow);
+                return;
+            }
+
+            if (armGate == OverseerDecisions::ClearingArmGate::HoldNotArmed)
             {
                 // NOT (OR NO LONGER) ACCEPTED ON EVERYONE INSIDE. If it was a
                 // moment ago, the clocks restart: the drive re-issues on its
@@ -57033,8 +57078,7 @@ private:
             // issue's own acceptance criterion is stated the same way. Only a
             // leader this module can see is measured; mid-relog it is skipped
             // for a poll and the anchor waits.
-            Player* leader = ObjectAccessor::FindPlayerByName(leaderName);
-            if (!leader || leader->GetMapId() != portal->insideMapId)
+            if (!leaderOnMap)
             {
                 // THE HOLD IS BOUNDED. On 2026-09-28 the family stood inside
                 // Scarlet Monastery for 17 minutes (01:15 to 01:32Z) with the
@@ -57042,34 +57086,16 @@ private:
                 // that is not back within DUNGEON_LEADER_AWAY_SECONDS is not
                 // coming back to this run: the party is walked out through
                 // EXIT, as the stall watchdog does, rather than standing still.
-                time_t const now = std::time(nullptr);
-                if (!coord.leaderAwaySince)
-                    coord.leaderAwaySince = now;
-                if (OverseerDecisions::LeaderAwayEndsRun(coord.leaderAwaySince, now,
+                if (OverseerDecisions::LeaderAwayEndsRun(coord.leaderAwaySince, clearingNow,
                                                          DUNGEON_LEADER_AWAY_SECONDS))
                 {
-                    coord.stalledReason = "the leader '" + leaderName +
-                                          "' was off map " + std::to_string(portal->insideMapId) +
-                                          " for more than " +
-                                          std::to_string(DUNGEON_LEADER_AWAY_SECONDS) + "s";
-                    LOG_ERROR("module.overseer",
-                              "overseer: dungeon run {} of campaign {} - {}. Walking the "
-                              "party back out through EXIT instead of holding the stall "
-                              "clock with everybody standing still",
-                              coord.runNumber, coord.campaignId, coord.stalledReason);
-                    coord.leaderAwaySince = 0;
-                    coord.phase = DungeonRunPhase::Exiting;
-                    coord.crossing.best = 0.f;
-                    coord.crossing.since = now;
-                    coord.loggedCrossingAim = false;
-                    coord.loggedCrossingWaiting = false;
+                    EndRunForAwayLeader(coord, leaderName, portal->insideMapId, clearingNow);
                     return;
                 }
                 HoldClearingClock(coord, OverseerDecisions::ClearingClockState(true, false, true),
                                   portal->insideMapId);
                 return;
             }
-            coord.leaderAwaySince = 0;
 
             // HAS THE RUN ACTUALLY GONE ANYWHERE (#171)? Asked BEFORE the
             // arming verdict below, because that verdict answers itself once
