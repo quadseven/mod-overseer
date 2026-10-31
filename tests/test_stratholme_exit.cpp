@@ -16,6 +16,7 @@ using OverseerDecisions::DecideStratholmeExit;
 using OverseerDecisions::InStratholmeExitYard;
 using OverseerDecisions::StratholmeButtonInReach;
 using OverseerDecisions::StratholmeHearthLeavesTheYard;
+using OverseerDecisions::StratholmeYardMemberMayWalk;
 using OverseerDecisions::StratholmeExitFacts;
 using OverseerDecisions::StratholmeExitWay;
 using OverseerDecisions::StratholmeExitWayWord;
@@ -71,6 +72,13 @@ std::string ReadModule()
 
 int main()
 {
+    CheckBool("leader in yard may walk", StratholmeYardMemberMayWalk(true, true, true), true);
+    CheckBool("follower in yard does not walk with leader present",
+              StratholmeYardMemberMayWalk(true, true, false), false);
+    CheckBool("follower does not walk when leader is outside",
+              StratholmeYardMemberMayWalk(false, true, false), false);
+    CheckBool("follower does not walk when leader is dead",
+              StratholmeYardMemberMayWalk(true, false, false), false);
     // door open means walk
     {
         StratholmeExitFacts facts;
@@ -218,6 +226,16 @@ int main()
         CheckBool("the coordinator drives the yard before its phases",
                   source.find("if (DriveStratholmeYard(family, leaderName, members))") !=
                       std::string::npos,
+                  true);
+        CheckBool("yard walker must be the living leader",
+                  source.find("StratholmeYardMemberMayWalk(") != std::string::npos &&
+                      source.find("Player* walker = inYard.front()") == std::string::npos,
+                  true);
+        CheckBool("missing leader holds or hearths the yard",
+                  source.find("if (!walker)") != std::string::npos &&
+                      source.find("if (!hearthers.empty())") != std::string::npos &&
+                      source.find("return true;\n        }\n        GameObject* const door") !=
+                          std::string::npos,
                   true);
     }
 

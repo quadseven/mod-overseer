@@ -25317,6 +25317,11 @@ StratholmeExitWay DecideStratholmeExit(StratholmeExitFacts const& facts)
     return StratholmeExitWay::None;
 }
 
+bool StratholmeYardMemberMayWalk(bool leaderInYard, bool leaderAlive, bool memberIsLeader)
+{
+    return leaderInYard && leaderAlive && memberIsLeader;
+}
+
 char const* StratholmeExitWayWord(StratholmeExitWay way)
 {
     switch (way)
