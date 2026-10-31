@@ -783,6 +783,10 @@ constexpr float GHOST_CORPSE_THREAT_RADIUS = float(CORPSE_RECLAIM_RADIUS);
 // ladder is left to take it. A released ghost starts at the graveyard, so this
 // is a walk back of however far the dead engine carried it in one poll.
 constexpr int64 GHOST_HEALER_WALK_SECONDS = 120;
+// How long a ghost with no graveyard to take waits out its killer before it
+// takes the nearest healer anyway (OverseerDecisions::RefusedHealerFallback).
+// Twenty minutes a death is three deaths an hour at worst.
+constexpr int64 GHOST_REFUSED_HOLD_SECONDS = 20 * 60;
 constexpr int64 SPIRIT_HEALER_SICKNESS_SECONDS = 600;
 // How far round the ghost to look for the spirit healer itself.
 constexpr float GHOST_HEALER_SWEEP_YARDS = 60.0f;
@@ -1212,15 +1216,16 @@ struct GraveyardEvidence
 //
 //   FindBaseMap   MapMgr.h:44   Map* FindBaseMap(uint32 mapId) const
 //   GetPhaseMask  Object.h:517  uint32 GetPhaseMask() const
+//
+// `standing`, when given, says whether the ground alone refused it (#1275).
 static std::string GraveyardRefusal(Player* bot, GraveyardStruct const& g,
-                                    GraveyardEvidence const& evidence)
+                                    GraveyardEvidence const& evidence,
+                                    OverseerDecisions::GraveyardStanding* standing = nullptr)
 {
     uint32 const level = bot->GetLevel();
     Map* map = g.Map == bot->GetMapId() ? bot->GetMap() : sMapMgr->FindBaseMap(g.Map);
     int32 const areaLevel = AreaLevelAt(map, bot->GetPhaseMask(), g.x, g.y, g.z);
-    if (areaLevel > int32(level))
-        return "it stands on level " + std::to_string(areaLevel) + " ground and the character is level " +
-               std::to_string(level);
+    bool const highGround = areaLevel > int32(level);
 
     std::vector<CreatureTemplate const*> templates;
     OverseerDecisions::PlaceDangerFacts facts;
@@ -1236,6 +1241,11 @@ static std::string GraveyardRefusal(Player* bot, GraveyardStruct const& g,
         evidence.deaths, time(nullptr), g.Map, g.x, g.y, GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES);
     facts.repeatDeaths = GHOST_RECOVERY_LIMITS.repeatDeaths;
     OverseerDecisions::PlaceDanger const danger = OverseerDecisions::JudgePlaceDanger(facts);
+    if (standing)
+        *standing = OverseerDecisions::JudgeGraveyard(highGround, danger.reason);
+    if (highGround)
+        return "it stands on level " + std::to_string(areaLevel) + " ground and the character is level " +
+               std::to_string(level);
 
     std::string const deaths = std::to_string(facts.deathsNear) + " death(s) within " +
                                std::to_string(uint32(GHOST_REPEAT_RADIUS)) + " yards in " +
@@ -1262,7 +1272,10 @@ static std::string GraveyardRefusal(Player* bot, GraveyardStruct const& g,
 // it passes, else the nearest of the core's own alternatives for this corpse
 // that does, else null (the caller goes to the bind point). `evidence` is
 // the character's own (GraveyardEvidenceFor). `refused` collects every
-// refusal, so the log line can say why.
+// refusal, so the log line can say why. `acceptHighGround` is for a ghost that
+// needs a healer: past those, the nearest refused for high ground alone counts
+// (OverseerDecisions::PickSafestGraveyard, #1275). A living member walking to
+// safe ground leaves it false.
 //
 // Members read at the pinned core:
 //   GetGraveyardData          GameGraveyard.h:62  GraveyardContainer const&
@@ -1273,12 +1286,22 @@ static std::string GraveyardRefusal(Player* bot, GraveyardStruct const& g,
 static GraveyardStruct const* SafeGraveyardNear(Player* bot, GraveyardStruct const* nearest,
                                                 uint32 corpseMap, float cx, float cy, float cz,
                                                 GraveyardEvidence const& evidence,
-                                                std::string& refused)
+                                                std::string& refused,
+                                                bool acceptHighGround = false)
 {
-    refused = GraveyardRefusal(bot, *nearest, evidence);
+    OverseerDecisions::GraveyardStanding standing{OverseerDecisions::GraveyardStanding::Dangerous};
+    refused = GraveyardRefusal(bot, *nearest, evidence, &standing);
     if (refused.empty())
         return nearest;
     refused = "'" + nearest->name + "': " + refused;
+    std::vector<GraveyardStruct const*> judged{nearest};
+    std::vector<OverseerDecisions::GraveyardStanding> standings{standing};
+    auto const safest = [&]() -> GraveyardStruct const* {
+        if (!acceptHighGround)
+            return nullptr;
+        std::size_t const pick = OverseerDecisions::PickSafestGraveyard(standings);
+        return pick < judged.size() ? judged[pick] : nullptr;
+    };
 
     // The corpse's zone and area, because that is what graveyard_zone keys
     // its links by (GameGraveyard.cpp:145-160): a graveyard linked to the
@@ -1287,7 +1310,7 @@ static GraveyardStruct const* SafeGraveyardNear(Player* bot, GraveyardStruct con
     // picked.
     Map* map = corpseMap == bot->GetMapId() ? bot->GetMap() : sMapMgr->FindBaseMap(corpseMap);
     if (!map)
-        return nullptr;
+        return safest();
     uint32 zoneId = 0;
     uint32 areaId = 0;
     map->GetZoneAndAreaId(bot->GetPhaseMask(), zoneId, areaId, cx, cy, cz);
@@ -1316,12 +1339,14 @@ static GraveyardStruct const* SafeGraveyardNear(Player* bot, GraveyardStruct con
         if (tried++ >= GRAVEYARD_CANDIDATES)
             break;
         GraveyardStruct const* g = candidate.second;
-        std::string const why = GraveyardRefusal(bot, *g, evidence);
+        std::string const why = GraveyardRefusal(bot, *g, evidence, &standing);
         if (why.empty())
             return g;
         refused += "; '" + g->name + "': " + why;
+        judged.push_back(g);
+        standings.push_back(standing);
     }
-    return nullptr;
+    return safest();
 }
 
 // A class the dungeon module elects to raise the dead (DcRezRecovery's
@@ -21697,6 +21722,59 @@ private:
             actualEnd.z, z, TRAVEL_ROUTE_ENDPOINT_YARDS);
     }
 
+    // Corners describe the route without exhausting the mover's smoothed-point
+    // buffer. They are a plan, never a spline handed directly to the mover.
+    static bool PlanNavmeshRoute(
+        Player* bot, float x, float y, float z,
+        std::vector<OverseerDecisions::MailWalkPoint>* points = nullptr)
+    {
+        PathGenerator path(bot);
+        path.SetUseStraightPath(true);
+        if (!path.CalculatePath(x, y, z))
+            return false;
+        PathType const type = path.GetPathType();
+        G3D::Vector3 const& end = path.GetActualEndPosition();
+        if (!OverseerDecisions::RoutedPathGoesWhereAsked(
+                (type & PATHFIND_NOPATH) != 0,
+                (type & PATHFIND_FARFROMPOLY_END) != 0,
+                path.GetPath().size() < 2 ||
+                    (type & (PATHFIND_NOT_USING_PATH | PATHFIND_SHORT)) != 0,
+                end.z, z, TRAVEL_ROUTE_ENDPOINT_YARDS))
+            return false;
+        if (points)
+            for (G3D::Vector3 const& point : path.GetPath())
+                points->push_back({point.x, point.y, point.z});
+        return true;
+    }
+
+    static bool NavmeshWalkingLeg(Player* bot, WorldPosition const& want,
+                                   WorldPosition& step)
+    {
+        std::vector<OverseerDecisions::MailWalkPoint> points;
+        if (!PlanNavmeshRoute(bot, want.GetPositionX(), want.GetPositionY(),
+                              want.GetPositionZ(), &points) || points.empty())
+            return false;
+        float const dx = points.front().x - bot->GetPositionX();
+        float const dy = points.front().y - bot->GetPositionY();
+        float const dz = points.front().z - bot->GetPositionZ();
+        if (dx * dx + dy * dy + dz * dz >
+            TRAVEL_ROUTE_ENDPOINT_YARDS * TRAVEL_ROUTE_ENDPOINT_YARDS)
+            return false;
+        OverseerDecisions::FirstLegPick const pick =
+            OverseerDecisions::PickFirstLegWaypoint(
+                points, TRAVEL_STEP_YARDS, TRAVEL_FIRST_LEG_STRIDE_YARDS,
+                TRAVEL_GROUND_DROP_YARDS);
+        if (!pick.found ||
+            !OverseerDecisions::StepMayBridgeGap(
+                bot->GetExactDist2d(pick.point.x, pick.point.y),
+                pick.point.z - bot->GetPositionZ(), TRAVEL_STEP_YARDS,
+                TRAVEL_STEP_VERTICAL_YARDS) ||
+            !NavmeshRoutes(bot, pick.point.x, pick.point.y, pick.point.z))
+            return false;
+        step = WorldPosition(want.GetMapId(), pick.point.x, pick.point.y, pick.point.z);
+        return true;
+    }
+
     // ------------------------------------ THE WAY ROUND AN OBSTACLE (#316) --
     //
     // Everything above this line is about ONE step. GroundedStep asks whether
@@ -21770,6 +21848,11 @@ private:
         // else and is thrown away rather than reused.
         std::set<std::uint64_t> measuredLegs;
         uint32 forOurMask{0};
+        // WHICH ZONE EACH SURVEY NODE STANDS IN (#1243), read off the map once
+        // per map per process, and only once some zone on that map is dangerous
+        // to somebody. A node's zone never changes.
+        OverseerDecisions::NodeZones nodeZones;
+        std::set<uint32> zonedMaps;
     };
 
     // World thread only - DriveTravel runs from OnUpdate - so unguarded, in the
@@ -21821,6 +21904,8 @@ private:
         std::uint32_t routeSerial{0};
         std::uint32_t cursorAt{0};
         std::time_t steppedAt{0};
+        // How many dangerous zones the last plan went round (#1243).
+        std::uint32_t zonesAvoided{0};
     };
 
     // How many legs this walker died on are still priced at `now` (#1228).
@@ -21928,6 +22013,123 @@ private:
                          static_cast<uint32>(DIED_ON_LEG_LIMITS.holdSeconds / 60));
             }
         }
+    }
+
+    // THE DEATHS EVERY ZONE'S DANGER IS SCORED FROM (#1243).
+    //
+    // One row per creature kill in the window, with the killer's faction kept
+    // beside it so a city guard's kills are not held against that city's own
+    // side. Read at most once per ZONE_DEATH_READ_SECONDS, and only rows past
+    // the last id read, so only the first read costs a scan of the table. A
+    // world without `overseer_death` answers null, which reads as nobody having
+    // died: the safe direction, since nothing is then routed round.
+    //
+    // World thread only, like Survey().
+    struct ZoneDeathRow
+    {
+        OverseerDecisions::ZoneDeath death;
+        uint32 killerFaction{0};
+    };
+
+    struct ZoneDeathLedger
+    {
+        std::vector<ZoneDeathRow> rows;
+        uint64 lastId{0};
+        std::time_t readAt{0};
+    };
+
+    static constexpr OverseerDecisions::ZoneDangerLimits ZONE_DANGER_LIMITS{};
+    static constexpr std::time_t ZONE_DEATH_READ_SECONDS = 300;
+
+    static ZoneDeathLedger& ZoneDeaths()
+    {
+        static ZoneDeathLedger ledger;
+        return ledger;
+    }
+
+    static void ReadZoneDeaths(std::time_t now)
+    {
+        ZoneDeathLedger& ledger = ZoneDeaths();
+        if (ledger.readAt && now - ledger.readAt < ZONE_DEATH_READ_SECONDS)
+            return;
+        ledger.readAt = now;
+        std::time_t const window = static_cast<std::time_t>(ZONE_DANGER_LIMITS.windowSeconds);
+        ledger.rows.erase(std::remove_if(ledger.rows.begin(), ledger.rows.end(),
+                                         [&](ZoneDeathRow const& row)
+                                         { return now - row.death.at >= window; }),
+                          ledger.rows.end());
+        // The id bound first, because it is the primary key; killer_type and
+        // the window narrow what is left. UNIX_TIMESTAMP is safe to compare
+        // with time(nullptr) whatever the session time zone is.
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT id, map, zone, killer_entry, CAST(UNIX_TIMESTAMP(created_at) AS SIGNED) "
+            "FROM overseer_death WHERE id > {} AND killer_type = 'creature' "
+            "AND created_at >= NOW() - INTERVAL {} SECOND",
+            ledger.lastId, ZONE_DANGER_LIMITS.windowSeconds);
+        if (!result)
+            return;
+        do
+        {
+            Field* fields = result->Fetch();
+            ledger.lastId = std::max(ledger.lastId, fields[0].Get<uint64>());
+            CreatureTemplate const* const killer =
+                sObjectMgr->GetCreatureTemplate(fields[3].Get<uint32>());
+            if (!killer)
+                continue;
+            ZoneDeathRow row;
+            row.death.mapId = fields[1].Get<uint16>();
+            row.death.zoneId = fields[2].Get<uint32>();
+            row.death.killerLevel = killer->maxlevel;
+            row.death.at = static_cast<std::time_t>(fields[4].Get<int64>());
+            row.killerFaction = killer->faction;
+            ledger.rows.push_back(row);
+        } while (result->NextRow());
+    }
+
+    // THE ZONES ON THIS MAP THAT ARE DANGEROUS TO THIS WALKER'S PARTY (#1243).
+    // A kill by something friendly to the walker says nothing about what the
+    // walker meets there: an Alliance member killed by Orgrimmar's guards does
+    // not make Orgrimmar a danger to the Horde.
+    static std::vector<OverseerDecisions::DangerZone> DangerZonesFor(Player* bot, std::time_t now)
+    {
+        ReadZoneDeaths(now);
+        FactionTemplateEntry const* const mine = bot->GetFactionTemplateEntry();
+        std::vector<OverseerDecisions::ZoneDeath> deaths;
+        for (ZoneDeathRow const& row : ZoneDeaths().rows)
+        {
+            if (row.death.mapId != bot->GetMapId())
+                continue;
+            FactionTemplateEntry const* const theirs =
+                sFactionTemplateStore.LookupEntry(row.killerFaction);
+            if (mine && theirs && mine->IsFriendlyTo(*theirs))
+                continue;
+            deaths.push_back(row.death);
+        }
+        std::vector<OverseerDecisions::DangerZone> zones = OverseerDecisions::DangerZonesOn(
+            deaths, bot->GetMapId(), OverseerDecisions::LowestPartyLevel(PartyLevelsFor(bot)),
+            now, ZONE_DANGER_LIMITS);
+        uint8 const locale = sWorld->GetDefaultDbcLocale();
+        for (OverseerDecisions::DangerZone& zone : zones)
+            if (AreaTableEntry const* const area = sAreaTableStore.LookupEntry(zone.zoneId))
+            {
+                if (area->area_name[locale] && *area->area_name[locale])
+                    zone.name = area->area_name[locale];
+                else if (area->area_name[LOCALE_enUS])
+                    zone.name = area->area_name[LOCALE_enUS];
+            }
+        return zones;
+    }
+
+    // Each survey node on the walker's map, placed in its zone once.
+    static void ReadNodeZones(Player* bot, TravelSurvey& survey)
+    {
+        Map* const map = bot->GetMap();
+        if (!map || !survey.zonedMaps.insert(bot->GetMapId()).second)
+            return;
+        for (OverseerDecisions::RouteNode const& node : survey.nodes)
+            if (node.mapId == bot->GetMapId())
+                survey.nodeZones[node.id] =
+                    map->GetZoneId(bot->GetPhaseMask(), node.x, node.y, node.z);
     }
 
     // READ ONCE, AND `read` IS SET BEFORE THE QUERIES RUN. A realm without these
@@ -22666,6 +22868,7 @@ private:
         Player* bot, TravelSurvey const& survey,
         std::vector<OverseerDecisions::RouteLink> const& links,
         std::vector<OverseerDecisions::DiedOnLeg> const& died, std::time_t now,
+        std::vector<OverseerDecisions::DangerZone> const& dangerZones,
         std::map<uint32, OverseerDecisions::RouteNode const*> const& byId,
         float aimX, float aimY, OverseerDecisions::RoutePlanLimits const& limits)
     {
@@ -22704,7 +22907,9 @@ private:
             option.remainingYards =
                 candidate.join.remainingYards +
                 OverseerDecisions::DiedOnLegPrice(link.from, link.to, died, now,
-                                                  DIED_ON_LEG_LIMITS);
+                                                  DIED_ON_LEG_LIMITS) +
+                OverseerDecisions::DangerZonePrice(link.from, link.to, survey.nodeZones,
+                                                   dangerZones, ZONE_DANGER_LIMITS);
             if (onward.verdict == OverseerDecisions::RoutePlanVerdict::Planned)
             {
                 candidate.onward = true;
@@ -22754,6 +22959,7 @@ private:
         diedOn.routeSerial = 0;
         diedOn.cursorAt = 0;
         diedOn.steppedAt = 0;
+        diedOn.zonesAvoided = 0;
         StagingCorridorAnswer const corridor =
             StagingCorridorRoute(bot, want, name, target, route);
         if (corridor.walkIt)
@@ -22908,16 +23114,26 @@ private:
         // survey itself and pays nothing for this.
         std::time_t const plannedAt = std::time(nullptr);
         std::uint32_t diedOnHeld = 0;
+        // AND A ZONE THAT KEEPS KILLING PARTIES LIKE THIS ONE COSTS MORE STILL
+        // (#1243), on the same copy, so any way round is taken and a walker
+        // with none still gets a route. A walker with no dangerous zone on this
+        // map and nothing it died on still plans on the survey itself.
+        std::vector<OverseerDecisions::DangerZone> const dangerZones =
+            DangerZonesFor(bot, plannedAt);
+        if (!dangerZones.empty())
+            ReadNodeZones(bot, survey);
         std::vector<OverseerDecisions::RouteLink> pricedLinks;
         auto const linksForThisWalker =
             [&]() -> std::vector<OverseerDecisions::RouteLink> const&
         {
             diedOnHeld = 0;
-            if (diedOn.died.empty())
+            if (diedOn.died.empty() && dangerZones.empty())
                 return survey.links;
             pricedLinks = survey.links;
             diedOnHeld = OverseerDecisions::PriceDiedOnLegs(pricedLinks, diedOn.died,
                                                             plannedAt, DIED_ON_LEG_LIMITS);
+            OverseerDecisions::PriceDangerZones(pricedLinks, survey.nodeZones, dangerZones,
+                                                ZONE_DANGER_LIMITS);
             return pricedLinks;
         };
         for (unsigned pass = 0; pass <= TRAVEL_ROUTE_GUARDED_PASSES;)
@@ -22937,7 +23153,7 @@ private:
                 OverseerDecisions::RoutePlanLimits joinLimits = limits;
                 joinLimits.refusedEntries.clear();
                 road = JoinSurveyedRoad(bot, survey, linksForThisWalker(), diedOn.died,
-                                        plannedAt, byId, aimX, aimY, joinLimits);
+                                        plannedAt, dangerZones, byId, aimX, aimY, joinLimits);
                 if (road.found)
                 {
                     auto const farEnd = byId.find(road.to);
@@ -23025,6 +23241,8 @@ private:
             diedOn.legs.assign(1, span);
             joinsCorridor = corridor.joinFirst && !route.empty();
             SayDiedOnLegs(name, target, diedOn, diedOnHeld, plannedAt);
+            SayDangerZones(bot, survey, name, target, diedOn, dangerZones, planFromX, planFromY,
+                           aimX, aimY, limits, plannedAt);
             return route;
         }
 
@@ -23159,7 +23377,61 @@ private:
                      plan.wentRound ? "came in under that and was taken"
                                     : "still cost more than that, so it was not");
         SayDiedOnLegs(name, target, diedOn, diedOnHeld, plannedAt);
+        SayDangerZones(bot, survey, name, target, diedOn, dangerZones, planFromX, planFromY,
+                       aimX, aimY, limits, plannedAt);
         return route;
+    }
+
+    // WHAT THE PLAN DID ABOUT THE DANGEROUS ZONES, SAID BY NAME (#1243). The
+    // way through is planned once more with the walker's died-on legs and
+    // without the zones' prices, so `avoided` names only a zone this walk would
+    // have crossed. A zone the route still touches has no way round.
+    static void SayDangerZones(Player* bot, TravelSurvey const& survey, std::string const& name,
+                               std::string const& target, DiedOnLegMemory& diedOn,
+                               std::vector<OverseerDecisions::DangerZone> const& dangerZones,
+                               float planFromX, float planFromY, float aimX, float aimY,
+                               OverseerDecisions::RoutePlanLimits const& limits,
+                               std::time_t plannedAt)
+    {
+        if (dangerZones.empty())
+            return;
+        std::vector<OverseerDecisions::RouteLink> links = survey.links;
+        OverseerDecisions::PriceDiedOnLegs(links, diedOn.died, plannedAt, DIED_ON_LEG_LIMITS);
+        OverseerDecisions::RoutePlan const through = OverseerDecisions::PlanFootRoute(
+            survey.nodes, links, bot->GetMapId(), planFromX, planFromY, aimX, aimY, limits);
+        std::vector<std::uint32_t> walked;
+        for (OverseerDecisions::RouteLegSpan const& leg : diedOn.legs)
+        {
+            walked.push_back(leg.from);
+            walked.push_back(leg.to);
+        }
+        OverseerDecisions::ZoneRouteReading const reading = OverseerDecisions::ReadZoneRoute(
+            walked, through.nodes, survey.nodeZones, dangerZones);
+        diedOn.zonesAvoided = static_cast<std::uint32_t>(reading.avoided.size());
+        if (!reading.avoided.empty())
+            LOG_INFO("module.overseer", "{}",
+                     OverseerDecisions::ZoneAvoidedLine(name, target, reading.avoided,
+                                                        ZONE_DANGER_LIMITS));
+        if (!reading.stillWalked.empty())
+            LOG_WARN("module.overseer", "{}",
+                     OverseerDecisions::ZoneNoWayRoundLine(name, target, reading.stillWalked,
+                                                           ZONE_DANGER_LIMITS));
+    }
+
+    // HOW MANY DANGEROUS ZONES THIS CREATURE WALK'S ROUTE GOES ROUND (#1243). A
+    // creature walk is handed to upstream's mover, which knows no zone, so the
+    // route is planned and, if it went round one, the walk is steered along it.
+    // Nothing is planned on a map with no zone dangerous to this walker, which
+    // keeps those creature walks exactly as they were.
+    static std::uint32_t ZonesCreatureWalkGoesRound(Player* bot, WorldPosition const& want,
+                                                    TravelAimBook::TravelState& state,
+                                                    std::string const& name,
+                                                    std::string const& target)
+    {
+        if (DangerZonesFor(bot, std::time(nullptr)).empty())
+            return 0;
+        PlanRouteOnce(bot, want, state, name, target);
+        return DiedOnLegBook()[bot->GetName()].zonesAvoided;
     }
 
     // AND WHAT THIS WALKER DIED ON, SAID WHEN IT MATTERED (#502). When the
@@ -23640,6 +23912,11 @@ private:
             step = WorldPosition(want.GetMapId(), wx, wy, wz);
             return true;
         }
+
+        // A winding route can exceed the native smoothing buffer even when
+        // the destination is nearby. Walk a short, natively checked leg of it.
+        if (NavmeshWalkingLeg(bot, WorldPosition(want.GetMapId(), wx, wy, wz), step))
+            return true;
 
         // Standing on it already. Nothing to step toward and nothing to check;
         // the arrival branches in DriveTravel are what act on this.
@@ -29217,8 +29494,13 @@ private:
             // that killed. While a died-on leg is held, it follows the walker's
             // priced route as a place walk, and the creature is handed over
             // when the route is spent (RouteLeg answers `pos` itself then).
+            //
+            // AND WHILE ITS ROUTE GOES ROUND A DANGEROUS ZONE (#1243), for the
+            // same reason: upstream's mover would walk straight across it.
+            std::uint32_t const zonesRound =
+                entry ? ZonesCreatureWalkGoesRound(bot, pos, state, name, target) : 0;
             bool const steered = OverseerDecisions::SteerCreatureWalkAlongRoute(
-                entry != 0, DiedOnLegsHeldBy(bot->GetName(), std::time(nullptr)));
+                entry != 0, DiedOnLegsHeldBy(bot->GetName(), std::time(nullptr)) + zonesRound);
             WorldPosition const leg =
                 entry && !steered ? pos : RouteLeg(bot, pos, state, name, target);
             // The creature the mover is handed: none while a steered walk is
@@ -31715,7 +31997,7 @@ private:
                 bot, grave, corpseMap, corpseX, corpseY, corpseZ,
                 GraveyardEvidenceFor(name, corpseMap, corpseX, corpseY,
                                      KillerEntryAt(name, corpseMap, corpseX, corpseY)),
-                refused);
+                refused, /*acceptHighGround*/ true);
             // No safe graveyard on this map: the nearest stands. The bind point
             // is not an alternative, because reaching it would be a teleport
             // and a resurrection no player has (natural only), and a character
@@ -32176,6 +32458,10 @@ private:
         // the safety test; only healers standing at it count.
         bool healerRerouted{false};
         int64 healerWalkSeconds{GHOST_HEALER_WALK_SECONDS};
+        // When a ghost with no graveyard began to wait out its killer, and
+        // whether that wait ended at the refused healer (#1275).
+        int64 refusedHoldSince{0};
+        bool refusedHealerTaken{false};
         // How far the ghost stood from the healer's graveyard when the current
         // allowance began (-1 before the walk), and how often a walk still
         // closing on it was renewed (OverseerDecisions::GhostHealerWalkRenews,
@@ -33415,7 +33701,10 @@ private:
         facts.strongestNearCorpse = strongest;
         facts.liveThreatsNearCorpse = corpseDanger.threats;
         facts.ghostSeconds = static_cast<long>(now - ghostTime);
-        facts.healerGraveyardSafe = st.healerGrave && st.healerRefused.empty();
+        // A healer the walk never reached is no healer for a caller with no
+        // ladder to take over: the fallback below decides, not the corpse run.
+        facts.healerGraveyardSafe = st.healerGrave && st.healerRefused.empty() &&
+                                    (ladder || !st.healerWalkSpent);
         facts.choseHealer = st.choseHealer;
         // ON THE OTHER FACTION'S HOME GROUND THE CORPSE RUN IS THE TRAP. The
         // guards stand over the corpse and the graveyard alike, and no wait
@@ -33463,14 +33752,12 @@ private:
                      st.healerRefused.empty() ? "" : " refused: ", st.healerRefused);
         }
 
-        // A CALLER WITHOUT THE LADDER (the natural guilds) does not fall back
-        // to a corpse run after repeat deaths: it takes the spirit healer
-        // (OverseerDecisions::GuildGhostFallback, wow-overseer#586).
+        // A CALLER WITHOUT THE LADDER (the natural guilds) does not reclaim
+        // beside its killer: it waits it out, then takes the nearest healer
+        // (OverseerDecisions::RefusedHealerFallback, #1275).
         OverseerDecisions::GhostRecovery choice = verdict.choice;
         if (choice == OverseerDecisions::GhostRecovery::Ladder && !ladder)
-            choice = OverseerDecisions::GuildGhostFallback(
-                st.deathsHere, st.healerGrave != nullptr && facts.healerGraveyardSafe,
-                GHOST_RECOVERY_LIMITS.repeatDeaths);
+            choice = RefusedHealerStep(bot, name, st, facts, now);
 
         switch (choice)
         {
@@ -33517,13 +33804,64 @@ private:
         return WalkGhostToSpiritHealer(bot, botAI, name, st, ladder, now);
     }
 
+    // One poll of a guild ghost whose healer is refused or out of reach. The
+    // hold is timed from the first poll that held it, and said once.
+    OverseerDecisions::GhostRecovery RefusedHealerStep(
+        Player* bot, std::string const& name, GhostRecoveryState& st,
+        OverseerDecisions::GhostRecoveryFacts const& ghost, int64 now)
+    {
+        OverseerDecisions::RefusedHealerFacts facts;
+        facts.deathsHere = ghost.deathsHere;
+        facts.level = ghost.level;
+        facts.strongestNearCorpse = ghost.strongestNearCorpse;
+        facts.liveThreatsNearCorpse = ghost.liveThreatsNearCorpse;
+        facts.heldSeconds = st.refusedHoldSince ? now - st.refusedHoldSince : 0;
+        facts.holdSeconds = GHOST_REFUSED_HOLD_SECONDS;
+        GraveyardStruct const* const nearest = sGraveyard->GetClosestGraveyard(bot, bot->GetTeamId());
+        facts.healerKnown = nearest && nearest->Map == bot->GetMapId();
+        facts.healerWalkFailed = st.refusedHealerTaken && st.healerWalkSpent;
+        OverseerDecisions::GhostRecovery const step =
+            OverseerDecisions::RefusedHealerFallback(facts, GHOST_RECOVERY_LIMITS);
+        if (step == OverseerDecisions::GhostRecovery::Wait && !st.refusedHoldSince)
+        {
+            st.refusedHoldSince = now;
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' (level {}) has no graveyard it can take and {} hostile(s) "
+                     "stand at its corpse - the ghost waits them out for up to {}s instead of "
+                     "reclaiming there. Refused: {}",
+                     name, ghost.level, ghost.liveThreatsNearCorpse, GHOST_REFUSED_HOLD_SECONDS,
+                     st.healerRefused.empty() ? "its walk to a healer ran out" : st.healerRefused);
+        }
+        if (step == OverseerDecisions::GhostRecovery::SpiritHealer && !st.refusedHealerTaken)
+        {
+            // The walk starts over, to the nearest healer this time.
+            st.refusedHealerTaken = true;
+            st.healerGrave = nearest;
+            st.healerRerouted = false;
+            st.healerWalkSpent = false;
+            st.choseHealer = false;
+            st.healerWalkIssued = false;
+            st.healerWalkRenewals = 0;
+            st.healerWalkFromYards = -1.f;
+            st.healerWalkSeconds = OverseerDecisions::GhostHealerWalkSeconds(
+                bot->GetExactDist2d(nearest->x, nearest->y), GHOST_HEALER_WALK_SECONDS);
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' (level {}) waited {}s and its killers still stand at its "
+                     "corpse - it takes the refused spirit healer at '{}' rather than reclaim "
+                     "there",
+                     name, ghost.level, facts.heldSeconds, nearest->name);
+        }
+        return step;
+    }
+
     // THE NEAREST GRAVEYARD FAILED THE SAFETY TEST: LOOK FOR ANOTHER ON THIS
     // MAP, the way the stuck-revival ladder does (SafeGraveyardNear). On
     // wow-dev 2026-10-10 seven Horde members died 318 times in six hours at one
     // Hillsbrad graveyard to Alliance footmen, each revived into them by the
     // healer this guild path took anyway. The ghost walks to the other
-    // graveyard's healer; nothing is granted. With none that passes, the
-    // nearest stands as before.
+    // graveyard's healer; nothing is granted. The safest in reach counts: one
+    // refused for high ground alone beats one beside a spawn (#1275). With
+    // neither, the nearest stands refused, which is said here once a death.
     void RerouteHealerGraveyard(Player* bot, std::string const& name, GhostRecoveryState& st,
                                 Corpse* corpse, GraveyardEvidence const& evidence)
     {
@@ -33531,10 +33869,16 @@ private:
         GraveyardStruct const* const nearest = st.healerGrave;
         GraveyardStruct const* const safe =
             SafeGraveyardNear(bot, nearest, st.mapId, st.corpseX, st.corpseY,
-                              corpse->GetPositionZ(), evidence, refused);
+                              corpse->GetPositionZ(), evidence, refused,
+                              /*acceptHighGround*/ true);
         if (OverseerDecisions::PickGuildHealerGraveyard(false, safe != nullptr) !=
             OverseerDecisions::GuildHealerGraveyard::Alternative)
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' (level {}) has no reachable graveyard it can stand at: {}",
+                     name, bot->GetLevel(), refused);
             return;
+        }
         st.healerGrave = safe;
         st.healerRefused.clear();
         st.healerRerouted = true;
@@ -33594,11 +33938,12 @@ private:
             st.healerWalkSpent = true;
             if (!ladder)
             {
-                ReturnCorpseRun(botAI, st);
+                // The next poll's RefusedHealerFallback says what follows, so a
+                // spent walk does not by itself reclaim beside the killer.
                 LOG_WARN("module.overseer",
                          "overseer: '{}' chose the spirit healer at '{}' {}s ago and never "
-                         "stood at one ({:.0f} yards short, {} renewal(s)) - the corpse run "
-                         "goes back to the dead engine",
+                         "stood at one ({:.0f} yards short, {} renewal(s)) - its corpse is "
+                         "judged again",
                          name, st.healerGrave->name, now - st.healerSince, healerYards,
                          st.healerWalkRenewals);
                 return false;
@@ -37055,7 +37400,7 @@ private:
     // hearth is in play, which is what holds adoption back.
     bool DriveExitHearths(std::string const& family, std::string const& leaderName,
                           std::vector<std::string> const& members, ExitHearthEpisode& episode,
-                          char const* phase)
+                          char const* phase, char const* reason)
     {
         using OverseerDecisions::ExitHearthStep;
 
@@ -37108,10 +37453,10 @@ private:
                     {
                         LOG_WARN("module.overseer",
                                  "overseer: EXIT HEARTH - '{}' is hearthing out of map {} "
-                                 "(attempt {} of {}) because the walk to the exit door "
-                                 "failed; the campaign stays as it is and the next run "
+                                 "(attempt {} of {}) because {}; the campaign stays as it is "
+                                 "and the next run "
                                  "starts normally",
-                                 name, episode.mapId, episode.attempts[name],
+                                 name, episode.mapId, episode.attempts[name], reason,
                                  OverseerDecisions::EXIT_HEARTH_ATTEMPTS);
                         if (OverseerDecisions::OffContinentHearthLetThrough(facts))
                             LOG_WARN("module.overseer",
@@ -37125,7 +37470,7 @@ private:
                             family, leaderName, name, episode, phase, "exit_hearth",
                             "hearth cast for " + name + " on map " +
                                 std::to_string(episode.mapId) +
-                                " after EXIT could not walk the party out (attempt " +
+                                " after " + reason + " (attempt " +
                                 std::to_string(episode.attempts[name]) + ")");
                     }
                     else
@@ -37220,6 +37565,7 @@ private:
         yard.hearth.campaignId = run.campaignId;
         yard.hearth.runNumber = run.runNumber;
         yard.hearth.portal = portal.keyword;
+        yard.hearth.mapId = OverseerDecisions::STRATHOLME_EXIT_YARD_MAP_ID;
         yard.hearth.doorMapKnown = true;
         yard.hearth.doorMapId = portal.outsideMapId;
         yard.hearth.walkFailingSince = yard.since;
@@ -37383,7 +37729,7 @@ private:
                 if (!yard.hearth.since)
                     yard.hearth.since = now;
                 if (DriveExitHearths(family, leaderName, hearthers, yard.hearth,
-                                     "STRATHOLME_YARD"))
+                                     "STRATHOLME_YARD", "leaving the Stratholme exit yard"))
                     return true;
                 LOG_WARN("module.overseer",
                          "overseer: stratholme exit: no hearth is left in play for the {} of "
@@ -38705,6 +39051,9 @@ private:
                 // AreaTrigger::y  ObjectMgr.h:427  float y
                 // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
                 state.distanceFromDoor = member->GetDistance2d(door->x, door->y);
+                state.insideDoor = OverseerDecisions::InsideAreaTrigger(
+                    TriggerShapeOf(*door), member->GetPositionX(), member->GetPositionY(),
+                    member->GetPositionZ(), 0.f);
             }
 
             states.push_back(state);
@@ -38821,10 +39170,12 @@ private:
         // A surface can be above the routed floor (#1269). Keep the original
         // x/y and arrival radius; a nearby mesh height is usable only when its
         // nearest point is inside this trigger, the arrival still fits, and the
-        // ordinary route check accepts the resulting aim. The query only reads
-        // this member's actual instance. Missing mesh keeps the surface answer.
+        // checked route plan accepts the resulting aim. Each walking leg still
+        // passes the ordinary mover check. The query only reads this member's
+        // actual instance. Missing mesh keeps the surface answer.
         OverseerDecisions::AreaTriggerShape const shape = TriggerShapeOf(*door);
-        if (haveGround && !NavmeshRoutes(onDoorMap, door->x, door->y, ground))
+        if (haveGround && !NavmeshRoutes(onDoorMap, door->x, door->y, ground) &&
+            !PlanNavmeshRoute(onDoorMap, door->x, door->y, ground))
         {
             auto const* query = map->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
             if (query)
@@ -38845,7 +39196,8 @@ private:
                         OverseerDecisions::DoorAimOnTheFloor(
                             true, nearest[1], arrivalYards, shape);
                     if (routed.grounded &&
-                        NavmeshRoutes(onDoorMap, door->x, door->y, routed.z))
+                        (NavmeshRoutes(onDoorMap, door->x, door->y, routed.z) ||
+                         PlanNavmeshRoute(onDoorMap, door->x, door->y, routed.z)))
                         return routed;
                 }
             }
@@ -39400,7 +39752,8 @@ private:
             episode.campaignId = coord.campaignId;
             episode.runNumber = coord.runNumber;
             episode.portal = coord.portalKeyword;
-            DriveExitHearths(family, leaderName, hearthers, episode, splitCopy ? "SPLIT" : "RESET");
+            DriveExitHearths(family, leaderName, hearthers, episode,
+                             splitCopy ? "SPLIT" : "RESET", "the walk out failed");
         }
 
         // AND THE DOOR IS KNOCKED ON AT POLL RATE, NOT ONLY ON ARRIVAL, which
@@ -47846,6 +48199,8 @@ private:
                                    coord->second.phase == DungeonRunPhase::Clearing;
         // GetDistance2d  Object.h:538  float GetDistance2d(float x, float y) const
         facts.yardsFromDoor = p->GetDistance2d(door->x, door->y);
+        facts.insideDoor = OverseerDecisions::InsideAreaTrigger(
+            shape, p->GetPositionX(), p->GetPositionY(), p->GetPositionZ(), 0.f);
         OverseerDecisions::DoorRejoinStep const step = OverseerDecisions::DecideDoorRejoin(
             facts, std::max(DUNGEON_DOORSTEP_RADIUS_YARDS, arriveWithin));
 
@@ -52639,7 +52994,7 @@ private:
                                                    episode.attempts[standin.outName]))
             {
                 DriveExitHearths(standin.family, standin.outName, {standin.outName}, episode,
-                                 "SIT-OUT");
+                                 "SIT-OUT", "the walk out failed");
                 continue;
             }
             std::ostringstream aim;
@@ -53919,7 +54274,8 @@ private:
                     if (!activeInside)
                         return;  // an unseen member is not proof of an exit
                     if (activeInside && activeInside->GetMapId() == episode->second.mapId &&
-                        DriveExitHearths(family, leaderName, members, episode->second, "IDLE"))
+                        DriveExitHearths(family, leaderName, members, episode->second, "IDLE",
+                                         "the walk out failed"))
                         return;
                     if (activeInside && activeInside->GetMapId() == episode->second.mapId)
                         LOG_WARN("module.overseer",
@@ -56259,8 +56615,9 @@ private:
                             episode.runNumber = coord.runNumber;
                             episode.portal = coord.portalKeyword;
                             episode.since = std::time(nullptr);
-                            bool const inPlay =
-                                DriveExitHearths(family, leaderName, members, episode, "EXIT");
+                            bool const inPlay = DriveExitHearths(
+                                family, leaderName, members, episode, "EXIT",
+                                "the walk to the exit door failed");
                             if (inPlay)
                             {
                                 LOG_WARN("module.overseer",
@@ -64541,10 +64898,39 @@ private:
 
         // Where it will go, asked with the same call and the same count the
         // core will use, so this answer and the core's are the same answer.
+        uint8 equipSlot = NULL_SLOT;
         {
             ItemPosCountVec dest;
-            InventoryResult const msg = buyer->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest,
-                                                              request.entry, uint32(ev.itemsWanted));
+            InventoryResult msg = buyer->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest,
+                                                         request.entry, uint32(ev.itemsWanted));
+            // A bag cures a full inventory without landing in it first (#1278).
+            // Only an empty general-bag position is considered; the core still
+            // decides whether this character can equip the purchased item.
+            if (msg == EQUIP_ERR_INVENTORY_FULL && ev.itemsWanted == 1 &&
+                proto->Class == ITEM_CLASS_CONTAINER &&
+                proto->SubClass == ITEM_SUBCLASS_CONTAINER &&
+                proto->InventoryType == INVTYPE_BAG && proto->ContainerSlots > 0)
+            {
+                for (uint8 slot = INVENTORY_SLOT_BAG_START; slot < INVENTORY_SLOT_BAG_END; ++slot)
+                {
+                    if (buyer->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                        continue;
+                    uint16 position = 0;
+                    msg = buyer->CanEquipNewItem(slot, position, request.entry, false);
+                    if (msg == EQUIP_ERR_OK)
+                    {
+                        if (position == uint16((uint16(INVENTORY_SLOT_BAG_0) << 8) | slot))
+                        {
+                            equipSlot = slot;
+                            // AI-REVIEW 2026-10-31 [poolside/laguna-s-2.1] C4431594205
+                            // (single-model review, PR #1279): only stop at a legal position.
+                            break;
+                        }
+                        else
+                            msg = EQUIP_ERR_ITEM_DOESNT_GO_TO_SLOT;
+                    }
+                }
+            }
             ev.haveInventoryResult = true;
             ev.inventoryResult = msg;
             if (msg != EQUIP_ERR_OK)
@@ -64568,6 +64954,20 @@ private:
         // reads (ItemPackets.cpp). THE SLOT IS SENT PLUS ONE: the client
         // numbers vendor slots from 1 and HandleBuyItemOpcode decrements before
         // it does anything, treating a 0 as a cheat and returning.
+        if (equipSlot != NULL_SLOT)
+        {
+            WorldPacket raw(CMSG_BUY_ITEM_IN_SLOT, 8 + 4 + 4 + 8 + 1 + 4);
+            raw << vendor->GetGUID();
+            raw << uint32(request.entry);
+            raw << uint32(uint32(ev.vendorSlot) + 1);
+            raw << buyer->GetGUID();
+            raw << equipSlot;
+            raw << uint32(request.count);
+            WorldPackets::Item::BuyItemInSlot packet(std::move(raw));
+            packet.Read();
+            session->HandleBuyItemInSlotOpcode(packet);
+        }
+        else
         {
             WorldPacket raw(CMSG_BUY_ITEM, 8 + 4 + 4 + 4 + 1);
             raw << vendor->GetGUID();
@@ -64588,6 +64988,15 @@ private:
         if (line->maxcount != 0)
             ev.stockLeft = int32(vendor->GetVendorItemCurrentCount(line));
 
+        if (equipSlot != NULL_SLOT)
+        {
+            Item const* worn = buyer->GetItemByPos(INVENTORY_SLOT_BAG_0, equipSlot);
+            if (!worn || worn->GetEntry() != request.entry)
+            {
+                describe("refused", "the purchased bag did not arrive in its equipment slot");
+                return "the purchased bag did not arrive in its equipment slot";
+            }
+        }
         if (ev.carriedAfter == ev.carriedBefore && ev.moneyAfter == ev.moneyBefore)
         {
             describe("refused", "the core refused the purchase");
