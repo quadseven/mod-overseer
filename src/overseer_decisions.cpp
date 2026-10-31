@@ -18534,12 +18534,37 @@ std::string FocusSpawnAim(FocusSpawn const& spawn)
            "," + whole(spawn.z);
 }
 
-GhostRecovery GuildGhostFallback(unsigned deathsHere, bool healerGraveKnown,
-                                 unsigned repeatDeaths)
+GhostRecovery RefusedHealerFallback(RefusedHealerFacts const& facts,
+                                    GhostRecoveryLimits const& limits)
 {
-    if (healerGraveKnown && deathsHere >= repeatDeaths)
-        return GhostRecovery::SpiritHealer;
-    return GhostRecovery::CorpseRun;
+    bool const repeat = limits.repeatDeaths && facts.deathsHere >= limits.repeatDeaths;
+    bool const outlevelled = facts.strongestNearCorpse &&
+                             facts.strongestNearCorpse >= facts.level + limits.levelGap;
+    if ((!repeat && !outlevelled) || facts.liveThreatsNearCorpse == 0)
+        return GhostRecovery::CorpseRun;
+    if (facts.heldSeconds < facts.holdSeconds || !facts.healerKnown || facts.healerWalkFailed)
+        return GhostRecovery::Wait;
+    return GhostRecovery::SpiritHealer;
+}
+
+GraveyardStanding JudgeGraveyard(bool highGround, PlaceDangerReason danger)
+{
+    if (danger != PlaceDangerReason::Safe)
+        return GraveyardStanding::Dangerous;
+    return highGround ? GraveyardStanding::HighGroundOnly : GraveyardStanding::Passes;
+}
+
+std::size_t PickSafestGraveyard(std::vector<GraveyardStanding> const& standings)
+{
+    std::size_t highGround = standings.size();
+    for (std::size_t i = 0; i < standings.size(); ++i)
+    {
+        if (standings[i] == GraveyardStanding::Passes)
+            return i;
+        if (standings[i] == GraveyardStanding::HighGroundOnly && highGround == standings.size())
+            highGround = i;
+    }
+    return highGround;
 }
 
 GuildHealerGraveyard PickGuildHealerGraveyard(bool nearestSafe, bool alternativeFound)

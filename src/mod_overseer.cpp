@@ -783,6 +783,10 @@ constexpr float GHOST_CORPSE_THREAT_RADIUS = float(CORPSE_RECLAIM_RADIUS);
 // ladder is left to take it. A released ghost starts at the graveyard, so this
 // is a walk back of however far the dead engine carried it in one poll.
 constexpr int64 GHOST_HEALER_WALK_SECONDS = 120;
+// How long a ghost with no graveyard to take waits out its killer before it
+// takes the nearest healer anyway (OverseerDecisions::RefusedHealerFallback).
+// Twenty minutes a death is three deaths an hour at worst.
+constexpr int64 GHOST_REFUSED_HOLD_SECONDS = 20 * 60;
 constexpr int64 SPIRIT_HEALER_SICKNESS_SECONDS = 600;
 // How far round the ghost to look for the spirit healer itself.
 constexpr float GHOST_HEALER_SWEEP_YARDS = 60.0f;
@@ -1212,15 +1216,16 @@ struct GraveyardEvidence
 //
 //   FindBaseMap   MapMgr.h:44   Map* FindBaseMap(uint32 mapId) const
 //   GetPhaseMask  Object.h:517  uint32 GetPhaseMask() const
+//
+// `standing`, when given, says whether the ground alone refused it (#1275).
 static std::string GraveyardRefusal(Player* bot, GraveyardStruct const& g,
-                                    GraveyardEvidence const& evidence)
+                                    GraveyardEvidence const& evidence,
+                                    OverseerDecisions::GraveyardStanding* standing = nullptr)
 {
     uint32 const level = bot->GetLevel();
     Map* map = g.Map == bot->GetMapId() ? bot->GetMap() : sMapMgr->FindBaseMap(g.Map);
     int32 const areaLevel = AreaLevelAt(map, bot->GetPhaseMask(), g.x, g.y, g.z);
-    if (areaLevel > int32(level))
-        return "it stands on level " + std::to_string(areaLevel) + " ground and the character is level " +
-               std::to_string(level);
+    bool const highGround = areaLevel > int32(level);
 
     std::vector<CreatureTemplate const*> templates;
     OverseerDecisions::PlaceDangerFacts facts;
@@ -1236,6 +1241,11 @@ static std::string GraveyardRefusal(Player* bot, GraveyardStruct const& g,
         evidence.deaths, time(nullptr), g.Map, g.x, g.y, GHOST_REPEAT_RADIUS, GHOST_REPEAT_MINUTES);
     facts.repeatDeaths = GHOST_RECOVERY_LIMITS.repeatDeaths;
     OverseerDecisions::PlaceDanger const danger = OverseerDecisions::JudgePlaceDanger(facts);
+    if (standing)
+        *standing = OverseerDecisions::JudgeGraveyard(highGround, danger.reason);
+    if (highGround)
+        return "it stands on level " + std::to_string(areaLevel) + " ground and the character is level " +
+               std::to_string(level);
 
     std::string const deaths = std::to_string(facts.deathsNear) + " death(s) within " +
                                std::to_string(uint32(GHOST_REPEAT_RADIUS)) + " yards in " +
@@ -1262,7 +1272,10 @@ static std::string GraveyardRefusal(Player* bot, GraveyardStruct const& g,
 // it passes, else the nearest of the core's own alternatives for this corpse
 // that does, else null (the caller goes to the bind point). `evidence` is
 // the character's own (GraveyardEvidenceFor). `refused` collects every
-// refusal, so the log line can say why.
+// refusal, so the log line can say why. `acceptHighGround` is for a ghost that
+// needs a healer: past those, the nearest refused for high ground alone counts
+// (OverseerDecisions::PickSafestGraveyard, #1275). A living member walking to
+// safe ground leaves it false.
 //
 // Members read at the pinned core:
 //   GetGraveyardData          GameGraveyard.h:62  GraveyardContainer const&
@@ -1273,12 +1286,22 @@ static std::string GraveyardRefusal(Player* bot, GraveyardStruct const& g,
 static GraveyardStruct const* SafeGraveyardNear(Player* bot, GraveyardStruct const* nearest,
                                                 uint32 corpseMap, float cx, float cy, float cz,
                                                 GraveyardEvidence const& evidence,
-                                                std::string& refused)
+                                                std::string& refused,
+                                                bool acceptHighGround = false)
 {
-    refused = GraveyardRefusal(bot, *nearest, evidence);
+    OverseerDecisions::GraveyardStanding standing{OverseerDecisions::GraveyardStanding::Dangerous};
+    refused = GraveyardRefusal(bot, *nearest, evidence, &standing);
     if (refused.empty())
         return nearest;
     refused = "'" + nearest->name + "': " + refused;
+    std::vector<GraveyardStruct const*> judged{nearest};
+    std::vector<OverseerDecisions::GraveyardStanding> standings{standing};
+    auto const safest = [&]() -> GraveyardStruct const* {
+        if (!acceptHighGround)
+            return nullptr;
+        std::size_t const pick = OverseerDecisions::PickSafestGraveyard(standings);
+        return pick < judged.size() ? judged[pick] : nullptr;
+    };
 
     // The corpse's zone and area, because that is what graveyard_zone keys
     // its links by (GameGraveyard.cpp:145-160): a graveyard linked to the
@@ -1287,7 +1310,7 @@ static GraveyardStruct const* SafeGraveyardNear(Player* bot, GraveyardStruct con
     // picked.
     Map* map = corpseMap == bot->GetMapId() ? bot->GetMap() : sMapMgr->FindBaseMap(corpseMap);
     if (!map)
-        return nullptr;
+        return safest();
     uint32 zoneId = 0;
     uint32 areaId = 0;
     map->GetZoneAndAreaId(bot->GetPhaseMask(), zoneId, areaId, cx, cy, cz);
@@ -1316,12 +1339,14 @@ static GraveyardStruct const* SafeGraveyardNear(Player* bot, GraveyardStruct con
         if (tried++ >= GRAVEYARD_CANDIDATES)
             break;
         GraveyardStruct const* g = candidate.second;
-        std::string const why = GraveyardRefusal(bot, *g, evidence);
+        std::string const why = GraveyardRefusal(bot, *g, evidence, &standing);
         if (why.empty())
             return g;
         refused += "; '" + g->name + "': " + why;
+        judged.push_back(g);
+        standings.push_back(standing);
     }
-    return nullptr;
+    return safest();
 }
 
 // A class the dungeon module elects to raise the dead (DcRezRecovery's
@@ -31965,7 +31990,7 @@ private:
                 bot, grave, corpseMap, corpseX, corpseY, corpseZ,
                 GraveyardEvidenceFor(name, corpseMap, corpseX, corpseY,
                                      KillerEntryAt(name, corpseMap, corpseX, corpseY)),
-                refused);
+                refused, /*acceptHighGround*/ true);
             // No safe graveyard on this map: the nearest stands. The bind point
             // is not an alternative, because reaching it would be a teleport
             // and a resurrection no player has (natural only), and a character
@@ -32426,6 +32451,10 @@ private:
         // the safety test; only healers standing at it count.
         bool healerRerouted{false};
         int64 healerWalkSeconds{GHOST_HEALER_WALK_SECONDS};
+        // When a ghost with no graveyard began to wait out its killer, and
+        // whether that wait ended at the refused healer (#1275).
+        int64 refusedHoldSince{0};
+        bool refusedHealerTaken{false};
         // How far the ghost stood from the healer's graveyard when the current
         // allowance began (-1 before the walk), and how often a walk still
         // closing on it was renewed (OverseerDecisions::GhostHealerWalkRenews,
@@ -33665,7 +33694,10 @@ private:
         facts.strongestNearCorpse = strongest;
         facts.liveThreatsNearCorpse = corpseDanger.threats;
         facts.ghostSeconds = static_cast<long>(now - ghostTime);
-        facts.healerGraveyardSafe = st.healerGrave && st.healerRefused.empty();
+        // A healer the walk never reached is no healer for a caller with no
+        // ladder to take over: the fallback below decides, not the corpse run.
+        facts.healerGraveyardSafe = st.healerGrave && st.healerRefused.empty() &&
+                                    (ladder || !st.healerWalkSpent);
         facts.choseHealer = st.choseHealer;
         // ON THE OTHER FACTION'S HOME GROUND THE CORPSE RUN IS THE TRAP. The
         // guards stand over the corpse and the graveyard alike, and no wait
@@ -33713,14 +33745,12 @@ private:
                      st.healerRefused.empty() ? "" : " refused: ", st.healerRefused);
         }
 
-        // A CALLER WITHOUT THE LADDER (the natural guilds) does not fall back
-        // to a corpse run after repeat deaths: it takes the spirit healer
-        // (OverseerDecisions::GuildGhostFallback, wow-overseer#586).
+        // A CALLER WITHOUT THE LADDER (the natural guilds) does not reclaim
+        // beside its killer: it waits it out, then takes the nearest healer
+        // (OverseerDecisions::RefusedHealerFallback, #1275).
         OverseerDecisions::GhostRecovery choice = verdict.choice;
         if (choice == OverseerDecisions::GhostRecovery::Ladder && !ladder)
-            choice = OverseerDecisions::GuildGhostFallback(
-                st.deathsHere, st.healerGrave != nullptr && facts.healerGraveyardSafe,
-                GHOST_RECOVERY_LIMITS.repeatDeaths);
+            choice = RefusedHealerStep(bot, name, st, facts, now);
 
         switch (choice)
         {
@@ -33767,13 +33797,64 @@ private:
         return WalkGhostToSpiritHealer(bot, botAI, name, st, ladder, now);
     }
 
+    // One poll of a guild ghost whose healer is refused or out of reach. The
+    // hold is timed from the first poll that held it, and said once.
+    OverseerDecisions::GhostRecovery RefusedHealerStep(
+        Player* bot, std::string const& name, GhostRecoveryState& st,
+        OverseerDecisions::GhostRecoveryFacts const& ghost, int64 now)
+    {
+        OverseerDecisions::RefusedHealerFacts facts;
+        facts.deathsHere = ghost.deathsHere;
+        facts.level = ghost.level;
+        facts.strongestNearCorpse = ghost.strongestNearCorpse;
+        facts.liveThreatsNearCorpse = ghost.liveThreatsNearCorpse;
+        facts.heldSeconds = st.refusedHoldSince ? now - st.refusedHoldSince : 0;
+        facts.holdSeconds = GHOST_REFUSED_HOLD_SECONDS;
+        GraveyardStruct const* const nearest = sGraveyard->GetClosestGraveyard(bot, bot->GetTeamId());
+        facts.healerKnown = nearest && nearest->Map == bot->GetMapId();
+        facts.healerWalkFailed = st.refusedHealerTaken && st.healerWalkSpent;
+        OverseerDecisions::GhostRecovery const step =
+            OverseerDecisions::RefusedHealerFallback(facts, GHOST_RECOVERY_LIMITS);
+        if (step == OverseerDecisions::GhostRecovery::Wait && !st.refusedHoldSince)
+        {
+            st.refusedHoldSince = now;
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' (level {}) has no graveyard it can take and {} hostile(s) "
+                     "stand at its corpse - the ghost waits them out for up to {}s instead of "
+                     "reclaiming there. Refused: {}",
+                     name, ghost.level, ghost.liveThreatsNearCorpse, GHOST_REFUSED_HOLD_SECONDS,
+                     st.healerRefused.empty() ? "its walk to a healer ran out" : st.healerRefused);
+        }
+        if (step == OverseerDecisions::GhostRecovery::SpiritHealer && !st.refusedHealerTaken)
+        {
+            // The walk starts over, to the nearest healer this time.
+            st.refusedHealerTaken = true;
+            st.healerGrave = nearest;
+            st.healerRerouted = false;
+            st.healerWalkSpent = false;
+            st.choseHealer = false;
+            st.healerWalkIssued = false;
+            st.healerWalkRenewals = 0;
+            st.healerWalkFromYards = -1.f;
+            st.healerWalkSeconds = OverseerDecisions::GhostHealerWalkSeconds(
+                bot->GetExactDist2d(nearest->x, nearest->y), GHOST_HEALER_WALK_SECONDS);
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' (level {}) waited {}s and its killers still stand at its "
+                     "corpse - it takes the refused spirit healer at '{}' rather than reclaim "
+                     "there",
+                     name, ghost.level, facts.heldSeconds, nearest->name);
+        }
+        return step;
+    }
+
     // THE NEAREST GRAVEYARD FAILED THE SAFETY TEST: LOOK FOR ANOTHER ON THIS
     // MAP, the way the stuck-revival ladder does (SafeGraveyardNear). On
     // wow-dev 2026-10-10 seven Horde members died 318 times in six hours at one
     // Hillsbrad graveyard to Alliance footmen, each revived into them by the
     // healer this guild path took anyway. The ghost walks to the other
-    // graveyard's healer; nothing is granted. With none that passes, the
-    // nearest stands as before.
+    // graveyard's healer; nothing is granted. The safest in reach counts: one
+    // refused for high ground alone beats one beside a spawn (#1275). With
+    // neither, the nearest stands refused, which is said here once a death.
     void RerouteHealerGraveyard(Player* bot, std::string const& name, GhostRecoveryState& st,
                                 Corpse* corpse, GraveyardEvidence const& evidence)
     {
@@ -33781,10 +33862,16 @@ private:
         GraveyardStruct const* const nearest = st.healerGrave;
         GraveyardStruct const* const safe =
             SafeGraveyardNear(bot, nearest, st.mapId, st.corpseX, st.corpseY,
-                              corpse->GetPositionZ(), evidence, refused);
+                              corpse->GetPositionZ(), evidence, refused,
+                              /*acceptHighGround*/ true);
         if (OverseerDecisions::PickGuildHealerGraveyard(false, safe != nullptr) !=
             OverseerDecisions::GuildHealerGraveyard::Alternative)
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' (level {}) has no reachable graveyard it can stand at: {}",
+                     name, bot->GetLevel(), refused);
             return;
+        }
         st.healerGrave = safe;
         st.healerRefused.clear();
         st.healerRerouted = true;
@@ -33844,11 +33931,12 @@ private:
             st.healerWalkSpent = true;
             if (!ladder)
             {
-                ReturnCorpseRun(botAI, st);
+                // The next poll's RefusedHealerFallback says what follows, so a
+                // spent walk does not by itself reclaim beside the killer.
                 LOG_WARN("module.overseer",
                          "overseer: '{}' chose the spirit healer at '{}' {}s ago and never "
-                         "stood at one ({:.0f} yards short, {} renewal(s)) - the corpse run "
-                         "goes back to the dead engine",
+                         "stood at one ({:.0f} yards short, {} renewal(s)) - its corpse is "
+                         "judged again",
                          name, st.healerGrave->name, now - st.healerSince, healerYards,
                          st.healerWalkRenewals);
                 return false;
