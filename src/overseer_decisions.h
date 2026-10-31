@@ -51,6 +51,7 @@
 #include <cstdio>
 #include <ctime>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -2589,6 +2590,10 @@ struct DungeonRunEntryState
     // On the dungeon map but in a different COPY of it than the head (#620).
     // Never `through`: see InAnotherInstanceCopy.
     bool otherCopy{false};
+    // A reachable edge of the actual trigger can be beyond the center's
+    // conservative doorstep radius. The native census measures containment;
+    // an absent reading retains the legacy distance gate for older callers.
+    std::optional<bool> insideDoor;
 };
 
 
@@ -10271,6 +10276,7 @@ struct DoorRejoinFacts
     bool runEscortHoldsIt{false};
     bool partyBelongsInside{false};
     float yardsFromDoor{-1.f};
+    std::optional<bool> insideDoor;
 };
 
 DoorRejoinStep DecideDoorRejoin(DoorRejoinFacts const& facts, float knockYards);
@@ -22654,7 +22660,7 @@ struct GhostRecoveryVerdict
 // Wherever rules 2 to 4 pick the spirit healer and its graveyard is unsafe,
 // the answer is Ladder instead: the ghost is still kept off the corpse, and
 // the existing revival ladder, which already knows how to refuse a graveyard,
-// takes it.
+// takes it. A caller without the ladder asks RefusedHealerFallback.
 GhostRecoveryVerdict DecideGhostRecovery(GhostRecoveryFacts const& facts,
                                          GhostRecoveryLimits const& limits = GhostRecoveryLimits{});
 
@@ -22795,20 +22801,59 @@ struct PlaceDanger
 
 PlaceDanger JudgePlaceDanger(PlaceDangerFacts const& facts);
 
-// A GUILD MEMBER THAT MAY NOT USE THE LADDER STILL LEAVES A DEATH LOOP. When the
-// ghost decision answers Ladder (the spirit healer's graveyard failed its safety
-// test) for a caller that does not run the stuck-revival ladder, the old
-// fallback was the corpse run: back to the killer. On wow-dev 2026-10-04 half of
-// 912 guild deaths an hour were repeat deaths at the same corpse
-// (wow-overseer#586). A player who has died twice in one place takes the spirit
-// healer, even at a graveyard that is not perfectly safe, rather than walk back
-// into the same mobs. Below `repeatDeaths` (or with no graveyard known) the
-// corpse run stands.
-GhostRecovery GuildGhostFallback(unsigned deathsHere, bool healerGraveKnown,
-                                 unsigned repeatDeaths);
+// A GHOST WITH NO HEALER TO TAKE IS NOT REVIVED BESIDE ITS KILLER (#1275). When
+// the ghost decision answers Ladder (the spirit healer's graveyard failed its
+// safety test) for a caller that does not run the stuck-revival ladder, the
+// answer used to be the corpse run. On wow-dev 2026-10-30 a level 34 guild member
+// with no errand died 313 times to level 45 Primitive Owlbeasts at the Shadra'Alor
+// graveyard: released beside its corpse, it reclaimed there, 26 yards from an
+// owlbeast spawn, every 2 to 3 minutes. The ghost is untouchable and the living
+// member is not, so:
+//
+//   1. Neither the repeat-death nor the outlevelled rule fired, or nothing the
+//      corpse danger test counts stands near the corpse now: corpse run.
+//   2. Held for less than `holdSeconds`: wait out the killer as a ghost.
+//   3. Held that long: the nearest healer, refused or not, so a ghost by a
+//      spawn that never moves is not parked forever. `healerWalkFailed` says
+//      this walk was already tried and never reached a healer: keep waiting.
+//
+// Rule 3 still never reclaims the corpse. With the default hold it costs at most
+// three deaths an hour, which is the ticket's bound of five at one spot.
+struct RefusedHealerFacts
+{
+    unsigned deathsHere{0};
+    uint32_t level{0};
+    uint32_t strongestNearCorpse{0};
+    unsigned liveThreatsNearCorpse{0};
+    int64_t heldSeconds{0};
+    int64_t holdSeconds{0};
+    bool healerKnown{false};
+    bool healerWalkFailed{false};
+};
+GhostRecovery RefusedHealerFallback(RefusedHealerFacts const& facts,
+                                    GhostRecoveryLimits const& limits = GhostRecoveryLimits{});
+
+// THE SAFEST GRAVEYARD IN REACH IS NOT ALWAYS ONE THAT PASSES (#1275). A
+// graveyard is refused for high ground alone when the ground outlevels the ghost
+// and nothing the danger test counts stands near it. For that level 34 member
+// every graveyard its zone links was refused, two of them with no spawn within
+// 60 yards. Ground with nothing on it kills nobody inside the ten seconds a
+// hearth takes, so a ghost that needs a healer takes it there before it takes
+// one beside a spawn. `Dangerous` is never picked.
+enum class GraveyardStanding : uint8_t
+{
+    Passes,
+    HighGroundOnly,
+    Dangerous,
+};
+GraveyardStanding JudgeGraveyard(bool highGround, PlaceDangerReason danger);
+
+// Index of the graveyard to take from `standings`, nearest first: the first that
+// passes, else the first refused for high ground alone, else `standings.size()`.
+std::size_t PickSafestGraveyard(std::vector<GraveyardStanding> const& standings);
 
 // A GUILD GHOST DOES NOT TAKE THE SPIRIT HEALER AT A GRAVEYARD THAT IS ITSELF
-// THE KILLER. GuildGhostFallback sends a repeat-death ghost to the nearest
+// THE KILLER. A guild fallback once sent a repeat-death ghost to the nearest
 // spirit healer "even at a graveyard that is not perfectly safe", and when that
 // graveyard stands among the other faction's guards the member is revived into
 // them and killed again within seconds. On wow-dev 2026-10-10 seven Horde
@@ -22875,7 +22920,7 @@ bool GhostHealerWalkRenews(float startYards, float nowYards, unsigned renewals);
 // recovery path brought guild members back to the same mobs: the corpse run,
 // the spirit healer at a graveyard beside the killer, the walk back from the
 // graveyard, the playerbots revive in place. On wow-dev 2026-10-04 after
-// GuildGhostFallback shipped, 311 guild deaths in 49 minutes were repeats and
+// that fallback shipped, 311 guild deaths in 49 minutes were repeats and
 // 161 of them a third or later death at one spot (wow-overseer#597). A player
 // who has died twice in one place stops, hearths, and comes back another way.
 // Hearth when `deathsHere` (deaths within the repeat radius of where the member
