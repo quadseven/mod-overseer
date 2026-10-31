@@ -94,6 +94,9 @@ public:
         : botAI(ai), checkInterval(interval), name(label) {}
     virtual Unit* Calculate() = 0;
     virtual Unit* Get();
+    virtual Unit* LazyGet() { return lastCheckTime ? value : Get(); }
+    virtual Unit*& RefGet() { Get(); return value; }
+    virtual void Set(Unit* unit) { value = unit; }
     void Reset() { lastCheckTime = 0; value = nullptr; }
     std::string getName() const { return name; }
 protected:
@@ -139,7 +142,21 @@ int main(int argc, char** argv) {
         require(selections == 1, "first selection missing");
         std::string scenario = argv[1];
         clockNow += 500;
-        if (scenario == "departed") {
+        if (scenario == "lazy-departed" || scenario == "ref-departed") {
+            registry.erase(ObjectGuid{2});
+            tank.poisoned = true;
+            Unit* selected = scenario == "lazy-departed" ? cached.LazyGet() : cached.RefGet();
+            require(selected == nullptr, "alternate read returned departed tank");
+        } else if (scenario == "set") {
+            cached.Set(&replacement);
+            require(cached.Get() == &replacement, "explicit cache setter ignored");
+            require(selections == 1, "setter changed selection cadence");
+        } else if (scenario == "lazy-expired") {
+            clockNow += 2000;
+            ai.candidate = &replacement;
+            require(cached.LazyGet() == &tank && selections == 1, "lazy read refreshed selection");
+            require(cached.Get() == &replacement && selections == 2, "normal read did not refresh");
+        } else if (scenario == "departed") {
             registry.erase(ObjectGuid{2});
             tank.poisoned = true;
             ai.candidate = nullptr;
@@ -209,9 +226,14 @@ class MainTankCachePatchTest(unittest.TestCase):
                 "float ThreatManager::GetThreat(Unit const* who, bool includeOffline) const",
             )
         )
-        signature = "Unit* PartyMemberMainTankValue::Get()"
-        if signature in source:
-            bodies += "\n\n" + function(source, signature)
+        for signature in (
+            "Unit* PartyMemberMainTankValue::Get()",
+            "Unit* PartyMemberMainTankValue::LazyGet()",
+            "Unit*& PartyMemberMainTankValue::RefGet()",
+            "void PartyMemberMainTankValue::Set(Unit* tank)",
+        ):
+            if signature in source:
+                bodies += "\n\n" + function(source, signature)
         harness = HARNESS.replace("// MAIN_TANK_CLASS", declaration)
         harness = harness.replace("// REAL_BODIES", bodies)
         harness = harness.replace(
@@ -247,6 +269,10 @@ class MainTankCachePatchTest(unittest.TestCase):
             "expired",
             "reset",
             "stable",
+            "lazy-departed",
+            "ref-departed",
+            "set",
+            "lazy-expired",
         ):
             with self.subTest(scenario=scenario):
                 result = subprocess.run(  # noqa: S603 - execute the replay with fixed scenarios

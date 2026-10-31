@@ -29,15 +29,23 @@ The native fixture replay executes the old and patched value path with the
 actual low-threat trigger, threat lookup and PlayerbotAI unit resolver bodies.
 
 diff --git a/src/Ai/Base/Value/PartyMemberValue.cpp b/src/Ai/Base/Value/PartyMemberValue.cpp
-index 1396f7f3..5c8c6973 100644
+index 1396f7f3..2af7dcb8 100644
 --- a/src/Ai/Base/Value/PartyMemberValue.cpp
 +++ b/src/Ai/Base/Value/PartyMemberValue.cpp
-@@ -170,3 +170,20 @@ Unit* PartyMemberMainTankValue::Calculate()
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include "PartyMemberValue.h"
++#include "AiObjectContext.h"
+ #include "Corpse.h"
+ #include "Group.h"
+ #include "Pet.h"
+@@ -170,3 +171,38 @@ Unit* PartyMemberMainTankValue::Calculate()
      FindMainTankPlayer findMainTankPlayer;
      return FindPartyMember(findMainTankPlayer);
  }
 +
-+// Keep identity across cache reads, never a member pointer that can leave the map.
++// Resolve identity before each read; a cached member address can outlive its object.
 +Unit* PartyMemberMainTankValue::Get()
 +{
 +    uint32 const now = getMSTime();
@@ -46,22 +54,43 @@ index 1396f7f3..5c8c6973 100644
 +        lastCheckTime = now;
 +        PerfMonitorOperation* pmo = sPerfMonitor.start(
 +            PERF_MON_VALUE, this->getName(), this->context ? &this->context->performanceStack : nullptr);
-+        Unit* tank = Calculate();
-+        tankGuid = tank ? tank->GetGUID() : ObjectGuid::Empty;
++        Set(Calculate());
 +        if (pmo)
 +            pmo->finish();
 +    }
-+    return botAI->GetUnit(tankGuid);
++    return value = botAI->GetUnit(tankGuid);
++}
++
++Unit* PartyMemberMainTankValue::LazyGet()
++{
++    if (!lastCheckTime)
++        return Get();
++    return value = botAI->GetUnit(tankGuid);
++}
++
++Unit*& PartyMemberMainTankValue::RefGet()
++{
++    Get();
++    return value;
++}
++
++void PartyMemberMainTankValue::Set(Unit* tank)
++{
++    tankGuid = tank ? tank->GetGUID() : ObjectGuid::Empty;
++    value = tank;
 +}
 diff --git a/src/Ai/Base/Value/PartyMemberValue.h b/src/Ai/Base/Value/PartyMemberValue.h
-index bdde26d0..2eb1b2ad 100644
+index bdde26d0..972a296d 100644
 --- a/src/Ai/Base/Value/PartyMemberValue.h
 +++ b/src/Ai/Base/Value/PartyMemberValue.h
-@@ -46,6 +46,10 @@ class PartyMemberMainTankValue : public PartyMemberValue
+@@ -46,6 +46,13 @@ class PartyMemberMainTankValue : public PartyMemberValue
  public:
      PartyMemberMainTankValue(PlayerbotAI* botAI) : PartyMemberValue(botAI, "main tank member", 2 * IN_MILLISECONDS) {}
      virtual Unit* Calculate();
 +    Unit* Get() override;
++    Unit* LazyGet() override;
++    Unit*& RefGet() override;
++    void Set(Unit* tank) override;
 +
 +private:
 +    ObjectGuid tankGuid;

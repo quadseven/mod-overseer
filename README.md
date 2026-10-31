@@ -91,6 +91,7 @@ commands from the repo root with the runner's own `g++` and `python3`:
 
 ```sh
 python3 -B tests/replay_exit_hearth_finalization.py
+python3 -B tests/replay_travel_claim_cache.py
 python3 -B tests/replay_main_tank_cache.py
 g++ -std=c++17 -Wall -Wextra -Isrc -c src/overseer_decisions.cpp -o overseer_decisions.o
 for test in tests/test_*.cpp; do
