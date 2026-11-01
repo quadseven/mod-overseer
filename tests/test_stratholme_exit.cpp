@@ -26,25 +26,12 @@ using OverseerDecisions::StratholmeYardPortalIndex;
 using OverseerDecisions::StratholmeExitFacts;
 using OverseerDecisions::StratholmeExitWay;
 using OverseerDecisions::StratholmeExitWayWord;
+using OverseerDecisions::StratholmeYardMemberCanWalk;
 
 namespace
 {
 
 int failures = 0;
-
-struct YardMember
-{
-    char const* name;
-    bool alive;
-};
-
-int SelectYardWalker(YardMember const* members, int count, char const* leaderName)
-{
-    for (int i = 0; i < count; ++i)
-        if (std::string(members[i].name) == leaderName && members[i].alive)
-            return i;
-    return -1;
-}
 
 void CheckBool(char const* what, bool got, bool want)
 {
@@ -92,28 +79,27 @@ std::string ReadModule()
 
 int main()
 {
-    YardMember const followersOnly[] = {{"follower-a", true}, {"follower-b", true}};
-    CheckBool("leader outside leaves every yard member without a walker",
-              SelectYardWalker(followersOnly, 2, "leader") == -1, true);
+    CheckBool("leader outside leaves each yard follower without a walker",
+              !StratholmeYardMemberCanWalk(false, true) &&
+                  !StratholmeYardMemberCanWalk(false, true), true);
     CheckWay("followers with a ready hearth take the hearth branch",
              DecideStratholmeExit(StratholmeExitFacts{false, false, true}),
              StratholmeExitWay::Hearth);
     CheckWay("followers without a ready hearth hold",
              DecideStratholmeExit(StratholmeExitFacts{}), StratholmeExitWay::None);
 
-    YardMember const deadLeader[] = {{"leader", false}, {"follower-a", true},
-                                     {"follower-b", true}};
-    CheckBool("dead leader leaves every yard member without a walker",
-              SelectYardWalker(deadLeader, 3, "leader") == -1, true);
+    CheckBool("dead leader and each follower cannot walk the yard exit",
+              !StratholmeYardMemberCanWalk(true, false) &&
+                  !StratholmeYardMemberCanWalk(false, true) &&
+                  !StratholmeYardMemberCanWalk(false, true), true);
     CheckBool("dead leader's followers can take the hearth branch",
               DecideStratholmeExit(StratholmeExitFacts{false, false, true}) ==
                   StratholmeExitWay::Hearth,
               true);
 
-    YardMember const leaderPresent[] = {{"leader", true}, {"follower-a", true},
-                                        {"follower-b", true}};
-    CheckBool("living leader is the only selected yard walker",
-              SelectYardWalker(leaderPresent, 3, "leader") == 0, true);
+    CheckBool("living leader alone can walk the yard exit",
+              StratholmeYardMemberCanWalk(true, true) &&
+                  !StratholmeYardMemberCanWalk(false, true), true);
     // door open means walk
     {
         StratholmeExitFacts facts;
@@ -364,12 +350,8 @@ int main()
                   source.find("if (DriveStratholmeYard(family, leaderName, members))") !=
                       std::string::npos,
                   true);
-        std::size_t const leaderFilter = driveSource.find("if (member->GetName() != leaderName)");
-        std::size_t const aliveGate = driveSource.find("if (leaderAlive)", leaderFilter);
-        std::size_t const walkerAssignment = driveSource.find("walker = member;", aliveGate);
-        CheckBool("production selects only the living leader from yard members",
-                  leaderFilter != std::string::npos && aliveGate > leaderFilter &&
-                      walkerAssignment > aliveGate &&
+        CheckBool("production uses the tested living-leader yard-walker decision",
+                  driveSource.find("StratholmeYardMemberCanWalk(") != std::string::npos &&
                       driveSource.find("Player* walker = inYard.front()") == std::string::npos,
                   true);
         std::size_t const missingLeader = driveSource.find("if (!walker)");

@@ -27865,6 +27865,9 @@ struct StratholmeExitFacts
 
 StratholmeExitWay DecideStratholmeExit(StratholmeExitFacts const& facts);
 
+// Only the living family leader can walk the yard exit or press its button.
+bool StratholmeYardMemberCanWalk(bool isLeader, bool alive);
+
 char const* StratholmeExitWayWord(StratholmeExitWay way);
 
 // The run's exit trigger whose landing is the yard, and the two gameobjects in

@@ -37769,13 +37769,10 @@ private:
         }
 
         Player* walker = nullptr;
-        bool leaderAlive = false;
         for (Player* member : inYard)
         {
-            if (member->GetName() != leaderName)
-                continue;
-            leaderAlive = member->IsAlive();
-            if (leaderAlive)
+            if (OverseerDecisions::StratholmeYardMemberCanWalk(
+                    member->GetName() == leaderName, member->IsAlive()))
                 walker = member;
         }
         std::vector<std::string> const hearthers = StratholmeHearthers(inYard);
