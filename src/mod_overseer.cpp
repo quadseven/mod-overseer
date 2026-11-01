@@ -260,6 +260,7 @@
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
 #include "Creature.h"
+#include "Spell.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "Timer.h"
@@ -315,6 +316,8 @@
 // header so that something other than this translation unit can reach them -
 // see overseer_decisions.h for why that was worth a file.
 #include "overseer_decisions.h"
+#include "overseer_disenchant.h"
+#include "overseer_disenchant_store.h"
 #include "overseer_crash.h"
 // The core and mod-playerbots APIs that differ between the pins build.yml
 // compiles against and the upstream heads (wow-overseer#826).
@@ -8264,6 +8267,8 @@ public:
 
     void OnStartup() override
     {
+        if (!_disenchantStore.Start(sConfigMgr->GetOption<std::string>("CharacterDatabaseInfo", "")))
+            LOG_ERROR("module.overseer", "overseer: disenchant queue database unavailable; no disenchant casts will run");
         RestoreGuildRunFinderDungeons();
         RestoreFamilyRunFinderDungeons();
         RestoreTravelRefusals();
@@ -8299,6 +8304,7 @@ public:
     // pool closes, so these writes land.
     void OnShutdown() override
     {
+        _disenchantStore.Stop();
         LOG_INFO("module.overseer",
                  "overseer: gear slot shadows seeded for {} characters; {} equips answered unknown",
                  g_wornSeedCount.load(), g_wornUnknownEquipCount.load());
@@ -8370,6 +8376,14 @@ public:
     void OnUpdate(uint32 diff) override
     {
         _shareSweepQuery.ProcessReadyCallbacks();
+        _disenchantQueries.ProcessReadyCallbacks();
+        _disenchantTimer += diff;
+        if (_disenchantTimer >= 1000)
+        {
+            _disenchantTimer = 0;
+            DriveDisenchant();
+            ReadDisenchantCommands();
+        }
         _commandTimer += diff;
         _snapshotTimer += diff;
         _movementTimer += diff;
@@ -16540,6 +16554,427 @@ private:
         return !plan.recipeSpell || BuyNamedRecipe(name, bot, entry, plan.recipeSpell);
     }
 
+    struct DisenchantTask
+    {
+        std::string name;
+        std::string job;
+        bool enabled = false;
+        bool completing = false;
+        std::string refusal;
+    };
+
+    struct DisenchantWindow
+    {
+        uint32 command = 0;
+        OverseerDisenchant::Proof proof;
+    };
+
+    static std::mutex& DisenchantLock()
+    {
+        static std::mutex lock;
+        return lock;
+    }
+
+    static std::map<std::string, DisenchantWindow>& DisenchantWindows()
+    {
+        static std::map<std::string, DisenchantWindow> windows;
+        return windows;
+    }
+
+    static DisenchantWindow DisenchantRead(std::string const& name, uint32 command)
+    {
+        std::lock_guard<std::mutex> guard(DisenchantLock());
+        auto const found = DisenchantWindows().find(name);
+        return found != DisenchantWindows().end() && found->second.command == command
+            ? found->second : DisenchantWindow{command, {}};
+    }
+
+    static void DisenchantWrite(std::string const& name, DisenchantWindow const& window)
+    {
+        std::lock_guard<std::mutex> guard(DisenchantLock());
+        DisenchantWindows()[name] = window;
+    }
+
+    static void DisenchantForget(std::string const& name, uint32 command)
+    {
+        std::lock_guard<std::mutex> guard(DisenchantLock());
+        auto const found = DisenchantWindows().find(name);
+        if (found != DisenchantWindows().end() && found->second.command == command)
+            DisenchantWindows().erase(found);
+    }
+
+    // StoreLootItem leaves a refused slot unlooted. The session opcode has an
+    // additional item-window error path which discards a refused slot, so this
+    // drive calls the core inventory operation directly and verifies its delta.
+    struct DisenchantInventory
+    {
+        Player* player;
+        Item* ItemOf(uint64 guid) const
+        {
+            Item* item = player->GetItemByGuid(ObjectGuid(guid));
+            return item && item->GetOwnerGUID() == player->GetGUID() ? item : nullptr;
+        }
+        bool Owns(uint64 guid) const { return ItemOf(guid) != nullptr; }
+        uint32 Count(uint32 entry) const { return player->GetItemCount(entry, false); }
+        Loot* LootOf(uint64 guid) const
+        {
+            Item* item = ItemOf(guid);
+            return item && item->m_lootGenerated && item->loot.loot_type == LOOT_DISENCHANTING
+                ? &item->loot : nullptr;
+        }
+        std::vector<OverseerDisenchant::LootSlot> Slots(uint64 guid) const
+        {
+            std::vector<OverseerDisenchant::LootSlot> slots;
+            Loot* loot = LootOf(guid);
+            if (!loot)
+                return slots;
+            auto add = [&](auto const& items, std::size_t offset)
+            {
+                for (std::size_t i = 0; i < items.size() && offset + i < 255; ++i)
+                    slots.push_back({static_cast<uint8>(offset + i), items[i].itemid,
+                                     items[i].count, items[i].is_looted});
+            };
+            add(loot->items, 0);
+            add(loot->quest_items, loot->items.size());
+            return slots;
+        }
+        void Store(uint64 guid, uint8 slot)
+        {
+            if (player->HasPlayerFlag(PLAYER_FLAGS_NO_PLAY_TIME))
+                return;
+            if (Loot* loot = LootOf(guid))
+            {
+                InventoryResult result;
+                player->StoreLootItem(slot, loot, result);
+            }
+        }
+        bool Empty(uint64 guid) const
+        {
+            Loot* loot = LootOf(guid);
+            return loot && loot->isLooted();
+        }
+        void Release(uint64 guid)
+        {
+            // AI-REVIEW 2026-11-01 [codex/in-process/standards] DE-KEEP (code-review):
+            // Destruction has no native keep hook; recheck after any inventory retry.
+            Item* source = ItemOf(guid);
+            if (!source || ItemKept(player, source))
+                return;
+            // Never close another loot window. An empty current guid is safe:
+            // the selected, owned source has already been proved fully looted.
+            ObjectGuid const current = player->GetLootGUID();
+            if (player->GetSession() && (current.IsEmpty() || current == ObjectGuid(guid)))
+                player->GetSession()->DoLootRelease(ObjectGuid(guid));
+        }
+    };
+
+public:
+    static void TakeDisenchantLoot(Player* player, ObjectGuid guid, Loot& loot)
+    {
+        if (!guid.IsItem() || loot.loot_type != LOOT_DISENCHANTING)
+            return;
+        DisenchantWindow window;
+        {
+            std::lock_guard<std::mutex> guard(DisenchantLock());
+            auto const found = DisenchantWindows().find(player->GetName());
+            if (found == DisenchantWindows().end() || found->second.proof.source != guid.GetRawValue())
+                return;
+            window = found->second;
+        }
+        DisenchantInventory inventory{player};
+        OverseerDisenchant::Collect(inventory, guid.GetRawValue(), window.proof);
+        // No item release here: Player::SendLoot still reads this Loot after
+        // the hook. Completion is deferred to the next world-thread poll.
+        std::lock_guard<std::mutex> guard(DisenchantLock());
+        auto const found = DisenchantWindows().find(player->GetName());
+        if (found != DisenchantWindows().end() && found->second.command == window.command &&
+            found->second.proof.source == window.proof.source)
+            found->second.proof = std::move(window.proof);
+    }
+
+private:
+    void RetireDisenchant(std::string const& name, uint32 command)
+    {
+        if (DisenchantRead(name, command).proof.source)
+            _disenchantRetired[name] = command;
+        else
+            DisenchantForget(name, command);
+    }
+
+    void DriveRetiredDisenchant()
+    {
+        for (auto it = _disenchantRetired.begin(); it != _disenchantRetired.end();)
+        {
+            Player* player = ObjectAccessor::FindPlayerByName(it->first);
+            if (!player || !player->IsInWorld() || !player->IsAlive())
+            {
+                ++it;
+                continue;
+            }
+            DisenchantWindow window = DisenchantRead(it->first, it->second);
+            DisenchantInventory inventory{player};
+            // AI-REVIEW 2026-11-01 [codex/in-process/spec] DE-CANCEL-LOOT (code-review, PR #1303):
+            // Cancellation cannot forget a cast's open loot. Finish only its existing
+            // inventory effects; never cast or acknowledge a cancelled command here.
+            if (OverseerDisenchant::Finish(inventory, window.proof))
+            {
+                DisenchantForget(it->first, it->second);
+                it = _disenchantRetired.erase(it);
+                continue;
+            }
+            if (Loot* loot = inventory.LootOf(window.proof.source))
+            {
+                TakeDisenchantLoot(player, ObjectGuid(window.proof.source), *loot);
+                ++it;
+                continue;
+            }
+            if (player->IsNonMeleeSpellCast(false))
+            {
+                ++it;
+                continue;
+            }
+            DisenchantForget(it->first, it->second);
+            it = _disenchantRetired.erase(it);
+        }
+    }
+
+    bool HasDisenchantWork(std::string const& name) const
+    {
+        return _disenchantClaiming.count(name) || std::any_of(
+            _disenchantTasks.begin(), _disenchantTasks.end(),
+            [&](auto const& task) { return task.second.name == name; });
+    }
+
+    static bool HasDisenchantProof(std::string const& name)
+    {
+        std::lock_guard<std::mutex> guard(DisenchantLock());
+        auto const found = DisenchantWindows().find(name);
+        return found != DisenchantWindows().end() && found->second.proof.observed &&
+               !found->second.proof.expected.empty();
+    }
+
+    void HoldDisenchant(uint32 id, DisenchantTask& task, char const* reason)
+    {
+        if (task.refusal == reason)
+            return;
+        task.refusal = reason;
+        auto* statement = _disenchantStore.Bound(OverseerDisenchant::SayHeld);
+        statement->SetData(0, task.refusal);
+        statement->SetData(1, id);
+        statement->SetData(2, g_runToken);
+        _disenchantStore.Execute(statement);
+        LOG_INFO("module.overseer", "overseer: disenchant {} for '{}' stays standing: {}",
+                 id, task.name, reason);
+    }
+
+    void ReadDisenchantCommands()
+    {
+        if (!_disenchantStore.Ready())
+            return;
+        for (auto it = _disenchantClaiming.begin(); it != _disenchantClaiming.end();)
+            if (GameTime::GetGameTime().count() - it->second >= 30)
+                it = _disenchantClaiming.erase(it);
+            else
+                ++it;
+        if (!_disenchantOwnedBusy)
+        {
+            _disenchantOwnedBusy = true;
+            auto* statement = _disenchantStore.Bound(OverseerDisenchant::Owned);
+            statement->SetData(0, g_runToken);
+            _disenchantQueries.AddCallback(_disenchantStore.AsyncQuery(statement)
+                .WithPreparedCallback([this](PreparedQueryResult result)
+                {
+                    _disenchantOwnedBusy = false;
+                    _disenchantFactsReadable = bool(result);
+                    _disenchantFactsAt = GameTime::GetGameTime().count();
+                    if (result)
+                    {
+                        std::set<uint32> owned;
+                        for (auto& entry : _disenchantTasks)
+                            entry.second.enabled = false;
+                        do
+                        {
+                            Field* fields = result->Fetch();
+                            uint32 const id = fields[0].Get<uint32>();
+                            if (!id || _disenchantCompleted.count(id))
+                                continue;
+                            owned.insert(id);
+                            auto& task = _disenchantTasks[id];
+                            task.name = fields[1].Get<std::string>();
+                            task.job = fields[2].Get<std::string>();
+                            task.enabled = fields[3].Get<uint8>() != 0;
+                            _disenchantClaiming.erase(task.name);
+                        } while (result->NextRow());
+                        // AI-REVIEW 2026-11-01 [claude-haiku-5-5] DE-STALE (Elder, PR #1303):
+                        // Cancelled rows must stop blocking later work. Prune only from a
+                        // readable snapshot; the id-0 sentinel distinguishes empty from failure.
+                        for (auto it = _disenchantTasks.begin(); it != _disenchantTasks.end();)
+                            if (!it->second.completing && !owned.count(it->first))
+                            {
+                                RetireDisenchant(it->second.name, it->first);
+                                it = _disenchantTasks.erase(it);
+                            }
+                            else
+                                ++it;
+                    }
+                    // At most one owned read is outstanding. Completed ids
+                    // fence that read's snapshot; later reads see delivery.
+                    _disenchantCompleted.clear();
+                }));
+        }
+        if (!_disenchantPendingBusy)
+        {
+            _disenchantPendingBusy = true;
+            _disenchantQueries.AddCallback(_disenchantStore.AsyncQuery(
+                _disenchantStore.Bound(OverseerDisenchant::Pending))
+                .WithPreparedCallback([this](PreparedQueryResult result)
+                {
+                    _disenchantPendingBusy = false;
+                    if (!result)
+                        return;
+                    do
+                    {
+                        Field* fields = result->Fetch();
+                        uint32 const id = fields[0].Get<uint32>();
+                        std::string const name = fields[1].Get<std::string>();
+                        if (HasDisenchantWork(name))
+                        {
+                            auto* defer = _disenchantStore.Bound(OverseerDisenchant::Defer);
+                            defer->SetData(0, id);
+                            _disenchantStore.Execute(defer);
+                            continue;
+                        }
+                        _disenchantClaiming[name] = GameTime::GetGameTime().count();
+                        auto* claim = _disenchantStore.Bound(OverseerDisenchant::Claim);
+                        claim->SetData(0, g_runToken);
+                        claim->SetData(1, id);
+                        _disenchantStore.Execute(claim);
+                    } while (result->NextRow());
+                }));
+        }
+    }
+
+    void CompleteDisenchant(uint32 id, DisenchantTask& task)
+    {
+        task.completing = true;
+        auto* complete = _disenchantStore.Bound(OverseerDisenchant::Complete);
+        complete->SetData(0, id);
+        complete->SetData(1, g_runToken);
+        _disenchantStore.Execute(complete);
+        auto* read = _disenchantStore.Bound(OverseerDisenchant::Acknowledge);
+        read->SetData(0, id);
+        read->SetData(1, g_runToken);
+        _disenchantQueries.AddCallback(_disenchantStore.AsyncQuery(read)
+            .WithPreparedCallback([this, id](PreparedQueryResult result)
+            {
+                auto const found = _disenchantTasks.find(id);
+                if (found == _disenchantTasks.end())
+                    return;
+                if (!result || result->Fetch()[0].Get<std::string>() == "claimed")
+                {
+                    found->second.completing = false;
+                    return;
+                }
+                LOG_INFO("module.overseer", "overseer: disenchant {} for '{}' ended as {} after inventory read-back",
+                         id, found->second.name, result->Fetch()[0].Get<std::string>());
+                DisenchantForget(found->second.name, id);
+                _disenchantCompleted.insert(id);
+                _disenchantTasks.erase(found);
+            }));
+    }
+
+    static bool MayDisenchantItem(Player* player, Item* item)
+    {
+        if (!item || item->GetOwnerGUID() != player->GetGUID() || ItemKept(player, item))
+            return false;
+        ItemTemplate const* proto = item->GetTemplate();
+        return item->IsSoulBound() && proto->Quality == ITEM_QUALITY_UNCOMMON &&
+            proto->DisenchantID && proto->RequiredDisenchantSkill >= 0 &&
+            player->GetSkillValue(SKILL_ENCHANTING) >= static_cast<uint32>(proto->RequiredDisenchantSkill) &&
+            player->CanUseItem(item) != EQUIP_ERR_OK;
+    }
+
+    static Item* DisenchantCandidate(Player* player)
+    {
+        for (Item* item : GearCarried(player))
+            if (MayDisenchantItem(player, item))
+                return item;
+        return nullptr;
+    }
+
+    void DriveDisenchant()
+    {
+        if (!_disenchantStore.Ready())
+            return;
+        DriveRetiredDisenchant();
+        for (auto& [id, task] : _disenchantTasks)
+        {
+            if (task.completing || _disenchantRetired.count(task.name))
+                continue;
+            Player* player = ObjectAccessor::FindPlayerByName(task.name);
+            if (!player || !player->IsInWorld() || !player->IsAlive())
+            {
+                HoldDisenchant(id, task, "target is not alive and online");
+                continue;
+            }
+            DisenchantWindow window = DisenchantRead(task.name, id);
+            DisenchantInventory inventory{player};
+            if (OverseerDisenchant::Finish(inventory, window.proof))
+            {
+                CompleteDisenchant(id, task);
+                continue;
+            }
+            if (!_disenchantFactsReadable || GameTime::GetGameTime().count() - _disenchantFactsAt > 5 ||
+                !task.enabled || task.job != "craft" || InAnyDungeonRun(player) ||
+                player->IsInCombat() || player->isMoving() || _craftLoneHeld.count(task.name))
+            {
+                HoldDisenchant(id, task, "waiting for fresh craft permission and a safe idle moment");
+                continue;
+            }
+            if (window.proof.source)
+            {
+                if (inventory.LootOf(window.proof.source))
+                {
+                    TakeDisenchantLoot(player, ObjectGuid(window.proof.source),
+                                       *inventory.LootOf(window.proof.source));
+                    HoldDisenchant(id, task, "waiting for every reagent to reach the bags");
+                    continue;
+                }
+                if (!inventory.Owns(window.proof.source))
+                {
+                    HoldDisenchant(id, task, "source disappeared without verified reagent inventory");
+                    continue;
+                }
+            }
+            if (player->IsNonMeleeSpellCast(false) || !player->GetLootGUID().IsEmpty())
+                continue;
+            if (!player->HasSpell(13262))
+            {
+                HoldDisenchant(id, task, "disenchant spell is not known");
+                continue;
+            }
+            Item* item = window.proof.source ? inventory.ItemOf(window.proof.source)
+                                              : DisenchantCandidate(player);
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(13262);
+            if (!MayDisenchantItem(player, item) || !info)
+            {
+                HoldDisenchant(id, task, "no eligible soulbound unusable green is carried");
+                continue;
+            }
+            window.proof.source = item->GetGUID().GetRawValue();
+            // Publish the target before the cast can synchronously open loot.
+            // Never overwrite the hook's proof with this older local copy.
+            DisenchantWrite(task.name, window);
+            SpellCastTargets targets;
+            targets.SetItemTarget(item);
+            // natural-only: known Disenchant on an owned item, with ordinary core cast checks.
+            SpellCastResult const cast = player->CastSpell(targets, info, nullptr, TRIGGERED_NONE);
+            HoldDisenchant(id, task, cast == SPELL_CAST_OK
+                ? "cast started; reagent inventory is not yet verified"
+                : "core refused the cast; the errand remains standing");
+        }
+    }
+
     // ------------------------------------- job='craft' (infra#440) --------
 
     // Every character with a standing craft errand, name -> recipe spell id.
@@ -16998,6 +17433,8 @@ private:
         {
             std::string const& name = entry.first;
             uint32 const spellId = entry.second;
+            if (HasDisenchantProof(name))
+                continue; // do not spend a reagent before its read-back
 
             // job='craft' is a PERMISSION, not a hint - an errand may sit on
             // the roster row while a character is off doing something else
@@ -60789,7 +61226,8 @@ private:
         QueryResult result = CharacterDatabase.Query(
             "SELECT id, target_name, command, kind, channel, target_arg, "
             "TIMESTAMPDIFF(SECOND, updated_at, NOW()), source FROM overseer_command "
-            "WHERE status = 'pending' ORDER BY updated_at ASC, id ASC LIMIT {}",
+            "WHERE status = 'pending' AND kind <> 'disenchant' "
+            "ORDER BY updated_at ASC, id ASC LIMIT {}",
             COMMANDS_PER_POLL);
         if (!result)
         {
@@ -81902,6 +82340,17 @@ private:
     }
 
     QueryCallbackProcessor _shareSweepQuery;
+    OverseerDisenchant::Store _disenchantStore;
+    QueryCallbackProcessor _disenchantQueries;
+    std::map<uint32, DisenchantTask> _disenchantTasks;
+    std::map<std::string, uint32> _disenchantRetired;
+    std::map<std::string, time_t> _disenchantClaiming;
+    std::set<uint32> _disenchantCompleted;
+    bool _disenchantOwnedBusy = false;
+    bool _disenchantPendingBusy = false;
+    bool _disenchantFactsReadable = false;
+    time_t _disenchantFactsAt = 0;
+    uint32 _disenchantTimer = 0;
     bool _shareSweepBusy = false;
     bool _shareSweepDeleted = false;
     uint32 _shareSweepRest = 0;
@@ -82669,9 +83118,12 @@ public:
 
     void OnPlayerBeforeSendLoot(Player* player, ObjectGuid lootGuid, Loot* loot) override
     {
-        if (!player || !loot || !lootGuid.IsGameObject())
+        if (!player || !loot)
             return;
-        OverseerWorldScript::TakeChestLoot(player, lootGuid, *loot);
+        if (lootGuid.IsItem())
+            OverseerWorldScript::TakeDisenchantLoot(player, lootGuid, *loot);
+        else if (lootGuid.IsGameObject())
+            OverseerWorldScript::TakeChestLoot(player, lootGuid, *loot);
     }
 };
 
