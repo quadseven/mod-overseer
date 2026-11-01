@@ -77577,12 +77577,9 @@ private:
                          : "");
             status = "delivered";
 
-            // A bot a mailbox walk left standing at this box has done what it
-            // was walked there for, so its hold comes off now rather than at
-            // the end of the linger (#569). A no-op for a sender nothing held,
-            // and it lets go only of a hold the walk placed.
-            ReleaseHold(who->GetName(), who, "the letter it was walked here to post is posted",
-                        MAIL_WALK_HOLD_VERB);
+            // One send completes a letter, not the mailbox visit (#1301).
+            // Keep the arrival's bounded linger for the next attachment row;
+            // the normal expiry sweep releases it without extending its clock.
 
             // The story of a notable item (#567): posted and read back, with
             // the mailbox it went from. A letter with no attachment is not a
