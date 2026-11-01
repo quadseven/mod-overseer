@@ -28321,23 +28321,16 @@ private:
             // the verdict wants to know whose aim this is.
             {
                 OverseerDecisions::ErrandDeathToll toll;
-                // A CLAIM IS ONLY DEFERRED TO WHEN SOMETHING CAN ANSWER FOR
-                // IT. `RunOwns` reads one fact - that the aim was Claimed -
-                // and nine call sites reach that door, of which a dungeon run
-                // is only one. The deference below is written for a run
-                // because "a timer ends the run"; with no run open, that
-                // sentence is about nothing, the release is declined for ever,
-                // and the errand is pinned by a claimant that will never come
-                // back to answer for it.
-                //
-                // MEASURED ON THE DEV REALM, 2026-09-22: the Alliance leader
-                // held a vendor aim that was refused sixty times in ten
-                // minutes - once every ten seconds - deferring to "the run" on
-                // every one of them, while the newest row in
-                // `overseer_dungeon_run` had ended ten days earlier. This is
-                // the same shape `catchUp` was added for (#298) and the same
-                // fix: a claim nothing answers for is answered here.
-                toll.runOwned = _travelAims.RunOwns(name, target) && AnyActiveRun();
+                // A non-run claimant cannot borrow another family's live run
+                // to suppress this breaker (#1209). RunOwns only records a
+                // claim, so consult its owner too. Keep catch-up/home walks on
+                // their existing EndCatchUp path, including legacy claims.
+                OverseerDecisions::TravelOwner claimant;
+                toll.runOwned = _travelAims.RunOwns(name, target) &&
+                    (IsCatchingUp(name) || IsWalkingHome(name) ||
+                     (_travelAims.ClaimedBy(name, target, claimant) &&
+                      OverseerDecisions::TravelOwnerIsALiveRun(claimant))) &&
+                    AnyActiveRun();
                 // ...AND WHETHER THE CLAIMANT IS THE ONE NOTHING ANSWERS FOR
                 // (#298). `_claimed` says a claim exists and cannot say whose;
                 // a dungeon run was the only claimant when RunOwns was written
