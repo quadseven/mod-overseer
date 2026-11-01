@@ -670,3 +670,17 @@
 #        Default:     "Cave,Bonkers"
 #
 #Overseer.Retire.KeepGuilds = "Cave,Bonkers"
+
+#
+#    Overseer.ShareRetention.Enable
+#        Description: Delete answered kind='share' rows of overseer_command
+#                     that the bridge's share backoff can no longer read: rows
+#                     older than 90 days, and rows behind the youngest 8 per
+#                     target_name, target_arg, command, status and reason. At
+#                     most 5000 rows each five minutes. Other kinds are never
+#                     touched. Default off because it deletes history: count
+#                     first with ShareRetentionCountSql().
+#
+#        Default:     0
+#
+#Overseer.ShareRetention.Enable = 0

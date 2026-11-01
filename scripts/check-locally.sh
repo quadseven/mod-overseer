@@ -14,6 +14,7 @@
 #                                              ninja and the Linux toolchain
 #                                              apps/docker/Dockerfile installs
 #                                              -- run inside WSL2 on Windows)
+#        scripts/check-locally.sh schema      (isolated MySQL test service)
 #
 # A STOCK UBUNTU IMAGE CAN STILL FAIL THE ADAPTER CHECK WITH A LINK ERROR ON
 # EVERY C++ FILE, NOT JUST THIS MODULE'S (seen on a WSL2 Ubuntu 26.04 image,
@@ -53,6 +54,10 @@ run_decisions() {
   python3 -B tests/replay_exit_hearth_finalization.py
   python3 -B tests/replay_travel_claim_cache.py
   python3 -B tests/replay_main_tank_cache.py
+  python3 -B tests/replay_door_floor.py
+  python3 -B tests/replay_long_navmesh.py
+  python3 -B tests/replay_buy_bag.py
+  python3 -B tests/replay_run_family.py
 
   echo "== decisions: compile and run"
   g++ --version | head -1
@@ -188,6 +193,7 @@ mode="${1:-both}"
 case "$mode" in
   decisions) run_decisions ;;
   adapter) run_adapter ;;
+  schema) python3 -B tests/replay_run_family_migration.py ;;
   both) run_decisions && run_adapter ;;
-  *) echo "usage: $0 [decisions|adapter|both]" >&2; exit 2 ;;
+  *) echo "usage: $0 [decisions|adapter|schema|both]" >&2; exit 2 ;;
 esac
