@@ -349,6 +349,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -8316,29 +8317,59 @@ public:
                  "overseer: the chat, event, death and level queues are flushed at shutdown");
     }
 
-    // ANSWERED SHARE ROWS PAST THE BACKOFF'S MEMORY (#1251), a batch a sweep.
-    // Asked on the async pool, because the read ranks every answered share
-    // row: run on this thread it would stall the world. Off unless the realm
+    // ANSWERED SHARE ROWS PAST THE BACKOFF'S MEMORY (#1251), one holder and one
+    // batch a sweep. On the async pool, because the read ranks that holder's
+    // rows: run on this thread it would stall the world. Off unless the realm
     // turns it on, because it deletes history.
     void SweepShareRows()
     {
         if (_shareSweepBusy ||
             !sConfigMgr->GetOption<bool>("Overseer.ShareRetention.Enable", false))
             return;
+        if (_shareSweepRest > 0)
+        {
+            --_shareSweepRest;
+            return;
+        }
         _shareSweepBusy = true;
+        std::string after = _shareSweepHolder;
+        CharacterDatabase.EscapeString(after);
         _shareSweepQuery.AddCallback(
-            CharacterDatabase.AsyncQuery(OverseerDecisions::ShareRetentionSelectSql())
-                .WithCallback([this](QueryResult result)
+            CharacterDatabase.AsyncQuery(OverseerDecisions::ShareRetentionNextHolderSql(after))
+                .WithCallback([this](QueryResult result) { ReadShareHolder(std::move(result)); }));
+    }
+
+    void ReadShareHolder(QueryResult result)
+    {
+        if (!result)
+        {
+            if (!_shareSweepDeleted)
+                _shareSweepRest = OverseerDecisions::SHARE_RETENTION_REST_SWEEPS;
+            _shareSweepHolder.clear();
+            _shareSweepDeleted = false;
+            _shareSweepBusy = false;
+            return;
+        }
+        std::string holder = result->Fetch()[0].Get<std::string>();
+        std::string const previous = std::exchange(_shareSweepHolder, holder);
+        CharacterDatabase.EscapeString(holder);
+        _shareSweepQuery.AddCallback(
+            CharacterDatabase.AsyncQuery(OverseerDecisions::ShareRetentionSelectSql(holder))
+                .WithCallback([this, previous](QueryResult rows)
                 {
                     _shareSweepBusy = false;
-                    if (!result)
+                    if (!rows)
                         return;
                     std::vector<uint32_t> ids;
                     do
-                        ids.push_back(result->Fetch()[0].Get<uint32>());
-                    while (result->NextRow());
+                        ids.push_back(rows->Fetch()[0].Get<uint32>());
+                    while (rows->NextRow());
+                    if (ids.size() >= OverseerDecisions::SHARE_RETENTION_BATCH)
+                        _shareSweepHolder = previous;
+                    _shareSweepDeleted = true;
                     CharacterDatabase.Execute(OverseerDecisions::ShareRetentionDeleteSql(ids));
-                    LOG_INFO("module", "overseer: share retention deleting {} rows", ids.size());
+                    LOG_INFO("module", "overseer: share retention queued a delete of {} rows",
+                             ids.size());
                 }));
     }
 
@@ -82261,6 +82292,9 @@ private:
     time_t _disenchantFactsAt = 0;
     uint32 _disenchantTimer = 0;
     bool _shareSweepBusy = false;
+    bool _shareSweepDeleted = false;
+    uint32 _shareSweepRest = 0;
+    std::string _shareSweepHolder;
     uint32 _commandTimer = 0;
     uint32 _snapshotTimer = 0;
     uint32 _movementTimer = 0;

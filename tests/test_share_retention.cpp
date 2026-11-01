@@ -36,7 +36,13 @@ int main()
               std::string::npos,
           "the sweep is off unless the realm turns it on");
 
-    std::string const select = ShareRetentionSelectSql();
+    std::string const select = ShareRetentionSelectSql("Holder");
+    Check(select.find("FORCE INDEX (idx_target_created) WHERE target_name = 'Holder'") !=
+              std::string::npos,
+          "the select reads one holder through its index");
+    Check(ShareRetentionNextHolderSql("Holder").find("target_name > 'Holder'") !=
+              std::string::npos,
+          "the next holder comes after the last");
     Check(select.find("LIMIT 5000") != std::string::npos, "the select is bounded");
     Check(select.find("kind = 'share'") != std::string::npos, "the select reads shares only");
     Check(ShareRetentionCountSql().find("LIMIT") == std::string::npos,
