@@ -11338,9 +11338,9 @@ struct ErrandDeathToll
     // over ENTER and EXIT, and CROSSING_BACKSTOP_SECONDS over a continent
     // crossing - which exists BECAUSE of this deference and says so.
     //
-    // THE NAME IS THE OLDER HALF OF THE TRUTH. The column fact it reads has not
-    // changed; what changed is that a dungeon run stopped being the only thing
-    // that writes it. See `catchUp`.
+    // The adapter checks the recorded claimant before granting run deference:
+    // town, training and respec claims have no run timer (#1209). Catch-up and
+    // home walks retain this flag so `catchUp` can end their reissuing drive.
     bool runOwned{false};
 
     // ...AND THE CLAIMANT IS THE CATCH-UP WALK, WHICH NOTHING ANSWERS FOR
