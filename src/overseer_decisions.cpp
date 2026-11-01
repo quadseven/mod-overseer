@@ -1979,6 +1979,8 @@ std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& mem
             why = "in combat";
         else if (member.distanceFromDoor < 0.f)
             why = "wrong map";
+        else if (member.distanceFromDoor > STAGED_INSIDE_REACH_YARDS)
+            why = std::to_string(static_cast<int>(member.distanceFromDoor)) + "y from the door";
         else if (!member.insideDoor.value_or(member.distanceFromDoor <= doorstepYards))
             why = member.insideDoor.has_value()
                 ? "outside the trigger"
@@ -1991,6 +1993,20 @@ std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& mem
         blockers += member.name + " (" + why + ")";
     }
     return blockers;
+}
+
+time_t StagedInsideBackstopSeconds(std::vector<DungeonRunEntryState> const& members,
+                                   time_t fullBackstopSeconds)
+{
+    for (DungeonRunEntryState const& member : members)
+    {
+        if (!member.seen || member.through || member.otherCopy)
+            continue;
+        if (member.distanceFromDoor < 0.f ||
+            member.distanceFromDoor > STAGED_INSIDE_REACH_YARDS)
+            return STAGED_INSIDE_OUT_OF_REACH_SECONDS;
+    }
+    return fullBackstopSeconds;
 }
 
 std::vector<std::string> DungeonRunOtherCopy(std::vector<DungeonRunEntryState> const& members)
@@ -3271,11 +3287,13 @@ DungeonCompletion DungeonRunCompletion(uint32_t expectedMask, uint32_t completed
                                                           : DungeonCompletion::NotYet;
 }
 
-DungeonRunAdoptPhase DungeonRunAdoptAt(bool allThrough, DungeonCompletion completion)
+DungeonRunAdoptPhase DungeonRunAdoptAt(bool allThrough, DungeonCompletion completion,
+                                       bool runIsOver)
 {
     // THE INSTANCE BEFORE THE CENSUS (#165). Whoever is or is not inside, there
-    // is nothing left in a cleared instance to stage for or to clear.
-    if (completion == DungeonCompletion::Complete)
+    // is nothing left in a cleared instance to stage for or to clear, and
+    // nothing left to do in a run that has been given up on (#1316).
+    if (completion == DungeonCompletion::Complete || runIsOver)
         return DungeonRunAdoptPhase::Exiting;
     return allThrough ? DungeonRunAdoptPhase::Clearing : DungeonRunAdoptPhase::StagedInside;
 }
@@ -19788,7 +19806,8 @@ char const* ExitHearthStepWord(ExitHearthStep step)
 bool OffContinentHearthLetThrough(ExitHearthFacts const& facts)
 {
     return facts.doorMapKnown && facts.bindMapId != facts.doorMapId &&
-           facts.failedWalkSeconds >= OFF_CONTINENT_HEARTH_AFTER_SECONDS;
+           (facts.familyHearthedOut ||
+            facts.failedWalkSeconds >= OFF_CONTINENT_HEARTH_AFTER_SECONDS);
 }
 
 bool SitOutHearthDue(std::int64_t walkingSeconds, unsigned attempts)

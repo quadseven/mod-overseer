@@ -2627,6 +2627,21 @@ bool DungeonRunAllThrough(std::vector<DungeonRunEntryState> const& members);
 std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& members,
                                     float doorstepYards);
 
+// HOW FAR OUT A MEMBER IS TOO FAR TO WAIT FOR (#1316). About five minutes at run
+// speed, the time the short backstop below gives it.
+constexpr float STAGED_INSIDE_REACH_YARDS = 2000.f;
+constexpr time_t STAGED_INSIDE_OUT_OF_REACH_SECONDS = 5 * 60;
+
+// How long STAGED_INSIDE may go without anybody else getting in. A member on
+// another map or past STAGED_INSIDE_REACH_YARDS cannot arrive inside the full
+// backstop, as Bork could not from 9076 yards on 2026-11-01 while four stood
+// still, so such a member ends the hold in STAGED_INSIDE_OUT_OF_REACH_SECONDS. A
+// member out of the world, or in another copy, is measured by nothing here and
+// keeps the full backstop.
+time_t StagedInsideBackstopSeconds(std::vector<DungeonRunEntryState> const& members,
+                                   time_t fullBackstopSeconds);
+
+
 // ------------------------------------------- getting one member back out --
 //
 // A CROSSING WALKS A PARTY THROUGH A DOOR TOGETHER. THIS IS THE OTHER CASE,
@@ -4081,7 +4096,12 @@ enum class DungeonRunAdoptPhase : uint8_t
     Exiting,       // the instance is cleared: walk whoever is inside out
 };
 
-DungeonRunAdoptPhase DungeonRunAdoptAt(bool allThrough, DungeonCompletion completion);
+// `runIsOver` says this run was closed or abandoned and somebody is simply still
+// standing in it (#1316): a failed EXIT that hearthed the family out, or a
+// `split_failed`. That goes to EXIT for the reason a cleared instance does:
+// staging would walk everybody outside back in to a run that has ended.
+DungeonRunAdoptPhase DungeonRunAdoptAt(bool allThrough, DungeonCompletion completion,
+                                       bool runIsOver = false);
 
 // Select the encounters this run must credit. Independent-wing maps require a
 // non-empty, verified wing mask; otherwise completion remains unknowable.
@@ -22390,6 +22410,12 @@ struct ExitHearthFacts
     // out left: a split family is recovered by the crossing, and a member kept
     // inside holds the instance for its whole party without bound.
     std::int64_t failedWalkSeconds{0};
+    // WHETHER THE FAMILY HAS ALREADY HEARTHED AWAY (#1316). The withhold keeps a
+    // family on one continent, so it has nothing left to protect once another
+    // member of this episode has hearthed out. Keeping the stone then strands
+    // this member inside alone, IDLE adopts it at STAGED_INSIDE, and the family
+    // is sent straight back to the door it has just left.
+    bool familyHearthedOut{false};
 };
 
 // How long a walk out must have failed before a stone bound off the door's
