@@ -131,6 +131,39 @@ void BusyRunsAreLeftAlone()
           GuildRunStallNext(f) == GuildRunStallStep::Nothing);
 }
 
+// A GROUP THAT SPLIT AND NEVER CLOSED UP ENDS (#1308). Zul'Farrak, 2026-11-01:
+// 7 of 11 runs timed out, with two members at a camp and three at the door 440
+// yards away. Each wipe reset the stillness clock, so no run reached the ladder.
+void ASplitGroupEnds()
+{
+    GuildRunStallFacts f;
+    f.secondsSplit = GUILD_RUN_SPLIT_END_SECONDS;
+    Check("a split past its window ends with nobody armed",
+          GuildRunStallNext(f) == GuildRunStallStep::EndSplit);
+    f.held = true;
+    Check("a brain the overseer holds does not hide the split",
+          GuildRunStallNext(f) == GuildRunStallStep::EndSplit);
+    f.secondsSplit = GUILD_RUN_SPLIT_END_SECONDS - 1;
+    Check("a split inside its window is left alone",
+          GuildRunStallNext(f) == GuildRunStallStep::Nothing);
+}
+
+void OnlyClosingUpClearsTheSplit()
+{
+    using OverseerDecisions::GuildRunSplitClock;
+    using OverseerDecisions::GuildRunSplitReading;
+    Check("a split starts the clock",
+          GuildRunSplitClock(0, GuildRunSplitReading::Split, 100) == 100);
+    Check("a split keeps its start",
+          GuildRunSplitClock(100, GuildRunSplitReading::Split, 200) == 100);
+    Check("a wipe keeps the clock",
+          GuildRunSplitClock(100, GuildRunSplitReading::Unread, 200) == 100);
+    Check("a wipe starts nothing",
+          GuildRunSplitClock(0, GuildRunSplitReading::Unread, 200) == 0);
+    Check("closing up clears it",
+          GuildRunSplitClock(100, GuildRunSplitReading::Together, 200) == 0);
+}
+
 void TheVerdictHasAWord()
 {
     Check("the stalled verdict is worded 'stalled'",
@@ -147,6 +180,8 @@ int main()
     TheLadderEnds();
     ProgressResetsTheLadder();
     BusyRunsAreLeftAlone();
+    ASplitGroupEnds();
+    OnlyClosingUpClearsTheSplit();
     TheVerdictHasAWord();
     std::printf("%d failure(s)\n", failures);
     return failures ? 1 : 0;

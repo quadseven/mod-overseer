@@ -29,6 +29,37 @@ void Check(char const* what, DungeonClearStallAction got,
     ++failures;
 }
 
+// A PARTY-WAIT STOP IS ARMED AGAIN (#1308). Razorfen Downs, 2026-11-01: the
+// dungeon module stopped on one member out of range with two bosses credited,
+// and the skip it then refused ended the run.
+void APartyWaitStopRearmsBeforeTheLadder()
+{
+    using OverseerDecisions::DungeonClearWaitStopRearms;
+    std::string const wait =
+        "Dungeon clear stopped: the party never became ready after 180s "
+        "(Waiting on Uzza (out of range)).";
+    bool const first = DungeonClearWaitStopRearms(wait, 0, 3);
+    bool const last = DungeonClearWaitStopRearms(wait, 2, 3);
+    bool const spent = DungeonClearWaitStopRearms(wait, 3, 3);
+    bool const other = DungeonClearWaitStopRearms("No bosses left - disabling", 0, 3);
+    bool const none = DungeonClearWaitStopRearms("", 0, 3);
+    if (!first || !last)
+    {
+        std::printf("FAIL a party-wait stop must re-arm\n");
+        ++failures;
+    }
+    if (spent)
+    {
+        std::printf("FAIL re-arming must be bounded\n");
+        ++failures;
+    }
+    if (other || none)
+    {
+        std::printf("FAIL any other stop keeps the ladder\n");
+        ++failures;
+    }
+}
+
 void HealthyProgressIsNeverInterrupted()
 {
     Check("boss progress", DungeonClearStallDecision(true, false, false, true, 3, 3),
@@ -131,6 +162,7 @@ void YardsWithTheBrainOffAreNotProgress()
 int main()
 {
     HealthyProgressIsNeverInterrupted();
+    APartyWaitStopRearmsBeforeTheLadder();
     StalledRunGetsBoundedSkips();
     ExhaustedRunIsExtracted();
     ARefusedSkipExtractsAtOnce();
