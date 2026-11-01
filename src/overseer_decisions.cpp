@@ -15929,12 +15929,37 @@ RaidDoor const* RaidDoorFor(std::string const& keyword)
     static RaidDoor const doors[] = {
         {"moltencore", "Molten Core", 0, 3529, 409, 2890,
          -7508.32f, -1039.74f, 180.912f, 50, "moltencore", {179587, 179586},
-         "Blackrock Mountain"},
+         "Blackrock Mountain", "", {0, 0, 0, 0}},
+        {"ubrs", "Upper Blackrock Spire", 0, 1468, 229, 1470,
+         -7524.7f, -1228.41f, 287.204f, 45, "", {179587, 179586},
+         "Blackrock Mountain", "ubrs", {9, 10, 12, 13}},
     };
     for (RaidDoor const& door : doors)
         if (keyword == door.keyword)
             return &door;
     return nullptr;
+}
+
+RaidClearCount RaidClearProgress(RaidDoor const& door, std::vector<bool> const& doneBySlot)
+{
+    RaidClearCount count;
+    bool wholeMap = true;
+    for (unsigned const slot : door.clearSlots)
+        wholeMap = wholeMap && slot == 0;
+    if (wholeMap)
+    {
+        count.total = unsigned(doneBySlot.size());
+        for (bool const done : doneBySlot)
+            count.done += done ? 1 : 0;
+        return count;
+    }
+    for (unsigned const slot : door.clearSlots)
+    {
+        ++count.total;
+        if (slot < doneBySlot.size() && doneBySlot[slot])
+            ++count.done;
+    }
+    return count;
 }
 
 std::string RaidKeywordForJob(std::string const& job)
@@ -16525,9 +16550,9 @@ RaidStoneSummon ChooseRaidStoneSummon(std::vector<RaidStoneSeat> const& seats,
     return choice;
 }
 
-bool DungeonClearMayArmHere(bool raidMap, bool raidClearOrdered)
+bool DungeonClearMayArmHere(bool raidMap, bool raidClearOrdered, bool onRaidDoorMap)
 {
-    return !raidMap || raidClearOrdered;
+    return (!raidMap && !onRaidDoorMap) || raidClearOrdered;
 }
 
 char const* GuildRemoveRefusalSaid(GuildRemoveRefusal refusal)
