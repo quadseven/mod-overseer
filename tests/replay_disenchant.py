@@ -23,17 +23,20 @@ class DisenchantReplay(unittest.TestCase):
         self.assertIn("ReadDisenchantCommands();", update)
         hook = function(source, "void OnPlayerBeforeSendLoot(Player* player, ObjectGuid lootGuid, Loot* loot)")
         self.assertIn("OverseerWorldScript::TakeDisenchantLoot", hook)
+        hook_class = function(source, "class OverseerChestScript : public PlayerScript")
         delivery = function(source, "void DeliverPendingCommands(uint32 sincePollMs)")
         self.assertIn("kind <> 'disenchant'", delivery)
         craft = function(source, "void DriveCraft()")
         self.assertIn("HasDisenchantProof(name)", craft)
         fixture = (ROOT / "tests/fixtures/disenchant/replay.cpp").read_text()
         self.assertEqual(fixture.count("// RUNTIME_METHODS"), 1)
+        self.assertEqual(fixture.count("// PRODUCTION_LOOT_HOOK"), 1)
         compiler = shutil.which(os.environ.get("CXX", "c++"))
         self.assertIsNotNone(compiler, "C++17 and SQLite development files required")
         with tempfile.TemporaryDirectory() as temp:
             cpp, binary = Path(temp) / "replay.cpp", Path(temp) / "replay"
-            cpp.write_text(fixture.replace("// RUNTIME_METHODS", bodies))
+            replay = fixture.replace("// RUNTIME_METHODS", bodies)
+            cpp.write_text(replay.replace("// PRODUCTION_LOOT_HOOK", hook_class + ";"))
             built = subprocess.run([
                 compiler, "-std=c++17", "-Wall", "-Wextra",
                 "-I" + str(ROOT / "tests/fixtures/disenchant"),

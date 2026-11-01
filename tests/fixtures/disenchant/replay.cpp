@@ -3,6 +3,8 @@
 #include "overseer_disenchant_store.h"
 #include <cstdio>
 
+void DispatchLootHook(Player*, ObjectGuid, Loot&);
+
 class Runtime
 {
 // RUNTIME_METHODS
@@ -26,12 +28,15 @@ class Runtime
         return items;
     }
 public:
+    static void TakeChestLoot(Player*, ObjectGuid, Loot&) {}
     Runtime()
     {
         DisenchantWindows().clear();
         if (!_disenchantStore.Start("isolated fixture")) throw std::runtime_error("store unavailable");
         ObjectAccessor::players.clear();
-        beforeLoot=[](Player* player,ObjectGuid guid,Loot& loot) { TakeDisenchantLoot(player,guid,loot); };
+        // AI-REVIEW 2026-11-01 [claude-haiku-5-5] DE-HOOK (Elder, PR #1303):
+        // Execute the extracted hook and registration, not a fixture's direct helper call.
+        beforeLoot=DispatchLootHook;
     }
     ~Runtime() { _disenchantStore.Stop(); }
     void Add(Player& player)
@@ -66,6 +71,15 @@ public:
     std::string SecondStatus() { return _disenchantStore.Status(100); }
     std::size_t Queued() { return _disenchantStore.Queued(); }
 };
+using OverseerWorldScript=Runtime;
+// PRODUCTION_LOOT_HOOK
+
+void DispatchLootHook(Player* player,ObjectGuid guid,Loot& loot)
+{
+    OverseerChestScript hook;
+    if (hook.HasHook(PLAYERHOOK_ON_BEFORE_SEND_LOOT))
+        hook.OnPlayerBeforeSendLoot(player,guid,&loot);
+}
 int failures=0;
 void Check(char const* text,bool ok)
 { if (!ok) { ++failures;std::printf("FAIL %s\n",text); } }

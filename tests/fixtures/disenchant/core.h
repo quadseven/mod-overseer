@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -212,6 +213,7 @@ public:
     uint64 GetRawValue() const { return value; }
     bool IsEmpty() const { return !value; }
     bool IsItem() const { return value && value<10000; }
+    bool IsGameObject() const { return value>=10000; }
     bool operator==(ObjectGuid other) const { return value==other.value; }
     bool operator!=(ObjectGuid other) const { return !(*this==other); }
 };
@@ -250,6 +252,16 @@ inline SpellMgr spellMgr;
 inline SpellMgr* sSpellMgr=&spellMgr;
 struct SpellCastTargets { Item* item=nullptr; void SetItemTarget(Item* target) { item=target; } };
 struct Player;
+constexpr int PLAYERHOOK_ON_BEFORE_SEND_LOOT=1;
+class PlayerScript
+{
+    std::set<int> hooks;
+public:
+    PlayerScript(char const*, std::initializer_list<int> enabled) : hooks(enabled) {}
+    virtual ~PlayerScript() = default;
+    bool HasHook(int hook) const { return hooks.count(hook)!=0; }
+    virtual void OnPlayerBeforeSendLoot(Player*, ObjectGuid, Loot*) {}
+};
 struct WorldSession { Player* player; void DoLootRelease(ObjectGuid); };
 inline std::function<void(Player*,ObjectGuid,Loot&)> beforeLoot;
 struct Player
