@@ -269,6 +269,38 @@ void TheYoungestMemberIsWhoTheZoneIsJudgedAgainst()
                           limits) == 0.f);
 }
 
+void TheFormerSeedZonesComeFromDeathRows()
+{
+    ZoneDangerLimits const limits;
+    std::vector<ZoneDeath> deaths;
+    // The two original seed zones use the same row-only rule, with no seed input.
+    for (std::uint32_t const zone : {46u, 51u})
+        for (std::time_t const ago : {60, 120, 180})
+        {
+            ZoneDeath death = Death(zone == 46 ? 58 : 51, NOW - ago);
+            death.zoneId = zone;
+            deaths.push_back(death);
+        }
+    std::vector<DangerZone> const zones = DangerZonesOn(deaths, MAP, 17, NOW, limits);
+    Check("death rows flag both former seed zones without configuration", zones.size() == 2);
+    for (std::uint32_t const zone : {46u, 51u})
+    {
+        Check("each former seed zone has three qualifying deaths",
+              ZoneDangerScore(deaths, MAP, zone, 17, NOW, limits) == 3);
+        NodeZones nodes = Zones();
+        nodes[20] = zone;
+        std::vector<RouteLink> links = LinksWithWayRound();
+        Check("each former seed zone prices its route without a seed",
+              PriceDangerZones(links, nodes, zones, limits) == 4);
+        Check("each former seed zone is avoided using only the death rows",
+              !Walks(Plan(links), 20) && Walks(Plan(links), 40));
+    }
+    Check("a zone absent from the rows has no score",
+          ZoneDangerScore(deaths, MAP, 999, 17, NOW, limits) == 0);
+    Check("empty rows do not silently restore the former seed zones",
+          DangerZonesOn({}, MAP, 17, NOW, limits).empty());
+}
+
 }  // namespace
 
 int main()
@@ -280,6 +312,7 @@ int main()
     WithNoAlternativeItWalksAndSaysSo();
     TheScoreDecaysAsThePartyLevels();
     TheYoungestMemberIsWhoTheZoneIsJudgedAgainst();
+    TheFormerSeedZonesComeFromDeathRows();
     std::printf("zone danger routing: %d checks, %d failures\n", checks, failures);
     return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }
