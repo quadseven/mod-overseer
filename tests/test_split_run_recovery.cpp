@@ -11,8 +11,9 @@
  * after the bag fix came from this.
  *
  * Pinned here: the withheld stone is released once the family it was protecting
- * has gone, a run that is over is walked out rather than staged into, and a
- * member too far away to arrive does not hold the party for the full backstop.
+ * has gone, a run that is over is walked out rather than staged into and never
+ * counts as done, and a living member outside does not hold the party past five
+ * minutes.
  *
  * Compiled against src/overseer_decisions.cpp and nothing else.
  */
@@ -23,7 +24,10 @@
 #include <string>
 #include <vector>
 
+using OverseerDecisions::AdoptedExitProvesComplete;
 using OverseerDecisions::DungeonCompletion;
+using OverseerDecisions::DungeonRunCountsAsDone;
+using OverseerDecisions::DungeonRunExitOutcome;
 using OverseerDecisions::DungeonRunAdoptAt;
 using OverseerDecisions::DungeonRunAdoptPhase;
 using OverseerDecisions::DungeonRunEntryBlockers;
@@ -126,23 +130,41 @@ DungeonRunEntryState Outside(float yards)
     return state;
 }
 
-void AMemberTooFarToArriveEndsTheHoldEarly()
+void ARunGivenUpOnDoesNotEndComplete()
+{
+    bool const givenUp = AdoptedExitProvesComplete(DungeonCompletion::NotYet);
+    Check("an unfinished instance proves nothing", !givenUp);
+    std::string const outcome = DungeonRunExitOutcome(givenUp, true, false);
+    Check("so a run walked out because it is over ends stalled", outcome == "stalled");
+    Check("and does not spend a run of the campaign", !DungeonRunCountsAsDone(outcome));
+
+    Check("a mask the map cannot answer proves nothing either",
+          !AdoptedExitProvesComplete(DungeonCompletion::Unknowable));
+    Check("a cleared instance is still the proof it always was",
+          AdoptedExitProvesComplete(DungeonCompletion::Complete));
+}
+
+void ALivingMemberOutsideEndsTheHoldInsideFiveMinutes()
 {
     std::vector<DungeonRunEntryState> party(4, Inside());
     party.push_back(Outside(126.f));
-    Check("a member within a walk of the door gets the full backstop",
-          StagedInsideBackstopSeconds(party, FULL_BACKSTOP) == FULL_BACKSTOP);
+    Check("a living member 126 yards out whose walk has failed gets 5 minutes",
+          StagedInsideBackstopSeconds(party, FULL_BACKSTOP) == 5 * 60);
 
     party.back() = Outside(9076.f);
-    time_t const far = StagedInsideBackstopSeconds(party, FULL_BACKSTOP);
-    Check("a member 9076 yards out cannot arrive, so the run ends inside 5 minutes",
-          far > 0 && far <= 5 * 60);
+    Check("a member 9076 yards out cannot arrive, so it gets 5 minutes",
+          StagedInsideBackstopSeconds(party, FULL_BACKSTOP) == 5 * 60);
 
     party.back() = DungeonRunEntryState();
     party.back().seen = true;
     party.back().alive = true;
     Check("a member on another map cannot arrive either",
-          StagedInsideBackstopSeconds(party, FULL_BACKSTOP) <= 5 * 60);
+          StagedInsideBackstopSeconds(party, FULL_BACKSTOP) == 5 * 60);
+
+    party.back() = Outside(300.f);
+    party.back().alive = false;
+    Check("a ghost's revival takes minutes of its own, so it keeps the backstop",
+          StagedInsideBackstopSeconds(party, FULL_BACKSTOP) == FULL_BACKSTOP);
 
     party.back() = DungeonRunEntryState();
     Check("a member out of the world is not measured, so it keeps the backstop",
@@ -174,7 +196,8 @@ int main()
 {
     TheWithheldStoneIsReleasedOnceTheFamilyHasGone();
     ARunThatIsOverIsWalkedOutNotStagedInto();
-    AMemberTooFarToArriveEndsTheHoldEarly();
+    ARunGivenUpOnDoesNotEndComplete();
+    ALivingMemberOutsideEndsTheHoldInsideFiveMinutes();
     TheReasonNamesWhyTheMemberIsNotComing();
 
     if (failures)

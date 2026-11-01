@@ -37776,13 +37776,28 @@ private:
         std::time_t since{0};
         std::map<std::string, unsigned> attempts;
         std::map<std::string, std::string> lastStep;
+        // Members whose cast DoHearth accepted (#1316). Apart from `attempts`,
+        // which counts refusals and takes a zero entry on every read.
+        std::set<std::string> hearthedOut;
     };
     std::map<std::string, ExitHearthEpisode> _exitHearths;
-    // The map of a family's run that is over while somebody still stands in it,
-    // so IDLE walks them out instead of staging the family back in (#1316). Set
-    // when a failed EXIT sent the family home and when a run closes split_failed.
-    // Spent by the adoption it steers; an IDLE poll with nobody inside drops it.
-    std::map<std::string, uint32> _runOverOnMap;
+    // A family's run that is over while somebody still stands in it, so IDLE walks
+    // them out instead of staging the family back in (#1316). Set when a failed EXIT
+    // sent the family home and when a run closes split_failed. It outlives a failed
+    // EXIT, because that walk may need another go; it ends when nobody is inside or
+    // a fresh run starts.
+    struct RunOverMark
+    {
+        uint32 mapId{0};
+        std::string reason;
+    };
+    std::map<std::string, RunOverMark> _runOver;
+    static bool DungeonRunPhaseStartsAFreshRun(DungeonRunPhase phase)
+    {
+        return phase == DungeonRunPhase::Resetting || phase == DungeonRunPhase::Gathering ||
+               phase == DungeonRunPhase::Barrier || phase == DungeonRunPhase::Enter ||
+               phase == DungeonRunPhase::StagedInside || phase == DungeonRunPhase::Clearing;
+    }
     // A failed EXIT ends its coordinator and the next poll adopts the same party
     // at the same door, so the failing walk is clocked per family across them
     // (#1202). One entry per family, overwritten by the next failure.
@@ -37938,24 +37953,24 @@ private:
         WriteRunTimeline(family, leaderName, characterName, event);
     }
 
-    // ONE PASS OVER THE FAMILY: every member still on the instance map is cast
-    // for, held still, waited on or named as impossible. Returns whether a
-    // hearth is in play, which is what holds adoption back.
-    // Has this episode already sent somebody home? Asked of who it cast for and
-    // where they stand now, so a member who was never inside does not count.
+    // Has this episode already sent somebody home? Read from accepted casts and
+    // where those members stand now, so a member who never left does not count.
     static bool EpisodeHearthedSomebodyOut(ExitHearthEpisode const& episode,
                                            std::vector<std::string> const& members)
     {
         for (std::string const& name : members)
         {
             Player* const member = ObjectAccessor::FindPlayerByName(name);
-            if (episode.attempts.count(name) && member && member->IsInWorld() &&
-                member->GetMapId() != episode.mapId)
+            if (episode.hearthedOut.find(name) != episode.hearthedOut.end() && member &&
+                member->IsInWorld() && member->GetMapId() != episode.mapId)
                 return true;
         }
         return false;
     }
 
+    // ONE PASS OVER THE FAMILY: every member still on the instance map is cast
+    // for, held still, waited on or named as impossible. Returns whether a
+    // hearth is in play, which is what holds adoption back.
     bool DriveExitHearths(std::string const& family, std::string const& leaderName,
                           std::vector<std::string> const& members, ExitHearthEpisode& episode,
                           char const* phase, char const* reason)
@@ -38011,6 +38026,7 @@ private:
                     std::string const refusal = answer ? answer : "";
                     if (refusal.empty())
                     {
+                        episode.hearthedOut.insert(name);
                         LOG_WARN("module.overseer",
                                  "overseer: EXIT HEARTH - '{}' is hearthing out of map {} "
                                  "(attempt {} of {}) because {}; the campaign stays as it is "
@@ -41506,9 +41522,9 @@ private:
                                coord.runNumber, "split_failed", reason,
                                JoinNames(members));
 
-        // Whoever is left inside walks out instead of being adopted back into a
-        // fresh 15-minute hold (#1316).
-        _runOverOnMap[FamilyOfCoordinator(coord)] = portal.insideMapId;
+        // Whoever is left inside walks out instead of being adopted back into
+        // another hold (#1316).
+        _runOver[FamilyOfCoordinator(coord)] = RunOverMark{portal.insideMapId, reason};
         EndRunAndDecide(coord, leaderName, portal, runId, "split_failed", reason,
                         stillWanted, &members);
     }
@@ -54672,6 +54688,8 @@ private:
         std::string const leaderJob = jobIt == jobs.end() ? std::string("quest") : jobIt->second;
 
         DungeonRunCoordinatorState& coord = _dungeonRunCoordinators[family];
+        if (DungeonRunPhaseStartsAFreshRun(coord.phase))
+            _runOver.erase(family);
         time_t const clientNow = std::time(nullptr);
         Player* const clientLeader = ObjectAccessor::FindPlayerByName(leaderName);
         // The seat rather than the socket (#792): a listed headless leader in
@@ -55025,13 +55043,18 @@ private:
                                  "the run is adopted again",
                                  episode->second.mapId);
                     if (EpisodeHearthedSomebodyOut(episode->second, members))
-                        _runOverOnMap[family] = episode->second.mapId;
+                        _runOver[family] = RunOverMark{
+                            episode->second.mapId,
+                            episode->second.run.stalledReason.empty()
+                                ? std::string("the walk out failed and the family hearthed "
+                                              "out, so the run is over")
+                                : episode->second.run.stalledReason};
                     _exitHearths.erase(episode);
                 }
             }
 
             if (!activeInside)
-                _runOverOnMap.erase(family);
+                _runOver.erase(family);
 
             if (!IsDungeonJob(leaderJob) && !activeInside)
                 return;
@@ -55146,13 +55169,13 @@ private:
                         : OverseerDecisions::DungeonRunCompletion(
                               ExpectedEncounterMask(inside->insideMapId, activeInside),
                               CompletedEncounters(activeInside));
-                auto const runOver = _runOverOnMap.find(family);
+                auto const runOver = _runOver.find(family);
+                bool const runIsOver =
+                    runOver != _runOver.end() && runOver->second.mapId == inside->insideMapId;
                 OverseerDecisions::DungeonRunAdoptPhase const adoptAt =
                     OverseerDecisions::DungeonRunAdoptAt(
                         OverseerDecisions::DungeonRunAllThrough(adoptedStates),
-                        adoptedCompletion,
-                        runOver != _runOverOnMap.end() &&
-                            runOver->second == inside->insideMapId);
+                        adoptedCompletion, runIsOver);
 
                 // A REPEAT WIPE'S HOLD STANDS OVER ADOPTION TOO (#1223). The
                 // hold below is asked only by a leader outside, but a member
@@ -55227,8 +55250,13 @@ private:
                     // the same mask one poll later, had the whole party been
                     // inside to get it there - so the run ends 'complete' and
                     // its campaign moves on, rather than running the cleared
-                    // instance again.
-                    coord.provedComplete = true;
+                    // instance again. A run given up on proves nothing, so it
+                    // ends stalled with the reason it was given up, and does not
+                    // spend a run of the campaign (#1316).
+                    coord.provedComplete =
+                        OverseerDecisions::AdoptedExitProvesComplete(adoptedCompletion);
+                    if (!coord.provedComplete && runIsOver)
+                        coord.stalledReason = runOver->second.reason;
                     coord.crossing.best = 0.f;
                     coord.crossing.since = std::time(nullptr);
                     coord.loggedCrossingAim = false;
@@ -55333,7 +55361,6 @@ private:
                                                                     : "STAGED_INSIDE",
                          adoptedInside, static_cast<uint32>(members.size()),
                          coord.runNumber, coord.campaignId);
-                _runOverOnMap.erase(family);
                 if (adoptAt == OverseerDecisions::DungeonRunAdoptPhase::Exiting)
                     LOG_WARN("module.overseer",
                              "overseer: the instance '{}' was found in on map {} is "

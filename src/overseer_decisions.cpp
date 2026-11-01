@@ -2000,11 +2000,8 @@ time_t StagedInsideBackstopSeconds(std::vector<DungeonRunEntryState> const& memb
 {
     for (DungeonRunEntryState const& member : members)
     {
-        if (!member.seen || member.through || member.otherCopy)
-            continue;
-        if (member.distanceFromDoor < 0.f ||
-            member.distanceFromDoor > STAGED_INSIDE_REACH_YARDS)
-            return STAGED_INSIDE_OUT_OF_REACH_SECONDS;
+        if (member.seen && member.alive && !member.through && !member.otherCopy)
+            return STAGED_INSIDE_LIVING_MEMBER_SECONDS;
     }
     return fullBackstopSeconds;
 }
@@ -3296,6 +3293,11 @@ DungeonRunAdoptPhase DungeonRunAdoptAt(bool allThrough, DungeonCompletion comple
     if (completion == DungeonCompletion::Complete || runIsOver)
         return DungeonRunAdoptPhase::Exiting;
     return allThrough ? DungeonRunAdoptPhase::Clearing : DungeonRunAdoptPhase::StagedInside;
+}
+
+bool AdoptedExitProvesComplete(DungeonCompletion completion)
+{
+    return completion == DungeonCompletion::Complete;
 }
 
 bool DungeonQuestGoalReady(std::vector<DungeonQuestObjective> const& objectives)

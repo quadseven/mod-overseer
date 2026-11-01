@@ -2627,17 +2627,17 @@ bool DungeonRunAllThrough(std::vector<DungeonRunEntryState> const& members);
 std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& members,
                                     float doorstepYards);
 
-// HOW FAR OUT A MEMBER IS TOO FAR TO WAIT FOR (#1316). About five minutes at run
-// speed, the time the short backstop below gives it.
+// PAST THIS A MEMBER IS NAMED BY ITS DISTANCE, not by "outside the trigger", so
+// a closed run says why that member was never going to arrive (#1316).
 constexpr float STAGED_INSIDE_REACH_YARDS = 2000.f;
-constexpr time_t STAGED_INSIDE_OUT_OF_REACH_SECONDS = 5 * 60;
+constexpr time_t STAGED_INSIDE_LIVING_MEMBER_SECONDS = 5 * 60;
 
-// How long STAGED_INSIDE may go without anybody else getting in. A member on
-// another map or past STAGED_INSIDE_REACH_YARDS cannot arrive inside the full
-// backstop, as Bork could not from 9076 yards on 2026-11-01 while four stood
-// still, so such a member ends the hold in STAGED_INSIDE_OUT_OF_REACH_SECONDS. A
-// member out of the world, or in another copy, is measured by nothing here and
-// keeps the full backstop.
+// How long STAGED_INSIDE may go without anybody else getting in. A living member
+// outside either walks in well inside STAGED_INSIDE_LIVING_MEMBER_SECONDS or is
+// not coming: Bork stood 9076 yards out on 2026-11-01 with four inside. Each
+// arrival restarts this clock, so a party filing in is not cut off. A ghost needs
+// its revival first, and a member out of the world or in another copy is measured
+// by nothing here, so those keep the full backstop.
 time_t StagedInsideBackstopSeconds(std::vector<DungeonRunEntryState> const& members,
                                    time_t fullBackstopSeconds);
 
@@ -4093,7 +4093,7 @@ enum class DungeonRunAdoptPhase : uint8_t
 {
     StagedInside,  // part of the roster is inside a run that still has work
     Clearing,      // all of it is inside a run that still has work
-    Exiting,       // the instance is cleared: walk whoever is inside out
+    Exiting,       // the instance is cleared or the run is over: walk whoever is inside out
 };
 
 // `runIsOver` says this run was closed or abandoned and somebody is simply still
@@ -4102,6 +4102,10 @@ enum class DungeonRunAdoptPhase : uint8_t
 // staging would walk everybody outside back in to a run that has ended.
 DungeonRunAdoptPhase DungeonRunAdoptAt(bool allThrough, DungeonCompletion completion,
                                        bool runIsOver = false);
+
+// Only the encounter mask proves a run complete. A run adopted at EXIT because it
+// was given up on (#1316) proves nothing and must never spend a campaign slot.
+bool AdoptedExitProvesComplete(DungeonCompletion completion);
 
 // Select the encounters this run must credit. Independent-wing maps require a
 // non-empty, verified wing mask; otherwise completion remains unknowable.
