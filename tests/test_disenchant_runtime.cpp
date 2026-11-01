@@ -15,17 +15,29 @@ struct Inventory
     bool Owns(uint64_t guid) const { return owned && guid == 42; }
     uint32_t Count(uint32_t item) const
     { auto it = bags.find(item); return it == bags.end() ? 0 : it->second; }
-    std::vector<D::LootSlot> Slots(uint64_t) const { return loot; }
-    void Store(uint64_t, uint8_t slot)
+    // AI-REVIEW 2026-11-01 [claude-haiku-5-5] DE-GUID (Elder, PR #1303):
+    // The one-item fixture must reject a different source just as the core does.
+    std::vector<D::LootSlot> Slots(uint64_t guid) const
+    { return Owns(guid) ? loot : std::vector<D::LootSlot>{}; }
+    void Store(uint64_t guid, uint8_t slot)
     {
-        if (!acceptLoot) return;
+        if (!Owns(guid) || !acceptLoot) return;
         for (auto& item : loot)
             if (item.slot == slot && !item.taken)
             { bags[item.entry] += item.count; item.taken = true; }
     }
-    bool Empty(uint64_t) const
-    { for (auto const& item : loot) if (!item.taken) return false; return true; }
-    void Release(uint64_t) { ++releases; if (releaseWorks) owned = false; }
+    bool Empty(uint64_t guid) const
+    {
+        if (!Owns(guid)) return false;
+        for (auto const& item : loot) if (!item.taken) return false;
+        return true;
+    }
+    void Release(uint64_t guid)
+    {
+        if (!Owns(guid)) return;
+        ++releases;
+        if (releaseWorks) owned = false;
+    }
 };
 int failures = 0;
 void Check(char const* message, bool value)
