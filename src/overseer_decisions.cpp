@@ -2413,6 +2413,13 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
                                                 : DungeonClearStallAction::Extract;
 }
 
+bool DungeonClearWaitStopRearms(std::string const& stopReason, unsigned rearms,
+                                unsigned maximumRearms)
+{
+    return rearms < maximumRearms &&
+           stopReason.find("the party never became ready") != std::string::npos;
+}
+
 std::string DungeonModuleStopWords(std::string const& raw)
 {
     static std::string const prefix = "Dungeon clear stopped:";
@@ -21481,6 +21488,10 @@ char const* GuildFinderFamilySeatWord(GuildFinderFamilySeat seat)
 
 GuildRunStallStep GuildRunStallNext(GuildRunStallFacts const& facts)
 {
+    // Asked first: a split is the group no longer being one, whoever is armed
+    // or held, and nothing the ladder sends the tank reaches the other half.
+    if (facts.secondsSplit >= GUILD_RUN_SPLIT_END_SECONDS)
+        return GuildRunStallStep::EndSplit;
     // Nobody to skip for, or a stillness the overseer asked for itself.
     if (!facts.armed || facts.held)
         return GuildRunStallStep::Nothing;
@@ -21495,6 +21506,15 @@ GuildRunStallStep GuildRunStallNext(GuildRunStallFacts const& facts)
         return GuildRunStallStep::Nothing;
     return facts.skips < GUILD_RUN_MAX_SKIPS && !facts.skipRefused ? GuildRunStallStep::Skip
                                                                    : GuildRunStallStep::End;
+}
+
+std::time_t GuildRunSplitClock(std::time_t since, GuildRunSplitReading reading, std::time_t now)
+{
+    if (reading == GuildRunSplitReading::Together)
+        return 0;
+    if (reading == GuildRunSplitReading::Split && !since)
+        return now;
+    return since;
 }
 
 GuildRunRearmStep GuildRunRearmNext(GuildRunRearmFacts const& facts)
