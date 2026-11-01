@@ -80622,6 +80622,7 @@ private:
         std::string request;
         bool gameObject{false};
         bool here{false};
+        bool mainHand{false};
         uint32 targetEntry{0};
         uint32 targetGuid{0};
         float yards{-1.0f};
@@ -80682,7 +80683,8 @@ private:
           << ",\"retry\":" << J(*reason ? TownRetryWord(QuestUseRefusalRetry(reason)) : "")
           << ",\"character\":" << J(ev.character)
           << ",\"verdict\":" << J(QuestUseOutcomeWord(ev.verdict))
-          << ",\"what\":" << J(ev.gameObject ? "gameobject" : ev.here ? "here" : "creature")
+          << ",\"what\":" << J(ev.gameObject ? "gameobject" : ev.here ? "here" : ev.mainHand ? "mainhand" : "creature")
+          << ",\"main_hand\":" << (ev.mainHand ? "true" : "false")
           << ",\"target_entry\":" << ev.targetEntry
           << ",\"target_guid\":" << ev.targetGuid
           << ",\"yards\":" << ev.yards
@@ -80856,6 +80858,7 @@ private:
             return refuse(request.error);
         ev.gameObject = request.gameObject;
         ev.here = request.here;
+        ev.mainHand = request.mainHand;
         ev.targetEntry = request.target;
         ev.itemEntry = request.item;
 
@@ -80890,7 +80893,12 @@ private:
         ObjectGuid targetGuid;
         if (gate.inWorld)
         {
-            if (request.here)
+            if (request.mainHand)
+            {
+                gate.targetSeen = true;
+                gate.targetYards = 0.0f;
+            }
+            else if (request.here)
             {
                 // No target: the item is used where the character stands, and the
                 // core checks the spell's own focus and range.
@@ -80948,7 +80956,30 @@ private:
         ev.yards = gate.targetYards;
 
         Item* item = nullptr;
-        if (request.spell)
+        if (request.mainHand)
+        {
+            ev.spellId = request.spell;
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(request.spell);
+            D::MainHandSpellFacts facts;
+            facts.spellKnown = who->HasSpell(request.spell) && info;
+            item = who->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
+            facts.mainHandEquipped = item && item->GetTemplate()->Class == ITEM_CLASS_WEAPON;
+            facts.spellOnCooldown = who->HasSpellCooldown(request.spell);
+            if (info && info->RequiresSpellFocus == 1552)
+                for (auto const& [spawnId, data] : sObjectMgr->GetAllGOData())
+                {
+                    (void)spawnId;
+                    GameObjectTemplate const* proto = sObjectMgr->GetGameObjectTemplate(data.id);
+                    if (data.mapid == map->GetId() && proto &&
+                        proto->type == GAMEOBJECT_TYPE_SPELL_FOCUS &&
+                        proto->spellFocus.focusId == 1552 &&
+                        who->GetDistance(data.posX, data.posY, data.posZ) <= info->GetMaxRange(false, who))
+                    { facts.focusInRange = true; break; }
+                }
+            if (char const* wall = D::MainHandSpellGate(facts))
+                return refuse(wall);
+        }
+        else if (request.spell)
         {
             // use-spell-on: a known spell cast at the creature (Tame Beast).
             gate.castsSpell = true;
@@ -81026,7 +81057,18 @@ private:
         HoldStillAndReport(who, ev.character, QUEST_USE_HOLD_VERB, ev.hold);
         ev.petBefore = who->GetPetGUID().GetRawValue();
 
-        if (request.spell)
+        if (request.mainHand)
+        {
+            WorldPacket raw(CMSG_CAST_SPELL, 1 + 4 + 1 + 4 + 8);
+            raw << uint8(1);
+            raw << uint32(request.spell);
+            raw << uint8(0);
+            raw << uint32(TARGET_FLAG_ITEM);
+            raw << item->GetGUID();
+            raw.rpos(0);
+            session->HandleCastSpellOpcode(raw);
+        }
+        else if (request.spell)
         {
             // The gate refused a target it did not see; said again here, so the
             // cast never names a creature that is not there.
