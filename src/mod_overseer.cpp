@@ -80963,7 +80963,7 @@ private:
             D::MainHandSpellFacts facts;
             facts.spellKnown = who->HasSpell(request.spell) && info;
             item = who->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND);
-            facts.mainHandEquipped = item && item->IsWeapon();
+            facts.mainHandEquipped = item && item->GetTemplate()->Class == ITEM_CLASS_WEAPON;
             facts.spellOnCooldown = who->HasSpellCooldown(request.spell);
             if (info && info->RequiresSpellFocus == 1552)
                 for (auto const& [spawnId, data] : sObjectMgr->GetAllGOData())
