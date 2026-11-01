@@ -3,19 +3,32 @@
 #include <ctime>
 #include <iostream>
 #include <map>
+#include <stdexcept>
 #include <string>
 
 using namespace OverseerDecisions;
 #define LOG_INFO(...) ((void)0)
+#define LOG_ERROR(...) ((void)0)
+
+// OWNER_KIND
 
 // Model only the SQL transport. The actual ReleaseImpl chooses whether to write.
 struct Database
 {
     std::map<std::string, std::string> columns;
-    void Execute(char const*, std::string const& name, std::string const& standing)
+    void Execute(char const* format, std::string const& first, std::string const& second)
     {
-        if (columns[name] == standing)
-            columns[name].clear();
+        std::string const sql = format;
+        if (sql == "UPDATE overseer_roster SET travel_npc = '{}' WHERE name = '{}'")
+            columns[second] = first;
+        else if (sql == "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}' "
+                        "AND travel_npc = '{}'")
+        {
+            if (columns[first] == second)
+                columns[first].clear();
+        }
+        else
+            throw std::runtime_error("Unexpected replay SQL");
     }
 } CharacterDatabase;
 
@@ -32,20 +45,20 @@ struct Book
     std::map<std::string, Landing> _landed;
     std::map<std::string, time_t> _handback;
     uint64_t _endSerial{0};
-    unsigned persisted{0};
+    unsigned persisted{0}, learnSkill{0};
+    bool allowIntent{true};
+    std::map<std::string, std::string> _claimRefusalSaid, _aimTooLongSaid;
     std::string CurrentTravelNpc(std::string const& name) const
     {
         return CharacterDatabase.columns.at(name);
     }
     std::string Esc(std::string const& value) const { return value; }
-    unsigned LearnSkillPending(std::string const&) const { return 0; }
+    unsigned LearnSkillPending(std::string const&) const { return learnSkill; }
+    LeaderIntentKind LeaderIntentNow(std::string const&) const { return LeaderIntentKind::None; }
+    bool AskForLeader(std::string const&, LeaderIntentKind, std::string const&,
+                      std::string const&, std::string const&) const { return allowIntent; }
     void EndLeaderColumnIntent(std::string const&, std::string const&) {}
     void KeepRefusal(std::string const&) { ++persisted; }
-    bool RecordClaim(std::string const& name, std::string const& target,
-                     TravelOwner owner)
-    {
-        // CLAIM_RECORDING
-    }
     // BOOK_METHODS
 };
 
@@ -90,11 +103,17 @@ int main()
             a.home = owner == TravelOwner::HomeErrand;
             auto& book = a._travelAims;
             auto claim = [&] {
-                CharacterDatabase.columns["Leader"] = "vendor";
-                book.RecordClaim("Leader", "vendor", owner);
+                CharacterDatabase.columns["Leader"].clear();
+                Check(book.Claim("Leader", "vendor", owner), "fixture claim accepted", owner, active);
                 book._state["Leader"] = {"vendor"};
             };
             claim();
+            // The production cache can reuse an accepted claim without another
+            // intent request; it must retain the previously recorded owner.
+            book.allowIntent = false;
+            Check(book.Claim("Leader", "vendor", owner) && book._claimOwner.at("Leader") == owner,
+                  "cached accepted claim retains owner", owner, active);
+            book.allowIntent = true;
             auto toll = a.Assemble("Leader", "vendor", false);
             toll.deaths = 3;
             bool const run = TravelOwnerIsALiveRun(owner);
@@ -143,6 +162,21 @@ int main()
             Check(CharacterDatabase.columns["Leader"].empty(),
                   "refused reissue clears column again", owner, active);
         }
+    }
+    // AI-REVIEW 2026-11-01 [claude-haiku-5-5] EO-CLAIM-HEAD (PR #1306):
+    // Run the full Claim, including its early refusals, before replaying death handling.
+    for (unsigned refusal = 0; refusal < 4; ++refusal)
+    {
+        Adapter a;
+        auto& book = a._travelAims;
+        CharacterDatabase.columns["Leader"] = refusal == 1 ? "banker" : "";
+        auto const before = CharacterDatabase.columns["Leader"];
+        book.learnSkill = refusal == 2 ? 1 : 0;
+        book.allowIntent = refusal != 3;
+        auto const aim = refusal == 0 ? std::string(33, 'x') : "vendor";
+        Check(!book.Claim("Leader", aim, TravelOwner::TownTrip) && book._claimed.empty() &&
+              book._claimOwner.empty() && CharacterDatabase.columns["Leader"] == before,
+              "refused claim leaves owner and column untouched", TravelOwner::TownTrip, false);
     }
     if (!failures)
         std::cout << "PASS 16 owner/run combinations with guard, target, release and reissue controls\n";
