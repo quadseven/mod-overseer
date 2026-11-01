@@ -59075,10 +59075,25 @@ private:
             if (facts.inRaid)
                 facts.casterSubgroup = group->GetMemberGroup(bot->GetGUID());
 
+            // The cross-party asks this caster made, by target, and when. One
+            // that still stands keeps its target from being chosen again
+            // (RebuffCrossAskCooling); the ones that have run out are dropped
+            // here so the map holds only live asks.
+            std::time_t const now = std::time(nullptr);
+            std::map<std::string, std::time_t>& crossAskedAt = _rebuffCrossAskedAt[name];
+            for (auto it = crossAskedAt.begin(); it != crossAskedAt.end();)
+            {
+                if (OverseerDecisions::RebuffCrossAskCooling(it->second, now))
+                    ++it;
+                else
+                    it = crossAskedAt.erase(it);
+            }
+
             auto readMember = [&](Player* member) {
                 OverseerDecisions::RebuffMember seen;
                 seen.name = member->GetName();
                 seen.subgroup = facts.inRaid ? group->GetMemberGroup(member->GetGUID()) : 0;
+                seen.crossAskedRecently = crossAskedAt.count(seen.name) != 0;
                 seen.alive = member->IsAlive();
                 seen.sameMap = member->IsInWorld() && member->GetMap() == bot->GetMap();
                 seen.hasBuff = botAI->HasAura(spell.aura, member) ||
@@ -59162,19 +59177,16 @@ private:
 
             if (decision.step != OverseerDecisions::RebuffStep::Cast)
             {
+                // Said only on a change, whether or not a cross-party ask goes
+                // out below: that ask has its own line, so a raid caster whose
+                // own subgroup stays out of reach says so once, not every poll.
                 auto const said = _rebuffSaid.find(name);
-                if (!decision.crossPartyTarget && said != _rebuffSaid.end() &&
-                    said->second == decision.step)
-                    continue;
+                bool const repeat = said != _rebuffSaid.end() && said->second == decision.step;
                 _rebuffSaid[name] = decision.step;
                 // The two ordinary states are remembered but not said.
-                if (decision.step == OverseerDecisions::RebuffStep::NoSpell ||
-                    decision.step == OverseerDecisions::RebuffStep::NothingMissing)
-                {
-                    if (!decision.crossPartyTarget)
-                        continue;
-                }
-                else
+                if (!repeat &&
+                    decision.step != OverseerDecisions::RebuffStep::NoSpell &&
+                    decision.step != OverseerDecisions::RebuffStep::NothingMissing)
                     LOG_INFO("module.overseer",
                              "overseer: '{}' does not rebuff '{}' - {} ({} member(s) missing it, "
                              "{} within {} yards and sight; mana {} of {}, the cast costs {})",
@@ -59205,7 +59217,7 @@ private:
                                       decision.crossPartyTarget->name;
                 std::string source = "rebuff raid " + name + " " +
                                      decision.crossPartyTarget->name + " " +
-                                     std::to_string(std::time(nullptr));
+                                     std::to_string(now);
                 if (source.size() > 64)
                     source.resize(64);
                 CharacterDatabase.Execute(
@@ -59216,6 +59228,7 @@ private:
                          "overseer: '{}' asked to cast '{}' on raid member '{}' through kind='cast'",
                          name, spell.aura, decision.crossPartyTarget->name);
                 _rebuffCrossAsked[name] = decision.crossPartyTarget->name;
+                crossAskedAt[decision.crossPartyTarget->name] = now;
             }
         } while (result->NextRow());
     }
@@ -82104,6 +82117,9 @@ private:
     std::map<std::string, OverseerDecisions::RebuffStep> _rebuffSaid;
     std::map<std::string, std::size_t> _rebuffAsked;
     std::map<std::string, std::string> _rebuffCrossAsked;
+    // Caster -> raid member -> when the cross-party cast was queued, so one
+    // that does not land is not queued again every poll (#1159).
+    std::map<std::string, std::map<std::string, std::time_t>> _rebuffCrossAskedAt;
 
     // The unlearn this module has already refused for each character, so a
     // standing disagreement about the price is said once rather than twice a

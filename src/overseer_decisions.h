@@ -27612,6 +27612,11 @@ struct RebuffMember
     bool hasBuff{false};      // the aura or its group variant, from any caster
     float yards{0.0f};        // from the caster
     bool inSight{true};       // line of sight from the caster
+    // This caster already queued a cross-party cast on this member within
+    // REBUFF_CROSS_ASK_COOLDOWN_SECONDS (RebuffCrossAskCooling). Such a member
+    // is not chosen again, so a cast that does not land is not re-queued every
+    // poll (mod-overseer#1159).
+    bool crossAskedRecently{false};
 };
 
 struct RebuffFacts
@@ -27648,6 +27653,24 @@ enum class RebuffStep : std::uint8_t
 constexpr float REBUFF_REACH_YARDS = 28.0f;
 // The mana the caster keeps after the cast, as a percent of its maximum.
 constexpr std::uint32_t REBUFF_MANA_RESERVE_PERCENT = 30;
+
+// HOW LONG ONE CROSS-PARTY ASK STANDS (mod-overseer#1159). A raid caster's
+// cross-party rebuff is a kind='cast' row, and a cast that does not land - a
+// stronger non-stacking buff already on the target, the target walking out of
+// range before the row runs, a refusal - leaves the target missing the buff,
+// so without this the next poll (PARTY_POLL_MS, thirty seconds) would queue
+// the same row again, and every row holds the caster still for its window.
+// Five minutes is ten polls: long enough that a cast that cannot land costs a
+// handful of rows an hour, short against the thirty to sixty minutes the buff
+// itself lasts. A cast that DID land needs no cooldown: the target then
+// carries the aura and is not missing.
+constexpr std::time_t REBUFF_CROSS_ASK_COOLDOWN_SECONDS = 5 * 60;
+
+// True while an ask made at `askedAt` still stands at `now`. Zero means never
+// asked. A clock that went backwards (now before askedAt) ends the cooldown
+// rather than stretching it by however far the clock jumped.
+bool RebuffCrossAskCooling(std::time_t askedAt, std::time_t now,
+                           std::time_t cooldownSeconds = REBUFF_CROSS_ASK_COOLDOWN_SECONDS);
 
 struct RebuffDecision
 {

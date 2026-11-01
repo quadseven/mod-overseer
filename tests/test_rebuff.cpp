@@ -23,6 +23,8 @@
 #include <string>
 
 using OverseerDecisions::DecideRebuff;
+using OverseerDecisions::RebuffCrossAskCooling;
+using OverseerDecisions::REBUFF_CROSS_ASK_COOLDOWN_SECONDS;
 using OverseerDecisions::RebuffDecision;
 using OverseerDecisions::RebuffFacts;
 using OverseerDecisions::RebuffMember;
@@ -579,6 +581,92 @@ void CrossPartyTargetAtMostOnePerPoll()
           d.crossPartyTarget.has_value());
 }
 
+
+// A RAID FACTS SET FOR THE CROSS-PARTY THROTTLE: the caster's own subgroup is
+// all buffed, and subgroup 1 has two members with no buffer and no buff, the
+// nearer at 10 yards and the farther at 20.
+RebuffFacts RaidWithTwoCrossTargets()
+{
+    RebuffFacts facts;
+    facts.knowsSpell = true;
+    facts.mana = 2000;
+    facts.maxMana = 2000;
+    facts.cost = 300;
+    facts.inRaid = true;
+    facts.casterSubgroup = 0;
+    RebuffMember self = Member(true, 0.0f);
+    self.name = "Caster";
+    facts.members.push_back(self);
+    RebuffMember near = Member(false, 10.0f);
+    near.name = "Near";
+    near.subgroup = 1;
+    facts.members.push_back(near);
+    RebuffMember far = Member(false, 20.0f);
+    far.name = "Far";
+    far.subgroup = 1;
+    facts.members.push_back(far);
+    return facts;
+}
+
+// A CAST THAT DOES NOT LAND IS NOT RE-QUEUED EVERY POLL (#1159). The target
+// still lacks the buff on the next poll, so without the throttle it is chosen
+// again and another kind='cast' row goes in thirty seconds after the last.
+void ACrossAskStandsForItsCooldown()
+{
+    RebuffFacts facts = RaidWithTwoCrossTargets();
+    RebuffDecision first = DecideRebuff(facts);
+    Check("the nearer raider is the first cross-party target",
+          first.crossPartyTarget && first.crossPartyTarget->name == "Near");
+
+    facts.members[1].crossAskedRecently = true;
+    RebuffDecision second = DecideRebuff(facts);
+    Check("a raider asked for within the cooldown is not asked for again",
+          !second.crossPartyTarget || second.crossPartyTarget->name != "Near");
+    Check("the next eligible raider is chosen instead",
+          second.crossPartyTarget && second.crossPartyTarget->name == "Far");
+
+    facts.members[2].crossAskedRecently = true;
+    Check("with every eligible raider asked for, no cross-party target",
+          !DecideRebuff(facts).crossPartyTarget);
+    Check("the party step itself is untouched by the throttle",
+          DecideRebuff(facts).step == first.step);
+}
+
+void TheCrossAskCooldownClock()
+{
+    std::time_t const t = 1700000000;
+    Check("never asked is not cooling", !RebuffCrossAskCooling(0, t));
+    Check("just asked is cooling", RebuffCrossAskCooling(t, t));
+    Check("one poll later is still cooling", RebuffCrossAskCooling(t, t + 30));
+    Check("one second short of the cooldown is still cooling",
+          RebuffCrossAskCooling(t, t + REBUFF_CROSS_ASK_COOLDOWN_SECONDS - 1));
+    Check("at the cooldown it has run out",
+          !RebuffCrossAskCooling(t, t + REBUFF_CROSS_ASK_COOLDOWN_SECONDS));
+    Check("a clock that went backwards ends the cooldown", !RebuffCrossAskCooling(t, t - 60));
+    Check("the cooldown is longer than one thirty-second poll",
+          REBUFF_CROSS_ASK_COOLDOWN_SECONDS > 30);
+}
+
+// The drive fills the throttle and keeps the said-on-a-change rule in a raid.
+void TheDriveThrottlesCrossAsks()
+{
+    std::string const src = Slurp("src/mod_overseer.cpp");
+    std::size_t const def = src.find("void DriveRebuff()");
+    Check("DriveRebuff is defined (throttle)", def != std::string::npos);
+    if (def == std::string::npos)
+        return;
+    std::size_t const end = src.find("\n    // THIS REALM SAYS WHAT IT IS AND WHAT IT IS RUNNING", def);
+    std::string const body = src.substr(def, end == std::string::npos ? std::string::npos : end - def);
+    Check("each member is marked with whether this caster asked for it recently",
+          body.find("seen.crossAskedRecently =") != std::string::npos);
+    Check("the asks are aged with RebuffCrossAskCooling",
+          body.find("OverseerDecisions::RebuffCrossAskCooling(") != std::string::npos);
+    Check("a queued cross-party ask is recorded with its time",
+          body.find("crossAskedAt[decision.crossPartyTarget->name] = now;") != std::string::npos);
+    Check("a cross-party target does not bypass the said-on-a-change rule",
+          body.find("!decision.crossPartyTarget && said") == std::string::npos);
+}
+
 }  // namespace
 
 int main()
@@ -602,6 +690,9 @@ int main()
     CrossPartyTargetIsNearest();
     CrossPartyTargetAtMostOnePerPoll();
     OutsideRaidKeepsWholePartyCount();
+    ACrossAskStandsForItsCooldown();
+    TheCrossAskCooldownClock();
+    TheDriveThrottlesCrossAsks();
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);
