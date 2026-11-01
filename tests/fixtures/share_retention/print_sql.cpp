@@ -1,5 +1,5 @@
 // Prints the shipped retention statements, so a test or a dry run reads the
-// real text. Arguments: select, count, or delete followed by ids.
+// real text. Arguments: next <after>, select <holder>, count, or delete <ids>.
 #include "overseer_decisions.h"
 
 #include <cstdio>
@@ -11,8 +11,10 @@ int main(int argc, char** argv)
 {
     std::string const mode = argc > 1 ? argv[1] : "";
     std::string sql;
-    if (mode == "select")
-        sql = OverseerDecisions::ShareRetentionSelectSql();
+    if (mode == "next")
+        sql = OverseerDecisions::ShareRetentionNextHolderSql(argc > 2 ? argv[2] : "");
+    else if (mode == "select")
+        sql = OverseerDecisions::ShareRetentionSelectSql(argc > 2 ? argv[2] : "");
     else if (mode == "count")
         sql = OverseerDecisions::ShareRetentionCountSql();
     else if (mode == "delete")

@@ -28135,14 +28135,22 @@ std::vector<std::size_t> NextPortalClickers(std::vector<MageTravelClicker> const
 // and the bridge's read on MySQL and compares the rows.
 constexpr uint32_t SHARE_RETENTION_DAYS = 90;
 constexpr uint32_t SHARE_RETENTION_DEPTH = 8;
-// At most this many rows a sweep: 134,000 rows drain in about 2.5 hours at one
-// sweep each five minutes, and no statement holds the async writer for long.
+// At most this many rows a sweep. A sweep reads ONE holder's answers through
+// idx_target_created, because the ranking reads every row it is given and this
+// realm has one async character worker: ranking all 134,000 rows held it for 3
+// to 17 seconds on the dev realm, and one holder holds it for under a second
+// warm and 3 cold. A holder with a full batch is read again next sweep.
 constexpr uint32_t SHARE_RETENTION_BATCH = 5000;
+// A whole round of holders that deleted nothing rests this many sweeps, a day.
+constexpr uint32_t SHARE_RETENTION_REST_SWEEPS = 288;
 
 // THE RULE IS IN ONE PLACE, the two readers below. It only ever grows: a new
 // answer pushes older rows further down and time ages them, so an id selected
 // here is still past keeping when its delete runs.
-std::string ShareRetentionSelectSql();
+// The holder after `after` in name order, or no row at the end of a round. Both
+// names are escaped by the caller.
+std::string ShareRetentionNextHolderSql(std::string const& after);
+std::string ShareRetentionSelectSql(std::string const& holder);
 std::string ShareRetentionCountSql();
 // The delete for ids ShareRetentionSelectSql() named, or "" for none. It is
 // apart from the select because a DELETE with a subquery takes shared locks on

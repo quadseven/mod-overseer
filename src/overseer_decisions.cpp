@@ -25601,7 +25601,7 @@ std::vector<std::size_t> NextPortalClickers(std::vector<MageTravelClicker> const
     return {};
 }
 
-static std::string ShareRetentionCandidates()
+static std::string ShareRetentionCandidates(std::string const& rows)
 {
     return "SELECT id FROM ("
            "SELECT id, updated_at <= NOW() - INTERVAL " +
@@ -25611,20 +25611,30 @@ static std::string ShareRetentionCandidates()
            "CASE WHEN JSON_VALID(result) "
            "THEN JSON_UNQUOTE(JSON_EXTRACT(result, '$.reason')) END "
            "ORDER BY updated_at DESC, id DESC) AS rn "
-           "FROM overseer_command "
-           "WHERE kind = 'share' AND status IN ('delivered', 'error')"
+           "FROM overseer_command " + rows +
+           "kind = 'share' AND status IN ('delivered', 'error')"
            ") AS answered WHERE aged OR rn > " +
            std::to_string(SHARE_RETENTION_DEPTH);
 }
 
-std::string ShareRetentionSelectSql()
+std::string ShareRetentionNextHolderSql(std::string const& after)
 {
-    return ShareRetentionCandidates() + " LIMIT " + std::to_string(SHARE_RETENTION_BATCH);
+    return "SELECT target_name FROM overseer_command FORCE INDEX (idx_target_created) "
+           "WHERE target_name > '" + after +
+           "' AND kind = 'share' AND status IN ('delivered', 'error') "
+           "ORDER BY target_name LIMIT 1";
+}
+
+std::string ShareRetentionSelectSql(std::string const& holder)
+{
+    return ShareRetentionCandidates("FORCE INDEX (idx_target_created) WHERE target_name = '" +
+                                    holder + "' AND ") +
+           " LIMIT " + std::to_string(SHARE_RETENTION_BATCH);
 }
 
 std::string ShareRetentionCountSql()
 {
-    return "SELECT COUNT(*) FROM (" + ShareRetentionCandidates() + ") AS candidates";
+    return "SELECT COUNT(*) FROM (" + ShareRetentionCandidates("WHERE ") + ") AS candidates";
 }
 
 std::string ShareRetentionDeleteSql(std::vector<uint32_t> const& ids)
