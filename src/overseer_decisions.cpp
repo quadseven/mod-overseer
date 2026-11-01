@@ -11917,6 +11917,30 @@ std::vector<DangerZone> DangerZonesOn(std::vector<ZoneDeath> const& deaths, std:
     return out;
 }
 
+std::string ZoneDangerProbeJson(std::vector<DangerZone> const& zones, std::uint32_t mapId,
+                                 std::uint32_t partyLevel, std::time_t now,
+                                 ZoneDangerLimits const& limits)
+{
+    std::string out = "{\"map_id\":" + std::to_string(mapId) +
+                      ",\"party_level\":" + std::to_string(partyLevel) +
+                      ",\"sampled_at\":" + std::to_string(now) +
+                      ",\"window_seconds\":" + std::to_string(limits.windowSeconds) +
+                      ",\"level_gap\":" + std::to_string(limits.levelGap) +
+                      ",\"threshold\":" + std::to_string(limits.deaths) + ",\"zones\":[";
+    for (std::size_t i = 0; i < zones.size(); ++i)
+    {
+        DangerZone const& zone = zones[i];
+        if (i)
+            out += ",";
+        out += "{\"zone_id\":" + std::to_string(zone.zoneId) +
+               ",\"name\":" + JsonString(zone.name) +
+               ",\"score\":" + std::to_string(zone.deaths) +
+               ",\"deaths_counted\":" + std::to_string(zone.deaths) +
+               ",\"strongest_killer\":" + std::to_string(zone.strongestKiller) + "}";
+    }
+    return out + "]}";
+}
+
 void ForgetOldZoneDeaths(std::vector<ZoneDeath>& deaths, std::time_t now,
                          ZoneDangerLimits const& limits)
 {
