@@ -9,6 +9,8 @@
 #include "overseer_decisions.h"
 
 #include <cstdio>
+#include <ctime>
+#include <string>
 
 using OverseerDecisions::DungeonClearStallAction;
 using OverseerDecisions::DungeonClearStallDecision;
@@ -94,6 +96,36 @@ void ABusyHoldThatExpiredNoLongerProtectsTheRun()
           DungeonClearStallAction::Extract);
 }
 
+// The tank drifts 50 yards every two minutes. Time runs from the first reading
+// and the ladder decides on each poll, as the adapter does.
+bool DriftStalls(std::string const& stopReason)
+{
+    OverseerDecisions::RatchetLimits const limits{
+        OverseerDecisions::RatchetReading::DistanceFromLastMark, 30.f, 300};
+    OverseerDecisions::RatchetState clock;
+    clock.since = 1000;
+    bool stalled = false;
+    for (time_t now = 1120; now <= 1000 + 45 * 60; now += 120)
+        stalled = stalled ||
+                  OverseerDecisions::Ratchet(
+                      clock, OverseerDecisions::DungeonClearWatchdogYards(50.f, stopReason),
+                      now, limits)
+                      .stalled;
+    return stalled;
+}
+
+void YardsWithTheBrainOffAreNotProgress()
+{
+    Check("drift while the brain drives", DriftStalls("") ? DungeonClearStallAction::Skip
+                                                          : DungeonClearStallAction::Nothing,
+          DungeonClearStallAction::Nothing);
+    Check("drift after the brain stopped itself",
+          DriftStalls("Dungeon clear stopped: the party never became ready after 180s")
+              ? DungeonClearStallAction::Skip
+              : DungeonClearStallAction::Nothing,
+          DungeonClearStallAction::Skip);
+}
+
 } // namespace
 
 int main()
@@ -103,5 +135,6 @@ int main()
     ExhaustedRunIsExtracted();
     ARefusedSkipExtractsAtOnce();
     ABusyHoldThatExpiredNoLongerProtectsTheRun();
+    YardsWithTheBrainOffAreNotProgress();
     return failures ? 1 : 0;
 }

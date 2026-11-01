@@ -19,6 +19,12 @@ that can be told what to do and that report what they did.
    (`overseer_snapshot`), deaths, events, dungeon run records and loot
    decisions, in `overseer_*` tables an outside page can read.
 
+`overseer_zone_danger` holds the routing rule's current result for each online
+roster member, replaced alongside presence snapshots and expired after logout.
+It includes party/map context, scores and counted deaths; the existing `state`
+probe carries the same projection. Consumers read this result rather than
+reimplementing the danger rule.
+
 ## Quick start
 
 There is no standalone build: the module compiles inside an AzerothCore
@@ -91,6 +97,10 @@ commands from the repo root with the runner's own `g++` and `python3`:
 
 ```sh
 python3 -B tests/replay_exit_hearth_finalization.py
+python3 -B tests/replay_travel_claim_cache.py
+python3 -B tests/replay_main_tank_cache.py
+python3 -B tests/replay_door_floor.py
+python3 -B tests/replay_run_family.py
 g++ -std=c++17 -Wall -Wextra -Isrc -c src/overseer_decisions.cpp -o overseer_decisions.o
 for test in tests/test_*.cpp; do
   name="$(basename "$test" .cpp)"
@@ -98,6 +108,51 @@ for test in tests/test_*.cpp; do
   "./$name"
 done
 ```
+
+The main-tank replay applies the carried playerbots patch to pinned source
+fixtures and compiles the actual cache and threat-consumer path. It needs git
+and a C++17 compiler; it uses no realm, database or network.
+
+The door-floor replay compiles the actual door-height adapter, route adapter
+and pure trigger decisions against fixed map and navigation readings. Its
+Razorfen Downs fixture models a surface above the routed floor. It requires
+a C++17 compiler, without client map files, a realm or a database.
+
+The long-navmesh replay compiles the actual route planner, walking adapter,
+door census and crossing loop. Its explicit navigation boundary records the
+native smoothing-buffer refusal and the corner prefix measured on that route.
+Every selected leg must pass the ordinary mover's path check. Sphere and
+rotated-box crossings use the actual containment decision, including a member
+on the wrong floor. The session boundary refuses crossings outside the trigger.
+This replay needs a C++17 compiler and does not include client map data. Live
+walking and repeated campaigns still require realm verification.
+
+The bag-purchase replay executes the actual buy preflight, packet dispatch
+and inventory readback against explicit inventory and session boundaries.
+It checks a full backpack with an empty bag position, refusal cases, and
+the existing ordinary storage path. Native adapter CI checks the SDK calls;
+live vendor purchases still require realm verification.
+
+The family-run replay compiles the actual ledger adapters against SQLite.
+It needs the SQLite development library as well as a C++17 compiler. It checks
+independent families on one map, repeated members, adoption, ownership after
+one run ends, and the older single-family schema behavior.
+
+The family ledger migration keeps one active row per family and map. An active
+legacy row is adopted only when its complete recorded membership identifies
+one family; its current leader can have changed. Mixed or incomplete rows keep
+their blank legacy scope and expire normally. Historical outcomes and roster
+campaign counters are not rewritten. Stable campaign counters across borrowed
+leadership remain separate work in wow-overseer#1688.
+
+CI also runs the actual migration twice on a fresh MySQL 8.4 service. Locally,
+`scripts/check-locally.sh schema` runs that test against an isolated MySQL
+server. `MYSQL_REPLAY_COMMAND` can supply a JSON array of client arguments,
+such as `["docker","exec","-i","your-test-mysql","mysql","--user=root"]`.
+The test uses only its `overseer_run_family_replay` fixture database. It checks
+different column collations, conservative adoption, index replacement,
+idempotent reapplication, and native MySQL upserts. The same suite checks the
+zone-danger snapshot migration twice, its JSON replacement and explicit collation.
 
 `scripts/check-locally.sh decisions` runs the same steps (plus the check that
 `VERSION` matches the constant in `src/overseer_decisions.h`) in a scratch

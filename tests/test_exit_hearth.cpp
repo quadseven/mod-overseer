@@ -19,6 +19,7 @@
 #include "overseer_decisions.h"
 
 #include <cstdio>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,11 @@ using OverseerDecisions::ExitHearthHoldsAdoption;
 using OverseerDecisions::ExitHearthImpossibleReason;
 using OverseerDecisions::ExitHearthStep;
 using OverseerDecisions::ExitHearthStepWord;
+using OverseerDecisions::EXIT_WALK_FAILING_GAP_SECONDS;
+using OverseerDecisions::ExitWalkFailingSince;
+using OverseerDecisions::OFF_CONTINENT_HEARTH_AFTER_SECONDS;
+using OverseerDecisions::OffContinentHearthLetThrough;
+using OverseerDecisions::SitOutHearthDue;
 
 namespace
 {
@@ -195,6 +201,57 @@ int main()
         unread.bindMapId = 1;
         CheckStep("a caller with no door map keeps the old rule (crossing, regroup)",
                   ExitFailureHearthStep(unread), ExitHearthStep::Cast);
+
+        // A WITHHOLD THAT NEVER ENDS IS A HELD INSTANCE (#1202). Measured on the
+        // dev realm: four members 112 to 135 yards from the door with every
+        // bearing refused and stones bound off the door's continent, 41 failed
+        // resets in a row and an instance held for 24 hours.
+        ExitHearthFacts trying = farBind;
+        trying.failedWalkSeconds = OFF_CONTINENT_HEARTH_AFTER_SECONDS - 1;
+        CheckStep("the stone stays withheld while the walk can still succeed",
+                  ExitFailureHearthStep(trying), ExitHearthStep::Impossible);
+        CheckBool("and no rule has let it through", OffContinentHearthLetThrough(trying), false);
+
+        ExitHearthFacts failed = farBind;
+        failed.failedWalkSeconds = OFF_CONTINENT_HEARTH_AFTER_SECONDS;
+        CheckStep("the stone is cast once the walk has failed for the whole bound",
+                  ExitFailureHearthStep(failed), ExitHearthStep::Cast);
+        CheckText("nothing is impossible about it then", ExitHearthImpossibleReason(failed), "");
+        CheckBool("and the rule that let it through can be named",
+                  OffContinentHearthLetThrough(failed), true);
+
+        ExitHearthFacts sameContinent = homeBind;
+        sameContinent.failedWalkSeconds = OFF_CONTINENT_HEARTH_AFTER_SECONDS;
+        CheckBool("a stone bound on the door's map needs no such rule",
+                  OffContinentHearthLetThrough(sameContinent), false);
+
+        ExitHearthFacts unknownDoor = unread;
+        unknownDoor.failedWalkSeconds = OFF_CONTINENT_HEARTH_AFTER_SECONDS;
+        CheckBool("nor does a caller with no door map",
+                  OffContinentHearthLetThrough(unknownDoor), false);
+
+        // The clock of failed walking outlives one failed EXIT: each one ends
+        // the coordinator, and the next adopts the same party at the same door.
+        std::int64_t const start = 1000;
+        CheckBool("the first failure starts the clock",
+                  ExitWalkFailingSince(0, 0, true, start) == start, true);
+        CheckBool("the next failure on the same map keeps it",
+                  ExitWalkFailingSince(start, start, true, start + 315) == start, true);
+        CheckBool("a failure on another map starts it again",
+                  ExitWalkFailingSince(start, start, false, start + 315) == start + 315, true);
+        std::int64_t const later = start + EXIT_WALK_FAILING_GAP_SECONDS + 1;
+        CheckBool("a failure long after the last starts it again",
+                  ExitWalkFailingSince(start, start, true, later) == later, true);
+
+        // A member sitting out is outside the run party, so neither hearth names
+        // it, and left inside it keeps the next reset from ever being possible.
+        CheckBool("a member sitting out keeps walking inside the bound",
+                  SitOutHearthDue(OFF_CONTINENT_HEARTH_AFTER_SECONDS - 1, 0), false);
+        CheckBool("its stone is asked for at the bound",
+                  SitOutHearthDue(OFF_CONTINENT_HEARTH_AFTER_SECONDS, 0), true);
+        CheckBool("and no longer once its attempts are spent",
+                  SitOutHearthDue(OFF_CONTINENT_HEARTH_AFTER_SECONDS, EXIT_HEARTH_ATTEMPTS),
+                  false);
 
         // The attempts bound is unchanged by the new rule.
         CheckBool("the attempts bound is still three", EXIT_HEARTH_ATTEMPTS == 3u, true);
