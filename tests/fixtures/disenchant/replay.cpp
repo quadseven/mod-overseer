@@ -9,6 +9,7 @@ class Runtime
     OverseerDisenchant::Store _disenchantStore;
     QueryCallbackProcessor _disenchantQueries;
     std::map<uint32, DisenchantTask> _disenchantTasks;
+    std::map<std::string, uint32> _disenchantRetired;
     std::map<std::string, time_t> _disenchantClaiming;
     std::set<uint32> _disenchantCompleted;
     bool _disenchantOwnedBusy = false;
@@ -174,6 +175,31 @@ int main()
         Check("a failed owned read does not masquerade as an empty snapshot", runtime.Tasks()==1);
         runtime.FailOwnedReads(false);runtime.Ticks(4);
         Check("a recovered valid empty snapshot releases the stale task", runtime.Tasks()==0);
+    }
+    {
+        Runtime runtime; Player player;player.acceptLoot=false;runtime.Add(player);runtime.Ticks(5);
+        runtime.Sql("UPDATE overseer_command SET status='error' WHERE id=1;");runtime.Ticks(4);
+        auto next=std::make_unique<Item>();next->guid=84;player.items.emplace(84,std::move(next));
+        runtime.Sql("INSERT INTO overseer_command(id,target_name,kind,status) VALUES(2,'Smith','disenchant','pending');");
+        player.acceptLoot=true;runtime.Ticks(10);
+        Check("a cancelled open-loot cast is cleaned up without changing its command status", runtime.Status()=="error" && !player.GetItemByGuid(ObjectGuid(42)));
+        Check("replacement work proceeds after cancelled loot cleanup without rerolling either source", runtime.ReplacementStatus()=="delivered" && player.casts==2 && player.GetItemCount(10940)==11 && !player.GetItemByGuid(ObjectGuid(84)));
+    }
+    {
+        Runtime runtime; Player player;player.acceptLoot=false;runtime.Add(player);runtime.Ticks(5);
+        runtime.Sql("UPDATE overseer_command SET status='error' WHERE id=1;");runtime.Ticks(4);
+        player.acceptLoot=true;runtime.Ticks(4);
+        Check("an already-started cancelled cast finishes cleanup without another request", runtime.Status()=="error" && runtime.Tasks()==0 && player.casts==1 && player.GetItemCount(10940)==9 && !player.GetItemByGuid(ObjectGuid(42)));
+    }
+    {
+        Runtime runtime; Player player;player.emitLoot=false;runtime.Add(player);runtime.Ticks(3);
+        player.casting=true;
+        runtime.Sql("UPDATE overseer_command SET status='error' WHERE id=1;");runtime.Ticks(4);
+        Item* source=player.GetItemByGuid(ObjectGuid(42));
+        source->m_lootGenerated=true;source->loot.items={{10940,2,false}};
+        player.currentLoot=ObjectGuid(42);player.casting=false;
+        beforeLoot(&player,player.currentLoot,source->loot);runtime.Ticks(4);
+        Check("a cancelled in-flight cast retains proof for its later loot callback", runtime.Status()=="error" && player.casts==1 && player.GetItemCount(10940)==9 && !player.GetItemByGuid(ObjectGuid(42)));
     }
     return failures?1:0;
 }

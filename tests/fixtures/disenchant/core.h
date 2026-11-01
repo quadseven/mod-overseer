@@ -257,7 +257,7 @@ struct Player
     std::string name="Smith";
     bool alive=true,online=true,combat=false,moving=false,dungeon=false,known=true;
     bool refuseCast=false,emitLoot=true,acceptLoot=true,releaseWorks=true,restricted=false;
-    bool loseStoredReagent=false;
+    bool loseStoredReagent=false,casting=false;
     uint32 skill=100,casts=0,releases=0;
     bool sourceSurvivedSendLoot=true;
     ObjectGuid currentLoot;
@@ -277,7 +277,7 @@ struct Player
     bool IsInWorld() const { return online; }
     bool IsInCombat() const { return combat; }
     bool isMoving() const { return moving; }
-    bool IsNonMeleeSpellCast(bool) const { return false; }
+    bool IsNonMeleeSpellCast(bool) const { return casting; }
     bool HasSpell(uint32) const { return known; }
     bool HasPlayerFlag(uint32) const { return restricted; }
     uint32 GetSkillValue(uint32) const { return skill; }

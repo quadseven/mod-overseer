@@ -16693,6 +16693,51 @@ public:
     }
 
 private:
+    void RetireDisenchant(std::string const& name, uint32 command)
+    {
+        if (DisenchantRead(name, command).proof.source)
+            _disenchantRetired[name] = command;
+        else
+            DisenchantForget(name, command);
+    }
+
+    void DriveRetiredDisenchant()
+    {
+        for (auto it = _disenchantRetired.begin(); it != _disenchantRetired.end();)
+        {
+            Player* player = ObjectAccessor::FindPlayerByName(it->first);
+            if (!player || !player->IsInWorld() || !player->IsAlive())
+            {
+                ++it;
+                continue;
+            }
+            DisenchantWindow window = DisenchantRead(it->first, it->second);
+            DisenchantInventory inventory{player};
+            // AI-REVIEW 2026-11-01 [codex/in-process/spec] DE-CANCEL-LOOT (code-review, PR #1303):
+            // Cancellation cannot forget a cast's open loot. Finish only its existing
+            // inventory effects; never cast or acknowledge a cancelled command here.
+            if (OverseerDisenchant::Finish(inventory, window.proof))
+            {
+                DisenchantForget(it->first, it->second);
+                it = _disenchantRetired.erase(it);
+                continue;
+            }
+            if (Loot* loot = inventory.LootOf(window.proof.source))
+            {
+                TakeDisenchantLoot(player, ObjectGuid(window.proof.source), *loot);
+                ++it;
+                continue;
+            }
+            if (player->IsNonMeleeSpellCast(false))
+            {
+                ++it;
+                continue;
+            }
+            DisenchantForget(it->first, it->second);
+            it = _disenchantRetired.erase(it);
+        }
+    }
+
     bool HasDisenchantWork(std::string const& name) const
     {
         return _disenchantClaiming.count(name) || std::any_of(
@@ -16766,7 +16811,7 @@ private:
                         for (auto it = _disenchantTasks.begin(); it != _disenchantTasks.end();)
                             if (!it->second.completing && !owned.count(it->first))
                             {
-                                DisenchantForget(it->second.name, it->first);
+                                RetireDisenchant(it->second.name, it->first);
                                 it = _disenchantTasks.erase(it);
                             }
                             else
@@ -16861,9 +16906,10 @@ private:
     {
         if (!_disenchantStore.Ready())
             return;
+        DriveRetiredDisenchant();
         for (auto& [id, task] : _disenchantTasks)
         {
-            if (task.completing)
+            if (task.completing || _disenchantRetired.count(task.name))
                 continue;
             Player* player = ObjectAccessor::FindPlayerByName(task.name);
             if (!player || !player->IsInWorld() || !player->IsAlive())
@@ -82297,6 +82343,7 @@ private:
     OverseerDisenchant::Store _disenchantStore;
     QueryCallbackProcessor _disenchantQueries;
     std::map<uint32, DisenchantTask> _disenchantTasks;
+    std::map<std::string, uint32> _disenchantRetired;
     std::map<std::string, time_t> _disenchantClaiming;
     std::set<uint32> _disenchantCompleted;
     bool _disenchantOwnedBusy = false;
