@@ -91,7 +91,7 @@ run state. Once every family member is observed outside, normal run
 finalization records the outcome and advances the same campaign. An unseen
 member is not proof of an exit; a member still inside remains in recovery.
 
-## Disenchanting a carried item
+### Disenchanting a carried item
 
 A `disenchant` command names one enabled roster character on `job='craft'`.
 Reserved items are excluded, and reservations are checked again before source destruction.
