@@ -35,7 +35,8 @@ CREATE TABLE overseer_command (
   status ENUM('pending','claimed','delivered','error') NOT NULL DEFAULT 'pending',
   result TEXT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_target_created (target_name, created_at)
 );
 """
 BRIDGE_READ = """
@@ -155,16 +156,26 @@ class ShareRetentionReplayTest(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         return result.stdout
 
-    def sweep(self):
-        """One sweep, as the module runs it: select, then delete those ids."""
-        ids = self.mysql(self.sql("select") + ";").split()
+    def sweep(self, holder):
+        """One holder's sweep, as the module runs it: select, then delete."""
+        ids = self.mysql(self.sql("select", holder) + ";").split()
         if ids:
             self.mysql(self.sql("delete", *ids) + ";")
         return len(ids)
 
+    def holders(self):
+        found, after = [], ""
+        while True:
+            holder = self.mysql(self.sql("next", after) + ";").strip()
+            if not holder:
+                return found
+            found.append(holder)
+            after = holder
+
     def drain(self):
-        while self.sweep():
-            pass
+        for holder in self.holders():
+            while self.sweep(holder):
+                pass
 
     def setUp(self):
         self.mysql(SCHEMA)
@@ -208,10 +219,26 @@ class ShareRetentionReplayTest(unittest.TestCase):
     def test_the_count_matches_and_a_second_pass_deletes_nothing(self):
         self.mysql("".join(row("Long", hour) for hour in range(1, 21)))
         self.assertEqual("12\n", self.mysql(self.sql("count") + ";"))
-        self.assertEqual(12, self.sweep())
+        self.assertEqual(12, self.sweep("Long"))
         self.assertEqual("0\n", self.mysql(self.sql("count") + ";"))
-        self.assertEqual(0, self.sweep())
+        self.assertEqual(0, self.sweep("Long"))
         self.assertEqual("8\n", self.mysql("SELECT COUNT(*) FROM overseer_command;"))
+
+    def test_a_sweep_reads_only_its_holder(self):
+        self.mysql(
+            "".join(row("Aone", h) for h in range(1, 12))
+            + "".join(row("Btwo", h) for h in range(1, 12))
+        )
+        self.assertEqual(["Aone", "Btwo"], self.holders())
+        self.assertEqual(3, self.sweep("Aone"))
+        self.assertEqual("3\n", self.mysql(self.sql("count") + ";"))
+
+    def test_the_plan_reads_through_the_holder_index(self):
+        self.mysql("".join(row("Aone", h) for h in range(1, 12)))
+        plan = self.mysql("EXPLAIN " + self.sql("select", "Aone") + ";")
+        self.assertIn("idx_target_created", plan)
+        plan = self.mysql("EXPLAIN " + self.sql("next", "") + ";")
+        self.assertIn("idx_target_created", plan)
 
     def test_one_sweep_is_bounded(self):
         values = ",".join(
@@ -224,9 +251,9 @@ class ShareRetentionReplayTest(unittest.TestCase):
             "(target_name, command, kind, target_arg, status, result, updated_at) "
             "VALUES %s;" % values
         )
-        self.assertEqual(5000, self.sweep())
-        self.assertEqual(12, self.sweep())
-        self.assertEqual(0, self.sweep())
+        self.assertEqual(5000, self.sweep("Long"))
+        self.assertEqual(12, self.sweep("Long"))
+        self.assertEqual(0, self.sweep("Long"))
 
 
 if __name__ == "__main__":
