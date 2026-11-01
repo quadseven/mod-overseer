@@ -51,6 +51,9 @@ public:
     void Ticks(int n) { while(n--) Tick(); }
     std::string Status() { return _disenchantStore.Status(1); }
     void FailCompletion() { _disenchantStore.failCompletionOnce=true; }
+    void FailOwnedReads(bool fail) { _disenchantStore.failOwnedReads=fail; }
+    std::size_t Tasks() const { return _disenchantTasks.size(); }
+    std::string ReplacementStatus() { return _disenchantStore.Status(2); }
     void Sql(char const* sql) { _disenchantStore.Exec(sql); }
     bool HasProof() { return HasDisenchantProof("Smith"); }
     void AddSecond(Player& player)
@@ -155,6 +158,22 @@ int main()
     {
         Runtime runtime; Player player;player.known=false;runtime.Add(player);runtime.Ticks(7);
         Check("no spell is granted to satisfy an errand", player.casts==0 && !player.known && runtime.Status()=="claimed");
+    }
+    {
+        Runtime runtime; Player player;player.refuseCast=true;runtime.Add(player);runtime.Ticks(5);
+        runtime.Sql("UPDATE overseer_command SET status='error' WHERE id=1;");runtime.Ticks(4);
+        Check("a cancelled command is removed from a valid empty owned snapshot", runtime.Tasks()==0);
+        runtime.Sql("INSERT INTO overseer_command(id,target_name,kind,status) VALUES(2,'Smith','disenchant','pending');");
+        player.refuseCast=false;runtime.Ticks(6);
+        Check("cancelled work does not defer a replacement errand forever", runtime.ReplacementStatus()=="delivered");
+    }
+    {
+        Runtime runtime; Player player;player.refuseCast=true;runtime.Add(player);runtime.Ticks(5);
+        runtime.FailOwnedReads(true);
+        runtime.Sql("UPDATE overseer_command SET status='error' WHERE id=1;");runtime.Ticks(4);
+        Check("a failed owned read does not masquerade as an empty snapshot", runtime.Tasks()==1);
+        runtime.FailOwnedReads(false);runtime.Ticks(4);
+        Check("a recovered valid empty snapshot releases the stale task", runtime.Tasks()==0);
     }
     return failures?1:0;
 }

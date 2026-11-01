@@ -16744,20 +16744,33 @@ private:
                     _disenchantFactsAt = GameTime::GetGameTime().count();
                     if (result)
                     {
+                        std::set<uint32> owned;
                         for (auto& entry : _disenchantTasks)
                             entry.second.enabled = false;
                         do
                         {
                             Field* fields = result->Fetch();
                             uint32 const id = fields[0].Get<uint32>();
-                            if (_disenchantCompleted.count(id))
+                            if (!id || _disenchantCompleted.count(id))
                                 continue;
+                            owned.insert(id);
                             auto& task = _disenchantTasks[id];
                             task.name = fields[1].Get<std::string>();
                             task.job = fields[2].Get<std::string>();
                             task.enabled = fields[3].Get<uint8>() != 0;
                             _disenchantClaiming.erase(task.name);
                         } while (result->NextRow());
+                        // AI-REVIEW 2026-11-01 [claude-haiku-5-5] DE-STALE (Elder, PR #1303):
+                        // Cancelled rows must stop blocking later work. Prune only from a
+                        // readable snapshot; the id-0 sentinel distinguishes empty from failure.
+                        for (auto it = _disenchantTasks.begin(); it != _disenchantTasks.end();)
+                            if (!it->second.completing && !owned.count(it->first))
+                            {
+                                DisenchantForget(it->second.name, it->first);
+                                it = _disenchantTasks.erase(it);
+                            }
+                            else
+                                ++it;
                     }
                     // At most one owned read is outstanding. Completed ids
                     // fence that read's snapshot; later reads see delivery.

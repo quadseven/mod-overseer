@@ -42,9 +42,12 @@ public:
             "WHERE id = ? AND kind = 'disenchant' AND status = 'pending'",
             CONNECTION_ASYNC);
         PrepareStatement(Owned,
-            "SELECT c.id, c.target_name, COALESCE(r.job, ''), COALESCE(r.enabled, 0) "
-            "FROM overseer_command c LEFT JOIN overseer_roster r ON r.name = c.target_name "
-            "WHERE c.kind = 'disenchant' AND c.status = 'claimed' AND c.claimed_by = ? "
+            // A valid empty snapshot returns id 0; a failed query still returns no result.
+            "SELECT COALESCE(c.id, 0), COALESCE(c.target_name, ''), "
+            "COALESCE(r.job, ''), COALESCE(r.enabled, 0) "
+            "FROM (SELECT 1) AS owned_snapshot LEFT JOIN overseer_command c "
+            "ON c.kind = 'disenchant' AND c.status = 'claimed' AND c.claimed_by = ? "
+            "LEFT JOIN overseer_roster r ON r.name = c.target_name "
             "ORDER BY c.id", CONNECTION_ASYNC);
         PrepareStatement(Complete,
             "UPDATE overseer_command SET status = 'delivered', "

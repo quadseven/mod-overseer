@@ -100,6 +100,7 @@ class ModuleDatabasePool
     std::vector<std::function<void()>> work;
 public:
     bool failCompletionOnce = false;
+    bool failOwnedReads = false;
     virtual ~ModuleDatabasePool() { Close(); }
     void SetConnectionInfo(std::string_view, uint8 async, uint8 sync)
     { if (async != 1 || sync != 1) throw std::runtime_error("unexpected pool concurrency"); }
@@ -174,6 +175,8 @@ private:
     PreparedQueryResult Run(PreparedStatementBase const& p)
     {
         auto const& sql = connection->sql.at(p.index);
+        if (failOwnedReads && sql.find("COALESCE(r.job") != std::string::npos)
+            return {};
         if (failCompletionOnce && sql.find("SET status = 'delivered'") != std::string::npos) {
             failCompletionOnce=false; return {};
         }
