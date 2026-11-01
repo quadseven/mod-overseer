@@ -18834,7 +18834,45 @@ struct RaidDoor
     // spawn and template tables at run time. 0 is no stone.
     unsigned meetingStones[2];
     char const* stonesName;
+    // The wing the dungeon brain clears, the parameter of its `dc on`. Empty is
+    // the whole map. Blackrock Spire needs it: a bare `dc on` at the portal
+    // reads the party's ground as the Lower Spire (mod-dungeon-clear's
+    // DungeonWingRegistry, Explicit select on map 229).
+    char const* clearWing;
+    // The instance-script slots that make this door's clear. All zeros is every
+    // slot the script keeps. The Spire's script keeps both wings and its hall
+    // flags in one list of 23, so "every slot" there could never read done.
+    unsigned clearSlots[4];
 };
+
+// THE UPPER SPIRE'S DOOR IS THE SPIRE'S ONLY PORTAL (mod-overseer#1187). Read
+// on the dev realm 2026-11-01:
+//
+//   areatrigger          (1468, 0, -7518.19, -1239.13, 287.243, radius 10)
+//   areatrigger_teleport (1470, 'Blackrock Spire Entrance', 0, -7524.7, -1228.41,
+//                         287.204): the way-out landing, 12.5 yards from 1468's
+//                         centre, so a raid staged there cannot drift in
+//   dungeon_access_template (map 229): min_level 45, no requirement rows
+//   Map.dbc 229 is type 1, a dungeon, not a raid, and MapDifficulty.dbc gives it
+//   15 players, so a raid group of ten is admitted and map->IsRaid() is false
+//   gameobject 164725, the Dragonspine Door: no lock, starts open, in no script
+//
+// THE KEYWORD IS `ubrs`, not the place name: overseer_raid_seat.keyword is
+// VARCHAR(20) and `upper-blackrock-spire` is 21 characters.
+//
+// THE SEAL OF ASCENSION IS NOT ASKED FOR on this core. The Upper Spire's bosses
+// are slots 9 Emberseer, 10 Rend, 12 The Beast and 13 Drakkisath of
+// instance_blackrock_spire; 11 Gyth is left out because Rend's event owns him.
+
+// How far a door's clear has got.
+struct RaidClearCount
+{
+    unsigned done{0};
+    unsigned total{0};
+};
+
+// `doneBySlot` is the instance script's encounters by slot, true for DONE.
+RaidClearCount RaidClearProgress(RaidDoor const& door, std::vector<bool> const& doneBySlot);
 
 // The door for `keyword`, or nullptr. Exact, lower case: the queue writes the
 // keyword and nothing else does.
@@ -19259,7 +19297,11 @@ RaidStoneSummon ChooseRaidStoneSummon(std::vector<RaidStoneSeat> const& seats,
 // operator's raid order reaches, and only after HOLD. HOLD and RECOVER keep the
 // brain off: a raid that is still gathering, eating or running back is not one
 // the brain may start pulling for.
-bool DungeonClearMayArmHere(bool raidMap, bool raidClearOrdered);
+//
+// A RAID RUN ON A DUNGEON-TYPE MAP HOLDS THE SAME WAY. Blackrock Spire is map
+// type dungeon, so `raidMap` alone would arm a bare `dc on` on the raid the
+// moment it crossed (`inRaidRun`, the character's family run is past Idle).
+bool DungeonClearMayArmHere(bool raidMap, bool raidClearOrdered, bool inRaidRun = false);
 
 // -- and the row that asks for any of it -------------------------------------
 //

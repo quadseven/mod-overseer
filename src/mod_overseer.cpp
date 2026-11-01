@@ -31026,18 +31026,15 @@ private:
             // operator's raid order reaches and only through HOLD; in every
             // other phase the answer on a raid map is hold, and no run row is
             // opened for it either.
-            bool raidClearOrdered = false;
-            if (map->IsRaid())
-            {
-                auto const raidPhase = _raidRunPhaseByMember.find(name);
-                raidClearOrdered = raidPhase != _raidRunPhaseByMember.end() &&
-                                   raidPhase->second == OverseerDecisions::RaidRunPhase::Clear;
-            }
-            if (!OverseerDecisions::DungeonClearMayArmHere(map->IsRaid(), raidClearOrdered))
+            auto const raidPhase = _raidRunPhaseByMember.find(name);
+            bool const inRaidRun = raidPhase != _raidRunPhaseByMember.end();
+            bool const raidClearOrdered =
+                inRaidRun && raidPhase->second == OverseerDecisions::RaidRunPhase::Clear;
+            if (!OverseerDecisions::DungeonClearMayArmHere(map->IsRaid(), raidClearOrdered, inRaidRun))
             {
                 if (_raidArmingHeldSaid.insert(name).second)
                     LOG_INFO("module.overseer",
-                             "overseer: '{}' is inside raid map {} - the dungeon brain is "
+                             "overseer: '{}' is inside raid run map {} - the dungeon brain is "
                              "held off until the family's raid run is in CLEAR; the raid "
                              "holds where it stands",
                              name, static_cast<uint32>(bot->GetMapId()));
@@ -31256,8 +31253,11 @@ private:
             bool const wasRefused = record.runId == runId && !record.accepted;
             // Event(source, param, owner)  Event.h:21-24; the owner is what
             // IsAuthorized reads (DungeonClearChatActions.cpp:62).
+            auto const wing = _raidRunWingByMember.find(name);
+            std::string const raidWing =
+                wing == _raidRunWingByMember.end() ? std::string() : wing->second;
             bool const accepted =
-                botAI->DoSpecificAction("dc on", Event("dc", "", issuer), true);
+                botAI->DoSpecificAction("dc on", Event("dc", raidWing, issuer), true);
             record.runId = runId;
             record.accepted = accepted;
             record.issuedAt = now;
@@ -51781,6 +51781,8 @@ private:
     // rebuilt on every DriveRaidRun, for HeadTravelFactsFor (#631's order of
     // claimants on a head's travel column). World thread only.
     std::map<std::string, OverseerDecisions::RaidRunPhase> _raidRunPhaseByMember;
+    // The wing each member's raid run clears, for `dc on`; rebuilt with it.
+    std::map<std::string, std::string> _raidRunWingByMember;
     // Characters already told that the dungeon brain is held on a raid map, so
     // the line is said once per stay rather than every poll.
     std::set<std::string> _raidArmingHeldSaid;
@@ -52283,10 +52285,13 @@ private:
             InstanceScript* script = member->GetInstanceScript();
             if (!script)
                 continue;
-            total = script->GetEncounterCount();
-            for (uint32 slot = 0; slot < total; ++slot)
-                if (script->GetBossState(slot) == DONE)
-                    ++done;
+            std::vector<bool> slots(script->GetEncounterCount(), false);
+            for (uint32 slot = 0; slot < slots.size(); ++slot)
+                slots[slot] = script->GetBossState(slot) == DONE;
+            OverseerDecisions::RaidClearCount const count =
+                OverseerDecisions::RaidClearProgress(*door, slots);
+            done = count.done;
+            total = count.total;
             return;
         }
     }
@@ -52735,6 +52740,7 @@ private:
 
         std::map<std::string, std::string> const jobs = LoadJobs();
         _raidRunPhaseByMember.clear();
+        _raidRunWingByMember.clear();
         _raidRunBackGhosts.clear();
         std::set<std::string> ghostsWalked;
         for (OverseerDecisions::FamilyRoster const& roster : LoadFamilyRosters())
@@ -52747,16 +52753,22 @@ private:
             struct MarkMembers
             {
                 std::map<std::string, OverseerDecisions::RaidRunPhase>& byMember;
+                std::map<std::string, std::string>& wingByMember;
                 OverseerDecisions::FamilyRoster const& roster;
                 RaidRunState const& run;
                 ~MarkMembers()
                 {
                     if (run.phase == OverseerDecisions::RaidRunPhase::Idle)
                         return;
+                    OverseerDecisions::RaidDoor const* door =
+                        OverseerDecisions::RaidDoorFor(run.keyword);
                     for (OverseerDecisions::FamilyMember const& member : roster.members)
+                    {
                         byMember[member.name] = run.phase;
+                        wingByMember[member.name] = door ? door->clearWing : "";
+                    }
                 }
-            } const mark{_raidRunPhaseByMember, roster, run};
+            } const mark{_raidRunPhaseByMember, _raidRunWingByMember, roster, run};
             auto const job = jobs.find(roster.leader);
             std::string const keyword = OverseerDecisions::RaidKeywordForJob(
                 job == jobs.end() ? std::string() : job->second);
