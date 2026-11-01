@@ -26,6 +26,7 @@ struct Book
     std::map<std::string, std::string> _claimed;
     std::map<std::string, TravelOwner> _claimOwner;
     std::map<std::string, Refusal> _refused;
+    std::map<std::string, LastWrite> _lastWrite;
     std::map<std::string, State> _state;
     std::map<std::string, ErrandEnd> _lastEnd;
     std::map<std::string, Landing> _landed;
@@ -40,6 +41,11 @@ struct Book
     unsigned LearnSkillPending(std::string const&) const { return 0; }
     void EndLeaderColumnIntent(std::string const&, std::string const&) {}
     void KeepRefusal(std::string const&) { ++persisted; }
+    bool RecordClaim(std::string const& name, std::string const& target,
+                     TravelOwner owner)
+    {
+        // CLAIM_RECORDING
+    }
     // BOOK_METHODS
 };
 
@@ -85,8 +91,7 @@ int main()
             auto& book = a._travelAims;
             auto claim = [&] {
                 CharacterDatabase.columns["Leader"] = "vendor";
-                book._claimed["Leader"] = "vendor";
-                book._claimOwner["Leader"] = owner;
+                book.RecordClaim("Leader", "vendor", owner);
                 book._state["Leader"] = {"vendor"};
             };
             claim();

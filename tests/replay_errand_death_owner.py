@@ -19,11 +19,18 @@ methods = [
     "    void ReleaseImpl(std::string const& name,",
     "    void Release(std::string const& name,",
 ]
-types = ["    struct Refusal\n", "    struct ErrandEnd\n", "    struct Landing\n"]
+types = ["    struct Refusal\n", "    struct ErrandEnd\n", "    struct Landing\n",
+         "    struct LastWrite\n"]
 harness = (ROOT / "tests/fixtures/errand_death_owner/replay.cpp").read_text()
 harness = harness.replace("// BOOK_TYPES", "\n".join(function(source, t) + ";" for t in types))
 harness = harness.replace("// BOOK_METHODS", "\n".join(function(source, m) for m in methods))
 harness = harness.replace("// TOLL_ASSEMBLY", source[start:end])
+# A real claim has one in-memory writer, which records both maps together.
+assert source.count("_claimed[name] = target;") == 1
+assert source.count("_claimOwner[name] = owner;") == 1
+claim = function(source, "    bool Claim(std::string const& name,")
+record = claim[claim.index("        _claimed[name] = target;"):claim.rindex("}")]
+harness = harness.replace("// CLAIM_RECORDING", record)
 with tempfile.TemporaryDirectory() as directory:
     cpp = Path(directory) / "replay.cpp"
     binary = Path(directory) / "replay"
