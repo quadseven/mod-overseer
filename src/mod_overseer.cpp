@@ -8310,8 +8310,35 @@ public:
                  "overseer: the chat, event, death and level queues are flushed at shutdown");
     }
 
+    // ANSWERED SHARE ROWS PAST THE BACKOFF'S MEMORY (#1251), a batch a sweep.
+    // Asked on the async pool, because the read ranks every answered share
+    // row: run on this thread it would stall the world. Off unless the realm
+    // turns it on, because it deletes history.
+    void SweepShareRows()
+    {
+        if (_shareSweepBusy ||
+            !sConfigMgr->GetOption<bool>("Overseer.ShareRetention.Enable", false))
+            return;
+        _shareSweepBusy = true;
+        _shareSweepQuery.AddCallback(
+            CharacterDatabase.AsyncQuery(OverseerDecisions::ShareRetentionSelectSql())
+                .WithCallback([this](QueryResult result)
+                {
+                    _shareSweepBusy = false;
+                    if (!result)
+                        return;
+                    std::vector<uint32_t> ids;
+                    do
+                        ids.push_back(result->Fetch()[0].Get<uint32>());
+                    while (result->NextRow());
+                    CharacterDatabase.Execute(OverseerDecisions::ShareRetentionDeleteSql(ids));
+                    LOG_INFO("module", "overseer: share retention deleting {} rows", ids.size());
+                }));
+    }
+
     void OnUpdate(uint32 diff) override
     {
+        _shareSweepQuery.ProcessReadyCallbacks();
         _commandTimer += diff;
         _snapshotTimer += diff;
         _movementTimer += diff;
@@ -8679,6 +8706,7 @@ public:
                 "DELETE FROM overseer_command WHERE kind = 'probe' "
                 "AND updated_at < NOW() - INTERVAL {} HOUR LIMIT {}",
                 PROBE_RETENTION_HOURS, PROBE_SWEEP_BATCH);
+            SweepShareRows();
             // The run timeline: swept on created_at like the deaths, because a
             // row is never updated after it is written.
             if (RunTimelinePresent())
@@ -81689,6 +81717,8 @@ private:
             "DELETE FROM overseer_zone_danger WHERE updated_at < NOW() - INTERVAL 60 SECOND");
     }
 
+    QueryCallbackProcessor _shareSweepQuery;
+    bool _shareSweepBusy = false;
     uint32 _commandTimer = 0;
     uint32 _snapshotTimer = 0;
     uint32 _movementTimer = 0;
