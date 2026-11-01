@@ -19,6 +19,12 @@ that can be told what to do and that report what they did.
    (`overseer_snapshot`), deaths, events, dungeon run records and loot
    decisions, in `overseer_*` tables an outside page can read.
 
+`overseer_zone_danger` holds the routing rule's current result for each online
+roster member, replaced alongside presence snapshots and expired after logout.
+It includes party/map context, scores and counted deaths; the existing `state`
+probe carries the same projection. Consumers read this result rather than
+reimplementing the danger rule.
+
 ## Quick start
 
 There is no standalone build: the module compiles inside an AzerothCore
@@ -145,7 +151,8 @@ server. `MYSQL_REPLAY_COMMAND` can supply a JSON array of client arguments,
 such as `["docker","exec","-i","your-test-mysql","mysql","--user=root"]`.
 The test uses only its `overseer_run_family_replay` fixture database. It checks
 different column collations, conservative adoption, index replacement,
-idempotent reapplication, and native MySQL upserts.
+idempotent reapplication, and native MySQL upserts. The same suite checks the
+zone-danger snapshot migration twice, its JSON replacement and explicit collation.
 
 `scripts/check-locally.sh decisions` runs the same steps (plus the check that
 `VERSION` matches the constant in `src/overseer_decisions.h`) in a scratch
