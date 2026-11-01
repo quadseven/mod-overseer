@@ -1937,9 +1937,12 @@ bool DungeonRunEntryReady(std::vector<DungeonRunEntryState> const& members,
             return false;
         if (!member.alive)
             return false;
+        if (member.otherCopy)
+            return false;
         if (member.inCombat)
             return false;
-        if (member.distanceFromDoor < 0.f || member.distanceFromDoor > doorstepYards)
+        if (member.distanceFromDoor < 0.f ||
+            !member.insideDoor.value_or(member.distanceFromDoor <= doorstepYards))
             return false;
     }
     return true;
@@ -1976,8 +1979,10 @@ std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& mem
             why = "in combat";
         else if (member.distanceFromDoor < 0.f)
             why = "wrong map";
-        else if (member.distanceFromDoor > doorstepYards)
-            why = std::to_string(static_cast<int>(member.distanceFromDoor)) + "y from the door";
+        else if (!member.insideDoor.value_or(member.distanceFromDoor <= doorstepYards))
+            why = member.insideDoor.has_value()
+                ? "outside the trigger"
+                : std::to_string(static_cast<int>(member.distanceFromDoor)) + "y from the door";
         else
             why = "at the door, not through";
 
@@ -2480,6 +2485,16 @@ DcArmingStep DecideDcArming(bool issuerAvailable, bool recordIsForThisRun,
 bool LeaderAwayEndsRun(time_t awaySince, time_t now, long ceilingSeconds)
 {
     return awaySince && now > awaySince && now - awaySince > ceilingSeconds;
+}
+
+ClearingArmGate DecideClearingArmGate(bool acceptedOnEveryoneInside, time_t leaderAwaySince,
+                                      time_t now, long ceilingSeconds)
+{
+    if (acceptedOnEveryoneInside)
+        return ClearingArmGate::Armed;
+    return LeaderAwayEndsRun(leaderAwaySince, now, ceilingSeconds)
+               ? ClearingArmGate::LeaderAwayEnds
+               : ClearingArmGate::HoldNotArmed;
 }
 
 bool ForgetDcOnRecord(bool inWorld, bool onDungeonMap)
@@ -4059,6 +4074,38 @@ StagingNudge StagingWatchdog(StagingStallState& state, ApproachGap const& gap,
     if (rung == 1)
         return StagingNudge::Reaim;
     return StagingNudge::ClearMovement;
+}
+
+bool StagingRetreated(StagingRetreatState& state, StagingRetreatReading const& reading,
+                      StagingRetreatLimits const& limits)
+{
+    if (!reading.measurable)
+    {
+        state.rebase = true;
+        return false;
+    }
+    if (reading.yards < 0.f)
+        return false;
+    if (state.startYards < 0.f)
+    {
+        state.startYards = reading.yards;
+        state.bestYards = reading.yards;
+        state.rebase = false;
+        return false;
+    }
+    if (state.rebase || reading.walkedOnRoute)
+    {
+        state.rebase = false;
+        state.startYards = std::max(state.startYards, reading.yards);
+        state.bestYards = reading.yards;
+        return false;
+    }
+    state.bestYards = std::min(state.bestYards, reading.yards);
+    float const headway = state.startYards - state.bestYards;
+    float const limit = headway >= limits.headwayYards
+                            ? state.bestYards + headway / 2.f
+                            : state.startYards + limits.wanderYards;
+    return reading.yards > limit;
 }
 
 StagingAim StagingAimStep(bool legChanged, bool runStillOwns)
@@ -8698,7 +8745,7 @@ DoorRejoinStep DecideDoorRejoin(DoorRejoinFacts const& f, float knockYards)
         return DoorRejoinStep::None;
     if (f.inCombat || f.yardsFromDoor < 0.f)
         return DoorRejoinStep::Wait;
-    if (f.yardsFromDoor > knockYards)
+    if (!f.insideDoor.value_or(f.yardsFromDoor <= knockYards))
         return DoorRejoinStep::Walk;
     return f.partyBelongsInside ? DoorRejoinStep::Knock : DoorRejoinStep::Wait;
 }
@@ -11787,6 +11834,193 @@ std::uint32_t DiedOnLegsHeld(std::vector<DiedOnLeg> const& died, std::time_t now
 bool SteerCreatureWalkAlongRoute(bool creatureAim, std::uint32_t diedOnLegsHeld)
 {
     return creatureAim && diedOnLegsHeld > 0;
+}
+
+std::uint32_t LowestPartyLevel(std::vector<std::uint32_t> const& partyLevels)
+{
+    std::uint32_t lowest = 0;
+    for (std::uint32_t const level : partyLevels)
+        if (level && (!lowest || level < lowest))
+            lowest = level;
+    return lowest;
+}
+
+namespace
+{
+bool CountsAgainstParty(ZoneDeath const& death, std::uint32_t partyLevel, std::time_t now,
+                        ZoneDangerLimits const& limits)
+{
+    return partyLevel && death.killerLevel >= partyLevel + limits.levelGap && death.at <= now &&
+           static_cast<std::int64_t>(now - death.at) < limits.windowSeconds;
+}
+
+std::string ZoneNames(std::vector<DangerZone> const& zones, ZoneDangerLimits const& limits)
+{
+    std::string out;
+    for (std::size_t i = 0; i < zones.size(); ++i)
+    {
+        if (i)
+            out += ", ";
+        out += "zone " + std::to_string(zones[i].zoneId);
+        if (!zones[i].name.empty())
+            out += " (" + zones[i].name + ")";
+        out += ", " + std::to_string(zones[i].deaths) + " death(s) in " +
+               std::to_string(limits.windowSeconds / 3600) + " hours to creatures up to level " +
+               std::to_string(zones[i].strongestKiller);
+    }
+    return out;
+}
+
+bool WalksZone(std::vector<std::uint32_t> const& nodes, NodeZones const& nodeZones,
+               std::uint32_t zoneId)
+{
+    for (std::uint32_t const node : nodes)
+    {
+        NodeZones::const_iterator const at = nodeZones.find(node);
+        if (at != nodeZones.end() && at->second == zoneId)
+            return true;
+    }
+    return false;
+}
+}  // namespace
+
+std::uint32_t ZoneDangerScore(std::vector<ZoneDeath> const& deaths, std::uint32_t mapId,
+                              std::uint32_t zoneId, std::uint32_t partyLevel, std::time_t now,
+                              ZoneDangerLimits const& limits)
+{
+    std::uint32_t score = 0;
+    for (ZoneDeath const& death : deaths)
+        if (death.mapId == mapId && death.zoneId == zoneId &&
+            CountsAgainstParty(death, partyLevel, now, limits))
+            ++score;
+    return score;
+}
+
+std::vector<DangerZone> DangerZonesOn(std::vector<ZoneDeath> const& deaths, std::uint32_t mapId,
+                                      std::uint32_t partyLevel, std::time_t now,
+                                      ZoneDangerLimits const& limits)
+{
+    std::map<std::uint32_t, DangerZone> counted;
+    for (ZoneDeath const& death : deaths)
+    {
+        if (death.mapId != mapId || !CountsAgainstParty(death, partyLevel, now, limits))
+            continue;
+        DangerZone& zone = counted[death.zoneId];
+        zone.zoneId = death.zoneId;
+        ++zone.deaths;
+        zone.strongestKiller = std::max(zone.strongestKiller, death.killerLevel);
+    }
+    std::vector<DangerZone> out;
+    for (std::pair<std::uint32_t const, DangerZone> const& entry : counted)
+        if (limits.deaths && entry.second.deaths >= limits.deaths)
+            out.push_back(entry.second);
+    return out;
+}
+
+std::string ZoneDangerProbeJson(std::vector<DangerZone> const& zones, std::uint32_t mapId,
+                                 std::uint32_t partyLevel, std::time_t now,
+                                 ZoneDangerLimits const& limits)
+{
+    std::string out = "{\"map_id\":" + std::to_string(mapId) +
+                      ",\"party_level\":" + std::to_string(partyLevel) +
+                      ",\"sampled_at\":" + std::to_string(now) +
+                      ",\"window_seconds\":" + std::to_string(limits.windowSeconds) +
+                      ",\"level_gap\":" + std::to_string(limits.levelGap) +
+                      ",\"threshold\":" + std::to_string(limits.deaths) + ",\"zones\":[";
+    for (std::size_t i = 0; i < zones.size(); ++i)
+    {
+        DangerZone const& zone = zones[i];
+        if (i)
+            out += ",";
+        out += "{\"zone_id\":" + std::to_string(zone.zoneId) +
+               ",\"name\":" + JsonString(zone.name) +
+               ",\"score\":" + std::to_string(zone.deaths) +
+               ",\"deaths_counted\":" + std::to_string(zone.deaths) +
+               ",\"strongest_killer\":" + std::to_string(zone.strongestKiller) + "}";
+    }
+    return out + "]}";
+}
+
+void ForgetOldZoneDeaths(std::vector<ZoneDeath>& deaths, std::time_t now,
+                         ZoneDangerLimits const& limits)
+{
+    deaths.erase(std::remove_if(deaths.begin(), deaths.end(),
+                                [&](ZoneDeath const& death)
+                                {
+                                    return static_cast<std::int64_t>(now - death.at) >=
+                                           limits.windowSeconds;
+                                }),
+                 deaths.end());
+}
+
+float DangerZonePrice(std::uint32_t from, std::uint32_t to, NodeZones const& nodeZones,
+                      std::vector<DangerZone> const& zones, ZoneDangerLimits const& limits)
+{
+    if (!(limits.priceYards >= 0.f) || !std::isfinite(limits.priceYards))
+        return 0.f;
+    NodeZones::const_iterator const a = nodeZones.find(from);
+    NodeZones::const_iterator const b = nodeZones.find(to);
+    for (DangerZone const& zone : zones)
+        if ((a != nodeZones.end() && a->second == zone.zoneId) ||
+            (b != nodeZones.end() && b->second == zone.zoneId))
+            return limits.priceYards;
+    return 0.f;
+}
+
+std::uint32_t PriceDangerZones(std::vector<RouteLink>& links, NodeZones const& nodeZones,
+                               std::vector<DangerZone> const& zones,
+                               ZoneDangerLimits const& limits)
+{
+    std::uint32_t priced = 0;
+    if (zones.empty())
+        return priced;
+    for (RouteLink& link : links)
+    {
+        if (!link.onFoot || !(link.yards >= 0.f))
+            continue;
+        float const price = DangerZonePrice(link.from, link.to, nodeZones, zones, limits);
+        if (price > 0.f)
+        {
+            link.yards += price;
+            ++priced;
+        }
+    }
+    return priced;
+}
+
+ZoneRouteReading ReadZoneRoute(std::vector<std::uint32_t> const& walked,
+                               std::vector<std::uint32_t> const& wayThrough,
+                               NodeZones const& nodeZones,
+                               std::vector<DangerZone> const& zones)
+{
+    ZoneRouteReading reading;
+    for (DangerZone const& zone : zones)
+    {
+        if (WalksZone(walked, nodeZones, zone.zoneId))
+            reading.stillWalked.push_back(zone);
+        else if (WalksZone(wayThrough, nodeZones, zone.zoneId))
+            reading.avoided.push_back(zone);
+    }
+    return reading;
+}
+
+std::string ZoneAvoidedLine(std::string const& name, std::string const& target,
+                            std::vector<DangerZone> const& avoided,
+                            ZoneDangerLimits const& limits)
+{
+    return "overseer: '" + name + "' is sent to '" + target + "' and its route avoids " +
+           ZoneNames(avoided, limits) + ", " + std::to_string(limits.levelGap) +
+           " or more levels above this party (#1243)";
+}
+
+std::string ZoneNoWayRoundLine(std::string const& name, std::string const& target,
+                               std::vector<DangerZone> const& stillWalked,
+                               ZoneDangerLimits const& limits)
+{
+    return "overseer: '" + name + "' is sent to '" + target +
+           "' and no alternative route exists round " + ZoneNames(stillWalked, limits) + ", " +
+           std::to_string(limits.levelGap) +
+           " or more levels above this party. It walks the fewest legs there it can (#1243)";
 }
 
 std::uint32_t DiedOnLegsOnRoute(std::vector<RouteLegSpan> const& legs,
@@ -18366,12 +18600,39 @@ std::string FocusSpawnAim(FocusSpawn const& spawn)
            "," + whole(spawn.z);
 }
 
-GhostRecovery GuildGhostFallback(unsigned deathsHere, bool healerGraveKnown,
-                                 unsigned repeatDeaths)
+GhostRecovery RefusedHealerFallback(RefusedHealerFacts const& facts,
+                                    GhostRecoveryLimits const& limits)
 {
-    if (healerGraveKnown && deathsHere >= repeatDeaths)
+    bool const repeat = limits.repeatDeaths && facts.deathsHere >= limits.repeatDeaths;
+    bool const outlevelled = facts.strongestNearCorpse &&
+                             facts.strongestNearCorpse >= facts.level + limits.levelGap;
+    if ((!repeat && !outlevelled) || facts.liveThreatsNearCorpse == 0)
+        return GhostRecovery::CorpseRun;
+    if (facts.healerWalkFailed && facts.healerKnown)
         return GhostRecovery::SpiritHealer;
-    return GhostRecovery::CorpseRun;
+    if (facts.heldSeconds < facts.holdSeconds || !facts.healerKnown)
+        return GhostRecovery::Wait;
+    return GhostRecovery::SpiritHealer;
+}
+
+GraveyardStanding JudgeGraveyard(bool highGround, PlaceDangerReason danger)
+{
+    if (danger != PlaceDangerReason::Safe)
+        return GraveyardStanding::Dangerous;
+    return highGround ? GraveyardStanding::HighGroundOnly : GraveyardStanding::Passes;
+}
+
+std::size_t PickSafestGraveyard(std::vector<GraveyardStanding> const& standings)
+{
+    std::size_t highGround = standings.size();
+    for (std::size_t i = 0; i < standings.size(); ++i)
+    {
+        if (standings[i] == GraveyardStanding::Passes)
+            return i;
+        if (standings[i] == GraveyardStanding::HighGroundOnly && highGround == standings.size())
+            highGround = i;
+    }
+    return highGround;
 }
 
 GuildHealerGraveyard PickGuildHealerGraveyard(bool nearestSafe, bool alternativeFound)
@@ -19371,6 +19632,11 @@ EvacuationStart DungeonEvacuationStart(bool coordinatorKnowsItsDoor, bool inside
 bool DungeonDoorShut(bool familyBagHeld, bool enteringDungeonMap, bool alive, bool steered)
 {
     return familyBagHeld && enteringDungeonMap && alive && steered;
+}
+
+bool FamilyDoorHeldForBags(bool noBagRoom, bool runHasMembersInside)
+{
+    return noBagRoom && !runHasMembersInside;
 }
 
 namespace Classic
@@ -25091,6 +25357,11 @@ StratholmeExitWay DecideStratholmeExit(StratholmeExitFacts const& facts)
     return StratholmeExitWay::None;
 }
 
+bool StratholmeYardMemberCanWalk(bool isLeader, bool alive)
+{
+    return isLeader && alive;
+}
+
 char const* StratholmeExitWayWord(StratholmeExitWay way)
 {
     switch (way)
@@ -25105,8 +25376,35 @@ char const* StratholmeExitWayWord(StratholmeExitWay way)
 
 bool InStratholmeExitYard(std::uint32_t mapId, float x, float y)
 {
-    return mapId == 0 && x >= STRATHOLME_YARD_WEST_X && x <= STRATHOLME_YARD_EAST_X &&
+    return mapId == STRATHOLME_EXIT_YARD_MAP_ID &&
+           x >= STRATHOLME_YARD_WEST_X && x <= STRATHOLME_YARD_EAST_X &&
            y >= STRATHOLME_YARD_SOUTH_Y && y <= STRATHOLME_YARD_NORTH_Y;
+}
+
+bool StratholmeYardGiveUpHolds(bool memberInYard, std::uint32_t secondsSinceGaveUp)
+{
+    return memberInYard && secondsSinceGaveUp < STRATHOLME_YARD_RECOVERY_COOLDOWN_SECONDS;
+}
+
+bool ShouldOpenStratholmeYardEpisode(bool memberInYard, bool episodeOpen, bool gaveUp,
+                                     std::uint32_t secondsSinceGaveUp)
+{
+    if (!memberInYard || episodeOpen)
+        return false;
+    return !gaveUp || !StratholmeYardGiveUpHolds(memberInYard, secondsSinceGaveUp);
+}
+
+bool StratholmeMemberInYard(StratholmeMemberPlace const& place)
+{
+    return place.found && place.inWorld && InStratholmeExitYard(place.mapId, place.x, place.y);
+}
+
+int StratholmeYardPortalIndex(std::vector<std::uint32_t> const& exitTriggerIds)
+{
+    for (std::size_t i = 0; i < exitTriggerIds.size(); ++i)
+        if (exitTriggerIds[i] == STRATHOLME_YARD_EXIT_TRIGGER)
+            return static_cast<int>(i);
+    return -1;
 }
 
 bool StratholmeButtonInReach(bool spawned, unsigned presses, std::uint32_t secondsWalking)
@@ -25119,6 +25417,202 @@ bool StratholmeHearthLeavesTheYard(bool stoneReady, std::uint32_t bindMap, float
                                    float bindY)
 {
     return stoneReady && !InStratholmeExitYard(bindMap, bindX, bindY);
+}
+
+// ------------------- a family mage's way to a capital instead of a walk (#1161)
+
+namespace
+{
+float MageLandingYards(MageTravelSpell const& spell, MageTravelFacts const& facts)
+{
+    float const dx = spell.x - facts.destX;
+    float const dy = spell.y - facts.destY;
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+// The nearest spell of this kind that lands within reach of the destination.
+MageTravelSpell const* MageSpellTo(MageTravelFacts const& facts, bool portal)
+{
+    MageTravelSpell const* best = nullptr;
+    for (MageTravelSpell const& spell : facts.spells)
+    {
+        if (spell.makesPortal != portal || spell.map != facts.destMap)
+            continue;
+        float const yards = MageLandingYards(spell, facts);
+        if (yards > MAGE_TRAVEL_LANDING_REACH_YARDS)
+            continue;
+        if (!best || yards < MageLandingYards(*best, facts))
+            best = &spell;
+    }
+    return best;
+}
+
+MageSpellLanding const* MageLandingOf(std::uint32_t spellId,
+                                      std::vector<MageSpellLanding> const& landings)
+{
+    for (MageSpellLanding const& landing : landings)
+        if (spellId && landing.spellId == spellId)
+            return &landing;
+    return nullptr;
+}
+}  // namespace
+
+std::vector<MageTravelSpell> MageTravelSpellsFrom(std::vector<MageKnownSpell> const& known,
+                                                  std::vector<MageSpellLanding> const& landings)
+{
+    std::vector<MageTravelSpell> spells;
+    for (MageKnownSpell const& spell : known)
+    {
+        if (!spell.mageFamily)
+            continue;
+        MageSpellLanding const* const own = MageLandingOf(spell.spellId, landings);
+        MageSpellLanding const* const landing =
+            own ? own : MageLandingOf(spell.portalObjectSpell, landings);
+        if (!landing || Classic::IsOutsideClassic(landing->map, 0))
+            continue;
+        MageTravelSpell read;
+        read.spellId = spell.spellId;
+        read.makesPortal = !own;
+        read.map = landing->map;
+        read.x = landing->x;
+        read.y = landing->y;
+        read.reagentEntry = spell.reagentEntry;
+        read.reagentNeeded = spell.reagentNeeded;
+        read.reagentCarried = spell.reagentCarried;
+        spells.push_back(read);
+    }
+    return spells;
+}
+
+char const* MageTravelWayWord(MageTravelWay way)
+{
+    switch (way)
+    {
+        case MageTravelWay::Teleport: return "teleport";
+        case MageTravelWay::Portal:   return "portal";
+        case MageTravelWay::Walk:     break;
+    }
+    return "walk";
+}
+
+MageTravelVerdict DecideMageTravel(MageTravelFacts const& facts)
+{
+    MageTravelVerdict verdict;
+    if (facts.sameMap && facts.walkYards < MAGE_TRAVEL_MIN_SAVED_YARDS)
+        return verdict;
+
+    bool const forTheParty = !facts.casterIsTraveller || facts.othersPresent > 0;
+    MageTravelSpell const* const teleport = MageSpellTo(facts, false);
+    MageTravelSpell const* const portal = MageSpellTo(facts, true);
+    MageTravelSpell const* const landing = teleport ? teleport : portal;
+    if (!landing)
+    {
+        verdict.reason = MageTravelRefusal::NoSpellForThatPlace;
+        return verdict;
+    }
+    if (facts.sameMap &&
+        facts.walkYards - MageLandingYards(*landing, facts) < MAGE_TRAVEL_MIN_SAVED_YARDS)
+        return verdict;
+
+    MageTravelSpell const* const spell = forTheParty ? portal : teleport;
+    if (!spell)
+    {
+        verdict.reason = forTheParty ? MageTravelRefusal::NoPortalForTheParty
+                                     : MageTravelRefusal::NoSpellForThatPlace;
+        return verdict;
+    }
+    verdict.spellId = spell->spellId;
+    if (spell->reagentCarried < spell->reagentNeeded)
+    {
+        verdict.reason = forTheParty ? MageTravelRefusal::NoRuneOfPortals
+                                     : MageTravelRefusal::NoRuneOfTeleportation;
+        return verdict;
+    }
+    verdict.way = forTheParty ? MageTravelWay::Portal : MageTravelWay::Teleport;
+    return verdict;
+}
+
+bool MageTravelCastRetries(std::string const& detail, std::uint32_t tries)
+{
+    return tries < MAGE_TRAVEL_CAST_TRIES && CastRefusalRetry(detail) == TownRetry::Later;
+}
+
+bool MageTravelCalledOff(bool travellerClicked, bool aimPresent, bool aimIsGuard,
+                         bool aimIsTheRuns)
+{
+    return !travellerClicked && (!aimPresent || aimIsGuard || !aimIsTheRuns);
+}
+
+std::vector<std::size_t> NextPortalClickers(std::vector<MageTravelClicker> const& party)
+{
+    for (std::size_t i = 0; i < party.size(); ++i)
+    {
+        if (!party[i].traveller || party[i].mage)
+            continue;
+        if (party[i].underWay)
+            return {};
+        if (party[i].waiting)
+            return {i};
+    }
+
+    std::vector<std::size_t> rest;
+    bool stillGoing = false;
+    for (std::size_t i = 0; i < party.size(); ++i)
+    {
+        if (party[i].mage)
+            continue;
+        stillGoing = stillGoing || party[i].underWay;
+        if (party[i].waiting)
+            rest.push_back(i);
+    }
+    if (!rest.empty() || stillGoing)
+        return rest;
+
+    for (std::size_t i = 0; i < party.size(); ++i)
+        if (party[i].mage && party[i].waiting)
+            return {i};
+    return {};
+}
+
+static std::string ShareRetentionCandidates()
+{
+    return "SELECT id FROM ("
+           "SELECT id, updated_at <= NOW() - INTERVAL " +
+           std::to_string(SHARE_RETENTION_DAYS) +
+           " DAY AS aged, ROW_NUMBER() OVER ("
+           "PARTITION BY target_name, target_arg, command, status, "
+           "CASE WHEN JSON_VALID(result) "
+           "THEN JSON_UNQUOTE(JSON_EXTRACT(result, '$.reason')) END "
+           "ORDER BY updated_at DESC, id DESC) AS rn "
+           "FROM overseer_command "
+           "WHERE kind = 'share' AND status IN ('delivered', 'error')"
+           ") AS answered WHERE aged OR rn > " +
+           std::to_string(SHARE_RETENTION_DEPTH);
+}
+
+std::string ShareRetentionSelectSql()
+{
+    return ShareRetentionCandidates() + " LIMIT " + std::to_string(SHARE_RETENTION_BATCH);
+}
+
+std::string ShareRetentionCountSql()
+{
+    return "SELECT COUNT(*) FROM (" + ShareRetentionCandidates() + ") AS candidates";
+}
+
+std::string ShareRetentionDeleteSql(std::vector<uint32_t> const& ids)
+{
+    if (ids.empty())
+        return "";
+    std::string list;
+    for (uint32_t id : ids)
+    {
+        if (!list.empty())
+            list += ',';
+        list += std::to_string(id);
+    }
+    return "DELETE FROM overseer_command WHERE id IN (" + list +
+           ") AND kind = 'share' AND status IN ('delivered', 'error')";
 }
 
 }  // namespace OverseerDecisions
