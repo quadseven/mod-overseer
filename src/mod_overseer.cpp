@@ -37796,18 +37796,39 @@ private:
             return false;
         }
 
-        Player* walker = inYard.front();
+        Player* walker = nullptr;
         for (Player* member : inYard)
-            if (member->GetName() == leaderName)
+        {
+            if (OverseerDecisions::StratholmeYardMemberCanWalk(
+                    member->GetName() == leaderName, member->IsAlive()))
                 walker = member;
+        }
+        std::vector<std::string> const hearthers = StratholmeHearthers(inYard);
+        if (!walker)
+        {
+            if (!yard.walker.empty())
+            {
+                _travelAims.ReleaseRunAim(yard.walker, yard.aim,
+                                          "the Stratholme yard way out");
+                yard.walker.clear();
+                yard.aim.clear();
+            }
+            if (!hearthers.empty())
+            {
+                if (!yard.hearth.since)
+                    yard.hearth.since = now;
+                return DriveExitHearths(family, leaderName, hearthers, yard.hearth,
+                                        "STRATHOLME_YARD",
+                                        "leaving the Stratholme exit yard");
+            }
+            return true;
+        }
         GameObject* const door = walker->FindNearestGameObject(
             OverseerDecisions::STRATHOLME_SERVICE_ENTRANCE_ENTRY,
             OverseerDecisions::STRATHOLME_YARD_SEARCH_YARDS);
         GameObject* const button = walker->FindNearestGameObject(
             OverseerDecisions::STRATHOLME_SERVICE_BUTTON_ENTRY,
             OverseerDecisions::STRATHOLME_YARD_SEARCH_YARDS);
-        std::vector<std::string> const hearthers = StratholmeHearthers(inYard);
-
         OverseerDecisions::StratholmeExitFacts facts;
         facts.doorOpen = door && door->GetGoState() == GO_STATE_ACTIVE;
         facts.buttonInReach = OverseerDecisions::StratholmeButtonInReach(
