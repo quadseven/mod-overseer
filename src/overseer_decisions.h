@@ -3220,6 +3220,15 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
                                                   unsigned maximumSkips,
                                                   bool skipRefused = false);
 
+// A PARTY-WAIT STOP IS ARMED AGAIN, NOT SKIPPED (#1308). The dungeon module
+// switches itself off when one member stays out of range or short of mana for
+// its wait, and `dc skip` is refused once it is off, so a lagging follower ended
+// a run with two bosses credited. `dc on` restarts the wait with the party that
+// has since caught up. True while `stopReason` is that stop and `rearms` is
+// under `maximumRearms`; every other stop keeps the skip ladder.
+bool DungeonClearWaitStopRearms(std::string const& stopReason, unsigned rearms,
+                                unsigned maximumRearms);
+
 // YARDS WALKED WITH THE BRAIN OFF ARE NOT A RUN GOING ANYWHERE. The CLEARING
 // watchdog takes the tank's yards as progress, which is only true while the
 // dungeon module is driving. On 2026-10-31 it stopped itself at 08:21:05 ("the
@@ -24787,6 +24796,25 @@ constexpr unsigned GUILD_RUN_STALL_SECONDS = 5 * 60;
 constexpr unsigned GUILD_RUN_QUIET_SECONDS = 15 * 60;
 constexpr unsigned GUILD_RUN_CREDITLESS_SECONDS = 20 * 60;
 constexpr unsigned GUILD_RUN_MAX_SKIPS = 2;
+// Two members alive inside this far apart are not one group (#1308). The
+// measured split stood 440 yards.
+constexpr float GUILD_RUN_SPLIT_YARDS = 150.f;
+// How long a split stands before the run ends. Past GUILD_RUN_RECOVERY_SECONDS,
+// so a corpse return has its whole window to close the gap first.
+constexpr unsigned GUILD_RUN_SPLIT_END_SECONDS = 20 * 60;
+
+// Only the group closing up clears a split. A fight or a wipe reads Unread and
+// keeps the clock: each pull and each wipe reset the stillness clock, which is
+// how Zul'Farrak runs reached the two hour ceiling.
+enum class GuildRunSplitReading : std::uint8_t
+{
+    Unread,    // fewer than two alive inside
+    Split,     // two alive inside stand GUILD_RUN_SPLIT_YARDS apart
+    Together,  // every pair alive inside stands closer
+};
+
+// The split's start after this reading; 0 when the group is not split.
+std::time_t GuildRunSplitClock(std::time_t since, GuildRunSplitReading reading, std::time_t now);
 // Combat holds the ladder, but not for ever (the family's #382): a member
 // whose combat flag never clears must not hold a run that has neither moved
 // nor credited a boss for this long.
@@ -24818,6 +24846,8 @@ struct GuildRunStallFacts
     // The last skip was refused: the brain has switched itself off with
     // nothing left it can reach, so no later skip can move it.
     bool skipRefused{false};
+    // How long since the group split and did not close up (GuildRunSplitClock).
+    unsigned secondsSplit{0};
 };
 
 enum class GuildRunStallStep : std::uint8_t
@@ -24825,6 +24855,7 @@ enum class GuildRunStallStep : std::uint8_t
     Nothing,  // progressing, busy, held, or not stalled long enough
     Skip,     // send `dc skip` from the tank
     End,      // the skips did not move it: end the run as Stalled
+    EndSplit, // the group split and never closed up: end the run as Stalled
 };
 
 GuildRunStallStep GuildRunStallNext(GuildRunStallFacts const& facts);

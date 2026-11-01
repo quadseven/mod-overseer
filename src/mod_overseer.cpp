@@ -3058,6 +3058,8 @@ constexpr OverseerDecisions::RatchetLimits DUNGEON_CLEAR_RATCHET{
 // reach - which is the case the operator asked to be ENDED rather than narrated,
 // so the next poll can open a fresh one.
 constexpr unsigned DUNGEON_CLEAR_SKIPS = 3;
+// How many times one stretch of a run may arm a stopped brain again (#1308).
+constexpr unsigned DUNGEON_CLEAR_WAIT_REARMS = 3;
 
 // HOW LONG A PARTY MAY LOOK BUSY BEFORE THE WATCHDOG STOPS BELIEVING IT (#382).
 //
@@ -36933,6 +36935,9 @@ private:
         // progress signal that does not depend on where anybody is standing.
         uint32 clearEncounters{0};
         unsigned clearSkips{0};
+        // `dc on`s sent again for a party-wait stop since the last boss credit
+        // (#1308). Yards do not clear it: a tank drifts with its brain off.
+        unsigned clearRearms{0};
         // The dungeon module refused a `dc skip`: the run walks out at once and
         // its row says so (DungeonClearStallDecision, skipRefused).
         bool clearSkipRefused{false};
@@ -39029,6 +39034,7 @@ private:
             coord.clearProgress.since = now;
             coord.clearMarked = false;
             coord.clearSkips = 0;
+            coord.clearRearms = 0;
             // AND THE RUN DEMONSTRABLY ADVANCED (#382). A boss died, so whatever
             // the party has been busy with for the last however-long, it was
             // busy doing THAT. The ceiling below exists to catch a hold that
@@ -39196,6 +39202,25 @@ private:
         // STALLED. The clock restarts on every rung, so whatever is tried here
         // gets a whole patience window to work in before the next thing is.
         coord.clearProgress.since = now;
+
+        // A PARTY-WAIT STOP IS ARMED AGAIN BEFORE ANY SKIP (#1308). Forgetting
+        // the `dc on` record is what makes the arming drive issue it next poll.
+        std::string const stopReason = DungeonBrainStopReason(leader);
+        if (!anyBusy &&
+            OverseerDecisions::DungeonClearWaitStopRearms(stopReason, coord.clearRearms,
+                                                          DUNGEON_CLEAR_WAIT_REARMS))
+        {
+            ++coord.clearRearms;
+            for (OverseerDecisions::DungeonRunEntryState const& state : states)
+                _dcOnIssued.erase(state.name);
+            LOG_WARN("module.overseer",
+                     "overseer: dungeon run {} of campaign {} stopped on a party wait, so "
+                     "the dungeon module is armed again ({} of {}): {}",
+                     coord.runNumber, coord.campaignId, coord.clearRearms,
+                     static_cast<uint32>(DUNGEON_CLEAR_WAIT_REARMS),
+                     OverseerDecisions::DungeonModuleStopWords(stopReason));
+            return false;
+        }
 
         if (action == OverseerDecisions::DungeonClearStallAction::Skip)
         {
@@ -44178,6 +44203,8 @@ private:
         std::time_t creditSince{0};
         std::time_t creditSeen{0};
         unsigned stallSkips{0};
+        // When the group split inside and has not closed up since (#1308).
+        std::time_t splitSince{0};
         bool stallSkipRefused{false};
     };
     std::vector<GuildRun> _guildRuns;
@@ -45422,6 +45449,26 @@ private:
             IssueGuildRunHold(run, true, now);
     }
 
+    // What the members alive inside say about the group's split (#1308).
+    OverseerDecisions::GuildRunSplitReading GuildRunSplitReadingOf(GuildRun const& run)
+    {
+        std::vector<Player*> inside;
+        for (std::string const& name : run.names)
+        {
+            Player* const member = ObjectAccessor::FindPlayerByName(name);
+            if (GuildRunAliveInside(run, member))
+                inside.push_back(member);
+        }
+        if (inside.size() < 2)
+            return OverseerDecisions::GuildRunSplitReading::Unread;
+        for (std::size_t i = 0; i < inside.size(); ++i)
+            for (std::size_t j = i + 1; j < inside.size(); ++j)
+                if (inside[i]->GetExactDist2d(inside[j]) >=
+                    OverseerDecisions::GUILD_RUN_SPLIT_YARDS)
+                    return OverseerDecisions::GuildRunSplitReading::Split;
+        return OverseerDecisions::GuildRunSplitReading::Together;
+    }
+
     // ONE POLL OF THE STALL LADDER (OverseerDecisions::GuildRunStallNext,
     // #1086), on a run the verdict left running. Sends `dc skip` from the tank
     // on Skip; true on End, when the caller ends the run as stalled and `why`
@@ -45484,6 +45531,10 @@ private:
             now >= run.creditSince ? static_cast<unsigned>(now - run.creditSince) : 0;
         facts.skips = run.stallSkips;
         facts.skipRefused = run.stallSkipRefused;
+        run.splitSince = OverseerDecisions::GuildRunSplitClock(
+            run.splitSince, GuildRunSplitReadingOf(run), now);
+        facts.secondsSplit =
+            run.splitSince && now >= run.splitSince ? static_cast<unsigned>(now - run.splitSince) : 0;
 
         OverseerDecisions::GuildRunStallStep const step = OverseerDecisions::GuildRunStallNext(facts);
         if (step == OverseerDecisions::GuildRunStallStep::Nothing)
@@ -45498,6 +45549,15 @@ private:
                 : "no boss credit and '" + run.tank + "' has not moved " +
                       std::to_string(static_cast<uint32>(OverseerDecisions::GUILD_RUN_STALL_YARDS)) +
                       "y for " + std::to_string(facts.secondsStill / 60) + " min";
+
+        if (step == OverseerDecisions::GuildRunStallStep::EndSplit)
+        {
+            why = "the group stood split inside for " + std::to_string(facts.secondsSplit / 60) +
+                  " min and did not close up; " + stall;
+            LOG_WARN("module.overseer", "overseer: guild finder run {} - {}; ending it so its "
+                     "members go free", run.id, why);
+            return true;
+        }
 
         if (step == OverseerDecisions::GuildRunStallStep::End)
         {
