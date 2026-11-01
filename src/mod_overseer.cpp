@@ -16872,6 +16872,7 @@ private:
             DisenchantWrite(task.name, window);
             SpellCastTargets targets;
             targets.SetItemTarget(item);
+            // natural-only: known Disenchant on an owned item, with ordinary core cast checks.
             SpellCastResult const cast = player->CastSpell(targets, info, nullptr, TRIGGERED_NONE);
             HoldDisenchant(id, task, cast == SPELL_CAST_OK
                 ? "cast started; reagent inventory is not yet verified"
