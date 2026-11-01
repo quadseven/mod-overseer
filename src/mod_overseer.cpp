@@ -22120,6 +22120,13 @@ private:
         return zones;
     }
 
+    static std::string ZoneDangerFor(Player* bot, std::time_t now)
+    {
+        return OverseerDecisions::ZoneDangerProbeJson(
+            DangerZonesFor(bot, now), bot->GetMapId(),
+            OverseerDecisions::LowestPartyLevel(PartyLevelsFor(bot)), now, ZONE_DANGER_LIMITS);
+    }
+
     // Each survey node on the walker's map, placed in its zone once.
     static void ReadNodeZones(Player* bot, TravelSurvey& survey)
     {
@@ -61567,6 +61574,8 @@ private:
             o << ",\"group_size\":" << uint32(group->GetMembersCount());
         }
         o << ",\"has_bot_ai\":" << (GET_PLAYERBOT_AI(bot) ? "true" : "false");
+        std::time_t const now = std::time(nullptr);
+        o << ",\"zone_danger\":" << ZoneDangerFor(bot, now);
         o << "}";
         return o.str();
     }
@@ -81671,6 +81680,9 @@ private:
             // alongside a walk that was happening anyway costs nothing extra.
             if (OnRoster(p->GetName()))
             {
+                CharacterDatabase.Execute(
+                    "REPLACE INTO overseer_zone_danger (name, result) VALUES ('{}', '{}')",
+                    Esc(p->GetName()), EscLong(ZoneDangerFor(p, std::time(nullptr))));
                 RememberHealth(p->GetName(), p->GetHealth(), p->GetMaxHealth());
                 // #188: the same argument, for the same walk. What had hold of
                 // this character and whether it was fighting are both gone by
@@ -81697,6 +81709,8 @@ private:
         // one sweep interval of grace, then the map stops drawing them.
         CharacterDatabase.Execute(
             "DELETE FROM overseer_snapshot WHERE updated_at < NOW() - INTERVAL 60 SECOND");
+        CharacterDatabase.Execute(
+            "DELETE FROM overseer_zone_danger WHERE updated_at < NOW() - INTERVAL 60 SECOND");
     }
 
     uint32 _commandTimer = 0;

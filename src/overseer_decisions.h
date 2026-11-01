@@ -14241,6 +14241,11 @@ std::vector<DangerZone> DangerZonesOn(std::vector<ZoneDeath> const& deaths, std:
                                       std::uint32_t partyLevel, std::time_t now,
                                       ZoneDangerLimits const& limits);
 
+// Serialize the already computed routing result; no second scoring pass.
+std::string ZoneDangerProbeJson(std::vector<DangerZone> const& zones, std::uint32_t mapId,
+                                 std::uint32_t partyLevel, std::time_t now,
+                                 ZoneDangerLimits const& limits);
+
 // Drop deaths older than the window at `now`.
 void ForgetOldZoneDeaths(std::vector<ZoneDeath>& deaths, std::time_t now,
                          ZoneDangerLimits const& limits);
