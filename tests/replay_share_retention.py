@@ -233,6 +233,13 @@ class ShareRetentionReplayTest(unittest.TestCase):
         self.assertEqual(3, self.sweep("Aone"))
         self.assertEqual("3\n", self.mysql(self.sql("count") + ";"))
 
+    def test_the_plan_reads_through_the_holder_index(self):
+        self.mysql("".join(row("Aone", h) for h in range(1, 12)))
+        plan = self.mysql("EXPLAIN " + self.sql("select", "Aone") + ";")
+        self.assertIn("idx_target_created", plan)
+        plan = self.mysql("EXPLAIN " + self.sql("next", "") + ";")
+        self.assertIn("idx_target_created", plan)
+
     def test_one_sweep_is_bounded(self):
         values = ",".join(
             "('Long','share 100','share','Taker','error','%s',NOW() - INTERVAL %d MINUTE)"
