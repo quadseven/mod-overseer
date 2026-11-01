@@ -364,11 +364,6 @@ int main()
                   source.find("if (DriveStratholmeYard(family, leaderName, members))") !=
                       std::string::npos,
                   true);
-        std::size_t const driveStart = source.find("bool DriveStratholmeYard(");
-        std::size_t const driveEnd = source.find(
-            "static OverseerDecisions::FetchRunPhase FetchRunPhaseOf", driveStart + 1);
-        std::string const driveSource = driveStart == std::string::npos || driveEnd == std::string::npos
-            ? std::string() : source.substr(driveStart, driveEnd - driveStart);
         std::size_t const leaderFilter = driveSource.find("if (member->GetName() != leaderName)");
         std::size_t const aliveGate = driveSource.find("if (leaderAlive)", leaderFilter);
         std::size_t const walkerAssignment = driveSource.find("walker = member;", aliveGate);
@@ -377,11 +372,26 @@ int main()
                       walkerAssignment > aliveGate &&
                       driveSource.find("Player* walker = inYard.front()") == std::string::npos,
                   true);
-        CheckBool("missing leader holds or hearths the yard",
-                  source.find("if (!walker)") != std::string::npos &&
-                      source.find("if (!hearthers.empty())") != std::string::npos &&
-                      source.find("return true;\n        }\n        GameObject* const door") !=
-                          std::string::npos,
+        std::size_t const missingLeader = driveSource.find("if (!walker)");
+        std::size_t const missingLeaderEnd = driveSource.find("GameObject* const door", missingLeader);
+        std::string const missingLeaderSource =
+            missingLeader == std::string::npos || missingLeaderEnd == std::string::npos
+                ? std::string()
+                : driveSource.substr(missingLeader, missingLeaderEnd - missingLeader);
+        CheckBool("missing leader branch releases its prior yard aim",
+                  missingLeaderSource.find("ReleaseRunAim(yard.walker, yard.aim") !=
+                          std::string::npos &&
+                      missingLeaderSource.find("yard.walker.clear()") != std::string::npos,
+                  true);
+        CheckBool("missing leader branch hearths eligible members or holds",
+                  missingLeaderSource.find("if (!hearthers.empty())") != std::string::npos &&
+                      missingLeaderSource.find("DriveExitHearths(family, leaderName, hearthers,") !=
+                          std::string::npos &&
+                      missingLeaderSource.find("return true;") != std::string::npos,
+                  true);
+        CheckBool("missing leader branch cannot issue a travel aim",
+                  missingLeaderSource.find("AimStratholmeWalker(") == std::string::npos &&
+                      missingLeaderSource.find("PressStratholmeButton(") == std::string::npos,
                   true);
     }
 
