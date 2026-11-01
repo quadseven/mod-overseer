@@ -3,6 +3,8 @@
 #include <map>
 #include <vector>
 
+// Proof-helper contracts only. tests/replay_disenchant.py exercises the actual
+// DriveDisenchant and SQL, registered by test_disenchant_adapter.cpp.
 namespace D = OverseerDisenchant;
 struct Inventory
 {
