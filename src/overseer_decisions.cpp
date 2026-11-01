@@ -25031,6 +25031,13 @@ RebuffSpell RebuffSpellFor(unsigned classId)
     return spell;
 }
 
+bool RebuffCrossAskCooling(std::time_t askedAt, std::time_t now, std::time_t cooldownSeconds)
+{
+    if (askedAt == 0 || now < askedAt)
+        return false;
+    return now - askedAt < cooldownSeconds;
+}
+
 RebuffDecision DecideRebuff(RebuffFacts const& facts)
 {
     RebuffDecision decision;
@@ -25045,6 +25052,7 @@ RebuffDecision DecideRebuff(RebuffFacts const& facts)
     {
         if (facts.inRaid && member.subgroup != facts.casterSubgroup && member.alive &&
             member.sameMap && !member.hasBuff && !member.hasBuffer && member.inSight &&
+            !member.crossAskedRecently &&
             member.yards <= REBUFF_REACH_YARDS && member.yards < nearest)
         {
             nearest = member.yards;
