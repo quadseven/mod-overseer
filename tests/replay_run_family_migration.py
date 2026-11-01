@@ -6,6 +6,12 @@ from pathlib import Path
 import subprocess
 import unittest
 
+# The workflow runs this file on its MySQL service, so importing the class runs it.
+from replay_share_retention import (  # noqa: F401
+    BridgeReadDriftTest,
+    ShareRetentionReplayTest,
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 SQL = ROOT / "data/sql/characters/base"
 DATABASE_SQL = (
@@ -16,6 +22,24 @@ DATABASE_SQL = (
 
 
 class RunFamilyMigrationTest(unittest.TestCase):
+    def test_zone_danger_snapshot_migration_is_idempotent_and_preserves_json(self):
+        migration = (SQL / "2026_11_01_00_overseer_zone_danger.sql").read_text()
+        self.mysql("DROP TABLE IF EXISTS overseer_zone_danger;" + migration + migration)
+        self.mysql("""
+REPLACE INTO overseer_zone_danger(name,result) VALUES ('LeaderA','{"zones":[]}');
+REPLACE INTO overseer_zone_danger(name,result) VALUES ('LeaderA','{"zones":[{"zone_id":46,"score":3}]}');
+""")
+        result = self.mysql(
+            "SELECT name,JSON_VALID(result),JSON_EXTRACT(result,'$.zones[0].score') "
+            "FROM overseer_zone_danger;"
+        )
+        self.assertEqual("LeaderA\t1\t3", result.strip())
+        collation = self.mysql(
+            "SELECT TABLE_COLLATION FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='overseer_zone_danger';"
+        )
+        self.assertEqual("utf8mb4_unicode_ci", collation.strip())
+
     def mysql(self, sql):
         command = json.loads(
             os.environ.get(

@@ -14241,6 +14241,11 @@ std::vector<DangerZone> DangerZonesOn(std::vector<ZoneDeath> const& deaths, std:
                                       std::uint32_t partyLevel, std::time_t now,
                                       ZoneDangerLimits const& limits);
 
+// Serialize the already computed routing result; no second scoring pass.
+std::string ZoneDangerProbeJson(std::vector<DangerZone> const& zones, std::uint32_t mapId,
+                                 std::uint32_t partyLevel, std::time_t now,
+                                 ZoneDangerLimits const& limits);
+
 // Drop deaths older than the window at `now`.
 void ForgetOldZoneDeaths(std::vector<ZoneDeath>& deaths, std::time_t now,
                          ZoneDangerLimits const& limits);
@@ -27860,6 +27865,9 @@ struct StratholmeExitFacts
 
 StratholmeExitWay DecideStratholmeExit(StratholmeExitFacts const& facts);
 
+// Only the living family leader can walk the yard exit or press its button.
+bool StratholmeYardMemberCanWalk(bool isLeader, bool alive);
+
 char const* StratholmeExitWayWord(StratholmeExitWay way);
 
 // The run's exit trigger whose landing is the yard, and the two gameobjects in
@@ -28074,6 +28082,29 @@ struct MageTravelClicker
 // Unit::RemoveFromWorld ends in RemoveAllGameObjects: its portal closes the
 // moment it changes map.
 std::vector<std::size_t> NextPortalClickers(std::vector<MageTravelClicker> const& party);
+
+// ANSWERED SHARE ROWS ARE KEPT ONLY WHILE THE BACKOFF CAN READ THEM (#1251).
+// The bridge's share read holds the youngest 8 answers per (target_name,
+// target_arg, command, status, reason) inside 90 days, and nothing else reads
+// a share answer's history. These two numbers are that read's memory window
+// and questshare.history_depth() in wow-overseer; a longer read there must
+// raise them first. tests/replay_share_retention.py runs the statements below
+// and the bridge's read on MySQL and compares the rows.
+constexpr uint32_t SHARE_RETENTION_DAYS = 90;
+constexpr uint32_t SHARE_RETENTION_DEPTH = 8;
+// At most this many rows a sweep: 134,000 rows drain in about 2.5 hours at one
+// sweep each five minutes, and no statement holds the async writer for long.
+constexpr uint32_t SHARE_RETENTION_BATCH = 5000;
+
+// THE RULE IS IN ONE PLACE, the two readers below. It only ever grows: a new
+// answer pushes older rows further down and time ages them, so an id selected
+// here is still past keeping when its delete runs.
+std::string ShareRetentionSelectSql();
+std::string ShareRetentionCountSql();
+// The delete for ids ShareRetentionSelectSql() named, or "" for none. It is
+// apart from the select because a DELETE with a subquery takes shared locks on
+// every row it reads, and this read covers every answered share row.
+std::string ShareRetentionDeleteSql(std::vector<uint32_t> const& ids);
 
 }  // namespace OverseerDecisions
 

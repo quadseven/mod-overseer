@@ -26,6 +26,7 @@ using OverseerDecisions::StratholmeYardPortalIndex;
 using OverseerDecisions::StratholmeExitFacts;
 using OverseerDecisions::StratholmeExitWay;
 using OverseerDecisions::StratholmeExitWayWord;
+using OverseerDecisions::StratholmeYardMemberCanWalk;
 
 namespace
 {
@@ -78,6 +79,27 @@ std::string ReadModule()
 
 int main()
 {
+    CheckBool("leader outside leaves each yard follower without a walker",
+              !StratholmeYardMemberCanWalk(false, true) &&
+                  !StratholmeYardMemberCanWalk(false, true), true);
+    CheckWay("followers with a ready hearth take the hearth branch",
+             DecideStratholmeExit(StratholmeExitFacts{false, false, true}),
+             StratholmeExitWay::Hearth);
+    CheckWay("followers without a ready hearth hold",
+             DecideStratholmeExit(StratholmeExitFacts{}), StratholmeExitWay::None);
+
+    CheckBool("dead leader and each follower cannot walk the yard exit",
+              !StratholmeYardMemberCanWalk(true, false) &&
+                  !StratholmeYardMemberCanWalk(false, true) &&
+                  !StratholmeYardMemberCanWalk(false, true), true);
+    CheckBool("dead leader's followers can take the hearth branch",
+              DecideStratholmeExit(StratholmeExitFacts{false, false, true}) ==
+                  StratholmeExitWay::Hearth,
+              true);
+
+    CheckBool("living leader alone can walk the yard exit",
+              StratholmeYardMemberCanWalk(true, true) &&
+                  !StratholmeYardMemberCanWalk(false, true), true);
     // door open means walk
     {
         StratholmeExitFacts facts;
@@ -327,6 +349,31 @@ int main()
         CheckBool("the coordinator drives the yard before its phases",
                   source.find("if (DriveStratholmeYard(family, leaderName, members))") !=
                       std::string::npos,
+                  true);
+        CheckBool("production uses the tested living-leader yard-walker decision",
+                  driveSource.find("StratholmeYardMemberCanWalk(") != std::string::npos &&
+                      driveSource.find("Player* walker = inYard.front()") == std::string::npos,
+                  true);
+        std::size_t const missingLeader = driveSource.find("if (!walker)");
+        std::size_t const missingLeaderEnd = driveSource.find("GameObject* const door", missingLeader);
+        std::string const missingLeaderSource =
+            missingLeader == std::string::npos || missingLeaderEnd == std::string::npos
+                ? std::string()
+                : driveSource.substr(missingLeader, missingLeaderEnd - missingLeader);
+        CheckBool("missing leader branch releases its prior yard aim",
+                  missingLeaderSource.find("ReleaseRunAim(yard.walker, yard.aim") !=
+                          std::string::npos &&
+                      missingLeaderSource.find("yard.walker.clear()") != std::string::npos,
+                  true);
+        CheckBool("missing leader branch hearths eligible members or holds",
+                  missingLeaderSource.find("if (!hearthers.empty())") != std::string::npos &&
+                      missingLeaderSource.find("DriveExitHearths(family, leaderName, hearthers,") !=
+                          std::string::npos &&
+                      missingLeaderSource.find("return true;") != std::string::npos,
+                  true);
+        CheckBool("missing leader branch cannot issue a travel aim",
+                  missingLeaderSource.find("AimStratholmeWalker(") == std::string::npos &&
+                      missingLeaderSource.find("PressStratholmeButton(") == std::string::npos,
                   true);
     }
 

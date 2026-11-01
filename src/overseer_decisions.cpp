@@ -11917,6 +11917,30 @@ std::vector<DangerZone> DangerZonesOn(std::vector<ZoneDeath> const& deaths, std:
     return out;
 }
 
+std::string ZoneDangerProbeJson(std::vector<DangerZone> const& zones, std::uint32_t mapId,
+                                 std::uint32_t partyLevel, std::time_t now,
+                                 ZoneDangerLimits const& limits)
+{
+    std::string out = "{\"map_id\":" + std::to_string(mapId) +
+                      ",\"party_level\":" + std::to_string(partyLevel) +
+                      ",\"sampled_at\":" + std::to_string(now) +
+                      ",\"window_seconds\":" + std::to_string(limits.windowSeconds) +
+                      ",\"level_gap\":" + std::to_string(limits.levelGap) +
+                      ",\"threshold\":" + std::to_string(limits.deaths) + ",\"zones\":[";
+    for (std::size_t i = 0; i < zones.size(); ++i)
+    {
+        DangerZone const& zone = zones[i];
+        if (i)
+            out += ",";
+        out += "{\"zone_id\":" + std::to_string(zone.zoneId) +
+               ",\"name\":" + JsonString(zone.name) +
+               ",\"score\":" + std::to_string(zone.deaths) +
+               ",\"deaths_counted\":" + std::to_string(zone.deaths) +
+               ",\"strongest_killer\":" + std::to_string(zone.strongestKiller) + "}";
+    }
+    return out + "]}";
+}
+
 void ForgetOldZoneDeaths(std::vector<ZoneDeath>& deaths, std::time_t now,
                          ZoneDangerLimits const& limits)
 {
@@ -25317,6 +25341,11 @@ StratholmeExitWay DecideStratholmeExit(StratholmeExitFacts const& facts)
     return StratholmeExitWay::None;
 }
 
+bool StratholmeYardMemberCanWalk(bool isLeader, bool alive)
+{
+    return isLeader && alive;
+}
+
 char const* StratholmeExitWayWord(StratholmeExitWay way)
 {
     switch (way)
@@ -25527,6 +25556,47 @@ std::vector<std::size_t> NextPortalClickers(std::vector<MageTravelClicker> const
         if (party[i].mage && party[i].waiting)
             return {i};
     return {};
+}
+
+static std::string ShareRetentionCandidates()
+{
+    return "SELECT id FROM ("
+           "SELECT id, updated_at <= NOW() - INTERVAL " +
+           std::to_string(SHARE_RETENTION_DAYS) +
+           " DAY AS aged, ROW_NUMBER() OVER ("
+           "PARTITION BY target_name, target_arg, command, status, "
+           "CASE WHEN JSON_VALID(result) "
+           "THEN JSON_UNQUOTE(JSON_EXTRACT(result, '$.reason')) END "
+           "ORDER BY updated_at DESC, id DESC) AS rn "
+           "FROM overseer_command "
+           "WHERE kind = 'share' AND status IN ('delivered', 'error')"
+           ") AS answered WHERE aged OR rn > " +
+           std::to_string(SHARE_RETENTION_DEPTH);
+}
+
+std::string ShareRetentionSelectSql()
+{
+    return ShareRetentionCandidates() + " LIMIT " + std::to_string(SHARE_RETENTION_BATCH);
+}
+
+std::string ShareRetentionCountSql()
+{
+    return "SELECT COUNT(*) FROM (" + ShareRetentionCandidates() + ") AS candidates";
+}
+
+std::string ShareRetentionDeleteSql(std::vector<uint32_t> const& ids)
+{
+    if (ids.empty())
+        return "";
+    std::string list;
+    for (uint32_t id : ids)
+    {
+        if (!list.empty())
+            list += ',';
+        list += std::to_string(id);
+    }
+    return "DELETE FROM overseer_command WHERE id IN (" + list +
+           ") AND kind = 'share' AND status IN ('delivered', 'error')";
 }
 
 }  // namespace OverseerDecisions

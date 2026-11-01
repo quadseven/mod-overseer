@@ -8310,8 +8310,35 @@ public:
                  "overseer: the chat, event, death and level queues are flushed at shutdown");
     }
 
+    // ANSWERED SHARE ROWS PAST THE BACKOFF'S MEMORY (#1251), a batch a sweep.
+    // Asked on the async pool, because the read ranks every answered share
+    // row: run on this thread it would stall the world. Off unless the realm
+    // turns it on, because it deletes history.
+    void SweepShareRows()
+    {
+        if (_shareSweepBusy ||
+            !sConfigMgr->GetOption<bool>("Overseer.ShareRetention.Enable", false))
+            return;
+        _shareSweepBusy = true;
+        _shareSweepQuery.AddCallback(
+            CharacterDatabase.AsyncQuery(OverseerDecisions::ShareRetentionSelectSql())
+                .WithCallback([this](QueryResult result)
+                {
+                    _shareSweepBusy = false;
+                    if (!result)
+                        return;
+                    std::vector<uint32_t> ids;
+                    do
+                        ids.push_back(result->Fetch()[0].Get<uint32>());
+                    while (result->NextRow());
+                    CharacterDatabase.Execute(OverseerDecisions::ShareRetentionDeleteSql(ids));
+                    LOG_INFO("module", "overseer: share retention deleting {} rows", ids.size());
+                }));
+    }
+
     void OnUpdate(uint32 diff) override
     {
+        _shareSweepQuery.ProcessReadyCallbacks();
         _commandTimer += diff;
         _snapshotTimer += diff;
         _movementTimer += diff;
@@ -8679,6 +8706,7 @@ public:
                 "DELETE FROM overseer_command WHERE kind = 'probe' "
                 "AND updated_at < NOW() - INTERVAL {} HOUR LIMIT {}",
                 PROBE_RETENTION_HOURS, PROBE_SWEEP_BATCH);
+            SweepShareRows();
             // The run timeline: swept on created_at like the deaths, because a
             // row is never updated after it is written.
             if (RunTimelinePresent())
@@ -22118,6 +22146,13 @@ private:
                     zone.name = area->area_name[LOCALE_enUS];
             }
         return zones;
+    }
+
+    static std::string ZoneDangerFor(Player* bot, std::time_t now)
+    {
+        return OverseerDecisions::ZoneDangerProbeJson(
+            DangerZonesFor(bot, now), bot->GetMapId(),
+            OverseerDecisions::LowestPartyLevel(PartyLevelsFor(bot)), now, ZONE_DANGER_LIMITS);
     }
 
     // Each survey node on the walker's map, placed in its zone once.
@@ -37761,18 +37796,39 @@ private:
             return false;
         }
 
-        Player* walker = inYard.front();
+        Player* walker = nullptr;
         for (Player* member : inYard)
-            if (member->GetName() == leaderName)
+        {
+            if (OverseerDecisions::StratholmeYardMemberCanWalk(
+                    member->GetName() == leaderName, member->IsAlive()))
                 walker = member;
+        }
+        std::vector<std::string> const hearthers = StratholmeHearthers(inYard);
+        if (!walker)
+        {
+            if (!yard.walker.empty())
+            {
+                _travelAims.ReleaseRunAim(yard.walker, yard.aim,
+                                          "the Stratholme yard way out");
+                yard.walker.clear();
+                yard.aim.clear();
+            }
+            if (!hearthers.empty())
+            {
+                if (!yard.hearth.since)
+                    yard.hearth.since = now;
+                return DriveExitHearths(family, leaderName, hearthers, yard.hearth,
+                                        "STRATHOLME_YARD",
+                                        "leaving the Stratholme exit yard");
+            }
+            return true;
+        }
         GameObject* const door = walker->FindNearestGameObject(
             OverseerDecisions::STRATHOLME_SERVICE_ENTRANCE_ENTRY,
             OverseerDecisions::STRATHOLME_YARD_SEARCH_YARDS);
         GameObject* const button = walker->FindNearestGameObject(
             OverseerDecisions::STRATHOLME_SERVICE_BUTTON_ENTRY,
             OverseerDecisions::STRATHOLME_YARD_SEARCH_YARDS);
-        std::vector<std::string> const hearthers = StratholmeHearthers(inYard);
-
         OverseerDecisions::StratholmeExitFacts facts;
         facts.doorOpen = door && door->GetGoState() == GO_STATE_ACTIVE;
         facts.buttonInReach = OverseerDecisions::StratholmeButtonInReach(
@@ -61543,6 +61599,8 @@ private:
             o << ",\"group_size\":" << uint32(group->GetMembersCount());
         }
         o << ",\"has_bot_ai\":" << (GET_PLAYERBOT_AI(bot) ? "true" : "false");
+        std::time_t const now = std::time(nullptr);
+        o << ",\"zone_danger\":" << ZoneDangerFor(bot, now);
         o << "}";
         return o.str();
     }
@@ -81647,6 +81705,9 @@ private:
             // alongside a walk that was happening anyway costs nothing extra.
             if (OnRoster(p->GetName()))
             {
+                CharacterDatabase.Execute(
+                    "REPLACE INTO overseer_zone_danger (name, result) VALUES ('{}', '{}')",
+                    Esc(p->GetName()), EscLong(ZoneDangerFor(p, std::time(nullptr))));
                 RememberHealth(p->GetName(), p->GetHealth(), p->GetMaxHealth());
                 // #188: the same argument, for the same walk. What had hold of
                 // this character and whether it was fighting are both gone by
@@ -81673,8 +81734,12 @@ private:
         // one sweep interval of grace, then the map stops drawing them.
         CharacterDatabase.Execute(
             "DELETE FROM overseer_snapshot WHERE updated_at < NOW() - INTERVAL 60 SECOND");
+        CharacterDatabase.Execute(
+            "DELETE FROM overseer_zone_danger WHERE updated_at < NOW() - INTERVAL 60 SECOND");
     }
 
+    QueryCallbackProcessor _shareSweepQuery;
+    bool _shareSweepBusy = false;
     uint32 _commandTimer = 0;
     uint32 _snapshotTimer = 0;
     uint32 _movementTimer = 0;
