@@ -16543,9 +16543,9 @@ RaidStoneSummon ChooseRaidStoneSummon(std::vector<RaidStoneSeat> const& seats,
     return choice;
 }
 
-bool DungeonClearMayArmHere(bool raidMap, bool raidClearOrdered, bool inRaidRun)
+bool DungeonClearMayArmHere(bool raidMap, bool raidClearOrdered, bool onRaidDoorMap)
 {
-    return (!raidMap && !inRaidRun) || raidClearOrdered;
+    return (!raidMap && !onRaidDoorMap) || raidClearOrdered;
 }
 
 char const* GuildRemoveRefusalSaid(GuildRemoveRefusal refusal)

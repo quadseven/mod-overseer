@@ -670,6 +670,7 @@ void TheUpperSpireDoorIsTheLowerSpiresTriggerWithAWing()
 void MoltenCoreStaysAWholeMapRun()
 {
     RaidDoor const* door = RaidDoorFor("moltencore");
+    Check("molten core keeps its door", door != nullptr);
     if (!door)
         return;
     CheckString("no wing", door->clearWing, "");
@@ -681,6 +682,7 @@ void MoltenCoreStaysAWholeMapRun()
 void TheUpperSpireIsClearedByItsOwnBossesOnly()
 {
     RaidDoor const* door = RaidDoorFor("ubrs");
+    Check("the upper spire's door for its clear", door != nullptr);
     if (!door)
         return;
     // The instance keeps 23 slots: nine Lower Spire bosses, five Upper Spire
@@ -702,9 +704,9 @@ void TheUpperSpireIsClearedByItsOwnBossesOnly()
 
 void ADungeonTypeRaidDoorHoldsTheBrainUntilClear()
 {
-    Check("off a raid run a dungeon map arms as ever",
-          DungeonClearMayArmHere(false, false));
-    Check("in a raid run a dungeon map holds", !DungeonClearMayArmHere(false, false, true));
+    Check("off the order's map a dungeon map arms as ever",
+          DungeonClearMayArmHere(false, false, false));
+    Check("on the order's map it holds", !DungeonClearMayArmHere(false, false, true));
     Check("until the run is in CLEAR", DungeonClearMayArmHere(false, true, true));
 }
 
@@ -715,12 +717,16 @@ void TheAdapterArmsTheRunsWing()
     source << in.rdbuf();
     std::string const text = source.str();
     Check("dc on carries the wing",
-          text.find("DoSpecificAction(\"dc on\", Event(\"dc\", raidWing, issuer), true)") !=
-              std::string::npos);
-    Check("the arming drive reads the run for any instance map",
-          text.find("map->IsRaid(), raidClearOrdered, inRaidRun") != std::string::npos);
+          Has(text, "DoSpecificAction(\"dc on\", Event(\"dc\", raidWing, issuer), true)"));
+    Check("the wing is the order's door's, on that door's map only",
+          Has(text, "onRaidDoorMap ? raidDoor->second->clearWing : \"\""));
+    Check("the hold is scoped to the door's map",
+          Has(text, "raidDoor->second->insideMapId == bot->GetMapId()"));
+    Check("every member's door is marked each poll, order standing or run past Idle",
+          Has(text, "if (door && (inRun || !ordered.empty()))") &&
+              Has(text, "doorByMember[member.name] = door;"));
     Check("the encounter read goes through the door's own count",
-          text.find("RaidClearProgress(*door, slots)") != std::string::npos);
+          Has(text, "RaidClearProgress(*door, slots)"));
 }
 
 int main()

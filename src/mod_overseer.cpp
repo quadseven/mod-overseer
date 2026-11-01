@@ -31026,11 +31026,21 @@ private:
             // operator's raid order reaches and only through HOLD; in every
             // other phase the answer on a raid map is hold, and no run row is
             // opened for it either.
+            //
+            // THE SAME ON A DUNGEON-TYPE RAID DOOR'S OWN MAP (Blackrock Spire),
+            // and only there: a family with a raid order standing is held on
+            // the map that order goes to, while a five-man run elsewhere keeps
+            // its heartbeat. The door is read off the order, so a raid inside
+            // after a restart is held too, before its phase is rebuilt.
             auto const raidPhase = _raidRunPhaseByMember.find(name);
-            bool const inRaidRun = raidPhase != _raidRunPhaseByMember.end();
             bool const raidClearOrdered =
-                inRaidRun && raidPhase->second == OverseerDecisions::RaidRunPhase::Clear;
-            if (!OverseerDecisions::DungeonClearMayArmHere(map->IsRaid(), raidClearOrdered, inRaidRun))
+                raidPhase != _raidRunPhaseByMember.end() &&
+                raidPhase->second == OverseerDecisions::RaidRunPhase::Clear;
+            auto const raidDoor = _raidRunDoorByMember.find(name);
+            bool const onRaidDoorMap = raidDoor != _raidRunDoorByMember.end() &&
+                                       raidDoor->second->insideMapId == bot->GetMapId();
+            if (!OverseerDecisions::DungeonClearMayArmHere(map->IsRaid(), raidClearOrdered,
+                                                           onRaidDoorMap))
             {
                 if (_raidArmingHeldSaid.insert(name).second)
                     LOG_INFO("module.overseer",
@@ -31253,9 +31263,7 @@ private:
             bool const wasRefused = record.runId == runId && !record.accepted;
             // Event(source, param, owner)  Event.h:21-24; the owner is what
             // IsAuthorized reads (DungeonClearChatActions.cpp:62).
-            auto const wing = _raidRunWingByMember.find(name);
-            std::string const raidWing =
-                wing == _raidRunWingByMember.end() ? std::string() : wing->second;
+            std::string const raidWing = onRaidDoorMap ? raidDoor->second->clearWing : "";
             bool const accepted =
                 botAI->DoSpecificAction("dc on", Event("dc", raidWing, issuer), true);
             record.runId = runId;
@@ -51781,8 +51789,9 @@ private:
     // rebuilt on every DriveRaidRun, for HeadTravelFactsFor (#631's order of
     // claimants on a head's travel column). World thread only.
     std::map<std::string, OverseerDecisions::RaidRunPhase> _raidRunPhaseByMember;
-    // The wing each member's raid run clears, for `dc on`; rebuilt with it.
-    std::map<std::string, std::string> _raidRunWingByMember;
+    // The door each member's standing raid order goes to, for the arming
+    // drive's hold and `dc on` wing; rebuilt with it.
+    std::map<std::string, OverseerDecisions::RaidDoor const*> _raidRunDoorByMember;
     // Characters already told that the dungeon brain is held on a raid map, so
     // the line is said once per stay rather than every poll.
     std::set<std::string> _raidArmingHeldSaid;
@@ -52740,7 +52749,7 @@ private:
 
         std::map<std::string, std::string> const jobs = LoadJobs();
         _raidRunPhaseByMember.clear();
-        _raidRunWingByMember.clear();
+        _raidRunDoorByMember.clear();
         _raidRunBackGhosts.clear();
         std::set<std::string> ghostsWalked;
         for (OverseerDecisions::FamilyRoster const& roster : LoadFamilyRosters())
@@ -52748,30 +52757,32 @@ private:
             if (roster.leader.empty())
                 continue;
             RaidRunState& run = _raidRuns[roster.family];
+            auto const job = jobs.find(roster.leader);
+            std::string const keyword = OverseerDecisions::RaidKeywordForJob(
+                job == jobs.end() ? std::string() : job->second);
             // Whatever this poll decides, the phase the members are read at by
             // the rest of the module is the one the run holds after it.
             struct MarkMembers
             {
                 std::map<std::string, OverseerDecisions::RaidRunPhase>& byMember;
-                std::map<std::string, std::string>& wingByMember;
+                std::map<std::string, OverseerDecisions::RaidDoor const*>& doorByMember;
                 OverseerDecisions::FamilyRoster const& roster;
                 RaidRunState const& run;
+                std::string const& ordered;
                 ~MarkMembers()
                 {
-                    if (run.phase == OverseerDecisions::RaidRunPhase::Idle)
-                        return;
                     OverseerDecisions::RaidDoor const* door =
-                        OverseerDecisions::RaidDoorFor(run.keyword);
+                        OverseerDecisions::RaidDoorFor(ordered.empty() ? run.keyword : ordered);
+                    bool const inRun = run.phase != OverseerDecisions::RaidRunPhase::Idle;
                     for (OverseerDecisions::FamilyMember const& member : roster.members)
                     {
-                        byMember[member.name] = run.phase;
-                        wingByMember[member.name] = door ? door->clearWing : "";
+                        if (inRun)
+                            byMember[member.name] = run.phase;
+                        if (door && (inRun || !ordered.empty()))
+                            doorByMember[member.name] = door;
                     }
                 }
-            } const mark{_raidRunPhaseByMember, _raidRunWingByMember, roster, run};
-            auto const job = jobs.find(roster.leader);
-            std::string const keyword = OverseerDecisions::RaidKeywordForJob(
-                job == jobs.end() ? std::string() : job->second);
+            } const mark{_raidRunPhaseByMember, _raidRunDoorByMember, roster, run, keyword};
             OverseerDecisions::RaidDoor const* door =
                 OverseerDecisions::RaidDoorFor(keyword.empty() ? run.keyword : keyword);
 

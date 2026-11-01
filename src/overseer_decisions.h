@@ -18863,6 +18863,8 @@ struct RaidDoor
 // THE SEAL OF ASCENSION IS NOT ASKED FOR on this core. The Upper Spire's bosses
 // are slots 9 Emberseer, 10 Rend, 12 The Beast and 13 Drakkisath of
 // instance_blackrock_spire; 11 Gyth is left out because Rend's event owns him.
+// The pre-pull repair hold counts Molten Core's bosses 8 and 9 and so never holds
+// this door: the raid repairs before FORM and not again.
 
 // How far a door's clear has got.
 struct RaidClearCount
@@ -19298,10 +19300,11 @@ RaidStoneSummon ChooseRaidStoneSummon(std::vector<RaidStoneSeat> const& seats,
 // brain off: a raid that is still gathering, eating or running back is not one
 // the brain may start pulling for.
 //
-// A RAID RUN ON A DUNGEON-TYPE MAP HOLDS THE SAME WAY. Blackrock Spire is map
+// A RAID ORDER'S OWN DUNGEON-TYPE MAP HOLDS THE SAME WAY. Blackrock Spire is map
 // type dungeon, so `raidMap` alone would arm a bare `dc on` on the raid the
-// moment it crossed (`inRaidRun`, the character's family run is past Idle).
-bool DungeonClearMayArmHere(bool raidMap, bool raidClearOrdered, bool inRaidRun = false);
+// moment it crossed (`onRaidDoorMap`, the character stands on the map its
+// family's standing raid order goes to).
+bool DungeonClearMayArmHere(bool raidMap, bool raidClearOrdered, bool onRaidDoorMap = false);
 
 // -- and the row that asks for any of it -------------------------------------
 //
