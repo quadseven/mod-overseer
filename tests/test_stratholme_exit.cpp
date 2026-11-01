@@ -6,16 +6,23 @@
 
 #include "overseer_decisions.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 using OverseerDecisions::DecideStratholmeExit;
 using OverseerDecisions::InStratholmeExitYard;
 using OverseerDecisions::StratholmeButtonInReach;
 using OverseerDecisions::StratholmeHearthLeavesTheYard;
+using OverseerDecisions::ShouldOpenStratholmeYardEpisode;
+using OverseerDecisions::StratholmeMemberInYard;
+using OverseerDecisions::StratholmeMemberPlace;
+using OverseerDecisions::StratholmeYardGiveUpHolds;
+using OverseerDecisions::StratholmeYardPortalIndex;
 using OverseerDecisions::StratholmeExitFacts;
 using OverseerDecisions::StratholmeExitWay;
 using OverseerDecisions::StratholmeExitWayWord;
@@ -186,6 +193,73 @@ int main()
                   false);
     }
 
+    // A member observed inside the exit yard on an IDLE poll gets one episode.
+    {
+        bool const memberInYard = InStratholmeExitYard(0, 3235.46f, -4050.6f);
+        CheckBool("IDLE opens an episode for a member already in the yard",
+                  ShouldOpenStratholmeYardEpisode(memberInYard, false, false, 0), true);
+        CheckBool("IDLE keeps the existing yard episode",
+                  ShouldOpenStratholmeYardEpisode(memberInYard, true, false, 0), false);
+        bool const memberOutsideYard = InStratholmeExitYard(0, 3165.48f, -4039.1f);
+        CheckBool("IDLE does not open an episode outside the yard",
+                  ShouldOpenStratholmeYardEpisode(memberOutsideYard, false, false, 0), false);
+    }
+
+    // An episode that gave up is not reopened by the IDLE recovery while the
+    // members are still in the yard: the same poll it gave up in, or any poll
+    // before the cool-down, leaves them to the ordinary drives.
+    {
+        std::uint32_t const cooldown = OverseerDecisions::STRATHOLME_YARD_RECOVERY_COOLDOWN_SECONDS;
+        CheckBool("a given-up episode is not reopened in the poll it gave up in",
+                  ShouldOpenStratholmeYardEpisode(true, false, true, 0), false);
+        CheckBool("a given-up episode is not reopened at its own ceiling",
+                  ShouldOpenStratholmeYardEpisode(
+                      true, false, true, OverseerDecisions::STRATHOLME_YARD_EPISODE_SECONDS),
+                  false);
+        CheckBool("a given-up episode is not reopened just before the cool-down",
+                  ShouldOpenStratholmeYardEpisode(true, false, true, cooldown - 1), false);
+        CheckBool("a given-up episode may reopen once the cool-down has passed",
+                  ShouldOpenStratholmeYardEpisode(true, false, true, cooldown), true);
+        CheckBool("the cool-down is longer than one episode",
+                  cooldown > OverseerDecisions::STRATHOLME_YARD_EPISODE_SECONDS, true);
+        CheckBool("the give-up holds while a member is still in the yard",
+                  StratholmeYardGiveUpHolds(true, 0), true);
+        CheckBool("the give-up ends when every member has left the yard",
+                  StratholmeYardGiveUpHolds(false, 0), false);
+        CheckBool("the give-up ends once the cool-down has passed",
+                  StratholmeYardGiveUpHolds(true, cooldown), false);
+    }
+
+    // The member scan: a member counts only when online, in the world and
+    // standing in the yard on map 0.
+    {
+        StratholmeMemberPlace inYard{true, true, 0, 3235.46f, -4050.6f};
+        CheckBool("an online member in the yard counts", StratholmeMemberInYard(inYard), true);
+        StratholmeMemberPlace offline = inYard;
+        offline.found = false;
+        CheckBool("an offline member does not count", StratholmeMemberInYard(offline), false);
+        StratholmeMemberPlace loading = inYard;
+        loading.inWorld = false;
+        CheckBool("a member not in the world does not count", StratholmeMemberInYard(loading),
+                  false);
+        StratholmeMemberPlace inside = inYard;
+        inside.mapId = 329;
+        CheckBool("a member inside the instance does not count", StratholmeMemberInYard(inside),
+                  false);
+        StratholmeMemberPlace outside{true, true, 0, 3165.48f, -4039.1f};
+        CheckBool("a member past the Service Entrance does not count",
+                  StratholmeMemberInYard(outside), false);
+    }
+
+    // The portal lookup: the first portal that leaves by areatrigger 2221.
+    {
+        CheckBool("the 2221 portal is found among others",
+                  StratholmeYardPortalIndex({119, 2221, 2221}) == 1, true);
+        CheckBool("no 2221 portal finds none",
+                  StratholmeYardPortalIndex({119, 0, 1234}) == -1, true);
+        CheckBool("an empty portal table finds none", StratholmeYardPortalIndex({}) == -1, true);
+    }
+
     // a hearth counts only when the stone is ready and the bind is not the yard
     {
         CheckBool("ready stone bound in a town leaves",
@@ -220,6 +294,41 @@ int main()
                   true);
         CheckBool("an EXIT through 2221 opens the yard episode",
                   source.find("OpenStratholmeYard(family, *portal, coord)") != std::string::npos, true);
+        std::size_t const recoveryStart = source.find("void RecoverStratholmeYardInIdle(");
+        std::size_t const recoveryEnd = source.find("// ----", recoveryStart);
+        std::string const recoverySource = recoveryStart == std::string::npos || recoveryEnd == std::string::npos
+            ? std::string() : source.substr(recoveryStart, recoveryEnd - recoveryStart);
+        CheckBool("IDLE recovery uses the tested episode decision",
+                  recoverySource.find("ShouldOpenStratholmeYardEpisode(") != std::string::npos &&
+                      recoverySource.find("StratholmeYardGiveUpHolds(") != std::string::npos &&
+                      recoverySource.find("StratholmeYardPortalIndex(") != std::string::npos &&
+                      recoverySource.find("OpenStratholmeYard(family, *portal, run, true)") !=
+                          std::string::npos,
+                  true);
+        CheckBool("the member scan uses the tested member decision",
+                  source.find("OverseerDecisions::StratholmeMemberInYard(") != std::string::npos,
+                  true);
+        CheckBool("a recovered episode says so rather than claiming a fresh entry",
+                  source.find("recovered the exit-yard episode after a restart") !=
+                      std::string::npos,
+                  true);
+        std::size_t const driveStart = source.find("bool DriveStratholmeYard(");
+        std::size_t const driveEnd = source.find("FetchRunPhaseOf", driveStart);
+        std::string const driveSource = driveStart == std::string::npos || driveEnd == std::string::npos
+            ? std::string() : source.substr(driveStart, driveEnd - driveStart);
+        std::size_t gaveUps = 0;
+        for (std::size_t at = driveSource.find("GiveUpStratholmeYard(family, yard)");
+             at != std::string::npos;
+             at = driveSource.find("GiveUpStratholmeYard(family, yard)", at + 1))
+            ++gaveUps;
+        CheckBool("every give-up in the drive records the give-up", gaveUps == 3, true);
+        std::size_t const idleStart = source.find("if (coord.phase == DungeonRunPhase::Idle)");
+        std::size_t const recoveryCall = source.find("RecoverStratholmeYardInIdle(family, members)", idleStart);
+        std::size_t const idleDrive = source.find("DriveStratholmeYard(family, leaderName, members)", idleStart);
+        CheckBool("IDLE poll recovers the episode before driving it",
+                  idleStart != std::string::npos && recoveryCall != std::string::npos &&
+                      idleDrive != std::string::npos && recoveryCall < idleDrive,
+                  true);
         std::size_t const yardStart = source.find("void OpenStratholmeYard(");
         std::size_t const yardEnd = source.find("static std::vector<Player*> MembersInStratholmeYard", yardStart);
         std::string const yardSource = yardStart == std::string::npos || yardEnd == std::string::npos

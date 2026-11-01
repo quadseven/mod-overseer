@@ -37581,12 +37581,19 @@ private:
         ExitHearthEpisode hearth;
     };
     std::map<std::string, StratholmeYardEpisode> _stratholmeYards;
+    // WHEN A FAMILY'S YARD EPISODE LAST GAVE UP (ceiling, or no way out left),
+    // so the IDLE recovery does not open it again in the same poll and undo
+    // the "the ordinary drives take them" fallback. Cleared when every member
+    // is out of the yard or the cool-down has passed; see
+    // OverseerDecisions::ShouldOpenStratholmeYardEpisode.
+    std::map<std::string, std::time_t> _stratholmeYardGaveUp;
 
     void OpenStratholmeYard(std::string const& family, DungeonPortal const& portal,
-                            DungeonRunCoordinatorState const& run)
+                            DungeonRunCoordinatorState const& run, bool recovered = false)
     {
         if (portal.exitTriggerId != OverseerDecisions::STRATHOLME_YARD_EXIT_TRIGGER)
             return;
+        _stratholmeYardGaveUp.erase(family);
         StratholmeYardEpisode yard;
         yard.since = std::time(nullptr);
         // The hearth leg's timeline rows are the run's own.
@@ -37599,10 +37606,17 @@ private:
         yard.hearth.doorMapId = portal.outsideMapId;
         yard.hearth.walkFailingSince = yard.since;
         _stratholmeYards[family] = yard;
-        LOG_INFO("module.overseer",
-                 "overseer: family '{}' left '{}' by areatrigger {} into the exit yard; "
-                 "the way out is read from the Service Entrance on the next poll",
-                 family, portal.keyword, portal.exitTriggerId);
+        if (recovered)
+            LOG_INFO("module.overseer",
+                     "overseer: family '{}' recovered the exit-yard episode after a restart "
+                     "('{}', areatrigger {}); the way out is read from the Service Entrance "
+                     "on the next poll",
+                     family, portal.keyword, portal.exitTriggerId);
+        else
+            LOG_INFO("module.overseer",
+                     "overseer: family '{}' left '{}' by areatrigger {} into the exit yard; "
+                     "the way out is read from the Service Entrance on the next poll",
+                     family, portal.keyword, portal.exitTriggerId);
     }
 
     static std::vector<Player*> MembersInStratholmeYard(std::vector<std::string> const& members)
@@ -37611,13 +37625,46 @@ private:
         for (std::string const& name : members)
         {
             Player* member = ObjectAccessor::FindPlayerByName(name);
-            if (member && member->IsInWorld() &&
-                OverseerDecisions::InStratholmeExitYard(member->GetMapId(),
-                                                        member->GetPositionX(),
-                                                        member->GetPositionY()))
+            OverseerDecisions::StratholmeMemberPlace place;
+            place.found = member != nullptr;
+            if (member)
+            {
+                place.inWorld = member->IsInWorld();
+                place.mapId = member->GetMapId();
+                place.x = member->GetPositionX();
+                place.y = member->GetPositionY();
+            }
+            if (OverseerDecisions::StratholmeMemberInYard(place))
                 inYard.push_back(member);
         }
         return inYard;
+    }
+
+    void RecoverStratholmeYardInIdle(std::string const& family,
+                                     std::vector<std::string> const& members)
+    {
+        bool const episodeOpen = _stratholmeYards.find(family) != _stratholmeYards.end();
+        std::vector<Player*> const inYard = MembersInStratholmeYard(members);
+        auto const gaveUpAt = _stratholmeYardGaveUp.find(family);
+        bool const gaveUp = gaveUpAt != _stratholmeYardGaveUp.end();
+        std::time_t const now = std::time(nullptr);
+        uint32 const sinceGaveUp =
+            gaveUp && now > gaveUpAt->second ? static_cast<uint32>(now - gaveUpAt->second) : 0u;
+        if (gaveUp && !OverseerDecisions::StratholmeYardGiveUpHolds(!inYard.empty(), sinceGaveUp))
+            _stratholmeYardGaveUp.erase(gaveUpAt);
+        if (!OverseerDecisions::ShouldOpenStratholmeYardEpisode(!inYard.empty(), episodeOpen,
+                                                                gaveUp, sinceGaveUp))
+            return;
+        std::vector<uint32> exitTriggers;
+        for (DungeonPortal const& candidate : DungeonPortals())
+            exitTriggers.push_back(candidate.exitTriggerId);
+        int const index = OverseerDecisions::StratholmeYardPortalIndex(exitTriggers);
+        if (index < 0)
+            return;
+        DungeonPortal const* const portal = &DungeonPortals()[static_cast<std::size_t>(index)];
+        DungeonRunCoordinatorState run;
+        run.portalKeyword = portal->keyword;
+        OpenStratholmeYard(family, *portal, run, true);
     }
 
     // The members whose own hearthstone takes them out of the yard, and those
@@ -37654,6 +37701,14 @@ private:
         if (!yard.walker.empty())
             _travelAims.ReleaseRunAim(yard.walker, yard.aim, "the Stratholme yard way out");
         _stratholmeYards.erase(family);
+    }
+
+    // The episode gives up while members are still in the yard: say so to the
+    // IDLE recovery, then close it.
+    void GiveUpStratholmeYard(std::string const& family, StratholmeYardEpisode const& yard)
+    {
+        _stratholmeYardGaveUp[family] = std::time(nullptr);
+        CloseStratholmeYard(family, yard);
     }
 
     void PressStratholmeButton(StratholmeYardEpisode& yard, Player* walker, GameObject* button,
@@ -37702,7 +37757,7 @@ private:
                      "minutes; the way out gives up and the ordinary drives take them",
                      static_cast<uint32>(inYard.size()), family,
                      OverseerDecisions::STRATHOLME_YARD_EPISODE_SECONDS / 60);
-            CloseStratholmeYard(family, yard);
+            GiveUpStratholmeYard(family, yard);
             return false;
         }
 
@@ -37788,7 +37843,7 @@ private:
                          "overseer: stratholme exit: no hearth is left in play for the {} of "
                          "'{}' still in the yard; the ordinary drives take them",
                          static_cast<uint32>(inYard.size()), family);
-                CloseStratholmeYard(family, yard);
+                GiveUpStratholmeYard(family, yard);
                 return false;
 
             case OverseerDecisions::StratholmeExitWay::None:
@@ -37799,7 +37854,7 @@ private:
                  "and no member in the yard can hearth out, so '{}' is left to the ordinary "
                  "drives",
                  family);
-        CloseStratholmeYard(family, yard);
+        GiveUpStratholmeYard(family, yard);
         return false;
     }
 
@@ -54289,6 +54344,9 @@ private:
 
         if (coord.phase == DungeonRunPhase::Idle)
         {
+            RecoverStratholmeYardInIdle(family, members);
+            if (DriveStratholmeYard(family, leaderName, members))
+                return;
             // job != 'dungeon' is the ordinary case - most polls, this drive
             // has nothing to do, same as every other job-gated drive in this
             // file when the roster is questing.
