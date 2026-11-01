@@ -94,6 +94,8 @@ class BridgeReadDriftTest(unittest.TestCase):
         try:
             with urllib.request.urlopen(BRIDGE_SOURCE, timeout=30) as reply:  # noqa: S310 - fixed https url
                 source = reply.read().decode()
+        except urllib.error.HTTPError:
+            raise  # the host answered: a moved file is a real failure
         except urllib.error.URLError as error:
             self.skipTest("the bridge source is unreachable: %s" % error)
         start = source.index("def _answered_share_rows")
