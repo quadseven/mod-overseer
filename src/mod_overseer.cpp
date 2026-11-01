@@ -16624,6 +16624,11 @@ private:
         }
         void Release(uint64 guid)
         {
+            // AI-REVIEW 2026-11-01 [codex/in-process/standards] DE-KEEP (code-review):
+            // Destruction has no native keep hook; recheck after any inventory retry.
+            Item* source = ItemOf(guid);
+            if (!source || ItemKept(player, source))
+                return;
             // Never close another loot window. An empty current guid is safe:
             // the selected, owned source has already been proved fully looted.
             ObjectGuid const current = player->GetLootGUID();
@@ -16791,7 +16796,7 @@ private:
 
     static bool MayDisenchantItem(Player* player, Item* item)
     {
-        if (!item || item->GetOwnerGUID() != player->GetGUID())
+        if (!item || item->GetOwnerGUID() != player->GetGUID() || ItemKept(player, item))
             return false;
         ItemTemplate const* proto = item->GetTemplate();
         return item->IsSoulBound() && proto->Quality == ITEM_QUALITY_UNCOMMON &&

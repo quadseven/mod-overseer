@@ -234,7 +234,7 @@ struct Item
 {
     ItemTemplate proto;
     uint64 guid=42,owner=100;
-    bool bound=true,m_lootGenerated=false;
+    bool bound=true,m_lootGenerated=false,kept=false;
     Loot loot;
     ItemTemplate const* GetTemplate() const { return &proto; }
     ObjectGuid GetGUID() const { return ObjectGuid(guid); }

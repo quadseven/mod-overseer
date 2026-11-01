@@ -17,6 +17,7 @@ class Runtime
     time_t _disenchantFactsAt = 0;
     std::set<std::string> _craftLoneHeld;
     static bool InAnyDungeonRun(Player* player) { return player->dungeon; }
+    static bool ItemKept(Player const*, Item const* item) { return item->kept; }
     static std::vector<Item*> GearCarried(Player* player)
     {
         std::vector<Item*> items;
@@ -110,6 +111,21 @@ int main()
     {
         Runtime runtime; Player player;player.items.at(42)->proto.usable=true;runtime.Add(player);runtime.Ticks(7);
         Check("wearable gear is not disenchanted and establishes no craft hold", player.casts==0 && !runtime.HasProof());
+    }
+    {
+        Runtime runtime; Player player;player.items.at(42)->kept=true;runtime.Add(player);runtime.Ticks(7);
+        Check("reserved unusable gear survives without a cast", player.casts==0 && player.GetItemByGuid(ObjectGuid(42)) && runtime.Status()=="claimed");
+        if (Item* source=player.GetItemByGuid(ObjectGuid(42))) source->kept=false;
+        runtime.Ticks(4);
+        Check("removing the reservation allows the same standing errand", runtime.Status()=="delivered" && player.casts==1);
+    }
+    {
+        Runtime runtime; Player player;runtime.Add(player);runtime.Ticks(3);
+        player.items.at(42)->kept=true;runtime.Ticks(4);
+        Check("a reservation added after loot opens prevents source destruction", player.releases==0 && player.GetItemByGuid(ObjectGuid(42)) && runtime.Status()=="claimed");
+        if (Item* source=player.GetItemByGuid(ObjectGuid(42))) source->kept=false;
+        runtime.Ticks(3);
+        Check("released reservation finishes from existing inventory proof without another cast", runtime.Status()=="delivered" && player.casts==1);
     }
     {
         Runtime runtime; Player player;player.restricted=true;runtime.Add(player);runtime.Ticks(7);

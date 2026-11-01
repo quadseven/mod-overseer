@@ -94,6 +94,7 @@ member is not proof of an exit; a member still inside remains in recovery.
 ## Disenchanting a carried item
 
 A `disenchant` command names one enabled roster character on `job='craft'`.
+Reserved items are excluded, and reservations are checked again before source destruction.
 The executor selects a carried, soulbound uncommon item its owner cannot use
 and has sufficient Enchanting skill to disenchant. The core casts spell 13262
 at that item and generates its ordinary disenchant loot. The loot hook stores
