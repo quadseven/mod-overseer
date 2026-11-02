@@ -17055,15 +17055,16 @@ private:
     // TrainOnArrival's own comment warns against for TeachSpell, wearing a
     // different verb.
     //
-    // SPELL FOCUS: A FIRE IS LIT, A FORGE IS NOT WALKED TO. Some recipes need
-    // a nearby gameobject. A world spawn (a forge, an anvil) is not walked to
-    // here - v1's scoping decision, per the design doc, is that the Python
-    // planner must only ever hand this column such a recipe once something
-    // brings the crafter to one. A recipe that needs one anyway is not a
-    // crash: CheckCast refuses it (SPELL_FAILED_REQUIRES_SPELL_FOCUS), this
-    // function logs the refusal and leaves the errand standing, and nothing
-    // is crafted out of thin air - the same "fail closed, not open" shape
-    // every other drive in this file holds to.
+    // SPELL FOCUS IS ASKED BEFORE THE CAST (quadseven/wow-overseer#1786). The
+    // one thing asked ahead of CheckCast, with the core's own check, because a
+    // refused cast is not silent: CastSpell sends it to the client, and a
+    // standing errand would put "Requires Forge" on the screen every poll. So a
+    // recipe whose focus is out of reach is not cast at all. CraftStationStepFor
+    // answers: a fire is lit, an Anvil is walked to, and anything else is
+    // deferred with one stated reason until the crafter stands at the station.
+    // A Forge is the bridge's walk (`_forge_once`), for a craft job and for a
+    // family on a town stop; this drive waits for it. A town run's leader may
+    // take the Anvil and banker walks here (CraftMayWalk).
     //
     // ANVILS AND THE BLACKSMITH HAMMER (#524). A worn Blacksmithing recipe
     // needs an Anvil (RequiresSpellFocus 1) and a Blacksmith Hammer (tool
@@ -17177,6 +17178,17 @@ private:
                  "overseer: indexed {} Anvil spawn(s) for the craft drive (#524)",
                  _anvilSpawns.size());
         return _anvilSpawns;
+    }
+
+    // Is a live focus object of this id within its own reach of `who`? The
+    // check Spell::CheckCast makes, asked without a cast.
+    static bool SpellFocusInReach(Player* who, uint32 focusId)
+    {
+        GameObject* found = nullptr;
+        Acore::GameObjectFocusCheck check(who, focusId);
+        Acore::GameObjectSearcher<Acore::GameObjectFocusCheck> searcher(who, found, check);
+        Cell::VisitObjects(who, searcher, who->GetVisibilityRange());
+        return found != nullptr;
     }
 
     // A tool of this category sitting in the character's own bank: its 28
@@ -17542,7 +17554,10 @@ private:
             // bank is the half asked here. Decided before the cast because the
             // core refuses the Anvil first, and the banker is the walk to take
             // before the Anvil, not after it.
-            bool const mayWalk = jobIt->second == "craft";
+            Group const* family = bot->GetGroup();
+            bool const mayWalk = OverseerDecisions::CraftMayWalk(
+                jobIt->second, !family || family->IsLeader(bot->GetGUID()),
+                bot->HasPlayerFlag(PLAYER_FLAGS_RESTING));
             OverseerDecisions::CraftToolPlace toolPlace = OverseerDecisions::CraftToolPlace::NotNeeded;
             uint32 toolCategory = 0;
             Item* bankedTool = nullptr;
@@ -17630,7 +17645,60 @@ private:
                 continue;
             }
 
-            // Off the mount first, through the handler a client drives for the
+            // THE STATION, BEFORE THE CAST (wow-overseer#1786). See the note above
+            // DriveHeadTrades. The walk is decided only when one could happen.
+            uint32 const focus = info->RequiresSpellFocus;
+            bool const focusInReach = !focus || SpellFocusInReach(bot, focus);
+            uint32 const lighter = OverseerDecisions::FocusLighterSpell(focus);
+            bool const lighterKnown = lighter && bot->HasSpell(lighter);
+            bool const walkedTo = OverseerDecisions::FocusIsWalkedTo(focus);
+            float nearestYards = -1.f;
+            OverseerDecisions::FocusSpawn nearest;
+            if (!focusInReach && walkedTo && mayWalk)
+            {
+                std::vector<OverseerDecisions::FocusSpawn> const& anvils = AnvilSpawns();
+                int const pick = OverseerDecisions::NearestFocusSpawn(
+                    anvils, bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(),
+                    OverseerDecisions::CRAFT_FOCUS_WALK_LIMIT_YARDS);
+                if (pick >= 0)
+                {
+                    nearest = anvils[pick];
+                    nearestYards = bot->GetExactDist2d(nearest.x, nearest.y);
+                }
+            }
+            OverseerDecisions::CraftFocusStep const focusStep =
+                OverseerDecisions::CraftFocusStepFor(walkedTo, mayWalk, nearestYards);
+            OverseerDecisions::CraftStationStep const stationStep =
+                OverseerDecisions::CraftStationStepFor(focus, focusInReach, lighterKnown,
+                                                       focusStep);
+            if (stationStep == OverseerDecisions::CraftStationStep::Walk)
+            {
+                std::string const aim = OverseerDecisions::FocusSpawnAim(nearest);
+                if (_travelAims.Claim(name, aim, OverseerDecisions::TravelOwner::TownTrip) &&
+                    SayCraftPrepOnce(name, "walking to " + aim))
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' needs an Anvil for '{}' ({}) - walked to the "
+                             "nearest one, {:.0f}y away at '{}' (#524)",
+                             name, info->SpellName[LOCALE_enUS], spellId, nearestYards, aim);
+                continue;
+            }
+            if (stationStep == OverseerDecisions::CraftStationStep::Defer)
+            {
+                std::string const reason =
+                    OverseerDecisions::CraftDeferReason(focus, mayWalk, focusStep);
+                if (SayCraftPrepOnce(name, reason))
+                {
+                    RecordEvent(bot, "craft-deferred", spellId, info->SpellName[LOCALE_enUS],
+                                reason);
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' does not cast '{}' ({}) yet - {}; the errand "
+                             "stands (wow-overseer#1786)",
+                             name, info->SpellName[LOCALE_enUS], spellId, reason);
+                }
+                continue;
+            }
+
+            // Off the mount first, for a fire as for a recipe, through the handler a client drives for the
             // same reason (see the cast hold, #337): it does both Dismount()
             // and the aura removal.
             if (OverseerDecisions::CraftDismountsFirst(bot->IsMounted(), bot->IsInFlight()))
@@ -17640,6 +17708,25 @@ private:
                     WorldPacket cancelMount(CMSG_CANCEL_MOUNT_AURA, 0);
                     session->HandleCancelMountAuraOpcode(cancelMount);
                 }
+            }
+
+            // A CONJURABLE FOCUS IS PROVIDED, not waited for (#534).
+            if (stationStep == OverseerDecisions::CraftStationStep::Light)
+            {
+                // ONCE FOR EACH FIRE: a refused light reaches the client too, so
+                // it is not asked again until a craft clears the said-once state.
+                if (!SayCraftPrepOnce(name, "lighting a fire"))
+                    continue;
+                // natural-only: a spell the character knows (HasSpell), cast
+                // untriggered, the way a cook at a client clicks it.
+                SpellCastResult const lit = bot->CastSpell(bot, lighter, false);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' needs spell focus {} for '{}' ({}) and {} spell {} "
+                         "to provide it (SpellCastResult {}) - leaving the errand standing "
+                         "for the next poll", name, focus, info->SpellName[LOCALE_enUS],
+                         spellId, lit == SPELL_CAST_OK ? "cast" : "was refused casting",
+                         lighter, static_cast<uint32>(lit));
+                continue;
             }
 
             // natural-only: a recipe the character knows (HasSpell above), cast untriggered with
@@ -17687,89 +17774,11 @@ private:
                     break;
             }
 
-            if (result == SPELL_FAILED_REQUIRES_SPELL_FOCUS)
-            {
-                // A WORLD FOCUS IN TOWN IS WALKED TO (#524): an Anvil, for a
-                // job 'craft' crafter, within a town's walk. Already at one,
-                // the refusal stands below rather than looping the walk.
-                bool const walkedTo = OverseerDecisions::FocusIsWalkedTo(info->RequiresSpellFocus);
-                float nearestYards = -1.f;
-                OverseerDecisions::FocusSpawn nearest;
-                if (walkedTo && mayWalk)
-                {
-                    std::vector<OverseerDecisions::FocusSpawn> const& anvils = AnvilSpawns();
-                    int const pick = OverseerDecisions::NearestFocusSpawn(
-                        anvils, bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(),
-                        OverseerDecisions::CRAFT_FOCUS_WALK_LIMIT_YARDS);
-                    if (pick >= 0)
-                    {
-                        nearest = anvils[pick];
-                        nearestYards = bot->GetExactDist2d(nearest.x, nearest.y);
-                    }
-                }
-                OverseerDecisions::CraftFocusStep const focusStep =
-                    OverseerDecisions::CraftFocusStepFor(walkedTo, mayWalk, nearestYards);
-                if (focusStep == OverseerDecisions::CraftFocusStep::Walk)
-                {
-                    std::string const aim = OverseerDecisions::FocusSpawnAim(nearest);
-                    if (_travelAims.Claim(name, aim, OverseerDecisions::TravelOwner::TownTrip) &&
-                        SayCraftPrepOnce(name, "walking to " + aim))
-                        LOG_INFO("module.overseer",
-                                 "overseer: '{}' needs an Anvil for '{}' ({}) - walked to the "
-                                 "nearest one, {:.0f}y away at '{}' (#524)",
-                                 name, info->SpellName[LOCALE_enUS], spellId, nearestYards, aim);
-                    continue;
-                }
-                if (focusStep == OverseerDecisions::CraftFocusStep::NoneNear)
-                {
-                    if (SayCraftPrepOnce(name, "no anvil near"))
-                        LOG_WARN("module.overseer",
-                                 "overseer: '{}' needs an Anvil for '{}' ({}) and none stands "
-                                 "within {:.0f}y on map {} - not walked across the world for "
-                                 "one; the errand stands (#524)",
-                                 name, info->SpellName[LOCALE_enUS], spellId,
-                                 OverseerDecisions::CRAFT_FOCUS_WALK_LIMIT_YARDS, bot->GetMapId());
-                    continue;
-                }
-
-                // A CONJURABLE FOCUS IS PROVIDED, not waited for (#534).
-                uint32 const lighter =
-                    OverseerDecisions::FocusLighterSpell(info->RequiresSpellFocus);
-                if (lighter && bot->HasSpell(lighter))
-                {
-                    // natural-only: a spell the character knows (HasSpell), cast
-                    // untriggered, the way a cook at a client clicks it.
-                    SpellCastResult const lit = bot->CastSpell(bot, lighter, false);
-                    LOG_INFO("module.overseer",
-                             "overseer: '{}' needs spell focus {} for '{}' ({}) and {} "
-                             "spell {} to provide it (SpellCastResult {}) - leaving the "
-                             "errand standing for the next poll", name, info->RequiresSpellFocus,
-                             info->SpellName[LOCALE_enUS], spellId,
-                             lit == SPELL_CAST_OK ? "cast" : "was refused casting",
-                             lighter, static_cast<uint32>(lit));
-                    continue;
-                }
-                if (lighter)
-                    LOG_WARN("module.overseer",
-                             "overseer: '{}' needs spell focus {} for '{}' ({}) and does "
-                             "not know spell {} that would provide it", name,
-                             info->RequiresSpellFocus, info->SpellName[LOCALE_enUS],
-                             spellId, lighter);
-                LOG_WARN("module.overseer",
-                         "overseer: '{}' tried to craft '{}' ({}) but is not near the "
-                         "required spell focus {} ({}; SpellCastResult {}) - leaving the "
-                         "errand standing for the next poll", name,
-                         info->SpellName[LOCALE_enUS], spellId, info->RequiresSpellFocus,
-                         resultName, static_cast<uint32>(result));
-            }
-            else
-            {
-                LOG_INFO("module.overseer",
-                         "overseer: '{}' tried to craft '{}' ({}) and the cast was refused "
-                         "({}; SpellCastResult {}) - leaving the errand standing for the "
-                         "next poll", name, info->SpellName[LOCALE_enUS], spellId,
-                         resultName, static_cast<uint32>(result));
-            }
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' tried to craft '{}' ({}) and the cast was refused "
+                     "({}; SpellCastResult {}) - leaving the errand standing for the "
+                     "next poll", name, info->SpellName[LOCALE_enUS], spellId,
+                     resultName, static_cast<uint32>(result));
         }
     }
 
@@ -73334,6 +73343,10 @@ private:
             return refuse(Refusal::Passive);
         if (!who->HasActiveSpell(ev.spellId))
             return refuse(Refusal::NotLearned);
+
+        // A station out of reach would come back as an error on the client.
+        if (spell->RequiresSpellFocus && !SpellFocusInReach(who, spell->RequiresSpellFocus))
+            return refuse(Refusal::NoSpellFocus);
 
         if (who->HasSpellCooldown(ev.spellId))
             return refuse(Refusal::OnCooldown);
