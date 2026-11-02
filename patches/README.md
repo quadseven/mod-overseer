@@ -187,3 +187,14 @@ wander the bot chose for itself still carries an empty position and is
 untouched. The walk itself needed no change; it was always positional, and the
 entry was only ever consulted on arrival. Pairs with `at:<map>:<x>,<y>,<z>` in
 this module's own travel aim.
+
+**`mod-playerbots/0019-dismount-fall-keeps-its-flags-and-its-bound.patch` fixes
+upstream behaviour** - dropping it costs the fix but the build still compiles
+clean, as long as all of it goes: the `CompleteDismount` return value and
+`PlayerbotAI::FinishDismountDescent` are one change. `CompleteDismount` cleared
+the falling flag under the spline `MoveFall` had just started, and `MoveFall`'s
+search has no real bound, so one dismount could commit to any drop. The flag now
+stays while a fall spline runs, and the settle is held to 50 yards unless the
+bot has a flight flag. Keeping the flag is only safe with the landing clear in
+the same patch: the core clears it at the end of a fall spline for creatures
+only, so a bot with no client would otherwise keep it, and routing with it.
