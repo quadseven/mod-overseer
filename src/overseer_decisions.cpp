@@ -14600,7 +14600,7 @@ TownRetry CastRefusalRetry(std::string const& detail)
     // that does is a trip to a vendor, which is exactly what this class means
     // everywhere else in this file.
     if (detail == CastRefusal::TargetOutOfRange || detail == CastRefusal::TargetOtherMap
-        || detail == CastRefusal::MissingReagent)
+        || detail == CastRefusal::MissingReagent || detail == CastRefusal::NoSpellFocus)
         return TownRetry::Elsewhere;
 
     // LATER, and everything this table has never heard of. The character's own
@@ -18620,6 +18620,56 @@ CraftFocusStep CraftFocusStepFor(bool walkedTo, bool mayWalk, float nearestYards
     if (nearestYards <= CRAFT_FOCUS_STANDING_YARDS)
         return CraftFocusStep::Stand;
     return CraftFocusStep::Walk;
+}
+
+CraftStationStep CraftStationStepFor(unsigned focus, bool focusInReach, bool lighterKnown,
+                                     CraftFocusStep walk)
+{
+    if (!focus || focusInReach)
+        return CraftStationStep::Cast;
+    if (FocusLighterSpell(focus) && lighterKnown)
+        return CraftStationStep::Light;
+    if (walk == CraftFocusStep::Walk)
+        return CraftStationStep::Walk;
+    return CraftStationStep::Defer;
+}
+
+namespace
+{
+// SpellFocusObject.dbc names, with their article, of the foci a recipe the
+// planners can hand out carries. Any other id is named by its number.
+std::string CraftFocusName(unsigned focus)
+{
+    switch (focus)
+    {
+        case SPELL_FOCUS_ANVIL:
+            return "an Anvil";
+        case 3:
+            return "a Forge";
+        case SPELL_FOCUS_COOKING_FIRE:
+            return "a Cooking Fire";
+        default:
+            return "spell focus " + std::to_string(focus);
+    }
+}
+
+std::string WithoutArticle(std::string const& name)
+{
+    size_t const space = name.find(' ');
+    return name.rfind("a", 0) == 0 && space <= 2 ? name.substr(space + 1) : name;
+}
+}  // namespace
+
+std::string CraftDeferReason(unsigned focus, bool mayWalk, CraftFocusStep walk)
+{
+    std::string const name = CraftFocusName(focus);
+    if (FocusLighterSpell(focus))
+        return "does not know how to light " + name;
+    if (walk == CraftFocusStep::NoneNear)
+        return "no " + WithoutArticle(name) + " stands within a town's walk";
+    if (mayWalk && FocusIsWalkedTo(focus))
+        return "standing at " + name + " that does not reach";
+    return "waiting for a town stop with " + name;
 }
 
 std::string FocusSpawnAim(FocusSpawn const& spawn)

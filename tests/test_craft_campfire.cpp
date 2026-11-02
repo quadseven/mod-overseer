@@ -54,13 +54,10 @@ void TheAdapterIsWired()
     std::size_t const end = source.find("// ----", drive);
     std::string const body =
         drive == std::string::npos ? std::string() : source.substr(drive, end - drive);
-    std::size_t const refusal = body.find("if (result == SPELL_FAILED_REQUIRES_SPELL_FOCUS)");
-    std::size_t const asks =
-        body.find("OverseerDecisions::FocusLighterSpell(info->RequiresSpellFocus)");
+    std::size_t const asks = body.find("OverseerDecisions::FocusLighterSpell(focus)");
     std::size_t const known = body.find("bot->HasSpell(lighter)");
     std::size_t const cast = body.find("bot->CastSpell(bot, lighter, false)");
-    Check("DriveCraft asks which spell provides the focus on a focus refusal",
-          refusal != std::string::npos && asks != std::string::npos && asks > refusal);
+    Check("DriveCraft asks which spell provides the focus", asks != std::string::npos);
     Check("only a spell the character knows is cast (natural-only)",
           known != std::string::npos && known > asks);
     Check("and it is cast untriggered", cast != std::string::npos && cast > known);

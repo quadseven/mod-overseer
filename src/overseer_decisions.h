@@ -17356,6 +17356,9 @@ constexpr char const* NotEnoughPower = "the character has too little mana for th
 // Portals, and a caster without one reaches CheckCast, is refused with
 // SPELL_FAILED_REAGENTS, and is told about it through a client a bot does not
 // have.
+// A forge, an anvil, a fire: the spell's focus object is not in reach, so the
+// row is not cast into a client error. Standing somewhere else answers it.
+constexpr char const* NoSpellFocus = "no spell focus object of that spell is in reach";
 constexpr char const* MissingReagent = "the character is missing a reagent for that spell";
 constexpr char const* NoSuchTarget = "no character of that name is in the world";
 constexpr char const* TargetOtherMap = "the target is on another map";
@@ -21275,7 +21278,7 @@ constexpr unsigned ITEM_BLACKSMITH_HAMMER = 5956;
 
 // Is this focus a world object the crafter is WALKED to? An Anvil only. A
 // Cooking Fire is lit where the crafter stands (FocusLighterSpell); a Forge
-// and everything else is left to the refusal it always got.
+// is the bridge's walk, and everything else is deferred (CraftStationStepFor).
 bool FocusIsWalkedTo(unsigned requiresSpellFocus);
 
 // The item a family buys for a tool category, or 0 when none is known. The
@@ -21404,6 +21407,25 @@ enum class CraftFocusStep : uint8_t
     Walk,
 };
 CraftFocusStep CraftFocusStepFor(bool walkedTo, bool mayWalk, float nearestYards);
+
+// WHAT A CRAFT DOES ABOUT ITS STATION, asked before the cast
+// (quadseven/wow-overseer#1786), since a refused cast reaches the client.
+//   no focus, or one in reach        -> Cast
+//   a focus the crafter can conjure  -> Light
+//   a focus walked to in reach of it -> Walk
+//   anything else                    -> Defer, with CraftDeferReason
+enum class CraftStationStep : uint8_t
+{
+    Cast,
+    Light,
+    Walk,
+    Defer,
+};
+CraftStationStep CraftStationStepFor(unsigned focus, bool focusInReach, bool lighterKnown,
+                                     CraftFocusStep walk);
+
+// The one sentence a deferred craft states. `mayWalk` is job 'craft'.
+std::string CraftDeferReason(unsigned focus, bool mayWalk, CraftFocusStep walk);
 
 // The travel aim for a focus spawn, `at:<map>:<x>,<y>,<z>` in whole yards so it
 // fits the 32 character travel column.
