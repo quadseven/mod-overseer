@@ -23385,11 +23385,17 @@ struct WeaponOffer
     uint32_t itemLevel{0};
     uint32_t price{0};   // copper
     float yards{0.f};    // to the vendor
+    // The member holds the weapon's skill now (#1329). The core's
+    // CanUseItem(ItemTemplate const*) does not check it, so an offer with no
+    // skill passed that filter, was bought, could not be put on and was sold
+    // back for a fifth of its price.
+    bool wearable{true};
 };
 
 // Index of the offer to walk to, or -1. The best item level that beats the
 // worn main hand by at least `minGain` and costs no more than the purse less
-// `reserve`; on a tie the cheaper, then the nearer.
+// `reserve`; on a tie the cheaper, then the nearer. An offer that is not
+// `wearable` is never picked.
 int ChooseWeaponOffer(std::vector<WeaponOffer> const& offers, uint32_t wornItemLevel,
                       uint64_t purse, uint64_t reserve, uint32_t minGain);
 

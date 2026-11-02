@@ -20259,6 +20259,8 @@ int ChooseWeaponOffer(std::vector<WeaponOffer> const& offers, uint32_t wornItemL
     for (std::size_t i = 0; i < offers.size(); ++i)
     {
         WeaponOffer const& o = offers[i];
+        if (!o.wearable)
+            continue;
         if (o.itemLevel < wornItemLevel + minGain)
             continue;
         if (purse < reserve || o.price > purse - reserve)
