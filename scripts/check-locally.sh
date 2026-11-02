@@ -41,6 +41,9 @@ cleanup_scratch() { [ "${#scratch_dirs[@]}" -eq 0 ] || rm -rf "${scratch_dirs[@]
 trap cleanup_scratch EXIT
 
 run_decisions() {
+  # VERSION is what a human reads and a release is cut from; the header
+  # constant is what the module reports at runtime. Two copies drift, so they
+  # are compared here.
   echo "== decisions: version strings agree"
   local file header
   file="$(tr -d '[:space:]' < VERSION)"
@@ -59,6 +62,25 @@ run_decisions() {
   python3 -B tests/replay_buy_bag.py
   python3 -B tests/replay_run_family.py
 
+  # CI and the lane contract both run this function, so the workflow's single
+  # step cannot drift from it (#1295). This test enforces that shape.
+  python3 -B tests/test_decisions_ci_parity.py
+
+  # The migration replay needs a MySQL server. check.decisions.yml starts one
+  # and sets OVERSEER_MYSQL_REPLAY=1; a lane machine has none, so it skips
+  # here and says so. `scripts/check-locally.sh schema` runs it on demand.
+  if [ "${OVERSEER_MYSQL_REPLAY:-}" = 1 ]; then
+    python3 -B tests/replay_run_family_migration.py
+  else
+    echo "== decisions: MySQL migration replay skipped (OVERSEER_MYSQL_REPLAY unset)"
+  fi
+
+  # Compiled once, not once per test: the file is over sixteen thousand lines,
+  # and compiling it per test once took 9 min 58 s of CI's 10-minute limit.
+  # -Wall -Wextra because this translation unit's warnings are not drowned out
+  # by a core's. No include path into a core: if an AzerothCore type gets into
+  # the decisions, this stops compiling, which is half of what it tests. An
+  # empty tests/ fails rather than passing vacuously.
   echo "== decisions: compile and run"
   g++ --version | head -1
   shopt -s nullglob

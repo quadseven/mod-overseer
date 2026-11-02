@@ -109,30 +109,19 @@ This carried-item executor is separate from the group-loot roll setting below.
 
 ## Run and test locally
 
-The pull request gate `.github/workflows/check.decisions.yml` runs these
-commands from the repo root with the runner's own `g++` and `python3`:
+The pull request gate `.github/workflows/check.decisions.yml` runs one
+command from the repo root with the runner's own `g++` and `python3`, the same
+command `.loom/validation.conf` runs:
 
 ```sh
-python3 -B tests/replay_exit_hearth_finalization.py
-python3 -B tests/replay_travel_claim_cache.py
-python3 -B tests/replay_main_tank_cache.py
-python3 -B tests/replay_door_floor.py
-python3 -B tests/replay_long_navmesh.py
-python3 -B tests/replay_buy_bag.py
-python3 -B tests/replay_run_family.py
-python3 -B tests/replay_run_family_migration.py
-g++ -std=c++17 -Wall -Wextra -Isrc -c src/overseer_decisions.cpp -o overseer_decisions.o
-for test in tests/test_*.cpp; do
-  name="$(basename "$test" .cpp)"
-  g++ -std=c++17 -Wall -Wextra -Isrc overseer_decisions.o "$test" -o "$name"
-  "./$name"
-done
+bash scripts/check-locally.sh decisions
 ```
 
-The two ledger replays need the SQLite development library, and the migration
-replay a MySQL 8.4 server (the gate starts one as a service; see
-`scripts/check-locally.sh schema` below for running it locally). The rest need
-only `g++` and `python3`.
+It checks that the two version strings agree, runs the Python replays, then
+compiles `src/overseer_decisions.cpp` once and links and runs each
+`tests/test_*.cpp` against it. The MySQL migration replay runs only when
+`OVERSEER_MYSQL_REPLAY=1` (CI sets it beside its MySQL service);
+`bash scripts/check-locally.sh schema` runs it on its own.
 
 The main-tank replay applies the carried playerbots patch to pinned source
 fixtures and compiles the actual cache and threat-consumer path. It needs git
