@@ -38371,7 +38371,9 @@ private:
         StratholmeYardEpisode& yard = found->second;
         std::time_t const now = std::time(nullptr);
         std::vector<Player*> const inYard = MembersInStratholmeYard(members);
-        if (inYard.empty())
+        OverseerDecisions::StratholmeYardPoll const step = OverseerDecisions::StratholmeYardPollStep(
+            !inYard.empty(), now > yard.since ? static_cast<uint32>(now - yard.since) : 0u);
+        if (step == OverseerDecisions::StratholmeYardPoll::EveryoneOut)
         {
             LOG_INFO("module.overseer",
                      "overseer: stratholme exit: every member of '{}' is out of the yard",
@@ -38379,8 +38381,7 @@ private:
             CloseStratholmeYard(family, yard);
             return false;
         }
-        if (now - yard.since >= static_cast<std::time_t>(
-                                    OverseerDecisions::STRATHOLME_YARD_EPISODE_SECONDS))
+        if (step == OverseerDecisions::StratholmeYardPoll::Ceiling)
         {
             LOG_WARN("module.overseer",
                      "overseer: stratholme exit: {} of '{}' still in the yard after {} "

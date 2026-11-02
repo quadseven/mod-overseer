@@ -28139,6 +28139,18 @@ bool StratholmeYardGiveUpHolds(bool memberInYard, std::uint32_t secondsSinceGave
 // episode keeps the hold exactly as before.
 bool StratholmeYardDrivesBeforeBagHold(bool yardEpisodeOpen);
 
+// What one poll of an open yard episode does first (#645, #1221): close it
+// because every member is out of the yard, give up at the ceiling while a
+// member is still in it, or go on driving the way out. Asked by
+// DriveStratholmeYard before it reads the door.
+enum class StratholmeYardPoll : std::uint8_t
+{
+    EveryoneOut,
+    Ceiling,
+    Drive,
+};
+StratholmeYardPoll StratholmeYardPollStep(bool memberInYard, std::uint32_t secondsOpen);
+
 // Where one member stands, as the yard member scan reads it.
 struct StratholmeMemberPlace
 {

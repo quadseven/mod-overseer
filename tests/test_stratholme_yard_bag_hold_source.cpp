@@ -68,5 +68,20 @@ int main()
               drive < firstReturn);
     Check("the yard is driven before the coordinator is reset",
           drive != std::string::npos && reset != std::string::npos && drive < reset);
+
+    // The replay in test_stratholme_yard_bag_hold.cpp asks the yard drive's
+    // first question through StratholmeYardPollStep; the drive must too.
+    std::string const yardDrive =
+        Between(source, "bool DriveStratholmeYard(std::string const& family,",
+                "Player* walker = nullptr;");
+    Check("DriveStratholmeYard is found", !yardDrive.empty());
+    Check("DriveStratholmeYard asks StratholmeYardPollStep whether to close or drive",
+          yardDrive.find("OverseerDecisions::StratholmeYardPollStep(") != std::string::npos);
+    Check("DriveStratholmeYard closes on EveryoneOut",
+          yardDrive.find("step == OverseerDecisions::StratholmeYardPoll::EveryoneOut") !=
+              std::string::npos);
+    Check("DriveStratholmeYard gives up on Ceiling",
+          yardDrive.find("step == OverseerDecisions::StratholmeYardPoll::Ceiling") !=
+              std::string::npos);
     return failures ? 1 : 0;
 }

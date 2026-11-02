@@ -10,9 +10,12 @@
  * now driven ahead of the hold; a family with no episode keeps the hold.
  *
  * The replay below walks one full-bags family through the coordinator's poll
- * order, poll by poll, with the module's own bag-pressure answer, yard box
- * and ceiling. It is the order the adapter's HoldOut case follows (pinned by
- * test_stratholme_yard_bag_hold_source.cpp).
+ * order, poll by poll, asking the same decisions the adapter asks: the
+ * bag-pressure answer, whether the yard drives before the hold, the yard box,
+ * and DriveStratholmeYard's own close-or-drive step. The adapter's HoldOut
+ * order and its use of that step are pinned by
+ * test_stratholme_yard_bag_hold_source.cpp. Only the way out itself (walk,
+ * button, hearth) is modelled, as a number of driven polls.
  *
  * Compiled against src/overseer_decisions.cpp and nothing else.
  */
@@ -30,6 +33,8 @@ using OverseerDecisions::STRATHOLME_YARD_EPISODE_SECONDS;
 using OverseerDecisions::StratholmeMemberInYard;
 using OverseerDecisions::StratholmeMemberPlace;
 using OverseerDecisions::StratholmeYardDrivesBeforeBagHold;
+using OverseerDecisions::StratholmeYardPoll;
+using OverseerDecisions::StratholmeYardPollStep;
 
 namespace
 {
@@ -93,13 +98,21 @@ YardClose Replay(bool driveBeforeHold, std::uint32_t secondsUntilBagsFree)
             freeSlots.assign(freeSlots.size(), 10);
         bool const inYard = StratholmeMemberInYard(Place(drivenPolls < DRIVEN_POLLS_TO_LEAVE));
 
+        // DriveStratholmeYard's own first question, asked the way it asks it.
         auto drive = [&]() -> YardClose {
             if (!episodeOpen)
                 return YardClose::StillOpen;
-            if (!inYard)
-                return YardClose::OwnPath;
-            if (elapsed >= STRATHOLME_YARD_EPISODE_SECONDS)
-                return YardClose::Ceiling;
+            switch (StratholmeYardPollStep(inYard, elapsed))
+            {
+                case StratholmeYardPoll::EveryoneOut:
+                    episodeOpen = false;
+                    return YardClose::OwnPath;
+                case StratholmeYardPoll::Ceiling:
+                    episodeOpen = false;
+                    return YardClose::Ceiling;
+                case StratholmeYardPoll::Drive:
+                    break;
+            }
             ++drivenPolls;
             return YardClose::StillOpen;
         };
@@ -142,6 +155,21 @@ int main()
               StratholmeYardDrivesBeforeBagHold(true), true);
     CheckBool("a family with no yard episode keeps the bag hold as it was",
               StratholmeYardDrivesBeforeBagHold(false), false);
+
+    CheckBool("a yard with nobody in it closes on its own path",
+              StratholmeYardPollStep(false, 0) == StratholmeYardPoll::EveryoneOut, true);
+    CheckBool("nobody in the yard closes on its own path even past the ceiling",
+              StratholmeYardPollStep(false, STRATHOLME_YARD_EPISODE_SECONDS) ==
+                  StratholmeYardPoll::EveryoneOut,
+              true);
+    CheckBool("a member still in the yard at the ceiling gives up",
+              StratholmeYardPollStep(true, STRATHOLME_YARD_EPISODE_SECONDS) ==
+                  StratholmeYardPoll::Ceiling,
+              true);
+    CheckBool("a member in the yard before the ceiling is driven",
+              StratholmeYardPollStep(true, STRATHOLME_YARD_EPISODE_SECONDS - 1) ==
+                  StratholmeYardPoll::Drive,
+              true);
 
     CheckBool("a full-bags family in the yard is answered HoldOut",
               DungeonRunBagPressure({0, 0, 0, 0, 0}, BAG_FLOOR, false, false) ==
