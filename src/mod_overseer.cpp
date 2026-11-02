@@ -18077,6 +18077,19 @@ private:
     // How long the hold tolerates that step, in seconds.
     static constexpr uint32 RECIPE_MANUAL_APPROACH_SECONDS = 20;
 
+    // THE HOLD FROM ARRIVAL TO THE END OF THE ERRAND (#1203). The travel drive
+    // releases the walk's aim on arrival, and the wander or a leader's follow
+    // could walk the character off before the next poll tried the buy. See
+    // OverseerDecisions::RecipeManualStepHoldsCharacter for which steps hold.
+    // The lease is renewed every poll that still holds, so it outlives a late
+    // poll; a drive that stops polling (a dungeon run, a logout) leaves it to
+    // the expiry sweep after three polls.
+    static constexpr char const* RECIPE_MANUAL_HOLD_VERB = "recipe manual";
+    static constexpr uint32 RECIPE_MANUAL_HOLD_SECONDS = 3 * RECIPE_MANUAL_POLL_MS / 1000;
+
+    static_assert(OverseerDecisions::RECIPE_MANUAL_ERRAND_SECONDS > TRAVEL_BACKSTOP_SECONDS,
+                  "the errand bound must let one whole walk run to the travel backstop");
+
     // What this worldserver has done for one errand. The column says what is
     // wanted; this says what has been tried and paid, which the proof line
     // and the bound on uses read. Lost on a restart, which costs at most one
@@ -18087,6 +18100,9 @@ private:
         uint64 paidCopper = 0;
         bool bought = false;
         bool walkSaid = false;
+        // When this worldserver first saw the errand: the clock
+        // RECIPE_MANUAL_ERRAND_SECONDS runs on. A restart starts it again.
+        time_t since = 0;
     };
 
     // Bounded by the roster: an entry lives only while its name has a
@@ -18120,6 +18136,30 @@ private:
         CharacterDatabase.Execute(
             "UPDATE overseer_roster SET buy_recipe_item = '' WHERE name = '{}'", Esc(name));
         _recipeManuals.erase(name);
+        ReleaseRecipeManualHold(name, "the recipe manual errand is released");
+    }
+
+    // Holds the character where it stands and renews the lease. A hold
+    // another verb placed is re-asserted and left that verb's, so it is not
+    // renewed here and is not this drive's to lift.
+    static void HoldAtTheManualVendor(Player* bot, std::string const& name)
+    {
+        PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+        if (!botAI)
+            return;
+        HoldCharacterStill(bot, botAI, name, RECIPE_MANUAL_HOLD_VERB,
+                           RECIPE_MANUAL_HOLD_SECONDS, false);
+        auto const hold = HoldsInForce().find(name);
+        if (hold != HoldsInForce().end() && hold->second.verb == RECIPE_MANUAL_HOLD_VERB)
+            hold->second.until = time(nullptr) + RECIPE_MANUAL_HOLD_SECONDS;
+    }
+
+    static void ReleaseRecipeManualHold(std::string const& name, char const* why)
+    {
+        auto const hold = HoldsInForce().find(name);
+        if (hold == HoldsInForce().end() || hold->second.verb != RECIPE_MANUAL_HOLD_VERB)
+            return;
+        ReleaseHold(name, ObjectAccessor::FindPlayerByName(name), why, RECIPE_MANUAL_HOLD_VERB);
     }
 
     void RefuseRecipeManual(std::string const& name, std::string const& column,
@@ -18179,6 +18219,8 @@ private:
             bot->GetNPCIfCanInteractWith(vendor->GetGUID(), UNIT_NPC_FLAG_VENDOR);
         facts.vendorSells = facts.vendorInReach && VendorSellsForGold(bot, vendor, proto, facts.price);
         facts.purse = bot->GetMoney();
+        facts.errandSince = _recipeManuals[name].since;
+        facts.now = time(nullptr);
         return facts;
     }
 
@@ -18318,10 +18360,19 @@ private:
         uint32 useSpell = 0;
         uint32 const recipe = RecipeTaughtByItem(proto, useSpell);
         Creature* vendor = bot->FindNearestCreature(errand.vendorEntry, TRAVEL_ARRIVED_YARDS);
+        RecipeManualProgress& progress = _recipeManuals[name];
+        if (!progress.since)
+            progress.since = time(nullptr);
         OverseerDecisions::RecipeManualFacts const facts =
             ReadRecipeManualFacts(bot, name, vendor, proto, recipe, errand.itemEntry);
 
         OverseerDecisions::RecipeManualPlan const plan = OverseerDecisions::PlanRecipeManual(facts);
+        // Before the step, so the approach below walks under the hold and the
+        // buy finds the character where the arrival left it.
+        if (OverseerDecisions::RecipeManualStepHoldsCharacter(plan.step))
+            HoldAtTheManualVendor(bot, name);
+        else if (plan.step == OverseerDecisions::RecipeManualStep::Walk)
+            ReleaseRecipeManualHold(name, "the vendor is out of reach and the walk resumes");
         switch (plan.step)
         {
             case OverseerDecisions::RecipeManualStep::Learned:
@@ -18355,12 +18406,27 @@ private:
         std::map<std::string, std::string> const errands = LoadRecipeManualErrands();
         // Progress for a column cleared from outside goes with it.
         for (auto it = _recipeManuals.begin(); it != _recipeManuals.end();)
-            it = errands.count(it->first) ? std::next(it) : _recipeManuals.erase(it);
+        {
+            if (errands.count(it->first))
+            {
+                ++it;
+                continue;
+            }
+            ReleaseRecipeManualHold(it->first, "the buy_recipe_item column was cleared");
+            it = _recipeManuals.erase(it);
+        }
         for (auto const& [name, column] : errands)
         {
             Player* bot = ObjectAccessor::FindPlayerByName(name);
-            if (!bot || !bot->IsInWorld() || InAnyDungeonRun(bot))
+            if (!bot || !bot->IsInWorld())
                 continue;
+            if (InAnyDungeonRun(bot))
+            {
+                // The run steers it now, so the errand's hold is not left
+                // standing for the expiry sweep to find.
+                ReleaseRecipeManualHold(name, "a dungeon run has the character");
+                continue;
+            }
             DriveRecipeManual(bot, name, column);
         }
     }
