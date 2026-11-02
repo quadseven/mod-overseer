@@ -33963,8 +33963,12 @@ private:
                 if (auto const b = _guildWeaponBenched[name].find(proto->ItemId);
                     b != _guildWeaponBenched[name].end() && std::time(nullptr) < b->second)
                     continue;
-                offers.push_back({proto->ItemLevel, proto->BuyPrice,
-                                  bot->GetExactDist2d(spot.x, spot.y)});
+                OverseerDecisions::WeaponOffer offer{proto->ItemLevel, proto->BuyPrice,
+                                                     bot->GetExactDist2d(spot.x, spot.y)};
+                // CanUseItem above does not check the weapon's own skill (#1329).
+                uint32 const skill = proto->GetSkill();
+                offer.wearable = skill == 0 || bot->GetSkillValue(skill) != 0;
+                offers.push_back(offer);
                 sources.emplace_back(&spot, proto->ItemId);
             }
         }

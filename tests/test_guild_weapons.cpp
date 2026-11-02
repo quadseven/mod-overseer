@@ -112,12 +112,45 @@ void TheDriveReadsEveryBag()
     Check(lesson.find("OverseerDecisions::WeaponsWorthTraining(") != std::string::npos,
           "and asks the pure pick which weapon is worth a lesson");
 }
+// A VENDOR WEAPON THE MEMBER HAS NO SKILL FOR IS NEVER BOUGHT (#1329).
+// Measured on the dev realm log archive, 24 hours to 2026-11-02 22:00 UTC:
+// 34 of 58 vendor weapon purchases were logged "not worn (equip result 8)",
+// 43 gold in all, and were sold back for about a fifth of the price. The
+// core's CanUseItem(ItemTemplate const*) does not check the weapon's own
+// skill, so the vendor step must say which offers the member can wield.
+void AWeaponWithNoSkillIsNotBought()
+{
+    std::vector<WeaponOffer> offers = {
+        {13, 2400, 800.f},  // 0: a sword it holds the skill for
+        {20, 3000, 100.f},  // 1: a better mace, no mace skill
+    };
+    offers[1].wearable = false;
+    Check(ChooseWeaponOffer(offers, 4, 4000, 500, 3) == 0,
+          "the best item level it can wield, not one it has no skill for");
+    offers[0].wearable = false;
+    Check(ChooseWeaponOffer(offers, 4, 4000, 500, 3) == -1,
+          "no offer it can wield, no walk");
+
+    std::string const src = ReadModule();
+    std::size_t const vendors = src.find("// 2. THE BEST WEAPON A VENDOR ON ITS MAP SELLS IT.");
+    std::size_t const pick = src.find("OverseerDecisions::ChooseWeaponOffer(", vendors);
+    Check(vendors != std::string::npos && pick != std::string::npos,
+          "the vendor step and its pick are where the test looks");
+    if (vendors == std::string::npos || pick == std::string::npos)
+        return;
+    std::string const step = src.substr(vendors, pick - vendors);
+    Check(step.find("offer.wearable =") != std::string::npos &&
+              step.find("bot->GetSkillValue(skill)") != std::string::npos &&
+              step.find("proto->GetSkill()") != std::string::npos,
+          "the vendor step marks each offer from the member's skill for the weapon");
+}
 }  // namespace
 
 int main()
 {
     AWeaponInAnyBagOrTheRangedSlotIsTrainedFor();
     TheDriveReadsEveryBag();
+    AWeaponWithNoSkillIsNotBought();
 
     std::vector<WeaponOffer> const offers = {
         {9, 900, 300.f},    // 0: a level-9 sword, 9 silver
