@@ -39405,29 +39405,52 @@ private:
         // combat the whole time" is the difference between a dungeon this party
         // could not clear and a party the world stopped hitting. Both end the
         // run; only one of them is worth chasing upstream.
-        coord.stalledReason =
-            coord.clearSkipRefused
-                ? OverseerDecisions::DungeonModuleStopWords(DungeonBrainStopReason(leader)) +
-                      "; it refused 'dc skip' " + std::to_string(coord.clearSkips) +
-                      " inside map " + std::to_string(insideMapId) +
-                      " with nothing left it could reach"
-                : "the run stopped progressing inside map " + std::to_string(insideMapId) +
-                      ": no boss credit and no movement for " +
-                      std::to_string((DUNGEON_CLEAR_SKIPS + 1) * DUNGEON_CLEAR_STALL_SECONDS /
-                                     60) +
-                      " minutes, and " + std::to_string(DUNGEON_CLEAR_SKIPS) +
-                      " 'dc skip's did not restart it";
-        coord.stalledReason +=
-            anyBusy ? " (" + busyName + " was " + busyReason + " throughout)" : "";
-        LOG_ERROR("module.overseer",
-                  "overseer: dungeon run {} of campaign {} cannot be cleared - {} 'dc "
-                  "skip's and '{}' has still not moved {}y on map {}, with {}. Walking "
-                  "the party back out through EXIT and ending the run so the next poll "
-                  "can open a fresh one; a run left 'active' inside a dungeon it is not "
-                  "clearing is the half hour of nothing this bound exists to end",
-                  coord.runNumber, coord.campaignId,
-                  static_cast<uint32>(DUNGEON_CLEAR_SKIPS), leader->GetName(),
-                  static_cast<uint32>(DUNGEON_CLEAR_STALL_YARDS), insideMapId, busyNote);
+        //
+        // A MODULE THAT STOPPED ON ALL BOSSES CLEARED FINISHED THE RUN (#1322).
+        // It refuses the skip for the same reason it refuses every skip once it
+        // is off, so the refusal is not a stall there: run 1280737 on map 209
+        // was booked 'stalled' with "All bosses cleared!" as its reason, the
+        // campaign spent no run on it, and the planner read a clear as a
+        // failure. It ends the way a credited last boss does, `provedComplete`
+        // read by EXIT, and every other stop keeps the stalled ending below.
+        if (coord.clearSkipRefused &&
+            OverseerDecisions::DungeonModuleStopIsCleared(DungeonBrainStopReason(leader)))
+        {
+            coord.provedComplete = true;
+            coord.stalledReason.clear();
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} of campaign {} is FINISHED by the dungeon "
+                     "module's own count on map {} ({}), so EXIT walks the party out and "
+                     "the row says complete rather than stalled",
+                     coord.runNumber, coord.campaignId, insideMapId,
+                     OverseerDecisions::DungeonModuleStopWords(DungeonBrainStopReason(leader)));
+        }
+        else
+        {
+            coord.stalledReason =
+                coord.clearSkipRefused
+                    ? OverseerDecisions::DungeonModuleStopWords(DungeonBrainStopReason(leader)) +
+                          "; it refused 'dc skip' " + std::to_string(coord.clearSkips) +
+                          " inside map " + std::to_string(insideMapId) +
+                          " with nothing left it could reach"
+                    : "the run stopped progressing inside map " + std::to_string(insideMapId) +
+                          ": no boss credit and no movement for " +
+                          std::to_string((DUNGEON_CLEAR_SKIPS + 1) * DUNGEON_CLEAR_STALL_SECONDS /
+                                         60) +
+                          " minutes, and " + std::to_string(DUNGEON_CLEAR_SKIPS) +
+                          " 'dc skip's did not restart it";
+            coord.stalledReason +=
+                anyBusy ? " (" + busyName + " was " + busyReason + " throughout)" : "";
+            LOG_ERROR("module.overseer",
+                      "overseer: dungeon run {} of campaign {} cannot be cleared - {} 'dc "
+                      "skip's and '{}' has still not moved {}y on map {}, with {}. Walking "
+                      "the party back out through EXIT and ending the run so the next poll "
+                      "can open a fresh one; a run left 'active' inside a dungeon it is not "
+                      "clearing is the half hour of nothing this bound exists to end",
+                      coord.runNumber, coord.campaignId,
+                      static_cast<uint32>(DUNGEON_CLEAR_SKIPS), leader->GetName(),
+                      static_cast<uint32>(DUNGEON_CLEAR_STALL_YARDS), insideMapId, busyNote);
+        }
 
         coord.phase = DungeonRunPhase::Exiting;
         coord.crossing.best = 0.f;

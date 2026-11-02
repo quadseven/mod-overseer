@@ -2464,6 +2464,22 @@ std::string DungeonModuleStopWords(std::string const& raw)
     return "dungeon clear stopped: " + text;
 }
 
+bool DungeonModuleStopIsCleared(std::string const& stopReason)
+{
+    // mod-dungeon-clear's kReasonAllCleared, the one stop that means done.
+    static std::string const prefix = "Dungeon clear stopped:";
+    static std::string const cleared = "All bosses cleared!";
+    static char const* const blanks = " \t\r\n";
+
+    std::string const text = stopReason.compare(0, prefix.size(), prefix) == 0
+                                 ? stopReason.substr(prefix.size())
+                                 : stopReason;
+    std::size_t const first = text.find_first_not_of(blanks);
+    if (first == std::string::npos)
+        return false;
+    return text.substr(first, text.find_last_not_of(blanks) - first + 1) == cleared;
+}
+
 bool DungeonClearBusyStillHolds(bool anyBusy, time_t advancedAt, time_t now,
                                 time_t ceilingSeconds)
 {
