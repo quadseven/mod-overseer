@@ -25596,6 +25596,20 @@ bool StratholmeYardGiveUpHolds(bool memberInYard, std::uint32_t secondsSinceGave
     return memberInYard && secondsSinceGaveUp < STRATHOLME_YARD_RECOVERY_COOLDOWN_SECONDS;
 }
 
+bool StratholmeYardDrivesBeforeBagHold(bool yardEpisodeOpen)
+{
+    return yardEpisodeOpen;
+}
+
+StratholmeYardPoll StratholmeYardPollStep(bool memberInYard, std::uint32_t secondsOpen)
+{
+    if (!memberInYard)
+        return StratholmeYardPoll::EveryoneOut;
+    if (secondsOpen >= STRATHOLME_YARD_EPISODE_SECONDS)
+        return StratholmeYardPoll::Ceiling;
+    return StratholmeYardPoll::Drive;
+}
+
 bool ShouldOpenStratholmeYardEpisode(bool memberInYard, bool episodeOpen, bool gaveUp,
                                      std::uint32_t secondsSinceGaveUp)
 {

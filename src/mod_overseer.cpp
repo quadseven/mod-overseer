@@ -38371,7 +38371,9 @@ private:
         StratholmeYardEpisode& yard = found->second;
         std::time_t const now = std::time(nullptr);
         std::vector<Player*> const inYard = MembersInStratholmeYard(members);
-        if (inYard.empty())
+        OverseerDecisions::StratholmeYardPoll const step = OverseerDecisions::StratholmeYardPollStep(
+            !inYard.empty(), now > yard.since ? static_cast<uint32>(now - yard.since) : 0u);
+        if (step == OverseerDecisions::StratholmeYardPoll::EveryoneOut)
         {
             LOG_INFO("module.overseer",
                      "overseer: stratholme exit: every member of '{}' is out of the yard",
@@ -38379,8 +38381,7 @@ private:
             CloseStratholmeYard(family, yard);
             return false;
         }
-        if (now - yard.since >= static_cast<std::time_t>(
-                                    OverseerDecisions::STRATHOLME_YARD_EPISODE_SECONDS))
+        if (step == OverseerDecisions::StratholmeYardPoll::Ceiling)
         {
             LOG_WARN("module.overseer",
                      "overseer: stratholme exit: {} of '{}' still in the yard after {} "
@@ -55047,6 +55048,18 @@ private:
                 }
 
                 case OverseerDecisions::DungeonBagPressure::HoldOut:
+                    // THE EXIT YARD IS WORKED BEFORE THE HOLD (#1221). A family
+                    // that leaves Stratholme with full bags lands in the closed
+                    // exit yard with this answer, and the return below used to
+                    // keep the yard drive after this switch from ever running:
+                    // the way out was never read and the episode closed only at
+                    // its ceiling. While the episode runs it holds the
+                    // coordinator, as it does below; once it closes, the hold
+                    // goes on in the same poll.
+                    if (OverseerDecisions::StratholmeYardDrivesBeforeBagHold(
+                            _stratholmeYards.find(family) != _stratholmeYards.end()) &&
+                        DriveStratholmeYard(family, leaderName, members))
+                        return;
                     // BACK TO IDLE, WHICH IS THE FIX AND NOT A TIDY-UP.
                     // DriveTownTrip - the only thing in this module that empties
                     // a bag - stands itself down on its first statement whenever
