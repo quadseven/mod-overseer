@@ -24909,6 +24909,35 @@ enum class GuildRunRearmStep : std::uint8_t
 
 GuildRunRearmStep GuildRunRearmNext(GuildRunRearmFacts const& facts);
 
+// A STOP THE MODULE ENDED ON IS NOT ARMED BACK INTO (#1205). The re-arm above
+// asked `dc ensure` whatever had switched the module off. A Deadmines party
+// with no opener for the cannon failed the Iron Clad Door event, the module
+// ended the clear with that reason, and the re-arm walked the party back to
+// the same door half a minute later, five times in ten minutes, until the
+// two-hour cap recorded a time-out. `stopReason` is the module's last stop
+// text, which any arming clears. A stop it says to resume from (a wipe or a
+// death, "Type 'dc on' ..."; a corpse run or a leader that left the dungeon; a
+// plain `dc off`) and no stop at all give Rearm, as before. A party-wait stop
+// gives Rearm while `waitRearmsUsed` is under `maximumWaitRearms`, the family
+// coordinator's budget (#1308). Every other stop gives EndWithReason: the run
+// stops asking and ends with GuildRunModuleStopWhy.
+constexpr unsigned GUILD_RUN_WAIT_REARMS = 3;
+
+enum class GuildRunModuleStopStep : std::uint8_t
+{
+    Rearm,          // ask the dungeon brain to be on, as GuildRunRearmNext says
+    EndWithReason,  // send nothing and end the run with the module's reason
+};
+
+GuildRunModuleStopStep GuildRunArmAfterModuleStop(std::string const& stopReason,
+                                                  unsigned waitRearmsUsed,
+                                                  unsigned maximumWaitRearms = GUILD_RUN_WAIT_REARMS);
+
+// The `why` of a run ended on EndWithReason: the module's words
+// (DungeonModuleStopWords), that the run was not armed again, and `stall`,
+// where the run stood (GuildRunStallWords).
+std::string GuildRunModuleStopWhy(std::string const& stopReason, std::string const& stall);
+
 // A GUILD RUN SKIPS WHAT THE DUNGEON BRAIN CANNOT REACH, THEN ENDS (#1086).
 // The family coordinator and the raid coordinator each walk a CLEARING stall
 // ladder (`dc skip` a bounded number of times, then leave); a guild finder run

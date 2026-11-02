@@ -21657,6 +21657,37 @@ GuildRunRearmStep GuildRunRearmNext(GuildRunRearmFacts const& facts)
                                                              : GuildRunRearmStep::Wait;
 }
 
+GuildRunModuleStopStep GuildRunArmAfterModuleStop(std::string const& stopReason,
+                                                  unsigned waitRearmsUsed,
+                                                  unsigned maximumWaitRearms)
+{
+    if (stopReason.empty())
+        return GuildRunModuleStopStep::Rearm;
+    if (stopReason.find("the party never became ready") != std::string::npos)
+        return DungeonClearWaitStopRearms(stopReason, waitRearmsUsed, maximumWaitRearms)
+                   ? GuildRunModuleStopStep::Rearm
+                   : GuildRunModuleStopStep::EndWithReason;
+    // The module's own resumable stops: a wipe or a death names `dc on` as the
+    // way back, the corpse-run and left-the-dungeon stops end with the party
+    // outside, and a plain `dc off` is somebody's hand, not a failure.
+    static char const* const resumable[] = {
+        "'dc on'",
+        "Corpse run ended outside",
+        "Left the dungeon",
+        "Dungeon clear disabled.",
+    };
+    for (char const* marker : resumable)
+        if (stopReason.find(marker) != std::string::npos)
+            return GuildRunModuleStopStep::Rearm;
+    return GuildRunModuleStopStep::EndWithReason;
+}
+
+std::string GuildRunModuleStopWhy(std::string const& stopReason, std::string const& stall)
+{
+    return DungeonModuleStopWords(stopReason) +
+           "; the run was not armed again into the same stop; " + stall;
+}
+
 GuildRunStrayStep GuildRunStrayNext(GuildRunStrayFacts const& facts)
 {
     // Asked first: a live run's group is never the leftover, whatever else is
