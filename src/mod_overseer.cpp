@@ -44289,6 +44289,11 @@ private:
         bool finderSliceSaid{false};
         bool dcAccepted{false};
         std::time_t dcTriedAt{0};
+        // A STOP THE MODULE ENDED ON (OverseerDecisions::GuildRunArmAfterModuleStop,
+        // #1205): the party-wait re-arms spent, and the stop text the run ends
+        // on once the verdict has left it running.
+        unsigned waitRearms{0};
+        std::string moduleStop;
         std::string outcome;
         std::string why;
         std::string said;
@@ -46026,10 +46031,30 @@ private:
                 rearm.secondsSinceIssued =
                     now >= run.dcTriedAt ? static_cast<unsigned>(now - run.dcTriedAt) : 0;
                 rearm.tankAlive = GuildRunAliveInside(run, tank);
-                if (OverseerDecisions::GuildRunRearmNext(rearm) ==
-                        OverseerDecisions::GuildRunRearmStep::Issue &&
-                    tank && tank->IsInWorld())
+                // A STOP THE MODULE ENDED ON IS NOT ARMED BACK INTO (#1205). The
+                // stop text is the tank's, as the stall ladder reads the brain's
+                // stall off the tank; any arming clears it, so it is this stay's.
+                bool const issue = OverseerDecisions::GuildRunRearmNext(rearm) ==
+                                       OverseerDecisions::GuildRunRearmStep::Issue &&
+                                   tank && tank->IsInWorld() && run.moduleStop.empty();
+                std::string const stopReason =
+                    issue && rearm.tankAlive ? DungeonBrainStopReason(tank) : std::string();
+                if (issue && OverseerDecisions::GuildRunArmAfterModuleStop(
+                                 stopReason, run.waitRearms) ==
+                                 OverseerDecisions::GuildRunModuleStopStep::EndWithReason)
                 {
+                    run.moduleStop = stopReason;
+                    LOG_WARN("module.overseer",
+                             "overseer: guild finder run {} - the dungeon module ended the "
+                             "clear ({}), so '{}' is not sent again and the run ends",
+                             run.id, OverseerDecisions::DungeonModuleStopWords(stopReason),
+                             OverseerDecisions::GUILD_RUN_REARM_VERB);
+                }
+                else if (issue)
+                {
+                    if (OverseerDecisions::DungeonClearWaitStopRearms(
+                            stopReason, run.waitRearms, OverseerDecisions::GUILD_RUN_WAIT_REARMS))
+                        ++run.waitRearms;
                     bool any = false;
                     bool all = true;
                     for (std::string const& name : run.names)
@@ -46125,6 +46150,24 @@ private:
                         break;
                 }
                 EndGuildRun(run, OverseerDecisions::GuildRunVerdictWord(verdict), why, now);
+                return true;
+            }
+            // THE MODULE ENDED THE CLEAR (#1205): after the verdict, so a run
+            // cleared or wiped on this poll is recorded as that, and the party
+            // walks out through the run's one exit with the module's reason.
+            if (!run.moduleStop.empty())
+            {
+                EndGuildRun(run,
+                            OverseerDecisions::GuildRunVerdictWord(
+                                OverseerDecisions::GuildRunVerdict::Stalled),
+                            OverseerDecisions::GuildRunModuleStopWhy(
+                                run.moduleStop,
+                                OverseerDecisions::GuildRunStallWords(
+                                    run.nextBoss, run.lastKillAt != 0,
+                                    run.lastKillAt && now >= run.lastKillAt
+                                        ? static_cast<unsigned>(now - run.lastKillAt)
+                                        : 0)),
+                            now);
                 return true;
             }
             // THE STALL LADDER (#1086): `dc skip` what the brain cannot reach,
