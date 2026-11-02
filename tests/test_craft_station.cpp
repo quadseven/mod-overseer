@@ -73,6 +73,15 @@ void TheReason()
               "waiting for a town stop with spell focus 999");
 }
 
+void TheWalk()
+{
+    Check("a craft job walks", CraftMayWalk("craft", false, false));
+    Check("a town run's leader in town walks", CraftMayWalk("town run", true, true));
+    Check("a town run's follower waits", !CraftMayWalk("town run", false, true));
+    Check("a town run's leader on the road waits", !CraftMayWalk("town run", true, false));
+    Check("a dungeon job waits", !CraftMayWalk("dungeon", true, true));
+}
+
 void TheCastVerb()
 {
     Check("a missing station is elsewhere, not later",
@@ -91,6 +100,9 @@ void TheAdapterIsWired()
     size_t const cast = source.find("bot->CastSpell(bot, spellId, false)", drive);
     Check("DriveCraft decides the station before its cast",
           drive != std::string::npos && step != std::string::npos && step < cast);
+    size_t const once = source.find("SayCraftPrepOnce(name, \"lighting a fire\")", drive);
+    size_t const light = source.find("bot->CastSpell(bot, lighter, false)", drive);
+    Check("a fire is asked for once", once != std::string::npos && once < light);
     size_t const verb = source.find("static char const* DoCast(");
     size_t const refused = source.find("Refusal::NoSpellFocus", verb);
     size_t const opcode = source.find("HandleCastSpellOpcode(", refused);
@@ -104,6 +116,7 @@ int main()
 {
     TheStep();
     TheReason();
+    TheWalk();
     TheCastVerb();
     TheAdapterIsWired();
     if (failures)

@@ -167,7 +167,6 @@ void TheAdapterIsWired()
     Check("the tool material-request is written once per state, inside the said-once gate",
           once != std::string::npos && written != std::string::npos && written > once);
 
-    std::size_t const cast = body.find("bot->CastSpell(bot, spellId, false)");
     std::size_t const walked = body.find("OverseerDecisions::CraftFocusStepFor(");
     Check("the cast is preceded by the question of walking to an Anvil",
           cast != std::string::npos && walked != std::string::npos && walked < cast);

@@ -21273,6 +21273,7 @@ unsigned FocusLighterSpell(unsigned requiresSpellFocus);
 // gameobject type 8 (GAMEOBJECT_TYPE_SPELL_FOCUS) with Data0 (focusId) 1;
 // Data1 is the 10 yard reach of the focus, not its id.
 constexpr unsigned SPELL_FOCUS_ANVIL = 1;
+constexpr unsigned SPELL_FOCUS_FORGE = 3;
 constexpr unsigned TOTEM_CATEGORY_BLACKSMITH_HAMMER = 162;
 constexpr unsigned ITEM_BLACKSMITH_HAMMER = 5956;
 
@@ -21382,11 +21383,11 @@ struct FocusSpawn
 
 // How far the craft drive walks a crafter to an Anvil: a town, not a journey.
 // Zones are not levels and travel does not know that (AGENTS.md), so an Anvil
-// further than this is not walked to and the refusal stands.
+// further than this is not walked to and the craft is deferred.
 constexpr float CRAFT_FOCUS_WALK_LIMIT_YARDS = 400.f;
 // Within this of the nearest Anvil's spawn the crafter is already at it: the
 // focus reaches 10 yards and arrival at a place is 5. A refusal there is not
-// fixed by walking again, so it stands rather than looping a walk.
+// fixed by walking again, so it is deferred rather than looping a walk.
 constexpr float CRAFT_FOCUS_STANDING_YARDS = 8.f;
 
 // The index of the nearest spawn on `mapId` within `limitYards` (in the plane)
@@ -21396,9 +21397,9 @@ int NearestFocusSpawn(std::vector<FocusSpawn> const& spawns, unsigned mapId, flo
 
 // WHAT A FOCUS REFUSAL LEADS TO. `nearestYards` is the plane distance to the
 // nearest spawn within the walk limit, negative when there is none.
-//   not walked to, or not job 'craft'   -> Stand (the refusal stands)
+//   not walked to, or may not walk      -> Stand (the craft is deferred)
 //   no spawn within the limit           -> NoneNear
-//   within CRAFT_FOCUS_STANDING_YARDS   -> Stand (already there)
+//   within CRAFT_FOCUS_STANDING_YARDS   -> Stand (already there, deferred)
 //   otherwise                           -> Walk
 enum class CraftFocusStep : uint8_t
 {
@@ -21424,7 +21425,12 @@ enum class CraftStationStep : uint8_t
 CraftStationStep CraftStationStepFor(unsigned focus, bool focusInReach, bool lighterKnown,
                                      CraftFocusStep walk);
 
-// The one sentence a deferred craft states. `mayWalk` is job 'craft'.
+// May the craft drive walk this crafter to a banker or a station? Job 'craft'
+// always. On a town run the family's leader may, in a rest area: the family
+// follows it, so the walk stays inside the town stop. A follower waits.
+bool CraftMayWalk(std::string const& job, bool leadsFamily, bool resting);
+
+// The one sentence a deferred craft states.
 std::string CraftDeferReason(unsigned focus, bool mayWalk, CraftFocusStep walk);
 
 // The travel aim for a focus spawn, `at:<map>:<x>,<y>,<z>` in whole yards so it

@@ -18634,42 +18634,48 @@ CraftStationStep CraftStationStepFor(unsigned focus, bool focusInReach, bool lig
     return CraftStationStep::Defer;
 }
 
+bool CraftMayWalk(std::string const& job, bool leadsFamily, bool resting)
+{
+    return job == "craft" || (job == "town run" && leadsFamily && resting);
+}
+
 namespace
 {
-// SpellFocusObject.dbc names, with their article, of the foci a recipe the
-// planners can hand out carries. Any other id is named by its number.
+// SpellFocusObject.dbc names of the foci a planner hands out. Any other id is
+// named by its number.
 std::string CraftFocusName(unsigned focus)
 {
     switch (focus)
     {
         case SPELL_FOCUS_ANVIL:
-            return "an Anvil";
-        case 3:
-            return "a Forge";
+            return "Anvil";
+        case SPELL_FOCUS_FORGE:
+            return "Forge";
         case SPELL_FOCUS_COOKING_FIRE:
-            return "a Cooking Fire";
+            return "Cooking Fire";
         default:
             return "spell focus " + std::to_string(focus);
     }
 }
 
-std::string WithoutArticle(std::string const& name)
+std::string WithArticle(unsigned focus)
 {
-    size_t const space = name.find(' ');
-    return name.rfind("a", 0) == 0 && space <= 2 ? name.substr(space + 1) : name;
+    std::string const name = CraftFocusName(focus);
+    if (focus == SPELL_FOCUS_ANVIL)
+        return "an " + name;
+    return name.rfind("spell", 0) == 0 ? name : "a " + name;
 }
 }  // namespace
 
 std::string CraftDeferReason(unsigned focus, bool mayWalk, CraftFocusStep walk)
 {
-    std::string const name = CraftFocusName(focus);
     if (FocusLighterSpell(focus))
-        return "does not know how to light " + name;
+        return "does not know how to light " + WithArticle(focus);
     if (walk == CraftFocusStep::NoneNear)
-        return "no " + WithoutArticle(name) + " stands within a town's walk";
+        return "no " + CraftFocusName(focus) + " stands within a town's walk";
     if (mayWalk && FocusIsWalkedTo(focus))
-        return "standing at " + name + " that does not reach";
-    return "waiting for a town stop with " + name;
+        return "standing at " + WithArticle(focus) + " that does not reach";
+    return "waiting for a town stop with " + WithArticle(focus);
 }
 
 std::string FocusSpawnAim(FocusSpawn const& spawn)

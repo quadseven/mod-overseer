@@ -17063,7 +17063,8 @@ private:
     // answers: a fire is lit, an Anvil is walked to, and anything else is
     // deferred with one stated reason until the crafter stands at the station.
     // A Forge is the bridge's walk (`_forge_once`), for a craft job and for a
-    // family on a town stop; this drive waits for it.
+    // family on a town stop; this drive waits for it. A town run's leader may
+    // take the Anvil and banker walks here (CraftMayWalk).
     //
     // ANVILS AND THE BLACKSMITH HAMMER (#524). A worn Blacksmithing recipe
     // needs an Anvil (RequiresSpellFocus 1) and a Blacksmith Hammer (tool
@@ -17553,7 +17554,10 @@ private:
             // bank is the half asked here. Decided before the cast because the
             // core refuses the Anvil first, and the banker is the walk to take
             // before the Anvil, not after it.
-            bool const mayWalk = jobIt->second == "craft";
+            Group const* family = bot->GetGroup();
+            bool const mayWalk = OverseerDecisions::CraftMayWalk(
+                jobIt->second, !family || family->IsLeader(bot->GetGUID()),
+                bot->HasPlayerFlag(PLAYER_FLAGS_RESTING));
             OverseerDecisions::CraftToolPlace toolPlace = OverseerDecisions::CraftToolPlace::NotNeeded;
             uint32 toolCategory = 0;
             Item* bankedTool = nullptr;
@@ -17709,6 +17713,10 @@ private:
             // A CONJURABLE FOCUS IS PROVIDED, not waited for (#534).
             if (stationStep == OverseerDecisions::CraftStationStep::Light)
             {
+                // ONCE FOR EACH FIRE: a refused light reaches the client too, so
+                // it is not asked again until a craft clears the said-once state.
+                if (!SayCraftPrepOnce(name, "lighting a fire"))
+                    continue;
                 // natural-only: a spell the character knows (HasSpell), cast
                 // untriggered, the way a cook at a client clicks it.
                 SpellCastResult const lit = bot->CastSpell(bot, lighter, false);
