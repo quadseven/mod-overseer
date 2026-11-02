@@ -167,10 +167,9 @@ void TheAdapterIsWired()
     Check("the tool material-request is written once per state, inside the said-once gate",
           once != std::string::npos && written != std::string::npos && written > once);
 
-    std::size_t const refusal = body.find("if (result == SPELL_FAILED_REQUIRES_SPELL_FOCUS)");
     std::size_t const walked = body.find("OverseerDecisions::CraftFocusStepFor(");
-    Check("a focus refusal asks whether to walk to an Anvil",
-          refusal != std::string::npos && walked != std::string::npos && walked > refusal);
+    Check("the cast is preceded by the question of walking to an Anvil",
+          cast != std::string::npos && walked != std::string::npos && walked < cast);
     Check("the Anvil walk is a town-trip claim of an at: place",
           body.find("_travelAims.Claim(name, aim, OverseerDecisions::TravelOwner::TownTrip)") !=
               std::string::npos);

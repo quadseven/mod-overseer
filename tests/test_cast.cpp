@@ -473,6 +473,7 @@ void WalkingSomewhereElseFixesTheseAndOnlyThese()
     CheckRetry("the target is on another map", CastRefusal::TargetOtherMap,
                TownRetry::Elsewhere);
     CheckRetry("a missing reagent", CastRefusal::MissingReagent, TownRetry::Elsewhere);
+    CheckRetry("a missing station", CastRefusal::NoSpellFocus, TownRetry::Elsewhere);
 }
 
 void AnUnknownRefusalIsWorthOneMoreTry()
@@ -497,7 +498,7 @@ void EveryRefusalLiteralIsDistinctAndCarriesNoQuote()
         CastRefusal::Moving,          CastRefusal::UnknownSpell,
         CastRefusal::NotLearned,      CastRefusal::Passive,
         CastRefusal::OnCooldown,      CastRefusal::OnGlobalCooldown,
-        CastRefusal::NotEnoughPower,  CastRefusal::MissingReagent,
+        CastRefusal::NotEnoughPower,  CastRefusal::MissingReagent, CastRefusal::NoSpellFocus,
         CastRefusal::NoSuchTarget,    CastRefusal::TargetOtherMap,
         CastRefusal::TargetDead,      CastRefusal::TargetOutOfRange,
         CastRefusal::AlreadyRunning,  CastRefusal::NoSpellId,
