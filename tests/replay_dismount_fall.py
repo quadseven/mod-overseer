@@ -207,6 +207,12 @@ int main() {
         c.bot.spline.done = true; c.Tick();
         c.Report("interrupted_descent_clears", !c.bot.flags);
     }
+    {   // Another generator replaces the fall spline, so one is running and it
+        // is not a descent. The next walk must not inherit the flag.
+        Case c; c.bot.world.terrainZ = 90; c.Dismount();
+        c.bot.spline.falling = false; c.Tick();
+        c.Report("replaced_spline_clears", !c.bot.flags && c.bot.flagUpdates == 1);
+    }
     {   // Standing on a surface the model search cannot see, 80 yards up.
         Case c; c.bot.world.terrainZ = 20; c.bot.flags = MOVEMENTFLAG_FALLING;
         c.Dismount();
@@ -269,6 +275,13 @@ int main() {
         c.ClientPacket(MOVEMENTFLAG_FALLING); c.Tick();
         c.Report("client_own_fall_is_left_alone", c.bot.flags == MOVEMENTFLAG_FALLING);
     }
+    {   // Client attached: it lands, then falls on its own, and only after
+        // that does the dismount's spline end. The record went with the landing.
+        Case c; c.bot.world.terrainZ = 90; c.Dismount();
+        c.ClientPacket(0); c.Tick();
+        c.ClientPacket(MOVEMENTFLAG_FALLING); c.Land(); c.Tick();
+        c.Report("client_fall_under_the_old_spline_is_left_alone", c.bot.flags == MOVEMENTFLAG_FALLING);
+    }
     {   // Client attached: its own fall with no dismount behind it.
         Case c; c.ClientPacket(MOVEMENTFLAG_FALLING); c.Tick();
         c.Report("client_fall_without_dismount_is_left_alone", c.bot.flags == MOVEMENTFLAG_FALLING);
@@ -291,6 +304,7 @@ SCENARIOS = {
     "live_earlier_descent_keeps_then_clears",
     "failed_launch_clears",
     "interrupted_descent_clears",
+    "replaced_spline_clears",
     "long_drop_refused",
     "long_model_drop_refused",
     "short_drop_settles",
@@ -301,13 +315,14 @@ SCENARIOS = {
     "client_lands_before_the_spline_ends",
     "client_landing_after_the_tick_clears_once",
     "client_own_fall_is_left_alone",
+    "client_fall_under_the_old_spline_is_left_alone",
     "client_fall_without_dismount_is_left_alone",
     "rooted_landing_sends_no_update",
 }
 
 # What the unpatched code gets right, so the rest are proved to fail on it. The
-# two client and rooted guards at the end pin the landing clear, which the old
-# code does not have, against a clear that reaches too far.
+# client and rooted guards pin the landing clear, which the old code does not
+# have, against a clear that reaches too far.
 OLD_PASSES = {
     "landing_tick_rebases_the_fall_baseline",
     "client_lands_before_the_spline_ends",
@@ -319,6 +334,7 @@ OLD_PASSES = {
     "flyer_falls_past_the_bound",
     "client_fall_without_dismount_is_left_alone",
     "client_own_fall_is_left_alone",
+    "client_fall_under_the_old_spline_is_left_alone",
     "rooted_landing_sends_no_update",
 }
 

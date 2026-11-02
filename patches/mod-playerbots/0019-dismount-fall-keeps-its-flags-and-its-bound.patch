@@ -17,9 +17,10 @@ sends no MSG_MOVE_FALL_LAND. Left on, the flag sends PathGenerator straight down
 (PathGenerator.cpp:325) and freezes the fall baseline in PlayerbotAI::UpdateAI.
 TempestKeepStuckFallingTrigger is that same stuck flag, on one map. So
 CompleteDismount now returns whether a fall spline is running, and
-PlayerbotAI::FinishDismountDescent clears the flags from the AI tick once that
-recorded spline has finished. A client's own fall is never recorded, so its
-flag stays with its packets.
+PlayerbotAI::FinishDismountDescent clears the flags from the AI tick once no
+fall spline runs, whether that spline finished or another generator replaced it.
+The record goes as soon as a client's landing packet takes the flags off, so a
+fall of that client's own after it stays with its packets.
 
 2. MoveFall searches with MAX_FALL_DISTANCE, 250000.0f, and the comment above
 the call once called that a guard. Where nothing lies within 50 yards it finds a
@@ -198,7 +199,7 @@ index 7f51eca..d93f924 100644
  #include "MoveSplineInit.h"
  #include "NewRpgStrategy.h"
  #include "ObjectGuid.h"
-@@ -247,6 +248,29 @@ PlayerbotAI::~PlayerbotAI()
+@@ -247,6 +248,34 @@ PlayerbotAI::~PlayerbotAI()
          PlayerbotsMgr::instance().RemovePlayerBotData(bot->GetGUID(), true);
  }
  
@@ -206,18 +207,23 @@ index 7f51eca..d93f924 100644
 +// takes them off. EffectMovementGenerator::Finalize() returns before its flag
 +// clear for a player, and a bot with no client sends no MSG_MOVE_FALL_LAND, so
 +// nothing else would: the flag would outlive the descent, block MMAP routing and
-+// freeze the fall baseline below. Only a descent CompleteDismount() recorded is
-+// touched. A client's own fall has a finished spline and the flag too, and that
-+// flag belongs to the client's packets. Where a client lands first, the flags are
-+// already off and this changes nothing.
++// freeze the fall baseline below. The test is the one CompleteDismount() used, so
++// a generator that replaces the fall spline ends the descent as a landing does.
++// Only a descent CompleteDismount() recorded is touched, and the record goes once
++// the flags are off. That is a client's landing packet, and a fall after it is
++// the client's own, with its flag left to its packets.
 +void PlayerbotAI::FinishDismountDescent()
 +{
-+    if (!dismountDescentRunning || !bot->movespline->Finalized())
++    if (!dismountDescentRunning)
++        return;
++
++    bool const flagged = bot->HasUnitMovementFlag(MOVEMENTFLAG_FALLING | MOVEMENTFLAG_FALLING_FAR);
++    if (flagged && !bot->movespline->Finalized() && bot->movespline->isFalling())
 +        return;
 +
 +    dismountDescentRunning = false;
 +
-+    if (!bot->HasUnitMovementFlag(MOVEMENTFLAG_FALLING | MOVEMENTFLAG_FALLING_FAR))
++    if (!flagged)
 +        return;
 +
 +    bot->RemoveUnitMovementFlag(MOVEMENTFLAG_FALLING | MOVEMENTFLAG_FALLING_FAR);
@@ -228,7 +234,7 @@ index 7f51eca..d93f924 100644
  void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
  {
      // Handle the AI check delay
-@@ -260,6 +284,8 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
+@@ -260,6 +289,8 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
          bot->GetSession()->IsLoggingOut() || bot->IsDuringRemoveFromWorld())
          return;
  
@@ -237,7 +243,7 @@ index 7f51eca..d93f924 100644
      // Bots send no movement opcodes, so m_lastFallZ stays frozen and Player::IsFalling() (a Z test
      // against it) blocks LFG teleports. Unit::IsFalling() is the flag test, so real falls keep theirs.
      if (!bot->Unit::IsFalling())
-@@ -1463,7 +1489,7 @@ void PlayerbotAI::HandleBotOutgoingPacket(WorldPacket const& packet)
+@@ -1463,7 +1494,7 @@ void PlayerbotAI::HandleBotOutgoingPacket(WorldPacket const& packet)
              p >> guid.ReadAsPacked();
              if (guid != bot->GetGUID())
                  return;
