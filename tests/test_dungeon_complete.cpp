@@ -17,6 +17,7 @@
 using OverseerDecisions::DungeonCompletion;
 using OverseerDecisions::DungeonRunCompletion;
 using OverseerDecisions::DungeonRunExpectedMask;
+using OverseerDecisions::DungeonRunFactionExpectedMask;
 using OverseerDecisions::DungeonMapHasIndependentWings;
 using OverseerDecisions::DungeonRunExitOutcome;
 using OverseerDecisions::DungeonQuestObjective;
@@ -150,6 +151,27 @@ void AnEventGatedBossIsNotRequired()
              DungeonRunExpectedMask(389, 0b1111, 0) == 0b1111, true);
 }
 
+void FriendlyFactionEncountersAreNotRequired()
+{
+    constexpr uint32_t uldamanMapMask = 0b11110111;
+    constexpr uint32_t allianceCredits = 0b11110101;
+    uint32_t const allianceExpected = DungeonRunFactionExpectedMask(
+        70, DungeonRunExpectedMask(70, uldamanMapMask, 0), true);
+    uint32_t const hordeExpected = DungeonRunFactionExpectedMask(
+        70, DungeonRunExpectedMask(70, uldamanMapMask, 0), false);
+
+    CheckBool("Alliance does not wait for friendly Lost Dwarves kill credit",
+              allianceExpected == allianceCredits, true);
+    Check("Alliance Uldaman completes after every creditable encounter",
+          DungeonRunCompletion(allianceExpected, allianceCredits),
+          DungeonCompletion::Complete);
+    Check("Horde Uldaman still requires Lost Dwarves",
+          DungeonRunCompletion(hordeExpected, allianceCredits),
+          DungeonCompletion::NotYet);
+    CheckBool("other maps keep the same faction mask",
+              DungeonRunFactionExpectedMask(389, 0b1111, true) == 0b1111, true);
+}
+
 void TheUpperSpireIsNotPartOfALowerSpireRun()
 {
     // #580. DungeonEncounter.dbc, map 229, normal difficulty (dev realm client
@@ -256,6 +278,7 @@ int main()
     BitsTheMapDoesNotCreditAreIgnored();
     IndependentWingsUseOnlyTheirVerifiedEncounters();
     AnEventGatedBossIsNotRequired();
+    FriendlyFactionEncountersAreNotRequired();
     TheUpperSpireIsNotPartOfALowerSpireRun();
     TheOutcomeWordPrefersProofOverInference();
     TheNewWordStillCountsAsARun();
