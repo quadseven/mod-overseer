@@ -36883,6 +36883,8 @@ private:
         // whichever of them was entered last. One ratchet per phase is what the
         // three that already exist do. See DUNGEON_STAGED_INSIDE_RATCHET.
         OverseerDecisions::RatchetState assembly;
+        // The patience the assembly clock last ran under (#1316).
+        time_t assemblyPatience{DUNGEON_STAGED_INSIDE_BACKSTOP_SECONDS};
         // THE STAGING WATCHDOG'S PER-MEMBER MEMORY (#164): whether each member
         // is actually closing on the staging point, and how far up the
         // correction ladder it has been taken. It lives on the RUN rather than
@@ -37776,8 +37778,31 @@ private:
         std::time_t since{0};
         std::map<std::string, unsigned> attempts;
         std::map<std::string, std::string> lastStep;
+        // Members whose cast DoHearth accepted (#1316). Apart from `attempts`,
+        // which counts refusals and takes a zero entry on every read.
+        std::set<std::string> hearthedOut;
     };
     std::map<std::string, ExitHearthEpisode> _exitHearths;
+    // A family's run that is over while somebody still stands in it, so IDLE walks
+    // them out instead of staging the family back in (#1316). Set when a failed EXIT
+    // sent the family home and when a run closes split_failed. It outlives a failed
+    // EXIT, because that walk may need another go; it ends when nobody is inside or
+    // a fresh run starts.
+    struct RunOverMark
+    {
+        uint32 mapId{0};
+        std::string reason;
+        // The run had already proved itself complete, as Deadmines can only by
+        // the clearing check, so its adopted EXIT still counts.
+        bool provedComplete{false};
+    };
+    std::map<std::string, RunOverMark> _runOver;
+    static bool DungeonRunPhaseStartsAFreshRun(DungeonRunPhase phase)
+    {
+        return phase == DungeonRunPhase::Resetting || phase == DungeonRunPhase::Gathering ||
+               phase == DungeonRunPhase::Barrier || phase == DungeonRunPhase::Enter ||
+               phase == DungeonRunPhase::StagedInside || phase == DungeonRunPhase::Clearing;
+    }
     // A failed EXIT ends its coordinator and the next poll adopts the same party
     // at the same door, so the failing walk is clocked per family across them
     // (#1202). One entry per family, overwritten by the next failure.
@@ -37933,6 +37958,21 @@ private:
         WriteRunTimeline(family, leaderName, characterName, event);
     }
 
+    // Has this episode already sent somebody home? Read from accepted casts and
+    // where those members stand now, so a member who never left does not count.
+    static bool EpisodeHearthedSomebodyOut(ExitHearthEpisode const& episode,
+                                           std::vector<std::string> const& members)
+    {
+        for (std::string const& name : members)
+        {
+            Player* const member = ObjectAccessor::FindPlayerByName(name);
+            if (episode.hearthedOut.find(name) != episode.hearthedOut.end() && member &&
+                member->IsInWorld() && member->GetMapId() != episode.mapId)
+                return true;
+        }
+        return false;
+    }
+
     // ONE PASS OVER THE FAMILY: every member still on the instance map is cast
     // for, held still, waited on or named as impossible. Returns whether a
     // hearth is in play, which is what holds adoption back.
@@ -37942,6 +37982,7 @@ private:
     {
         using OverseerDecisions::ExitHearthStep;
 
+        bool const familyHearthedOut = EpisodeHearthedSomebodyOut(episode, members);
         std::vector<ExitHearthStep> steps;
         for (std::string const& name : members)
         {
@@ -37965,6 +38006,7 @@ private:
                 facts.failedWalkSeconds = episode.walkFailingSince
                     ? std::time(nullptr) - episode.walkFailingSince
                     : 0;
+                facts.familyHearthedOut = familyHearthedOut;
             }
 
             ExitHearthStep const step = OverseerDecisions::ExitFailureHearthStep(facts);
@@ -37989,6 +38031,7 @@ private:
                     std::string const refusal = answer ? answer : "";
                     if (refusal.empty())
                     {
+                        episode.hearthedOut.insert(name);
                         LOG_WARN("module.overseer",
                                  "overseer: EXIT HEARTH - '{}' is hearthing out of map {} "
                                  "(attempt {} of {}) because {}; the campaign stays as it is "
@@ -38000,10 +38043,13 @@ private:
                             LOG_WARN("module.overseer",
                                      "overseer: EXIT HEARTH - '{}' is let through to its bind "
                                      "on map {}, off map {} where the door lets out, because "
-                                     "the walk out has failed for {} seconds and the stone is "
-                                     "the only way left (#1202)",
+                                     "{} and the stone is the only way left (#1202, #1316)",
                                      name, facts.bindMapId, facts.doorMapId,
-                                     static_cast<int64>(facts.failedWalkSeconds));
+                                     facts.familyHearthedOut
+                                         ? std::string("the family has already hearthed out")
+                                         : "the walk out has failed for " +
+                                               std::to_string(facts.failedWalkSeconds) +
+                                               " seconds");
                         WriteExitHearthEvent(
                             family, leaderName, name, episode, phase, "exit_hearth",
                             "hearth cast for " + name + " on map " +
@@ -41437,10 +41483,10 @@ private:
                          std::string const& leaderName,
                          std::vector<std::string> const& members,
                          DungeonPortal const& portal, uint32 inside, uint32 roster,
-                         std::string const& blockers, bool stillWanted)
+                         std::string const& blockers, bool stillWanted,
+                         time_t heldSeconds)
     {
-        std::string const minutes =
-            std::to_string(DUNGEON_STAGED_INSIDE_BACKSTOP_SECONDS / 60);
+        std::string const minutes = std::to_string(heldSeconds / 60);
         std::string const reason =
             "STAGED_INSIDE held with " + std::to_string(inside) + " of " +
             std::to_string(roster) + " on map " + std::to_string(portal.insideMapId) +
@@ -41481,6 +41527,10 @@ private:
                                coord.runNumber, "split_failed", reason,
                                JoinNames(members));
 
+        // A closure that ends at IDLE walks whoever is left inside out instead of
+        // adopting them back into another hold (#1316). A campaign that goes again
+        // goes through RESET, which does that walking and drops this mark.
+        _runOver[FamilyOfCoordinator(coord)] = RunOverMark{portal.insideMapId, reason};
         EndRunAndDecide(coord, leaderName, portal, runId, "split_failed", reason,
                         stillWanted, &members);
     }
@@ -54644,6 +54694,8 @@ private:
         std::string const leaderJob = jobIt == jobs.end() ? std::string("quest") : jobIt->second;
 
         DungeonRunCoordinatorState& coord = _dungeonRunCoordinators[family];
+        if (DungeonRunPhaseStartsAFreshRun(coord.phase))
+            _runOver.erase(family);
         time_t const clientNow = std::time(nullptr);
         Player* const clientLeader = ObjectAccessor::FindPlayerByName(leaderName);
         // The seat rather than the socket (#792): a listed headless leader in
@@ -54996,9 +55048,20 @@ private:
                                  "with a member still inside and no hearth in play, so "
                                  "the run is adopted again",
                                  episode->second.mapId);
+                    if (EpisodeHearthedSomebodyOut(episode->second, members))
+                        _runOver[family] = RunOverMark{
+                            episode->second.mapId,
+                            episode->second.run.stalledReason.empty()
+                                ? std::string("the walk out failed and the family hearthed "
+                                              "out, so the run is over")
+                                : episode->second.run.stalledReason,
+                            episode->second.run.provedComplete};
                     _exitHearths.erase(episode);
                 }
             }
+
+            if (!activeInside)
+                _runOver.erase(family);
 
             if (!IsDungeonJob(leaderJob) && !activeInside)
                 return;
@@ -55113,10 +55176,13 @@ private:
                         : OverseerDecisions::DungeonRunCompletion(
                               ExpectedEncounterMask(inside->insideMapId, activeInside),
                               CompletedEncounters(activeInside));
+                auto const runOver = _runOver.find(family);
+                bool const runIsOver =
+                    runOver != _runOver.end() && runOver->second.mapId == inside->insideMapId;
                 OverseerDecisions::DungeonRunAdoptPhase const adoptAt =
                     OverseerDecisions::DungeonRunAdoptAt(
                         OverseerDecisions::DungeonRunAllThrough(adoptedStates),
-                        adoptedCompletion);
+                        adoptedCompletion, runIsOver);
 
                 // A REPEAT WIPE'S HOLD STANDS OVER ADOPTION TOO (#1223). The
                 // hold below is asked only by a leader outside, but a member
@@ -55191,8 +55257,14 @@ private:
                     // the same mask one poll later, had the whole party been
                     // inside to get it there - so the run ends 'complete' and
                     // its campaign moves on, rather than running the cleared
-                    // instance again.
-                    coord.provedComplete = true;
+                    // instance again. A run given up on proves nothing, so it
+                    // ends stalled with the reason it was given up, and does not
+                    // spend a run of the campaign (#1316).
+                    coord.provedComplete =
+                        OverseerDecisions::AdoptedExitProvesComplete(
+                            adoptedCompletion, runIsOver && runOver->second.provedComplete);
+                    if (!coord.provedComplete && runIsOver)
+                        coord.stalledReason = runOver->second.reason;
                     coord.crossing.best = 0.f;
                     coord.crossing.since = std::time(nullptr);
                     coord.loggedCrossingAim = false;
@@ -55300,10 +55372,9 @@ private:
                 if (adoptAt == OverseerDecisions::DungeonRunAdoptPhase::Exiting)
                     LOG_WARN("module.overseer",
                              "overseer: the instance '{}' was found in on map {} is "
-                             "already cleared - every encounter is credited - so the "
-                             "adopted run goes straight to EXIT for the {} inside, and "
-                             "nobody outside is walked back in to a dungeon with nothing "
-                             "left in it (#165)",
+                             "cleared or its run is over, so the adopted run goes straight "
+                             "to EXIT for the {} inside, and nobody outside is walked back "
+                             "in to a dungeon with nothing left to do in it (#165, #1316)",
                              activeInside->GetName(), inside->insideMapId, adoptedInside);
                 return;
             }
@@ -57529,11 +57600,19 @@ private:
                     // getting in makes the phase say the line again with the
                     // new count rather than staying silent on a number that has
                     // changed. Same treatment loggedCrossingWaiting gets.
+                    OverseerDecisions::RatchetLimits assemblyLimits =
+                        DUNGEON_STAGED_INSIDE_RATCHET;
+                    assemblyLimits.patienceSeconds = OverseerDecisions::StagedInsideBackstopSeconds(
+                        states, DUNGEON_STAGED_INSIDE_BACKSTOP_SECONDS);
+                    if (coord.assembly.seen)
+                        coord.assembly.since = OverseerDecisions::StagedInsideClockAfter(
+                            coord.assembly.since, coord.assemblyPatience,
+                            assemblyLimits.patienceSeconds, std::time(nullptr));
+                    coord.assemblyPatience = assemblyLimits.patienceSeconds;
                     OverseerDecisions::RatchetVerdict const assembling =
                         OverseerDecisions::Ratchet(coord.assembly,
                                                    static_cast<float>(inside),
-                                                   std::time(nullptr),
-                                                   DUNGEON_STAGED_INSIDE_RATCHET);
+                                                   std::time(nullptr), assemblyLimits);
                     if (assembling.progressed)
                         coord.loggedStagedWaiting = false;
 
@@ -57555,8 +57634,7 @@ private:
                                  "held forever",
                                  portal->insideMapId, inside,
                                  static_cast<uint32>(states.size()), blockers,
-                                 static_cast<uint32>(
-                                     DUNGEON_STAGED_INSIDE_BACKSTOP_SECONDS / 60));
+                                 static_cast<uint32>(assemblyLimits.patienceSeconds / 60));
                     }
 
                     // AND WAITING IS NOT A PLAN WHEN NOTHING IS BRINGING THE
@@ -57593,7 +57671,8 @@ private:
                     if (assembling.stalled)
                         FailSplitInside(coord, leaderName, members, *portal, inside,
                                         static_cast<uint32>(states.size()), blockers,
-                                        IsDungeonJob(leaderJob));
+                                        IsDungeonJob(leaderJob),
+                                        assemblyLimits.patienceSeconds);
                     return;
                 }
 
