@@ -38392,14 +38392,34 @@ private:
             return false;
         }
 
-        Player* walker = nullptr;
+        // Who walks, who hearths and who holds comes from the tested plan
+        // (#1299): the walker is the member it aims, and with nobody aimed
+        // the hearth list is the members it sends home. Only the Hearth way
+        // below, taken when the walker has no way out, reaches past the plan
+        // to every ready stone.
+        std::vector<std::string> const readyHearthers = StratholmeHearthers(inYard);
+        std::vector<OverseerDecisions::StratholmeYardMember> yardMembers;
+        yardMembers.reserve(inYard.size());
         for (Player* member : inYard)
         {
-            if (OverseerDecisions::StratholmeYardMemberCanWalk(
-                    member->GetName() == leaderName, member->IsAlive()))
-                walker = member;
+            OverseerDecisions::StratholmeYardMember yardMember;
+            yardMember.isLeader = member->GetName() == leaderName;
+            yardMember.alive = member->IsAlive();
+            yardMember.hearthReady = std::find(readyHearthers.begin(), readyHearthers.end(),
+                                               member->GetName()) != readyHearthers.end();
+            yardMembers.push_back(yardMember);
         }
-        std::vector<std::string> const hearthers = StratholmeHearthers(inYard);
+        std::vector<OverseerDecisions::StratholmeYardStep> const plan =
+            OverseerDecisions::StratholmeYardPlan(yardMembers);
+        Player* walker = nullptr;
+        std::vector<std::string> hearthers;
+        for (std::size_t i = 0; i < plan.size(); ++i)
+        {
+            if (plan[i] == OverseerDecisions::StratholmeYardStep::Aim)
+                walker = inYard[i];
+            else if (plan[i] == OverseerDecisions::StratholmeYardStep::Hearth)
+                hearthers.push_back(inYard[i]->GetName());
+        }
         if (!walker)
         {
             if (!yard.walker.empty())
@@ -38430,7 +38450,7 @@ private:
         facts.buttonInReach = OverseerDecisions::StratholmeButtonInReach(
             button && button->isSpawned(), yard.presses,
             yard.buttonWalkSince ? static_cast<uint32>(now - yard.buttonWalkSince) : 0u);
-        facts.hearthAvailable = !hearthers.empty();
+        facts.hearthAvailable = !readyHearthers.empty();
         OverseerDecisions::StratholmeExitWay const way =
             OverseerDecisions::DecideStratholmeExit(facts);
 
@@ -38464,7 +38484,9 @@ private:
             case OverseerDecisions::StratholmeExitWay::Hearth:
                 if (!yard.hearth.since)
                     yard.hearth.since = now;
-                if (DriveExitHearths(family, leaderName, hearthers, yard.hearth,
+                // No way out is left for the walker, so every member with a
+                // ready stone, the walker too, takes it.
+                if (DriveExitHearths(family, leaderName, readyHearthers, yard.hearth,
                                      "STRATHOLME_YARD", "leaving the Stratholme exit yard"))
                     return true;
                 LOG_WARN("module.overseer",

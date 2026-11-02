@@ -27,6 +27,9 @@ using OverseerDecisions::StratholmeExitFacts;
 using OverseerDecisions::StratholmeExitWay;
 using OverseerDecisions::StratholmeExitWayWord;
 using OverseerDecisions::StratholmeYardMemberCanWalk;
+using OverseerDecisions::StratholmeYardMember;
+using OverseerDecisions::StratholmeYardPlan;
+using OverseerDecisions::StratholmeYardStep;
 
 namespace
 {
@@ -59,6 +62,39 @@ void CheckText(char const* what, std::string const& got, std::string const& want
     ++failures;
 }
 
+char const* StepWord(StratholmeYardStep step)
+{
+    switch (step)
+    {
+        case StratholmeYardStep::Aim:    return "aim";
+        case StratholmeYardStep::Hearth: return "hearth";
+        case StratholmeYardStep::Hold:   return "hold";
+    }
+    return "?";
+}
+
+// The plan for a yard, checked member by member against the steps wanted.
+void CheckPlan(char const* what, std::vector<StratholmeYardMember> const& members,
+               std::vector<StratholmeYardStep> const& want)
+{
+    std::vector<StratholmeYardStep> const got = StratholmeYardPlan(members);
+    if (got.size() != want.size())
+    {
+        std::printf("FAIL %s: got %u steps, want %u\n", what,
+                    static_cast<unsigned>(got.size()), static_cast<unsigned>(want.size()));
+        ++failures;
+        return;
+    }
+    for (std::size_t i = 0; i < got.size(); ++i)
+    {
+        if (got[i] == want[i])
+            continue;
+        std::printf("FAIL %s: member %u got %s, want %s\n", what, static_cast<unsigned>(i),
+                    StepWord(got[i]), StepWord(want[i]));
+        ++failures;
+    }
+}
+
 std::string ReadModule()
 {
     std::string const path = std::getenv("OVERSEER_SOURCE") ? std::getenv("OVERSEER_SOURCE")
@@ -79,27 +115,30 @@ std::string ReadModule()
 
 int main()
 {
-    CheckBool("leader outside leaves each yard follower without a walker",
-              !StratholmeYardMemberCanWalk(false, true) &&
-                  !StratholmeYardMemberCanWalk(false, true), true);
-    CheckWay("followers with a ready hearth take the hearth branch",
-             DecideStratholmeExit(StratholmeExitFacts{false, false, true}),
-             StratholmeExitWay::Hearth);
-    CheckWay("followers without a ready hearth hold",
-             DecideStratholmeExit(StratholmeExitFacts{}), StratholmeExitWay::None);
-
-    CheckBool("dead leader and each follower cannot walk the yard exit",
-              !StratholmeYardMemberCanWalk(true, false) &&
-                  !StratholmeYardMemberCanWalk(false, true) &&
-                  !StratholmeYardMemberCanWalk(false, true), true);
-    CheckBool("dead leader's followers can take the hearth branch",
-              DecideStratholmeExit(StratholmeExitFacts{false, false, true}) ==
-                  StratholmeExitWay::Hearth,
-              true);
+    // The per-member plan the drive acts on (#1299). Members are
+    // {isLeader, alive, hearthReady}.
+    {
+        using S = StratholmeYardStep;
+        CheckPlan("leader out of the yard: no follower is aimed; ready stones hearth, others hold",
+                  {{false, true, true}, {false, true, false}, {false, true, true}},
+                  {S::Hearth, S::Hold, S::Hearth});
+        CheckPlan("leader out of the yard, no stone ready: every follower holds",
+                  {{false, true, false}, {false, true, false}}, {S::Hold, S::Hold});
+        CheckPlan("dead leader in the yard: nobody is aimed; ready stones hearth, others hold",
+                  {{true, false, true}, {false, true, true}, {false, true, false}},
+                  {S::Hearth, S::Hearth, S::Hold});
+        CheckPlan("dead leader without a stone holds with its followers",
+                  {{false, true, false}, {true, false, false}}, {S::Hold, S::Hold});
+        CheckPlan("living leader in the yard: the leader alone is aimed and followers hold",
+                  {{false, true, true}, {true, true, true}, {false, true, false}},
+                  {S::Hold, S::Aim, S::Hold});
+        CheckPlan("an empty yard has no plan", {}, {});
+    }
 
     CheckBool("living leader alone can walk the yard exit",
               StratholmeYardMemberCanWalk(true, true) &&
-                  !StratholmeYardMemberCanWalk(false, true), true);
+                  !StratholmeYardMemberCanWalk(false, true) &&
+                  !StratholmeYardMemberCanWalk(true, false), true);
     // door open means walk
     {
         StratholmeExitFacts facts;
@@ -350,9 +389,49 @@ int main()
                   source.find("if (DriveStratholmeYard(family, leaderName, members))") !=
                       std::string::npos,
                   true);
-        CheckBool("production uses the tested living-leader yard-walker decision",
-                  driveSource.find("StratholmeYardMemberCanWalk(") != std::string::npos &&
+        CheckBool("production uses the tested per-member yard plan",
+                  driveSource.find("OverseerDecisions::StratholmeYardPlan(") != std::string::npos &&
+                      driveSource.find("StratholmeYardMemberCanWalk(") == std::string::npos &&
                       driveSource.find("Player* walker = inYard.front()") == std::string::npos,
+                  true);
+        // The walker is taken only from a member the plan aims (its one
+        // assignment besides the nullptr start), and every aim in the drive
+        // goes to that walker.
+        std::size_t const planAt = driveSource.find("OverseerDecisions::StratholmeYardPlan(");
+        std::size_t const walkerSet = driveSource.find(
+            "if (plan[i] == OverseerDecisions::StratholmeYardStep::Aim)\n                walker = inYard[i];");
+        std::size_t walkerAssigns = 0;
+        for (std::size_t at = driveSource.find("walker = ");
+             at != std::string::npos; at = driveSource.find("walker = ", at + 1))
+            ++walkerAssigns;
+        CheckBool("the drive takes its walker only from a member the plan aims",
+                  planAt != std::string::npos && walkerSet != std::string::npos &&
+                      planAt < walkerSet && walkerAssigns == 2 &&
+                      driveSource.find("Player* walker = nullptr;") != std::string::npos,
+                  true);
+        std::size_t aims = 0;
+        std::size_t aimsAtWalker = 0;
+        for (std::size_t at = driveSource.find("AimStratholmeWalker(");
+             at != std::string::npos; at = driveSource.find("AimStratholmeWalker(", at + 1))
+        {
+            ++aims;
+            std::string const wrapped = "AimStratholmeWalker(\n                    yard, walker,";
+            std::string const oneLine = "AimStratholmeWalker(yard, walker,";
+            if (driveSource.compare(at, wrapped.size(), wrapped) == 0 ||
+                driveSource.compare(at, oneLine.size(), oneLine) == 0)
+                ++aimsAtWalker;
+        }
+        CheckBool("every AimStratholmeWalker in the drive aims the planned walker",
+                  aims >= 1 && aims == aimsAtWalker && walkerSet < driveSource.find("AimStratholmeWalker("),
+                  true);
+        std::size_t const pressStart = source.find("void PressStratholmeButton(");
+        std::size_t const pressEnd = source.find("bool DriveStratholmeYard(", pressStart);
+        std::string const pressSource = pressStart == std::string::npos || pressEnd == std::string::npos
+            ? std::string() : source.substr(pressStart, pressEnd - pressStart);
+        CheckBool("the button press aims only the walker the drive hands it",
+                  pressSource.find("AimStratholmeWalker(yard, walker,") != std::string::npos &&
+                      driveSource.find("PressStratholmeButton(yard, walker, button, now)") !=
+                          std::string::npos,
                   true);
         std::size_t const missingLeader = driveSource.find("if (!walker)");
         std::size_t const missingLeaderEnd = driveSource.find("GameObject* const door", missingLeader);
