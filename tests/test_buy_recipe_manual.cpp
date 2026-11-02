@@ -30,6 +30,7 @@ using OverseerDecisions::ManualUseRefusalReleases;
 using OverseerDecisions::ParseRecipeManualErrand;
 using OverseerDecisions::PlanRecipeManual;
 using OverseerDecisions::RECIPE_MANUAL_MAX_USES;
+using OverseerDecisions::RECIPE_MANUAL_WALK_TIMEOUT_SECONDS;
 using OverseerDecisions::RecipeManualErrand;
 using OverseerDecisions::RecipeManualFacts;
 using OverseerDecisions::RecipeManualPlan;
@@ -196,6 +197,50 @@ int main()
         f.usesTried = 1;
         Check("a manual consumed without teaching is refused, not bought again",
               Is(PlanRecipeManual(f), RecipeManualStep::Refuse, Refusal::UsedAndNotLearned));
+    }
+
+    // ---- walk timeout -----------------------------------------------------
+    {
+        RecipeManualFacts f = AtTheVendor();
+        f.vendorNearby = false;
+        f.vendorInReach = false;
+        f.walkStartedAt = 0;
+        Check("walk not started (walkStartedAt=0) does not time out",
+              Is(PlanRecipeManual(f), RecipeManualStep::Walk, ""));
+    }
+    {
+        RecipeManualFacts f = AtTheVendor();
+        f.vendorNearby = false;
+        f.vendorInReach = false;
+        f.walkStartedAt = std::time(nullptr) - 10;
+        Check("walk started recently does not time out",
+              Is(PlanRecipeManual(f), RecipeManualStep::Walk, ""));
+    }
+    {
+        RecipeManualFacts f = AtTheVendor();
+        f.vendorNearby = false;
+        f.vendorInReach = false;
+        f.walkStartedAt = std::time(nullptr) - RECIPE_MANUAL_WALK_TIMEOUT_SECONDS - 1;
+        Check("walk older than RECIPE_MANUAL_WALK_TIMEOUT_SECONDS times out",
+              Is(PlanRecipeManual(f), RecipeManualStep::Refuse, Refusal::WalkTimeout));
+    }
+
+    // ---- vendor nearby with walk started does not re-walk -----------------
+    {
+        RecipeManualFacts f = AtTheVendor();
+        f.vendorNearby = true;
+        f.vendorInReach = false;
+        f.walkStartedAt = std::time(nullptr) - 10;
+        Check("vendor nearby but not in reach steps to it, does not re-walk",
+              Is(PlanRecipeManual(f), RecipeManualStep::Approach, ""));
+    }
+    {
+        RecipeManualFacts f = AtTheVendor();
+        f.vendorNearby = true;
+        f.vendorInReach = true;
+        f.walkStartedAt = std::time(nullptr) - 10;
+        Check("vendor nearby and in reach buys, does not re-walk",
+              Is(PlanRecipeManual(f), RecipeManualStep::Buy, ""));
     }
 
     // ---- which verb refusals release the errand -------------------------

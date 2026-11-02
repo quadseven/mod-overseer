@@ -23724,6 +23724,12 @@ bool ParseRecipeManualErrand(std::string const& column, RecipeManualErrand& out)
 // asking a third time every poll is the retry loop the column exists to end.
 constexpr uint32_t RECIPE_MANUAL_MAX_USES = 2;
 
+// How long the walk phase may run before the errand is refused. The walk is
+// bounded so a character that cannot reach the vendor (or stalls mid-walk)
+// does not hold the travel aim forever. The errand releases itself with a log
+// line after this many seconds without a purchase attempt.
+constexpr uint32_t RECIPE_MANUAL_WALK_TIMEOUT_SECONDS = 300;
+
 // The refusal literals, written into the log line. No quote characters.
 namespace RecipeManualRefusal
 {
@@ -23733,6 +23739,8 @@ constexpr char const* NotSold = "the vendor does not sell the manual";
 constexpr char const* TooPoor = "the character cannot afford the manual";
 constexpr char const* UsedAndNotLearned =
     "the manual was used and the recipe is still not known";
+constexpr char const* WalkTimeout =
+    "the walk to the vendor timed out without a purchase attempt";
 }  // namespace RecipeManualRefusal
 
 // Everything the plan reads, as the adapter measured it this poll.
@@ -23748,6 +23756,7 @@ struct RecipeManualFacts
     bool vendorSells{false};    // its list carries the manual for gold
     uint64_t price{0};          // copper, reputation discount applied
     uint64_t purse{0};          // copper the character holds
+    time_t walkStartedAt{0};    // when the walk phase began (0 = not walking)
 };
 
 enum class RecipeManualStep : uint8_t

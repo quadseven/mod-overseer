@@ -18072,13 +18072,15 @@ private:
     // wanted; this says what has been tried and paid, which the proof line
     // and the bound on uses read. Lost on a restart, which costs at most one
     // more use of a manual already carried.
-    struct RecipeManualProgress
-    {
-        uint32 usesTried = 0;
-        uint64 paidCopper = 0;
-        bool bought = false;
-        bool walkSaid = false;
-    };
+struct RecipeManualProgress
+{
+    uint32 usesTried = 0;
+    uint64 paidCopper = 0;
+    bool bought = false;
+    bool walkSaid = false;
+    time_t walkStartedAt = 0;
+    bool arrivedAtVendor = false;
+};
 
     // Bounded by the roster: an entry lives only while its name has a
     // standing buy_recipe_item. ReleaseRecipeManual erases it on every
@@ -18155,41 +18157,48 @@ private:
         return false;
     }
 
-    OverseerDecisions::RecipeManualFacts ReadRecipeManualFacts(
-        Player* bot, std::string const& name, Creature* vendor, ItemTemplate const* proto,
-        uint32 recipe, uint32 itemEntry)
-    {
-        OverseerDecisions::RecipeManualFacts facts;
-        facts.teachesRecipe = recipe != 0;
-        facts.knowsRecipe = bot->HasSpell(recipe);
-        facts.learning = LearnPendingFor(name) || bot->IsNonMeleeSpellCast(false);
-        facts.carriesManual = bot->GetItemCount(itemEntry, false) > 0;
-        facts.usesTried = _recipeManuals[name].usesTried;
-        facts.vendorNearby = vendor && vendor->IsAlive();
-        facts.vendorInReach = facts.vendorNearby &&
-            bot->GetNPCIfCanInteractWith(vendor->GetGUID(), UNIT_NPC_FLAG_VENDOR);
-        facts.vendorSells = facts.vendorInReach && VendorSellsForGold(bot, vendor, proto, facts.price);
-        facts.purse = bot->GetMoney();
-        return facts;
-    }
+OverseerDecisions::RecipeManualFacts ReadRecipeManualFacts(
+    Player* bot, std::string const& name, Creature* vendor, ItemTemplate const* proto,
+    uint32 recipe, uint32 itemEntry)
+{
+    OverseerDecisions::RecipeManualFacts facts;
+    facts.teachesRecipe = recipe != 0;
+    facts.knowsRecipe = bot->HasSpell(recipe);
+    facts.learning = LearnPendingFor(name) || bot->IsNonMeleeSpellCast(false);
+    facts.carriesManual = bot->GetItemCount(itemEntry, false) > 0;
+    facts.usesTried = _recipeManuals[name].usesTried;
+    facts.walkStartedAt = _recipeManuals[name].walkStartedAt;
+    facts.vendorNearby = vendor && vendor->IsAlive();
+    facts.vendorInReach = facts.vendorNearby &&
+        bot->GetNPCIfCanInteractWith(vendor->GetGUID(), UNIT_NPC_FLAG_VENDOR);
+    facts.vendorSells = facts.vendorInReach && VendorSellsForGold(bot, vendor, proto, facts.price);
+    facts.purse = bot->GetMoney();
+    return facts;
+}
 
-    // The walk, through the travel aim book like every other module walk, so
-    // a guard, a run or the bridge's own errand in the column is not written
-    // over. A refused claim leaves the errand standing; Claim says why once.
-    void WalkToManualVendor(std::string const& name,
-                            OverseerDecisions::RecipeManualErrand const& errand)
-    {
-        if (!_travelAims.Claim(name, std::to_string(errand.vendorEntry),
-                               OverseerDecisions::TravelOwner::TownTrip))
-            return;
-        RecipeManualProgress& progress = _recipeManuals[name];
-        if (progress.walkSaid)
-            return;
-        progress.walkSaid = true;
-        LOG_INFO("module.overseer",
-                 "overseer: '{}' is walked to vendor creature {} to buy recipe manual item {}",
-                 name, errand.vendorEntry, errand.itemEntry);
-    }
+// The walk, through the travel aim book like every other module walk, so
+// a guard, a run or the bridge's own errand in the column is not written
+// over. A refused claim leaves the errand standing; Claim says why once.
+void WalkToManualVendor(std::string const& name,
+                        OverseerDecisions::RecipeManualErrand const& errand)
+{
+    RecipeManualProgress& progress = _recipeManuals[name];
+    // If we've already arrived at the vendor, don't re-claim the travel aim.
+    // The character is already at the vendor; let Approach/Buy handle the rest.
+    if (progress.arrivedAtVendor)
+        return;
+
+    if (!_travelAims.Claim(name, std::to_string(errand.vendorEntry),
+                           OverseerDecisions::TravelOwner::TownTrip))
+        return;
+    if (progress.walkSaid)
+        return;
+    progress.walkSaid = true;
+    progress.walkStartedAt = std::time(nullptr);
+    LOG_INFO("module.overseer",
+             "overseer: '{}' is walked to vendor creature {} to buy recipe manual item {}",
+             name, errand.vendorEntry, errand.itemEntry);
+}
 
     // The last yards: the arrival radius is wider than the interact gate the
     // core sells through. One grounded step per poll, as DriveLockpick takes.
@@ -18297,49 +18306,53 @@ private:
     }
 
     // One poll of one character's errand.
-    void DriveRecipeManual(Player* bot, std::string const& name, std::string const& column)
+void DriveRecipeManual(Player* bot, std::string const& name, std::string const& column)
+{
+    OverseerDecisions::RecipeManualErrand errand;
+    if (!OverseerDecisions::ParseRecipeManualErrand(column, errand))
     {
-        OverseerDecisions::RecipeManualErrand errand;
-        if (!OverseerDecisions::ParseRecipeManualErrand(column, errand))
-        {
-            RefuseRecipeManual(name, column, OverseerDecisions::RecipeManualRefusal::Malformed);
-            return;
-        }
-        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(errand.itemEntry);
-        uint32 useSpell = 0;
-        uint32 const recipe = RecipeTaughtByItem(proto, useSpell);
-        Creature* vendor = bot->FindNearestCreature(errand.vendorEntry, TRAVEL_ARRIVED_YARDS);
-        OverseerDecisions::RecipeManualFacts const facts =
-            ReadRecipeManualFacts(bot, name, vendor, proto, recipe, errand.itemEntry);
-
-        OverseerDecisions::RecipeManualPlan const plan = OverseerDecisions::PlanRecipeManual(facts);
-        switch (plan.step)
-        {
-            case OverseerDecisions::RecipeManualStep::Learned:
-                FinishRecipeManual(bot, name, errand, proto, recipe);
-                return;
-            case OverseerDecisions::RecipeManualStep::Refuse:
-                RefuseRecipeManual(name, column, plan.refusal);
-                return;
-            case OverseerDecisions::RecipeManualStep::Wait:
-                return;
-            case OverseerDecisions::RecipeManualStep::Walk:
-                WalkToManualVendor(name, errand);
-                return;
-            case OverseerDecisions::RecipeManualStep::Approach:
-                ApproachManualVendor(bot, name, vendor);
-                return;
-            case OverseerDecisions::RecipeManualStep::Buy:
-                // Used in the same poll it is bought, so a walk-away between
-                // the two cannot leave a paid manual sitting in the bags.
-                if (BuyRecipeManual(bot, name, column, errand, facts.price))
-                    UseRecipeManual(bot, name, column, errand.itemEntry);
-                return;
-            case OverseerDecisions::RecipeManualStep::Use:
-                UseRecipeManual(bot, name, column, errand.itemEntry);
-                return;
-        }
+        RefuseRecipeManual(name, column, OverseerDecisions::RecipeManualRefusal::Malformed);
+        return;
     }
+    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(errand.itemEntry);
+    uint32 useSpell = 0;
+    uint32 const recipe = RecipeTaughtByItem(proto, useSpell);
+    Creature* vendor = bot->FindNearestCreature(errand.vendorEntry, TRAVEL_ARRIVED_YARDS);
+    OverseerDecisions::RecipeManualFacts const facts =
+        ReadRecipeManualFacts(bot, name, vendor, proto, recipe, errand.itemEntry);
+
+    // Track that we've arrived at the vendor so we don't re-walk
+    if (facts.vendorNearby)
+        _recipeManuals[name].arrivedAtVendor = true;
+
+    OverseerDecisions::RecipeManualPlan const plan = OverseerDecisions::PlanRecipeManual(facts);
+    switch (plan.step)
+    {
+        case OverseerDecisions::RecipeManualStep::Learned:
+            FinishRecipeManual(bot, name, errand, proto, recipe);
+            return;
+        case OverseerDecisions::RecipeManualStep::Refuse:
+            RefuseRecipeManual(name, column, plan.refusal);
+            return;
+        case OverseerDecisions::RecipeManualStep::Wait:
+            return;
+        case OverseerDecisions::RecipeManualStep::Walk:
+            WalkToManualVendor(name, errand);
+            return;
+        case OverseerDecisions::RecipeManualStep::Approach:
+            ApproachManualVendor(bot, name, vendor);
+            return;
+        case OverseerDecisions::RecipeManualStep::Buy:
+            // Used in the same poll it is bought, so a walk-away between
+            // the two cannot leave a paid manual sitting in the bags.
+            if (BuyRecipeManual(bot, name, column, errand, facts.price))
+                UseRecipeManual(bot, name, column, errand.itemEntry);
+            return;
+        case OverseerDecisions::RecipeManualStep::Use:
+            UseRecipeManual(bot, name, column, errand.itemEntry);
+            return;
+    }
+}
 
     void DriveRecipeManuals()
     {
