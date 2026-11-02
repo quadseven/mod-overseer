@@ -17388,6 +17388,9 @@ constexpr char const* NotEnoughPower = "the character has too little mana for th
 // Portals, and a caster without one reaches CheckCast, is refused with
 // SPELL_FAILED_REAGENTS, and is told about it through a client a bot does not
 // have.
+// A forge, an anvil, a fire: the spell's focus object is not in reach, so the
+// row is not cast into a client error. Standing somewhere else answers it.
+constexpr char const* NoSpellFocus = "no spell focus object of that spell is in reach";
 constexpr char const* MissingReagent = "the character is missing a reagent for that spell";
 constexpr char const* NoSuchTarget = "no character of that name is in the world";
 constexpr char const* TargetOtherMap = "the target is on another map";
@@ -21302,12 +21305,13 @@ unsigned FocusLighterSpell(unsigned requiresSpellFocus);
 // gameobject type 8 (GAMEOBJECT_TYPE_SPELL_FOCUS) with Data0 (focusId) 1;
 // Data1 is the 10 yard reach of the focus, not its id.
 constexpr unsigned SPELL_FOCUS_ANVIL = 1;
+constexpr unsigned SPELL_FOCUS_FORGE = 3;
 constexpr unsigned TOTEM_CATEGORY_BLACKSMITH_HAMMER = 162;
 constexpr unsigned ITEM_BLACKSMITH_HAMMER = 5956;
 
 // Is this focus a world object the crafter is WALKED to? An Anvil only. A
 // Cooking Fire is lit where the crafter stands (FocusLighterSpell); a Forge
-// and everything else is left to the refusal it always got.
+// is the bridge's walk, and everything else is deferred (CraftStationStepFor).
 bool FocusIsWalkedTo(unsigned requiresSpellFocus);
 
 // The item a family buys for a tool category, or 0 when none is known. The
@@ -21411,11 +21415,11 @@ struct FocusSpawn
 
 // How far the craft drive walks a crafter to an Anvil: a town, not a journey.
 // Zones are not levels and travel does not know that (AGENTS.md), so an Anvil
-// further than this is not walked to and the refusal stands.
+// further than this is not walked to and the craft is deferred.
 constexpr float CRAFT_FOCUS_WALK_LIMIT_YARDS = 400.f;
 // Within this of the nearest Anvil's spawn the crafter is already at it: the
 // focus reaches 10 yards and arrival at a place is 5. A refusal there is not
-// fixed by walking again, so it stands rather than looping a walk.
+// fixed by walking again, so it is deferred rather than looping a walk.
 constexpr float CRAFT_FOCUS_STANDING_YARDS = 8.f;
 
 // The index of the nearest spawn on `mapId` within `limitYards` (in the plane)
@@ -21425,9 +21429,9 @@ int NearestFocusSpawn(std::vector<FocusSpawn> const& spawns, unsigned mapId, flo
 
 // WHAT A FOCUS REFUSAL LEADS TO. `nearestYards` is the plane distance to the
 // nearest spawn within the walk limit, negative when there is none.
-//   not walked to, or not job 'craft'   -> Stand (the refusal stands)
+//   not walked to, or may not walk      -> Stand (the craft is deferred)
 //   no spawn within the limit           -> NoneNear
-//   within CRAFT_FOCUS_STANDING_YARDS   -> Stand (already there)
+//   within CRAFT_FOCUS_STANDING_YARDS   -> Stand (already there, deferred)
 //   otherwise                           -> Walk
 enum class CraftFocusStep : uint8_t
 {
@@ -21436,6 +21440,30 @@ enum class CraftFocusStep : uint8_t
     Walk,
 };
 CraftFocusStep CraftFocusStepFor(bool walkedTo, bool mayWalk, float nearestYards);
+
+// WHAT A CRAFT DOES ABOUT ITS STATION, asked before the cast
+// (wow-overseer#1786), since a refused cast reaches the client.
+//   no focus, or one in reach        -> Cast
+//   a focus the crafter can conjure  -> Light
+//   CraftFocusStep says Walk         -> Walk
+//   anything else                    -> Defer, with CraftDeferReason
+enum class CraftStationStep : uint8_t
+{
+    Cast,
+    Light,
+    Walk,
+    Defer,
+};
+CraftStationStep CraftStationStepFor(unsigned focus, bool focusInReach, bool lighterKnown,
+                                     CraftFocusStep walk);
+
+// May the craft drive walk this crafter to a banker or a station? Job 'craft'
+// always. On a town run the family's leader may, in a rest area: the family
+// follows it, so the walk stays inside the town stop. A follower waits.
+bool CraftMayWalk(std::string const& job, bool leadsFamily, bool resting);
+
+// The one sentence a deferred craft states.
+std::string CraftDeferReason(unsigned focus, bool mayWalk, CraftFocusStep walk);
 
 // The travel aim for a focus spawn, `at:<map>:<x>,<y>,<z>` in whole yards so it
 // fits the 32 character travel column.
@@ -23724,6 +23752,15 @@ bool ParseRecipeManualErrand(std::string const& column, RecipeManualErrand& out)
 // asking a third time every poll is the retry loop the column exists to end.
 constexpr uint32_t RECIPE_MANUAL_MAX_USES = 2;
 
+// How long one errand may stand without the manual in the bags before it is
+// refused (#1203). The walk goes through the travel aim book, whose backstop
+// gives up on an aim after TRAVEL_BACKSTOP_SECONDS (twenty minutes), and the
+// next poll of this drive would claim the same walk again, so without a bound
+// of its own the errand could walk, give up and walk again for ever. Thirty
+// minutes lets one whole walk run to that backstop and ends the retry after it.
+// A fence that refuses the claim every poll is bounded by the same clock.
+constexpr std::time_t RECIPE_MANUAL_ERRAND_SECONDS = 30 * 60;
+
 // The refusal literals, written into the log line. No quote characters.
 namespace RecipeManualRefusal
 {
@@ -23733,6 +23770,8 @@ constexpr char const* NotSold = "the vendor does not sell the manual";
 constexpr char const* TooPoor = "the character cannot afford the manual";
 constexpr char const* UsedAndNotLearned =
     "the manual was used and the recipe is still not known";
+constexpr char const* NotBoughtInTime =
+    "the manual was not bought within the errand's time bound";
 }  // namespace RecipeManualRefusal
 
 // Everything the plan reads, as the adapter measured it this poll.
@@ -23748,6 +23787,11 @@ struct RecipeManualFacts
     bool vendorSells{false};    // its list carries the manual for gold
     uint64_t price{0};          // copper, reputation discount applied
     uint64_t purse{0};          // copper the character holds
+    // When this worldserver first saw the errand, and the time of this poll.
+    // Zero for errandSince means the clock has not started, and nothing is
+    // bounded. Passed in rather than read here so the bound is tested.
+    std::time_t errandSince{0};
+    std::time_t now{0};
 };
 
 enum class RecipeManualStep : uint8_t
@@ -23772,7 +23816,19 @@ struct RecipeManualPlan
 // walked to, and then stepped up to, before its stock or price is judged,
 // because the core sells only inside the interact gate; and a manual that has been used and still taught nothing
 // is refused rather than bought again with the character's money.
+// An errand still without the manual RECIPE_MANUAL_ERRAND_SECONDS after it was
+// first seen is refused with NotBoughtInTime, whatever step it was on.
 RecipeManualPlan PlanRecipeManual(RecipeManualFacts const& facts);
+
+// DOES THIS STEP HOLD THE CHARACTER WHERE IT STANDS (#1203)? Every step from
+// arrival at the vendor until the errand ends: the last yards, the buy, the
+// use and the wait for the use to read back. The travel drive releases the
+// aim on arrival, and between that and this drive's next poll the wander
+// (`new rpg`) or a leader's `follow` could walk the character off again, so
+// the walk, arrive and wander cycle never reaches the buy. The hold takes both
+// strategies off until the errand is released. The walk alone does not hold:
+// it is the travel drive's to steer.
+bool RecipeManualStepHoldsCharacter(RecipeManualStep step);
 
 // Does this refusal from the buy verb release the errand? Every refusal
 // BuyRefusalRetry calls Never, and two it calls otherwise that the errand cannot
