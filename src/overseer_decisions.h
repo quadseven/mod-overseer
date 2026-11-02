@@ -28131,6 +28131,14 @@ bool ShouldOpenStratholmeYardEpisode(bool memberInYard, bool episodeOpen, bool g
 // land in the yard is a new episode and is recovered as one.
 bool StratholmeYardGiveUpHolds(bool memberInYard, std::uint32_t secondsSinceGaveUp);
 
+// Whether the bag-pressure hold drives the family's Stratholme yard episode
+// before it returns (#1221). A family that leaves Stratholme with full bags is
+// held at IDLE for the town trip while it still stands in the closed exit
+// yard; the hold used to return before the yard was polled, so the episode
+// ran unseen to its ceiling. An open episode is driven first; a family with no
+// episode keeps the hold exactly as before.
+bool StratholmeYardDrivesBeforeBagHold(bool yardEpisodeOpen);
+
 // Where one member stands, as the yard member scan reads it.
 struct StratholmeMemberPlace
 {

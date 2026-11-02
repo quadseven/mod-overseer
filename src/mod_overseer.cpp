@@ -55004,6 +55004,18 @@ private:
                 }
 
                 case OverseerDecisions::DungeonBagPressure::HoldOut:
+                    // THE EXIT YARD IS WORKED BEFORE THE HOLD (#1221). A family
+                    // that leaves Stratholme with full bags lands in the closed
+                    // exit yard with this answer, and the return below used to
+                    // keep the yard drive after this switch from ever running:
+                    // the way out was never read and the episode closed only at
+                    // its ceiling. While the episode runs it holds the
+                    // coordinator, as it does below; once it closes, the hold
+                    // goes on in the same poll.
+                    if (OverseerDecisions::StratholmeYardDrivesBeforeBagHold(
+                            _stratholmeYards.find(family) != _stratholmeYards.end()) &&
+                        DriveStratholmeYard(family, leaderName, members))
+                        return;
                     // BACK TO IDLE, WHICH IS THE FIX AND NOT A TIDY-UP.
                     // DriveTownTrip - the only thing in this module that empties
                     // a bag - stands itself down on its first statement whenever
