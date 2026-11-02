@@ -20763,6 +20763,9 @@ RecipeManualPlan PlanRecipeManual(RecipeManualFacts const& facts)
         return {RecipeManualStep::Refuse, R::UsedAndNotLearned};
     if (facts.carriesManual)
         return {RecipeManualStep::Use, ""};
+    if (facts.errandSince != 0 && facts.now >= facts.errandSince &&
+        facts.now - facts.errandSince >= RECIPE_MANUAL_ERRAND_SECONDS)
+        return {RecipeManualStep::Refuse, R::NotBoughtInTime};
     if (!facts.vendorNearby)
         return {RecipeManualStep::Walk, ""};
     if (!facts.vendorInReach)
@@ -20772,6 +20775,23 @@ RecipeManualPlan PlanRecipeManual(RecipeManualFacts const& facts)
     if (facts.price > facts.purse)
         return {RecipeManualStep::Refuse, R::TooPoor};
     return {RecipeManualStep::Buy, ""};
+}
+
+bool RecipeManualStepHoldsCharacter(RecipeManualStep step)
+{
+    switch (step)
+    {
+        case RecipeManualStep::Approach:
+        case RecipeManualStep::Buy:
+        case RecipeManualStep::Use:
+        case RecipeManualStep::Wait:
+            return true;
+        case RecipeManualStep::Learned:
+        case RecipeManualStep::Refuse:
+        case RecipeManualStep::Walk:
+            return false;
+    }
+    return false;
 }
 
 bool ManualBuyRefusalReleases(std::string const& detail)

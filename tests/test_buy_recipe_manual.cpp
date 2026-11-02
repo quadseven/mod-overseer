@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -29,7 +30,9 @@ using OverseerDecisions::ManualPurchaseLine;
 using OverseerDecisions::ManualUseRefusalReleases;
 using OverseerDecisions::ParseRecipeManualErrand;
 using OverseerDecisions::PlanRecipeManual;
+using OverseerDecisions::RECIPE_MANUAL_ERRAND_SECONDS;
 using OverseerDecisions::RECIPE_MANUAL_MAX_USES;
+using OverseerDecisions::RecipeManualStepHoldsCharacter;
 using OverseerDecisions::RecipeManualErrand;
 using OverseerDecisions::RecipeManualFacts;
 using OverseerDecisions::RecipeManualPlan;
@@ -198,6 +201,68 @@ int main()
               Is(PlanRecipeManual(f), RecipeManualStep::Refuse, Refusal::UsedAndNotLearned));
     }
 
+    // ---- the errand's time bound (#1203) --------------------------------
+    {
+        std::time_t const t0 = 1000000;
+        RecipeManualFacts f = AtTheVendor();
+        f.vendorNearby = false;
+        f.vendorInReach = false;
+        f.errandSince = t0;
+        f.now = t0 + RECIPE_MANUAL_ERRAND_SECONDS - 1;
+        Check("a walk inside the bound goes on walking",
+              Is(PlanRecipeManual(f), RecipeManualStep::Walk, ""));
+        f.now = t0 + RECIPE_MANUAL_ERRAND_SECONDS;
+        Check("a walk that reaches the bound without the manual is refused and released",
+              Is(PlanRecipeManual(f), RecipeManualStep::Refuse, Refusal::NotBoughtInTime));
+        f.errandSince = 0;
+        Check("an errand whose clock has not started is not bounded",
+              Is(PlanRecipeManual(f), RecipeManualStep::Walk, ""));
+        f.errandSince = t0;
+        f.now = t0 - 5;
+        Check("a clock that reads before the errand began does not refuse it",
+              Is(PlanRecipeManual(f), RecipeManualStep::Walk, ""));
+    }
+    {
+        std::time_t const t0 = 1000000;
+        RecipeManualFacts f = AtTheVendor();
+        f.vendorInReach = false;
+        f.errandSince = t0;
+        f.now = t0 + RECIPE_MANUAL_ERRAND_SECONDS;
+        Check("the last yards past the bound are refused too",
+              Is(PlanRecipeManual(f), RecipeManualStep::Refuse, Refusal::NotBoughtInTime));
+        f.vendorInReach = true;
+        Check("a buy that keeps failing past the bound is refused",
+              Is(PlanRecipeManual(f), RecipeManualStep::Refuse, Refusal::NotBoughtInTime));
+        f.carriesManual = true;
+        Check("a manual already in the bags is used, whatever the clock says",
+              Is(PlanRecipeManual(f), RecipeManualStep::Use, ""));
+    }
+    Check("the errand bound is longer than the travel drive's twenty minute backstop",
+          RECIPE_MANUAL_ERRAND_SECONDS > 20 * 60);
+
+    // ---- the hold from arrival to the buy (#1203) ------------------------
+    // Arrival is the vendor inside the arrival radius: from there every step
+    // up to the end of the errand holds the character, so neither the wander
+    // nor a leader's follow can take it off before the buy is tried.
+    {
+        RecipeManualFacts f = AtTheVendor();
+        f.vendorInReach = false;
+        RecipeManualStep const approach = PlanRecipeManual(f).step;
+        Check("arrived but short of the interact gate: the last yards hold",
+              approach == RecipeManualStep::Approach && RecipeManualStepHoldsCharacter(approach));
+        f.vendorInReach = true;
+        RecipeManualStep const buy = PlanRecipeManual(f).step;
+        Check("arrived and in reach: the buy holds",
+              buy == RecipeManualStep::Buy && RecipeManualStepHoldsCharacter(buy));
+    }
+    Check("the use holds", RecipeManualStepHoldsCharacter(RecipeManualStep::Use));
+    Check("the wait for the use to read back holds",
+          RecipeManualStepHoldsCharacter(RecipeManualStep::Wait));
+    Check("the walk does not hold: the travel drive steers it",
+          !RecipeManualStepHoldsCharacter(RecipeManualStep::Walk));
+    Check("a learned recipe lets go", !RecipeManualStepHoldsCharacter(RecipeManualStep::Learned));
+    Check("a refusal lets go", !RecipeManualStepHoldsCharacter(RecipeManualStep::Refuse));
+
     // ---- which verb refusals release the errand -------------------------
     // Each detail below is fed to the release table AND looked up as a
     // refuse("...") inside DoBuy itself, so a test detail the real buy verb
@@ -271,8 +336,42 @@ int main()
     Check("a release drops the errand's progress with the column",
           source.find("Esc(name));\n        _recipeManuals.erase(name);") != std::string::npos);
     Check("progress for a column cleared from outside is pruned every poll",
-          source.find("it = errands.count(it->first) ? std::next(it) : _recipeManuals.erase(it);") !=
+          source.find("it = _recipeManuals.erase(it);") != std::string::npos);
+    Check("a column cleared from outside lets go of the hold",
+          source.find("ReleaseRecipeManualHold(it->first, \"the buy_recipe_item column was cleared\");") !=
               std::string::npos);
+    Check("the facts carry the errand's clock",
+          source.find("facts.errandSince = _recipeManuals[name].since;") != std::string::npos &&
+              source.find("facts.now = time(nullptr);") != std::string::npos);
+    Check("the clock starts the first poll the errand is seen",
+          source.find("if (!progress.since)\n            progress.since = time(nullptr);") !=
+              std::string::npos);
+    {
+        // The hold is taken off the plan's step BEFORE the step runs, so the
+        // approach walks under it and the buy finds the character standing.
+        std::size_t const plan = source.find("OverseerDecisions::PlanRecipeManual(facts);");
+        std::size_t const hold = source.find(
+            "if (OverseerDecisions::RecipeManualStepHoldsCharacter(plan.step))\n"
+            "            HoldAtTheManualVendor(bot, name);");
+        std::size_t const sw = source.find("switch (plan.step)", plan);
+        Check("the drive holds the character on the steps the decision names, before the step",
+              plan != std::string::npos && hold != std::string::npos && plan < hold && hold < sw);
+    }
+    Check("the hold takes follow and new rpg off through the shared hold",
+          source.find("HoldCharacterStill(bot, botAI, name, RECIPE_MANUAL_HOLD_VERB,") !=
+              std::string::npos);
+    Check("the hold's lease is renewed every poll that holds",
+          source.find("hold->second.until = time(nullptr) + RECIPE_MANUAL_HOLD_SECONDS;") !=
+              std::string::npos);
+    Check("every release of the errand lets go of its hold",
+          source.find("_recipeManuals.erase(name);\n        ReleaseRecipeManualHold(name,") !=
+              std::string::npos);
+    Check("a character a dungeon run has is let go of rather than left held",
+          source.find("ReleaseRecipeManualHold(name, \"a dungeon run has the character\");") !=
+              std::string::npos);
+    Check("the hold is lifted only when this drive placed it",
+          source.find("ReleaseHold(name, ObjectAccessor::FindPlayerByName(name), why, "
+                      "RECIPE_MANUAL_HOLD_VERB);") != std::string::npos);
     Check("the drive is polled",
           source.find("DriveRecipeManuals();") != std::string::npos);
 
