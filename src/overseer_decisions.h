@@ -2627,6 +2627,28 @@ bool DungeonRunAllThrough(std::vector<DungeonRunEntryState> const& members);
 std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& members,
                                     float doorstepYards);
 
+// PAST THIS A MEMBER IS NAMED BY ITS DISTANCE, not by "outside the trigger", so
+// a closed run says why that member was never going to arrive (#1316).
+constexpr float STAGED_INSIDE_REACH_YARDS = 4000.f;
+constexpr float STAGED_INSIDE_DOORSTEP_YARDS = 1000.f;
+constexpr time_t STAGED_INSIDE_LIVING_MEMBER_SECONDS = 5 * 60;
+
+// How long STAGED_INSIDE may go without anybody else getting in. A living member
+// within STAGED_INSIDE_DOORSTEP_YARDS walks in well inside
+// STAGED_INSIDE_LIVING_MEMBER_SECONDS or its walk has failed. One beyond
+// STAGED_INSIDE_REACH_YARDS, or on another map, is not coming: Bork stood 9076
+// yards out on 2026-11-01 with four inside. Between the two a walk can be working
+// and need longer: the rejoin measured 3712 yards out took about thirteen minutes.
+// Each arrival restarts this clock, so a party filing in is not cut off. A ghost
+// needs its revival first, and a member out of the world or in another copy is
+// measured by nothing here, so those keep the full backstop.
+time_t StagedInsideBackstopSeconds(std::vector<DungeonRunEntryState> const& members,
+                                   time_t fullBackstopSeconds);
+
+// When the patience shortens, as when a ghost stands up, the member gets the
+// shorter patience from now and not from a clock that may already be past it.
+time_t StagedInsideClockAfter(time_t since, time_t oldPatience, time_t patience, time_t now);
+
 // ------------------------------------------- getting one member back out --
 //
 // A CROSSING WALKS A PARTY THROUGH A DOOR TOGETHER. THIS IS THE OTHER CASE,
@@ -4078,10 +4100,20 @@ enum class DungeonRunAdoptPhase : uint8_t
 {
     StagedInside,  // part of the roster is inside a run that still has work
     Clearing,      // all of it is inside a run that still has work
-    Exiting,       // the instance is cleared: walk whoever is inside out
+    Exiting,       // the instance is cleared or the run is over: walk whoever is inside out
 };
 
-DungeonRunAdoptPhase DungeonRunAdoptAt(bool allThrough, DungeonCompletion completion);
+// `runIsOver` says this run was closed or abandoned and somebody is simply still
+// standing in it (#1316): a failed EXIT that hearthed the family out, or a
+// `split_failed`. That goes to EXIT for the reason a cleared instance does:
+// staging would walk everybody outside back in to a run that has ended.
+DungeonRunAdoptPhase DungeonRunAdoptAt(bool allThrough, DungeonCompletion completion,
+                                       bool runIsOver = false);
+
+// The encounter mask, or a proof the run already took before its EXIT failed, is
+// what proves a run complete. A run given up on and adopted at EXIT (#1316) proves
+// nothing and must never spend a campaign slot.
+bool AdoptedExitProvesComplete(DungeonCompletion completion, bool provedBeforeTheExit = false);
 
 // Select the encounters this run must credit. Independent-wing maps require a
 // non-empty, verified wing mask; otherwise completion remains unknowable.
@@ -22390,6 +22422,12 @@ struct ExitHearthFacts
     // out left: a split family is recovered by the crossing, and a member kept
     // inside holds the instance for its whole party without bound.
     std::int64_t failedWalkSeconds{0};
+    // WHETHER THE FAMILY HAS ALREADY HEARTHED AWAY (#1316). The withhold keeps a
+    // family on one continent, so it has nothing left to protect once another
+    // member of this episode has hearthed out. Keeping the stone then strands
+    // this member inside alone, IDLE adopts it at STAGED_INSIDE, and the family
+    // is sent straight back to the door it has just left.
+    bool familyHearthedOut{false};
 };
 
 // How long a walk out must have failed before a stone bound off the door's
