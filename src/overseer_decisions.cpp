@@ -1998,12 +1998,22 @@ std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& mem
 time_t StagedInsideBackstopSeconds(std::vector<DungeonRunEntryState> const& members,
                                    time_t fullBackstopSeconds)
 {
+    bool shortened = false;
     for (DungeonRunEntryState const& member : members)
     {
-        if (member.seen && member.alive && !member.through && !member.otherCopy)
-            return STAGED_INSIDE_LIVING_MEMBER_SECONDS;
+        if (!member.seen || !member.alive || member.through || member.otherCopy)
+            continue;
+        float const yards = member.distanceFromDoor;
+        if (yards > STAGED_INSIDE_DOORSTEP_YARDS && yards <= STAGED_INSIDE_REACH_YARDS)
+            return fullBackstopSeconds;
+        shortened = true;
     }
-    return fullBackstopSeconds;
+    return shortened ? STAGED_INSIDE_LIVING_MEMBER_SECONDS : fullBackstopSeconds;
+}
+
+time_t StagedInsideClockAfter(time_t since, time_t oldPatience, time_t patience, time_t now)
+{
+    return patience < oldPatience ? now : since;
 }
 
 std::vector<std::string> DungeonRunOtherCopy(std::vector<DungeonRunEntryState> const& members)
@@ -3295,9 +3305,9 @@ DungeonRunAdoptPhase DungeonRunAdoptAt(bool allThrough, DungeonCompletion comple
     return allThrough ? DungeonRunAdoptPhase::Clearing : DungeonRunAdoptPhase::StagedInside;
 }
 
-bool AdoptedExitProvesComplete(DungeonCompletion completion)
+bool AdoptedExitProvesComplete(DungeonCompletion completion, bool provedBeforeTheExit)
 {
-    return completion == DungeonCompletion::Complete;
+    return provedBeforeTheExit || completion == DungeonCompletion::Complete;
 }
 
 bool DungeonQuestGoalReady(std::vector<DungeonQuestObjective> const& objectives)

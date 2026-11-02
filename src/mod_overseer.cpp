@@ -36883,6 +36883,8 @@ private:
         // whichever of them was entered last. One ratchet per phase is what the
         // three that already exist do. See DUNGEON_STAGED_INSIDE_RATCHET.
         OverseerDecisions::RatchetState assembly;
+        // The patience the assembly clock last ran under (#1316).
+        time_t assemblyPatience{DUNGEON_STAGED_INSIDE_BACKSTOP_SECONDS};
         // THE STAGING WATCHDOG'S PER-MEMBER MEMORY (#164): whether each member
         // is actually closing on the staging point, and how far up the
         // correction ladder it has been taken. It lives on the RUN rather than
@@ -37790,6 +37792,9 @@ private:
     {
         uint32 mapId{0};
         std::string reason;
+        // The run had already proved itself complete, as Deadmines can only by
+        // the clearing check, so its adopted EXIT still counts.
+        bool provedComplete{false};
     };
     std::map<std::string, RunOverMark> _runOver;
     static bool DungeonRunPhaseStartsAFreshRun(DungeonRunPhase phase)
@@ -41495,9 +41500,9 @@ private:
                   "Still outside: {}. The attempt is CLOSED rather than left 'active': the "
                   "census is what hands the run to the clearing drive, so a run that cannot "
                   "satisfy it is not a slow run, it is five characters standing still with "
-                  "no ceiling on them. Closing walks whoever is left inside back out "
-                  "through the exit door, so the next run's BARRIER can gather everybody "
-                  "on one map. It does not spend "
+                  "no ceiling on them. Closing lets the next poll open a fresh run, whose "
+                  "RESET walks whoever is left inside back out through the exit door and "
+                  "whose BARRIER can then gather everybody on one map. It does not spend "
                   "run {} of the campaign: the party was never inside together",
                   coord.runNumber, coord.campaignId, inside, roster, portal.insideMapId,
                   minutes, blockers, coord.runNumber);
@@ -41522,8 +41527,9 @@ private:
                                coord.runNumber, "split_failed", reason,
                                JoinNames(members));
 
-        // Whoever is left inside walks out instead of being adopted back into
-        // another hold (#1316).
+        // A closure that ends at IDLE walks whoever is left inside out instead of
+        // adopting them back into another hold (#1316). A campaign that goes again
+        // goes through RESET, which does that walking and drops this mark.
         _runOver[FamilyOfCoordinator(coord)] = RunOverMark{portal.insideMapId, reason};
         EndRunAndDecide(coord, leaderName, portal, runId, "split_failed", reason,
                         stillWanted, &members);
@@ -55048,7 +55054,8 @@ private:
                             episode->second.run.stalledReason.empty()
                                 ? std::string("the walk out failed and the family hearthed "
                                               "out, so the run is over")
-                                : episode->second.run.stalledReason};
+                                : episode->second.run.stalledReason,
+                            episode->second.run.provedComplete};
                     _exitHearths.erase(episode);
                 }
             }
@@ -55254,7 +55261,8 @@ private:
                     // ends stalled with the reason it was given up, and does not
                     // spend a run of the campaign (#1316).
                     coord.provedComplete =
-                        OverseerDecisions::AdoptedExitProvesComplete(adoptedCompletion);
+                        OverseerDecisions::AdoptedExitProvesComplete(
+                            adoptedCompletion, runIsOver && runOver->second.provedComplete);
                     if (!coord.provedComplete && runIsOver)
                         coord.stalledReason = runOver->second.reason;
                     coord.crossing.best = 0.f;
@@ -57596,6 +57604,11 @@ private:
                         DUNGEON_STAGED_INSIDE_RATCHET;
                     assemblyLimits.patienceSeconds = OverseerDecisions::StagedInsideBackstopSeconds(
                         states, DUNGEON_STAGED_INSIDE_BACKSTOP_SECONDS);
+                    if (coord.assembly.seen)
+                        coord.assembly.since = OverseerDecisions::StagedInsideClockAfter(
+                            coord.assembly.since, coord.assemblyPatience,
+                            assemblyLimits.patienceSeconds, std::time(nullptr));
+                    coord.assemblyPatience = assemblyLimits.patienceSeconds;
                     OverseerDecisions::RatchetVerdict const assembling =
                         OverseerDecisions::Ratchet(coord.assembly,
                                                    static_cast<float>(inside),

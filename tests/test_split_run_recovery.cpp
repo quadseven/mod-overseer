@@ -37,6 +37,7 @@ using OverseerDecisions::ExitHearthFacts;
 using OverseerDecisions::ExitHearthStep;
 using OverseerDecisions::OffContinentHearthLetThrough;
 using OverseerDecisions::StagedInsideBackstopSeconds;
+using OverseerDecisions::StagedInsideClockAfter;
 
 namespace
 {
@@ -151,6 +152,16 @@ void ALivingMemberOutsideEndsTheHoldInsideFiveMinutes()
     Check("a living member 126 yards out whose walk has failed gets 5 minutes",
           StagedInsideBackstopSeconds(party, FULL_BACKSTOP) == 5 * 60);
 
+    party.back() = Outside(3712.f);
+    Check("a walk of thirteen minutes can be working, so it keeps the backstop",
+          StagedInsideBackstopSeconds(party, FULL_BACKSTOP) == FULL_BACKSTOP);
+
+    party.back() = Outside(126.f);
+    party.insert(party.begin(), Outside(3712.f));
+    Check("one member on a long walk holds the door for the whole party",
+          StagedInsideBackstopSeconds(party, FULL_BACKSTOP) == FULL_BACKSTOP);
+    party.erase(party.begin());
+
     party.back() = Outside(9076.f);
     Check("a member 9076 yards out cannot arrive, so it gets 5 minutes",
           StagedInsideBackstopSeconds(party, FULL_BACKSTOP) == 5 * 60);
@@ -177,6 +188,24 @@ void ALivingMemberOutsideEndsTheHoldInsideFiveMinutes()
           StagedInsideBackstopSeconds(party, FULL_BACKSTOP) == FULL_BACKSTOP);
 }
 
+void AShorterPatienceStartsFromNow()
+{
+    Check("a ghost standing up at minute 6 gets 5 minutes of its own",
+          StagedInsideClockAfter(100, 15 * 60, 5 * 60, 460) == 460);
+    Check("the same patience keeps its clock",
+          StagedInsideClockAfter(100, 5 * 60, 5 * 60, 460) == 100);
+    Check("a longer patience keeps its clock",
+          StagedInsideClockAfter(100, 5 * 60, 15 * 60, 460) == 100);
+}
+
+void ARunProvedBeforeItsExitStaysProved()
+{
+    Check("a map that cannot answer does not undo the clearing check's proof",
+          AdoptedExitProvesComplete(DungeonCompletion::Unknowable, true));
+    Check("an unproved given-up run proves nothing",
+          !AdoptedExitProvesComplete(DungeonCompletion::Unknowable, false));
+}
+
 void TheReasonNamesWhyTheMemberIsNotComing()
 {
     std::vector<DungeonRunEntryState> party(1, Outside(9076.f));
@@ -198,6 +227,8 @@ int main()
     ARunThatIsOverIsWalkedOutNotStagedInto();
     ARunGivenUpOnDoesNotEndComplete();
     ALivingMemberOutsideEndsTheHoldInsideFiveMinutes();
+    AShorterPatienceStartsFromNow();
+    ARunProvedBeforeItsExitStaysProved();
     TheReasonNamesWhyTheMemberIsNotComing();
 
     if (failures)

@@ -2629,18 +2629,25 @@ std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& mem
 
 // PAST THIS A MEMBER IS NAMED BY ITS DISTANCE, not by "outside the trigger", so
 // a closed run says why that member was never going to arrive (#1316).
-constexpr float STAGED_INSIDE_REACH_YARDS = 2000.f;
+constexpr float STAGED_INSIDE_REACH_YARDS = 4000.f;
+constexpr float STAGED_INSIDE_DOORSTEP_YARDS = 1000.f;
 constexpr time_t STAGED_INSIDE_LIVING_MEMBER_SECONDS = 5 * 60;
 
 // How long STAGED_INSIDE may go without anybody else getting in. A living member
-// outside either walks in well inside STAGED_INSIDE_LIVING_MEMBER_SECONDS or is
-// not coming: Bork stood 9076 yards out on 2026-11-01 with four inside. Each
-// arrival restarts this clock, so a party filing in is not cut off. A ghost needs
-// its revival first, and a member out of the world or in another copy is measured
-// by nothing here, so those keep the full backstop.
+// within STAGED_INSIDE_DOORSTEP_YARDS walks in well inside
+// STAGED_INSIDE_LIVING_MEMBER_SECONDS or its walk has failed. One beyond
+// STAGED_INSIDE_REACH_YARDS, or on another map, is not coming: Bork stood 9076
+// yards out on 2026-11-01 with four inside. Between the two a walk can be working
+// and need longer: the rejoin measured 3712 yards out took about thirteen minutes.
+// Each arrival restarts this clock, so a party filing in is not cut off. A ghost
+// needs its revival first, and a member out of the world or in another copy is
+// measured by nothing here, so those keep the full backstop.
 time_t StagedInsideBackstopSeconds(std::vector<DungeonRunEntryState> const& members,
                                    time_t fullBackstopSeconds);
 
+// When the patience shortens, as when a ghost stands up, the member gets the
+// shorter patience from now and not from a clock that may already be past it.
+time_t StagedInsideClockAfter(time_t since, time_t oldPatience, time_t patience, time_t now);
 
 // ------------------------------------------- getting one member back out --
 //
@@ -4103,9 +4110,10 @@ enum class DungeonRunAdoptPhase : uint8_t
 DungeonRunAdoptPhase DungeonRunAdoptAt(bool allThrough, DungeonCompletion completion,
                                        bool runIsOver = false);
 
-// Only the encounter mask proves a run complete. A run adopted at EXIT because it
-// was given up on (#1316) proves nothing and must never spend a campaign slot.
-bool AdoptedExitProvesComplete(DungeonCompletion completion);
+// The encounter mask, or a proof the run already took before its EXIT failed, is
+// what proves a run complete. A run given up on and adopted at EXIT (#1316) proves
+// nothing and must never spend a campaign slot.
+bool AdoptedExitProvesComplete(DungeonCompletion completion, bool provedBeforeTheExit = false);
 
 // Select the encounters this run must credit. Independent-wing maps require a
 // non-empty, verified wing mask; otherwise completion remains unknowable.

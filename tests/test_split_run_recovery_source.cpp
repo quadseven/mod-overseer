@@ -59,7 +59,8 @@ int main()
 
     // An abandoned run is not proved complete, and its reason is carried.
     std::string const adopt = Between(text, "uint32 adoptedInside = 0;", "adopting it at {}");
-    Require(adopt, "AdoptedExitProvesComplete(adoptedCompletion)", "the proof asks the mask");
+    Require(adopt, "adoptedCompletion, runIsOver && runOver->second.provedComplete",
+            "the proof asks the mask and the mark");
     Require(adopt, "coord.stalledReason = runOver->second.reason", "the reason is carried");
     if (adopt.find("coord.provedComplete = true;") != std::string::npos)
     {
