@@ -76,6 +76,12 @@ int main()
                 "the IDLE quarantine block line names the refused position");
         Require(source, "\"`overseer_approach_quarantine`. \"",
                 "the IDLE quarantine block line names the table");
+        Require(source,
+                "if (step == OverseerDecisions::StagingAim::NewLeg)\n                {\n"
+                "                    coord.gatherRetreat = OverseerDecisions::StagingRetreatState();",
+                "the retreat memory restarts with a new leg, not with a re-armed errand");
+        Require(source, "FailRetreat(coord, family, leaderName, members, *portal,",
+                "a leader giving the leg back closes the run");
     }
     if (Read("data/sql/characters/base/2026_10_25_00_overseer_approach_quarantine.sql",
              schema))

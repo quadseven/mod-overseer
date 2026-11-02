@@ -66,13 +66,17 @@ int main()
     for (char const* needed : {"OverseerDecisions::ParsePortalUseRequest(command)",
                                "OverseerDecisions::PickPortal(candidates, request.objectGuid, wall)",
                                "OverseerDecisions::PortalLeaderCrossesFirst(order)",
-                               "Refusal::LeaderFirst", "BeginPortalUse(", "Cast::InCombat",
-                               "Cast::NoBotAI"})
+                               "Refusal::LeaderFirst", "BeginPortalUse(",
+                               "PortalUseStateWall(who)"})
         if (!Has(row, needed))
         {
             std::cerr << "DoPortalUse must use " << needed << "\n";
             return EXIT_FAILURE;
         }
+
+    std::string const walls = Body(text, "static char const* PortalUseStateWall(");
+    if (!Has(walls, "Cast::InCombat") || !Has(walls, "Cast::NoBotAI"))
+        return Fail("PortalUseStateWall must carry the refusals `cast` has");
 
     std::string const begin = Body(text, "char const* BeginPortalUse(");
     for (char const* needed : {"HoldStillAndReport(", "AtTheStone(who, portal)",

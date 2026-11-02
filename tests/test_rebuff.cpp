@@ -23,6 +23,8 @@
 #include <string>
 
 using OverseerDecisions::DecideRebuff;
+using OverseerDecisions::RebuffCrossAskCooling;
+using OverseerDecisions::REBUFF_CROSS_ASK_COOLDOWN_SECONDS;
 using OverseerDecisions::RebuffDecision;
 using OverseerDecisions::RebuffFacts;
 using OverseerDecisions::RebuffMember;
@@ -210,12 +212,459 @@ void TheDriveIsWired()
     Check("and called", src.find("DriveRebuff();") != std::string::npos);
     if (def == std::string::npos)
         return;
-    std::size_t const end = src.find("\n    }\n", def);
+    std::size_t const end = src.find("\n    // THIS REALM SAYS WHAT IT IS AND WHAT IT IS RUNNING", def);
     std::string const body = src.substr(def, end == std::string::npos ? std::string::npos : end - def);
     Check("it decides with DecideRebuff", body.find("OverseerDecisions::DecideRebuff(") != std::string::npos);
     Check("it asks the AI's own action", body.find("DoSpecificAction(spell.action") != std::string::npos);
-    Check("it never casts a spell itself", body.find("CastSpell(") == std::string::npos);
+    Check("raid casts are queued as named cast rows",
+          body.find("'cast', '', '{}'") != std::string::npos &&
+          body.find(" on:\" +") != std::string::npos &&
+          body.find("decision.crossPartyTarget->name") != std::string::npos);
     Check("it never adds an aura itself", body.find("AddAura(") == std::string::npos);
+}
+
+// RAID GROUPING: only the caster's own subgroup for the party step (#1159).
+void CasterOwnSubgroupOnlyWhenInRaid()
+{
+    RebuffFacts facts;
+    facts.knowsSpell = true;
+    facts.mana = 2000;
+    facts.maxMana = 2000;
+    facts.cost = 300;
+    facts.inRaid = true;
+    facts.casterSubgroup = 0;
+    
+    // One group: 2 subgroups with 5 each
+    for (int i = 0; i < 5; ++i)
+    {
+        RebuffMember m;
+        m.hasBuff = false;
+        m.yards = 0.0f;
+        m.subgroup = 0;
+        m.hasBuffer = false;
+        facts.members.push_back(m);
+    }
+    for (int i = 0; i < 5; ++i)
+    {
+        RebuffMember m;
+        m.hasBuff = false;
+        m.yards = 0.0f;
+        m.subgroup = 1;
+        m.hasBuffer = false;
+        facts.members.push_back(m);
+    }
+    
+    RebuffDecision const d = DecideRebuff(facts);
+    Check("in a raid, only caster's subgroup is counted as missing",
+          d.missing == 5 && d.inReach == 5);
+}
+
+void CrossPartyTargetChosenWhenNoBufferInSubgroup()
+{
+    RebuffFacts facts;
+    facts.knowsSpell = true;
+    facts.mana = 2000;
+    facts.maxMana = 2000;
+    facts.cost = 300;
+    facts.inRaid = true;
+    
+    // Caster's subgroup: all have buff
+    for (int i = 0; i < 5; ++i)
+    {
+        RebuffMember m;
+        m.hasBuff = true;
+        m.yards = 0.0f;
+        m.subgroup = 0;
+        m.hasBuffer = true;
+        m.alive = true;
+        m.sameMap = true;
+        facts.members.push_back(m);
+    }
+    
+    // Other subgroup has no living caster able to provide this buff.
+    for (int i = 0; i < 4; ++i)
+    {
+        RebuffMember m;
+        m.hasBuff = false;
+        m.yards = 15.0f;
+        m.subgroup = 1;
+        m.hasBuffer = false;
+        m.alive = true;
+        m.sameMap = true;
+        facts.members.push_back(m);
+    }
+    RebuffDecision const d = DecideRebuff(facts);
+    Check("cross-party target chosen only if subgroup has no buffer",
+          d.crossPartyTarget.has_value() && d.crossPartyTarget->subgroup == 1);
+}
+
+void OutsideRaidKeepsWholePartyCount()
+{
+    RebuffFacts facts = TownTrip();
+    RebuffMember other = Member(false, 12.0f);
+    other.subgroup = 1;
+    facts.members.push_back(other);
+    RebuffDecision const d = DecideRebuff(facts);
+    Check("outside a raid all party members still count", d.missing == 6 && d.inReach == 6);
+    Check("outside a raid there is no cross-party target", !d.crossPartyTarget.has_value());
+}
+
+void CrossPartyTargetRejectedIfBufferInSubgroup()
+{
+    RebuffFacts facts;
+    facts.knowsSpell = true;
+    facts.mana = 2000;
+    facts.maxMana = 2000;
+    facts.cost = 300;
+    facts.inRaid = true;
+    
+    // Caster's subgroup: all have buff
+    for (int i = 0; i < 5; ++i)
+    {
+        RebuffMember m;
+        m.hasBuff = true;
+        m.yards = 0.0f;
+        m.subgroup = 0;
+        m.hasBuffer = true;
+        m.alive = true;
+        m.sameMap = true;
+        facts.members.push_back(m);
+    }
+    
+    // Other subgroup: all have buffer
+    for (int i = 0; i < 5; ++i)
+    {
+        RebuffMember m;
+        m.hasBuff = false;
+        m.yards = 15.0f;
+        m.subgroup = 1;
+        m.hasBuffer = true;
+        m.alive = true;
+        m.sameMap = true;
+        facts.members.push_back(m);
+    }
+    
+    RebuffDecision const d = DecideRebuff(facts);
+    Check("no cross-party target when subgroup has buffer",
+          !d.crossPartyTarget.has_value());
+}
+
+void CrossPartyTargetRejectedIfOutofReach()
+{
+    RebuffFacts facts;
+    facts.knowsSpell = true;
+    facts.mana = 2000;
+    facts.maxMana = 2000;
+    facts.cost = 300;
+    facts.inRaid = true;
+    
+    // Caster's subgroup: all have buff
+    for (int i = 0; i < 5; ++i)
+    {
+        RebuffMember m;
+        m.hasBuff = true;
+        m.yards = 0.0f;
+        m.subgroup = 0;
+        m.hasBuffer = true;
+        m.alive = true;
+        m.sameMap = true;
+        facts.members.push_back(m);
+    }
+    
+    // Other subgroup: one member at exactly REBUFF_REACH_YARDS
+    RebuffMember m;
+    m.hasBuff = false;
+    m.yards = OverseerDecisions::REBUFF_REACH_YARDS + 0.1f;
+    m.subgroup = 1;
+    m.hasBuffer = false;
+    m.alive = true;
+    m.sameMap = true;
+    m.inSight = true;
+    facts.members.push_back(m);
+    
+    RebuffDecision const d = DecideRebuff(facts);
+    Check("cross-party target rejected if out of reach",
+          !d.crossPartyTarget.has_value());
+}
+
+void CrossPartyTargetRejectedIfOutOfSight()
+{
+    RebuffFacts facts;
+    facts.knowsSpell = true;
+    facts.mana = 2000;
+    facts.maxMana = 2000;
+    facts.cost = 300;
+    facts.inRaid = true;
+    
+    // Caster's subgroup: all have buff
+    for (int i = 0; i < 5; ++i)
+    {
+        RebuffMember m;
+        m.hasBuff = true;
+        m.yards = 0.0f;
+        m.subgroup = 0;
+        m.hasBuffer = true;
+        m.alive = true;
+        m.sameMap = true;
+        facts.members.push_back(m);
+    }
+    
+    // Other subgroup: one member out of sight
+    RebuffMember m;
+    m.hasBuff = false;
+    m.yards = 10.0f;
+    m.subgroup = 1;
+    m.hasBuffer = false;
+    m.alive = true;
+    m.sameMap = true;
+    m.inSight = false;
+    facts.members.push_back(m);
+    
+    RebuffDecision const d = DecideRebuff(facts);
+    Check("cross-party target rejected if out of sight",
+          !d.crossPartyTarget.has_value());
+}
+
+void CrossPartyTargetRejectedIfDead()
+{
+    RebuffFacts facts;
+    facts.knowsSpell = true;
+    facts.mana = 2000;
+    facts.maxMana = 2000;
+    facts.cost = 300;
+    facts.inRaid = true;
+    
+    // Caster's subgroup: all have buff
+    for (int i = 0; i < 5; ++i)
+    {
+        RebuffMember m;
+        m.hasBuff = true;
+        m.yards = 0.0f;
+        m.subgroup = 0;
+        m.hasBuffer = true;
+        m.alive = true;
+        m.sameMap = true;
+        facts.members.push_back(m);
+    }
+    
+    // Other subgroup: one dead member
+    RebuffMember m;
+    m.hasBuff = false;
+    m.yards = 10.0f;
+    m.subgroup = 1;
+    m.hasBuffer = false;
+    m.alive = false;
+    m.sameMap = true;
+    facts.members.push_back(m);
+    
+    RebuffDecision const d = DecideRebuff(facts);
+    Check("cross-party target rejected if dead",
+          !d.crossPartyTarget.has_value());
+}
+
+void CrossPartyTargetRejectedIfNotSameMap()
+{
+    RebuffFacts facts;
+    facts.knowsSpell = true;
+    facts.mana = 2000;
+    facts.maxMana = 2000;
+    facts.cost = 300;
+    facts.inRaid = true;
+    
+    // Caster's subgroup: all have buff
+    for (int i = 0; i < 5; ++i)
+    {
+        RebuffMember m;
+        m.hasBuff = true;
+        m.yards = 0.0f;
+        m.subgroup = 0;
+        m.hasBuffer = true;
+        m.alive = true;
+        m.sameMap = true;
+        facts.members.push_back(m);
+    }
+    
+    // Other subgroup: one on another map
+    RebuffMember m;
+    m.hasBuff = false;
+    m.yards = 10.0f;
+    m.subgroup = 1;
+    m.hasBuffer = false;
+    m.alive = true;
+    m.sameMap = false;
+    facts.members.push_back(m);
+    
+    RebuffDecision const d = DecideRebuff(facts);
+    Check("cross-party target rejected if not same map",
+          !d.crossPartyTarget.has_value());
+}
+
+void CrossPartyTargetIsNearest()
+{
+    RebuffFacts facts;
+    facts.knowsSpell = true;
+    facts.mana = 2000;
+    facts.maxMana = 2000;
+    facts.cost = 300;
+    facts.inRaid = true;
+    
+    // Caster's subgroup: all have buff
+    for (int i = 0; i < 5; ++i)
+    {
+        RebuffMember m;
+        m.hasBuff = true;
+        m.yards = 0.0f;
+        m.subgroup = 0;
+        m.hasBuffer = true;
+        m.alive = true;
+        m.sameMap = true;
+        facts.members.push_back(m);
+    }
+    
+    // Other subgroup: two members at different distances
+    for (int i = 0; i < 2; ++i)
+    {
+        RebuffMember m;
+        m.hasBuff = false;
+        m.yards = 10.0f + i * 5.0f;
+        m.subgroup = 1;
+        m.hasBuffer = false;
+        m.alive = true;
+        m.sameMap = true;
+        m.inSight = true;
+        facts.members.push_back(m);
+    }
+    
+    RebuffDecision const d = DecideRebuff(facts);
+    Check("cross-party target is the nearest one",
+          d.crossPartyTarget.has_value() && d.crossPartyTarget->yards == 10.0f);
+}
+
+void CrossPartyTargetAtMostOnePerPoll()
+{
+    RebuffFacts facts;
+    facts.knowsSpell = true;
+    facts.mana = 2000;
+    facts.maxMana = 2000;
+    facts.cost = 300;
+    facts.inRaid = true;
+    
+    // Caster's subgroup: all have buff
+    for (int i = 0; i < 5; ++i)
+    {
+        RebuffMember m;
+        m.hasBuff = true;
+        m.yards = 0.0f;
+        m.subgroup = 0;
+        m.hasBuffer = true;
+        m.alive = true;
+        m.sameMap = true;
+        facts.members.push_back(m);
+    }
+    
+    // Other subgroup: two members
+    for (int i = 0; i < 2; ++i)
+    {
+        RebuffMember m;
+        m.hasBuff = false;
+        m.yards = 15.0f;
+        m.subgroup = 1;
+        m.hasBuffer = false;
+        m.alive = true;
+        m.sameMap = true;
+        m.inSight = true;
+        facts.members.push_back(m);
+    }
+    
+    RebuffDecision const d = DecideRebuff(facts);
+    Check("at most one cross-party target per poll",
+          d.crossPartyTarget.has_value());
+}
+
+
+// A RAID FACTS SET FOR THE CROSS-PARTY THROTTLE: the caster's own subgroup is
+// all buffed, and subgroup 1 has two members with no buffer and no buff, the
+// nearer at 10 yards and the farther at 20.
+RebuffFacts RaidWithTwoCrossTargets()
+{
+    RebuffFacts facts;
+    facts.knowsSpell = true;
+    facts.mana = 2000;
+    facts.maxMana = 2000;
+    facts.cost = 300;
+    facts.inRaid = true;
+    facts.casterSubgroup = 0;
+    RebuffMember self = Member(true, 0.0f);
+    self.name = "Caster";
+    facts.members.push_back(self);
+    RebuffMember near = Member(false, 10.0f);
+    near.name = "Near";
+    near.subgroup = 1;
+    facts.members.push_back(near);
+    RebuffMember far = Member(false, 20.0f);
+    far.name = "Far";
+    far.subgroup = 1;
+    facts.members.push_back(far);
+    return facts;
+}
+
+// A CAST THAT DOES NOT LAND IS NOT RE-QUEUED EVERY POLL (#1159). The target
+// still lacks the buff on the next poll, so without the throttle it is chosen
+// again and another kind='cast' row goes in thirty seconds after the last.
+void ACrossAskStandsForItsCooldown()
+{
+    RebuffFacts facts = RaidWithTwoCrossTargets();
+    RebuffDecision first = DecideRebuff(facts);
+    Check("the nearer raider is the first cross-party target",
+          first.crossPartyTarget && first.crossPartyTarget->name == "Near");
+
+    facts.members[1].crossAskedRecently = true;
+    RebuffDecision second = DecideRebuff(facts);
+    Check("a raider asked for within the cooldown is not asked for again",
+          !second.crossPartyTarget || second.crossPartyTarget->name != "Near");
+    Check("the next eligible raider is chosen instead",
+          second.crossPartyTarget && second.crossPartyTarget->name == "Far");
+
+    facts.members[2].crossAskedRecently = true;
+    Check("with every eligible raider asked for, no cross-party target",
+          !DecideRebuff(facts).crossPartyTarget);
+    Check("the party step itself is untouched by the throttle",
+          DecideRebuff(facts).step == first.step);
+}
+
+void TheCrossAskCooldownClock()
+{
+    std::time_t const t = 1700000000;
+    Check("never asked is not cooling", !RebuffCrossAskCooling(0, t));
+    Check("just asked is cooling", RebuffCrossAskCooling(t, t));
+    Check("one poll later is still cooling", RebuffCrossAskCooling(t, t + 30));
+    Check("one second short of the cooldown is still cooling",
+          RebuffCrossAskCooling(t, t + REBUFF_CROSS_ASK_COOLDOWN_SECONDS - 1));
+    Check("at the cooldown it has run out",
+          !RebuffCrossAskCooling(t, t + REBUFF_CROSS_ASK_COOLDOWN_SECONDS));
+    Check("a clock that went backwards ends the cooldown", !RebuffCrossAskCooling(t, t - 60));
+    Check("the cooldown is longer than one thirty-second poll",
+          REBUFF_CROSS_ASK_COOLDOWN_SECONDS > 30);
+}
+
+// The drive fills the throttle and keeps the said-on-a-change rule in a raid.
+void TheDriveThrottlesCrossAsks()
+{
+    std::string const src = Slurp("src/mod_overseer.cpp");
+    std::size_t const def = src.find("void DriveRebuff()");
+    Check("DriveRebuff is defined (throttle)", def != std::string::npos);
+    if (def == std::string::npos)
+        return;
+    std::size_t const end = src.find("\n    // THIS REALM SAYS WHAT IT IS AND WHAT IT IS RUNNING", def);
+    std::string const body = src.substr(def, end == std::string::npos ? std::string::npos : end - def);
+    Check("each member is marked with whether this caster asked for it recently",
+          body.find("seen.crossAskedRecently =") != std::string::npos);
+    Check("the asks are aged with RebuffCrossAskCooling",
+          body.find("OverseerDecisions::RebuffCrossAskCooling(") != std::string::npos);
+    Check("a queued cross-party ask is recorded with its time",
+          body.find("crossAskedAt[decision.crossPartyTarget->name] = now;") != std::string::npos);
+    Check("a cross-party target does not bypass the said-on-a-change rule",
+          body.find("!decision.crossPartyTarget && said") == std::string::npos);
 }
 
 }  // namespace
@@ -231,6 +680,19 @@ int main()
     TheClassTable();
     EveryStepHasAWord();
     TheDriveIsWired();
+    CasterOwnSubgroupOnlyWhenInRaid();
+    CrossPartyTargetChosenWhenNoBufferInSubgroup();
+    CrossPartyTargetRejectedIfBufferInSubgroup();
+    CrossPartyTargetRejectedIfOutofReach();
+    CrossPartyTargetRejectedIfOutOfSight();
+    CrossPartyTargetRejectedIfDead();
+    CrossPartyTargetRejectedIfNotSameMap();
+    CrossPartyTargetIsNearest();
+    CrossPartyTargetAtMostOnePerPoll();
+    OutsideRaidKeepsWholePartyCount();
+    ACrossAskStandsForItsCooldown();
+    TheCrossAskCooldownClock();
+    TheDriveThrottlesCrossAsks();
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);

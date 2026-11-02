@@ -25,14 +25,16 @@ class DoorFloorReplayTest(unittest.TestCase):
         compiler = shutil.which(os.environ.get("CXX", "c++"))
         self.assertIsNotNone(compiler, "C++17 compiler required")
         source = (ROOT / "src/mod_overseer.cpp").read_text()
-        bodies = "\n\n".join(
-            function(source, signature)
-            for signature in (
-                "static bool NavmeshRoutes(",
+        signatures = ["static bool NavmeshRoutes("]
+        if "static bool PlanNavmeshRoute(" in source:
+            signatures.append("static bool PlanNavmeshRoute(")
+        signatures.extend(
+            [
                 "static OverseerDecisions::AreaTriggerShape TriggerShapeOf(",
                 "static OverseerDecisions::DoorAimHeight DoorAimHeightFor(",
-            )
+            ]
         )
+        bodies = "\n\n".join(function(source, s) for s in signatures)
         harness = (ROOT / "tests/fixtures/door_floor/replay.cpp").read_text()
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)

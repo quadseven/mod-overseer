@@ -37,6 +37,8 @@ using OverseerDecisions::RaidAssembleWaitSeconds;
 using OverseerDecisions::RAID_FORM_WAIT_SECONDS;
 using OverseerDecisions::RAID_STONE_SUMMON_AFTER_SECONDS;
 using OverseerDecisions::RAID_STONE_SUMMON_TRIES;
+using OverseerDecisions::RaidClearCount;
+using OverseerDecisions::RaidClearProgress;
 using OverseerDecisions::RaidDoor;
 using OverseerDecisions::RaidDoorFor;
 using OverseerDecisions::RaidKeywordForJob;
@@ -644,6 +646,89 @@ void TheInFlightSummonVerdictIsReadIndependentOfGroup()
 
 }  // namespace
 
+void TheUpperSpireDoorIsTheLowerSpiresTriggerWithAWing()
+{
+    RaidDoor const* door = RaidDoorFor("ubrs");
+    Check("the upper spire has a door", door != nullptr);
+    if (!door)
+        return;
+    Check("entered from the mountain's own map", door->outsideMapId == 0);
+    Check("through the spire's only portal", door->entryTriggerId == 1468);
+    Check("onto the spire's map", door->insideMapId == 229);
+    Check("and out by the spire's exit", door->exitTriggerId == 1470);
+    Check("staged on the exit's landing", door->stageX == -7524.7f &&
+                                              door->stageY == -1228.41f &&
+                                              door->stageZ == 287.204f);
+    Check("the access row's level", door->minLevel == 45);
+    CheckString("the brain is armed on the upper wing", door->clearWing, "ubrs");
+    Check("no bot strategy exists for the map", *door->fightStrategy == '\0');
+    Check("the mountain's stones serve this door too",
+          door->meetingStones[0] == 179587 && door->meetingStones[1] == 179586);
+    Check("the job names it", RaidKeywordForJob("raid:ubrs") == "ubrs");
+}
+
+void MoltenCoreStaysAWholeMapRun()
+{
+    RaidDoor const* door = RaidDoorFor("moltencore");
+    Check("molten core keeps its door", door != nullptr);
+    if (!door)
+        return;
+    CheckString("no wing", door->clearWing, "");
+    std::vector<bool> const slots = {true, true, false};
+    RaidClearCount const count = RaidClearProgress(*door, slots);
+    Check("every slot counts", count.done == 2 && count.total == 3);
+}
+
+void TheUpperSpireIsClearedByItsOwnBossesOnly()
+{
+    RaidDoor const* door = RaidDoorFor("ubrs");
+    Check("the upper spire's door for its clear", door != nullptr);
+    if (!door)
+        return;
+    // The instance keeps 23 slots: nine Lower Spire bosses, five Upper Spire
+    // bosses, Valthalak, and eight hall flags no boss ever sets.
+    std::vector<bool> slots(23, false);
+    for (unsigned lower = 0; lower <= 8; ++lower)
+        slots[lower] = true;
+    RaidClearCount count = RaidClearProgress(*door, slots);
+    Check("a cleared Lower Spire credits nothing", count.done == 0 && count.total == 4);
+    slots[9] = slots[10] = slots[12] = true;
+    count = RaidClearProgress(*door, slots);
+    Check("three of four is not a clear", count.done == 3 && count.total == 4);
+    slots[13] = true;
+    count = RaidClearProgress(*door, slots);
+    Check("Drakkisath ends it", count.done == 4 && count.total == 4);
+    Check("a short read counts no slot it does not have",
+          RaidClearProgress(*door, std::vector<bool>(5, true)).done == 0);
+}
+
+void ADungeonTypeRaidDoorHoldsTheBrainUntilClear()
+{
+    Check("off the order's map a dungeon map arms as ever",
+          DungeonClearMayArmHere(false, false, false));
+    Check("on the order's map it holds", !DungeonClearMayArmHere(false, false, true));
+    Check("until the run is in CLEAR", DungeonClearMayArmHere(false, true, true));
+}
+
+void TheAdapterArmsTheRunsWing()
+{
+    std::ifstream in("src/mod_overseer.cpp");
+    std::stringstream source;
+    source << in.rdbuf();
+    std::string const text = source.str();
+    Check("dc on carries the wing",
+          Has(text, "DoSpecificAction(\"dc on\", Event(\"dc\", raidWing, issuer), true)"));
+    Check("the wing is the order's door's, on that door's map only",
+          Has(text, "onRaidDoorMap ? raidDoor->second->clearWing : \"\""));
+    Check("the hold is scoped to the door's map",
+          Has(text, "raidDoor->second->insideMapId == bot->GetMapId()"));
+    Check("every member's door is marked each poll, order standing or run past Idle",
+          Has(text, "if (door && (inRun || !ordered.empty()))") &&
+              Has(text, "doorByMember[member.name] = door;"));
+    Check("the encounter read goes through the door's own count",
+          Has(text, "RaidClearProgress(*door, slots)"));
+}
+
 int main()
 {
     TheRepairFloorIsStrictAndConfigurable();
@@ -666,6 +751,11 @@ int main()
     AStragglerIsSummonedByASeatAtTheStone();
     TheStonesMinimumIsKeptForBothEnds();
     TheInFlightSummonVerdictIsReadIndependentOfGroup();
+    TheUpperSpireDoorIsTheLowerSpiresTriggerWithAWing();
+    MoltenCoreStaysAWholeMapRun();
+    TheUpperSpireIsClearedByItsOwnBossesOnly();
+    ADungeonTypeRaidDoorHoldsTheBrainUntilClear();
+    TheAdapterArmsTheRunsWing();
 
     if (failures)
     {

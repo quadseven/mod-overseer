@@ -19,6 +19,12 @@ that can be told what to do and that report what they did.
    (`overseer_snapshot`), deaths, events, dungeon run records and loot
    decisions, in `overseer_*` tables an outside page can read.
 
+`overseer_zone_danger` holds the routing rule's current result for each online
+roster member, replaced alongside presence snapshots and expired after logout.
+It includes party/map context, scores and counted deaths; the existing `state`
+probe carries the same projection. Consumers read this result rather than
+reimplementing the danger rule.
+
 ## Quick start
 
 There is no standalone build: the module compiles inside an AzerothCore
@@ -53,6 +59,7 @@ flowchart LR
 | `src/mod_overseer.cpp` | The module: the scripts hooked into the worldserver, the command poll, and the writes back. |
 | `src/overseer_decisions.{h,cpp}` | The pure decisions. They include only the C++ standard library, so tests compile them with no core behind them. |
 | `src/overseer_core_compat.h` | The seam between the module and core or playerbots APIs that move between pins. |
+| `src/overseer_disenchant*.h` | Reagent inventory proof and the prepared, queued disenchant command store. |
 | `data/sql/characters/base/` | Dated migrations against `characters`, applied in filename order by the core's `dbimport`. Each is guarded, so an older schema degrades rather than crashing. |
 | `patches/`, `apply-patches.sh` | Small patches to the pinned core and mod-playerbots, applied at build time with zero fuzz. `patches/README.md` explains the mechanics. |
 | `realm-pins.env` | The one copy of the pinned core, mod-playerbots and module SHAs that CI builds against. |
@@ -84,6 +91,22 @@ run state. Once every family member is observed outside, normal run
 finalization records the outcome and advances the same campaign. An unseen
 member is not proof of an exit; a member still inside remains in recovery.
 
+### Disenchanting a carried item
+
+A `disenchant` command names one enabled roster character on `job='craft'`.
+Reserved items are excluded, and reservations are checked again before source destruction.
+The executor selects a carried, soulbound uncommon item its owner cannot use
+and has sufficient Enchanting skill to disenchant. The core casts spell 13262
+at that item and generates its ordinary disenchant loot. The loot hook stores
+the reagents; a later poll verifies every rolled count in the bags and the
+source item's removal before marking the command `delivered`. Temporary
+refusals keep the command `claimed` with a reason for its next attempt.
+
+The command store uses bound prepared statements and an asynchronous worker,
+with a separate startup connection using the existing character-database
+configuration. The general command drain leaves this kind to that store.
+This carried-item executor is separate from the group-loot roll setting below.
+
 ## Run and test locally
 
 The pull request gate `.github/workflows/check.decisions.yml` runs these
@@ -112,10 +135,33 @@ and pure trigger decisions against fixed map and navigation readings. Its
 Razorfen Downs fixture models a surface above the routed floor. It requires
 a C++17 compiler, without client map files, a realm or a database.
 
+The long-navmesh replay compiles the actual route planner, walking adapter,
+door census and crossing loop. Its explicit navigation boundary records the
+native smoothing-buffer refusal and the corner prefix measured on that route.
+Every selected leg must pass the ordinary mover's path check. Sphere and
+rotated-box crossings use the actual containment decision, including a member
+on the wrong floor. The session boundary refuses crossings outside the trigger.
+This replay needs a C++17 compiler and does not include client map data. Live
+walking and repeated campaigns still require realm verification.
+
+The bag-purchase replay executes the actual buy preflight, packet dispatch
+and inventory readback against explicit inventory and session boundaries.
+It checks a full backpack with an empty bag position, refusal cases, and
+the existing ordinary storage path. Native adapter CI checks the SDK calls;
+live vendor purchases still require realm verification.
+
 The family-run replay compiles the actual ledger adapters against SQLite.
 It needs the SQLite development library as well as a C++17 compiler. It checks
 independent families on one map, repeated members, adoption, ownership after
 one run ends, and the older single-family schema behavior.
+
+The disenchant replay runs through `test_disenchant_adapter.cpp` in the same
+test loop. It compiles the actual drive, loot adapter and prepared command SQL
+against a controlled core API boundary and a real isolated SQLite ledger.
+It checks asynchronous ownership, unchanged inventory after accepted calls,
+cast and storage refusals, release and acknowledgement retries, and queue
+fairness. It needs a C++17 compiler and SQLite development files. Native SDK
+compilation and a realm's item-to-reagent result remain separate evidence.
 
 The family ledger migration keeps one active row per family and map. An active
 legacy row is adopted only when its complete recorded membership identifies
@@ -130,7 +176,8 @@ server. `MYSQL_REPLAY_COMMAND` can supply a JSON array of client arguments,
 such as `["docker","exec","-i","your-test-mysql","mysql","--user=root"]`.
 The test uses only its `overseer_run_family_replay` fixture database. It checks
 different column collations, conservative adoption, index replacement,
-idempotent reapplication, and native MySQL upserts.
+idempotent reapplication, and native MySQL upserts. The same suite checks the
+zone-danger snapshot migration twice, its JSON replacement and explicit collation.
 
 `scripts/check-locally.sh decisions` runs the same steps (plus the check that
 `VERSION` matches the constant in `src/overseer_decisions.h`) in a scratch

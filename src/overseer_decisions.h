@@ -51,9 +51,11 @@
 #include <cstdio>
 #include <ctime>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <optional>
 #include <vector>
 
 namespace OverseerDecisions
@@ -2589,6 +2591,10 @@ struct DungeonRunEntryState
     // On the dungeon map but in a different COPY of it than the head (#620).
     // Never `through`: see InAnotherInstanceCopy.
     bool otherCopy{false};
+    // A reachable edge of the actual trigger can be beyond the center's
+    // conservative doorstep radius. The native census measures containment;
+    // an absent reading retains the legacy distance gate for older callers.
+    std::optional<bool> insideDoor;
 };
 
 
@@ -2620,6 +2626,28 @@ bool DungeonRunAllThrough(std::vector<DungeonRunEntryState> const& members);
 // that is harder to test twice.
 std::string DungeonRunEntryBlockers(std::vector<DungeonRunEntryState> const& members,
                                     float doorstepYards);
+
+// PAST THIS A MEMBER IS NAMED BY ITS DISTANCE, not by "outside the trigger", so
+// a closed run says why that member was never going to arrive (#1316).
+constexpr float STAGED_INSIDE_REACH_YARDS = 4000.f;
+constexpr float STAGED_INSIDE_DOORSTEP_YARDS = 1000.f;
+constexpr time_t STAGED_INSIDE_LIVING_MEMBER_SECONDS = 5 * 60;
+
+// How long STAGED_INSIDE may go without anybody else getting in. A living member
+// within STAGED_INSIDE_DOORSTEP_YARDS walks in well inside
+// STAGED_INSIDE_LIVING_MEMBER_SECONDS or its walk has failed. One beyond
+// STAGED_INSIDE_REACH_YARDS, or on another map, is not coming: Bork stood 9076
+// yards out on 2026-11-01 with four inside. Between the two a walk can be working
+// and need longer: the rejoin measured 3712 yards out took about thirteen minutes.
+// Each arrival restarts this clock, so a party filing in is not cut off. A ghost
+// needs its revival first, and a member out of the world or in another copy is
+// measured by nothing here, so those keep the full backstop.
+time_t StagedInsideBackstopSeconds(std::vector<DungeonRunEntryState> const& members,
+                                   time_t fullBackstopSeconds);
+
+// When the patience shortens, as when a ghost stands up, the member gets the
+// shorter patience from now and not from a clock that may already be past it.
+time_t StagedInsideClockAfter(time_t since, time_t oldPatience, time_t patience, time_t now);
 
 // ------------------------------------------- getting one member back out --
 //
@@ -3214,6 +3242,26 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
                                                   unsigned maximumSkips,
                                                   bool skipRefused = false);
 
+// A PARTY-WAIT STOP IS ARMED AGAIN, NOT SKIPPED (#1308). The dungeon module
+// switches itself off when one member stays out of range or short of mana for
+// its wait, and `dc skip` is refused once it is off, so a lagging follower ended
+// a run with two bosses credited. `dc on` restarts the wait with the party that
+// has since caught up. True while `stopReason` is that stop and `rearms` is
+// under `maximumRearms`; every other stop keeps the skip ladder.
+bool DungeonClearWaitStopRearms(std::string const& stopReason, unsigned rearms,
+                                unsigned maximumRearms);
+
+// YARDS WALKED WITH THE BRAIN OFF ARE NOT A RUN GOING ANYWHERE. The CLEARING
+// watchdog takes the tank's yards as progress, which is only true while the
+// dungeon module is driving. On 2026-10-31 it stopped itself at 08:21:05 ("the
+// party never became ready after 180s") with two bosses credited, and the tank
+// then drifted 50 yards back and forth for over 45 minutes: every drift reset
+// the ladder, no `dc skip` went out, and the active row held the map against
+// the next family. `stopReason` is the module's last stop text, which it keeps
+// until the next `dc on`; while it says anything the reading is 0 yards, so the
+// stall clock runs and the refused skip ends the run.
+float DungeonClearWatchdogYards(float yardsFromMark, std::string const& stopReason);
+
 // WHY THE MODULE STOPPED, NOT HOW THE EXIT WAS CLEANED UP (#1089). A run that
 // stalls after the dungeon module switched itself off used to record only that
 // a `dc skip` was refused, and then the exit's own wording ("the failed exit
@@ -3297,6 +3345,21 @@ bool ForgetDcOnRecord(bool inWorld, bool onDungeonMap);
 // than `ceilingSeconds` at `now`, so the run is walked out rather than held.
 // A zero `awaySince` (not away) or a clock stepped backwards never ends it.
 bool LeaderAwayEndsRun(time_t awaySince, time_t now, long ceilingSeconds);
+
+// THE ARMING HOLD DOES NOT OUTLAST THE LEADER-AWAY BOUND. CLEARING held its stall
+// clock for "`dc on` not accepted" and returned before it read the leader's map.
+// A leader that died inside and revived on the outdoor map left four members
+// refused 235 times in four hours, with `LeaderAwayEndsRun` never asked, because
+// the dungeon brain will not arm a party whose tank is elsewhere. The bound is
+// asked first: a leader away past it walks the party out through EXIT.
+enum class ClearingArmGate : uint8_t
+{
+    Armed,           // accepted on everyone inside
+    HoldNotArmed,    // not yet, and the leader is here or still inside its bound
+    LeaderAwayEnds,  // not armed, and the leader is not coming back to this run
+};
+ClearingArmGate DecideClearingArmGate(bool acceptedOnEveryoneInside, time_t leaderAwaySince,
+                                      time_t now, long ceilingSeconds);
 
 // Does the CLEARING stall clock run this poll (#618)? Only while the brain can
 // actually be driven: `dc on` accepted for everyone inside, the leader
@@ -4037,10 +4100,20 @@ enum class DungeonRunAdoptPhase : uint8_t
 {
     StagedInside,  // part of the roster is inside a run that still has work
     Clearing,      // all of it is inside a run that still has work
-    Exiting,       // the instance is cleared: walk whoever is inside out
+    Exiting,       // the instance is cleared or the run is over: walk whoever is inside out
 };
 
-DungeonRunAdoptPhase DungeonRunAdoptAt(bool allThrough, DungeonCompletion completion);
+// `runIsOver` says this run was closed or abandoned and somebody is simply still
+// standing in it (#1316): a failed EXIT that hearthed the family out, or a
+// `split_failed`. That goes to EXIT for the reason a cleared instance does:
+// staging would walk everybody outside back in to a run that has ended.
+DungeonRunAdoptPhase DungeonRunAdoptAt(bool allThrough, DungeonCompletion completion,
+                                       bool runIsOver = false);
+
+// The encounter mask, or a proof the run already took before its EXIT failed, is
+// what proves a run complete. A run given up on and adopted at EXIT (#1316) proves
+// nothing and must never spend a campaign slot.
+bool AdoptedExitProvesComplete(DungeonCompletion completion, bool provedBeforeTheExit = false);
 
 // Select the encounters this run must credit. Independent-wing maps require a
 // non-empty, verified wing mask; otherwise completion remains unknowable.
@@ -5070,6 +5143,54 @@ StagingNudge StagingWatchdog(StagingStallState& state, ApproachGap const& gap,
                              bool measurable, time_t now,
                              RatchetLimits const& limits,
                              ApproachLimits const& approach);
+
+// ------------------------ a leader giving the approach back (#1153) --
+//
+// THE WATCHDOG CLOSES A RUN FOR A LEADER ABOVE THE POINT AND NOTHING ELSE. One
+// beside it and walking away was left to the twelve-minute backstop: measured
+// on #396, 224 yards down to 26 and then 38, 154, 335, 423, 674 with the run
+// still open, and nothing steering him. So a leg remembers where it started
+// and how near it got, and closes while he is still nearer than he started.
+//
+// IT IS NOT THE LADDER'S MEMORY AND IT DOES NOT SHARE ITS LIFETIME. A re-armed
+// errand restarts the ladder, correctly, but that drift is a leader whose
+// errand keeps ending, so a measurement that restarted with it would never see
+// him leave. This one restarts with the leg and survives a re-arm.
+//
+// A STRAIGHT LINE CANNOT SEE A WAY ROUND. A surveyed route that first walks
+// away from the door is the walk asked for, so going forward on one moves the
+// mark instead of counting against it, as does any poll that was not about
+// walking at all (combat, flight, death, a town stop).
+//
+// A LEADER WITH NO HEADWAY HAS NO NEARER PLACE TO FAIL AT, so he is given
+// `wanderYards` past his start and closed there. That is the one case that
+// ends further out than it started, and it is bounded.
+struct StagingRetreatLimits
+{
+    // Less headway than this is not yet a place to retreat from. Half of it
+    // must still clear the jitter floor, or a wobble would close a run.
+    float headwayYards{0.f};
+    float wanderYards{0.f};  // how far past his start a leader with none may go
+};
+
+struct StagingRetreatState
+{
+    float startYards{-1.f};  // below zero: no reading on this leg yet
+    float bestYards{-1.f};
+    bool rebase{false};      // the next reading is a new mark, not a verdict
+};
+
+struct StagingRetreatReading
+{
+    bool measurable{false};  // false: this poll says nothing about walking
+    float yards{-1.f};       // ApproachDistance to the leg's end
+    bool walkedOnRoute{false};  // RouteMarkAdvanced's answer for this poll
+};
+
+// True on the poll the leader has given back half his headway, or wandered out
+// past `wanderYards` with none, and the run must close.
+bool StagingRetreated(StagingRetreatState& state, StagingRetreatReading const& reading,
+                      StagingRetreatLimits const& limits);
 
 // ------------ whether the staging walk is still the run's to measure (#367) --
 //
@@ -7241,6 +7362,7 @@ char const* TownRetryWord(TownRetry retry);
 //
 //   kind='quest'  use-item-on creature:<entry> item:<entry>
 //   kind='quest'  use-gameobject <entry>
+//   kind='quest'  cast-spell-on-mainhand spell:<id>
 //
 // `use-item-on` is a player selecting a creature and using a carried item at
 // it: the hunter's taming and pet quests, the warlock's pet-chain items, a
@@ -7249,6 +7371,8 @@ char const* TownRetryWord(TownRetry retry);
 // player clicking the nearest gameobject of an entry (CMSG_GAMEOBJ_USE), which
 // is how an altar or a lever is operated; a quest chest is opened with the
 // spell its lock names instead (ChestOpeningSpell), as a client opens one.
+// `cast-spell-on-mainhand` casts a known spell at the main-hand weapon; the
+// character must be within the spell's range of a Runeforge (focus 1552).
 //
 // THE WALK IS THE BRIDGE'S. These verbs never move the character: they fire
 // when it already stands within reach of the target, and refuse with `the
@@ -7290,6 +7414,8 @@ constexpr char const* USE_ITEM_HERE_VERB = "use-item-here";
 // done (QuestUseReadBack::petGained). Nothing here makes a pet: the core's
 // own TAME_CREATURE effect does, when the channel ends with the beast alive.
 constexpr char const* USE_SPELL_ON_VERB = "use-spell-on";
+// Cast a known spell at the equipped main-hand item beside focus 1552.
+constexpr char const* CAST_SPELL_ON_MAINHAND_VERB = "cast-spell-on-mainhand";
 
 // Reach for a creature target. The item's own spell range is checked again by
 // the core, so this is the near edge of what any quest item allows.
@@ -7329,12 +7455,15 @@ struct QuestUseRequest
     std::uint32_t target{0};  // creature entry, or gameobject entry
     std::uint32_t item{0};    // item entry; 0 for a gameobject or spell use
     std::uint32_t spell{0};   // use-spell-on: the spell cast at the creature
+    bool mainHand{false};
     char const* error{""};    // a QuestUseRefusal literal; empty when it parsed
 };
 
 // `use-item-on creature:<entry> item:<entry>` (both keys, each once, any
 // order, non-zero digits) and `use-gameobject <entry>` (one non-zero entry).
 QuestUseRequest ParseQuestUseRequest(std::string const& command);
+struct MainHandSpellFacts { bool spellKnown{false}; bool mainHandEquipped{false}; bool focusInRange{false}; bool spellOnCooldown{false}; };
+char const* MainHandSpellGate(MainHandSpellFacts const& facts);
 
 namespace QuestUseRefusal
 {
@@ -7342,6 +7471,11 @@ constexpr char const* MalformedItem = "malformed use-item-on command";
 constexpr char const* MalformedObject = "malformed use-gameobject command";
 constexpr char const* MalformedHere = "malformed use-item-here command";
 constexpr char const* MalformedSpell = "malformed use-spell-on command";
+constexpr char const* MalformedMainHandSpell = "malformed cast-spell-on-mainhand command";
+constexpr char const* MainHandSpellUnknown = "the character does not know the main-hand spell";
+constexpr char const* MainHandMissing = "the character has no main-hand weapon";
+constexpr char const* MainHandFocusMissing = "no Runeforge is within spell range";
+constexpr char const* MainHandSpellOnCooldown = "the main-hand spell is on cooldown";
 constexpr char const* SpellUnknown = "the character does not know that spell";
 constexpr char const* NoCreatureSpell = "that spell takes no creature target";
 constexpr char const* SpellOnCooldown = "the spell is on cooldown";
@@ -10260,6 +10394,7 @@ struct DoorRejoinFacts
     bool runEscortHoldsIt{false};
     bool partyBelongsInside{false};
     float yardsFromDoor{-1.f};
+    std::optional<bool> insideDoor;
 };
 
 DoorRejoinStep DecideDoorRejoin(DoorRejoinFacts const& facts, float knockYards);
@@ -11244,9 +11379,9 @@ struct ErrandDeathToll
     // over ENTER and EXIT, and CROSSING_BACKSTOP_SECONDS over a continent
     // crossing - which exists BECAUSE of this deference and says so.
     //
-    // THE NAME IS THE OLDER HALF OF THE TRUTH. The column fact it reads has not
-    // changed; what changed is that a dungeon run stopped being the only thing
-    // that writes it. See `catchUp`.
+    // The adapter checks the recorded claimant before granting run deference:
+    // town, training and respec claims have no run timer (#1209). Catch-up and
+    // home walks retain this flag so `catchUp` can end their reissuing drive.
     bool runOwned{false};
 
     // ...AND THE CLAIMANT IS THE CATCH-UP WALK, WHICH NOTHING ANSWERS FOR
@@ -14097,6 +14232,113 @@ std::uint32_t DiedOnLegsHeld(std::vector<DiedOnLeg> const& died, std::time_t now
 // false for a walker that holds nothing, which keeps every other creature walk
 // exactly as it was.
 bool SteerCreatureWalkAlongRoute(bool creatureAim, std::uint32_t diedOnLegsHeld);
+
+// ------------- a zone that keeps killing a party is routed round (#1243) ----
+//
+// Died-on-leg pricing (#502, #1228) remembers one road for one walker for two
+// hours. A level 17 party walked into a level 50 to 58 zone again and again
+// because nothing remembers a whole zone. This does, built on the same idea:
+// the walker plans on a priced copy of the survey's links, so a way round is
+// taken when one exists, the zone is never deleted from the graph, and a walker
+// with no way round still gets a route and says so.
+//
+// THE EVIDENCE IS REALM-WIDE AND THE VERDICT IS PER PARTY. A death counts for a
+// zone whoever died, because `overseer_death` says what stands in that zone. It
+// counts against a party only while the killer is `levelGap` or more levels
+// above the party's lowest level, so the score decays as the party levels, and
+// no timer is needed for a party that has outgrown the zone.
+struct ZoneDeath
+{
+    std::uint32_t mapId{0};
+    std::uint32_t zoneId{0};
+    std::uint32_t killerLevel{0};
+    std::time_t at{0};
+};
+
+struct ZoneDangerLimits
+{
+    std::int64_t windowSeconds{24 * 60 * 60};
+    // How far above the party's lowest level a killer must be to count.
+    std::uint32_t levelGap{8};
+    // How many counted deaths in the window make a zone dangerous.
+    std::uint32_t deaths{3};
+    // What each leg touching a dangerous zone costs on top of its survey cost.
+    // More than the longest walk the survey can plan across a continent, so any
+    // way round wins, however long, and only a leg with none is ever walked.
+    float priceYards{50000.f};
+};
+
+struct DangerZone
+{
+    std::uint32_t zoneId{0};
+    // Deaths counted against this party in the window: the zone's score.
+    std::uint32_t deaths{0};
+    std::uint32_t strongestKiller{0};
+    // Filled in by the caller for the log; the decisions never read it.
+    std::string name;
+};
+
+// Survey node id to the zone it stands in.
+using NodeZones = std::map<std::uint32_t, std::uint32_t>;
+
+// The party's lowest level, or 0 for an empty list. Every member walks the leg,
+// so the youngest is who the zone is judged against.
+std::uint32_t LowestPartyLevel(std::vector<std::uint32_t> const& partyLevels);
+
+// Deaths in `zoneId` on `mapId` inside the window at `now` to creatures
+// `levelGap` or more levels above `partyLevel`. A party level of 0 scores 0.
+std::uint32_t ZoneDangerScore(std::vector<ZoneDeath> const& deaths, std::uint32_t mapId,
+                              std::uint32_t zoneId, std::uint32_t partyLevel, std::time_t now,
+                              ZoneDangerLimits const& limits);
+
+// Every zone on `mapId` whose score reaches `limits.deaths`, in zone id order.
+std::vector<DangerZone> DangerZonesOn(std::vector<ZoneDeath> const& deaths, std::uint32_t mapId,
+                                      std::uint32_t partyLevel, std::time_t now,
+                                      ZoneDangerLimits const& limits);
+
+// Serialize the already computed routing result; no second scoring pass.
+std::string ZoneDangerProbeJson(std::vector<DangerZone> const& zones, std::uint32_t mapId,
+                                 std::uint32_t partyLevel, std::time_t now,
+                                 ZoneDangerLimits const& limits);
+
+// Drop deaths older than the window at `now`.
+void ForgetOldZoneDeaths(std::vector<ZoneDeath>& deaths, std::time_t now,
+                         ZoneDangerLimits const& limits);
+
+// What walking the leg `from`-`to` costs on top of its distance: `priceYards`
+// when either end stands in a dangerous zone, else 0. Either end, because a leg
+// with one foot in the zone walks into it.
+float DangerZonePrice(std::uint32_t from, std::uint32_t to, NodeZones const& nodeZones,
+                      std::vector<DangerZone> const& zones, ZoneDangerLimits const& limits);
+
+// Price every walk link on a copy of the survey's links, and return how many
+// were priced. A link the survey refused (negative cost) stays refused.
+std::uint32_t PriceDangerZones(std::vector<RouteLink>& links, NodeZones const& nodeZones,
+                               std::vector<DangerZone> const& zones,
+                               ZoneDangerLimits const& limits);
+
+// What a priced plan did about the dangerous zones. `avoided` are the zones the
+// plan on unpriced links (`wayThrough`) walks and `walked` does not. `stillWalked`
+// are the zones `walked` still touches, because no way round exists: the walker
+// starts in the zone, its aim is in the zone, or the survey has no other road.
+struct ZoneRouteReading
+{
+    std::vector<DangerZone> avoided;
+    std::vector<DangerZone> stillWalked;
+};
+
+ZoneRouteReading ReadZoneRoute(std::vector<std::uint32_t> const& walked,
+                               std::vector<std::uint32_t> const& wayThrough,
+                               NodeZones const& nodeZones,
+                               std::vector<DangerZone> const& zones);
+
+// The travel log's two sentences, pure so the wording is tested as text.
+std::string ZoneAvoidedLine(std::string const& name, std::string const& target,
+                            std::vector<DangerZone> const& avoided,
+                            ZoneDangerLimits const& limits);
+std::string ZoneNoWayRoundLine(std::string const& name, std::string const& target,
+                               std::vector<DangerZone> const& stillWalked,
+                               ZoneDangerLimits const& limits);
 
 // ------------------ a staging walk that is measured rather than routed (#342) --
 //
@@ -17146,6 +17388,9 @@ constexpr char const* NotEnoughPower = "the character has too little mana for th
 // Portals, and a caster without one reaches CheckCast, is refused with
 // SPELL_FAILED_REAGENTS, and is told about it through a client a bot does not
 // have.
+// A forge, an anvil, a fire: the spell's focus object is not in reach, so the
+// row is not cast into a client error. Standing somewhere else answers it.
+constexpr char const* NoSpellFocus = "no spell focus object of that spell is in reach";
 constexpr char const* MissingReagent = "the character is missing a reagent for that spell";
 constexpr char const* NoSuchTarget = "no character of that name is in the world";
 constexpr char const* TargetOtherMap = "the target is on another map";
@@ -18633,7 +18878,47 @@ struct RaidDoor
     // spawn and template tables at run time. 0 is no stone.
     unsigned meetingStones[2];
     char const* stonesName;
+    // The wing the dungeon brain clears, the parameter of its `dc on`. Empty is
+    // the whole map. Blackrock Spire needs it: a bare `dc on` at the portal
+    // reads the party's ground as the Lower Spire (mod-dungeon-clear's
+    // DungeonWingRegistry, Explicit select on map 229).
+    char const* clearWing;
+    // The instance-script slots that make this door's clear. All zeros is every
+    // slot the script keeps. The Spire's script keeps both wings and its hall
+    // flags in one list of 23, so "every slot" there could never read done.
+    unsigned clearSlots[4];
 };
+
+// THE UPPER SPIRE'S DOOR IS THE SPIRE'S ONLY PORTAL (mod-overseer#1187). Read
+// on the dev realm 2026-11-01:
+//
+//   areatrigger          (1468, 0, -7518.19, -1239.13, 287.243, radius 10)
+//   areatrigger_teleport (1470, 'Blackrock Spire Entrance', 0, -7524.7, -1228.41,
+//                         287.204): the way-out landing, 12.5 yards from 1468's
+//                         centre, so a raid staged there cannot drift in
+//   dungeon_access_template (map 229): min_level 45, no requirement rows
+//   Map.dbc 229 is type 1, a dungeon, not a raid, and MapDifficulty.dbc gives it
+//   15 players, so a raid group of ten is admitted and map->IsRaid() is false
+//   gameobject 164725, the Dragonspine Door: no lock, starts open, in no script
+//
+// THE KEYWORD IS `ubrs`, not the place name: overseer_raid_seat.keyword is
+// VARCHAR(20) and `upper-blackrock-spire` is 21 characters.
+//
+// THE SEAL OF ASCENSION IS NOT ASKED FOR on this core. The Upper Spire's bosses
+// are slots 9 Emberseer, 10 Rend, 12 The Beast and 13 Drakkisath of
+// instance_blackrock_spire; 11 Gyth is left out because Rend's event owns him.
+// The pre-pull repair hold counts Molten Core's bosses 8 and 9 and so never holds
+// this door: the raid repairs before FORM and not again.
+
+// How far a door's clear has got.
+struct RaidClearCount
+{
+    unsigned done{0};
+    unsigned total{0};
+};
+
+// `doneBySlot` is the instance script's encounters by slot, true for DONE.
+RaidClearCount RaidClearProgress(RaidDoor const& door, std::vector<bool> const& doneBySlot);
 
 // The door for `keyword`, or nullptr. Exact, lower case: the queue writes the
 // keyword and nothing else does.
@@ -19058,7 +19343,12 @@ RaidStoneSummon ChooseRaidStoneSummon(std::vector<RaidStoneSeat> const& seats,
 // operator's raid order reaches, and only after HOLD. HOLD and RECOVER keep the
 // brain off: a raid that is still gathering, eating or running back is not one
 // the brain may start pulling for.
-bool DungeonClearMayArmHere(bool raidMap, bool raidClearOrdered);
+//
+// A RAID ORDER'S OWN DUNGEON-TYPE MAP HOLDS THE SAME WAY. Blackrock Spire is map
+// type dungeon, so `raidMap` alone would arm a bare `dc on` on the raid the
+// moment it crossed (`onRaidDoorMap`, the character stands on the map its
+// family's standing raid order goes to).
+bool DungeonClearMayArmHere(bool raidMap, bool raidClearOrdered, bool onRaidDoorMap = false);
 
 // -- and the row that asks for any of it -------------------------------------
 //
@@ -21015,12 +21305,13 @@ unsigned FocusLighterSpell(unsigned requiresSpellFocus);
 // gameobject type 8 (GAMEOBJECT_TYPE_SPELL_FOCUS) with Data0 (focusId) 1;
 // Data1 is the 10 yard reach of the focus, not its id.
 constexpr unsigned SPELL_FOCUS_ANVIL = 1;
+constexpr unsigned SPELL_FOCUS_FORGE = 3;
 constexpr unsigned TOTEM_CATEGORY_BLACKSMITH_HAMMER = 162;
 constexpr unsigned ITEM_BLACKSMITH_HAMMER = 5956;
 
 // Is this focus a world object the crafter is WALKED to? An Anvil only. A
 // Cooking Fire is lit where the crafter stands (FocusLighterSpell); a Forge
-// and everything else is left to the refusal it always got.
+// is the bridge's walk, and everything else is deferred (CraftStationStepFor).
 bool FocusIsWalkedTo(unsigned requiresSpellFocus);
 
 // The item a family buys for a tool category, or 0 when none is known. The
@@ -21124,11 +21415,11 @@ struct FocusSpawn
 
 // How far the craft drive walks a crafter to an Anvil: a town, not a journey.
 // Zones are not levels and travel does not know that (AGENTS.md), so an Anvil
-// further than this is not walked to and the refusal stands.
+// further than this is not walked to and the craft is deferred.
 constexpr float CRAFT_FOCUS_WALK_LIMIT_YARDS = 400.f;
 // Within this of the nearest Anvil's spawn the crafter is already at it: the
 // focus reaches 10 yards and arrival at a place is 5. A refusal there is not
-// fixed by walking again, so it stands rather than looping a walk.
+// fixed by walking again, so it is deferred rather than looping a walk.
 constexpr float CRAFT_FOCUS_STANDING_YARDS = 8.f;
 
 // The index of the nearest spawn on `mapId` within `limitYards` (in the plane)
@@ -21138,9 +21429,9 @@ int NearestFocusSpawn(std::vector<FocusSpawn> const& spawns, unsigned mapId, flo
 
 // WHAT A FOCUS REFUSAL LEADS TO. `nearestYards` is the plane distance to the
 // nearest spawn within the walk limit, negative when there is none.
-//   not walked to, or not job 'craft'   -> Stand (the refusal stands)
+//   not walked to, or may not walk      -> Stand (the craft is deferred)
 //   no spawn within the limit           -> NoneNear
-//   within CRAFT_FOCUS_STANDING_YARDS   -> Stand (already there)
+//   within CRAFT_FOCUS_STANDING_YARDS   -> Stand (already there, deferred)
 //   otherwise                           -> Walk
 enum class CraftFocusStep : uint8_t
 {
@@ -21149,6 +21440,30 @@ enum class CraftFocusStep : uint8_t
     Walk,
 };
 CraftFocusStep CraftFocusStepFor(bool walkedTo, bool mayWalk, float nearestYards);
+
+// WHAT A CRAFT DOES ABOUT ITS STATION, asked before the cast
+// (wow-overseer#1786), since a refused cast reaches the client.
+//   no focus, or one in reach        -> Cast
+//   a focus the crafter can conjure  -> Light
+//   CraftFocusStep says Walk         -> Walk
+//   anything else                    -> Defer, with CraftDeferReason
+enum class CraftStationStep : uint8_t
+{
+    Cast,
+    Light,
+    Walk,
+    Defer,
+};
+CraftStationStep CraftStationStepFor(unsigned focus, bool focusInReach, bool lighterKnown,
+                                     CraftFocusStep walk);
+
+// May the craft drive walk this crafter to a banker or a station? Job 'craft'
+// always. On a town run the family's leader may, in a rest area: the family
+// follows it, so the walk stays inside the town stop. A follower waits.
+bool CraftMayWalk(std::string const& job, bool leadsFamily, bool resting);
+
+// The one sentence a deferred craft states.
+std::string CraftDeferReason(unsigned focus, bool mayWalk, CraftFocusStep walk);
 
 // The travel aim for a focus spawn, `at:<map>:<x>,<y>,<z>` in whole yards so it
 // fits the 32 character travel column.
@@ -22007,6 +22322,14 @@ EvacuationStart DungeonEvacuationStart(bool coordinatorKnowsItsDoor, bool inside
 // crossing). A ghost is never refused: its corpse may be inside.
 bool DungeonDoorShut(bool familyBagHeld, bool enteringDungeonMap, bool alive, bool steered);
 
+// A FAMILY ALREADY INSIDE IS NOT HELD AT THE DOOR. A run with a member inside
+// makes room rather than leaving (DungeonRunBagAnswer), so no town trip follows
+// and a shut door only strands whoever is outside. On the dev realm one member
+// stood at the entrance for over two hours with four inside, and the run closed
+// `split_failed` every 15 minutes. Nobody inside, or a run walking out, stays
+// held: that is the family #631 keeps from walking back in.
+bool FamilyDoorHeldForBags(bool noBagRoom, bool runHasMembersInside);
+
 // THE CLASSIC RULESET. The operator restricts these worlds to a classic
 // level-60 feel: characters stop at level 60, professions stop at skill 300,
 // and the world is Eastern Kingdoms, Kalimdor and the classic instances, never
@@ -22127,6 +22450,12 @@ struct ExitHearthFacts
     // out left: a split family is recovered by the crossing, and a member kept
     // inside holds the instance for its whole party without bound.
     std::int64_t failedWalkSeconds{0};
+    // WHETHER THE FAMILY HAS ALREADY HEARTHED AWAY (#1316). The withhold keeps a
+    // family on one continent, so it has nothing left to protect once another
+    // member of this episode has hearthed out. Keeping the stone then strands
+    // this member inside alone, IDLE adopts it at STAGED_INSIDE, and the family
+    // is sent straight back to the door it has just left.
+    bool familyHearthedOut{false};
 };
 
 // How long a walk out must have failed before a stone bound off the door's
@@ -22541,7 +22870,7 @@ struct GhostRecoveryVerdict
 // Wherever rules 2 to 4 pick the spirit healer and its graveyard is unsafe,
 // the answer is Ladder instead: the ghost is still kept off the corpse, and
 // the existing revival ladder, which already knows how to refuse a graveyard,
-// takes it.
+// takes it. A caller without the ladder asks RefusedHealerFallback.
 GhostRecoveryVerdict DecideGhostRecovery(GhostRecoveryFacts const& facts,
                                          GhostRecoveryLimits const& limits = GhostRecoveryLimits{});
 
@@ -22682,20 +23011,60 @@ struct PlaceDanger
 
 PlaceDanger JudgePlaceDanger(PlaceDangerFacts const& facts);
 
-// A GUILD MEMBER THAT MAY NOT USE THE LADDER STILL LEAVES A DEATH LOOP. When the
-// ghost decision answers Ladder (the spirit healer's graveyard failed its safety
-// test) for a caller that does not run the stuck-revival ladder, the old
-// fallback was the corpse run: back to the killer. On wow-dev 2026-10-04 half of
-// 912 guild deaths an hour were repeat deaths at the same corpse
-// (wow-overseer#586). A player who has died twice in one place takes the spirit
-// healer, even at a graveyard that is not perfectly safe, rather than walk back
-// into the same mobs. Below `repeatDeaths` (or with no graveyard known) the
-// corpse run stands.
-GhostRecovery GuildGhostFallback(unsigned deathsHere, bool healerGraveKnown,
-                                 unsigned repeatDeaths);
+// A GHOST WITH NO HEALER TO TAKE IS NOT REVIVED BESIDE ITS KILLER (#1275). When
+// the ghost decision answers Ladder (the spirit healer's graveyard failed its
+// safety test) for a caller that does not run the stuck-revival ladder, the
+// answer used to be the corpse run. On wow-dev 2026-10-30 a level 34 guild member
+// with no errand died 313 times to level 45 Primitive Owlbeasts at the Shadra'Alor
+// graveyard: released beside its corpse, it reclaimed there, 26 yards from an
+// owlbeast spawn, every 2 to 3 minutes. The ghost is untouchable and the living
+// member is not, so:
+//
+//   1. Neither the repeat-death nor the outlevelled rule fired, or nothing the
+//      corpse danger test counts stands near the corpse now: corpse run.
+//   2. Held for less than `holdSeconds`: wait out the killer as a ghost.
+//   3. Held that long: the nearest healer, refused or not, so a ghost by a
+//      spawn that never moves is not parked forever. `healerWalkFailed` says
+//      this walk was already tried and never reached a healer: retry the
+//      natural walk while a threat remains.
+//
+// Rule 3 still never reclaims the corpse. With the default hold it costs at most
+// three deaths an hour, which is the ticket's bound of five at one spot.
+struct RefusedHealerFacts
+{
+    unsigned deathsHere{0};
+    uint32_t level{0};
+    uint32_t strongestNearCorpse{0};
+    unsigned liveThreatsNearCorpse{0};
+    int64_t heldSeconds{0};
+    int64_t holdSeconds{0};
+    bool healerKnown{false};
+    bool healerWalkFailed{false};
+};
+GhostRecovery RefusedHealerFallback(RefusedHealerFacts const& facts,
+                                    GhostRecoveryLimits const& limits = GhostRecoveryLimits{});
+
+// THE SAFEST GRAVEYARD IN REACH IS NOT ALWAYS ONE THAT PASSES (#1275). A
+// graveyard is refused for high ground alone when the ground outlevels the ghost
+// and nothing the danger test counts stands near it. For that level 34 member
+// every graveyard its zone links was refused, two of them with no spawn within
+// 60 yards. Ground with nothing on it kills nobody inside the ten seconds a
+// hearth takes, so a ghost that needs a healer takes it there before it takes
+// one beside a spawn. `Dangerous` is never picked.
+enum class GraveyardStanding : uint8_t
+{
+    Passes,
+    HighGroundOnly,
+    Dangerous,
+};
+GraveyardStanding JudgeGraveyard(bool highGround, PlaceDangerReason danger);
+
+// Index of the graveyard to take from `standings`, nearest first: the first that
+// passes, else the first refused for high ground alone, else `standings.size()`.
+std::size_t PickSafestGraveyard(std::vector<GraveyardStanding> const& standings);
 
 // A GUILD GHOST DOES NOT TAKE THE SPIRIT HEALER AT A GRAVEYARD THAT IS ITSELF
-// THE KILLER. GuildGhostFallback sends a repeat-death ghost to the nearest
+// THE KILLER. A guild fallback once sent a repeat-death ghost to the nearest
 // spirit healer "even at a graveyard that is not perfectly safe", and when that
 // graveyard stands among the other faction's guards the member is revived into
 // them and killed again within seconds. On wow-dev 2026-10-10 seven Horde
@@ -22762,7 +23131,7 @@ bool GhostHealerWalkRenews(float startYards, float nowYards, unsigned renewals);
 // recovery path brought guild members back to the same mobs: the corpse run,
 // the spirit healer at a graveyard beside the killer, the walk back from the
 // graveyard, the playerbots revive in place. On wow-dev 2026-10-04 after
-// GuildGhostFallback shipped, 311 guild deaths in 49 minutes were repeats and
+// that fallback shipped, 311 guild deaths in 49 minutes were repeats and
 // 161 of them a third or later death at one spot (wow-overseer#597). A player
 // who has died twice in one place stops, hearths, and comes back another way.
 // Hearth when `deathsHere` (deaths within the repeat radius of where the member
@@ -24547,6 +24916,25 @@ constexpr unsigned GUILD_RUN_STALL_SECONDS = 5 * 60;
 constexpr unsigned GUILD_RUN_QUIET_SECONDS = 15 * 60;
 constexpr unsigned GUILD_RUN_CREDITLESS_SECONDS = 20 * 60;
 constexpr unsigned GUILD_RUN_MAX_SKIPS = 2;
+// Two members alive inside this far apart are not one group (#1308). The
+// measured split stood 440 yards.
+constexpr float GUILD_RUN_SPLIT_YARDS = 150.f;
+// How long a split stands before the run ends. Past GUILD_RUN_RECOVERY_SECONDS,
+// so a corpse return has its whole window to close the gap first.
+constexpr unsigned GUILD_RUN_SPLIT_END_SECONDS = 20 * 60;
+
+// Only the group closing up clears a split. A fight or a wipe reads Unread and
+// keeps the clock: each pull and each wipe reset the stillness clock, which is
+// how Zul'Farrak runs reached the two hour ceiling.
+enum class GuildRunSplitReading : std::uint8_t
+{
+    Unread,    // fewer than two alive inside
+    Split,     // two alive inside stand GUILD_RUN_SPLIT_YARDS apart
+    Together,  // every pair alive inside stands closer
+};
+
+// The split's start after this reading; 0 when the group is not split.
+std::time_t GuildRunSplitClock(std::time_t since, GuildRunSplitReading reading, std::time_t now);
 // Combat holds the ladder, but not for ever (the family's #382): a member
 // whose combat flag never clears must not hold a run that has neither moved
 // nor credited a boss for this long.
@@ -24578,6 +24966,8 @@ struct GuildRunStallFacts
     // The last skip was refused: the brain has switched itself off with
     // nothing left it can reach, so no later skip can move it.
     bool skipRefused{false};
+    // How long since the group split and did not close up (GuildRunSplitClock).
+    unsigned secondsSplit{0};
 };
 
 enum class GuildRunStallStep : std::uint8_t
@@ -24585,6 +24975,7 @@ enum class GuildRunStallStep : std::uint8_t
     Nothing,  // progressing, busy, held, or not stalled long enough
     Skip,     // send `dc skip` from the tank
     End,      // the skips did not move it: end the run as Stalled
+    EndSplit, // the group split and never closed up: end the run as Stalled
 };
 
 GuildRunStallStep GuildRunStallNext(GuildRunStallFacts const& facts);
@@ -27364,15 +27755,25 @@ RebuffSpell RebuffSpellFor(unsigned classId);
 // One member of the caster's group, the caster included, as the caster sees it.
 struct RebuffMember
 {
+    std::string name;
+    unsigned subgroup{0};
+    bool hasBuffer{false};   // a living member of this subgroup can cast this buff
     bool alive{true};
     bool sameMap{true};       // in the world, on the caster's map
     bool hasBuff{false};      // the aura or its group variant, from any caster
     float yards{0.0f};        // from the caster
     bool inSight{true};       // line of sight from the caster
+    // This caster already queued a cross-party cast on this member within
+    // REBUFF_CROSS_ASK_COOLDOWN_SECONDS (RebuffCrossAskCooling). Such a member
+    // is not chosen again, so a cast that does not land is not re-queued every
+    // poll (mod-overseer#1159).
+    bool crossAskedRecently{false};
 };
 
 struct RebuffFacts
 {
+    bool inRaid{false};
+    unsigned casterSubgroup{0};
     bool knowsSpell{false};   // the caster has learned a rank of the buff
     bool alive{true};
     bool inCombat{false};
@@ -27404,11 +27805,30 @@ constexpr float REBUFF_REACH_YARDS = 28.0f;
 // The mana the caster keeps after the cast, as a percent of its maximum.
 constexpr std::uint32_t REBUFF_MANA_RESERVE_PERCENT = 30;
 
+// HOW LONG ONE CROSS-PARTY ASK STANDS (mod-overseer#1159). A raid caster's
+// cross-party rebuff is a kind='cast' row, and a cast that does not land - a
+// stronger non-stacking buff already on the target, the target walking out of
+// range before the row runs, a refusal - leaves the target missing the buff,
+// so without this the next poll (PARTY_POLL_MS, thirty seconds) would queue
+// the same row again, and every row holds the caster still for its window.
+// Five minutes is ten polls: long enough that a cast that cannot land costs a
+// handful of rows an hour, short against the thirty to sixty minutes the buff
+// itself lasts. A cast that DID land needs no cooldown: the target then
+// carries the aura and is not missing.
+constexpr std::time_t REBUFF_CROSS_ASK_COOLDOWN_SECONDS = 5 * 60;
+
+// True while an ask made at `askedAt` still stands at `now`. Zero means never
+// asked. A clock that went backwards (now before askedAt) ends the cooldown
+// rather than stretching it by however far the clock jumped.
+bool RebuffCrossAskCooling(std::time_t askedAt, std::time_t now,
+                           std::time_t cooldownSeconds = REBUFF_CROSS_ASK_COOLDOWN_SECONDS);
+
 struct RebuffDecision
 {
     RebuffStep step{RebuffStep::NoSpell};
     std::size_t missing{0};   // living members on the map without the buff
     std::size_t inReach{0};   // of those, within reach and sight
+    std::optional<RebuffMember> crossPartyTarget;
 };
 
 RebuffDecision DecideRebuff(RebuffFacts const& facts);
@@ -27639,11 +28059,15 @@ struct StratholmeExitFacts
 
 StratholmeExitWay DecideStratholmeExit(StratholmeExitFacts const& facts);
 
+// Only the living family leader can walk the yard exit or press its button.
+bool StratholmeYardMemberCanWalk(bool isLeader, bool alive);
+
 char const* StratholmeExitWayWord(StratholmeExitWay way);
 
 // The run's exit trigger whose landing is the yard, and the two gameobjects in
 // it: the Elders' Square Service Entrance and the button that opens it.
 constexpr std::uint32_t STRATHOLME_YARD_EXIT_TRIGGER = 2221;
+constexpr std::uint32_t STRATHOLME_EXIT_YARD_MAP_ID = 0;
 constexpr std::uint32_t STRATHOLME_SERVICE_ENTRANCE_ENTRY = 175369;
 constexpr std::uint32_t STRATHOLME_SERVICE_BUTTON_ENTRY = 175432;
 // The yard as the navmesh closes it (the stratholme-undead row in
@@ -27670,6 +28094,41 @@ constexpr std::uint32_t STRATHOLME_YARD_EPISODE_SECONDS = 15 * 60;
 // Whether a point on `mapId` stands in the exit yard.
 bool InStratholmeExitYard(std::uint32_t mapId, float x, float y);
 
+// How long a yard episode that gave up keeps the IDLE recovery from opening
+// it again while members are still in the yard. Longer than one episode, so a
+// family the way out could not move is left to the ordinary drives rather than
+// cycled through a fresh episode every poll or every ceiling.
+constexpr std::uint32_t STRATHOLME_YARD_RECOVERY_COOLDOWN_SECONDS = 60 * 60;
+
+// Whether an IDLE poll should open the missing yard episode for a member.
+// `gaveUp` says this family's last episode gave up (ceiling, or no way out
+// left) and has not been cleared since; it holds the recovery off until
+// STRATHOLME_YARD_RECOVERY_COOLDOWN_SECONDS have passed.
+bool ShouldOpenStratholmeYardEpisode(bool memberInYard, bool episodeOpen, bool gaveUp,
+                                     std::uint32_t secondsSinceGaveUp);
+
+// Whether a recorded give-up still stands: a member is still in the yard and
+// the cool-down has not passed. Once every member is out, the next family to
+// land in the yard is a new episode and is recovered as one.
+bool StratholmeYardGiveUpHolds(bool memberInYard, std::uint32_t secondsSinceGaveUp);
+
+// Where one member stands, as the yard member scan reads it.
+struct StratholmeMemberPlace
+{
+    bool found{false};     // the player is online
+    bool inWorld{false};
+    std::uint32_t mapId{0};
+    float x{0.f};
+    float y{0.f};
+};
+
+// Whether that member is one the yard episode is for.
+bool StratholmeMemberInYard(StratholmeMemberPlace const& place);
+
+// The index of the first portal whose exit trigger is
+// STRATHOLME_YARD_EXIT_TRIGGER, or -1 when the table has none.
+int StratholmeYardPortalIndex(std::vector<std::uint32_t> const& exitTriggerIds);
+
 // Whether the button is still worth walking to: it is spawned, it has not
 // been pressed STRATHOLME_BUTTON_PRESSES times already, and the walk to it has
 // not run past STRATHOLME_BUTTON_WALK_SECONDS.
@@ -27679,6 +28138,175 @@ bool StratholmeButtonInReach(bool spawned, unsigned presses, std::uint32_t secon
 // off cooldown and its bind is not in the yard itself.
 bool StratholmeHearthLeavesTheYard(bool stoneReady, std::uint32_t bindMap, float bindX,
                                    float bindY);
+
+// ------------------- a family mage's way to a capital instead of a walk (#1161)
+//
+// WHEN A CHARACTER IS SENT SOMEWHERE ITS FAMILY MAGE CAN REACH BY ONE CAST, THE
+// MAGE CASTS IT. A teleport when it travels alone, a portal when anybody is
+// beside it. A capital is not listed anywhere: it is wherever a spell the mage
+// knows lands, read off the character's spell list and spell_target_position,
+// so no id and no coordinate is written down in this module.
+//
+// A KNOWN TELEPORT DOES NOT STAND IN FOR AN UNKNOWN PORTAL. It would carry the
+// mage off and leave the party on the road with nobody to follow, so the party
+// walks and the log says why.
+
+// A spell must save this much walking, on one continent, to be worth a rune and
+// the party's time. A way onto another continent has no walk to compare.
+constexpr float MAGE_TRAVEL_MIN_SAVED_YARDS = 1000.f;
+// How far from a spell's landing a destination may stand and still be that
+// capital. Stormwind's keep is 780 yards from the mage quarter landing.
+constexpr float MAGE_TRAVEL_LANDING_REACH_YARDS = 900.f;
+// How many times one errand asks a mage that is moving or fighting. The travel
+// poll is 15 seconds, so this is most of a minute, and then the party walks.
+constexpr std::uint32_t MAGE_TRAVEL_CAST_TRIES = 3;
+
+// ONE SPELL THE MAGE KNOWS THAT MOVES SOMEBODY, as the adapter read it.
+struct MageTravelSpell
+{
+    std::uint32_t spellId{0};
+    // A portal object for the party, rather than a teleport of the caster.
+    bool makesPortal{false};
+    // Where it lands: spell_target_position, of the spell itself or, for a
+    // portal, of the spell its object casts.
+    std::uint32_t map{0};
+    float x{0.f};
+    float y{0.f};
+    std::uint32_t reagentEntry{0};
+    std::uint32_t reagentNeeded{0};
+    std::uint32_t reagentCarried{0};
+};
+
+// ONE SPELL ON THE MAGE'S OWN LIST, as the world describes it. Teleports and
+// portals are told apart here and nowhere else: a portal is a spell that opens
+// an object, and portalObjectSpell is the spell that object casts.
+struct MageKnownSpell
+{
+    std::uint32_t spellId{0};
+    bool mageFamily{false};
+    std::uint32_t portalObjectSpell{0};
+    std::uint32_t reagentEntry{0};
+    std::uint32_t reagentNeeded{0};
+    std::uint32_t reagentCarried{0};
+};
+
+// One spell_target_position row, cut to the fields decided on.
+struct MageSpellLanding
+{
+    std::uint32_t spellId{0};
+    std::uint32_t map{0};
+    float x{0.f};
+    float y{0.f};
+};
+
+// The ways this mage knows, in list order: a mage's spell with a landing of its
+// own or through its portal object, in the classic world. Everything else on
+// the list moves nobody this module may send.
+std::vector<MageTravelSpell> MageTravelSpellsFrom(std::vector<MageKnownSpell> const& known,
+                                                  std::vector<MageSpellLanding> const& landings);
+
+struct MageTravelFacts
+{
+    // The mage is the one who was sent. False when it casts for its leader.
+    bool casterIsTraveller{false};
+    // Group members beside the mage, the mage not counted.
+    std::uint32_t othersPresent{0};
+    bool sameMap{false};
+    // The walk from the traveller to the destination. Unread across maps.
+    float walkYards{0.f};
+    std::uint32_t destMap{0};
+    float destX{0.f};
+    float destY{0.f};
+    std::vector<MageTravelSpell> spells;
+};
+
+enum class MageTravelWay : std::uint8_t
+{
+    Walk,
+    Teleport,
+    Portal,
+};
+
+char const* MageTravelWayWord(MageTravelWay way);
+
+// No quote characters: these go into a log line and sit beside the cast verb's.
+namespace MageTravelRefusal
+{
+constexpr char const* NoSpellForThatPlace = "the mage knows no spell that lands there";
+constexpr char const* NoPortalForTheParty = "the mage knows no portal there and its party is beside it";
+constexpr char const* NoRuneOfPortals = "no Rune of Portals in the bags";
+constexpr char const* NoRuneOfTeleportation = "no Rune of Teleportation in the bags";
+}  // namespace MageTravelRefusal
+
+// `way` Walk with a `reason` is a refusal to log. Walk with an empty `reason`
+// is a walk too short for a mage to have any opinion about.
+struct MageTravelVerdict
+{
+    MageTravelWay way{MageTravelWay::Walk};
+    std::uint32_t spellId{0};
+    char const* reason{""};
+};
+
+MageTravelVerdict DecideMageTravel(MageTravelFacts const& facts);
+
+// IS A REFUSED CAST WORTH ASKING AGAIN? Only one the mage's own state answers,
+// by CastRefusalRetry's own table, and `tries` asks so far under the bound.
+bool MageTravelCastRetries(std::string const& detail, std::uint32_t tries);
+
+// HAS THE ERRAND BEHIND A RUN GONE? True when the column is empty, holds another
+// aim, or holds an operator's guard, while the traveller has not yet been sent
+// through. Once it has, the rest of the party still has a portal to take.
+bool MageTravelCalledOff(bool travellerClicked, bool aimPresent, bool aimIsGuard,
+                         bool aimIsTheRuns);
+
+// ONE PARTY MEMBER AT THE PORTAL.
+struct MageTravelClicker
+{
+    bool traveller{false};  // the one who was sent
+    bool mage{false};       // the portal's owner
+    // Beside the portal and not yet asked to click it.
+    bool waiting{false};
+    // Walking to it, or clicked and not yet read back.
+    bool underWay{false};
+};
+
+// WHO CLICKS THIS POLL, as indexes. The one who was sent goes first and alone,
+// because DecideStrandedWay hearths back a follower that crosses ahead of its
+// leader. The rest go together. THE MAGE GOES LAST AND ALONE, because
+// Unit::RemoveFromWorld ends in RemoveAllGameObjects: its portal closes the
+// moment it changes map.
+std::vector<std::size_t> NextPortalClickers(std::vector<MageTravelClicker> const& party);
+
+// ANSWERED SHARE ROWS ARE KEPT ONLY WHILE THE BACKOFF CAN READ THEM (#1251).
+// The bridge's share read holds the youngest 8 answers per (target_name,
+// target_arg, command, status, reason) inside 90 days, and nothing else reads
+// a share answer's history. These two numbers are that read's memory window
+// and questshare.history_depth() in wow-overseer; a longer read there must
+// raise them first. tests/replay_share_retention.py runs the statements below
+// and the bridge's read on MySQL and compares the rows.
+constexpr uint32_t SHARE_RETENTION_DAYS = 90;
+constexpr uint32_t SHARE_RETENTION_DEPTH = 8;
+// At most this many rows a sweep. A sweep reads ONE holder's answers through
+// idx_target_created, because the ranking reads every row it is given and this
+// realm has one async character worker: ranking all 134,000 rows held it for 3
+// to 17 seconds on the dev realm, and one holder holds it for under a second
+// warm and 3 cold. A holder with a full batch is read again next sweep.
+constexpr uint32_t SHARE_RETENTION_BATCH = 5000;
+// A whole round of holders that deleted nothing rests this many sweeps, a day.
+constexpr uint32_t SHARE_RETENTION_REST_SWEEPS = 288;
+
+// THE RULE IS IN ONE PLACE, the two readers below. It only ever grows: a new
+// answer pushes older rows further down and time ages them, so an id selected
+// here is still past keeping when its delete runs.
+// The holder after `after` in name order, or no row at the end of a round. Both
+// names are escaped by the caller.
+std::string ShareRetentionNextHolderSql(std::string const& after);
+std::string ShareRetentionSelectSql(std::string const& holder);
+std::string ShareRetentionCountSql();
+// The delete for ids ShareRetentionSelectSql() named, or "" for none. It is
+// apart from the select because a DELETE with a subquery takes shared locks on
+// every row it reads, and this read covers every answered share row.
+std::string ShareRetentionDeleteSql(std::vector<uint32_t> const& ids);
 
 }  // namespace OverseerDecisions
 

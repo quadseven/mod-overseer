@@ -9,6 +9,8 @@
 #include "overseer_decisions.h"
 
 #include <cstdio>
+#include <ctime>
+#include <string>
 
 using OverseerDecisions::DungeonClearStallAction;
 using OverseerDecisions::DungeonClearStallDecision;
@@ -25,6 +27,37 @@ void Check(char const* what, DungeonClearStallAction got,
         return;
     std::printf("FAIL %s\n", what);
     ++failures;
+}
+
+// A PARTY-WAIT STOP IS ARMED AGAIN (#1308). Razorfen Downs, 2026-11-01: the
+// dungeon module stopped on one member out of range with two bosses credited,
+// and the skip it then refused ended the run.
+void APartyWaitStopRearmsBeforeTheLadder()
+{
+    using OverseerDecisions::DungeonClearWaitStopRearms;
+    std::string const wait =
+        "Dungeon clear stopped: the party never became ready after 180s "
+        "(Waiting on Uzza (out of range)).";
+    bool const first = DungeonClearWaitStopRearms(wait, 0, 3);
+    bool const last = DungeonClearWaitStopRearms(wait, 2, 3);
+    bool const spent = DungeonClearWaitStopRearms(wait, 3, 3);
+    bool const other = DungeonClearWaitStopRearms("No bosses left - disabling", 0, 3);
+    bool const none = DungeonClearWaitStopRearms("", 0, 3);
+    if (!first || !last)
+    {
+        std::printf("FAIL a party-wait stop must re-arm\n");
+        ++failures;
+    }
+    if (spent)
+    {
+        std::printf("FAIL re-arming must be bounded\n");
+        ++failures;
+    }
+    if (other || none)
+    {
+        std::printf("FAIL any other stop keeps the ladder\n");
+        ++failures;
+    }
 }
 
 void HealthyProgressIsNeverInterrupted()
@@ -94,14 +127,46 @@ void ABusyHoldThatExpiredNoLongerProtectsTheRun()
           DungeonClearStallAction::Extract);
 }
 
+// The tank drifts 50 yards every two minutes. Time runs from the first reading
+// and the ladder decides on each poll, as the adapter does.
+bool DriftStalls(std::string const& stopReason)
+{
+    OverseerDecisions::RatchetLimits const limits{
+        OverseerDecisions::RatchetReading::DistanceFromLastMark, 30.f, 300};
+    OverseerDecisions::RatchetState clock;
+    clock.since = 1000;
+    bool stalled = false;
+    for (time_t now = 1120; now <= 1000 + 45 * 60; now += 120)
+        stalled = stalled ||
+                  OverseerDecisions::Ratchet(
+                      clock, OverseerDecisions::DungeonClearWatchdogYards(50.f, stopReason),
+                      now, limits)
+                      .stalled;
+    return stalled;
+}
+
+void YardsWithTheBrainOffAreNotProgress()
+{
+    Check("drift while the brain drives", DriftStalls("") ? DungeonClearStallAction::Skip
+                                                          : DungeonClearStallAction::Nothing,
+          DungeonClearStallAction::Nothing);
+    Check("drift after the brain stopped itself",
+          DriftStalls("Dungeon clear stopped: the party never became ready after 180s")
+              ? DungeonClearStallAction::Skip
+              : DungeonClearStallAction::Nothing,
+          DungeonClearStallAction::Skip);
+}
+
 } // namespace
 
 int main()
 {
     HealthyProgressIsNeverInterrupted();
+    APartyWaitStopRearmsBeforeTheLadder();
     StalledRunGetsBoundedSkips();
     ExhaustedRunIsExtracted();
     ARefusedSkipExtractsAtOnce();
     ABusyHoldThatExpiredNoLongerProtectsTheRun();
+    YardsWithTheBrainOffAreNotProgress();
     return failures ? 1 : 0;
 }
