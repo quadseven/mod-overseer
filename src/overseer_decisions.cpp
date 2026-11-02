@@ -25572,6 +25572,26 @@ bool StratholmeYardMemberCanWalk(bool isLeader, bool alive)
     return isLeader && alive;
 }
 
+std::vector<StratholmeYardStep> StratholmeYardPlan(
+    std::vector<StratholmeYardMember> const& members)
+{
+    bool walkerInYard = false;
+    for (StratholmeYardMember const& member : members)
+        walkerInYard = walkerInYard || StratholmeYardMemberCanWalk(member.isLeader, member.alive);
+    std::vector<StratholmeYardStep> plan;
+    plan.reserve(members.size());
+    for (StratholmeYardMember const& member : members)
+    {
+        if (StratholmeYardMemberCanWalk(member.isLeader, member.alive))
+            plan.push_back(StratholmeYardStep::Aim);
+        else if (!walkerInYard && member.hearthReady)
+            plan.push_back(StratholmeYardStep::Hearth);
+        else
+            plan.push_back(StratholmeYardStep::Hold);
+    }
+    return plan;
+}
+
 char const* StratholmeExitWayWord(StratholmeExitWay way)
 {
     switch (way)

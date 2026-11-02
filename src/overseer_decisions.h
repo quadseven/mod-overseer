@@ -28110,6 +28110,30 @@ StratholmeExitWay DecideStratholmeExit(StratholmeExitFacts const& facts);
 // Only the living family leader can walk the yard exit or press its button.
 bool StratholmeYardMemberCanWalk(bool isLeader, bool alive);
 
+// What one member in the yard does on one poll (#1299). Aim: walks the way out
+// (the door, or the button that opens it). Hearth: uses its own ready
+// hearthstone. Hold: waits.
+enum class StratholmeYardStep : std::uint8_t
+{
+    Aim,
+    Hearth,
+    Hold,
+};
+
+struct StratholmeYardMember
+{
+    bool isLeader{false};
+    bool alive{false};
+    bool hearthReady{false};
+};
+
+// One step per member in the yard, in the same order. The living leader alone
+// is aimed and the others hold while it works the way out. With no living
+// leader in the yard nobody is aimed: a member with a ready stone hearths and
+// the rest hold.
+std::vector<StratholmeYardStep> StratholmeYardPlan(
+    std::vector<StratholmeYardMember> const& members);
+
 char const* StratholmeExitWayWord(StratholmeExitWay way);
 
 // The run's exit trigger whose landing is the yard, and the two gameobjects in
