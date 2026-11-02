@@ -4144,6 +4144,11 @@ uint32_t RaidWingEncounterMask(uint32_t mapId);
 uint32_t DungeonRunExpectedMask(uint32_t mapId, uint32_t mapMask,
                                 uint32_t wingMask);
 
+// Remove encounter bits this faction cannot earn when the clear roster treats
+// a friendly encounter as a travel objective.
+uint32_t DungeonRunFactionExpectedMask(uint32_t mapId, uint32_t expectedMask,
+                                       bool alliance);
+
 // Some maps contain several independent dungeon wings behind different
 // entrance triggers. Their encounter list is the union of all wings, so a
 // single-wing run cannot be proved complete from the map-level mask.

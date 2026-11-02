@@ -3421,6 +3421,17 @@ uint32_t DungeonRunExpectedMask(uint32_t mapId, uint32_t mapMask, uint32_t wingM
     return required & wingMask;
 }
 
+uint32_t DungeonRunFactionExpectedMask(uint32_t mapId, uint32_t expectedMask,
+                                       bool alliance)
+{
+    // Uldaman's Lost Dwarves encounter is credited by Baelog (6906). The
+    // Alliance clear roster treats that friendly entry as a travel objective,
+    // so it cannot set encounter bit 1 even after reaching the objective.
+    if (mapId == 70 && alliance)
+        return expectedMask & ~(1u << 1);
+    return expectedMask;
+}
+
 bool DungeonMapHasIndependentWings(uint32_t mapId)
 {
     // Scarlet Monastery's four wings share map 189 but have separate entrance

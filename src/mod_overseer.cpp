@@ -39009,7 +39009,12 @@ private:
             OverseerDecisions::DungeonMapHasIndependentWings(mapId)
                 ? DungeonBrainExpectedEncounterMask(member)
                 : 0;
-        return OverseerDecisions::DungeonRunExpectedMask(mapId, mapMask, wingMask);
+        uint32 const expectedMask =
+            OverseerDecisions::DungeonRunExpectedMask(mapId, mapMask, wingMask);
+        return member
+                   ? OverseerDecisions::DungeonRunFactionExpectedMask(
+                         mapId, expectedMask, member->GetTeamId() == TEAM_ALLIANCE)
+                   : expectedMask;
     }
 
     // ---- the CLEARING watchdog: has the run gone anywhere (#171) ----
