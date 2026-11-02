@@ -114,7 +114,7 @@ void TheStandDownDrivesAskTheGuildRunToo(std::string const& text)
          "the craft drive does not craft for a lent member mid-clear"},
         {"void DriveLockpick()", "if (InAnyDungeonRun(bot))",
          "the lockpick errand stands down for a lent member"},
-        {"void DriveRecipeManuals()", "|| InAnyDungeonRun(bot))",
+        {"void DriveRecipeManuals()", "if (InAnyDungeonRun(bot))",
          "the recipe-manual errand stands down for a lent member"},
         {"void DriveStuckRevival()", "bool const inRun = InAnyDungeonRun(bot);",
          "the healer-death path treats a lent member as in a run"},

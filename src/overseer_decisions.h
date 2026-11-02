@@ -23752,11 +23752,14 @@ bool ParseRecipeManualErrand(std::string const& column, RecipeManualErrand& out)
 // asking a third time every poll is the retry loop the column exists to end.
 constexpr uint32_t RECIPE_MANUAL_MAX_USES = 2;
 
-// How long the walk phase may run before the errand is refused. The walk is
-// bounded so a character that cannot reach the vendor (or stalls mid-walk)
-// does not hold the travel aim forever. The errand releases itself with a log
-// line after this many seconds without a purchase attempt.
-constexpr uint32_t RECIPE_MANUAL_WALK_TIMEOUT_SECONDS = 300;
+// How long one errand may stand without the manual in the bags before it is
+// refused (#1203). The walk goes through the travel aim book, whose backstop
+// gives up on an aim after TRAVEL_BACKSTOP_SECONDS (twenty minutes), and the
+// next poll of this drive would claim the same walk again, so without a bound
+// of its own the errand could walk, give up and walk again for ever. Thirty
+// minutes lets one whole walk run to that backstop and ends the retry after it.
+// A fence that refuses the claim every poll is bounded by the same clock.
+constexpr std::time_t RECIPE_MANUAL_ERRAND_SECONDS = 30 * 60;
 
 // The refusal literals, written into the log line. No quote characters.
 namespace RecipeManualRefusal
@@ -23767,8 +23770,8 @@ constexpr char const* NotSold = "the vendor does not sell the manual";
 constexpr char const* TooPoor = "the character cannot afford the manual";
 constexpr char const* UsedAndNotLearned =
     "the manual was used and the recipe is still not known";
-constexpr char const* WalkTimeout =
-    "the walk to the vendor timed out without a purchase attempt";
+constexpr char const* NotBoughtInTime =
+    "the manual was not bought within the errand's time bound";
 }  // namespace RecipeManualRefusal
 
 // Everything the plan reads, as the adapter measured it this poll.
@@ -23784,7 +23787,11 @@ struct RecipeManualFacts
     bool vendorSells{false};    // its list carries the manual for gold
     uint64_t price{0};          // copper, reputation discount applied
     uint64_t purse{0};          // copper the character holds
-    time_t walkStartedAt{0};    // when the walk phase began (0 = not walking)
+    // When this worldserver first saw the errand, and the time of this poll.
+    // Zero for errandSince means the clock has not started, and nothing is
+    // bounded. Passed in rather than read here so the bound is tested.
+    std::time_t errandSince{0};
+    std::time_t now{0};
 };
 
 enum class RecipeManualStep : uint8_t
@@ -23809,7 +23816,19 @@ struct RecipeManualPlan
 // walked to, and then stepped up to, before its stock or price is judged,
 // because the core sells only inside the interact gate; and a manual that has been used and still taught nothing
 // is refused rather than bought again with the character's money.
+// An errand still without the manual RECIPE_MANUAL_ERRAND_SECONDS after it was
+// first seen is refused with NotBoughtInTime, whatever step it was on.
 RecipeManualPlan PlanRecipeManual(RecipeManualFacts const& facts);
+
+// DOES THIS STEP HOLD THE CHARACTER WHERE IT STANDS (#1203)? Every step from
+// arrival at the vendor until the errand ends: the last yards, the buy, the
+// use and the wait for the use to read back. The travel drive releases the
+// aim on arrival, and between that and this drive's next poll the wander
+// (`new rpg`) or a leader's `follow` could walk the character off again, so
+// the walk, arrive and wander cycle never reaches the buy. The hold takes both
+// strategies off until the errand is released. The walk alone does not hold:
+// it is the travel drive's to steer.
+bool RecipeManualStepHoldsCharacter(RecipeManualStep step);
 
 // Does this refusal from the buy verb release the errand? Every refusal
 // BuyRefusalRetry calls Never, and two it calls otherwise that the errand cannot
