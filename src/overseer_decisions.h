@@ -3273,6 +3273,14 @@ float DungeonClearWatchdogYards(float yardsFromMark, std::string const& stopReas
 // text is "dungeon clear switched itself off; no reason given".
 std::string DungeonModuleStopWords(std::string const& raw);
 
+// AND WHETHER THAT STOP WAS THE MODULE FINISHING (#1322). The module switches
+// itself off with "All bosses cleared!" when it has counted every boss down,
+// and the CLEARING stall path used to book that run as 'stalled' like any other
+// switched-off module: run 1280737 on map 209 (2026-11-02). True only for that
+// stop, as the module says it, with or without its "Dungeon clear stopped:"
+// prefix and surrounding blanks; every other reason, and no reason, is false.
+bool DungeonModuleStopIsCleared(std::string const& stopReason);
+
 // ------------------------------ how long busy may mean anything (#382) --
 //
 // `partyBusy` above is the input that outranks everything, and until #382
