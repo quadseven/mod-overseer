@@ -81694,12 +81694,14 @@ private:
 
         if (request.mainHand)
         {
-            WorldPacket raw(CMSG_CAST_SPELL, 1 + 4 + 1 + 4 + 8);
+            // TARGET_FLAG_ITEM and one PACKED guid: what SpellCastTargets::Read
+            // expects after the flag. The raw 8-byte guid read as the wrong bytes.
+            WorldPacket raw(CMSG_CAST_SPELL, 1 + 4 + 1 + 4 + 9);
             raw << uint8(1);
             raw << uint32(request.spell);
             raw << uint8(0);
             raw << uint32(TARGET_FLAG_ITEM);
-            raw << item->GetGUID();
+            raw << item->GetGUID().WriteAsPacked();
             raw.rpos(0);
             session->HandleCastSpellOpcode(raw);
         }
