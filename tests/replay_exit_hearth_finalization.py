@@ -37,7 +37,7 @@ bool IsDungeonJob(std::string const&){return true;}
 namespace OverseerDecisions { const char* DungeonRunExitOutcome(bool complete,bool stalled,bool evacuated){return evacuated?"evacuated":complete?"complete":stalled?"stalled":"left";} }
 std::map<std::string,ExitHearthEpisode> _exitHearths;
 DungeonRunCoordinatorState coord; int finalized=0; std::string outcome, endedReason;
-bool hearthInPlay=true, hearthedOut=false; struct RunOverMark{unsigned mapId; std::string reason;}; std::map<std::string,RunOverMark> _runOver;
+bool hearthInPlay=true, hearthedOut=false; struct RunOverMark{unsigned mapId; std::string reason; bool provedComplete;}; std::map<std::string,RunOverMark> _runOver;
 bool DriveExitHearths(std::string const&,std::string const&,std::vector<std::string> const&,ExitHearthEpisode&,const char*,const char*){return hearthInPlay;}
 bool EpisodeHearthedSomebodyOut(ExitHearthEpisode const&,std::vector<std::string> const&){return hearthedOut;}
 void EndRunAndDecide(DungeonRunCoordinatorState& c,std::string const&,DungeonPortal const&,unsigned id,const char* o,std::string const& r,bool,std::vector<std::string> const*){endedReason=r; assert(id==7); assert(c.campaignId==9001 && c.runNumber==1 && c.runsWanted==50 && c.capKnown); finalized++; outcome=o;}
