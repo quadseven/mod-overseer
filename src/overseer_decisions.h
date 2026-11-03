@@ -25164,10 +25164,19 @@ GuildRunStallStep GuildRunStallNext(GuildRunStallFacts const& facts);
 // the progress window closed.
 //
 // So, with the tank alive inside, out of combat, within ZF_END_DOOR_NEAR_YARDS
-// of the shut door, and the pyramid event played to its last wave: ask a
-// living, idle Weegli to go (the core's own ACTION_DESTROY_GATES), give him
+// of the shut door, and the pyramid's trolls all dead: ask a living, idle
+// Weegli to go (the core's own ACTION_DESTROY_GATES), give him
 // ZF_END_DOOR_WEEGLI_SECONDS, and open the door the way his barrel does when
 // he cannot.
+//
+// The pre-roll review of the first roll carrying this found the open path
+// running ahead of the event it waits on (#1341). At the last wave, the
+// trolls still up and nobody in combat, Weegli refused to go and the module
+// opened the door itself once his wait ran out; and the adapter looked for
+// him only within 200 yards of the tank, so a living Weegli standing
+// farther off counted as gone and the door opened on the first poll. The
+// decision now holds at Nothing until the trolls are all dead, and the
+// adapter searches the whole instance by entry before it calls him gone.
 constexpr std::uint32_t ZF_MAP_ID = 209;
 constexpr std::uint32_t ZF_END_DOOR_ENTRY = 146084;   // GO_END_DOOR
 constexpr std::uint32_t ZF_WEEGLI_ENTRY = 7607;       // NPC_WEEGLI
@@ -25184,6 +25193,11 @@ constexpr float ZF_END_DOOR_NEAR_YARDS = 100.f;
 // Weegli's run from the crew's gathering spot to the door, his barrel and its
 // fuse take well under a minute.
 constexpr unsigned ZF_END_DOOR_WEEGLI_SECONDS = 90;
+// How far the adapter looks for a living Weegli, by entry: the whole
+// instance, from wherever the tank stands. The search this replaces
+// reached 200 yards from the tank, so a living Weegli farther off in
+// the instance counted as gone (#1341).
+constexpr float ZF_WEEGLI_SEARCH_YARDS = 2000.f;
 
 struct ZulFarrakEndDoorFacts
 {

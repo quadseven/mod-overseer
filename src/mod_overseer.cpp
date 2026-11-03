@@ -45878,10 +45878,22 @@ private:
             run.zfDoorNearSince = now;
         facts.pyramidPhase = script->GetData(OverseerDecisions::ZF_DATA_PYRAMID);
         facts.endDoorState = script->GetData(OverseerDecisions::ZF_DATA_END_DOOR);
-        // Weegli's escape, his death and his despawn all leave him unfound.
-        Creature* const weegli = tank->FindNearestCreature(OverseerDecisions::ZF_WEEGLI_ENTRY,
-                                                           2.f * OverseerDecisions::ZF_END_DOOR_NEAR_YARDS,
-                                                           /*alive*/ true);
+        // Weegli is looked for by entry across the whole instance (#1341):
+        // the search this replaces reached 200 yards from the tank, so a
+        // living Weegli standing farther off read as gone and the door
+        // opened on the first poll. His escape, his death and his despawn
+        // all leave him unfound here too.
+        Creature* weegli = nullptr;
+        std::list<Creature*> weegliFound;
+        tank->GetCreatureListWithEntryInGrid(weegliFound, OverseerDecisions::ZF_WEEGLI_ENTRY,
+                                             OverseerDecisions::ZF_WEEGLI_SEARCH_YARDS);
+        for (Creature* const candidate : weegliFound)
+        {
+            if (!candidate || !candidate->IsAlive())
+                continue;
+            if (!weegli || tank->GetExactDist(candidate) < tank->GetExactDist(weegli))
+                weegli = candidate;
+        }
         facts.weegliAlive = weegli != nullptr;
         facts.weegliAsked = run.zfWeegliAsked;
         facts.secondsNear = static_cast<unsigned>(now - run.zfDoorNearSince);
@@ -45903,7 +45915,10 @@ private:
                 script->SetData(OverseerDecisions::ZF_DATA_END_DOOR,
                                 OverseerDecisions::ZF_END_DOOR_DONE);
                 // The deploy proof: "Zul'Farrak's End Door - opened" is said
-                // nowhere else.
+                // nowhere else. The line names which of the open path's
+                // preconditions held, so a live read can tell a real stall
+                // from a shortcut (#1341): the phase and door state it fired
+                // at, and Weegli's state after the instance-wide search.
                 LOG_WARN("module.overseer",
                          "overseer: guild finder run {} - Zul'Farrak's End Door - opened by the "
                          "module after '{}' stood {}s {:.0f}y from it out of combat (pyramid "
@@ -45911,7 +45926,11 @@ private:
                          "and Chief Ukorz Sandscalp is behind it",
                          run.id, run.tank, facts.secondsNear, tank->GetExactDist(door),
                          facts.pyramidPhase, facts.endDoorState,
-                         facts.weegliAlive ? "alive but the door still shut" : "gone");
+                         facts.weegliAlive
+                             ? (facts.weegliAsked
+                                    ? "alive, sent by the module, and still shut after his wait"
+                                    : "alive but never sent by the module")
+                             : "gone: no living one anywhere in the instance");
                 run.zfDoorNearSince = 0;
                 run.zfWeegliAsked = false;
                 return;
