@@ -10915,9 +10915,17 @@ private:
             auto const hold = holds.find(name);
             if (hold != holds.end() && hold->second.verb == "hearth")
             {
+                // A keep-out hold is not a failed cast and is not counted
+                // (#1229, the live check): counting it drove the streak past
+                // the bound while the stone was on cooldown and on for ever.
                 unsigned released = 0;
                 if (_guildDeathSpotTries.count(name))
-                    released = ++_guildDeathSpotCeilings[name];
+                {
+                    unsigned& streak = _guildDeathSpotCeilings[name];
+                    streak = OverseerDecisions::HearthCeilingStreakAfter(
+                        streak, true, _guildDeathSpotKeptOut.count(name) != 0);
+                    released = streak;
+                }
                 auto const said = _guildDeathSpotRefusal.find(name);
                 LOG_INFO("module.overseer",
                          "overseer: '{}' reached its hearth hold's ceiling without going home - "
@@ -33353,6 +33361,7 @@ private:
             _guildDeathSpotTries.erase(name);
             _guildDeathSpotRefusal.erase(name);
             _guildDeathSpotCeilings.erase(name);
+            _guildDeathSpotKeptOut.erase(name);
             return false;
         }
 
@@ -33405,8 +33414,12 @@ private:
         {
             bool const keepOut = OverseerDecisions::KeepOutOfDeathZone(
                 true, outmatchedHere, guildMovedIt);
-            if (keepOut && holdStill())
-                sayCannotSucceed();
+            if (keepOut)
+            {
+                _guildDeathSpotKeptOut.insert(name);
+                if (holdStill())
+                    sayCannotSucceed();
+            }
             return keepOut;
         };
 
@@ -33422,6 +33435,9 @@ private:
                                                           boundTries, ceilings),
                 outmatchedHere, guildMovedIt))
         {
+            // This hold keeps the member out; it is not a hearth attempt, so
+            // its ceiling is not counted as one with no cast.
+            _guildDeathSpotKeptOut.insert(name);
             if (holdStill())
                 sayCannotSucceed();
             return true;
@@ -33440,6 +33456,8 @@ private:
 
         // The first hearth and every retry are driven with the member stopped:
         // a cast driven while an outside walk moves the character is broken.
+        // From here the hold is a hearth attempt's, and its ceiling counts.
+        _guildDeathSpotKeptOut.erase(name);
         holdStill();
         char const* status = "error";
         std::string evidence;
@@ -82814,6 +82832,10 @@ private:
     // ReleaseExpiredHolds, cleared when a cast starts or the member leaves the
     // death zone; HearthOutCannotSucceed sends it to the keep-out at the bound.
     std::map<std::string, unsigned> _guildDeathSpotCeilings;
+    // Members whose `hearth` hold in force was placed by the death-spot
+    // keep-out rather than for a hearth attempt (#1229). Its ceiling is not a
+    // cast that failed, so ReleaseExpiredHolds does not count it.
+    std::set<std::string> _guildDeathSpotKeptOut;
     // DriveGuildTraining: every class trainer spawn by the class it serves, the
     // entry each spot is, the trainer each member was last sent to, and when
     // the drive last ran.

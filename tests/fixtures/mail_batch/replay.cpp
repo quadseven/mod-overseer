@@ -57,6 +57,7 @@ bool ARowStillOwnsTheHold(std::string const&) { return false; }
 std::set<std::string> _guildDeathSpotTries;
 std::map<std::string, unsigned> _guildDeathSpotCeilings;
 std::map<std::string, std::string> _guildDeathSpotRefusal;
+std::set<std::string> _guildDeathSpotKeptOut;
 
 #error "Inject RELEASE from the production adapter"
 #error "Inject ARRIVAL from the production adapter"
