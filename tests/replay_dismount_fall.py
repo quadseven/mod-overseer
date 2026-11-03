@@ -364,8 +364,11 @@ def run(tree, workdir, patched):
     cpp = workdir / ("new.cpp" if patched else "old.cpp")
     binary = cpp.with_suffix(".bin")
     cpp.write_text(source)
-    subprocess.run(["g++", "-std=c++17", "-w", str(cpp), "-o", str(binary)], check=True)
-    output = subprocess.run([str(binary)], check=True, capture_output=True, text=True).stdout
+    compiler = shutil.which(os.environ.get("CXX", "c++"))
+    subprocess.run([compiler, "-std=c++17", "-w", str(cpp), "-o", str(binary)],
+                   check=True, timeout=60)
+    output = subprocess.run([str(binary)], check=True, capture_output=True, text=True,
+                            timeout=10).stdout
     results = {}
     for line in output.splitlines():
         name, ok = line.split("=")

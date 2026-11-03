@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 
@@ -31,8 +32,9 @@ with tempfile.TemporaryDirectory() as directory:
     cpp = Path(directory) / "replay.cpp"
     binary = Path(directory) / "replay"
     cpp.write_text(harness)
+    compiler = shutil.which(os.environ.get("CXX", "c++"))
     subprocess.run(
-        ["g++", "-std=c++17", "-Wall", "-Wextra", "-I" + str(ROOT / "src"),
+        [compiler, "-std=c++17", "-Wall", "-Wextra", "-I" + str(ROOT / "src"),
          str(ROOT / "src/overseer_decisions.cpp"), str(cpp), "-o", str(binary)],
         check=True, timeout=60,
     )

@@ -55,8 +55,14 @@ FROM (
 WHERE rn <= 8
 ORDER BY target_name, target_arg, command, status, updated_at, result;
 """
+# Pinned to a commit rather than the branch. This test runs inside the
+# decisions gate, so a floating read would let a change in the other
+# repository fail every pull request here at once, and a moved file would
+# read as a drift failure (#1346). Bump the pin deliberately, to that
+# repository's main head, when the bridge's share read changes.
 BRIDGE_SOURCE = (
-    "https://raw.githubusercontent.com/quadseven/wow-overseer/main/bridge.py"
+    "https://raw.githubusercontent.com/quadseven/wow-overseer/"
+    "653088262a8ff54b921a86a937e7882b58161873/bridge.py"
 )
 # What the copy above and the retention both rest on, in the bridge's words.
 BRIDGE_FRAGMENTS = (

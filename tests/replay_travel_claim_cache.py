@@ -1,6 +1,8 @@
 """Replay Claim and FenceRefuses caches against changed travel columns."""
 
 from pathlib import Path
+import os
+import shutil
 import subprocess
 import tempfile
 
@@ -85,8 +87,9 @@ with tempfile.TemporaryDirectory() as directory:
     cpp.write_text(
         prefix + source[start:end] + between + source[fence_start:fence_end] + suffix
     )
+    compiler = shutil.which(os.environ.get("CXX", "c++"))
     subprocess.run(
-        ["g++", "-std=c++17", "-Wall", "-Wextra", str(cpp), "-o", str(binary)],
+        [compiler, "-std=c++17", "-Wall", "-Wextra", str(cpp), "-o", str(binary)],
         check=True,
         timeout=30,
     )
