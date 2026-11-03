@@ -36068,14 +36068,39 @@ private:
     //     arriving; see WithinHomeBindStandDown.
     //   * NOT STEERABLE. Offline, mid-login or mid-teardown. Its home is read
     //     off a live Player and there is nothing to read.
+    // THE HOME THIS CAMPAIGN JUDGES AGAINST: the door's own town, or, for a
+    // door that names none, the family's own inn on the door's continent
+    // (#1142). Without the second, the Uldaman campaign judged nobody and a
+    // member left bound at Ratchet by an earlier campaign was hearthed to the
+    // other continent on every failed walk out. Both callers ask it here, so
+    // the drive and the run coordinator's hold read one anchor.
+    static OverseerDecisions::CampaignHomeAnchor CampaignHomeAnchorFor(
+        DungeonPortal const& portal, std::vector<std::string> const& members)
+    {
+        OverseerDecisions::CampaignHomeAnchor const named = DungeonHomeAnchor(portal);
+        if (named.known)
+            return named;
+
+        std::vector<OverseerDecisions::HomeBind> binds;
+        for (std::string const& name : members)
+        {
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            if (bot && bot->IsInWorld())
+                binds.push_back(ReadHomeBind(bot));
+        }
+        return OverseerDecisions::FamilyInnOnDoorMap(binds, portal.outsideMapId,
+                                                     CAMPAIGN_HOME_TOWN_YARDS);
+    }
+
     std::vector<std::string> MembersOwedAHome(std::vector<std::string> const& members,
                                               DungeonPortal const& portal)
     {
         std::vector<std::string> owed;
 
-        OverseerDecisions::CampaignHomeAnchor const anchor = DungeonHomeAnchor(portal);
+        OverseerDecisions::CampaignHomeAnchor const anchor =
+            CampaignHomeAnchorFor(portal, members);
         if (!anchor.known)
-            return owed;   // this door names no town: nothing is judged
+            return owed;   // no town named and no family inn on the door's map
 
         for (std::string const& name : members)
         {
@@ -36264,9 +36289,10 @@ private:
         if (!portal)
             return;
 
-        OverseerDecisions::CampaignHomeAnchor const anchor = DungeonHomeAnchor(*portal);
+        OverseerDecisions::CampaignHomeAnchor const anchor =
+            CampaignHomeAnchorFor(*portal, members);
         if (!anchor.known)
-            return;   // this door names no town: nothing is judged, nobody walks
+            return;   // no town named and no family inn on the door's map: nobody walks
 
         // The aim is the inn's own position, formatted the way every other
         // place-aim in this module is. It is not a `trigger:` and not a role
@@ -38116,8 +38142,8 @@ private:
                                  "(attempt {} of {}) because {}; the campaign stays as it is "
                                  "and the next run "
                                  "starts normally",
-                                 name, episode.mapId, episode.attempts[name], reason,
-                                 OverseerDecisions::EXIT_HEARTH_ATTEMPTS);
+                                 name, episode.mapId, episode.attempts[name],
+                                 OverseerDecisions::EXIT_HEARTH_ATTEMPTS, reason);
                         if (OverseerDecisions::OffContinentHearthLetThrough(facts))
                             LOG_WARN("module.overseer",
                                      "overseer: EXIT HEARTH - '{}' is let through to its bind "

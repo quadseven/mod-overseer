@@ -12374,7 +12374,30 @@ struct CampaignHomeAnchor
     float x{0.f};
     float y{0.f};
     float z{0.f};
+    // AN ANCHOR THE DOOR DID NOT NAME (#1142). True for the family's own inn,
+    // FamilyInnOnDoorMap below, which stands in for a door that names no town.
+    // It judges the continent only: any home on the anchor's map suits, so the
+    // fallback moves only a home a hearthstone would carry across an ocean,
+    // never one that is merely at a different inn on the right continent.
+    bool mapOnly{false};
 };
+
+// THE FAMILY'S OWN INN ON THE DOOR'S CONTINENT, FOR A DOOR THAT NAMES NO TOWN
+// (#1142). Measured on the dev realm 2026-11-02: the Uldaman row names no town,
+// so the campaign home drive judged nobody, and Ugga stayed bound at Ratchet on
+// map 1 (left there by a Wailing Caverns campaign) while the other four were
+// bound in Stormwind on map 0, the continent the Uldaman door lets out on.
+// Every failed walk out then hearthed Ugga to map 1 (44 times in 30 hours)
+// and the family was split until it sailed back.
+//
+// `binds` is every family member's home, read off the live characters; an
+// unreadable one is skipped. The anchor is the home on `doorMapId` that the
+// most other homes share within `townYards`, ties to the earliest in the list,
+// which is an inn somebody in this family already bound at, so it is friendly
+// to the family by construction. Unknown when no home is on the door's map:
+// nobody can be walked to an inn the family has never used.
+CampaignHomeAnchor FamilyInnOnDoorMap(std::vector<HomeBind> const& binds,
+                                      std::uint32_t doorMapId, float townYards);
 
 // Does this member's home suit the dungeon its campaign runs?
 //

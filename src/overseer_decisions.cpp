@@ -10538,12 +10538,49 @@ CampaignHome ReadCampaignHome(HomeBind const& home, CampaignHomeAnchor const& an
     if (home.mapId != anchor.mapId)
         return CampaignHome::OffTheDungeonsMap;
 
+    // The family's own inn judges the continent only (#1142).
+    if (anchor.mapOnly)
+        return CampaignHome::Suits;
+
     // Squared, so these two files keep including nothing but the five standard
     // headers the decisions job compiles them with.
     float const dx = home.x - anchor.x;
     float const dy = home.y - anchor.y;
     return dx * dx + dy * dy > townYards * townYards ? CampaignHome::TooFarFromTheTown
                                                      : CampaignHome::Suits;
+}
+
+CampaignHomeAnchor FamilyInnOnDoorMap(std::vector<HomeBind> const& binds,
+                                      std::uint32_t doorMapId, float townYards)
+{
+    CampaignHomeAnchor anchor;
+    std::size_t best = 0;
+    for (HomeBind const& candidate : binds)
+    {
+        if (!candidate.known || candidate.mapId != doorMapId)
+            continue;
+        std::size_t sharing = 0;
+        for (HomeBind const& other : binds)
+        {
+            if (!other.known || other.mapId != doorMapId)
+                continue;
+            float const dx = other.x - candidate.x;
+            float const dy = other.y - candidate.y;
+            if (dx * dx + dy * dy <= townYards * townYards)
+                ++sharing;
+        }
+        if (sharing > best)
+        {
+            best = sharing;
+            anchor.known = true;
+            anchor.mapId = doorMapId;
+            anchor.x = candidate.x;
+            anchor.y = candidate.y;
+            anchor.z = candidate.z;
+            anchor.mapOnly = true;
+        }
+    }
+    return anchor;
 }
 
 bool CampaignHomeNeedsRebinding(CampaignHome verdict)
