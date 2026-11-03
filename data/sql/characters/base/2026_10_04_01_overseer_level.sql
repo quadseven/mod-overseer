@@ -16,7 +16,7 @@
 -- overseer_death (DEATH_RETENTION_DAYS). Created without `IF NOT EXISTS`, like
 -- overseer_death, so re-applying fails loudly. A worldserver that starts before
 -- db-import has run this loses rows, not the level change.
-CREATE TABLE `overseer_level` (
+CREATE TABLE IF NOT EXISTS `overseer_level` (
     `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     `character_name` VARCHAR(12) NOT NULL,
     `character_guid` INT UNSIGNED NOT NULL DEFAULT 0,

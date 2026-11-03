@@ -37,6 +37,20 @@
 -- goals._reconcile_quest); teaching DriveQuests() to prefer it over the first
 -- eligible quest in the leader's own log is a separate, C++-only change.
 -- Until then the column is written and unread, which is a no-op on the game.
-ALTER TABLE `overseer_roster`
-    ADD COLUMN `drive_quest` INT UNSIGNED NOT NULL DEFAULT 0
-        COMMENT 'Quest id the overseer wants this character working; 0 = pick for itself';
+-- Guarded the way 2026_08_26_01_overseer_roster_job.sql guards its own
+-- (#1343): dbimport re-applies a hash-changed file, and an unguarded
+-- ADD COLUMN aborts the second run with a duplicate-column error.
+SET @drive_quest_column_missing = (
+    SELECT COUNT(*) = 0 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'overseer_roster'
+      AND COLUMN_NAME = 'drive_quest'
+);
+SET @add_drive_quest_column = IF(
+    @drive_quest_column_missing,
+    "ALTER TABLE `overseer_roster` ADD COLUMN `drive_quest` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Quest id the overseer wants this character working; 0 = pick for itself'",
+    "SELECT 1"
+);
+PREPARE add_drive_quest_column_stmt FROM @add_drive_quest_column;
+EXECUTE add_drive_quest_column_stmt;
+DEALLOCATE PREPARE add_drive_quest_column_stmt;

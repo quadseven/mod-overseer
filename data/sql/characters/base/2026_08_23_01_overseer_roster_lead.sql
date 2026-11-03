@@ -10,6 +10,20 @@
 -- at gmlevel 3, `.pinfo` and `.gps` issued as the bot are both refused. The
 -- whole kind='gm' path only works while a real client holds the character, so
 -- correcting leadership from the bridge produced an error every cycle forever.
-ALTER TABLE `overseer_roster`
-    ADD COLUMN `lead` TINYINT UNSIGNED NOT NULL DEFAULT 0
-    COMMENT 'This character should lead the roster party';
+-- Guarded the way 2026_08_26_01_overseer_roster_job.sql guards its own
+-- (#1343): dbimport re-applies a hash-changed file, and an unguarded
+-- ADD COLUMN aborts the second run with a duplicate-column error.
+SET @lead_column_missing = (
+    SELECT COUNT(*) = 0 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'overseer_roster'
+      AND COLUMN_NAME = 'lead'
+);
+SET @add_lead_column = IF(
+    @lead_column_missing,
+    "ALTER TABLE `overseer_roster` ADD COLUMN `lead` TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'This character should lead the roster party'",
+    "SELECT 1"
+);
+PREPARE add_lead_column_stmt FROM @add_lead_column;
+EXECUTE add_lead_column_stmt;
+DEALLOCATE PREPARE add_lead_column_stmt;

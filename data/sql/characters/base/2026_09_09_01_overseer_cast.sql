@@ -153,6 +153,13 @@
 -- the schema silently, after which every row of that kind fails to insert.
 -- 'conjure' is last in the list below because it was the last one added; the
 -- order inside the ENUM is not meaningful and the completeness of the list is.
+-- RESTATED TO THE FINAL UNION AFTER THE FACT (#1343). dbimport re-applies
+-- any file whose hash changed, and this statement's shorter list, re-applied
+-- after later files had widened the column, shrank the ENUM under live rows
+-- (an error in strict mode, or truncation). It now names the final union
+-- the chain ends at, so a re-apply in any order cannot shrink it; a first
+-- application still ends at the same schema, because every file in the
+-- chain now restates this same list.
 ALTER TABLE `overseer_command`
-    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction','mail','repair','buy','bind','hearth','summon','conjure','cast')
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction','mail','repair','buy','bind','hearth','summon','conjure','cast','guild','quest','naturalize','disenchant')
         NOT NULL DEFAULT 'bot';

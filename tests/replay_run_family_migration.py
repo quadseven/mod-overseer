@@ -113,5 +113,126 @@ INSERT INTO overseer_dungeon_run(family,leader_name,map_id,state)
         self.assertEqual("2", count.strip())
 
 
+class WholeDirectoryMigrationTest(unittest.TestCase):
+    """Every base migration applies cleanly again against the full schema.
+
+    dbimport re-applies any file whose hash changed, so a comment-only edit
+    re-runs a file against a database that already holds every later
+    migration and live rows. A second (and third, and out-of-order) pass
+    must be a no-op: no duplicate-column aborts, no dropped tables, and no
+    ENUM restated shorter than the final list while rows hold newer values.
+    """
+
+    FINAL_KIND = (
+        "enum('bot','chat','gm','probe','give','share','trade','job','sell',"
+        "'bank','auction','mail','repair','buy','bind','hearth','summon',"
+        "'conjure','cast','guild','quest','naturalize','disenchant')"
+    )
+    FINAL_STATUS = (
+        "enum('pending','claimed','delivered','error','verifying','applied',"
+        "'unchanged')"
+    )
+
+    def run_sql(self, sql, label):
+        command = json.loads(
+            os.environ.get(
+                "MYSQL_REPLAY_COMMAND",
+                '["mysql","--protocol=TCP","--host=127.0.0.1","--user=root"]',
+            )
+        )
+        result = subprocess.run(  # noqa: S603 - explicitly supplied test database client
+            [*command, "--batch", "--skip-column-names"],
+            input=DATABASE_SQL + sql,
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        self.assertEqual(0, result.returncode, f"{label}: {result.stderr}")
+        return result.stdout
+
+    def apply_directory(self, label):
+        # One client call per pass: a process per file costs more than the
+        # gate has to spare. Every file's statements are self-contained
+        # (the guards set and consume their own session variables), so a
+        # shared session changes nothing. If a pass ever fails, replay it
+        # file by file so the failure names its file before failing again.
+        paths = sorted(SQL.glob("*.sql"))
+        payload = "\n".join(path.read_text() for path in paths)
+        try:
+            self.run_sql(payload, label)
+        except AssertionError:
+            for path in paths:
+                self.run_sql(path.read_text(), f"{label} (isolating): {path.name}")
+            raise
+
+    def column_type(self, table, column):
+        out = self.run_sql(
+            "SELECT COLUMN_TYPE FROM information_schema.COLUMNS "
+            f"WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='{table}' "
+            f"AND COLUMN_NAME='{column}';",
+            f"column type of {table}.{column}",
+        )
+        return out.strip()
+
+    def test_full_directory_reapplies_cleanly_and_preserves_live_rows(self):
+        self.run_sql(
+            "DROP DATABASE IF EXISTS overseer_run_family_replay;",
+            "reset replay database",
+        )
+        self.apply_directory("first pass")
+        # Live rows a re-apply must never lose or strand: roster members,
+        # and a command holding the newest kind and a status the chat
+        # migration's own shorter restatement predates.
+        self.run_sql(
+            "INSERT INTO overseer_roster(name) VALUES ('LeaderA'),('MemberA');",
+            "seed roster rows",
+        )
+        self.run_sql(
+            "INSERT INTO overseer_command(target_name,command,kind,status) "
+            "VALUES ('LeaderA','say hi','disenchant','verifying');",
+            "seed command row",
+        )
+        self.apply_directory("second pass")
+        self.apply_directory("third pass")
+        roster = self.run_sql(
+            "SELECT name FROM overseer_roster "
+            "WHERE name IN ('LeaderA','MemberA') ORDER BY name;",
+            "roster rows after re-apply",
+        )
+        self.assertEqual(["LeaderA", "MemberA"], roster.splitlines())
+        command = self.run_sql(
+            "SELECT kind,status FROM overseer_command "
+            "WHERE target_name='LeaderA';",
+            "command row after re-apply",
+        )
+        self.assertEqual("disenchant\tverifying", command.strip())
+        self.assertEqual(
+            self.FINAL_KIND, self.column_type("overseer_command", "kind")
+        )
+        self.assertEqual(
+            self.FINAL_STATUS, self.column_type("overseer_command", "status")
+        )
+        # dbimport re-applies one changed file at a time, out of order: the
+        # two files whose restatements predate the final lists must not
+        # shrink either ENUM while the probe rows above are live.
+        for name in (
+            "2026_08_22_00_overseer_chat.sql",
+            "2026_08_24_00_overseer_give.sql",
+        ):
+            self.run_sql((SQL / name).read_text(), f"out-of-order: {name}")
+        self.assertEqual(
+            self.FINAL_KIND, self.column_type("overseer_command", "kind")
+        )
+        self.assertEqual(
+            self.FINAL_STATUS, self.column_type("overseer_command", "status")
+        )
+        command = self.run_sql(
+            "SELECT kind,status FROM overseer_command "
+            "WHERE target_name='LeaderA';",
+            "command row after out-of-order re-apply",
+        )
+        self.assertEqual("disenchant\tverifying", command.strip())
+
+
 if __name__ == "__main__":
     unittest.main()

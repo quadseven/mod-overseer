@@ -36,6 +36,20 @@
 -- skill is confirmed learned (read back via HasSkill, never assumed from
 -- TeachSpell's own void return - see the design doc for why that read-back is
 -- not optional).
-ALTER TABLE `overseer_roster`
-    ADD COLUMN `learn_fishing` TINYINT(1) UNSIGNED NOT NULL DEFAULT 0
-        COMMENT 'Learn Fishing from the next trainer this character reaches that offers it; 0 = nothing to learn, cleared once HasSkill(SKILL_FISHING) reads back true';
+-- Guarded the way 2026_08_26_01_overseer_roster_job.sql guards its own
+-- (#1343): dbimport re-applies a hash-changed file, and an unguarded
+-- ADD COLUMN aborts the second run with a duplicate-column error.
+SET @learn_fishing_column_missing = (
+    SELECT COUNT(*) = 0 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'overseer_roster'
+      AND COLUMN_NAME = 'learn_fishing'
+);
+SET @add_learn_fishing_column = IF(
+    @learn_fishing_column_missing,
+    "ALTER TABLE `overseer_roster` ADD COLUMN `learn_fishing` TINYINT(1) UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Learn Fishing from the next trainer this character reaches that offers it; 0 = nothing to learn, cleared once HasSkill(SKILL_FISHING) reads back true'",
+    "SELECT 1"
+);
+PREPARE add_learn_fishing_column_stmt FROM @add_learn_fishing_column;
+EXECUTE add_learn_fishing_column_stmt;
+DEALLOCATE PREPARE add_learn_fishing_column_stmt;

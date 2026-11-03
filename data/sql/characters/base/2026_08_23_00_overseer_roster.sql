@@ -10,10 +10,19 @@
 -- whose usernames match AiPlayerbot.RandomBotAccountPrefix, because
 -- IsRandomBot() gates on IsInRandomAccountList(), and that list is built at
 -- startup by walking "<prefix>0".."<prefix>N" (RandomPlayerbotFactory.cpp).
--- Accounts named GRUG/UGGA/GROG/BORK/OG can never enter it. Verified live:
--- the server logs ">> 106 random bot accounts", ids 208-313, ours are 314-318.
-DROP TABLE IF EXISTS `overseer_roster`;
-CREATE TABLE `overseer_roster` (
+-- Accounts with ordinary names can never enter it. Verified live: the
+-- server logs how many random bot accounts it generated at startup, and
+-- the overseer's named accounts sit outside that generated range.
+--
+-- NO DROP, AND IF NOT EXISTS (#1343). This file once dropped and recreated
+-- the table, which was safe only while it could never run twice. dbimport
+-- re-applies any file whose hash changed, so the first later edit to this
+-- file (a comment scrub, as it happened) would have deleted every roster
+-- row and every column later migrations added. The create below is a
+-- no-op on any database that already has the table, which is what makes
+-- the edit that carries this fix safe to land: the re-apply it triggers
+-- is this harmless version.
+CREATE TABLE IF NOT EXISTS `overseer_roster` (
     `name` VARCHAR(12) NOT NULL,
     -- Set 0 to let a character log out and stay out without deleting the row,
     -- so a character can be parked without losing why it was on the list.
