@@ -3544,6 +3544,57 @@ std::string EscLong(std::string s)
     return s;
 }
 
+// The one write-back of a claimed command row: a command this process
+// claimed is finished by writing its status, detail and result, and only
+// while the row is still in the state the finish expects and still
+// claimed by this process. Every finish used to spell this UPDATE out at
+// its own site - thirty-one copies, each applying the escape discipline
+// by hand - so the discipline lives here instead: detail through Esc,
+// result through EscLong, the status words internal and passed as they
+// always were. `touchClock` marks the finishes whose write also holds
+// the row against the abandoned-claim sweep; the rest leave updated_at
+// alone, as they did at their own sites. The claim stamp and the
+// claim-expiry release are not finishes and keep their own statements;
+// the source test for this helper names both.
+static void WriteCommandRow(uint32 id, std::string const& status, std::string const& detail,
+                            std::string const& result, char const* fromStatus, bool touchClock)
+{
+    if (touchClock)
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}', "
+            "updated_at = NOW() WHERE id = {} AND status = '{}' AND claimed_by = '{}'",
+            status, Esc(detail), EscLong(result), id, fromStatus, g_runToken);
+    }
+    else
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
+            "WHERE id = {} AND status = '{}' AND claimed_by = '{}'",
+            status, Esc(detail), EscLong(result), id, fromStatus, g_runToken);
+    }
+}
+
+// The finishes that write no result column leave it as it stands.
+static void WriteCommandRow(uint32 id, std::string const& status, std::string const& detail,
+                            char const* fromStatus, bool touchClock)
+{
+    if (touchClock)
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_command SET status = '{}', detail = '{}', "
+            "updated_at = NOW() WHERE id = {} AND status = '{}' AND claimed_by = '{}'",
+            status, Esc(detail), id, fromStatus, g_runToken);
+    }
+    else
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_command SET status = '{}', detail = '{}' "
+            "WHERE id = {} AND status = '{}' AND claimed_by = '{}'",
+            status, Esc(detail), id, fromStatus, g_runToken);
+    }
+}
+
 // Minimal JSON string escaping. Item and character names come from the world,
 // not from the probe, so they can carry anything the client allows.
 std::string J(std::string const& s)
@@ -13720,7 +13771,7 @@ private:
         CharacterDatabase.Execute(
             "UPDATE overseer_dungeon_run SET campaign_id = {}, run_number = {}, "
             "members = '{}' WHERE id = {} AND campaign_id = 0",
-            campaignId, runNumber, Esc(members), runId);
+            campaignId, runNumber, EscLong(members), runId);
     }
 
     // Read a run's campaign back, for the coordinator that adopts a run it did
@@ -13814,7 +13865,7 @@ private:
             "VALUES ('{}', {}, 'ended', NOW(), '{}', {}, {}, '{}', '{}')",
             Esc(leaderName), mapId,
             Esc(OverseerDecisions::FitEndedReasonColumn(reason)), campaignId, runNumber, outcome,
-            Esc(members));
+            EscLong(members));
     }
 
     // WAS THAT A WIPE, ASKED OF THE DEATH RECORD RATHER THAN OF A GUESS.
@@ -21187,7 +21238,7 @@ private:
             "INSERT IGNORE INTO overseer_loot_council (council_key, kind, family, source, map, "
             "item_entry, item_name, item_quality, candidates, heuristic, heuristic_why) "
             "VALUES ('{}', '{}', '{}', '{}', {}, {}, '{}', {}, '{}', '{}', '{}')",
-            Esc(key), kind, Esc(family), Esc(src), mapId, proto->ItemId, Esc(proto->Name1),
+            EscLong(key), kind, Esc(family), Esc(src), mapId, proto->ItemId, Esc(proto->Name1),
             static_cast<uint32>(proto->Quality),
             EscLong(OverseerDecisions::LootCandidatesJson(candidates)), Esc(pick.recipient),
             Esc(why));
@@ -21495,7 +21546,7 @@ private:
             return;
         std::string list;
         for (std::string const& key : keys)
-            list += (list.empty() ? "'" : ",'") + Esc(key) + "'";
+            list += (list.empty() ? "'" : ",'") + EscLong(key) + "'";
         QueryResult result = CharacterDatabase.Query(
             "SELECT council_key, recipient, reason, decided_by, item_name "
             "FROM overseer_loot_council WHERE status = 'decided' AND council_key IN ({})",
@@ -21554,7 +21605,7 @@ private:
                 "UPDATE overseer_loot_council SET status = 'decided', recipient = heuristic, "
                 "reason = heuristic_why, decided_by = 'heuristic', decided_at = NOW() "
                 "WHERE council_key = '{}' AND status = 'open'",
-                Esc(key));
+                EscLong(key));
             LOG_INFO("module.overseer",
                      "overseer: loot council heard nothing on {} in time, so the heuristic "
                      "decides it", key);
@@ -21585,7 +21636,7 @@ private:
                     "UPDATE overseer_loot_council SET status = 'failed', outcome = '{}' "
                     "WHERE council_key = '{}'",
                     Esc("the corpse was gone before the master looter handed it over"),
-                    Esc(it->first));
+                    EscLong(it->first));
                 LOG_WARN("module.overseer",
                          "overseer: loot council could not hand over {} - the corpse was gone",
                          it->first);
@@ -21643,7 +21694,7 @@ private:
                 CharacterDatabase.Execute(
                     "UPDATE overseer_loot_council SET status = 'failed', outcome = '{}' "
                     "WHERE council_key = '{}'",
-                    Esc(outcome), Esc(it->first));
+                    Esc(outcome), EscLong(it->first));
                 LOG_WARN("module.overseer",
                          "overseer: loot council could not hand {} to anybody - {}", itemName,
                          outcome);
@@ -21660,7 +21711,7 @@ private:
             CharacterDatabase.Execute(
                 "UPDATE overseer_loot_council SET status = 'given', given_to = '{}', "
                 "item_guid = {}, outcome = '{}', given_at = NOW() WHERE council_key = '{}'",
-                Esc(given), itemGuid, Esc(outcome), Esc(it->first));
+                Esc(given), itemGuid, Esc(outcome), EscLong(it->first));
             LOG_INFO("module.overseer",
                      "overseer: loot council gave {} from {} to '{}' by master loot ({}: {})",
                      itemName, drop.source, given,
@@ -21714,7 +21765,7 @@ private:
                     "UPDATE overseer_loot_council SET status = 'lapsed', "
                     "outcome = 'the roll ended without a winner the council could see' "
                     "WHERE council_key = '{}' AND status IN ('open', 'decided')",
-                    Esc(OverseerDecisions::LootCouncilRollKey(it->first)));
+                    EscLong(OverseerDecisions::LootCouncilRollKey(it->first)));
                 it = _councilOpenRolls.erase(it);
             }
             else
@@ -21747,7 +21798,7 @@ private:
                 "item_guid = {}, outcome = 'won on the roll', given_at = NOW() "
                 "WHERE council_key = '{}'",
                 Esc(roll.winner), roll.itemGuid,
-                Esc(OverseerDecisions::LootCouncilRollKey(roll.rollGuid)));
+                EscLong(OverseerDecisions::LootCouncilRollKey(roll.rollGuid)));
             LOG_INFO("module.overseer", "overseer: loot council roll {} was won by '{}'",
                      roll.rollGuid, roll.winner);
             _councilOpenRolls.erase(roll.rollGuid);
@@ -41972,8 +42023,8 @@ private:
             "VALUES ('{}', '{}', {}, {}, '{}', {}, '{}', '{}', '{}', '{}', '{}')",
             Esc(family), Esc(leaderName), campaignId, runNumber, kind, attempt,
             Esc(OverseerDecisions::RunTimelineDetail(failure, 500)),
-            Esc(OverseerDecisions::RunTimelineDetail(facts, 1000)), Esc(options),
-            Esc(heuristic), Esc(OverseerDecisions::RunTimelineDetail(heuristicWhy, 300)));
+            Esc(OverseerDecisions::RunTimelineDetail(facts, 1000)), EscLong(options),
+            EscLong(heuristic), Esc(OverseerDecisions::RunTimelineDetail(heuristicWhy, 300)));
     }
 
     // The bridge's answer to one request, when it has written one. `by` is who
@@ -45062,10 +45113,7 @@ private:
     static void WriteGuildRunRow(uint32 id, char const* status, std::string const& detail,
                                  std::string const& result)
     {
-        CharacterDatabase.Execute(
-            "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}', "
-            "updated_at = NOW() WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-            status, Esc(detail), EscLong(result), id, g_runToken);
+        WriteCommandRow(id, status, detail, result, "verifying", true);
     }
 
     // THE RUN IS OVER: the living are taken out by the finder's own teleport,
@@ -46666,12 +46714,11 @@ private:
                          "restart - {}; {} of {} member(s) back in the world, {} inside",
                          adoption.id, adoption.tank, adoption.request.keyword, why,
                          facts.membersInWorld, facts.groupSize, facts.membersBack);
-                CharacterDatabase.Execute(
-                    "UPDATE overseer_command SET status = 'error', detail = '{}', "
-                    "updated_at = NOW() WHERE id = {} AND status = 'verifying' "
-                    "AND claimed_by = '{}'",
-                    Esc(("lost at the restart: " + why).substr(0, 255)), adoption.id,
-                    g_runToken);
+                WriteCommandRow(adoption.id,
+                                "error",
+                                ("lost at the restart: " + why).substr(0, 255),
+                                "verifying",
+                                true);
                 if (!facts.liveRunGroup)
                 {
                     GuildRunStray stray;
@@ -49761,12 +49808,12 @@ private:
             end == OverseerDecisions::CrossEnd::Arrived    ? "applied"
             : end == OverseerDecisions::CrossEnd::TimedOut ? "unchanged"
                                                            : "error";
-        CharacterDatabase.Execute(
-            "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}', "
-            "updated_at = NOW() WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-            status, Esc(shown),
-            EscLong(OverseerDecisions::CrossResultJson(end, reason, retry, destination, steps)),
-            row, g_runToken);
+        WriteCommandRow(row,
+                        status,
+                        shown,
+                        OverseerDecisions::CrossResultJson(end, reason, retry, destination, steps),
+                        "verifying",
+                        true);
         LOG_INFO("module.overseer",
                  "overseer: cross-to-map {} for '{}' ends {} after {} polls{}{}", row, name,
                  OverseerDecisions::CrossEndWord(end), steps, reason.empty() ? "" : ": ",
@@ -61447,11 +61494,11 @@ private:
                          "overseer: command {} ('{}' for '{}') cannot be verified - the "
                          "character is no longer in the world",
                          check.id, check.command, check.targetName);
-                CharacterDatabase.Execute(
-                    "UPDATE overseer_command SET status = 'error', detail = '{}' "
-                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                    Esc("left the world before the change could be read back"), check.id,
-                    g_runToken);
+                WriteCommandRow(check.id,
+                                "error",
+                                "left the world before the change could be read back",
+                                "verifying",
+                                false);
                 continue;
             }
 
@@ -61514,10 +61561,7 @@ private:
                          "see overseer_command.result for the lists",
                          check.id, check.command, check.targetName, check.waitedMs);
 
-            CharacterDatabase.Execute(
-                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
-                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                status, Esc(detail), EscLong(o.str()), check.id, g_runToken);
+            WriteCommandRow(check.id, status, detail, o.str(), "verifying", false);
         }
 
         _pendingChecks.swap(stillWaiting);
@@ -61635,10 +61679,7 @@ private:
             Player* bot = ObjectAccessor::FindPlayerByName(check.targetName);
             if (!bot)
             {
-                CharacterDatabase.Execute(
-                    "UPDATE overseer_command SET status = 'error', detail = '{}' "
-                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                    Esc("not in world"), check.id, g_runToken);
+                WriteCommandRow(check.id, "error", "not in world", "verifying", false);
                 continue;
             }
             bool worn = false;
@@ -61672,10 +61713,7 @@ private:
                 else if (bot->IsNonMeleeSpellCast(false))
                     detail += "; casting";
             }
-            CharacterDatabase.Execute(
-                "UPDATE overseer_command SET status = '{}', detail = '{}' "
-                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                verdict.status, Esc(detail), check.id, g_runToken);
+            WriteCommandRow(check.id, verdict.status, detail, "verifying", false);
         }
         _pendingEquipChecks.swap(waiting);
     }
@@ -62370,15 +62408,9 @@ private:
             // NULL written over whatever a reader might already have taken
             // from it.
             if (rowResult.empty())
-                CharacterDatabase.Execute(
-                    "UPDATE overseer_command SET status = '{}', detail = '{}' "
-                    "WHERE id = {} AND status = 'claimed' AND claimed_by = '{}'",
-                    status, Esc(detail), id, g_runToken);
+                WriteCommandRow(id, status, detail, "claimed", false);
             else
-                CharacterDatabase.Execute(
-                    "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
-                    "WHERE id = {} AND status = 'claimed' AND claimed_by = '{}'",
-                    status, Esc(detail), EscLong(rowResult), id, g_runToken);
+                WriteCommandRow(id, status, detail, rowResult, "claimed", false);
         } while (result->NextRow());
 
         // AND SAY HOW THAT WENT, IF IT IS WORTH SAYING (mod-overseer#230).
@@ -68002,10 +68034,7 @@ private:
     void FinishVerifyingRow(uint32 id, char const* status, std::string const& detail,
                             std::string const& result)
     {
-        CharacterDatabase.Execute(
-            "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
-            "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-            status, Esc(detail), EscLong(result), id, g_runToken);
+        WriteCommandRow(id, status, detail, result, "verifying", false);
     }
 
     void FinishNaturalize(NaturalizeCheck const& check, char const* status, std::string const& detail,
@@ -68265,10 +68294,7 @@ private:
     void FinishRetire(RetireCheck const& check, char const* status, std::string const& detail,
                       std::string const& result)
     {
-        CharacterDatabase.Execute(
-            "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
-            "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-            status, Esc(detail), EscLong(result), check.id, g_runToken);
+        WriteCommandRow(check.id, status, detail, result, "verifying", false);
     }
 
     void ResolveRetireChecks(uint32 elapsedMs)
@@ -72360,11 +72386,12 @@ private:
                          check.id, check.targetName);
                 check.ev.verdict = ConjureOutcome::Unreadable;
                 char const* const gone = "left the world before the conjure could be read back";
-                CharacterDatabase.Execute(
-                    "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
-                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                    Esc(gone), EscLong(ConjureJson(check.ev, "unreadable", gone)), check.id,
-                    g_runToken);
+                WriteCommandRow(check.id,
+                                "error",
+                                gone,
+                                ConjureJson(check.ev, "unreadable", gone),
+                                "verifying",
+                                false);
                 continue;
             }
 
@@ -72542,13 +72569,13 @@ private:
                 ReleaseConjureHold(bot, check.ev);
                 check.ev.verdict = ConjureReadBack(true, uint32(check.ev.carriedBefore),
                                                    carried, check.ev.wanted);
-                CharacterDatabase.Execute(
-                    "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
-                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                    Esc(Refusal::NoBotAI),
-                    EscLong(ConjureJson(check.ev, ConjureOutcomeWord(check.ev.verdict),
-                                        Refusal::NoBotAI)),
-                    check.id, g_runToken);
+                WriteCommandRow(check.id,
+                                "error",
+                                Refusal::NoBotAI,
+                                ConjureJson(check.ev, ConjureOutcomeWord(check.ev.verdict),
+                                        Refusal::NoBotAI),
+                                "verifying",
+                                false);
                 continue;
             }
 
@@ -72672,11 +72699,12 @@ private:
                     break;
             }
 
-            CharacterDatabase.Execute(
-                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
-                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                status, Esc(detail), EscLong(ConjureJson(check.ev, outcome, detail)), check.id,
-                g_runToken);
+            WriteCommandRow(check.id,
+                            status,
+                            detail,
+                            ConjureJson(check.ev, outcome, detail),
+                            "verifying",
+                            false);
         }
 
         _pendingConjures.swap(stillRunning);
@@ -73361,13 +73389,13 @@ private:
                 // a character that is no longer being held by anything (#335).
                 ReleaseHold(check.targetName, bot,
                                 "the character left the world mid-hearth", "hearth");
-                CharacterDatabase.Execute(
-                    "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
-                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                    Esc("left the world before the hearth could be read back"),
-                    EscLong(HearthJson(check.ev, "unreadable",
-                                       "left the world before the hearth could be read back")),
-                    check.id, g_runToken);
+                WriteCommandRow(check.id,
+                                "error",
+                                "left the world before the hearth could be read back",
+                                HearthJson(check.ev, "unreadable",
+                                       "left the world before the hearth could be read back"),
+                                "verifying",
+                                false);
                 continue;
             }
 
@@ -73495,11 +73523,12 @@ private:
             // Id 0 is a hearth the dungeon coordinator asked for (a failed
             // EXIT), which has no row to write; its verdict is the log line.
             if (check.id)
-                CharacterDatabase.Execute(
-                    "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
-                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                    status, Esc(detail), EscLong(HearthJson(check.ev, outcome, detail)), check.id,
-                    g_runToken);
+                WriteCommandRow(check.id,
+                                status,
+                                detail,
+                                HearthJson(check.ev, outcome, detail),
+                                "verifying",
+                                false);
         }
 
         _pendingHearths.swap(stillCasting);
@@ -74181,11 +74210,12 @@ private:
                 // character nothing is holding any more (#335).
                 ReleaseHold(check.targetName, bot,
                             "the character left the world mid-cast", "cast");
-                CharacterDatabase.Execute(
-                    "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
-                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                    Esc(gone), EscLong(CastJson(check.ev, "unreadable", gone)), check.id,
-                    g_runToken);
+                WriteCommandRow(check.id,
+                                "error",
+                                gone,
+                                CastJson(check.ev, "unreadable", gone),
+                                "verifying",
+                                false);
                 continue;
             }
 
@@ -74344,11 +74374,12 @@ private:
                     break;
             }
 
-            CharacterDatabase.Execute(
-                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
-                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                status, Esc(detail), EscLong(CastJson(check.ev, outcome, detail)), check.id,
-                g_runToken);
+            WriteCommandRow(check.id,
+                            status,
+                            detail,
+                            CastJson(check.ev, outcome, detail),
+                            "verifying",
+                            false);
         }
 
         _pendingCasts.swap(stillCasting);
@@ -75140,11 +75171,12 @@ private:
                  *detail ? " - " : "", detail);
         if (!check.id)
             return;
-        CharacterDatabase.Execute(
-            "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
-            "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-            status, Esc(detail), EscLong(PortalUseJson(check, outcome, detail)), check.id,
-            g_runToken);
+        WriteCommandRow(check.id,
+                        status,
+                        detail,
+                        PortalUseJson(check, outcome, detail),
+                        "verifying",
+                        false);
     }
 
     // WHERE A CLICK IS WALKED, DRIVEN AND ANSWERED, on the command poll beside
@@ -75885,11 +75917,12 @@ private:
                 // nothing is holding any more.
                 ReleaseHold(check.targetName, bot,
                             "the character left the world mid-learn", "learn");
-                CharacterDatabase.Execute(
-                    "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
-                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                    Esc(gone), EscLong(LearnJson(check.ev, "unreadable", gone)), check.id,
-                    g_runToken);
+                WriteCommandRow(check.id,
+                                "error",
+                                gone,
+                                LearnJson(check.ev, "unreadable", gone),
+                                "verifying",
+                                false);
                 continue;
             }
 
@@ -75962,11 +75995,12 @@ private:
                     break;
             }
 
-            CharacterDatabase.Execute(
-                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
-                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                status, Esc(detail), EscLong(LearnJson(check.ev, outcome, detail)), check.id,
-                g_runToken);
+            WriteCommandRow(check.id,
+                            status,
+                            detail,
+                            LearnJson(check.ev, outcome, detail),
+                            "verifying",
+                            false);
         }
 
         _pendingLearns.swap(stillLearning);
@@ -77585,11 +77619,12 @@ private:
         {
             ReleaseSummonRitualHold(check.ev, check.summonerName,
                                     "the walk to the meeting stone ended");
-            CharacterDatabase.Execute(
-                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
-                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                status, Esc(detail), EscLong(SummonJson(check.ev, "refused", detail)), check.id,
-                g_runToken);
+            WriteCommandRow(check.id,
+                            status,
+                            detail,
+                            SummonJson(check.ev, "refused", detail),
+                            "verifying",
+                            false);
             return false;
         };
 
@@ -77705,10 +77740,12 @@ private:
         // sees the click rather than the walk. The status does not move: it was
         // `verifying` for the walk and it is `verifying` for this, which is the
         // one honest status for either.
-        CharacterDatabase.Execute(
-            "UPDATE overseer_command SET status = 'verifying', detail = '', result = '{}' "
-            "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-            EscLong(SummonJson(check.ev, "clicking", "")), check.id, g_runToken);
+        WriteCommandRow(check.id,
+                        "verifying",
+                        "",
+                        SummonJson(check.ev, "clicking", ""),
+                        "verifying",
+                        false);
         return true;
     }
 
@@ -77742,11 +77779,12 @@ private:
         {
             ReleaseSummonRitualHold(check.ev, check.summonerName,
                                     "the wait for the summoning portal ended");
-            CharacterDatabase.Execute(
-                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
-                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                status, Esc(detail), EscLong(SummonJson(check.ev, "refused", detail)), check.id,
-                g_runToken);
+            WriteCommandRow(check.id,
+                            status,
+                            detail,
+                            SummonJson(check.ev, "refused", detail),
+                            "verifying",
+                            false);
             return false;
         };
 
@@ -77819,10 +77857,12 @@ private:
         check.awaitingPortal = false;
         check.ev.waitedMs = 0;
 
-        CharacterDatabase.Execute(
-            "UPDATE overseer_command SET status = 'verifying', detail = '', result = '{}' "
-            "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-            EscLong(SummonJson(check.ev, "summoning", "")), check.id, g_runToken);
+        WriteCommandRow(check.id,
+                        "verifying",
+                        "",
+                        SummonJson(check.ev, "summoning", ""),
+                        "verifying",
+                        false);
         return true;
     }
 
@@ -77893,14 +77933,14 @@ private:
                 check.ev.verdict = SummonOutcome::Unreadable;
                 ReleaseSummonRitualHold(check.ev, check.summonerName,
                                         "the character to summon left the world mid-summon");
-                CharacterDatabase.Execute(
-                    "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
-                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                    Esc("the character to summon logged out before the summon could be read back"),
-                    EscLong(SummonJson(check.ev, "unreadable",
+                WriteCommandRow(check.id,
+                                "error",
+                                "the character to summon logged out before the summon could be read back",
+                                SummonJson(check.ev, "unreadable",
                                        "the character to summon logged out before the summon "
-                                       "could be read back")),
-                    check.id, g_runToken);
+                                       "could be read back"),
+                                "verifying",
+                                false);
                 continue;
             }
 
@@ -78072,11 +78112,12 @@ private:
             // (#335). A no-op for the rows that never held anybody.
             ReleaseSummonRitualHold(check.ev, check.summonerName, "the summon row ended");
 
-            CharacterDatabase.Execute(
-                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
-                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                status, Esc(detail), EscLong(SummonJson(check.ev, outcome, detail)), check.id,
-                g_runToken);
+            WriteCommandRow(check.id,
+                            status,
+                            detail,
+                            SummonJson(check.ev, outcome, detail),
+                            "verifying",
+                            false);
         }
 
         _pendingSummons.swap(stillSummoning);
@@ -80902,11 +80943,12 @@ private:
             // Write the row's ending, whatever it is.
             auto finish = [&](char const* status, char const* reason, char const* word)
             {
-                CharacterDatabase.Execute(
-                    "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
-                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                    status, Esc(reason), EscLong(MailWalkJson(ev, word, reason)), check.id,
-                    g_runToken);
+                WriteCommandRow(check.id,
+                                status,
+                                reason,
+                                MailWalkJson(ev, word, reason),
+                                "verifying",
+                                false);
             };
 
             // ---- a fight: pause ------------------------------------------------
@@ -82376,11 +82418,12 @@ private:
                 ReleaseHold(check.targetName, bot, "the character left the world mid-use",
                             QUEST_USE_HOLD_VERB);
                 ForgetChestOpen(check.targetName);
-                CharacterDatabase.Execute(
-                    "UPDATE overseer_command SET status = 'error', detail = '{}', result = '{}' "
-                    "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                    Esc(gone), EscLong(QuestUseJson(check.ev, "unreadable", gone)), check.id,
-                    g_runToken);
+                WriteCommandRow(check.id,
+                                "error",
+                                gone,
+                                QuestUseJson(check.ev, "unreadable", gone),
+                                "verifying",
+                                false);
                 continue;
             }
 
@@ -82432,11 +82475,12 @@ private:
             if (*detail == '\0')
                 SettleOnTheDeck(bot, "quest use");
 
-            CharacterDatabase.Execute(
-                "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}' "
-                "WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-                status, Esc(detail), EscLong(QuestUseJson(check.ev, outcome, detail)), check.id,
-                g_runToken);
+            WriteCommandRow(check.id,
+                            status,
+                            detail,
+                            QuestUseJson(check.ev, outcome, detail),
+                            "verifying",
+                            false);
         }
 
         _pendingQuestUses.swap(stillWaiting);
@@ -82719,10 +82763,7 @@ private:
         HuntDisarm(hunt.character);
         LOG_INFO("module.overseer", "overseer: hunt {} for '{}' ended: {} {}", hunt.id,
                  hunt.character, outcome, reason);
-        CharacterDatabase.Execute(
-            "UPDATE overseer_command SET status = '{}', detail = '{}', result = '{}', "
-            "updated_at = NOW() WHERE id = {} AND status = 'verifying' AND claimed_by = '{}'",
-            status, Esc(reason), EscLong(result), hunt.id, g_runToken);
+        WriteCommandRow(hunt.id, status, reason, result, "verifying", true);
     }
 
     void DriveHunts()

@@ -363,14 +363,42 @@ namespace
 // One decimal field of a place aim, read without a stream or a header this file
 // does not include. std::stof comes with <string>; it throws on no digits and
 // says through `used` where it stopped, which is what the separators need.
+//
+// The field is checked before stof sees it: digits, at most one point, and
+// the minus a coordinate may carry - the hand check MailWalkYards makes for
+// its cap, widened by that minus. std::stof on its own also takes "nan",
+// "inf", hex floats and exponents as valid fields, and an aim holding one
+// of those is not a place: the distance comparisons downstream just come
+// out false against it, silently. The writer (TravelAimAtPosition) emits
+// fixed decimals only, so nothing it writes is refused by the check.
 bool ReadAimNumber(std::string const& text, std::size_t& at, float& out)
 {
     if (at >= text.size())
         return false;
+    std::size_t end = at;
+    if (text[end] == '-')
+        ++end;
+    bool sawDigit = false, sawPoint = false;
+    for (; end < text.size(); ++end)
+    {
+        char const c = text[end];
+        if (c == '.')
+        {
+            if (sawPoint)
+                break;
+            sawPoint = true;
+            continue;
+        }
+        if (c < '0' || c > '9')
+            break;
+        sawDigit = true;
+    }
+    if (!sawDigit)
+        return false;
     try
     {
         std::size_t used = 0;
-        out = std::stof(text.substr(at), &used);
+        out = std::stof(text.substr(at, end - at), &used);
         if (used == 0)
             return false;
         at += used;
@@ -3057,12 +3085,12 @@ std::string RunRecoveryFactsLine(RunFailureFacts const& facts)
     // the ladder clauses after "tried" are what it did not carry before.
     std::ostringstream line;
     line << "leader ";
-    if (facts.leaderYardsFromStaging >= 0.f)
+    if (facts.leaderYardsFromStaging >= 0.f && FiniteReading(facts.leaderYardsFromStaging))
         line << static_cast<unsigned>(facts.leaderYardsFromStaging) << "y from the staging point";
     else
         line << "not measured against the staging point";
     line << "; farthest member ";
-    if (facts.farthestMemberYards >= 0.f)
+    if (facts.farthestMemberYards >= 0.f && FiniteReading(facts.farthestMemberYards))
         line << static_cast<unsigned>(facts.farthestMemberYards) << "y from the leader";
     else
         line << "not measured";
@@ -25489,16 +25517,29 @@ bool RunDamageNote(RunDamageBook& book, std::string const& name, std::uint32_t m
 
 namespace
 {
-// A character name inside single quotes. Roster names are letters only; this
-// is the guard for the day one is not.
+// A character name inside single quotes, escaped with the full set
+// mysql_real_escape_string covers: NUL, newline, carriage return,
+// backslash, both quotes and 0x1A. The decisions layer cannot call the
+// core's escaper, and the statement this SQL becomes is executed whole by
+// the adapter, so a partial set left control bytes standing raw inside
+// the literal. Roster names are letters only; this is the guard for the
+// day one is not.
 std::string RunDamageQuoted(std::string const& text)
 {
     std::string out = "'";
     for (char c : text)
     {
-        if (c == '\\' || c == '\'')
-            out += '\\';
-        out += c;
+        switch (c)
+        {
+            case '\0':   out += "\\0"; break;
+            case '\n':   out += "\\n"; break;
+            case '\r':   out += "\\r"; break;
+            case '\\':   out += "\\\\"; break;
+            case '\'':   out += "\\'"; break;
+            case '"':    out += "\\\""; break;
+            case '\x1A': out += "\\Z"; break;
+            default:     out += c; break;
+        }
     }
     out += '\'';
     return out;
