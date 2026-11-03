@@ -21078,6 +21078,17 @@ SummonRungPlan PlanSummonRung(std::vector<SummonRungMember> const& family,
                 summoner = &m;
     if (!summoner)
     {
+        // The selected summoner names nobody in the family (a guild warlock
+        // still walking in, or a stale name), so a family member at the stone
+        // summons instead. With nobody able to click there is nobody to pick:
+        // front() of an empty list is not a member, it is undefined behaviour.
+        if (clickers.empty())
+        {
+            plan.step = SummonRungStep::WaitForClickers;
+            plan.why = "the selected ritual summoner is not in the family and "
+                       "nobody at the stone can click";
+            return plan;
+        }
         summoner = clickers.front();
         for (SummonRungMember const* c : clickers)
             if (c->leader)
