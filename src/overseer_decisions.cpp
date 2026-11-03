@@ -10336,6 +10336,8 @@ RetireRefusal RetireVerdictFor(RetireRequest const& request, RetireFacts const& 
         return RetireRefusal::BetweenWorlds;
     if (facts.clientAttached)
         return RetireRefusal::ClientAttached;
+    if (facts.inGuildRun)
+        return RetireRefusal::InGuildRun;
     return RetireRefusal::None;
 }
 
@@ -10363,6 +10365,8 @@ char const* RetireRefusalSaid(RetireRefusal refusal)
             return "logging in or out right now; retry in a minute";
         case RetireRefusal::ClientAttached:
             return "a real game client holds it; only a headless bot is logged out";
+        case RetireRefusal::InGuildRun:
+            return "seated in a live guild finder run; retry after the run ends";
     }
     return "refused";
 }
