@@ -21751,6 +21751,13 @@ GuildRunModuleStopStep GuildRunArmAfterModuleStop(std::string const& stopReason,
 {
     if (stopReason.empty())
         return GuildRunModuleStopStep::Rearm;
+    // THE MODULE FINISHING IS NOT A FAILURE (#1331). It switches itself off
+    // with "All bosses cleared!" once it has counted every boss down; that
+    // stop was not listed here, so the run ended with the module's reason and
+    // was booked stalled, the guild run's version of the family defect #1328
+    // fixed. It ends complete instead.
+    if (DungeonModuleStopIsCleared(stopReason))
+        return GuildRunModuleStopStep::EndComplete;
     if (stopReason.find("the party never became ready") != std::string::npos)
         return DungeonClearWaitStopRearms(stopReason, waitRearmsUsed, maximumWaitRearms)
                    ? GuildRunModuleStopStep::Rearm
@@ -22375,16 +22382,25 @@ std::string GuildRunTimedOutWhy(unsigned secondsInside, std::string const& stall
 }
 
 std::uint32_t GuildRunExpectedMask(std::uint32_t mapId, std::uint32_t mapMask,
-                                   std::uint32_t brainMask, bool finderEndsDungeon)
+                                   std::uint32_t brainMask, bool finderEndsDungeon,
+                                   bool alliance)
 {
+    std::uint32_t expected;
     if (finderEndsDungeon || DungeonMapHasIndependentWings(mapId) || !brainMask)
-        return DungeonRunExpectedMask(mapId, mapMask, brainMask);
-    // A wing row of a connected dungeon: the whole map, less what the brain's
-    // roster never clears. A roster that shares no bit with the map (read off
-    // another map) says nothing, and the map stands.
-    std::uint32_t const required = DungeonRunExpectedMask(mapId, mapMask, 0);
-    std::uint32_t const armed = required & brainMask;
-    return armed ? armed : required;
+        expected = DungeonRunExpectedMask(mapId, mapMask, brainMask);
+    else
+    {
+        // A wing row of a connected dungeon: the whole map, less what the
+        // brain's roster never clears. A roster that shares no bit with the
+        // map (read off another map) says nothing, and the map stands.
+        std::uint32_t const required = DungeonRunExpectedMask(mapId, mapMask, 0);
+        std::uint32_t const armed = required & brainMask;
+        expected = armed ? armed : required;
+    }
+    // AS THE FAMILY MASK (#1327): an encounter a faction cannot be credited
+    // for is not expected of it, or the run can never read cleared on the
+    // mask (#1331).
+    return DungeonRunFactionExpectedMask(mapId, expected, alliance);
 }
 
 unsigned GuildRunCeilingSeconds(bool finderEndsDungeon, unsigned bossesExpected)

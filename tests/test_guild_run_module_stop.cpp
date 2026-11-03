@@ -14,6 +14,12 @@
  * to the same three times the family coordinator allows (#1308). Every other
  * stop ends the run with the module's own words.
  *
+ * One stop is neither: the module switches itself off with "All bosses
+ * cleared!" when it has counted every boss down, and that list above did not
+ * name it, so a guild run that cleared ended with EndWithReason and was
+ * booked stalled (#1331) - the guild version of the family defect #1328
+ * fixed. It gives EndComplete, and the run ends cleared.
+ *
  * Also pins the adapter: the re-arm asks GuildRunArmAfterModuleStop before it
  * sends the verb, and the run ends on that answer only after the verdict.
  *
@@ -54,6 +60,19 @@ void AFailedEventEndsTheRun()
               GuildRunModuleStopStep::EndWithReason);
     Check("a failed portal event gives EndWithReason",
           GuildRunArmAfterModuleStop("Medivh's shield hit 0 - the Dark Portal event failed", 0) ==
+              GuildRunModuleStopStep::EndWithReason);
+}
+
+void AClearedStopEndsTheRunComplete()
+{
+    Check("a cleared stop gives EndComplete",
+          GuildRunArmAfterModuleStop("All bosses cleared!", 0) ==
+              GuildRunModuleStopStep::EndComplete);
+    Check("a cleared stop with the module's prefix gives EndComplete",
+          GuildRunArmAfterModuleStop("Dungeon clear stopped: All bosses cleared!", 0) ==
+              GuildRunModuleStopStep::EndComplete);
+    Check("a sentence that only contains the words is not a clear",
+          GuildRunArmAfterModuleStop("Not All bosses cleared! before the timer", 0) ==
               GuildRunModuleStopStep::EndWithReason);
 }
 
@@ -137,12 +156,23 @@ void TheAdapterAsksBeforeItArms()
     Check("the run ends on the module's stop after the verdict and before the ladder",
           verdict != std::string::npos && ends != std::string::npos &&
               ladder != std::string::npos && verdict < ends && ends < ladder);
+    std::size_t const complete = drive.find("GuildRunModuleStopStep::EndComplete");
+    std::size_t const flag = drive.find("run.moduleCleared = true");
+    Check("a cleared stop marks the run cleared where the re-arm asks",
+          complete != std::string::npos && flag != std::string::npos && complete < flag);
+    std::size_t const block = drive.find("if (!run.moduleStop.empty())");
+    std::size_t const clearedEnd = drive.find("GuildRunVerdict::Cleared", block);
+    std::size_t const stalledEnd = drive.find("GuildRunVerdict::Stalled", block);
+    Check("a run the module cleared ends cleared, ahead of the stalled ending",
+          block != std::string::npos && clearedEnd != std::string::npos &&
+              stalledEnd != std::string::npos && clearedEnd < stalledEnd);
 }
 }  // namespace
 
 int main()
 {
     AFailedEventEndsTheRun();
+    AClearedStopEndsTheRunComplete();
     APartyWaitIsArmedWithinItsBudget();
     AResumableStopIsArmedAsBefore();
     TheWhyCarriesTheModuleWords();

@@ -24950,8 +24950,15 @@ std::string GuildRunTimedOutWhy(unsigned secondsInside, std::string const& stall
 // (FinderRowEndsDungeon false) the brain's roster narrows it: the whole
 // dungeon, less what the brain never clears (Maraudon's Rotgrip, who lives in
 // open water, and the Ring of Law, an objective credited to its announcer).
+// And, as the family mask (DungeonRunFactionExpectedMask, #1327), a faction
+// is never expected to credit an encounter its roster cannot be credited
+// for: an Alliance run on map 70 does not expect the Lost Dwarves bit, which
+// is credited by a friendly entry the Alliance roster treats as a travel
+// objective, so the bit can never be set and the run could never read
+// cleared on the mask (#1331).
 std::uint32_t GuildRunExpectedMask(std::uint32_t mapId, std::uint32_t mapMask,
-                                   std::uint32_t brainMask, bool finderEndsDungeon);
+                                   std::uint32_t brainMask, bool finderEndsDungeon,
+                                   bool alliance);
 
 // AND THE TIME A WHOLE DUNGEON GETS. Guild runs that cleared Wailing Caverns,
 // seven bosses, took 101 minutes on average and 116 at most (dev realm, to
@@ -25042,14 +25049,18 @@ GuildRunRearmStep GuildRunRearmNext(GuildRunRearmFacts const& facts);
 // death, "Type 'dc on' ..."; a corpse run or a leader that left the dungeon; a
 // plain `dc off`) and no stop at all give Rearm, as before. A party-wait stop
 // gives Rearm while `waitRearmsUsed` is under `maximumWaitRearms`, the family
-// coordinator's budget (#1308). Every other stop gives EndWithReason: the run
-// stops asking and ends with GuildRunModuleStopWhy.
+// coordinator's budget (#1308). The one stop that means the module finished,
+// "All bosses cleared!" (DungeonModuleStopIsCleared), gives EndComplete: the
+// run ends complete, as a family run does (#1328), not stalled (#1331). Every
+// other stop gives EndWithReason: the run stops asking and ends with
+// GuildRunModuleStopWhy.
 constexpr unsigned GUILD_RUN_WAIT_REARMS = 3;
 
 enum class GuildRunModuleStopStep : std::uint8_t
 {
     Rearm,          // ask the dungeon brain to be on, as GuildRunRearmNext says
     EndWithReason,  // send nothing and end the run with the module's reason
+    EndComplete,    // send nothing: the module counted every boss down, so the run is complete
 };
 
 GuildRunModuleStopStep GuildRunArmAfterModuleStop(std::string const& stopReason,
