@@ -48,6 +48,7 @@ struct HoldRecord
     bool removedNewRpg = true;
     bool removedMount = false;
     unsigned retaken = 0;
+    std::string hearthRefusal;
 };
 std::map<std::string, HoldRecord> holds;
 auto& HoldsInForce() { return holds; }
