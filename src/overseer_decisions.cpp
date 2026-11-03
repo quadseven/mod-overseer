@@ -21710,6 +21710,24 @@ GuildRunStallStep GuildRunStallNext(GuildRunStallFacts const& facts)
                                                                    : GuildRunStallStep::End;
 }
 
+ZulFarrakEndDoorStep ZulFarrakEndDoorNext(ZulFarrakEndDoorFacts const& facts)
+{
+    if (!facts.tankNear || !facts.doorShut || facts.endDoorState == ZF_END_DOOR_DONE)
+        return ZulFarrakEndDoorStep::Nothing;
+    // Before the last wave the dungeon brain's own temple event moves the run;
+    // the door is not the obstacle yet.
+    if (facts.pyramidPhase < ZF_PYRAMID_WAVE_3 || facts.fighting)
+        return ZulFarrakEndDoorStep::Nothing;
+    // The core's Weegli goes only once the trolls are dead and nobody sent him.
+    if (facts.weegliAlive && !facts.weegliAsked &&
+        facts.pyramidPhase >= ZF_PYRAMID_KILLED_ALL_TROLLS &&
+        facts.endDoorState == ZF_END_DOOR_NOT_STARTED)
+        return ZulFarrakEndDoorStep::AskWeegli;
+    if (facts.weegliAlive && facts.secondsNear < ZF_END_DOOR_WEEGLI_SECONDS)
+        return ZulFarrakEndDoorStep::Wait;
+    return ZulFarrakEndDoorStep::Open;
+}
+
 std::time_t GuildRunSplitClock(std::time_t since, GuildRunSplitReading reading, std::time_t now)
 {
     if (reading == GuildRunSplitReading::Together)

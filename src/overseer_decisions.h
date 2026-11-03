@@ -25090,6 +25090,69 @@ enum class GuildRunStallStep : std::uint8_t
 
 GuildRunStallStep GuildRunStallNext(GuildRunStallFacts const& facts);
 
+// ZUL'FARRAK'S END DOOR OPENS WHEN NOBODY IS LEFT TO BLOW IT (#1337). Chief
+// Ukorz Sandscalp stands behind the End Door, and only the core's script for
+// Weegli Blastfuse opens it: once the pyramid's trolls are dead he walks to the
+// door, plants a barrel, and the barrel's SmartAI sets the door open and the
+// instance's end-door state DONE. A Weegli who died in the waves, or who
+// teleported out because nobody talked to him in time (Sergeant Bly's port-home
+// timer), leaves the door shut for good. On the dev realm (2026-11-02 12:00 to
+// 2026-11-03 09:50 UTC) four guild finder runs timed out exactly there: the
+// dungeon brain finished the temple event, set out for Ukorz, logged
+// "door-blocked: can't open 'End Door' -> auto-pausing", and stood still until
+// the progress window closed.
+//
+// So, with the tank alive inside, out of combat, within ZF_END_DOOR_NEAR_YARDS
+// of the shut door, and the pyramid event played to its last wave: ask a
+// living, idle Weegli to go (the core's own ACTION_DESTROY_GATES), give him
+// ZF_END_DOOR_WEEGLI_SECONDS, and open the door the way his barrel does when
+// he cannot.
+constexpr std::uint32_t ZF_MAP_ID = 209;
+constexpr std::uint32_t ZF_END_DOOR_ENTRY = 146084;   // GO_END_DOOR
+constexpr std::uint32_t ZF_WEEGLI_ENTRY = 7607;       // NPC_WEEGLI
+constexpr std::uint32_t ZF_DATA_PYRAMID = 0;          // ZulFarrakData
+constexpr std::uint32_t ZF_DATA_END_DOOR = 2;
+constexpr std::uint32_t ZF_PYRAMID_WAVE_3 = 7;        // ZFPyramidPhases
+constexpr std::uint32_t ZF_PYRAMID_KILLED_ALL_TROLLS = 8;
+constexpr std::uint32_t ZF_END_DOOR_NOT_STARTED = 0;  // EncounterState
+constexpr std::uint32_t ZF_END_DOOR_DONE = 3;
+constexpr std::int32_t ZF_ACTION_DESTROY_GATES = 2;   // ZulFarrakActions
+// The brain parks 48 to 81 yards short of the door (measured), and the summit
+// where the waves are fought is about 150 yards from it.
+constexpr float ZF_END_DOOR_NEAR_YARDS = 100.f;
+// Weegli's run from the crew's gathering spot to the door, his barrel and its
+// fuse take well under a minute.
+constexpr unsigned ZF_END_DOOR_WEEGLI_SECONDS = 90;
+
+struct ZulFarrakEndDoorFacts
+{
+    // The tank is alive inside, within ZF_END_DOOR_NEAR_YARDS of the End Door.
+    bool tankNear{false};
+    // The door reads shut (GO_STATE_READY).
+    bool doorShut{false};
+    // A member alive inside is in combat.
+    bool fighting{false};
+    // The instance's DATA_PYRAMID and DATA_END_DOOR.
+    std::uint32_t pyramidPhase{0};
+    std::uint32_t endDoorState{ZF_END_DOOR_NOT_STARTED};
+    // Weegli is in the instance and alive.
+    bool weegliAlive{false};
+    // He was already asked to go during this stand at the door.
+    bool weegliAsked{false};
+    // Since the tank first stood near the shut door out of combat.
+    unsigned secondsNear{0};
+};
+
+enum class ZulFarrakEndDoorStep : std::uint8_t
+{
+    Nothing,    // no party at a shut door, a fight, or the event not played yet
+    AskWeegli,  // the core's script opens it: send Weegli
+    Wait,       // Weegli may still be on his way
+    Open,       // nobody else will: open it as his barrel does
+};
+
+ZulFarrakEndDoorStep ZulFarrakEndDoorNext(ZulFarrakEndDoorFacts const& facts);
+
 // THE GROUP GOES BACK IN TOGETHER, AND RESTS BEFORE IT PULLS. Measured on the
 // dev realm from the corpse run's deploy to 2026-10-10 00:00 (New York): 17
 // Deadmines guild runs cleared 0 and took 157 deaths. 13 wiped to the last

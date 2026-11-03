@@ -288,6 +288,8 @@
 // refusal - both named by MailHandler.cpp itself. The clock HandleMailTakeItem
 // compares deliver_time against is GameTime, already included above.
 #include "GameObject.h"
+// Zul'Farrak's End Door (#1337) sends Weegli with his script's DoAction.
+#include "CreatureAI.h"
 #include "Mail.h"
 #include "RBAC.h"
 // kind='bot' `e Hitem:` (#927): the verdict and the scorer mod-playerbots' own
@@ -44443,6 +44445,11 @@ private:
         // When the group split inside and has not closed up since (#1308).
         std::time_t splitSince{0};
         bool stallSkipRefused{false};
+        // ZUL'FARRAK'S END DOOR (OverseerDecisions::ZulFarrakEndDoorNext,
+        // #1337): when the tank first stood near the shut door out of combat,
+        // and whether Weegli was sent during that stand.
+        std::time_t zfDoorNearSince{0};
+        bool zfWeegliAsked{false};
     };
     std::vector<GuildRun> _guildRuns;
 
@@ -45706,6 +45713,87 @@ private:
         return OverseerDecisions::GuildRunSplitReading::Together;
     }
 
+    // ZUL'FARRAK'S END DOOR (OverseerDecisions::ZulFarrakEndDoorNext, #1337),
+    // one poll on a run the verdict left running. Reads the instance's pyramid
+    // and end-door states off the core's instance_zulfarrak, sends a living
+    // Weegli with the core's own action, and when he cannot open it, opens the
+    // End Door exactly as his barrel's SmartAI does: the door to
+    // GO_STATE_ACTIVE_ALTERNATIVE and DATA_END_DOOR to DONE. The dungeon
+    // brain's door-reopened trigger then resumes the clear toward Ukorz.
+    void StepZulFarrakEndDoor(GuildRun& run, std::time_t now)
+    {
+        if (run.mapId != OverseerDecisions::ZF_MAP_ID)
+            return;
+        Player* const tank = ObjectAccessor::FindPlayerByName(run.tank);
+        InstanceScript* const script =
+            GuildRunAliveInside(run, tank) ? tank->GetInstanceScript() : nullptr;
+        GameObject* const door =
+            script ? tank->FindNearestGameObject(OverseerDecisions::ZF_END_DOOR_ENTRY,
+                                                 OverseerDecisions::ZF_END_DOOR_NEAR_YARDS)
+                   : nullptr;
+
+        OverseerDecisions::ZulFarrakEndDoorFacts facts;
+        facts.tankNear = door != nullptr;
+        facts.doorShut = door && door->GetGoState() == GO_STATE_READY;
+        for (std::string const& name : run.names)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            if (GuildRunAliveInside(run, p) && p->IsInCombat())
+                facts.fighting = true;
+        }
+        if (!facts.tankNear || !facts.doorShut || facts.fighting)
+        {
+            run.zfDoorNearSince = 0;
+            run.zfWeegliAsked = false;
+            return;
+        }
+        if (!run.zfDoorNearSince)
+            run.zfDoorNearSince = now;
+        facts.pyramidPhase = script->GetData(OverseerDecisions::ZF_DATA_PYRAMID);
+        facts.endDoorState = script->GetData(OverseerDecisions::ZF_DATA_END_DOOR);
+        // Weegli's escape, his death and his despawn all leave him unfound.
+        Creature* const weegli = tank->FindNearestCreature(OverseerDecisions::ZF_WEEGLI_ENTRY,
+                                                           2.f * OverseerDecisions::ZF_END_DOOR_NEAR_YARDS,
+                                                           /*alive*/ true);
+        facts.weegliAlive = weegli != nullptr;
+        facts.weegliAsked = run.zfWeegliAsked;
+        facts.secondsNear = static_cast<unsigned>(now - run.zfDoorNearSince);
+
+        switch (OverseerDecisions::ZulFarrakEndDoorNext(facts))
+        {
+            case OverseerDecisions::ZulFarrakEndDoorStep::AskWeegli:
+                run.zfWeegliAsked = true;
+                if (weegli->AI())
+                    weegli->AI()->DoAction(OverseerDecisions::ZF_ACTION_DESTROY_GATES);
+                LOG_INFO("module.overseer",
+                         "overseer: guild finder run {} - Zul'Farrak's End Door is shut with "
+                         "'{}' {:.0f}y from it and the trolls dead (pyramid phase {}); sending "
+                         "Weegli Blastfuse to blow it, as his own gossip does",
+                         run.id, run.tank, tank->GetExactDist(door), facts.pyramidPhase);
+                return;
+            case OverseerDecisions::ZulFarrakEndDoorStep::Open:
+                door->SetGoState(GO_STATE_ACTIVE_ALTERNATIVE);
+                script->SetData(OverseerDecisions::ZF_DATA_END_DOOR,
+                                OverseerDecisions::ZF_END_DOOR_DONE);
+                // The deploy proof: "Zul'Farrak's End Door - opened" is said
+                // nowhere else.
+                LOG_WARN("module.overseer",
+                         "overseer: guild finder run {} - Zul'Farrak's End Door - opened by the "
+                         "module after '{}' stood {}s {:.0f}y from it out of combat (pyramid "
+                         "phase {}, end door state {}, Weegli {}); nobody else would open it "
+                         "and Chief Ukorz Sandscalp is behind it",
+                         run.id, run.tank, facts.secondsNear, tank->GetExactDist(door),
+                         facts.pyramidPhase, facts.endDoorState,
+                         facts.weegliAlive ? "alive but the door still shut" : "gone");
+                run.zfDoorNearSince = 0;
+                run.zfWeegliAsked = false;
+                return;
+            case OverseerDecisions::ZulFarrakEndDoorStep::Wait:
+            case OverseerDecisions::ZulFarrakEndDoorStep::Nothing:
+                return;
+        }
+    }
+
     // ONE POLL OF THE STALL LADDER (OverseerDecisions::GuildRunStallNext,
     // #1086), on a run the verdict left running. Sends `dc skip` from the tank
     // on Skip; true on End, when the caller ends the run as stalled and `why`
@@ -46269,6 +46357,10 @@ private:
                             now);
                 return true;
             }
+            // ZUL'FARRAK'S END DOOR (#1337): before the ladder, so a party
+            // parked at the shut door is let through to Ukorz rather than
+            // skipped past him.
+            StepZulFarrakEndDoor(run, now);
             // THE STALL LADDER (#1086): `dc skip` what the brain cannot reach,
             // and end the run as stalled when skipping does not move it.
             {
