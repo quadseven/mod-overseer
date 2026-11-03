@@ -12165,6 +12165,7 @@ struct RetireFacts
     unsigned level{0};
     bool betweenWorlds{false};     // logging in, logging out or teleporting
     bool clientAttached{false};    // a real game client holds its session
+    bool inGuildRun{false};        // seated in a live guild finder run (#1334)
 };
 
 enum class RetireRefusal
@@ -12179,12 +12180,16 @@ enum class RetireRefusal
     BelowLevel,
     BetweenWorlds,
     ClientAttached,
+    InGuildRun,
 };
 
 // The first rule the character fails, in the order above, or None. Who the
 // character IS (account, guild, roster, class, level) is asked before WHERE it
 // is (between worlds, a client attached), so a character that must never be
 // retired is refused for that reason and not for one that a retry would clear.
+// A seat in a live guild finder run is a WHERE: the guild finder seats level
+// 42 factory bots as pugs, and deleting one mid-run abandoned the run with the
+// pug "not in world" (#1334); the bridge asks again after its backoff.
 RetireRefusal RetireVerdictFor(RetireRequest const& request, RetireFacts const& facts);
 char const* RetireRefusalSaid(RetireRefusal refusal);
 

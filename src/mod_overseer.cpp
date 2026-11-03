@@ -67912,7 +67912,18 @@ private:
         return OverseerDecisions::AccountNameHasPrefix(account, OverseerCompat::RandomBotAccountPrefix(sPlayerbotAIConfig));
     }
 
-    static OverseerDecisions::RetireFacts ReadRetireFacts(ObjectGuid guid, std::string const& name, Player* live)
+    // Seated in a live guild finder run: its pugs are the level 42 factory
+    // bots a retire deletes, and a pug deleted mid-run abandoned the run
+    // (#1334). An ended run is gone from _guildRuns, so it holds nobody.
+    bool SeatedInGuildRun(std::string const& name) const
+    {
+        for (GuildRun const& run : _guildRuns)
+            if (std::find(run.names.begin(), run.names.end(), name) != run.names.end())
+                return true;
+        return false;
+    }
+
+    OverseerDecisions::RetireFacts ReadRetireFacts(ObjectGuid guid, std::string const& name, Player* live)
     {
         OverseerDecisions::RetireFacts facts;
         CharacterCacheEntry const* cache = guid ? sCharacterCache->GetCharacterCacheByGuid(guid) : nullptr;
@@ -67930,6 +67941,7 @@ private:
         facts.betweenWorlds = live ? (!live->IsInWorld() || live->IsBeingTeleported())
                                    : sWorldSessionMgr->FindOfflineSessionForCharacterGUID(guid.GetCounter()) != nullptr;
         facts.clientAttached = live && ClientAttached(live);
+        facts.inGuildRun = SeatedInGuildRun(name);
         return facts;
     }
 

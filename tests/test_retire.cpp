@@ -123,6 +123,22 @@ void WhereItIs()
     f.betweenWorlds = true;
     Check("who outranks where", RetireVerdictFor(Ok(), f) == RetireRefusal::KeptGuild);
 
+    // A pug seated in a live guild finder run is not deleted out from under
+    // the run (#1334): eight finder runs in one day were abandoned with a
+    // level 42 pug "not in world" five minutes after a retire deleted it.
+    f = Factory();
+    f.level = RETIRE_MIN_LEVEL;
+    f.inGuildRun = true;
+    Check("not while seated in a live guild run", RetireVerdictFor(Ok(), f) == RetireRefusal::InGuildRun);
+
+    f = Factory();
+    f.onRoster = true;
+    f.inGuildRun = true;
+    Check("who still outranks a guild run seat", RetireVerdictFor(Ok(), f) == RetireRefusal::OnRoster);
+
+    f = Factory();
+    f.inGuildRun = false;
+    Check("out of every guild run it is retired", RetireVerdictFor(Ok(), f) == RetireRefusal::None);
 }
 
 void EveryRefusalIsSaid()
@@ -130,7 +146,8 @@ void EveryRefusalIsSaid()
     for (RetireRefusal r : {RetireRefusal::BadRequest, RetireRefusal::NoSuchCharacter,
                             RetireRefusal::NotRandomBotAccount, RetireRefusal::KeptGuild,
                             RetireRefusal::OnRoster, RetireRefusal::DeathKnight, RetireRefusal::BelowLevel,
-                            RetireRefusal::BetweenWorlds, RetireRefusal::ClientAttached})
+                            RetireRefusal::BetweenWorlds, RetireRefusal::ClientAttached,
+                            RetireRefusal::InGuildRun})
         Check("every refusal has words", std::strlen(RetireRefusalSaid(r)) > 0);
     Check("none has none", std::strlen(RetireRefusalSaid(RetireRefusal::None)) == 0);
 }
@@ -139,6 +156,8 @@ void HowItIsCarriedOut()
 {
     Check("refused is refused", RetirePlanFor(RetireRefusal::OnRoster, false) == RetirePlan::Refuse);
     Check("refused in the world is refused", RetirePlanFor(RetireRefusal::DeathKnight, true) == RetirePlan::Refuse);
+    Check("a guild run seat is refused, not logged out",
+          RetirePlanFor(RetireRefusal::InGuildRun, true) == RetirePlan::Refuse);
     Check("offline settles", RetirePlanFor(RetireRefusal::None, false) == RetirePlan::Settle);
     Check("a headless bot in the world is logged out first",
           RetirePlanFor(RetireRefusal::None, true) == RetirePlan::EvictThenSettle);
