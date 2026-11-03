@@ -1,14 +1,14 @@
 # Local patches against the pinned upstream trees
 
-`UPSTREAM-PINS.env` pins five upstream repositories by SHA and the build
-compiles them **verbatim**. That is the right default, and it is why the image
-is reproducible - but on its own it means a bug in upstream's code has exactly
-two outcomes: open a PR upstream and wait, or live with it.
+`realm-pins.env` at the repository root pins the upstream repositories by SHA
+and the build compiles them **verbatim**. That is the right default, and it is
+why the image is reproducible - but on its own it means a bug in upstream's
+code has exactly two outcomes: open a PR upstream and wait, or live with it.
 
 This directory is the third option. Each file here is a small, exactly-matching
-diff applied to a pinned tree at build time, in
-`build.azerothcore-playerbots.yml`'s "Apply local patches" step, after the
-clone and before the compile.
+diff applied to a pinned tree at build time, by the patch step of
+`.github/workflows/build.yml` and `.github/workflows/check.adapter.yml`, after
+the clone and before the compile.
 
 A patch here is **temporary by construction**. It exists to hold a fix until
 upstream takes it, and it is designed to break loudly the moment it stops being
@@ -27,8 +27,8 @@ into, which makes the target unambiguous:
 
 | directory                     | tree it patches                          |
 | ----------------------------- | ---------------------------------------- |
-| `patches/azerothcore-wotlk/`  | the core fork (`AC_CORE_*`)              |
-| `patches/mod-playerbots/`     | `modules/mod-playerbots` (`AC_MODULE_*`) |
+| `patches/azerothcore-wotlk/`  | the core fork (`CORE_*`)                 |
+| `patches/mod-playerbots/`     | `modules/mod-playerbots` (`MODULE_*`)    |
 | `patches/mod-ollama-chat/`    | `modules/mod-ollama-chat`                |
 | `patches/mod-dungeon-clear/`  | `modules/mod-dungeon-clear`              |
 | `patches/mod-junk-to-gold/`   | `modules/mod-junk-to-gold`               |
@@ -40,27 +40,26 @@ a silently-skipped patch.
 
 Patches apply in filename order within a directory, hence the `NNNN-` prefix.
 
-`mod-overseer` is ours, but as of infra#2929 it lives in its own repo
-(quadseven/mod-overseer), pinned the same way as `mod-ollama-chat`/
-`mod-dungeon-clear`/`mod-junk-to-gold` above - edit it there and bump
-`AC_OVERSEER_SHA` in `UPSTREAM-PINS.env`; patching it here is rejected.
+This repository is `mod-overseer` itself, so there is no
+`patches/mod-overseer/`: a change to the module is an ordinary commit here, and
+the deployment pins this repository by SHA the same way `realm-pins.env` pins
+the modules above.
 
 ## Adding a patch
 
 1. Fetch the tree at the pin it will be applied to:
-   `git clone <repo> && git checkout <SHA from UPSTREAM-PINS.env>`
+   `git clone <repo> && git checkout <SHA from realm-pins.env>`
 2. Make the change, then `git diff > NNNN-name.patch`.
 3. Prepend the WHY block (see below) above the `--- a/` line. Everything before
    the first diff header is ignored by `git apply`, so it is free-form prose.
 4. Drop it in the right directory. **Nothing else needs editing** - not the
    build workflow, not the check workflow, not `apply-patches.sh`.
-5. `production/docker/azerothcore-playerbots/verify-patches.sh` proves it
-   applies against the current pins **and that it changes bytes**. It rebuilds
-   the build's exact tree layout and performs a real apply into a throwaway
-   workdir, because a dry run cannot tell "would change this file" from "never
-   looked at this file" (see infra#2849 below). The PR check runs the same
-   script; `tests/test-apply-patches.sh` covers the script's own guard rails
-   with no network at all.
+5. `bash apply-patches.sh <acore-root> --check` proves it still matches the
+   pinned tree. The pull request check (`check.adapter.yml`, or
+   `scripts/check-locally.sh adapter`) lays out the build's exact tree and
+   performs a **real** apply, which is the only step that proves the patch
+   **changes bytes**: a dry run cannot tell "would change this file" from
+   "never looked at this file" (see infra#2849 below).
 
 ## What every patch must carry
 
@@ -70,7 +69,7 @@ patch nobody knows how to retire outlives its reason. Use the existing patches
 as the template:
 
 - `WHY THIS PATCH EXISTS` - the defect, cited to file:line at the pinned SHA,
-  and a link to the analysis in `plans/` if there is one.
+  and the issue that holds the analysis if there is one.
 - `WHAT WOULD LET THIS PATCH BE DELETED` - the upstream change that retires it,
   and the upstream PR link once one is open.
 - `APPLIES TO` - repo, SHA, and the function or region touched.
@@ -110,7 +109,7 @@ is the wrong answer.** 0001-0004 fix upstream behaviour, so dropping one costs a
 feature but still builds; 0005 ADDS an overload that `mod-overseer` calls
 (`DriveTravel` -> `ChangeToWanderNpc(entry, pos)`), so dropping it breaks our own
 compile 45 minutes into a build on `main`. Rebase it, or delete it and adapt the
-call site in `mod_overseer.cpp` in the SAME commit. `UPSTREAM-PINS.env` carries
+call site in `mod_overseer.cpp` in the SAME commit. `realm-pins.env` carries
 the full argument, and it is the file you are more likely to have open.
 
 **`mod-playerbots/0006-wander-random-has-a-home-anchor.patch`** fixes

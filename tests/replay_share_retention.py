@@ -116,6 +116,8 @@ class ShareRetentionReplayTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         compiler = shutil.which(os.environ.get("CXX", "c++"))
+        if compiler is None:
+            raise RuntimeError("no C++ compiler found; set CXX or install c++")
         cls.scratch = tempfile.TemporaryDirectory()
         cls.printer = Path(cls.scratch.name) / "print_sql"
         subprocess.run(

@@ -117,7 +117,10 @@ python3 -B tests/replay_exit_hearth_finalization.py
 python3 -B tests/replay_travel_claim_cache.py
 python3 -B tests/replay_main_tank_cache.py
 python3 -B tests/replay_door_floor.py
+python3 -B tests/replay_long_navmesh.py
+python3 -B tests/replay_buy_bag.py
 python3 -B tests/replay_run_family.py
+python3 -B tests/replay_run_family_migration.py
 g++ -std=c++17 -Wall -Wextra -Isrc -c src/overseer_decisions.cpp -o overseer_decisions.o
 for test in tests/test_*.cpp; do
   name="$(basename "$test" .cpp)"
@@ -125,6 +128,11 @@ for test in tests/test_*.cpp; do
   "./$name"
 done
 ```
+
+The two ledger replays need the SQLite development library, and the migration
+replay a MySQL 8.4 server (the gate starts one as a service; see
+`scripts/check-locally.sh schema` below for running it locally). The rest need
+only `g++` and `python3`.
 
 The main-tank replay applies the carried playerbots patch to pinned source
 fixtures and compiles the actual cache and threat-consumer path. It needs git
