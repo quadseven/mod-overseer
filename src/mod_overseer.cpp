@@ -10060,7 +10060,32 @@ private:
         // nothing fought the hold, and a large number on a `stage` row says the
         // party is being dragged by something this module has not identified.
         uint32 retaken{0};
+        // A `hearth` hold's last word on why it has no cast (#1338): the last
+        // refusal DoHearth gave under it, or the keep-out's reason. The
+        // ceiling line names it, so no hearth hold ends at its ceiling with
+        // "none recorded". `hearthOwed` is set while that refusal was only
+        // "character is moving": the hold then owes the cast, which
+        // CastOwedHearths makes once the character stands.
+        std::string hearthRefusal;
+        bool hearthOwed{false};
+        uint32 hearthOwedMapId{0};
+        time_t hearthAskedAt{0};
     };
+
+    // Records on a standing `hearth` hold why it has no cast, and whether that
+    // reason owes the cast (#1338). A hold of another verb is not touched.
+    static void NoteHearthHold(std::string const& name, std::string const& refusal,
+                               uint32 mapId)
+    {
+        auto& holds = HoldsInForce();
+        auto const hold = holds.find(name);
+        if (hold == holds.end() || hold->second.verb != "hearth")
+            return;
+        hold->second.hearthRefusal = refusal;
+        hold->second.hearthOwed = OverseerDecisions::HearthRefusalOwesACast(refusal);
+        hold->second.hearthOwedMapId = mapId;
+        hold->second.hearthAskedAt = time(nullptr);
+    }
 
     // THE CEILING, AND IT IS THE ONE #330 ARGUED FOR. 45 seconds is how long
     // this module will hold a character still for any cast, and it is a ceiling
@@ -10928,18 +10953,101 @@ private:
                         streak, true, _guildDeathSpotKeptOut.count(name) != 0);
                     released = streak;
                 }
+                // Outside an episode the hold's own last word is named (#1338):
+                // the refusal DoHearth gave under it, or the keep-out's reason.
                 auto const said = _guildDeathSpotRefusal.find(name);
                 LOG_INFO("module.overseer",
                          "overseer: '{}' reached its hearth hold's ceiling without going home - "
                          "last refusal: {}; {} such hold(s) in a row this episode",
                          name,
-                         said != _guildDeathSpotRefusal.end() && !said->second.empty()
-                             ? said->second
-                             : std::string("none recorded"),
+                         OverseerDecisions::HearthCeilingRefusal(
+                             said != _guildDeathSpotRefusal.end() ? said->second
+                                                                  : std::string(),
+                             hold->second.hearthRefusal),
                          released);
             }
             ReleaseHold(name, ObjectAccessor::FindPlayerByName(name, false),
                         "its hold reached the ceiling and nothing came back for it");
+        }
+    }
+
+    // A HEARTH REFUSED FOR MOVING IS CAST BY THE HOLD PLACED FOR IT (#1338).
+    // DoHearth answers a moving character with a hold and a refusal, so the
+    // next ask finds it standing. Live, the bridge asks again every 60 seconds
+    // and the hold's ceiling is 45: 152 holds in a day ended at the ceiling with
+    // no cast, and each re-ask found the character walking again. So once the
+    // character stands and nobody has asked again within the grace, the cast
+    // the hold was placed for is made here. A refusal now is said and the hold
+    // lets go, before its ceiling; a character still moving is left to the
+    // ceiling, whose line names the refusal. Runs before ReleaseExpiredHolds.
+    void CastOwedHearths()
+    {
+        auto& holds = HoldsInForce();
+        if (holds.empty())
+            return;
+        time_t const now = time(nullptr);
+        std::vector<std::string> owed;
+        for (auto const& hold : holds)
+            if (hold.second.verb == "hearth" && hold.second.hearthOwed &&
+                now < hold.second.until)
+                owed.push_back(hold.first);
+        for (std::string const& name : owed)
+        {
+            auto const hold = holds.find(name);
+            if (hold == holds.end())
+                continue;
+            Player* who = ObjectAccessor::FindPlayerByName(name, false);
+            OverseerDecisions::OwedHearthFacts facts;
+            facts.owed = hold->second.hearthOwed;
+            facts.rowOwnsIt = ARowStillOwnsTheHold(name);
+            facts.found = who && who->IsInWorld();
+            facts.moving = facts.found && who->isMoving();
+            facts.sameMap = facts.found && who->GetMapId() == hold->second.hearthOwedMapId;
+            facts.secondsSinceAsked =
+                now > hold->second.hearthAskedAt
+                    ? static_cast<unsigned>(now - hold->second.hearthAskedAt)
+                    : 0;
+            switch (OverseerDecisions::DecideOwedHearth(facts))
+            {
+                case OverseerDecisions::OwedHearthStep::None:
+                case OverseerDecisions::OwedHearthStep::Wait:
+                    break;
+                case OverseerDecisions::OwedHearthStep::Stale:
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' cannot hearth from the hold placed for it - it is "
+                             "on map {}, not map {} where the hearth was asked, so that ask is "
+                             "stale; the hold lets go before its ceiling (#1338)",
+                             name, who->GetMapId(), hold->second.hearthOwedMapId);
+                    ReleaseHold(name, who, "the hearth it was held for was asked on another map",
+                                "hearth");
+                    break;
+                case OverseerDecisions::OwedHearthStep::Cast:
+                {
+                    // Not owed again unless DoHearth refuses for moving once more.
+                    hold->second.hearthOwed = false;
+                    char const* status = "error";
+                    std::string evidence;
+                    char const* const refusal =
+                        DoHearth(who, "use", status, evidence, _pendingHearths, 0);
+                    if (!refusal || !*refusal)
+                    {
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' stands, and the hold placed for its refused "
+                                 "hearth casts the stone now; nobody asked again in {}s (#1338)",
+                                 name, facts.secondsSinceAsked);
+                        break;
+                    }
+                    // Moving again: DoHearth re-took the hold and it stays owed.
+                    if (OverseerDecisions::HearthRefusalOwesACast(refusal))
+                        break;
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' cannot hearth from the hold placed for it - {}; "
+                             "the hold lets go before its ceiling (#1338)",
+                             name, refusal);
+                    ReleaseHold(name, who, "its hearth cannot be cast", "hearth");
+                    break;
+                }
+            }
         }
     }
 
@@ -33412,6 +33520,23 @@ private:
                      boundTries, ceilings);
         };
 
+        // The keep-out hold, with its reason written on the hold (#1338): if
+        // the episode ends while it stands, its ceiling line still says why it
+        // had no cast, rather than "none recorded". It owes no cast.
+        auto holdKeptOut = [&]()
+        {
+            bool const placed = holdStill();
+            NoteHearthHold(name,
+                           std::string("kept out of the death zone, the hearth-out cannot "
+                                       "succeed (stone ") +
+                               (!stone ? "missing" : stoneOnCooldown ? "on cooldown" : "ready") +
+                               ", tries " + std::to_string(tries) + "/" +
+                               std::to_string(boundTries) + ")",
+                           bot->GetMapId());
+            if (placed)
+                sayCannotSucceed();
+        };
+
         auto keepMemberOut = [&]()
         {
             bool const keepOut = OverseerDecisions::KeepOutOfDeathZone(
@@ -33419,8 +33544,7 @@ private:
             if (keepOut)
             {
                 _guildDeathSpotKeptOut.insert(name);
-                if (holdStill())
-                    sayCannotSucceed();
+                holdKeptOut();
             }
             return keepOut;
         };
@@ -33440,8 +33564,7 @@ private:
             // This hold keeps the member out; it is not a hearth attempt, so
             // its ceiling is not counted as one with no cast.
             _guildDeathSpotKeptOut.insert(name);
-            if (holdStill())
-                sayCannotSucceed();
+            holdKeptOut();
             return true;
         }
 
@@ -38204,6 +38327,8 @@ private:
                     // cast waits for a poll that finds the character standing.
                     CastHoldReport report;
                     HoldStillAndReport(bot, name, "hearth", report);
+                    NoteHearthHold(name, "moving, held still first for the exit hearth",
+                                   bot->GetMapId());
                     if (changed)
                         LOG_INFO("module.overseer",
                                  "overseer: EXIT HEARTH - '{}' is moving on map {}, so it is "
@@ -42632,6 +42757,8 @@ private:
                     {
                         CastHoldReport report;
                         HoldStillAndReport(bot, name, "hearth", report);
+                        NoteHearthHold(name, "moving, held still first for the hearth regroup",
+                                       bot->GetMapId());
                         if (changed)
                             LOG_INFO("module.overseer",
                                      "overseer: hearth regroup - '{}' is moving, so it is "
@@ -48144,6 +48271,8 @@ private:
                 {
                     CastHoldReport report;
                     HoldStillAndReport(bot, name, "hearth", report);
+                    NoteHearthHold(name, "moving, held still first for the crossing hearth",
+                                   bot->GetMapId());
                     if (changed)
                         LOG_INFO("module.overseer",
                                  "overseer: crossing hearth - '{}' is moving, so it is held "
@@ -49506,6 +49635,8 @@ private:
                     {
                         CastHoldReport report;
                         HoldStillAndReport(p, name, "hearth", report);
+                        NoteHearthHold(name, "moving, held still first for the stranded hearth",
+                                       p->GetMapId());
                         break;
                     }
                     case OverseerDecisions::ExitHearthStep::Waiting:
@@ -61666,6 +61797,10 @@ private:
         // poll reads the character and, when it is free, starts its next pull.
         DriveHunts();
 
+        // Then cast any hearth a hold still owes (#1338), before the sweep
+        // below would end that hold at its ceiling with no cast.
+        CastOwedHearths();
+
         // Then end any cast hold that outlived the row that placed it (#335).
         // AFTER the five above, so a hold a resolver is about to release itself
         // is released by the resolver with the reason its row can report, and
@@ -72866,9 +73001,13 @@ private:
 
         // The refusal literals go straight into the UPDATE, so none may carry a
         // quote character - the rule every executor in this file keeps.
+        // AND EACH REFUSAL IS WRITTEN ON A STANDING `hearth` HOLD (#1338), so
+        // the hold's ceiling line names it, and a refusal for moving leaves the
+        // hold owing the cast (CastOwedHearths).
         auto refuse = [&](char const* reason) -> char const*
         {
             out = HearthJson(ev, "refused", reason);
+            NoteHearthHold(ev.character, reason, who->GetMapId());
             return reason;
         };
 
@@ -73056,6 +73195,8 @@ private:
         // checks. What happens a tick later cannot undo a cast that has started,
         // because the mount is checked once, at Spell::prepare.
         HoldStillAndReport(who, ev.character, "hearth", ev.hold);
+        // The cast is going out: the hold owes nothing and has no refusal.
+        NoteHearthHold(ev.character, "", who->GetMapId());
 
         WorldPacket raw(CMSG_USE_ITEM, 1 + 1 + 1 + 4 + 8 + 4 + 1 + 4);
         raw << uint8(stone->GetBagSlot());

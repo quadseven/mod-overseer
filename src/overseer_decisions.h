@@ -23278,6 +23278,67 @@ inline unsigned HearthCeilingStreakAfter(unsigned streak, bool inDeathSpotEpisod
     return inDeathSpotEpisode && !keepOutHold ? streak + 1 : streak;
 }
 
+// A `HEARTH` HOLD OUTSIDE A DEATH-SPOT EPISODE CASTS OR SAYS WHY (#1338).
+// Read live (2026-10-30T19:13Z to 2026-10-31T19:13Z): 152 of 159 such holds
+// that ended at the ceiling with "last refusal: none recorded" were placed by
+// DoHearth refusing a bridge hearth row because the character was moving. The
+// hold stands the character still so the next ask can cast, but the bridge
+// asks again every 60 seconds and the hold's ceiling is 45, so the re-ask
+// always found it walking again and nothing ever cast.
+//
+// So a hearth refused only because the character was moving owes the cast:
+// the hold placed for it casts once the character stands, if nobody asked
+// again within HEARTH_OWED_GRACE_SECONDS (a caller that re-asks on its own
+// poll goes first). Any other refusal owes nothing: the caller has its answer.
+// Inline, like HearthCeilingStreakAfter, for the hold-sweep replay.
+constexpr unsigned HEARTH_OWED_GRACE_SECONDS = 10;
+
+inline bool HearthRefusalOwesACast(std::string const& refusal)
+{
+    return refusal == "character is moving";
+}
+
+enum class OwedHearthStep
+{
+    None,   // nothing owed, or a cast in flight answers for the hold
+    Wait,   // inside the grace, or still moving: the ceiling names the refusal
+    Cast,   // standing and nobody asked again: cast it now
+    Stale,  // on another map than the one the hearth was asked on: let go
+};
+
+struct OwedHearthFacts
+{
+    bool owed = false;       // the last ask under this hold was refused for moving
+    bool rowOwnsIt = false;  // a parked row (a cast in flight) answers for the hold
+    bool found = false;      // the character is in the world
+    bool moving = false;
+    bool sameMap = true;     // on the map the refused hearth was asked on
+    unsigned secondsSinceAsked = 0;
+};
+
+inline OwedHearthStep DecideOwedHearth(OwedHearthFacts const& facts)
+{
+    if (!facts.owed || facts.rowOwnsIt || !facts.found)
+        return OwedHearthStep::None;
+    if (!facts.sameMap)
+        return OwedHearthStep::Stale;
+    if (facts.secondsSinceAsked < HEARTH_OWED_GRACE_SECONDS || facts.moving)
+        return OwedHearthStep::Wait;
+    return OwedHearthStep::Cast;
+}
+
+// What the ceiling line names as the last refusal: the death-spot episode's
+// own, else what the hold itself last heard, else "none recorded".
+inline std::string HearthCeilingRefusal(std::string const& episodeRefusal,
+                                        std::string const& holdRefusal)
+{
+    if (!episodeRefusal.empty())
+        return episodeRefusal;
+    if (!holdRefusal.empty())
+        return holdRefusal;
+    return "none recorded";
+}
+
 // "corpse_run", "spirit_healer", "wait", "ladder": the words written to
 // overseer_death.ghost_recovery and to the log.
 char const* GhostRecoveryWord(GhostRecovery choice);
