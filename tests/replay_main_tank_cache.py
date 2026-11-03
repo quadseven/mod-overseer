@@ -201,18 +201,27 @@ class MainTankCachePatchTest(unittest.TestCase):
         target.mkdir(parents=True)
         for name in ("PartyMemberValue.cpp", "PartyMemberValue.h"):
             shutil.copyfile(FIXTURES / name, target / name)
-        if PATCH.exists():
-            git = shutil.which("git")
-            if git is None:
-                raise RuntimeError("git required to apply the repository patch")
-            subprocess.run(  # noqa: S603 - repository patch applied to temporary fixtures
-                [git, "apply", str(PATCH)],
-                cwd=root,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=15,
+        # The replay proves the PATCHED cache. Without the patch it would
+        # compile the pinned fixture as upstream shipped it and could pass
+        # for the wrong reason, so a missing patch is a failure, not a skip.
+        # When upstream takes the fix and the patch is deleted, retire this
+        # replay or re-pin its fixtures in the same change.
+        if not PATCH.exists():
+            raise RuntimeError(
+                "%s is missing: this replay applies it to the fixtures and "
+                "proves nothing without it" % PATCH.relative_to(HERE.parent)
             )
+        git = shutil.which("git")
+        if git is None:
+            raise RuntimeError("git required to apply the repository patch")
+        subprocess.run(  # noqa: S603 - repository patch applied to temporary fixtures
+            [git, "apply", str(PATCH)],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
         header = (target / "PartyMemberValue.h").read_text()
         start = header.index("class PartyMemberMainTankValue")
         declaration = header[start : header.index("};", start) + 2]

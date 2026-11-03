@@ -63141,9 +63141,11 @@ private:
         if (hadRosterRow)
             beforeJob = before->Fetch()[0].Get<std::string>();
 
+        // Both values go through Esc like every other string this file writes:
+        // the mode is allow-listed above, but the write does not rely on that.
         CharacterDatabase.DirectExecute(
             "UPDATE overseer_roster SET job = '{}' WHERE name = '{}'",
-            mode, player->GetName());
+            Esc(mode), Esc(player->GetName()));
 
         QueryResult after = CharacterDatabase.Query(
             "SELECT job FROM overseer_roster WHERE name = '{}'", Esc(player->GetName()));
@@ -82912,7 +82914,7 @@ private:
             first = false;
 
             ss << '(' << p->GetGUID().GetCounter()
-               << ",'" << p->GetName() << "',"
+               << ",'" << Esc(p->GetName()) << "',"
                << uint32(p->GetLevel()) << ','
                << uint32(p->getRace()) << ','
                << uint32(p->getClass()) << ','
