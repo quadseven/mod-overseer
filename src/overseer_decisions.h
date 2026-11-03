@@ -23258,6 +23258,21 @@ bool HearthOutCannotSucceed(bool hasStone, bool stoneOnCooldown, unsigned tries,
                             unsigned boundTries, unsigned ceilingReleases = 0,
                             unsigned ceilingBound = HEARTH_HOLD_CEILING_RELEASES);
 
+// The no-cast streak after a `hearth` hold reached its ceiling. Only a hold
+// placed for a hearth attempt in a death-spot episode counts. The keep-out
+// holds the member with a `hearth` hold as well, and that hold is not a cast
+// that failed: counted, it pushed a member kept out while its stone was on
+// cooldown past the bound before the stone was ready, so it never cast, and
+// every later keep-out hold fed the same count (102 in a row for one member
+// live, 2026-10-31, #1229). Inline, so the hold-sweep replay
+// (tests/replay_mail_batch.py), which compiles the sweep without this file's
+// .cpp, links it.
+inline unsigned HearthCeilingStreakAfter(unsigned streak, bool inDeathSpotEpisode,
+                                         bool keepOutHold)
+{
+    return inDeathSpotEpisode && !keepOutHold ? streak + 1 : streak;
+}
+
 // "corpse_run", "spirit_healer", "wait", "ladder": the words written to
 // overseer_death.ghost_recovery and to the log.
 char const* GhostRecoveryWord(GhostRecovery choice);

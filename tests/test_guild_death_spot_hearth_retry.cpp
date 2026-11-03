@@ -21,6 +21,7 @@
 using OverseerDecisions::DecideHearthOutRetry;
 using OverseerDecisions::HearthOutRetry;
 using OverseerDecisions::HearthOutCannotSucceed;
+using OverseerDecisions::HearthCeilingStreakAfter;
 using OverseerDecisions::KeepOutOfDeathZone;
 
 namespace
@@ -147,7 +148,9 @@ void TheCeilingCountIsWired()
               counted != std::string::npos && gate != std::string::npos && counted < gate,
           true);
     std::size_t const sweep = source.find("void ReleaseExpiredHolds()");
-    std::size_t const bump = source.find("++_guildDeathSpotCeilings", sweep);
+    // The streak is moved through HearthCeilingStreakAfter, which leaves a
+    // keep-out hold out of it (TheKeepOutHoldIsMarked pins that call).
+    std::size_t const bump = source.find("_guildDeathSpotCeilings[name]", sweep);
     std::size_t const sweepEnd = source.find("\n    }\n", sweep);
     Check("the ceiling sweep counts a hearth hold that ended with no cast",
           sweep != std::string::npos && bump != std::string::npos && bump < sweepEnd, true);
@@ -263,6 +266,75 @@ void TheMarkEndsOnArrival()
           true);
 }
 
+// #1229, the live check (2026-11-03): the keep-out holds the member with a
+// `hearth` hold too, and when that hold reached its ceiling the sweep counted it
+// as one more hearth hold that ended with no cast. So a member kept out while
+// its stone was on cooldown (Bromli, four such holds) came out of the cooldown
+// already past the bound, never cast with a ready stone, and every keep-out hold
+// after that fed the same count: 102 "in a row" by 01:02Z. Only a hold placed
+// for a hearth attempt is counted; a keep-out hold that ends leaves the streak
+// where it was.
+void TheKeepOutHoldIsNotACeilingRelease()
+{
+    unsigned const bound = OverseerDecisions::HEARTH_HOLD_CEILING_RELEASES;
+    Check("an attempt hold that ends at its ceiling counts",
+          HearthCeilingStreakAfter(1, true, false) == 2, true);
+    Check("a keep-out hold that ends at its ceiling does not count",
+          HearthCeilingStreakAfter(1, true, true) == 1, true);
+    Check("outside a death-spot episode nothing is counted",
+          HearthCeilingStreakAfter(0, false, false) == 0, true);
+
+    // Bromli, replayed: five keep-out holds with the stone on cooldown, then
+    // the stone is ready. The member hearths out instead of a sixth keep-out.
+    unsigned streak = 0;
+    for (int hold = 0; hold < 5; ++hold)
+    {
+        Check("a stone on cooldown keeps the member out",
+              KeepOutOfDeathZone(HearthOutCannotSucceed(true, true, 0, 3, streak, bound), true,
+                                 false),
+              true);
+        streak = HearthCeilingStreakAfter(streak, true, true);
+    }
+    Check("the ready stone after a cooldown keep-out is cast",
+          HearthOutCannotSucceed(true, false, 0, 3, streak, bound), false);
+
+    // And the bound holds: past it, every hold is a keep-out hold, and a
+    // hundred of them leave the streak at the bound, not at 102.
+    streak = 0;
+    for (int hold = 0; hold < 100; ++hold)
+    {
+        bool const keptOut = HearthOutCannotSucceed(true, false, 0, 3, streak, bound);
+        streak = HearthCeilingStreakAfter(streak, true, keptOut);
+    }
+    Check("the streak stops at the bound", streak == bound, true);
+}
+
+void TheKeepOutHoldIsMarked()
+{
+    std::ifstream in("src/mod_overseer.cpp");
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    std::string const source = buffer.str();
+    std::size_t const sweep = source.find("void ReleaseExpiredHolds()");
+    std::size_t const sweepEnd = source.find("\n    }\n", sweep);
+    std::size_t const asked = source.find("OverseerDecisions::HearthCeilingStreakAfter(", sweep);
+    Check("the ceiling sweep asks whether the hold was a keep-out",
+          sweep != std::string::npos && asked != std::string::npos && asked < sweepEnd, true);
+    Check("the ceiling sweep no longer bumps the count on every hearth hold",
+          sweep != std::string::npos &&
+              source.find("++_guildDeathSpotCeilings", sweep) > sweepEnd,
+          true);
+    std::size_t const spot = source.find("bool LeaveGuildDeathSpot(");
+    std::size_t const marked = source.find("_guildDeathSpotKeptOut.insert(name)", spot);
+    std::size_t const cleared = source.find("_guildDeathSpotKeptOut.erase(name)", spot);
+    std::size_t const cast = source.find(
+        "DoHearth(bot, \"use\", status, evidence, _pendingHearths, 0);", spot);
+    Check("the keep-out marks its hold, and an attempt clears the mark before the cast",
+          spot != std::string::npos && marked != std::string::npos &&
+              cleared != std::string::npos && cast != std::string::npos && cleared < cast,
+          true);
+}
+
 }  // namespace
 
 int main()
@@ -274,6 +346,8 @@ int main()
     TheMarkEndsOnArrival();
     TheHoldThatKeepsEndingAtItsCeiling();
     TheCeilingCountIsWired();
+    TheKeepOutHoldIsNotACeilingRelease();
+    TheKeepOutHoldIsMarked();
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);
