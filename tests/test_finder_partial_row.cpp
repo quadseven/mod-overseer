@@ -138,26 +138,46 @@ void TheWholeDungeonIsWhatTheBrainIsArmedFor()
     // its roster never credits bit 6.
     std::uint32_t const brain = MARAUDON_MAP_MASK & ~ROTGRIP;
     Check("a Maraudon wing run expects what the brain will clear",
-          GuildRunExpectedMask(349, MARAUDON_MAP_MASK, brain, false) == brain);
+          GuildRunExpectedMask(349, MARAUDON_MAP_MASK, brain, false, false) == brain);
     Check("Princess Theradras is part of it",
-          (GuildRunExpectedMask(349, MARAUDON_MAP_MASK, brain, false) & THERADRAS) != 0);
+          (GuildRunExpectedMask(349, MARAUDON_MAP_MASK, brain, false, false) & THERADRAS) != 0);
     Check("an unread brain expects the whole map",
-          GuildRunExpectedMask(349, MARAUDON_MAP_MASK, 0, false) == MARAUDON_MAP_MASK);
+          GuildRunExpectedMask(349, MARAUDON_MAP_MASK, 0, false, false) == MARAUDON_MAP_MASK);
 
     // Blackrock Depths: the brain's roster counts combat bosses only, so the
     // Ring of Law (an objective, credited to the announcer) is not expected.
     std::uint32_t const depthsBrain = DEPTHS_MAP_MASK & ~RING_OF_LAW;
-    std::uint32_t const depths = GuildRunExpectedMask(230, DEPTHS_MAP_MASK, depthsBrain, false);
+    std::uint32_t const depths =
+        GuildRunExpectedMask(230, DEPTHS_MAP_MASK, depthsBrain, false, false);
     Check("a Blackrock Depths wing run expects the Emperor", (depths & EMPEROR) != 0);
     Check("and Gerstahn", (depths & GERSTAHN) != 0);
     Check("and nothing the brain does not clear", (depths & RING_OF_LAW) == 0);
 
     Check("a row that ends its connected dungeon keeps the map's expectation",
-          GuildRunExpectedMask(36, 0b1111111, 0b0000011, true) == 0b1111111);
+          GuildRunExpectedMask(36, 0b1111111, 0b0000011, true, false) == 0b1111111);
     Check("an independent wing is still narrowed to the brain's wing",
-          GuildRunExpectedMask(429, 0xFFFF, 0x000F, true) == 0x000F);
+          GuildRunExpectedMask(429, 0xFFFF, 0x000F, true, false) == 0x000F);
     Check("Gnomeregan's escort boss stays out of every expectation",
-          (GuildRunExpectedMask(90, 0b111110, 0, true) & (1u << 2)) == 0);
+          (GuildRunExpectedMask(90, 0b111110, 0, true, false) & (1u << 2)) == 0);
+}
+
+void AnAllianceUldamanRunDoesNotExpectTheLostDwarves()
+{
+    // Uldaman (map 70) credits the Lost Dwarves encounter (bit 1) to Baelog, a
+    // friendly entry the Alliance roster treats as a travel objective, so an
+    // Alliance party can never set that bit. The family mask drops it
+    // (DungeonRunFactionExpectedMask, #1327); the guild mask must too, or an
+    // Alliance guild run that clears can never read cleared on the mask
+    // (#1331). The map's mask is the one test_dungeon_complete.cpp reads.
+    constexpr std::uint32_t uldaman = 0b11110111;
+    Check("an Alliance run on a row that ends Uldaman drops the Lost Dwarves bit",
+          GuildRunExpectedMask(70, uldaman, 0, true, true) == 0b11110101);
+    Check("a Horde run on the same row still expects the Lost Dwarves",
+          GuildRunExpectedMask(70, uldaman, 0, true, false) == uldaman);
+    Check("an Alliance wing row drops the bit too",
+          GuildRunExpectedMask(70, uldaman, uldaman, false, true) == 0b11110101);
+    Check("the faction leaves another map's mask untouched",
+          GuildRunExpectedMask(389, 0b1111, 0, true, true) == 0b1111);
 }
 
 void AWholeDungeonGetsTheTimeItsBossesTake()
@@ -265,6 +285,7 @@ int main()
     AWingRowOfAConnectedDungeonDoesNotEndIt();
     TheFinderFlagOnAWingRowLeavesTheRunGoing();
     TheWholeDungeonIsWhatTheBrainIsArmedFor();
+    AnAllianceUldamanRunDoesNotExpectTheLostDwarves();
     AWholeDungeonGetsTheTimeItsBossesTake();
     EveryDireMaulDoorFindsItsWing();
     TheAdapterIsWired();

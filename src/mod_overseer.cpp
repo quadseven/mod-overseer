@@ -44522,6 +44522,9 @@ private:
         // on once the verdict has left it running.
         unsigned waitRearms{0};
         std::string moduleStop;
+        // The module counted every boss down before it stopped (#1331): the
+        // run moduleStop holds ends cleared, not stalled.
+        bool moduleCleared{false};
         std::string outcome;
         std::string why;
         std::string said;
@@ -46256,7 +46259,8 @@ private:
                     : 0;
             poll.finderEndsDungeon = run.finderEndsDungeon;
             poll.expectedMask = OverseerDecisions::GuildRunExpectedMask(
-                run.mapId, MapEncounterMask(run.mapId), brainMask, run.finderEndsDungeon);
+                run.mapId, MapEncounterMask(run.mapId), brainMask, run.finderEndsDungeon,
+                tank && tank->GetTeamId() == TEAM_ALLIANCE);
             poll.creditedMask = poll.expectedMask ? CompletedEncounters(tank) : 0;
             if (!run.bossesTotal && poll.expectedMask)
             {
@@ -46353,14 +46357,30 @@ private:
                                    tank && tank->IsInWorld() && run.moduleStop.empty();
                 std::string const stopReason =
                     issue && rearm.tankAlive ? DungeonBrainStopReason(tank) : std::string();
-                if (issue && OverseerDecisions::GuildRunArmAfterModuleStop(
-                                 stopReason, run.waitRearms) ==
-                                 OverseerDecisions::GuildRunModuleStopStep::EndWithReason)
+                OverseerDecisions::GuildRunModuleStopStep const stopStep =
+                    issue ? OverseerDecisions::GuildRunArmAfterModuleStop(stopReason,
+                                                                          run.waitRearms)
+                          : OverseerDecisions::GuildRunModuleStopStep::Rearm;
+                if (issue && stopStep == OverseerDecisions::GuildRunModuleStopStep::EndWithReason)
                 {
                     run.moduleStop = stopReason;
                     LOG_WARN("module.overseer",
                              "overseer: guild finder run {} - the dungeon module ended the "
                              "clear ({}), so '{}' is not sent again and the run ends",
+                             run.id, OverseerDecisions::DungeonModuleStopWords(stopReason),
+                             OverseerDecisions::GUILD_RUN_REARM_VERB);
+                }
+                else if (issue &&
+                         stopStep == OverseerDecisions::GuildRunModuleStopStep::EndComplete)
+                {
+                    // THE MODULE COUNTED EVERY BOSS DOWN (#1331): not armed
+                    // again, and the run ends cleared below, not stalled.
+                    run.moduleStop = stopReason;
+                    run.moduleCleared = true;
+                    LOG_INFO("module.overseer",
+                             "overseer: guild finder run {} - the dungeon module counted "
+                             "every boss down ({}), so '{}' is not sent again and the run "
+                             "ends cleared",
                              run.id, OverseerDecisions::DungeonModuleStopWords(stopReason),
                              OverseerDecisions::GUILD_RUN_REARM_VERB);
                 }
@@ -46471,6 +46491,18 @@ private:
             // walks out through the run's one exit with the module's reason.
             if (!run.moduleStop.empty())
             {
+                // A MODULE THAT STOPPED ON ALL BOSSES CLEARED FINISHED THE RUN
+                // (#1331): it ends the way a credited last boss does, with the
+                // module's own words, and every other stop keeps the stalled
+                // ending below.
+                if (run.moduleCleared)
+                {
+                    EndGuildRun(run,
+                                OverseerDecisions::GuildRunVerdictWord(
+                                    OverseerDecisions::GuildRunVerdict::Cleared),
+                                OverseerDecisions::DungeonModuleStopWords(run.moduleStop), now);
+                    return true;
+                }
                 EndGuildRun(run,
                             OverseerDecisions::GuildRunVerdictWord(
                                 OverseerDecisions::GuildRunVerdict::Stalled),
