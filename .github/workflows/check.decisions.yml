@@ -50,75 +50,25 @@ jobs:
     # setting somebody can change without ever reading this file.
     permissions:
       contents: read
+    # Tells scripts/check-locally.sh this runner has the MySQL service above,
+    # so run_decisions also replays the ledger migration on it. A lane
+    # machine has no such service and leaves this unset.
+    env:
+      OVERSEER_MYSQL_REPLAY: "1"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
 
-      # -Wall -Wextra because this is the one translation unit in the module
-      # whose warnings are not drowned out by a core's own, so they are cheap
-      # to keep clean here and worth having.
-      #
-      # ONE BINARY PER TEST FILE, over whatever tests/ holds. Each of these
-      # files owns a main() and they cannot be linked together, and naming them
-      # one at a time here means the next decision that gets a test is a
-      # decision whose test silently never runs until somebody remembers to
-      # edit this file. The loop changes nothing about WHAT is compiled: still
-      # src/overseer_decisions.cpp plus one test file, still no include path
-      # into a core, which is the half of this job that IS the test. An empty
-      # tests/ fails rather than passing vacuously, for the same reason.
-      # The version exists twice on purpose: `VERSION` at the root is what a
-      # human reads and what a release is cut from, and the constant in the pure
-      # header is what the module can report at runtime without dragging a core
-      # in behind it. Two copies of a string is exactly the thing that drifts
-      # silently, and a wrong version in a build banner is worse than none
-      # because it is believed. So they are compared here, where it costs a
-      # second, rather than discovered from a page showing the wrong number.
-      - name: The two version strings agree
-        run: |
-          set -euo pipefail
-          file="$(tr -d '[:space:]' < VERSION)"
-          header="$(grep -oE '^constexpr char VERSION\[\] = "[^"]+"' src/overseer_decisions.h | grep -oE '"[^"]+"' | tr -d '"')"
-          echo "VERSION file:    $file"
-          echo "header constant: $header"
-          test -n "$file"   || { echo '::error::VERSION file is empty'; exit 1; }
-          test -n "$header" || { echo '::error::no VERSION constant in src/overseer_decisions.h'; exit 1; }
-          test "$file" = "$header" || { echo "::error::version drift: VERSION=$file header=$header"; exit 1; }
-          printf '%s\n' "$file" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::not semver: $file"; exit 1; }
-      - name: Replay exit-hearth finalization
-        run: python3 -B tests/replay_exit_hearth_finalization.py
-      - name: Replay cached travel claim ownership
-        run: python3 -B tests/replay_travel_claim_cache.py
-      - name: Replay main-tank cache lifetime
-        run: python3 -B tests/replay_main_tank_cache.py
-      - name: Replay routed door floor selection
-        run: python3 -B tests/replay_door_floor.py
-      - name: Replay long-route walking and physical trigger crossing
-        run: python3 -B tests/replay_long_navmesh.py
-      - name: Replay buying into an empty bag position
-        run: python3 -B tests/replay_buy_bag.py
       - name: Install ledger replay database clients
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev default-mysql-client
-      - name: Replay independent family run ledgers
-        run: python3 -B tests/replay_run_family.py
-      - name: Replay the family ledger migration twice on MySQL
-        run: python3 -B tests/replay_run_family_migration.py
+
+      # ONE ENTRY POINT, THE SAME ONE THE LANE CONTRACT RUNS. Every check this
+      # job makes (the two version strings agree, the Python replays, and the
+      # compile-once loop over tests/test_*.cpp with -Wall -Wextra and no
+      # include path into a core) lives in run_decisions in
+      # scripts/check-locally.sh, with the reasons beside each. When this file
+      # repeated those commands inline, the two copies drifted and a lane's own
+      # validation passed a change this job then failed.
+      # tests/test_decisions_ci_parity.py fails if a run step other than the
+      # package install above comes back.
       - name: Compile and run
-        run: |
-          set -euo pipefail
-          g++ --version | head -1
-          shopt -s nullglob
-          found=0
-          # THE DECISIONS ARE COMPILED ONCE, NOT ONCE PER TEST. The file is over
-          # sixteen thousand lines and every test used to compile it again: on
-          # 2026-09-26 main took 9 min 58 s of this job's 10-minute limit for
-          # about 160 tests, and three more tests timed a pull request out.
-          # Same flags, same warnings (said once instead of per test), and each
-          # test still links against exactly that translation unit.
-          g++ -std=c++17 -Wall -Wextra -Isrc -c src/overseer_decisions.cpp -o overseer_decisions.o
-          for test in tests/test_*.cpp; do
-            found=1
-            name="$(basename "$test" .cpp)"
-            echo "== $test"
-            g++ -std=c++17 -Wall -Wextra -Isrc overseer_decisions.o "$test" -o "$name"
-            "./$name"
-          done
-          test "$found" = 1 || { echo "no tests/test_*.cpp found"; exit 1; }
+        run: bash scripts/check-locally.sh decisions

@@ -5,12 +5,13 @@
  * Status, and ASCII only.
  *
  * The Run and test section is pinned to .github/workflows/check.decisions.yml
- * as text, both ways: each command the README names must still be in the
- * workflow, so a workflow change that drops one fails here instead of leaving
- * the README quietly wrong.
+ * as text, both ways: the one command the README names must still be in the
+ * workflow, and the steps it describes must still be in the decisions mode of
+ * scripts/check-locally.sh, so a change that drops one fails here instead of
+ * leaving the README quietly wrong.
  *
  * Compiled against src/overseer_decisions.cpp like every other test; reads
- * README.md and the workflow as text (run from the repo root).
+ * README.md, the workflow and the script as text (run from the repo root).
  */
 
 #include "overseer_decisions.h"
@@ -76,12 +77,19 @@ std::vector<std::string> const kSections = {
     "## Contributing",
 };
 
-// The commands the README tells a reader to run, each of which must also be
-// in the workflow that gates a pull request.
+// The command the README tells a reader to run, which must also be in the
+// workflow that gates a pull request.
 std::vector<std::string> const kCiCommands = {
+    "bash scripts/check-locally.sh decisions",
+};
+
+// The steps the README says that command runs, each of which must still be in
+// scripts/check-locally.sh.
+std::vector<std::string> const kScriptSteps = {
     "python3 -B tests/replay_exit_hearth_finalization.py",
-    "g++ -std=c++17 -Wall -Wextra -Isrc -c src/overseer_decisions.cpp -o overseer_decisions.o",
-    "g++ -std=c++17 -Wall -Wextra -Isrc overseer_decisions.o \"$test\" -o \"$name\"",
+    "g++ -std=c++17 -Wall -Wextra -Isrc -c src/overseer_decisions.cpp",
+    "for test_src in tests/test_*.cpp",
+    "OVERSEER_MYSQL_REPLAY",
 };
 
 void TheOpeningNamesTheProduct(std::string const& doc)
@@ -135,7 +143,8 @@ void HowItWorksHasOneMermaidDiagram(std::string const& doc)
           first == std::string::npos || how.find("```mermaid\n", first + 1) == std::string::npos);
 }
 
-void RunAndTestMatchesTheWorkflow(std::string const& doc, std::string const& workflow)
+void RunAndTestMatchesTheWorkflow(std::string const& doc, std::string const& workflow,
+                                  std::string const& script)
 {
     std::string const run = Section(doc, "## Run and test locally");
     Check("the workflow file was read", !workflow.empty());
@@ -148,6 +157,12 @@ void RunAndTestMatchesTheWorkflow(std::string const& doc, std::string const& wor
         Check(inReadme.c_str(), Has(run, cmd));
         std::string const inWorkflow = "workflow still runs: " + cmd;
         Check(inWorkflow.c_str(), Has(workflow, cmd));
+    }
+    Check("the local runner was read", !script.empty());
+    for (std::string const& step : kScriptSteps)
+    {
+        std::string const inScript = "check-locally.sh still runs: " + step;
+        Check(inScript.c_str(), Has(script, step));
     }
 }
 
@@ -184,12 +199,13 @@ int main()
 {
     std::string const doc = ReadFile("README.md");
     std::string const workflow = ReadFile(".github/workflows/check.decisions.yml");
+    std::string const script = ReadFile("scripts/check-locally.sh");
     Check("README.md was read", !doc.empty());
 
     TheOpeningNamesTheProduct(doc);
     TheSectionsAreAllThereInOrder(doc);
     HowItWorksHasOneMermaidDiagram(doc);
-    RunAndTestMatchesTheWorkflow(doc, workflow);
+    RunAndTestMatchesTheWorkflow(doc, workflow, script);
     StatusLinksOneLiveIssue(doc);
     ContributingPointsAtAgents(doc);
     TheTextIsAsciiOnly(doc);
