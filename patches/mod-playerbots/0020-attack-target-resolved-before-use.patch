@@ -1,0 +1,62 @@
+Subject: [PATCH] an attack resolves its target again before reading its reaction
+
+WHY THIS PATCH EXISTS
+
+A worldserver SIGSEGV at AttackAction::Attack (src/Ai/Base/Actions/AttackAction.cpp:102
+at the pin below): bot->IsFriendlyTo(target) walks the target's reaction through
+Unit::GetReactionTo into Object::GetGuidValue and faults at address 0, because the
+target's update-field array is already gone. The target reaches Attack() as a raw
+Unit* out of an AI value ("current target", "duel target"), checked only for null
+and IsInWorld(). Both checks passed on the crashed tick, and neither can see the
+state that matters: the flag they read is not the array the reaction read
+dereferences, so a unit that has been removed from the world or destroyed -
+despawned creature, logged-out player, a unit that left for another map - passes
+both and faults three calls later.
+
+AttackMyTargetAction, in the same file, already does the safe thing: it hands
+Attack() botAI->GetUnit(guid), a fresh ObjectAccessor resolution that answers
+only for a unit on the bot's own map. Attack() itself never re-resolves, so
+every other caller rides on the cached pointer. This patch moves the resolution
+into Attack(): after the existing null refusal, the target is resolved again by
+GUID through botAI->GetUnit(...), and a null answer (target gone, or on another
+map) refuses the attack. The existing IsInWorld() refusal and everything below
+it run on the resolved pointer, unchanged.
+
+WHAT WOULD LET THIS PATCH BE DELETED
+
+Upstream mod-playerbots re-resolving the attack target by GUID inside
+AttackAction::Attack (or dropping the raw-pointer AI values that feed it), so
+the reaction read can only ever run on a unit the map still holds.
+
+APPLIES TO
+
+quadseven/mod-playerbots @ 40884e9c135c1daf27ffd894a6047502a5701130, on top of
+local patches 0001-0019. Touches only AttackAction::Attack in
+src/Ai/Base/Actions/AttackAction.cpp. tests/replay_attack_target.py in
+mod-overseer compiles the real body, pinned and patched, against a lifetime
+model of the map store and runs the departed-target and other-map cases.
+
+diff --git a/src/Ai/Base/Actions/AttackAction.cpp b/src/Ai/Base/Actions/AttackAction.cpp
+index 702b6a3..be4a709 100644
+--- a/src/Ai/Base/Actions/AttackAction.cpp
++++ b/src/Ai/Base/Actions/AttackAction.cpp
+@@ -63,6 +63,19 @@ bool AttackAction::Attack(Unit* target, bool /*with_pet*/ /*true*/)
+         return false;
+     }
+ 
++    // The target arrives as a raw pointer out of an AI value, and a value
++    // can outlive the unit it names: a despawned creature, a logged-out
++    // player, a unit that left for another map. The null check above and
++    // the IsInWorld() check below cannot see that state - the reaction
++    // read further down goes through the target's update fields, which
++    // are already gone by then, and faults. Resolve the target again by
++    // GUID, the way AttackMyTargetAction in this file already does: the
++    // accessor answers only for a unit on the bot's own map, so a target
++    // that is gone or elsewhere comes back null and is refused here.
++    target = botAI->GetUnit(target->GetGUID());
++    if (!target)
++        return false;
++
+     if (!target->IsInWorld())
+     {
+         if (verbose)
