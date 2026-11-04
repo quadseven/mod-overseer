@@ -96,7 +96,7 @@
 -- built for - is a deployment decision for a separate change, not a schema
 -- one.
 
-CREATE TABLE `overseer_death` (
+CREATE TABLE IF NOT EXISTS `overseer_death` (
     `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
 
     -- WHO. Same convention as overseer_event: name is the join key every

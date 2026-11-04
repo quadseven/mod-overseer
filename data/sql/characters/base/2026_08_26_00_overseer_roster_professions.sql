@@ -29,7 +29,9 @@
 -- spelling of a fact that already exists twice, and the only thing a third
 -- spelling can add is a way to disagree. The module prints the DBC's own name
 -- next to the id in every log line, so nothing is unreadable at 2am.
-ALTER TABLE `overseer_roster`
+-- Guarded the way 2026_08_26_01_overseer_roster_job.sql guards its own
+-- (#1343): dbimport re-applies a hash-changed file, and an unguarded
+-- ADD COLUMN aborts the second run with a duplicate-column error.
     -- THE DECLARATIVE END STATE, and the module's only permission to act.
     --
     -- The primary professions this character is MEANT to hold, as
@@ -52,8 +54,20 @@ ALTER TABLE `overseer_roster`
     -- assignment is not a character that may be freely rearranged; it is one
     -- nobody has decided about, and the safe reading of an absent decision is
     -- to leave the character exactly as it is.
-    ADD COLUMN `professions` VARCHAR(64) NOT NULL DEFAULT ''
-        COMMENT 'Primary profession skill ids this character should end up holding, comma separated; empty = no opinion, touch nothing',
+SET @professions_column_missing = (
+    SELECT COUNT(*) = 0 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'overseer_roster'
+      AND COLUMN_NAME = 'professions'
+);
+SET @add_professions_column = IF(
+    @professions_column_missing,
+    "ALTER TABLE `overseer_roster` ADD COLUMN `professions` VARCHAR(64) NOT NULL DEFAULT '' COMMENT 'Primary profession skill ids this character should end up holding, comma separated; empty = no opinion, touch nothing'",
+    "SELECT 1"
+);
+PREPARE add_professions_column_stmt FROM @add_professions_column;
+EXECUTE add_professions_column_stmt;
+DEALLOCATE PREPARE add_professions_column_stmt;
 
     -- THE STANDING ERRAND. One skill id, or 0 for none. It means: when this
     -- character is standing at a trainer who teaches this, learn it.
@@ -69,8 +83,20 @@ ALTER TABLE `overseer_roster`
     -- CLEARED BY THE MODULE ON SUCCESS, and only on success. A failed attempt
     -- leaves it standing so the next poll retries, and the errand ends through
     -- the travel backstop rather than through a column that quietly forgot.
-    ADD COLUMN `learn_skill` SMALLINT UNSIGNED NOT NULL DEFAULT 0
-        COMMENT 'Primary profession skill id to learn at the trainer; 0 = nothing to learn',
+SET @learn_skill_column_missing = (
+    SELECT COUNT(*) = 0 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'overseer_roster'
+      AND COLUMN_NAME = 'learn_skill'
+);
+SET @add_learn_skill_column = IF(
+    @learn_skill_column_missing,
+    "ALTER TABLE `overseer_roster` ADD COLUMN `learn_skill` SMALLINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Primary profession skill id to learn at the trainer; 0 = nothing to learn'",
+    "SELECT 1"
+);
+PREPARE add_learn_skill_column_stmt FROM @add_learn_skill_column;
+EXECUTE add_learn_skill_column_stmt;
+DEALLOCATE PREPARE add_learn_skill_column_stmt;
 
     -- THE DELIBERATE ACT. One skill id, or 0 for none. Unlearning destroys
     -- every point of a skill and every recipe hanging off it, and there is no
@@ -84,8 +110,20 @@ ALTER TABLE `overseer_roster`
     -- (SkillHandler.cpp:91-100). The module does the same two things in the
     -- same order, so a character unlearning here is doing what a person at a
     -- keyboard would do, and nothing else.
-    ADD COLUMN `unlearn_skill` SMALLINT UNSIGNED NOT NULL DEFAULT 0
-        COMMENT 'Primary profession skill id to give up; 0 = give up nothing',
+SET @unlearn_skill_column_missing = (
+    SELECT COUNT(*) = 0 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'overseer_roster'
+      AND COLUMN_NAME = 'unlearn_skill'
+);
+SET @add_unlearn_skill_column = IF(
+    @unlearn_skill_column_missing,
+    "ALTER TABLE `overseer_roster` ADD COLUMN `unlearn_skill` SMALLINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Primary profession skill id to give up; 0 = give up nothing'",
+    "SELECT 1"
+);
+PREPARE add_unlearn_skill_column_stmt FROM @add_unlearn_skill_column;
+EXECUTE add_unlearn_skill_column_stmt;
+DEALLOCATE PREPARE add_unlearn_skill_column_stmt;
 
     -- THE PRICE THE REQUESTER AGREED TO PAY, and the reason an unlearn cannot
     -- destroy work by accident.
@@ -110,5 +148,17 @@ ALTER TABLE `overseer_roster`
     -- nothing at all". The sentinel for "no request" lives in `unlearn_skill`,
     -- which is the column the module tests, so this one never has to carry two
     -- meanings at once.
-    ADD COLUMN `unlearn_max` SMALLINT UNSIGNED NOT NULL DEFAULT 0
-        COMMENT 'Refuse the unlearn if the live skill value exceeds this; the cost the requester agreed to destroy';
+SET @unlearn_max_column_missing = (
+    SELECT COUNT(*) = 0 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'overseer_roster'
+      AND COLUMN_NAME = 'unlearn_max'
+);
+SET @add_unlearn_max_column = IF(
+    @unlearn_max_column_missing,
+    "ALTER TABLE `overseer_roster` ADD COLUMN `unlearn_max` SMALLINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Refuse the unlearn if the live skill value exceeds this; the cost the requester agreed to destroy'",
+    "SELECT 1"
+);
+PREPARE add_unlearn_max_column_stmt FROM @add_unlearn_max_column;
+EXECUTE add_unlearn_max_column_stmt;
+DEALLOCATE PREPARE add_unlearn_max_column_stmt;

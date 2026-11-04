@@ -25,7 +25,9 @@
 -- walks the whole talent DBC and every trainer list for the class. Recording
 -- the level it was last done at turns a per-tick sweep into one pass per level
 -- gained, which is exactly how often a real character visits a trainer.
-ALTER TABLE `overseer_roster`
+-- Guarded the way 2026_08_26_01_overseer_roster_job.sql guards its own
+-- (#1343): dbimport re-applies a hash-changed file, and an unguarded
+-- ADD COLUMN aborts the second run with a duplicate-column error.
     -- Which talent tree to spend points in, as a DBC tabpage: 0, 1 or 2 in the
     -- in-game left-to-right order (warrior 0=arms 1=fury 2=protection).
     -- Anything outside that range leaves talents alone entirely, which is the
@@ -43,9 +45,33 @@ ALTER TABLE `overseer_roster`
     -- never uses once. A column shape whose reader has no precedent in the
     -- codebase that has to compile against it is a compile risk for nothing,
     -- and 255 is as unambiguous as -1 when the valid range is 0-2.
-    ADD COLUMN `spec_tab` TINYINT UNSIGNED NOT NULL DEFAULT 255
-        COMMENT 'Talent tree to spend points in (DBC tabpage 0-2); 255 leaves talents alone',
+SET @spec_tab_column_missing = (
+    SELECT COUNT(*) = 0 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'overseer_roster'
+      AND COLUMN_NAME = 'spec_tab'
+);
+SET @add_spec_tab_column = IF(
+    @spec_tab_column_missing,
+    "ALTER TABLE `overseer_roster` ADD COLUMN `spec_tab` TINYINT UNSIGNED NOT NULL DEFAULT 255 COMMENT 'Talent tree to spend points in (DBC tabpage 0-2); 255 leaves talents alone'",
+    "SELECT 1"
+);
+PREPARE add_spec_tab_column_stmt FROM @add_spec_tab_column;
+EXECUTE add_spec_tab_column_stmt;
+DEALLOCATE PREPARE add_spec_tab_column_stmt;
     -- 0 means never trained, and level 1 is a real level, so this cannot be
     -- NULL-as-never without every read having to say so.
-    ADD COLUMN `trained_level` TINYINT UNSIGNED NOT NULL DEFAULT 0
-        COMMENT 'Character level at which training was last applied';
+SET @trained_level_column_missing = (
+    SELECT COUNT(*) = 0 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'overseer_roster'
+      AND COLUMN_NAME = 'trained_level'
+);
+SET @add_trained_level_column = IF(
+    @trained_level_column_missing,
+    "ALTER TABLE `overseer_roster` ADD COLUMN `trained_level` TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Character level at which training was last applied'",
+    "SELECT 1"
+);
+PREPARE add_trained_level_column_stmt FROM @add_trained_level_column;
+EXECUTE add_trained_level_column_stmt;
+DEALLOCATE PREPARE add_trained_level_column_stmt;

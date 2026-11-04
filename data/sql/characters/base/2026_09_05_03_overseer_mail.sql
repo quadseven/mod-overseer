@@ -145,6 +145,13 @@
 -- stands today, not as it stood when the branch was opened, and it has already
 -- had to be widened twice while this branch waited. Anything adding a kind
 -- after this must add it here too.
+-- RESTATED TO THE FINAL UNION AFTER THE FACT (#1343). dbimport re-applies
+-- any file whose hash changed, and this statement's shorter list, re-applied
+-- after later files had widened the column, shrank the ENUM under live rows
+-- (an error in strict mode, or truncation). It now names the final union
+-- the chain ends at, so a re-apply in any order cannot shrink it; a first
+-- application still ends at the same schema, because every file in the
+-- chain now restates this same list.
 ALTER TABLE `overseer_command`
-    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction','mail','repair','buy','bind')
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction','mail','repair','buy','bind','hearth','summon','conjure','cast','guild','quest','naturalize','disenchant')
         NOT NULL DEFAULT 'bot';

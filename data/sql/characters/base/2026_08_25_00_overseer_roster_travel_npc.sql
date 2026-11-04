@@ -54,6 +54,20 @@
 -- not train, buy, repair or sign anything - the only interaction upstream
 -- performs on arrival is its existing quest-giver branch. Every one of those
 -- verbs is its own issue, and every one of them was blocked on this.
-ALTER TABLE `overseer_roster`
-    ADD COLUMN `travel_npc` VARCHAR(32) NOT NULL DEFAULT ''
-        COMMENT 'Role keyword or creature entry this character should walk to; empty = stay with the family';
+-- Guarded the way 2026_08_26_01_overseer_roster_job.sql guards its own
+-- (#1343): dbimport re-applies a hash-changed file, and an unguarded
+-- ADD COLUMN aborts the second run with a duplicate-column error.
+SET @travel_npc_column_missing = (
+    SELECT COUNT(*) = 0 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'overseer_roster'
+      AND COLUMN_NAME = 'travel_npc'
+);
+SET @add_travel_npc_column = IF(
+    @travel_npc_column_missing,
+    "ALTER TABLE `overseer_roster` ADD COLUMN `travel_npc` VARCHAR(32) NOT NULL DEFAULT '' COMMENT 'Role keyword or creature entry this character should walk to; empty = stay with the family'",
+    "SELECT 1"
+);
+PREPARE add_travel_npc_column_stmt FROM @add_travel_npc_column;
+EXECUTE add_travel_npc_column_stmt;
+DEALLOCATE PREPARE add_travel_npc_column_stmt;

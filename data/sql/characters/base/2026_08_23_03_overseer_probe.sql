@@ -22,10 +22,34 @@
 -- it cannot be the reason an experiment succeeded. Anything that changes the
 -- world still goes through kind='bot' or kind='chat', where it is visible as a
 -- command rather than hidden inside an inspection.
+-- RESTATED TO THE FINAL UNION AFTER THE FACT (#1343). dbimport re-applies
+-- any file whose hash changed, and this statement's shorter list, re-applied
+-- after later files had widened the column, shrank the ENUM under live rows
+-- (an error in strict mode, or truncation). It now names the final union
+-- the chain ends at, so a re-apply in any order cannot shrink it; a first
+-- application still ends at the same schema, because every file in the
+-- chain now restates this same list.
 ALTER TABLE `overseer_command`
-    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe') NOT NULL DEFAULT 'bot',
-    -- MEDIUMTEXT because `detail` is VARCHAR(255) and a spell list alone
-    -- exceeds that at level 11. detail keeps its job - short status and error
-    -- strings - and this carries the payload, so nothing that reads detail
-    -- today has to learn about probes.
-    ADD COLUMN `result` MEDIUMTEXT NULL DEFAULT NULL AFTER `detail`;
+    MODIFY COLUMN `kind` ENUM('bot','chat','gm','probe','give','share','trade','job','sell','bank','auction','mail','repair','buy','bind','hearth','summon','conjure','cast','guild','quest','naturalize','disenchant') NOT NULL DEFAULT 'bot';
+
+-- The add is guarded the way 2026_08_26_01_overseer_roster_job.sql guards
+-- its own (#1343): an unguarded ADD COLUMN aborts a re-apply of this file
+-- with a duplicate-column error.
+-- MEDIUMTEXT because `detail` is VARCHAR(255) and a spell list alone
+-- exceeds that at level 11. detail keeps its job - short status and error
+-- strings - and this carries the payload, so nothing that reads detail
+-- today has to learn about probes.
+SET @result_column_missing = (
+    SELECT COUNT(*) = 0 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'overseer_command'
+      AND COLUMN_NAME = 'result'
+);
+SET @add_result_column = IF(
+    @result_column_missing,
+    "ALTER TABLE `overseer_command` ADD COLUMN `result` MEDIUMTEXT NULL DEFAULT NULL AFTER `detail`",
+    "SELECT 1"
+);
+PREPARE add_result_column_stmt FROM @add_result_column;
+EXECUTE add_result_column_stmt;
+DEALLOCATE PREPARE add_result_column_stmt;

@@ -262,8 +262,12 @@ void TheAdapterSeams()
            "the log is read back before 'delivered'");
 
     std::string const sql = Read("data/sql/characters/base/2026_09_24_04_overseer_quest.sql");
-    Expect(sql.find("'guild','quest')") != std::string::npos,
-           "the kind enum adds quest after every value before it");
+    // The migration restates the final union (#1343), so 'quest' is no
+    // longer the last value in its own file. What this pins is unchanged:
+    // quest keeps its place immediately after guild - after every value
+    // that came before it, before the ones that came after.
+    Expect(sql.find("'guild','quest','naturalize'") != std::string::npos,
+           "the kind enum names quest after every value before it");
 }
 
 }  // namespace

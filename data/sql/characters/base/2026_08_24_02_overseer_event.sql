@@ -103,7 +103,7 @@
 -- ADD UNIQUE KEY - and it must be thought about, because widening the key
 -- splits existing rows' futures and narrowing it cannot merge their pasts.
 
-CREATE TABLE `overseer_event` (
+CREATE TABLE IF NOT EXISTS `overseer_event` (
     `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
 
     -- WHO. Name rather than guid as the key half, because every other overseer

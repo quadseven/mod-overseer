@@ -55,13 +55,81 @@ INSERT IGNORE INTO `overseer_chat_watch` (`name`) VALUES ('Grug');
 -- synchronously BEFORE carrying the command out, so a crash mid-command
 -- leaves it claimed and it is never run twice. A row still sitting in
 -- 'claimed' means the worldserver died while doing it.
+-- GUARDED AFTER THE FACT (#1343). dbimport re-applies any file whose hash
+-- changed, and the single ALTER this file originally ended with could not
+-- run twice: its ADD COLUMNs abort with a duplicate-column error. Each add
+-- below is guarded the way 2026_08_26_01_overseer_roster_job.sql guards its
+-- own - `ADD COLUMN IF NOT EXISTS` is a parse error on this pipeline's
+-- MySQL, so each is an INFORMATION_SCHEMA check plus a prepared statement.
+-- The status MODIFY names the final list, not the four values above:
+-- 'verifying', 'applied' and 'unchanged' join in
+-- 2026_08_24_04_overseer_outcome.sql, and a shorter restatement re-applied
+-- after that file would shrink the ENUM under live rows, the same hazard
+-- the kind chain documents.
 ALTER TABLE `overseer_command`
-  MODIFY COLUMN `status` ENUM('pending','claimed','delivered','error')
-    NOT NULL DEFAULT 'pending',
-  ADD COLUMN `kind` ENUM('bot','chat','gm') NOT NULL DEFAULT 'bot' AFTER `command`,
-  ADD COLUMN `channel` VARCHAR(16) NOT NULL DEFAULT '' AFTER `kind`,
-  ADD COLUMN `target_arg` VARCHAR(12) NOT NULL DEFAULT '' AFTER `channel`,
-  -- Which worldserver run holds the claim. The claim is only honoured by the
-  -- run whose token is read back, so a conditional UPDATE that another process
-  -- won cannot be mistaken for one this process won.
-  ADD COLUMN `claimed_by` VARCHAR(36) NOT NULL DEFAULT '' AFTER `status`;
+  MODIFY COLUMN `status`
+    ENUM('pending','claimed','delivered','error','verifying','applied','unchanged')
+    NOT NULL DEFAULT 'pending';
+
+SET @kind_column_missing = (
+    SELECT COUNT(*) = 0 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'overseer_command'
+      AND COLUMN_NAME = 'kind'
+);
+SET @add_kind_column = IF(
+    @kind_column_missing,
+    "ALTER TABLE `overseer_command` ADD COLUMN `kind` ENUM('bot','chat','gm') NOT NULL DEFAULT 'bot' AFTER `command`",
+    "SELECT 1"
+);
+PREPARE add_kind_column_stmt FROM @add_kind_column;
+EXECUTE add_kind_column_stmt;
+DEALLOCATE PREPARE add_kind_column_stmt;
+
+SET @channel_column_missing = (
+    SELECT COUNT(*) = 0 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'overseer_command'
+      AND COLUMN_NAME = 'channel'
+);
+SET @add_channel_column = IF(
+    @channel_column_missing,
+    "ALTER TABLE `overseer_command` ADD COLUMN `channel` VARCHAR(16) NOT NULL DEFAULT '' AFTER `kind`",
+    "SELECT 1"
+);
+PREPARE add_channel_column_stmt FROM @add_channel_column;
+EXECUTE add_channel_column_stmt;
+DEALLOCATE PREPARE add_channel_column_stmt;
+
+SET @target_arg_column_missing = (
+    SELECT COUNT(*) = 0 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'overseer_command'
+      AND COLUMN_NAME = 'target_arg'
+);
+SET @add_target_arg_column = IF(
+    @target_arg_column_missing,
+    "ALTER TABLE `overseer_command` ADD COLUMN `target_arg` VARCHAR(12) NOT NULL DEFAULT '' AFTER `channel`",
+    "SELECT 1"
+);
+PREPARE add_target_arg_column_stmt FROM @add_target_arg_column;
+EXECUTE add_target_arg_column_stmt;
+DEALLOCATE PREPARE add_target_arg_column_stmt;
+
+-- Which worldserver run holds the claim. The claim is only honoured by the
+-- run whose token is read back, so a conditional UPDATE that another process
+-- won cannot be mistaken for one this process won.
+SET @claimed_by_column_missing = (
+    SELECT COUNT(*) = 0 FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'overseer_command'
+      AND COLUMN_NAME = 'claimed_by'
+);
+SET @add_claimed_by_column = IF(
+    @claimed_by_column_missing,
+    "ALTER TABLE `overseer_command` ADD COLUMN `claimed_by` VARCHAR(36) NOT NULL DEFAULT '' AFTER `status`",
+    "SELECT 1"
+);
+PREPARE add_claimed_by_column_stmt FROM @add_claimed_by_column;
+EXECUTE add_claimed_by_column_stmt;
+DEALLOCATE PREPARE add_claimed_by_column_stmt;
