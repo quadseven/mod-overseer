@@ -72,6 +72,22 @@ int main()
     Check("and records the end door DONE",
           Has(step, "script->SetData(OverseerDecisions::ZF_DATA_END_DOOR,"));
 
+    // #1341: a living Weegli beyond the old 200-yard search around the tank
+    // counted as gone, and the door opened on the first poll. He is looked
+    // for by entry across the whole instance before he is called gone, and
+    // the open log names which of its preconditions held.
+    Check("it looks for Weegli by entry, not near the tank",
+          Has(step, "GetCreatureListWithEntryInGrid(weegliFound, OverseerDecisions::ZF_WEEGLI_ENTRY"));
+    Check("...across the whole instance",
+          Has(step, "OverseerDecisions::ZF_WEEGLI_SEARCH_YARDS"));
+    Check("...and counts only a living one", Has(step, "candidate->IsAlive()"));
+    Check("the old 200-yard Weegli search around the tank is gone",
+          !Has(step, "FindNearestCreature(OverseerDecisions::ZF_WEEGLI_ENTRY"));
+    Check("the open log says a sent Weegli was waited on",
+          Has(step, "alive, sent by the module, and still shut after his wait"));
+    Check("the open log says an unfound Weegli was searched instance-wide",
+          Has(step, "gone: no living one anywhere in the instance"));
+
     std::string const poll = Between(source, "bool DriveGuildRun(GuildRun& run, std::time_t now)",
                                      "// LEAVING: the living were sent out");
     std::string::size_type const door = poll.find("StepZulFarrakEndDoor(run, now);");

@@ -46,11 +46,27 @@ void AGoneWeegliMeansTheModuleOpensIt()
     ZulFarrakEndDoorFacts f = AtTheDoor();
     Check("Weegli dead or gone, the party at the shut door: Open",
           ZulFarrakEndDoorNext(f) == ZulFarrakEndDoorStep::Open);
-    f.pyramidPhase = ZF_PYRAMID_WAVE_3;
-    Check("...also when a temple boss was never credited and the phase stayed at wave 3",
-          ZulFarrakEndDoorNext(f) == ZulFarrakEndDoorStep::Open);
     f.pyramidPhase = 12;  // PYRAMID_DONE: Bly is dead
     Check("...and after Bly is dead", ZulFarrakEndDoorNext(f) == ZulFarrakEndDoorStep::Open);
+}
+
+// #1341: the pre-roll review found the door opening at wave 3, the trolls
+// still up and nobody in combat: Weegli refuses to go until they are dead,
+// his wait ran out, and the module opened the door around the fight. Below
+// the all-trolls-killed phase the door is not the obstacle yet, whatever
+// Weegli's state and however long the stand has lasted.
+void NothingBelowTheAllTrollsKilledPhase()
+{
+    ZulFarrakEndDoorFacts f = AtTheDoor();
+    f.pyramidPhase = ZF_PYRAMID_WAVE_3;
+    Check("wave 3, Weegli gone: Nothing, not Open",
+          ZulFarrakEndDoorNext(f) == ZulFarrakEndDoorStep::Nothing);
+    f.weegliAlive = true;
+    Check("wave 3, a living Weegli who cannot be sent yet: Nothing",
+          ZulFarrakEndDoorNext(f) == ZulFarrakEndDoorStep::Nothing);
+    f.secondsNear = ZF_END_DOOR_WEEGLI_SECONDS;
+    Check("...and still Nothing once his wait would have run out",
+          ZulFarrakEndDoorNext(f) == ZulFarrakEndDoorStep::Nothing);
 }
 
 void ALivingWeegliIsSentFirst()
@@ -67,14 +83,6 @@ void ALivingWeegliIsSentFirst()
     f.secondsNear = ZF_END_DOOR_WEEGLI_SECONDS;
     Check("...and Open once his time is up and the door is still shut",
           ZulFarrakEndDoorNext(f) == ZulFarrakEndDoorStep::Open);
-
-    ZulFarrakEndDoorFacts early = AtTheDoor();
-    early.weegliAlive = true;
-    early.pyramidPhase = ZF_PYRAMID_WAVE_3;
-    Check("a living Weegli before the trolls are dead cannot be sent: Wait",
-          ZulFarrakEndDoorNext(early) == ZulFarrakEndDoorStep::Wait);
-    early.secondsNear = ZF_END_DOOR_WEEGLI_SECONDS;
-    Check("...and Open after the wait", ZulFarrakEndDoorNext(early) == ZulFarrakEndDoorStep::Open);
 }
 
 void NothingWhenTheDoorIsNotTheObstacle()
@@ -116,12 +124,15 @@ void TheConstantsAreTheCoresAndTheMeasuredOnes()
     Check("the brain parked 48 to 81 yards from the door, inside the near radius",
           ZF_END_DOOR_NEAR_YARDS > 81.f);
     Check("the summit, about 150 yards off, is outside it", ZF_END_DOOR_NEAR_YARDS < 150.f);
+    Check("Weegli is searched across the whole instance, far past the old 200-yard search",
+          ZF_WEEGLI_SEARCH_YARDS > 2.f * ZF_END_DOOR_NEAR_YARDS);
 }
 }  // namespace
 
 int main()
 {
     AGoneWeegliMeansTheModuleOpensIt();
+    NothingBelowTheAllTrollsKilledPhase();
     ALivingWeegliIsSentFirst();
     NothingWhenTheDoorIsNotTheObstacle();
     TheConstantsAreTheCoresAndTheMeasuredOnes();

@@ -21753,13 +21753,15 @@ ZulFarrakEndDoorStep ZulFarrakEndDoorNext(ZulFarrakEndDoorFacts const& facts)
 {
     if (!facts.tankNear || !facts.doorShut || facts.endDoorState == ZF_END_DOOR_DONE)
         return ZulFarrakEndDoorStep::Nothing;
-    // Before the last wave the dungeon brain's own temple event moves the run;
-    // the door is not the obstacle yet.
-    if (facts.pyramidPhase < ZF_PYRAMID_WAVE_3 || facts.fighting)
+    // Before the trolls are all dead the dungeon brain's own temple event
+    // moves the run; the door is not the obstacle yet. The hold first ran
+    // only to the last wave, and at wave 3 the wait ran out with the trolls
+    // still up and the module opened the door around the fight (#1341), so
+    // the hold now runs to the all-trolls-killed phase.
+    if (facts.pyramidPhase < ZF_PYRAMID_KILLED_ALL_TROLLS || facts.fighting)
         return ZulFarrakEndDoorStep::Nothing;
     // The core's Weegli goes only once the trolls are dead and nobody sent him.
     if (facts.weegliAlive && !facts.weegliAsked &&
-        facts.pyramidPhase >= ZF_PYRAMID_KILLED_ALL_TROLLS &&
         facts.endDoorState == ZF_END_DOOR_NOT_STARTED)
         return ZulFarrakEndDoorStep::AskWeegli;
     if (facts.weegliAlive && facts.secondsNear < ZF_END_DOOR_WEEGLI_SECONDS)
