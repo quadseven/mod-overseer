@@ -1,6 +1,8 @@
 """Replay the actual IDLE hearth handler with lightweight core stand-ins."""
 
 from pathlib import Path
+import os
+import shutil
 import subprocess
 import tempfile
 root = Path(__file__).resolve().parents[1]
@@ -64,7 +66,8 @@ with tempfile.TemporaryDirectory() as directory:
     source.write_text(prefix + block + suffix)
     # AI-REVIEW 2026-09-29 [deepseek-v4.1-flash] reviewer pass three (bot review, PR #801):
     # Bound both subprocesses so a wedged compiler or replay fails promptly.
-    subprocess.run(["g++", "-std=c++17", str(source), "-o", str(binary)],
+    compiler = shutil.which(os.environ.get("CXX", "c++"))
+    subprocess.run([compiler, "-std=c++17", str(source), "-o", str(binary)],
                    check=True, timeout=30)
     subprocess.run([str(binary)], check=True, timeout=5)
 print("PASS: completed, stalled, still-inside, unseen, and once-only finalization, and the module's stop reason leading a stalled run's ended_reason")
