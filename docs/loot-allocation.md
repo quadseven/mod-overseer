@@ -1,6 +1,6 @@
 # AzerothCore Group Loot Allocation Analysis
 
-**Commit**: 8a4e76eac8c4ccebf547113afe7b51d6c3e91641 (mod-playerbots/azerothcore-wotlk fork)  
+**Commit**: 7f12e89ee5f467a50e62eba1d525eac7dc953d03 (mod-playerbots/azerothcore-wotlk fork, the `CORE_SHA` pinned in `.github/workflows/build.yml`)  
 **Date**: 2026-11-03  
 **Module**: mod-overseer
 
@@ -10,18 +10,18 @@
 
 ### 1.1 Group.cpp — Primary Loot Logic Location
 
-The loot allocation logic resides in `src/server/game/Entities/Player/Group.cpp`, **not** in `LootMgr.cpp` as might be expected.
+The loot allocation logic resides in `src/server/game/Groups/Group.cpp`, **not** in `LootMgr.cpp` as might be expected. The need eligibility check is `Player::CanRollForItemInLFG` in `src/server/game/Entities/Player/PlayerStorage.cpp:2469`.
 
 | Function | Line | Purpose |
 |----------|------|---------|
-| `Group::GroupLoot` | 1123 | GROUP_LOOT method — creates rolls, sends `SMSG_LOOT_START_ROLL` to eligible members |
-| `Group::NeedBeforeGreed` | 1288 | NEED_BEFORE_GREED method (LFG) — checks `CanRollForItemInLFG()` for role-based eligibility |
-| `Group::MasterLoot` | 1443 | MASTER_LOOT method — sends `SMSG_LOOT_MASTER_LIST` to master looter |
-| `Group::CountRollVote` | 1497 | Processes Need/Greed/Pass/Disenchant votes from clients |
-| `Group::EndRoll` | 1548 | Handles roll timer expiry — auto-passes remaining votes |
-| `Group::CountTheRoll` | 1604 | **Core resolution** — Need rolls first (random 1-100), then Greed/Disenchant |
+| `Group::GroupLoot` | 1122 | GROUP_LOOT method — creates rolls, sends `SMSG_LOOT_START_ROLL` to eligible members |
+| `Group::NeedBeforeGreed` | 1287 | NEED_BEFORE_GREED method — passes `CanRollForItemInLFG() == EQUIP_ERR_OK` as each member's can-need flag (lines 1351, 1421) |
+| `Group::MasterLoot` | 1442 | MASTER_LOOT method — sends `SMSG_LOOT_MASTER_LIST` to master looter |
+| `Group::CountRollVote` | 1496 | Processes Need/Greed/Pass/Disenchant votes from clients |
+| `Group::EndRoll` | 1547 | Handles roll timer expiry — auto-passes remaining votes |
+| `Group::CountTheRoll` | 1603 | **Core resolution** — Need rolls first (random 1-100), then Greed/Disenchant |
 
-### 1.2 CountTheRoll Detail (Lines 1604–1750)
+### 1.2 CountTheRoll Detail (Lines 1603–1815)
 
 This is the single function that decides the winner:
 
@@ -29,22 +29,23 @@ This is the single function that decides the winner:
 // Need rolls win first
 for (auto const& vote : roll->votes)
     if (vote.vote == NEED)
-        // highest roll 1-100 wins tie goes to first
+        // highest roll 1-100 wins; a tie keeps the earlier voter (strict <)
 
 // If no Need votes, Greed rolls
 for (auto const& vote : roll->votes)
     if (vote.vote == GREED || vote.vote == DISENCHANT)
-        // highest roll 1-100 wins tie goes to first
+        // highest roll 1-100 wins; a tie keeps the earlier voter (strict <)
 
-// If all Pass, item goes to round-robin (GroupLoot) or remains on corpse (NeedBeforeGreed)
+// If all pass (lines 1806-1813): SendLootAllPassed, then item->is_blocked = false,
+// so the item stays on the corpse and any group member may loot it
 ```
 
 **Key behaviors**:
 - Need beats Greed always (regardless of roll value)
 - Roll is 1-100 random per voter
-- Tiebreaker: first voter to roll that value wins
+- Tiebreaker: `maxresul < randomN` is strict, so on a tie the voter met first in the roll's vote map keeps the item
 - Master Loot bypasses all rolls — master looter assigns manually via `SMSG_LOOT_MASTER_LIST`
-- Group Loot uses round-robin for unrolled items; Need Before Greed leaves on corpse
+- All pass, under either method: the item is unblocked on the corpse for anyone in the group to loot. Round-robin (`m_looterGuid`, `Group::UpdateLooterGuid` at line 2080) only decides who may loot items **below** the loot threshold; `Group::GroupLoot` starts a roll only for items at or above it (line 1140)
 
 ---
 
@@ -92,50 +93,42 @@ All hooks are per-item and fire on use/quest/expire — **none** fire during gro
 
 ### 3.1 Hook Registration (mod_overseer.cpp)
 
-The module registers `OnPlayerGroupRollRewardItem` via `PlayerScript`:
+The module overrides `OnPlayerGroupRollRewardItem` in its `PlayerScript` (`src/mod_overseer.cpp:7936` on main at f5a8acc). Abridged from that function:
 
 ```cpp
-// In OverseerPlayerScript class
 void OnPlayerGroupRollRewardItem(Player* player, Item* item, uint32 count,
                                  RollVote voteType, Roll* roll) override
 {
-    // Records the loot for tracking / guild runs / loot council
     OverseerDecisions::LootedItem noted;
     Item* live = TakeLootedItem(player, item, count, noted);
     NoteGuildRunLoot(player, count, NotableLootEntry(live));
-    RecordLootWon(player, noted, count,
-                  voteType == NEED ? OverseerDecisions::ItemVia::Need
-                                   : OverseerDecisions::ItemVia::Greed,
-                  won ? won->sourceWorldObjectGUID : ObjectGuid::Empty);
-    // ... council tracking
+    {
+        Loot* won = roll ? roll->getLoot() : nullptr;
+        RecordLootWon(player, noted, count,
+                      voteType == NEED ? OverseerDecisions::ItemVia::Need
+                                       : OverseerDecisions::ItemVia::Greed,
+                      won ? won->sourceWorldObjectGUID : ObjectGuid::Empty);
+    }
+    // ... loot council bookkeeping, then RecordItemLoot for the live item
 }
 ```
 
 ### 3.2 Loot Tracking Structures (overseer_decisions.h)
 
 ```cpp
-struct LootedItem {
-    std::string name;
-    uint32 entry = 0;
-    uint32 count = 0;
-    ItemQuality quality = ITEM_QUALITY_POOR;
-    ObjectGuid guid;
-    bool opened = false;
-    bool windowBusy = false;
-    bool hasLoot = false;
+struct LootedItem
+{
+    std::uint32_t storyGuid{0};
+    std::uint32_t guid{0};
+    std::uint32_t entry{0};
 };
 ```
 
+`ItemVia` is a namespace of word constants (`Need` is `"need"`, `Greed` is `"greed"`, `Council` is `"council"`), not an enum.
+
 ### 3.3 Compatibility (overseer_core_compat.h)
 
-```cpp
-// AzerothCore version compatibility for LootRollDisenchant enum
-#ifdef AZEROTHCORE_LT_2024_06_15
-enum LootRollDisenchant { /* old values */ };
-#else
-using LootRollDisenchant = RollVote;  // NEED, GREED, PASS, DISENCHANT
-#endif
-```
+`LootRollDisenchant(config)` reads the mod-playerbots config field under either spelling (`lootRollDisenchant` or `LootRollDisenchant`), the same `if constexpr (requires ...)` pattern the header uses for every renamed field. It is not a vote enum; `RollVote` comes from the core.
 
 ---
 
@@ -143,10 +136,13 @@ using LootRollDisenchant = RollVote;  // NEED, GREED, PASS, DISENCHANT
 
 ### Option A: Need Before Greed by Role Fit (Current AzerothCore LFG Behavior)
 
-**How it works**: `Group::NeedBeforeGreed` (line 1288) calls `CanRollForItemInLFG()` which checks:
-- Item class/subclass matches player's armor type (plate/mail/leather/cloth)
-- Item stats match player's role (tank/healer/dps) via primary stat
-- Item is equippable by player's class
+**How it works**: `Group::NeedBeforeGreed` (line 1287) and the NEED_BEFORE_GREED branch of the roll-start send (line 984) ask `Player::CanRollForItemInLFG()` (PlayerStorage.cpp:2469) whether each member may roll Need. That function returns OK at once unless the group is an LFG group and the looted object is inside its LFG dungeon map. Inside one, it checks, in order:
+- `ITEM_FLAG2_EVERYONE_CAN_ROLL_NEED` lets anyone need
+- the item's class and race masks, required spell and required skill
+- a weapon needs its weapon skill; shields, librams, idols, totems and sigils need their class
+- armor (not cloaks) must not be of a higher subclass than the class's best armor type: plate for paladin, death knight and warrior, mail for hunter and shaman, leather for druid and rogue, cloth otherwise; a warrior or rogue is refused any armor that carries spell power; with `CONFIG_LOOT_NEED_BEFORE_GREED_ILVL_RESTRICTION` set, armor above that item level must also be exactly that type
+
+There is no tank/healer/dps role or primary-stat test, beyond the spell-power exclusion for warriors and rogues.
 
 **Pros**:
 - Already implemented in core (LFG dungeon finder uses this)
@@ -154,14 +150,15 @@ using LootRollDisenchant = RollVote;  // NEED, GREED, PASS, DISENCHANT
 - No configuration required
 
 **Cons**:
-- Only active in LFG (NeedBeforeGreed loot method), not in GroupLoot or MasterLoot
-- Role detection is coarse (primary stat only, no off-spec support)
+- Only bites in an LFG group inside its LFG dungeon: a hand-made bot group on Need Before Greed gets `EQUIP_ERR_OK` for every member, so the check changes nothing for it
+- Not applied under GroupLoot or MasterLoot
+- Armor-type and proficiency only: no role or off-spec notion
 - Cannot be extended by modules — no hooks in the eligibility check
 - Rigid: a ret paladin needing on healing gear is blocked
 
 ### Option B: Rotation / Round-Robin
 
-**How it works**: Track last winner per group, next eligible item goes to next member. GroupLoot already does a weak form of this for unrolled items (`Group::GroupLoot` round-robin).
+**How it works**: Track last winner per group, next eligible item goes to next member. The core has no rotation for rolled items: round-robin (`Group::UpdateLooterGuid`, line 2080) only picks who may loot items below the loot threshold, and an all-pass roll unblocks the item for everyone (CountTheRoll, lines 1806-1813). A module would build the rotation itself.
 
 **Pros**:
 - Simple, fair over long sessions
@@ -172,7 +169,7 @@ using LootRollDisenchant = RollVote;  // NEED, GREED, PASS, DISENCHANT
 - Ignores item utility — a healer gets DPS trinket because "their turn"
 - No concept of need vs want
 - Hard to implement for modules — no hook at roll creation time to inject priority
-- Round-robin in core only triggers when **all pass**; cannot intercept Need/Greed phase
+- Core round-robin covers only below-threshold items; nothing lets a module intercept the Need/Greed phase
 
 ### Option C: EPGP-Style (Effort Points / Gear Points)
 
@@ -202,11 +199,11 @@ using LootRollDisenchant = RollVote;  // NEED, GREED, PASS, DISENCHANT
 
 **Reasoning**:
 
-1. **Already exists in core** — `CanRollForItemInLFG()` at Group.cpp:1300+ implements the logic. It just needs to be exposed to GroupLoot method, not only NeedBeforeGreed.
+1. **Already exists in core** — `Player::CanRollForItemInLFG()` (PlayerStorage.cpp:2469) implements an armor-type and proficiency check. It is gated to LFG groups inside LFG dungeons and read only under NEED_BEFORE_GREED, so a bot group needs both gates widened.
 
 2. **Minimal module changes** — mod-overseer already tracks `ItemVia::Need` vs `ItemVia::Greed` in `OnPlayerGroupRollRewardItem`. The module can already *observe* the outcome; it just can't *influence* it.
 
-3. **Solves the real problem** — The primary complaint in bot groups is "wrong armor type rolls need" (e.g., hunter needing on plate). Role-fit check eliminates 90% of this.
+3. **Solves the real problem** — The primary complaint in bot groups is "wrong armor type rolls need" (e.g., hunter needing on plate). The check refuses exactly that case. No measurement yet says what share of bad Need rolls it would remove.
 
 4. **Extensible path** — If a hook were added at `Group::GroupLoot` roll creation (before `SMSG_LOOT_START_ROLL`), a module could:
    - Filter eligible Need voters by role fit
@@ -217,11 +214,11 @@ using LootRollDisenchant = RollVote;  // NEED, GREED, PASS, DISENCHANT
 
 ### What Would Need to Change in AzerothCore
 
-A single hook in `Group::GroupLoot` (around line 1150, before vote collection):
+A new hook in `Group::GroupLoot` (between the roll's creation at line 1143 and `SendLootStartRoll` at line 1198). This is an illustrative sketch of a hook that does not exist yet. A real one follows the core's pattern: a `GROUPHOOK_*` value in the enum in `src/server/game/Scripting/ScriptDefines/GroupScript.h`, a virtual on `GroupScript`, and a `ScriptMgr` dispatcher called from Group.cpp.
 
 ```cpp
-// Proposed hook point
-virtual bool OnGroupLootRollCreated(Group* group, Loot* loot, Item* item, std::vector<Player*>& eligibleNeeders);
+// Sketch only: GroupScript has no such hook at 7f12e89e
+virtual void OnGroupLootRollCreated(Group* group, Loot* loot, Roll* roll); // may edit who can need
 ```
 
 Or simpler: expose `CanRollForItemInLFG` as a virtual method modules can override.
@@ -249,10 +246,11 @@ Must pass before any documentation merge.
 
 ## 7. References
 
-- `src/server/game/Entities/Player/Group.cpp` — lines 1123, 1288, 1443, 1497, 1548, 1604
+- `src/server/game/Groups/Group.cpp` — lines 984, 1122, 1287, 1442, 1496, 1547, 1603, 1806, 2080
+- `src/server/game/Entities/Player/PlayerStorage.cpp` — line 2469 `Player::CanRollForItemInLFG`
 - `src/server/game/Scripting/ScriptDefines/PlayerScript.h` — `PLAYERHOOK_ON_GROUP_ROLL_REWARD_ITEM`
 - `src/server/game/Scripting/ScriptDefines/GroupScript.h` — no roll hooks
 - `src/server/game/Scripting/ScriptDefines/LootScript.h` — `LOOTHOOK_ON_LOOT_MONEY` only
-- `src/mod_overseer.cpp` — line 7885 `OnPlayerGroupRollRewardItem`
-- `src/overseer_decisions.h` — `LootedItem`, `ItemVia` enum
-- `src/overseer_core_compat.h` — `LootRollDisenchant` compatibility
+- `src/mod_overseer.cpp` — line 7936 `OnPlayerGroupRollRewardItem` (main at f5a8acc)
+- `src/overseer_decisions.h` — `LootedItem`, `ItemVia` constants
+- `src/overseer_core_compat.h` — `LootRollDisenchant` config-field accessor
