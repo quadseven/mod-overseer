@@ -2,7 +2,7 @@
 #
 # Apply this repo's local patches to the pinned upstream trees.
 #
-# WHY THIS EXISTS: UPSTREAM-PINS.env pins five upstream repositories by SHA and
+# WHY THIS EXISTS: realm-pins.env pins the upstream repositories by SHA and
 # the build compiles them verbatim. That is the right default - but it left no
 # way at all to carry a fix for a bug that lives in UPSTREAM's code. The only
 # options were "open a PR upstream and wait" or "live with it". This is the
@@ -31,8 +31,7 @@
 #
 #   `git apply` resolves the paths in a patch against the top level of the
 #   REPOSITORY IT DISCOVERS, not against the directory passed to `-C`. The
-#   build deletes each module's `.git` (build.azerothcore-playerbots.yml:150),
-#   so from $ACORE_ROOT/modules/mod-playerbots git walks UP, finds the CORE's
+#   build deletes each module's `.git` (the clone step of build.yml), so from $ACORE_ROOT/modules/mod-playerbots git walks UP, finds the CORE's
 #   repository, and gives itself a prefix of `modules/mod-playerbots/`. Any
 #   file in the patch that falls outside that prefix is SKIPPED - printed as
 #   `Skipped patch 'src/...'.` on STDERR, and then exit 0. Not rejected.
@@ -87,20 +86,19 @@
 #           NOTE that --check is strictly weaker than a real apply: it proves
 #           a patch still matches, and it detects a skip, but it cannot prove
 #           bytes changed, because by definition it changes none.
-#           verify-patches.sh therefore runs a REAL apply against a throwaway
-#           tree rather than using this mode - see the comment there.
+#           check.adapter.yml and scripts/check-locally.sh adapter therefore
+#           run a REAL apply against a throwaway tree rather than this mode.
 #
-# TESTS: tests/test-apply-patches.sh (bash, no network, no Docker). Sourcing
-# this file defines the helpers below without running anything, which is what
-# that test does.
+# SOURCING: sourcing this file defines the helpers below without running
+# anything, so a test harness can exercise each defence on its own.
 
 set -euo pipefail
 
 PATCHES_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/patches"
 
 # ---------------------------------------------------------------------------
-# Helpers. Kept as functions with no global state so tests/test-apply-patches.sh
-# can source this file and exercise each defence on its own.
+# Helpers. Kept as functions with no global state so a test harness can source
+# this file and exercise each defence on its own.
 # ---------------------------------------------------------------------------
 
 # The path prefix git would prepend to (and filter patch paths against) when
@@ -242,7 +240,7 @@ main() {
         fi
 
         # A patch directory naming a tree that is not in the build context is a
-        # typo, or a module that was removed from UPSTREAM-PINS.env and left its
+        # typo, or a module that was removed from realm-pins.env and left its
         # patches behind. Either way the patches would be silently skipped,
         # which is the exact outcome this script refuses to allow.
         if [ ! -d "$target" ]; then
@@ -374,8 +372,8 @@ main() {
     fi
 }
 
-# Sourced by the test harness (which then calls the helpers directly);
-# executed by the build. Same source-guard as .github/scripts/emit-pulumi-event.sh.
+# Sourced by a test harness (which then calls the helpers directly); executed
+# by the build.
 if [ "${BASH_SOURCE[0]:-$0}" = "${0}" ]; then
     main "$@"
 fi
