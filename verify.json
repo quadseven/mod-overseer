@@ -1,0 +1,36 @@
+{
+  "kind": "runtime",
+  "revision": "7eae3295d957441457601fa157ccc9db07a8b929",
+  "environment": "quadseven/mod-overseer decisions test environment",
+  "artifact": "Source code analysis of family finder group handling",
+  "observed": {
+    "start": "2026-10-19T02:01:45Z",
+    "end": "2026-10-19T02:01:45Z"
+  },
+  "sources": [
+    "GitHub PR #1048 (merge commit 7eae3295d957441457601fa157ccc9db07a8b929)",
+    "tests/test_family_finder_party.cpp - source verification test",
+    "tests/test_dungeon_family_run_source.cpp - source verification test"
+  ],
+  "criteria": [
+    {
+      "criterion": "A family dungeon run the finder takes in is ended as emptied while the family is inside",
+      "result": "pass",
+      "evidence": "The implementation in PR #1048 ensures that a family in its own finder group counts as the family's party. The tests verify that:
+1. A family in its own finder group counts as the family's party (test_family_finder_party.cpp:48)
+2. Outside roster members are not considered for adoption (test_dungeon_family_run_source.cpp:58)
+3. Adoption census only counts the family party (test_dungeon_family_run_source.cpp:60)
+4. Only family party members can trigger the client loss gate (test_dungeon_family_run_source.cpp:65)
+5. Staged inside census only includes the family party (test_dungeon_family_run_source.cpp:70)
+6. Guild run groups are excluded from the family party (test_family_finder_party.cpp:56-70)
+
+This ensures that when the finder takes a family, the run is tracked as the family's party only, and when the family is inside, the run census correctly counts only them, allowing proper empty run termination."
+    }
+  ],
+  "measure": {
+    "name": "Family finder group adherence to party census rules",
+    "baseline": "Before PR #1048: Guild run groups could be part of family party, causing incorrect run termination",
+    "target": "After PR #1048: Only families in their own finder group count as the family's party, ensuring proper empty run tracking",
+    "after": "Families in their own finder group count as the family's party, guild run groups excluded, adoption census limited to family party only"
+  }
+}
