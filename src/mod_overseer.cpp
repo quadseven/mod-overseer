@@ -44632,6 +44632,9 @@ private:
         // and whether Weegli was sent during that stand.
         std::time_t zfDoorNearSince{0};
         bool zfWeegliAsked{false};
+        // THE CARRY LEASE THE ROW KEPT (#1363): set on adoption and cleared
+        // once SeedGuildCarryLease has given it to the in-memory lease.
+        OverseerDecisions::GuildCarrySaved carrySaved;
     };
     std::vector<GuildRun> _guildRuns;
 
@@ -44678,6 +44681,49 @@ private:
             }
             it = _guildCarryLeases.erase(it);
         }
+    }
+
+    // THE ADOPTED RUN TAKES BACK THE LEASE ITS ROW KEPT (#1363), before any
+    // ApplyGuildCarryTactics looks at the member: a `passive` the saved lists
+    // replayed on login is the carry's, not the member's, and the run's end
+    // takes it off. False while the member is not in the world yet, so the
+    // caller keeps the saved lease and tries again on a later poll.
+    bool SeedGuildCarryLease(std::string const& name, uint32 runId,
+                             OverseerDecisions::GuildCarrySaved const& saved)
+    {
+        if (name.empty() || !saved.saved)
+            return true;
+        Player* p = ObjectAccessor::FindPlayerByName(name);
+        PlayerbotAI* ai = p && p->IsInWorld() ? GET_PLAYERBOT_AI(p) : nullptr;
+        if (!ai)
+            return false;
+        auto& lease = _guildCarryLeases[name];
+        lease.runId = runId;
+        lease.returning = false;
+        for (auto state : {BOT_STATE_NON_COMBAT, BOT_STATE_COMBAT})
+        {
+            bool hasPassive = true;
+            for (auto const& strategy : OverseerDecisions::GuildRunSeatTactics(
+                     OverseerDecisions::GuildSeat::Damage, true))
+                hasPassive = hasPassive && ai->HasStrategy(strategy, state);
+            char const* const engine = state == BOT_STATE_COMBAT
+                                           ? OverseerDecisions::GUILD_CARRY_ENGINE_COMBAT
+                                           : OverseerDecisions::GUILD_CARRY_ENGINE_NON_COMBAT;
+            switch (OverseerDecisions::GuildCarryLeaseOnAdopt(saved, engine, hasPassive))
+            {
+                case OverseerDecisions::GuildCarryAdoptEngine::Preexisting:
+                    lease.observed.insert(state);
+                    lease.preexisting.insert(state);
+                    break;
+                case OverseerDecisions::GuildCarryAdoptEngine::Added:
+                    lease.observed.insert(state);
+                    lease.added.insert(state);
+                    break;
+                case OverseerDecisions::GuildCarryAdoptEngine::Unobserved:
+                    break;
+            }
+        }
+        return true;
     }
 
     bool ApplyGuildCarryTactics(GuildRun const& run)
@@ -44950,6 +44996,40 @@ private:
             for (std::size_t i = 0; i < loot->notable.size(); ++i)
                 o << (i ? "," : "") << loot->notable[i];
             o << ']';
+        }
+        // THE CARRY LEASE (#1363), so a restart's adoption can tell the
+        // carry's `passive` from the member's own. Written from the lease while
+        // it is this run's, else from the lease the row last kept.
+        if (!run.carried.empty())
+        {
+            std::string seen;
+            std::string pre;
+            bool have = false;
+            auto const lease = _guildCarryLeases.find(run.carried);
+            if (lease != _guildCarryLeases.end() && lease->second.runId == run.id)
+            {
+                have = true;
+                for (auto state : {BOT_STATE_NON_COMBAT, BOT_STATE_COMBAT})
+                {
+                    std::string const engine = state == BOT_STATE_COMBAT
+                                                   ? OverseerDecisions::GUILD_CARRY_ENGINE_COMBAT
+                                                   : OverseerDecisions::GUILD_CARRY_ENGINE_NON_COMBAT;
+                    if (lease->second.observed.count(state))
+                        seen += (seen.empty() ? "" : ",") + engine;
+                    if (lease->second.preexisting.count(state))
+                        pre += (pre.empty() ? "" : ",") + engine;
+                }
+            }
+            else if (run.carrySaved.saved)
+            {
+                have = true;
+                for (std::string const& engine : run.carrySaved.seen)
+                    seen += (seen.empty() ? "" : ",") + engine;
+                for (std::string const& engine : run.carrySaved.preexisting)
+                    pre += (pre.empty() ? "" : ",") + engine;
+            }
+            if (have)
+                o << ",\"carry_seen\":" << J(seen) << ",\"carry_pre\":" << J(pre);
         }
         o << ",\"members\":[";
         for (std::size_t i = 0; i < run.names.size(); ++i)
@@ -46228,6 +46308,10 @@ private:
 
     bool DriveGuildRun(GuildRun& run, std::time_t now)
     {
+        // An adopted carried member that was not in the world at adoption
+        // takes the row's lease back on the poll it is (#1363).
+        if (run.carrySaved.saved && SeedGuildCarryLease(run.carried, run.id, run.carrySaved))
+            run.carrySaved = OverseerDecisions::GuildCarrySaved{};
         bool const carryReady = run.phase == GuildRunPhase::Leaving || ApplyGuildCarryTactics(run);
         Player* const tank = ObjectAccessor::FindPlayerByName(run.tank);
         Group* const group = RunGroup(run.groupGuid);
@@ -46924,6 +47008,11 @@ private:
             run.deaths = adoption.resume.deaths;
             run.ilvlAtEntry = adoption.resume.ilvlStart;
             run.said = "inside";
+            // The carry lease the row kept goes back to memory before anything
+            // looks at the carried member's strategies (#1363).
+            run.carrySaved = adoption.resume.carry;
+            if (SeedGuildCarryLease(run.carried, run.id, run.carrySaved))
+                run.carrySaved = OverseerDecisions::GuildCarrySaved{};
 
             // THE TANK LEADS AND IS ITS OWN MASTER AGAIN, as DoGuildFinderRun
             // made it: the master was memory, and the other four follow nobody

@@ -25517,10 +25517,48 @@ struct GuildRunResumeMember
     unsigned deaths{0};
 };
 
+// THE CARRY LEASE, KEPT WITH THE RUN (#1363). A carried member's `passive`
+// is added by the run and given back at its end, and the lease that says which
+// engines the run added it to lives in the worldserver's memory. Upstream can
+// save the carried lists, `+passive` included, to playerbots_db_store mid-run,
+// so after a restart the member logs back in with `passive` on both engines and
+// a fresh lease reads it as the member's own. The row therefore carries the
+// lease: `carry_seen` names the engines the lease looked at, and `carry_pre`
+// the ones where `passive` was there before the carry began. An engine is named
+// as playerbots_db_store names it: "nc" for non-combat, "co" for combat.
+constexpr char GUILD_CARRY_ENGINE_NON_COMBAT[] = "nc";
+constexpr char GUILD_CARRY_ENGINE_COMBAT[] = "co";
+
+struct GuildCarrySaved
+{
+    // The row carried the lease. A row written before #1363 did not, and
+    // adoption then reads the member's strategies afresh, as it always has.
+    bool saved{false};
+    std::vector<std::string> seen;
+    std::vector<std::string> preexisting;
+};
+
+enum class GuildCarryAdoptEngine : std::uint8_t
+{
+    Unobserved,   // the adopted lease looks at the engine afresh
+    Preexisting,  // the member's own `passive`: the run's end leaves it
+    Added,        // the carry's `passive`: the run's end takes it off
+};
+
+// Who owns `passive` on `engine` for a run adopted after a restart. An engine
+// the first lease marked preexisting stays the member's. An engine it looked
+// at and did not mark had `passive` added by the carry, so `passive` there now
+// is the carry's, whatever the saved lists replayed. Anything else, and every
+// engine of a row with no saved lease, is looked at afresh.
+GuildCarryAdoptEngine GuildCarryLeaseOnAdopt(GuildCarrySaved const& saved,
+                                             std::string const& engine, bool hasPassiveNow);
+
 struct GuildRunResume
 {
     // The row's phase was "inside": the group had been taken in.
     bool inside{false};
+    // The carried member's lease as the row last recorded it.
+    GuildCarrySaved carry;
     unsigned mapId{0};
     unsigned dungeonId{0};
     unsigned secondsQueued{0};
