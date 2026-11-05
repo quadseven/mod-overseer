@@ -1,6 +1,7 @@
 #ifndef DISENCHANT_REPLAY_CORE_H
 #define DISENCHANT_REPLAY_CORE_H
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -110,6 +111,18 @@ public:
         if (sqlite3_open(":memory:", &db) != SQLITE_OK) throw std::runtime_error("SQLite unavailable");
         sqlite3_create_function(db, "NOW", 0, SQLITE_UTF8, nullptr,
             [](sqlite3_context* c, int, sqlite3_value**) { sqlite3_result_int64(c, sqlClock); }, nullptr, nullptr);
+        // The store names MySQL's utf8mb4_unicode_ci to join columns of two
+        // collations; stand it in as a case-insensitive ASCII compare.
+        sqlite3_create_collation(db, "utf8mb4_unicode_ci", SQLITE_UTF8, nullptr,
+            [](void*, int la, void const* a, int lb, void const* b) {
+                auto const* x = static_cast<unsigned char const*>(a);
+                auto const* y = static_cast<unsigned char const*>(b);
+                for (int i = 0; i < la && i < lb; ++i) {
+                    int d = std::tolower(x[i]) - std::tolower(y[i]);
+                    if (d) return d;
+                }
+                return la - lb;
+            });
         Exec("CREATE TABLE overseer_roster(name TEXT PRIMARY KEY, enabled INTEGER, job TEXT);"
              "CREATE TABLE overseer_command(id INTEGER PRIMARY KEY,target_name TEXT,kind TEXT,status TEXT,claimed_by TEXT DEFAULT '',result TEXT DEFAULT '',updated_at INTEGER DEFAULT 0);");
         return 0;

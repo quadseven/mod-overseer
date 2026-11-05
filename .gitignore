@@ -1,3 +1,4 @@
 .hermes-scratch/
 build_test/
 test_private_brain
+__pycache__/
