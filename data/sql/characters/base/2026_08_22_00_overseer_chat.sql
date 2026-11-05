@@ -49,7 +49,9 @@ CREATE TABLE IF NOT EXISTS `overseer_chat_watch` (
   PRIMARY KEY (`name`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-INSERT IGNORE INTO `overseer_chat_watch` (`name`) VALUES ('Grug');
+-- NO SEED ROW (#1344). Who is watched is one deployment's choice, so the rows
+-- are an outside write (the chat bridge adds its notable characters), never a
+-- shipped default. A database that already holds a seeded row keeps it.
 
 -- 'claimed' is the in-flight state. mod-overseer moves a row into it
 -- synchronously BEFORE carrying the command out, so a crash mid-command
