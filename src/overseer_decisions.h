@@ -24681,6 +24681,8 @@ struct GuildFinderRequest
     // Members of the five who joined from outside the guild, as the row
     // spells them. Empty for a group of guildmates only.
     std::vector<std::string> pugs;
+    // Optional non-tank passenger; names are compared without case.
+    std::string carried;
 };
 
 // Is `name` one of the request's pugs (names compare without case, as the
@@ -25445,6 +25447,7 @@ unsigned GuildRunHoldAccepted(GuildRunHoldRetry& retry);
 // and every damage dealer's target value takes the skull before anything
 // else. The run turns it on for the seat and takes it off at the end.
 std::vector<std::string> GuildRunSeatTactics(GuildSeat seat);
+std::vector<std::string> GuildRunSeatTactics(GuildSeat seat, bool carried);
 
 // "none", "regroup", "rest", "rested", "rest timed out", "a body inside".
 char const* GuildRunHoldWhyWord(GuildRunHoldWhy why);

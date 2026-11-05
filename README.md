@@ -231,3 +231,12 @@ Changes land through a pull request; direct pushes to `main`, deletion and
 force-push are refused by a repository ruleset. A pull request must pass the
 decisions check, the adapter compile and the leak scan. Read
 [AGENTS.md](AGENTS.md) first: this repository is public.
+
+A finder row may append `carry <name>` for one seated non-tank member. The
+member follows the dungeon tank with attack and spell actions suppressed in
+both AI engines; ordinary rows retain their existing seat behavior. Companions
+are temporarily unsummoned through the core while carrying. Permanent pets
+retain their saved state and are resummoned through the core on return; temporary
+summons are dismissed rather than recreated. The command row retains the carry
+name when a run is adopted after a restart. Only passive strategies added by
+the run are removed on exit; disconnected members are restored on reconnect.

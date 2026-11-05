@@ -21565,19 +21565,22 @@ GuildFinderRequest ParseGuildFinderRequest(std::string const& command, std::stri
         return out;
     }
     std::size_t const five = 2 + (GUILD_FINDER_GROUP_SIZE - 1);
-    // After the five, nothing but `pug <name>` pairs.
+    // Optional pug and carry name pairs follow the five seats.
     if (words.size() < five || (words.size() - five) % 2 != 0)
     {
         out.error = GuildFinderRefusal::Malformed;
         return out;
     }
     for (std::size_t i = five; i < words.size(); i += 2)
-        if (words[i] != GUILD_FINDER_PUG_WORD)
+        if (words[i] != GUILD_FINDER_PUG_WORD && words[i] != "carry")
         {
             out.error = GuildFinderRefusal::Malformed;
             return out;
         }
-    if ((words.size() - five) / 2 > GUILD_FINDER_MAX_PUGS)
+    std::size_t pugCount = 0;
+    for (std::size_t i = five; i < words.size(); i += 2)
+        pugCount += words[i] == GUILD_FINDER_PUG_WORD;
+    if (pugCount > GUILD_FINDER_MAX_PUGS)
     {
         out.error = GuildFinderRefusal::TooManyPugs;
         return out;
@@ -21620,8 +21623,19 @@ GuildFinderRequest ParseGuildFinderRequest(std::string const& command, std::stri
         std::string const lower = LowerName(words[i]);
         if (std::find(seen.begin(), seen.end(), lower) == seen.end())
         {
-            out.error = GuildFinderRefusal::PugNotInGroup;
+            out.error = words[i - 1] == "carry" ? GuildFinderRefusal::Malformed
+                                                : GuildFinderRefusal::PugNotInGroup;
             return out;
+        }
+        if (words[i - 1] == "carry")
+        {
+            if (!out.carried.empty() || lower == LowerName(tank))
+            {
+                out.error = GuildFinderRefusal::Malformed;
+                return out;
+            }
+            out.carried = words[i];
+            continue;
         }
         if (std::find(pugsSeen.begin(), pugsSeen.end(), lower) != pugsSeen.end())
         {
@@ -21677,7 +21691,7 @@ char const* GuildFinderRefusalWord(GuildFinderRefusal refusal)
         case GuildFinderRefusal::NotThisVerb:   return "not a finder-run row";
         case GuildFinderRefusal::Malformed:
             return "a finder-run row is: finder-run <keyword> <healer> <dps> <dps> <dps> "
-                   "[pug <name>]";
+                   "[pug <name>] [carry <member>]";
         case GuildFinderRefusal::BadName:       return "a name in the row is not a character name";
         case GuildFinderRefusal::SameNameTwice: return "the row names one character twice";
         case GuildFinderRefusal::PugNotInGroup: return "a pug the row names is not one of the five";
@@ -22307,6 +22321,12 @@ std::vector<std::string> GuildRunSeatTactics(GuildSeat seat)
     if (seat == GuildSeat::Tank)
         return {"mark rti"};
     return {};
+}
+
+std::vector<std::string> GuildRunSeatTactics(GuildSeat seat, bool carried)
+{
+    // PassiveMultiplier permits the dungeon follow action, but vetoes attacks.
+    return carried ? std::vector<std::string>{"passive"} : GuildRunSeatTactics(seat);
 }
 
 char const* GuildRunHoldWhyWord(GuildRunHoldWhy why)
