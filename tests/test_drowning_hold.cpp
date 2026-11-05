@@ -105,6 +105,9 @@ char const* Name(SelfDeathReading reading)
         case SelfDeathReading::NoOpinion: return "no opinion";
         case SelfDeathReading::Drowning:  return "drowning";
         case SelfDeathReading::Fall:      return "fall";
+        case SelfDeathReading::Magma:     return "magma";
+        case SelfDeathReading::Slime:     return "slime";
+        case SelfDeathReading::LiquidUnread: return "liquid unread";
     }
     return "unknown";
 }
@@ -411,6 +414,10 @@ SelfDeathReadingFacts Row(int32_t mask, int32_t guardSeconds, char const* killer
     facts.selfAttributed = std::string(killer) == "self";
     facts.fall = AccountForFall(yardsFallen, 0.f, 1.f, z,
                                 OverseerDecisions::VOID_PLANE_Z);
+    // These rows are lake water in Un'Goro Crater, read through the same
+    // classifier the adapter calls (#1158); test_death_liquid.cpp covers the
+    // other liquids.
+    facts.liquid = OverseerDecisions::ClassifyDeathLiquid(OverseerDecisions::DEATH_LIQUID_WATER);
     return facts;
 }
 

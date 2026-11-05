@@ -17375,9 +17375,28 @@ SelfDeathReading ReadSelfDeath(SelfDeathReadingFacts const& facts,
         facts.fall == FallAccount::VoidPlane)
         return SelfDeathReading::Fall;
 
+    // THE WATER BIT IS ANY LIQUID (#1158). Unit::IsInWater is true in magma and
+    // slime as well, so the bit says "in liquid" and the core's liquid data at
+    // the death point says which. Only water reads as drowning. A read that
+    // found no liquid disagrees with the guard, and disagreement says nothing.
     uint16_t const mask = static_cast<uint16_t>(facts.fallGuardMask);
     if (mask & FALL_GUARD_IN_WATER)
-        return SelfDeathReading::Drowning;
+    {
+        switch (facts.liquid)
+        {
+            case DeathLiquid::Water:
+                return SelfDeathReading::Drowning;
+            case DeathLiquid::Magma:
+                return SelfDeathReading::Magma;
+            case DeathLiquid::Slime:
+                return SelfDeathReading::Slime;
+            case DeathLiquid::Unread:
+                return SelfDeathReading::LiquidUnread;
+            case DeathLiquid::None:
+                return SelfDeathReading::NoOpinion;
+        }
+        return SelfDeathReading::NoOpinion;
+    }
 
     // EVERYTHING ELSE, INCLUDING A MASK OF ZERO. The guard looked and found
     // nothing to decline it, so it has nothing to contribute about how this
@@ -17398,8 +17417,43 @@ char const* SelfDeathReadingName(SelfDeathReading reading)
             return "it was in water and did not fall, which reads as drowning";
         case SelfDeathReading::Fall:
             return "the recorded drop accounts for it";
+        case SelfDeathReading::Magma:
+            return "it was in magma and did not fall, which reads as burning";
+        case SelfDeathReading::Slime:
+            return "it was in slime and did not fall, which reads as slime damage";
+        case SelfDeathReading::LiquidUnread:
+            return "it was in a liquid of unread type and did not fall";
     }
     return "unknown";
+}
+
+DeathLiquid ClassifyDeathLiquid(uint32_t liquidTypeMask)
+{
+    if (liquidTypeMask & DEATH_LIQUID_MAGMA)
+        return DeathLiquid::Magma;
+    if (liquidTypeMask & DEATH_LIQUID_SLIME)
+        return DeathLiquid::Slime;
+    if (liquidTypeMask & (DEATH_LIQUID_WATER | DEATH_LIQUID_OCEAN | DEATH_LIQUID_DARK_WATER))
+        return DeathLiquid::Water;
+    return DeathLiquid::None;
+}
+
+char const* DeathLiquidName(DeathLiquid liquid)
+{
+    switch (liquid)
+    {
+        case DeathLiquid::Unread:
+            return nullptr;
+        case DeathLiquid::None:
+            return "none";
+        case DeathLiquid::Water:
+            return "water";
+        case DeathLiquid::Magma:
+            return "magma";
+        case DeathLiquid::Slime:
+            return "slime";
+    }
+    return nullptr;
 }
 
 std::vector<std::string> HeadlessRosterNames(std::string const& configured)

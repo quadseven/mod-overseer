@@ -12572,7 +12572,57 @@ enum class SelfDeathReading
     Drowning,
     // The recorded drop accounts for the death on the core's own arithmetic.
     Fall,
+    // The guard found it in liquid and the core's liquid data at the death
+    // point names magma (#1158). Lava burns in seconds; this is not drowning.
+    Magma,
+    // Likewise, in slime.
+    Slime,
+    // The guard found it in liquid and nobody read which liquid. Unit::IsInWater
+    // is true in magma and slime too, so this does not say drowning either.
+    LiquidUnread,
 };
+
+// ------------------------- which liquid a death was in (#1158) -------------
+//
+// WHY THE WATER BIT IS NOT ENOUGH. FALL_GUARD_IN_WATER is Unit::IsInWater,
+// which tests the core's swimming status, and the core sets that status for
+// any liquid. The #503 live check found self-attributed deaths in Burning
+// Steppes (zone 46) and Blackrock Mountain (zone 25) at heights where the
+// liquid is lava, most with `seconds_since_full_health` under 15 s, and the
+// summary called every one of them drowning.
+//
+// THE TYPE BITS ARE THE CORE'S, mirrored here so the decisions stay free of
+// core headers: MAP_LIQUID_TYPE_* in GridTerrainData.h, which is what
+// LiquidData::Flags carries from either the grid or the vmap path
+// (`1 << LiquidType.Type`). The adapter static_asserts each one against the
+// core's own define, so a core that renumbers them stops the build.
+constexpr uint32_t DEATH_LIQUID_WATER = 0x01;
+constexpr uint32_t DEATH_LIQUID_OCEAN = 0x02;
+constexpr uint32_t DEATH_LIQUID_MAGMA = 0x04;
+constexpr uint32_t DEATH_LIQUID_SLIME = 0x08;
+constexpr uint32_t DEATH_LIQUID_DARK_WATER = 0x10;
+
+enum class DeathLiquid
+{
+    // Nobody read it: a row written before `overseer_death.liquid_type`
+    // existed, or a caller that does not sample it. Stored as NULL.
+    Unread,
+    // Read, and the core reports no liquid type bit at the death point.
+    None,
+    // Water, ocean or dark water: the liquids a character can drown in.
+    Water,
+    Magma,
+    Slime,
+};
+
+// The core's LiquidData::Flags as a liquid. Magma outranks slime and both
+// outrank water when bits are combined, because the burning liquid is the one
+// that kills fastest and calling it water is the mistake this exists to end.
+DeathLiquid ClassifyDeathLiquid(uint32_t liquidTypeMask);
+
+// `overseer_death.liquid_type`'s value: "water", "magma", "slime" or "none",
+// and nullptr for Unread, which the writer stores as NULL.
+char const* DeathLiquidName(DeathLiquid liquid);
 
 struct SelfDeathReadingFacts
 {
@@ -12589,6 +12639,9 @@ struct SelfDeathReadingFacts
     // so this rule cannot disagree with the one the summary line already
     // prints.
     FallAccount fall{FallAccount::Unsampled};
+    // The core's liquid at the death point (#1158). Only Water lets the
+    // in-water bit read as drowning.
+    DeathLiquid liquid{DeathLiquid::Unread};
 };
 
 struct SelfDeathReadingLimits
