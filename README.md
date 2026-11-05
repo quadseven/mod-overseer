@@ -207,6 +207,12 @@ missing-file line and the module runs on its defaults.
 Each key is documented in `conf/mod_overseer.conf.dist`. Everything else is
 worked out from the database when it is needed, so it is not a setting.
 
+No default names one deployment's guilds or characters. `Retire.KeepGuilds`
+defaults to empty, which keeps no guild beyond `Natural.Guilds`. The chat watch
+list, `overseer_chat_watch`, ships empty: it is an outside write, filled by
+whatever system relays the chat (one row per watched character, with the
+channels to record), and the module only reads it.
+
 One setting the module reads belongs to mod-playerbots:
 `AiPlayerbot.LootRollDisenchant` (`Playerbots.LootRollDisenchant` after the
 playerbots config rename). Set to 1, a weapon or armour drop the loot council
