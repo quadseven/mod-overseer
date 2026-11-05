@@ -474,8 +474,17 @@ jobs:
           printf '%s -fsyntax-only %s\n' "$syntax" "$src"
           echo "== compiling"
           started=$SECONDS
+          # $syntax comes from compile_commands.json, which cmake generates
+          # from a tree that includes the pull request's own CMakeLists.txt,
+          # so it is not something to hand to eval or any other shell
+          # re-parse. xargs's word-splitting understands quoting and escaping
+          # but, unlike a shell, never expands $(...), backticks, ;, | or &,
+          # so a malicious flag value lands as one inert argv element instead
+          # of running. The same form scripts/check-locally.sh uses, pinned by
+          # tests/test_adapter_ci_argv.py (#1346).
+          mapfile -t args < <(xargs -n1 <<<"$syntax")
           status=0
-          eval "$syntax -fsyntax-only \"$src\"" || status=$?
+          "${args[@]}" -fsyntax-only "$src" || status=$?
           elapsed=$((SECONDS - started))
           echo "== compile took ${elapsed}s, exit $status"
 
