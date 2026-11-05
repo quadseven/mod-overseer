@@ -66,6 +66,8 @@ run_decisions() {
   # CI and the lane contract both run this function, so the workflow's single
   # step cannot drift from it (#1295). This test enforces that shape.
   python3 -B tests/test_decisions_ci_parity.py
+  # check.adapter.yml runs its compile command as an argv, not through eval.
+  python3 -B tests/test_adapter_ci_argv.py
 
   # The migration replay needs a MySQL server. check.decisions.yml starts one
   # and sets OVERSEER_MYSQL_REPLAY=1; a lane machine has none, so it skips
