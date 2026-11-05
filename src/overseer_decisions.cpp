@@ -21902,6 +21902,29 @@ GuildRunResume ReadGuildRunResume(std::string const& result)
     resume.deaths = GuildRunJsonUnsigned(head, "deaths");
     resume.ilvlStart = GuildRunJsonUnsigned(head, "ilvl_start");
     resume.lootItems = GuildRunJsonUnsigned(head, "loot_items");
+    if (GuildRunJsonValueAt(head, "carry_seen") != std::string::npos)
+    {
+        auto split = [](std::string const& words)
+        {
+            std::vector<std::string> out;
+            std::size_t from = 0;
+            while (from <= words.size())
+            {
+                std::size_t const comma = words.find(',', from);
+                std::string const word =
+                    words.substr(from, comma == std::string::npos ? std::string::npos : comma - from);
+                if (!word.empty())
+                    out.push_back(word);
+                if (comma == std::string::npos)
+                    break;
+                from = comma + 1;
+            }
+            return out;
+        };
+        resume.carry.saved = true;
+        resume.carry.seen = split(GuildRunJsonString(head, "carry_seen"));
+        resume.carry.preexisting = split(GuildRunJsonString(head, "carry_pre"));
+    }
     {
         std::size_t at = GuildRunJsonValueAt(head, "loot_notable");
         if (at != std::string::npos && at < head.size() && head[at] == '[')
@@ -21956,6 +21979,22 @@ GuildRunResume ReadGuildRunResume(std::string const& result)
         at = end + 1;
     }
     return resume;
+}
+
+GuildCarryAdoptEngine GuildCarryLeaseOnAdopt(GuildCarrySaved const& saved,
+                                             std::string const& engine, bool hasPassiveNow)
+{
+    if (!saved.saved)
+        return GuildCarryAdoptEngine::Unobserved;
+    auto const names = [&engine](std::vector<std::string> const& list)
+    { return std::find(list.begin(), list.end(), engine) != list.end(); };
+    if (names(saved.preexisting))
+        return GuildCarryAdoptEngine::Preexisting;
+    // Seen and not preexisting: the carry added `passive` here. Absent now
+    // (a restart with nothing saved), the adopted lease adds it again as its own.
+    if (names(saved.seen) && hasPassiveNow)
+        return GuildCarryAdoptEngine::Added;
+    return GuildCarryAdoptEngine::Unobserved;
 }
 
 GuildRunAdoptStep GuildRunAdoptNext(GuildRunAdoptFacts const& facts)
