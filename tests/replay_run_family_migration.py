@@ -233,6 +233,52 @@ class WholeDirectoryMigrationTest(unittest.TestCase):
         )
         self.assertEqual("disenchant\tverifying", command.strip())
 
+    def test_disenchant_store_reads_run_against_the_replayed_schema(self):
+        # overseer_command takes the server default collation (utf8mb4_0900_ai_ci
+        # on MySQL 8) while overseer_roster names utf8mb4_unicode_ci, so a bare
+        # join on the two name columns fails to prepare live with "Illegal mix
+        # of collations" and the disenchant queue never runs. The commands
+        # below spell the name differently from the roster: the join matches
+        # case-insensitively, so both reads must hand back the roster's own
+        # spelling, the name every later lookup and claim keys on.
+        self.run_sql(
+            "DROP DATABASE IF EXISTS overseer_run_family_replay;",
+            "reset replay database",
+        )
+        self.apply_directory("schema for store reads")
+        self.run_sql(
+            "INSERT INTO overseer_roster(name,enabled,job) "
+            "VALUES ('CrafterA',1,'craft');"
+            "INSERT INTO overseer_command(target_name,command,kind,status,claimed_by) "
+            "VALUES ('craftera','item 1','disenchant','pending',''),"
+            "('CRAFTERA','item 2','disenchant','claimed','CrafterA');",
+            "seed disenchant rows",
+        )
+        reads = store_selects(ROOT / "src/overseer_disenchant_store.h")
+        self.assertEqual({"Pending", "Owned"}, set(reads))
+        pending = self.run_sql(reads["Pending"] + ";", "Pending read")
+        self.assertEqual(["CrafterA"], [r.split("\t")[1] for r in pending.splitlines()])
+        owned = self.run_sql(
+            reads["Owned"].replace("?", "'CrafterA'") + ";", "Owned read"
+        )
+        self.assertEqual(["CrafterA\tcraft\t1"], [r.split("\t", 1)[1] for r in owned.splitlines()])
+
+
+def store_selects(path):
+    """Map each PrepareStatement name to its SQL, for the SELECT statements."""
+    import re
+
+    text = path.read_text()
+    out = {}
+    for name, body in re.findall(
+        r"PrepareStatement\((\w+),\s*((?:\s*(?://[^\n]*\n)?\s*\"(?:[^\"\\]|\\.)*\")+)",
+        text,
+    ):
+        sql = "".join(re.findall(r"\"((?:[^\"\\]|\\.)*)\"", body))
+        if sql.lstrip().upper().startswith("SELECT") and " JOIN " in sql:
+            out[name] = sql
+    return out
+
 
 if __name__ == "__main__":
     unittest.main()
