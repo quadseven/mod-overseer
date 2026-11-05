@@ -8816,6 +8816,58 @@ StrandedWay DecideStrandedWay(StrandedFacts const& f)
     return StrandedWay::Refuse;
 }
 
+StrandedOwner WhoOwnsStrandedWay(StrandedOwners const& o)
+{
+    // A crossing with somebody aboard is supervised whatever else is true; one
+    // with only a clock owns the member while a poll still reads it.
+    if (o.familyCrossingOpen && (o.familyAboard || o.familyCrossingRead))
+        return StrandedOwner::FamilyCrossing;
+    if (o.escort && !o.escortCatchUp && !o.escortCrossing && !o.escortRejoin &&
+        !o.escortHomeBind)
+        return StrandedOwner::RunEscort;
+    if (o.insideRun)
+        return StrandedOwner::InsideRun;
+    if (o.familyComesHere)
+        return StrandedOwner::FamilyComesHere;
+    return StrandedOwner::Nobody;
+}
+
+char const* StrandedOwnerWhy(StrandedOwner owner)
+{
+    switch (owner)
+    {
+        case StrandedOwner::Nobody:
+            return "nothing else decides where it goes";
+        case StrandedOwner::FamilyCrossing:
+            return "the family's own crossing is under way";
+        case StrandedOwner::RunEscort:
+            return "a dungeon run's escort is walking it";
+        case StrandedOwner::InsideRun:
+            return "it is inside a dungeon a run has open";
+        case StrandedOwner::FamilyComesHere:
+            return "its leader's dungeon door is on this member's continent and the family "
+                   "walks to it";
+    }
+    return "unknown";
+}
+
+bool StrandedSplitReasonDue(std::int64_t splitSeconds, std::int64_t secondsSinceSaid)
+{
+    if (splitSeconds < STRANDED_SPLIT_REASON_SECONDS)
+        return false;
+    return secondsSinceSaid < 0 || secondsSinceSaid >= STRANDED_SPLIT_REASON_SECONDS;
+}
+
+std::string StrandedSplitReasonLine(std::string const& name, std::uint32_t memberMap,
+                                    std::uint32_t leaderMap, std::int64_t splitSeconds,
+                                    char const* verdict, std::string const& why)
+{
+    return "'" + name + "' has been on map " + std::to_string(memberMap) +
+           " and its leader on map " + std::to_string(leaderMap) + " for " +
+           std::to_string(splitSeconds / 60) + " minutes - its way across is '" +
+           (verdict ? verdict : "unknown") + "': " + why + " (#1143)";
+}
+
 StrandedGoal StrandedCrossingGoal(std::uint32_t leaderMap, bool leaderInsideKnownDoor,
                                   std::uint32_t doorOutsideMap)
 {

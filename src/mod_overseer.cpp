@@ -49563,6 +49563,10 @@ private:
     std::map<std::string, std::string> _strandedWaySaid;
     // Why a split member is not crossing, for SayPartySplit's line.
     std::map<std::string, std::string> _strandedWhy;
+    // When each member's split from its leader began, and when its reason line
+    // was last said (SayStrandedSplitReason, #1143). World thread only.
+    std::map<std::string, time_t> _strandedSplitSince;
+    std::map<std::string, time_t> _strandedReasonSaidAt;
 
     bool CrossingAlone(std::string const& name) const
     {
@@ -49728,17 +49732,55 @@ private:
         return false;
     }
 
+    // NO SPLIT IS SILENT PAST ITS BOUND (#1143). Every line beside a verdict is
+    // said once per change of way, so a verdict that held for twelve hours said
+    // nothing after its first poll. This one is on its own clock: past
+    // STRANDED_SPLIT_REASON_SECONDS of split, one line per member per bound,
+    // whatever the verdict, naming it and the fact that holds it.
+    void SayStrandedSplitReason(std::string const& name, Player* p, Player* leader,
+                                char const* verdict, std::string const& why)
+    {
+        time_t const now = std::time(nullptr);
+        auto const since = _strandedSplitSince.find(name);
+        std::int64_t const splitSeconds =
+            since == _strandedSplitSince.end() ? 0 : std::int64_t(now - since->second);
+        auto const said = _strandedReasonSaidAt.find(name);
+        std::int64_t const sinceSaid =
+            said == _strandedReasonSaidAt.end() ? -1 : std::int64_t(now - said->second);
+        if (!OverseerDecisions::StrandedSplitReasonDue(splitSeconds, sinceSaid))
+            return;
+        _strandedReasonSaidAt[name] = now;
+        LOG_WARN("module.overseer", "overseer: {}",
+                 OverseerDecisions::StrandedSplitReasonLine(name, p->GetMapId(), leader->GetMapId(),
+                                                            splitSeconds, verdict, why));
+    }
+
     // ONE STRANDED MEMBER, ONE PARTY POLL. Answers true when this took the
     // member (a hearth, or a crossing of its own), so DriveCatchUp does nothing
     // else with it on this poll; false leaves the member to the drive as before,
     // with `_strandedWhy` saying why nothing crosses for it.
     bool DriveStrandedMember(Player* p, Player* leader, std::string const& name, bool split)
     {
+        // THE SPLIT'S OWN CLOCK (#1143), started on the first poll that sees it
+        // and stopped on the first that does not, ahead of every return below.
+        if (split)
+            _strandedSplitSince.emplace(name, std::time(nullptr));
+        else
+        {
+            _strandedSplitSince.erase(name);
+            _strandedReasonSaidAt.erase(name);
+        }
         auto memo = _loneCrossings.find(name);
         // A `cross-to-map` ROW OWNS THIS MEMBER until it ends: the party poll
         // neither prices a boat home for it nor ends the crossing the row asked for.
         if (memo != _loneCrossings.end() && memo->second.jobRow)
+        {
+            if (split)
+                SayStrandedSplitReason(name, p, leader, "cross-to-map row",
+                                       "its `cross-to-map` row owns this crossing until the "
+                                       "row ends");
             return true;
+        }
         // THE CHEAP QUESTION FIRST: a member beside its leader with no crossing
         // of its own is every member on every ordinary poll.
         if (!split && memo == _loneCrossings.end())
@@ -49776,10 +49818,32 @@ private:
         // and which the family walks to: the family is coming here, and sailing
         // away from it is the ping-pong this must not start. A family that
         // goes in by the finder walks to no door, so it is not one of these.
+        //
+        // ...AND ONLY WHAT IS MOVING THE FAMILY NOW (#1143). A walk back in or a
+        // home errand left from the exit episode is not a run's escort, and a
+        // family crossing clock no coordinator poll reads moves nobody: both
+        // held a member 11 h 50 min on the dev realm, in silence, until a
+        // restart cleared them. See OverseerDecisions::WhoOwnsStrandedWay.
         std::string const family = FamilyOfCharacter(name);
         auto const escort = _dungeonEscorts.find(name);
-        bool const runEscort = escort != _dungeonEscorts.end() && !escort->second.catchUp &&
-                               !escort->second.crossing;
+        OverseerDecisions::StrandedOwners owners;
+        auto const coord = _dungeonRunCoordinators.find(family);
+        if (coord != _dungeonRunCoordinators.end())
+        {
+            owners.familyCrossingOpen =
+                coord->second.crossingSince != 0 || coord->second.crossingPassengers;
+            owners.familyCrossingRead = coord->second.crossingReadThisPoll;
+            owners.familyAboard = coord->second.crossingPassengers;
+        }
+        if (escort != _dungeonEscorts.end())
+        {
+            owners.escort = true;
+            owners.escortCatchUp = escort->second.catchUp;
+            owners.escortCrossing = escort->second.crossing;
+            owners.escortRejoin = escort->second.rejoin;
+            owners.escortHomeBind = escort->second.homeBind;
+        }
+        owners.insideRun = InDungeonRun(p);
         bool familyComesHere = false;
         if (split && !FinderIsDefault())
             if (QueryResult job = CharacterDatabase.Query(
@@ -49791,8 +49855,9 @@ private:
                             FindDungeonPortal(DungeonKeywordForJob(leaderJob)))
                         familyComesHere = portal->outsideMapId == p->GetMapId();
             }
-        facts.familyOwnsTheWay =
-            FamilyCrossing(family) || runEscort || InDungeonRun(p) || familyComesHere;
+        owners.familyComesHere = familyComesHere;
+        OverseerDecisions::StrandedOwner const owner = OverseerDecisions::WhoOwnsStrandedWay(owners);
+        facts.familyOwnsTheWay = owner != OverseerDecisions::StrandedOwner::Nobody;
 
         facts.boundOnLeaderMap = p->m_homebindMapId == facts.leaderMap;
         facts.boundOnMemberMap = p->m_homebindMapId == p->GetMapId();
@@ -49845,12 +49910,20 @@ private:
                    std::to_string(LONE_CROSSING_STANDDOWN_SECONDS / 60) + " minutes";
         else if (!priced.empty() && way == OverseerDecisions::StrandedWay::Refuse)
             why += " (priced: " + priced + ")";
+        // WHICH OWNER, not the list of three it might be (#1143).
+        if (way == OverseerDecisions::StrandedWay::StandDown)
+            why += std::string(" (") + OverseerDecisions::StrandedOwnerWhy(owner) + ")";
         _strandedWhy[name] = why;
 
         // SAID ONCE PER CHANGE OF WAY, for SayPartySplit's reason.
         std::string const word = OverseerDecisions::StrandedWayName(way);
         bool const fresh = _strandedWaySaid[name] != word;
         _strandedWaySaid[name] = word;
+
+        // AND PAST THE BOUND, ONCE PER BOUND WHATEVER THE WAY (#1143), before
+        // any branch below can return.
+        if (split)
+            SayStrandedSplitReason(name, p, leader, OverseerDecisions::StrandedWayName(way), why);
 
         switch (way)
         {
