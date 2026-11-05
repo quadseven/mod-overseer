@@ -192,6 +192,19 @@ class WholeDirectoryMigrationTest(unittest.TestCase):
             "VALUES ('LeaderA','say hi','disenchant','verifying');",
             "seed command row",
         )
+        # The chat migration ships no watch row (#1344): the watch list is an
+        # outside write, and a row already written must outlive a re-apply.
+        self.assertEqual(
+            "0",
+            self.run_sql(
+                "SELECT COUNT(*) FROM overseer_chat_watch;",
+                "watch list after first pass",
+            ).strip(),
+        )
+        self.run_sql(
+            "INSERT INTO overseer_chat_watch(name) VALUES ('Watched');",
+            "seed watch row",
+        )
         self.apply_directory("second pass")
         self.apply_directory("third pass")
         roster = self.run_sql(
@@ -200,6 +213,11 @@ class WholeDirectoryMigrationTest(unittest.TestCase):
             "roster rows after re-apply",
         )
         self.assertEqual(["LeaderA", "MemberA"], roster.splitlines())
+        watch = self.run_sql(
+            "SELECT name FROM overseer_chat_watch ORDER BY name;",
+            "watch rows after re-apply",
+        )
+        self.assertEqual(["Watched"], watch.splitlines())
         command = self.run_sql(
             "SELECT kind,status FROM overseer_command "
             "WHERE target_name='LeaderA';",
