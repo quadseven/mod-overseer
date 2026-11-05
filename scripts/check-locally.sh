@@ -57,6 +57,7 @@ run_decisions() {
   python3 -B tests/replay_exit_hearth_finalization.py
   python3 -B tests/replay_travel_claim_cache.py
   python3 -B tests/replay_main_tank_cache.py
+  python3 -B tests/replay_guild_carry.py
   python3 -B tests/replay_door_floor.py
   python3 -B tests/replay_long_navmesh.py
   python3 -B tests/replay_buy_bag.py

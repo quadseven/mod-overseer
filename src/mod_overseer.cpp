@@ -44530,6 +44530,7 @@ private:
     {
         uint32 id{0};
         std::string tank;
+        std::string carried;
         // The tank first, then the healer, then the three damage dealers.
         std::vector<std::string> names;
         std::vector<OverseerDecisions::GuildSeat> seats;
@@ -44633,6 +44634,91 @@ private:
         bool zfWeegliAsked{false};
     };
     std::vector<GuildRun> _guildRuns;
+
+    struct GuildCarryLease
+    {
+        uint32 runId{0};
+        std::set<decltype(BOT_STATE_COMBAT)> added;
+        std::set<decltype(BOT_STATE_COMBAT)> observed;
+        std::set<decltype(BOT_STATE_COMBAT)> preexisting;
+        bool petHeld{false};
+        bool returning{false};
+    };
+    std::map<std::string, GuildCarryLease> _guildCarryLeases;
+
+    void ReturnGuildCarryLeases()
+    {
+        for (auto it = _guildCarryLeases.begin(); it != _guildCarryLeases.end();)
+        {
+            if (!it->second.returning)
+            {
+                ++it;
+                continue;
+            }
+            Player* p = ObjectAccessor::FindPlayerByName(it->first);
+            PlayerbotAI* ai = p && p->IsInWorld() ? GET_PLAYERBOT_AI(p) : nullptr;
+            if (!ai)
+            {
+                ++it;
+                continue;
+            }
+            for (auto state : it->second.added)
+                ai->ChangeStrategy("-passive", state);
+            it->second.added.clear();
+            if (it->second.petHeld)
+            {
+                p->ResummonPetTemporaryUnSummonedIfAny();
+                // Dead, mounted or teleporting players keep the core's pet
+                // number. Retry on a later poll rather than abandoning it.
+                if (p->GetTemporaryUnsummonedPetNumber())
+                {
+                    ++it;
+                    continue;
+                }
+            }
+            it = _guildCarryLeases.erase(it);
+        }
+    }
+
+    bool ApplyGuildCarryTactics(GuildRun const& run)
+    {
+        if (run.carried.empty())
+            return true;
+        Player* p = ObjectAccessor::FindPlayerByName(run.carried);
+        PlayerbotAI* ai = p && p->IsInWorld() ? GET_PLAYERBOT_AI(p) : nullptr;
+        if (!ai)
+            return false;
+        auto& lease = _guildCarryLeases[run.carried];
+        lease.runId = run.id;
+        lease.returning = false;
+        for (auto const& strategy : OverseerDecisions::GuildRunSeatTactics(
+                 OverseerDecisions::GuildSeat::Damage, true))
+        for (auto state : {BOT_STATE_NON_COMBAT, BOT_STATE_COMBAT})
+        {
+            if (lease.observed.insert(state).second && ai->HasStrategy(strategy, state))
+                lease.preexisting.insert(state);
+            if (!ai->HasStrategy(strategy, state))
+            {
+                ai->ChangeStrategy("+" + strategy, state);
+                if (ai->HasStrategy(strategy, state) && !lease.preexisting.count(state))
+                    lease.added.insert(state);
+            }
+            if (!ai->HasStrategy(strategy, state))
+                return false;
+        }
+        // PassiveMultiplier keeps dc follow tank available while vetoing
+        // engagement actions. Install before dc ensure can start the pull.
+        p->AttackStop();
+        p->InterruptNonMeleeSpells(false);
+        if (p->GetPet())
+        {
+            p->UnsummonPetTemporaryIfAny();
+            lease.petHeld = true;
+            if (p->GetPet())
+                return false;
+        }
+        return true;
+    }
 
     // Is `name` one of a guild run's five right now (queued, inside or on its
     // way out)? A family member lent to one (wow-overseer issue 784) is the
@@ -45080,6 +45166,8 @@ private:
         run.id = id;
         run.tank = tankName;
         run.names = names;
+        run.carried = request.carried;
+        normalizePlayerName(run.carried);
         run.seats = seats;
         for (Player* p : players)
         {
@@ -45106,6 +45194,7 @@ private:
                  request.keyword, portal->insideMapId, static_cast<unsigned>(FinderStateOf(state)),
                  pugWords.empty() ? "" : "; pug ", pugWords);
         out = GuildRunJson(run, "queued", nullptr, 0, run.queuedAt);
+        ApplyGuildCarryTactics(run);
         _guildRuns.push_back(run);
         status = "verifying";
         return "queued";
@@ -45128,6 +45217,10 @@ private:
         // the ordinary recoveries' again. So do the run's combat tactics.
         ReturnGuildRunLeases(run, {});
         ReturnGuildRunTactics(run);
+        auto carry = _guildCarryLeases.find(run.carried);
+        if (carry != _guildCarryLeases.end() && carry->second.runId == run.id)
+            carry->second.returning = true;
+        ReturnGuildCarryLeases();
         run.outcome = outcome;
         run.why = why;
         run.phase = GuildRunPhase::Leaving;
@@ -45226,6 +45319,7 @@ private:
     void DriveGuildFinderRuns()
     {
         std::time_t const now = std::time(nullptr);
+        ReturnGuildCarryLeases();
         DriveGuildRunStrays(now);
         DriveGuildRunAdoptions(now);
         std::vector<GuildRun> still;
@@ -45489,6 +45583,7 @@ private:
     // end of the run never takes off what it did not add. A refusal is said once.
     void ApplyGuildRunTactics(GuildRun& run)
     {
+        ApplyGuildCarryTactics(run);
         for (std::size_t i = 0; i < run.names.size() && i < run.seats.size(); ++i)
         {
             std::vector<std::string> const wanted =
@@ -46133,6 +46228,7 @@ private:
 
     bool DriveGuildRun(GuildRun& run, std::time_t now)
     {
+        bool const carryReady = run.phase == GuildRunPhase::Leaving || ApplyGuildCarryTactics(run);
         Player* const tank = ObjectAccessor::FindPlayerByName(run.tank);
         Group* const group = RunGroup(run.groupGuid);
         bool const ourGroup = group != nullptr;
@@ -46383,7 +46479,7 @@ private:
             // APART. Sent to every member inside, from the tank, as the family's
             // drive sends it: a non-leader returns true at once and follows the
             // elected leader; only the leader's answer says the run is enabled.
-            if (!run.dcAccepted && poll.inside && tank && tank->IsInWorld() &&
+            if (!run.dcAccepted && carryReady && poll.inside && tank && tank->IsInWorld() &&
                 now - run.dcTriedAt >= 60)
             {
                 run.dcTriedAt = now;
@@ -46421,7 +46517,7 @@ private:
                 // stall off the tank; any arming clears it, so it is this stay's.
                 bool const issue = OverseerDecisions::GuildRunRearmNext(rearm) ==
                                        OverseerDecisions::GuildRunRearmStep::Issue &&
-                                   tank && tank->IsInWorld() && run.moduleStop.empty();
+                                   tank && tank->IsInWorld() && run.moduleStop.empty() && carryReady;
                 std::string const stopReason =
                     issue && rearm.tankAlive ? DungeonBrainStopReason(tank) : std::string();
                 OverseerDecisions::GuildRunModuleStopStep const stopStep =
@@ -46789,6 +46885,8 @@ private:
             run.id = adoption.id;
             run.tank = adoption.tank;
             run.names = names;
+            run.carried = adoption.request.carried;
+            normalizePlayerName(run.carried);
             run.seats = {OverseerDecisions::GuildSeat::Tank, OverseerDecisions::GuildSeat::Healer};
             for (std::size_t i = 2; i < names.size(); ++i)
                 run.seats.push_back(OverseerDecisions::GuildSeat::Damage);
@@ -46847,6 +46945,7 @@ private:
                      now - run.enteredAt);
             WriteGuildRunRow(run.id, "verifying", "inside",
                              GuildRunJson(run, "inside", &carried, run.ilvlAtEntry, now));
+            ApplyGuildCarryTactics(run);
             _guildRuns.push_back(run);
         }
         _guildRunAdoptions.swap(still);
