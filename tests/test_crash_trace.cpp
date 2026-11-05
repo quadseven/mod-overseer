@@ -1,6 +1,7 @@
 #include "overseer_crash.h"
 
 #include <cassert>
+#include <cstdio>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -34,7 +35,12 @@ int main()
     size_t const baseLine = contents.find("base 0x");
     size_t const frameStart = contents.find('\n', baseLine);
     assert(frameStart != std::string::npos);
-    assert(contents.find("\n0 ", frameStart) != std::string::npos ||
-           contents.find(")[0x", frameStart) != std::string::npos);
+    // A frame line: macOS writes "0   name ...", glibc "name(+0x..)[0x..]",
+    // and the glibc on ubuntu-26.04 runners "name(+0x..) [0x..]" (seen in CI).
+    bool const frames = contents.find("\n0 ", frameStart) != std::string::npos ||
+                        contents.find("[0x", frameStart) != std::string::npos;
+    if (!frames)
+        fprintf(stderr, "no frame line in the trace:\n%s\n", contents.c_str());
+    assert(frames);
     return 0;
 }
