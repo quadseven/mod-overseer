@@ -34,9 +34,17 @@ from pathlib import Path
 
 
 HERE = Path(__file__).resolve().parent
-PATCH = HERE.parent / "patches/mod-playerbots/0020-attack-target-resolved-before-use.patch"
+PREVIOUS_PATCH = HERE.parent / "patches/mod-playerbots/0020-attack-target-resolved-before-use.patch"
+PATCH = HERE.parent / "patches/mod-playerbots/0021-attack-uses-stored-target-guid.patch"
+CORE_PATCH = HERE.parent / "patches/azerothcore-wotlk/0002-duel-info-retains-opponent-guid.patch"
 FIXTURE = HERE / "fixtures/attack_target/AttackAction.cpp"
-TARGET = Path("src/Ai/Base/Actions/AttackAction.cpp")
+FIXTURES = {
+    Path("src/Ai/Base/Actions/AttackAction.cpp"): FIXTURE,
+    Path("src/Ai/Base/Actions/AttackAction.h"): HERE / "fixtures/attack_target/AttackAction.h",
+    Path("src/Ai/Base/Value/CurrentTargetValue.h"): HERE / "fixtures/attack_target/CurrentTargetValue.h",
+    Path("src/Ai/Base/Value/DuelTargetValue.h"): HERE / "fixtures/attack_target/DuelTargetValue.h",
+    Path("src/Ai/Base/Value/DuelTargetValue.cpp"): HERE / "fixtures/attack_target/DuelTargetValue.cpp",
+}
 
 
 def function(source, signature):
@@ -73,6 +81,7 @@ struct ObjectGuid
     bool operator!() const { return raw == 0; }
     bool operator<(ObjectGuid other) const { return raw < other.raw; }
     bool operator==(ObjectGuid other) const { return raw == other.raw; }
+    bool operator!=(ObjectGuid other) const { return raw != other.raw; }
 };
 
 struct Unit
@@ -86,8 +95,14 @@ struct Unit
     int reaction = 1;             // < 5 hostile, >= 5 friendly (stand-in scale)
     std::string name = "target";
 
-    ObjectGuid GetGUID() const { return guid; }  // a direct member read, as in the core
+    ObjectGuid GetGUID() const
+    {
+        if (!fields)
+            throw SegvModel{"GUID read through a null update-field array"};
+        return guid;
+    }
     bool IsInWorld() const { return inWorld; }
+    int GetMap() const { return mapId; }
     bool IsPlayer() const { return player; }
     bool IsPet() const { return pet; }
     bool isDead() const { return dead; }
@@ -130,6 +145,7 @@ struct MotionMaster
 struct DuelInfo
 {
     Unit* Opponent = nullptr;
+    ObjectGuid OpponentGuid;
 };
 
 struct Player : Unit
@@ -310,6 +326,16 @@ int main(int argc, char** argv)
         target.mapId = 2;
         mapStore[{2, target.guid.raw}] = &target;
     }
+    else if (scenario == "out-of-world")
+    {
+        target.inWorld = false;
+        mapStore[{1, target.guid.raw}] = &target;
+    }
+    else if (scenario == "wrong-map-resolver")
+    {
+        target.mapId = 2;
+        mapStore[{1, target.guid.raw}] = &target;
+    }
     else if (scenario == "friendly")
     {
         target.reaction = 9;
@@ -341,9 +367,23 @@ int main(int argc, char** argv)
 """
 
 
-def build(root, source_text):
-    body = function(source_text, "bool AttackAction::Attack(Unit* target")
-    (root / "replay.cpp").write_text(HARNESS.replace("// REAL_BODY", body))
+GUID_HARNESS = HARNESS.replace(
+    "bool Attack(Unit* target, bool with_pet = true);",
+    "bool Attack(ObjectGuid targetGuid, bool with_pet = true);",
+).replace("Unit* passed = &target;", "ObjectGuid passed = target.guid;").replace(
+    "passed = nullptr;", "passed = ObjectGuid();"
+)
+
+
+def build(root, source_text, *, guid_argument):
+    signature = (
+        "bool AttackAction::Attack(ObjectGuid targetGuid"
+        if guid_argument
+        else "bool AttackAction::Attack(Unit* target"
+    )
+    harness = GUID_HARNESS if guid_argument else HARNESS
+    body = function(source_text, signature)
+    (root / "replay.cpp").write_text(harness.replace("// REAL_BODY", body))
     compiler = shutil.which(os.environ.get("CXX", "c++"))
     if compiler is None:
         raise RuntimeError("C++ compiler required for the attack target replay")
@@ -378,78 +418,134 @@ class AttackTargetPatchTest(unittest.TestCase):
         cls.addClassCleanup(cls.temp.cleanup)
         root = Path(cls.temp.name)
 
-        pinned_root = root / "pinned"
-        pinned_file = pinned_root / TARGET
-        pinned_file.parent.mkdir(parents=True)
-        shutil.copyfile(FIXTURE, pinned_file)
-        cls.pinned = build(pinned_root, pinned_file.read_text())
-
-        # The replay proves the PATCHED body. Without the patch it would
-        # compile the pinned fixture as the realm ships it and could pass
-        # for the wrong reason, so a missing patch is a failure, not a
-        # skip. When upstream takes the fix and the patch is deleted,
-        # retire this replay or re-pin its fixture in the same change.
-        if not PATCH.exists():
+        if not PREVIOUS_PATCH.exists() or not PATCH.exists():
             raise RuntimeError(
-                "%s is missing: this replay applies it to the fixture and "
-                "proves nothing without it" % PATCH.relative_to(HERE.parent)
+                "both attack target patches are required for this replay"
             )
         git = shutil.which("git")
         if git is None:
             raise RuntimeError("git required to apply the repository patch")
-        patched_root = root / "patched"
-        patched_file = patched_root / TARGET
-        patched_file.parent.mkdir(parents=True)
-        shutil.copyfile(FIXTURE, patched_file)
-        applied = subprocess.run(  # noqa: S603 - repository patch applied to temporary fixtures
-            [git, "apply", str(PATCH)],
-            cwd=patched_root,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        if applied.returncode != 0:
-            raise RuntimeError("patch does not apply to the pinned fixture:\n" + applied.stderr)
-        cls.patched = build(patched_root, patched_file.read_text())
 
-    def test_pinned_body_faults_on_departed_target(self):
-        code, out = run(self.pinned, "departed")
+        def copy_fixtures(destination):
+            for target, fixture in FIXTURES.items():
+                target_file = destination / target
+                target_file.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(fixture, target_file)
+
+        def apply_patch(destination, patch):
+            applied = subprocess.run(  # noqa: S603 - repository patch applied to temporary fixtures
+                [git, "apply", str(patch)],
+                cwd=destination,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if applied.returncode != 0:
+                raise RuntimeError("patch does not apply to the pinned fixture:\n" + applied.stderr)
+
+        previous_root = root / "previous"
+        copy_fixtures(previous_root)
+        apply_patch(previous_root, PREVIOUS_PATCH)
+        cls.previous = build(
+            previous_root,
+            (previous_root / "src/Ai/Base/Actions/AttackAction.cpp").read_text(),
+            guid_argument=False,
+        )
+
+        patched_root = root / "patched"
+        copy_fixtures(patched_root)
+        apply_patch(patched_root, PREVIOUS_PATCH)
+        apply_patch(patched_root, PATCH)
+        cls.patched_source = (patched_root / "src/Ai/Base/Actions/AttackAction.cpp").read_text()
+        cls.current_target_source = (
+            patched_root / "src/Ai/Base/Value/CurrentTargetValue.h"
+        ).read_text()
+        cls.attack_header_source = (
+            patched_root / "src/Ai/Base/Actions/AttackAction.h"
+        ).read_text()
+        cls.duel_target_source = (
+            patched_root / "src/Ai/Base/Value/DuelTargetValue.cpp"
+        ).read_text()
+        cls.patched = build(
+            patched_root,
+            cls.patched_source,
+            guid_argument=True,
+        )
+
+    def test_previous_patch_faults_while_reading_stale_target_guid(self):
+        code, out = run(self.previous, "departed")
         self.assertEqual(code, 3, out)
-        self.assertIn("CRASH", out)
+        self.assertIn("GUID read through a null update-field array", out)
 
     def test_patched_body_refuses_departed_target(self):
         code, out = run(self.patched, "departed")
         self.assertEqual(code, 0, out)
         self.assertIn("returned=0 attacked=0", out)
 
-    def test_pinned_body_attacks_other_map_target(self):
-        code, out = run(self.pinned, "other-map")
+    def test_previous_patch_refuses_other_map_target(self):
+        code, out = run(self.previous, "other-map")
         self.assertEqual(code, 0, out)
-        self.assertIn("returned=1 attacked=1", out)
+        self.assertIn("returned=0 attacked=0", out)
 
     def test_patched_body_refuses_other_map_target(self):
         code, out = run(self.patched, "other-map")
         self.assertEqual(code, 0, out)
         self.assertIn("returned=0 attacked=0", out)
 
+    def test_patched_body_refuses_out_of_world_resolved_target(self):
+        code, out = run(self.patched, "out-of-world")
+        self.assertEqual(code, 0, out)
+        self.assertIn("returned=0 attacked=0", out)
+
+    def test_patched_body_refuses_wrong_map_resolver_result(self):
+        code, out = run(self.patched, "wrong-map-resolver")
+        self.assertEqual(code, 0, out)
+        self.assertIn("returned=0 attacked=0", out)
+
     def test_live_target_attacked_with_and_without_patch(self):
-        for binary in (self.pinned, self.patched):
+        for binary in (self.previous, self.patched):
             code, out = run(binary, "live")
             self.assertEqual(code, 0, out)
             self.assertIn("returned=1 attacked=1", out)
 
     def test_friendly_target_refused_with_and_without_patch(self):
-        for binary in (self.pinned, self.patched):
+        for binary in (self.previous, self.patched):
             code, out = run(binary, "friendly")
             self.assertEqual(code, 0, out)
             self.assertIn("returned=0 attacked=0", out)
 
     def test_null_target_refused_with_and_without_patch(self):
-        for binary in (self.pinned, self.patched):
+        for binary in (self.previous, self.patched):
             code, out = run(binary, "null")
             self.assertEqual(code, 0, out)
             self.assertIn("returned=0 attacked=0", out)
+
+    def test_core_patch_caches_the_duel_opponent_guid(self):
+        patch = CORE_PATCH.read_text()
+        self.assertIn("ObjectGuid const OpponentGuid;", patch)
+        header, implementation = patch.split(
+            "diff --git a/src/server/game/Entities/Player/Player.cpp ", 1
+        )
+        self.assertNotIn("opponent->GetGUID()", header)
+        self.assertIn("DuelInfo::DuelInfo(Player* opponent", implementation)
+        self.assertIn("OpponentGuid(opponent ? opponent->GetGUID() : ObjectGuid::Empty)", implementation)
+
+    def test_every_attack_value_enters_through_a_stored_guid(self):
+        self.assertIn("return value ? value->GetGuid() : ObjectGuid::Empty;", self.patched_source)
+        self.assertIn("bool result = Attack(guid);", self.patched_source)
+        self.assertIn("return guid ? Attack(guid) : false;", self.patched_source)
+        self.assertNotIn("Attack(AI_VALUE(Unit*", self.patched_source)
+        self.assertNotIn("Attack(botAI->GetUnit(guid))", self.patched_source)
+        self.assertNotIn("botAI->GetUnit(target->GetGUID())", self.patched_source)
+        self.assertNotIn("ObjectGuid guid = target->GetGUID();", self.patched_source)
+        self.assertIn(
+            "if (!target || !target->IsInWorld() || target->GetMap() != bot->GetMap())",
+            self.patched_source,
+        )
+        self.assertIn("ObjectGuid GetGuid() const { return selection; }", self.current_target_source)
+        self.assertIn("botAI->GetUnit(guid)", self.duel_target_source)
+        self.assertIn('GetTargetName() override { return "duel target"; }', self.attack_header_source)
 
 
 if __name__ == "__main__":

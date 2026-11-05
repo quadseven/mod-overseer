@@ -1,0 +1,37 @@
+Subject: [PATCH] retain a duel opponent GUID for safe target resolution
+
+Capture the opponent GUID while constructing live duel state so later AI
+lookups do not dereference a cached opponent pointer.
+
+diff --git a/src/server/game/Entities/Player/Player.h b/src/server/game/Entities/Player/Player.h
+index 5a29ac7..b554876 100644
+--- a/src/server/game/Entities/Player/Player.h
++++ b/src/server/game/Entities/Player/Player.h
+@@ -362,9 +362,10 @@ enum DuelState
+ 
+ struct DuelInfo
+ {
+-    DuelInfo(Player* opponent, Player* initiator, bool isMounted) : Opponent(opponent), Initiator(initiator), IsMounted(isMounted) {}
++    DuelInfo(Player* opponent, Player* initiator, bool isMounted);
+ 
+     Player* const Opponent;
++    ObjectGuid const OpponentGuid;
+     Player* const Initiator;
+     bool const IsMounted;
+     DuelState State = DUEL_STATE_CHALLENGED;
+diff --git a/src/server/game/Entities/Player/Player.cpp b/src/server/game/Entities/Player/Player.cpp
+index 38738f3..d88f19c 100644
+--- a/src/server/game/Entities/Player/Player.cpp
++++ b/src/server/game/Entities/Player/Player.cpp
+@@ -95,5 +95,11 @@
+ //  see: https://github.com/azerothcore/azerothcore-wotlk/issues/9766
+ #include "GridNotifiersImpl.h"
+ 
++DuelInfo::DuelInfo(Player* opponent, Player* initiator, bool isMounted)
++    : Opponent(opponent), OpponentGuid(opponent ? opponent->GetGUID() : ObjectGuid::Empty),
++      Initiator(initiator), IsMounted(isMounted)
++{
++}
++
+ enum CharacterFlags
+ {
