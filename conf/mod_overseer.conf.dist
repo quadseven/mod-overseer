@@ -665,11 +665,13 @@
 #                     Overseer.Natural.Guilds is kept as well. A retire also
 #                     refuses anyone on the roster, anyone off a random-bot
 #                     account, any death knight and anyone below level 42.
+#                     The empty default keeps no guild beyond
+#                     Overseer.Natural.Guilds.
 #
 #        Example:     Overseer.Retire.KeepGuilds = "My Guild,Other Guild"
-#        Default:     "Cave,Bonkers"
+#        Default:     ""
 #
-#Overseer.Retire.KeepGuilds = "Cave,Bonkers"
+#Overseer.Retire.KeepGuilds = ""
 
 #
 #    Overseer.ShareRetention.Enable

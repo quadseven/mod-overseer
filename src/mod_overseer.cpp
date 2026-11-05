@@ -68489,7 +68489,8 @@ private:
     static std::vector<std::string> RetireKeepGuilds()
     {
         return OverseerDecisions::ParseNameList(
-            sConfigMgr->GetOption<std::string>("Overseer.Retire.KeepGuilds", "Cave,Bonkers"));
+            sConfigMgr->GetOption<std::string>("Overseer.Retire.KeepGuilds",
+                                               OverseerDecisions::RETIRE_KEEP_GUILDS_DEFAULT));
     }
 
     static bool RetireAccountIsRandomBot(uint32 accountId)

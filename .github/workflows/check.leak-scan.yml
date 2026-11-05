@@ -31,7 +31,7 @@ on:
 
 jobs:
   leak-scan:
-    uses: quadseven/infra-public/.github/workflows/_reusable.leak-scan.yml@273755079c88172df39501ee6914fd878c0920bc
+    uses: quadseven/infra-public/.github/workflows/_reusable.leak-scan.yml@9d8c5a6e4d9a72c95c711b353d45da22b82a0325
     permissions:
       contents: read
       # Mint the OIDC token for the deny-list read role.

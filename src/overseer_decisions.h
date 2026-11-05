@@ -12226,6 +12226,12 @@ RetireRequest ParseRetireRequest(std::string const& command);
 // random-bot account was made that way by the factory.
 constexpr unsigned RETIRE_MIN_LEVEL = 42;
 
+// The default of Overseer.Retire.KeepGuilds: no guild (#1344). A shipped
+// default that named guilds would hand one realm's guild list to every other
+// install. Empty keeps no guild beyond Overseer.Natural.Guilds, which the
+// retire facts keep as well.
+constexpr char const* RETIRE_KEEP_GUILDS_DEFAULT = "";
+
 // WHAT A RETIRE IS ASKED ABOUT. Read from the core's character cache and this
 // module's roster, and asked again at the moment of the delete.
 struct RetireFacts
