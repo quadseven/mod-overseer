@@ -10229,7 +10229,9 @@ private:
     // the `expectedVerb` argument there - so it must be the same string at the
     // place that holds and the places that release.
     static constexpr char const* STAGE_HOLD_VERB = "stage";
-    static constexpr char const* REVIVED_SICK_HOLD_VERB = "revived sickness";
+    // Spelled once, in the decisions, where the food walk's release reads it (#1377).
+    static constexpr char const* REVIVED_SICK_HOLD_VERB =
+        OverseerDecisions::REVIVED_SICKNESS_HOLD_VERB;
 
     static std::map<std::string, HoldRecord>& HoldsInForce()
     {
@@ -33087,8 +33089,19 @@ private:
         if (step != OverseerDecisions::RevivedSickGroundStep::HoldOutOfCombat)
             return;
 
-        HoldCharacterStill(bot, botAI, name, REVIVED_SICK_HOLD_VERB,
-                           static_cast<uint32>(SPIRIT_HEALER_SICKNESS_SECONDS + 90), false);
+        // A WALK HOLD IS LEFT ALONE (#1377). A supply walk for a member with
+        // nothing to eat released this hold and took its own; holding the
+        // member still here would stop that walk on the next poll. The combat
+        // strategies below still come off, so it walks out of combat. Every
+        // walk goal, a vendor walk included, holds under MAIL_WALK_HOLD_VERB
+        // (DoWalk, RetakeWalkHold); there is no vendor hold verb.
+        auto const& holds = HoldsInForce();
+        auto const walkHold = holds.find(name);
+        bool const walkHolds = HeldStill(name) && walkHold != holds.end() &&
+                               walkHold->second.verb == MAIL_WALK_HOLD_VERB;
+        if (!walkHolds)
+            HoldCharacterStill(bot, botAI, name, REVIVED_SICK_HOLD_VERB,
+                               static_cast<uint32>(SPIRIT_HEALER_SICKNESS_SECONDS + 90), false);
         for (char const* strategy : {"pull", "aoe", "grind"})
         {
             if (StrategyPresent(botAI, StrategyItem{strategy, true}) &&
@@ -80772,6 +80785,34 @@ private:
         return "unchanged";
     }
 
+    // Food or drink, the way the starting outfit reads it: a consumable of the
+    // food subclass, which holds both (#1377).
+    static bool IsFoodOrDrink(ItemTemplate const* proto)
+    {
+        return proto && proto->Class == ITEM_CLASS_CONSUMABLE &&
+               proto->SubClass == ITEM_SUBCLASS_FOOD;
+    }
+
+    // Anything to eat or drink in the backpack or the worn bags (#1377).
+    static bool CarriesFoodOrDrink(Player* who)
+    {
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            if (Item* item = who->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                if (IsFoodOrDrink(item->GetTemplate()))
+                    return true;
+        for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+        {
+            Bag* bag = who->GetBagByPos(bagSlot);
+            if (!bag)
+                continue;
+            for (uint32 i = 0; i < bag->GetBagSize(); ++i)
+                if (Item* item = bag->GetItemByPos(i))
+                    if (IsFoodOrDrink(item->GetTemplate()))
+                        return true;
+        }
+        return false;
+    }
+
     // One walk row of any of the three kinds: parse, gate, choose, hold, walk.
     static char const* DoWalk(Player* who, std::string const& command,
                               OverseerDecisions::WalkGoal goal, char const*& status,
@@ -80880,6 +80921,37 @@ private:
         for (MailWalkCheck const& check : walking)
             if (check.targetName == ev.character)
                 gate.alreadyWalking = true;
+        {
+            // A FOOD WALK RELEASES THE REVIVED SICKNESS HOLD OF A MEMBER WITH
+            // NOTHING TO EAT (#1377). That hold keeps a member still so it may
+            // eat; with no food it only refuses the walk that would buy some.
+            // Only the hold comes off: the sickness drive's removed pull, aoe
+            // and grind and its added flee stay, so the member walks out of
+            // combat, and the drive does not re-take its hold while the walk's
+            // own holds the member. Released only when the gate's other walls
+            // pass (heldByAnother is not read yet), so a walk refused for its
+            // own reason does not take the hold off.
+            auto const& holds = HoldsInForce();
+            auto const hold = holds.find(ev.character);
+            if (goal == D::WalkGoal::Vendor && HeldStill(ev.character) && hold != holds.end() &&
+                !*D::MailWalkGate(gate))
+            {
+                bool const supplyFood =
+                    !ev.anyVendor && IsFoodOrDrink(sObjectMgr->GetItemTemplate(ev.item));
+                if (D::SupplyWalkReleasesSickHold(hold->second.verb, supplyFood,
+                                                  CarriesFoodOrDrink(who)))
+                {
+                    LOG_WARN("module.overseer",
+                             "overseer: vendor walk {} for '{}' (item {}) releases its revived "
+                             "sickness hold: it carries nothing to eat or drink, and the hold "
+                             "only kept it from buying some; it walks out of combat (#1377)",
+                             id, ev.character, ev.item);
+                    ReleaseHold(ev.character, who,
+                                "a supply walk for a member with nothing to eat or drink",
+                                REVIVED_SICK_HOLD_VERB);
+                }
+            }
+        }
         {
             // A settle on the deck is the walk's to take over (2026-10-09).
             auto const& holds = HoldsInForce();

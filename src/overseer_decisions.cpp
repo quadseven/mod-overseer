@@ -25430,6 +25430,13 @@ bool HoldYieldsToWalk(std::string const& holdVerb)
     return holdVerb == DECK_SETTLE_HOLD_VERB;
 }
 
+bool SupplyWalkReleasesSickHold(std::string const& holdVerb, bool walkIsSupplyFoodOrDrink,
+                                bool carriesFoodOrDrink)
+{
+    return holdVerb == REVIVED_SICKNESS_HOLD_VERB && walkIsSupplyFoodOrDrink &&
+           !carriesFoodOrDrink;
+}
+
 LogoutScope LogoutOfflineScope(uint32_t otherInWorldOnAccount)
 {
     return otherInWorldOnAccount == 0 ? LogoutScope::Account

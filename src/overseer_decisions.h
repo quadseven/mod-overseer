@@ -28071,6 +28071,18 @@ bool RowLiftsDeckSettle(std::string const& kind);
 // replaces its own linger? True for the settle on the deck.
 bool HoldYieldsToWalk(std::string const& holdVerb);
 
+// THE REVIVED SICKNESS HOLD AND A FOOD WALK (mod-overseer#1377). The hold
+// (#746) keeps a member still after a spirit healer revive so that it may eat.
+// A member that carries no food or drink cannot, and the supply step's walk to
+// a food vendor was refused "held by another verb" for the whole hold, again
+// at every death of a looper. True only when the hold in force is the revived
+// sickness hold, the walk is a vendor walk for a food or drink item, and the
+// member carries none: the walk then releases that hold and goes. A member
+// with food keeps the hold and eats.
+constexpr char const* REVIVED_SICKNESS_HOLD_VERB = "revived sickness";
+bool SupplyWalkReleasesSickHold(std::string const& holdVerb, bool walkIsSupplyFoodOrDrink,
+                                bool carriesFoodOrDrink);
+
 // WHICH ROWS A LOGOUT MARKS OFFLINE. The core's logout clears the online flag
 // for every character on the leaving character's ACCOUNT. Under playerbots
 // many characters on one account are in the world at once, so one bot's logout
