@@ -186,6 +186,19 @@ void TheDriveAsksIt()
           drive.find("released = bot->HasPlayerFlag(PLAYER_FLAGS_GHOST)") != std::string::npos);
     Check("a living body at zero health falls by a death, not a grant",
           drive.find("KillSelf(false)") != std::string::npos);
+    // Unit::Kill opens with `if (!victim->GetHealth()) return;` ("prevent
+    // killing unit twice"), so KillSelf on a zero-health body is a no-op.
+    // Measured after the roll that shipped the fall: the member logged "read
+    // alive at zero health" every two minutes and never died. The one point of
+    // health is set on the line before the kill and taken by it.
+    std::size_t const point = drive.find("bot->SetHealth(1);");
+    std::size_t const kill = drive.find("bot->KillSelf(false);");
+    Check("the fall gives the body the one point Unit::Kill needs, right before the kill",
+          point != std::string::npos && kill != std::string::npos && point < kill &&
+              drive.find(';', point) + 1 < kill &&
+              drive.substr(point, kill - point).find("if (") == std::string::npos);
+    Check("the fall is read back from the world",
+          drive.find("fell = !bot->IsAlive()") != std::string::npos);
     Check("the drive never resurrects by hand",
           drive.find("ResurrectPlayer(") == std::string::npos);
 

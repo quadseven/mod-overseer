@@ -33458,17 +33458,28 @@ private:
                 body.runTakesBack = runTakesBack;
                 if (OverseerDecisions::GuildBodyNext(body) == OverseerDecisions::GuildBodyStep::Fall)
                 {
+                    // UNIT::KILL REFUSES A BODY WITH NO HEALTH. It opens with
+                    // `if (!victim->GetHealth()) return;` ("prevent killing
+                    // unit twice"), which is also why no guard's blow ever
+                    // finished this body. KillSelf alone was a no-op: after the
+                    // roll that shipped it, the member logged this line every
+                    // two minutes and never died. So the body gets the one
+                    // point Unit::Kill needs and the kill takes it on the next
+                    // line: nothing runs between them, and nothing is granted.
+                    _guildZeroHealth.erase(name);
+                    bot->SetHealth(1);
+                    bot->KillSelf(false);
+                    bool const fell = !bot->IsAlive();
                     LOG_WARN("module.overseer",
                              "overseer: guild member '{}' (level {}) has read alive at zero "
                              "health for {}s at map {} ({:.0f}, {:.0f}) - no regeneration, "
                              "refresh or recovery leaves that reading, so it dies as anything "
-                             "at zero health does (no durability loss) and is released like "
-                             "any other death (wow-overseer#1879)",
+                             "at zero health does (no durability loss): {} (wow-overseer#1879)",
                              name, bot->GetLevel(), reading.deadSeconds,
                              static_cast<uint32>(bot->GetMapId()), bot->GetPositionX(),
-                             bot->GetPositionY());
-                    _guildZeroHealth.erase(name);
-                    bot->KillSelf(false);
+                             bot->GetPositionY(),
+                             fell ? "it is dead now, and released like any other death"
+                                  : "the core did NOT kill it - it still reads alive");
                     continue;
                 }
             }
