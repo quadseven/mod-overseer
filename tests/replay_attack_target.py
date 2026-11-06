@@ -47,6 +47,8 @@ FIXTURES = {
     Path("src/Ai/Base/Value/RtiTargetValue.h"): HERE / "fixtures/attack_target/RtiTargetValue.h",
     Path("src/Ai/Base/Value/RtiTargetValue.cpp"): HERE / "fixtures/attack_target/RtiTargetValue.cpp",
     Path("src/Ai/Base/Actions/ChooseTargetActions.cpp"): HERE / "fixtures/attack_target/ChooseTargetActions.cpp",
+    Path("src/Bot/Engine/Value/Value.cpp"): HERE / "fixtures/attack_target/Value.cpp",
+    Path("src/Bot/Engine/Value/Value.h"): HERE / "fixtures/attack_target/Value.h",
 }
 
 
@@ -378,6 +380,109 @@ GUID_HARNESS = HARNESS.replace(
 )
 
 
+UNIT_VALUE_HARNESS = r"""
+#include <cstdint>
+#include <iostream>
+#include <string>
+
+using uint32 = uint32_t;
+using int32 = int32_t;
+
+struct ObjectGuid
+{
+    uint64_t raw = 0;
+    ObjectGuid() = default;
+    explicit ObjectGuid(uint64_t value) : raw(value) {}
+    explicit operator bool() const { return raw != 0; }
+    static ObjectGuid const Empty;
+};
+ObjectGuid const ObjectGuid::Empty{};
+
+struct Unit
+{
+    ObjectGuid guid;
+    bool inWorld = true;
+    bool fields = true;
+
+    ObjectGuid GetGUID() const
+    {
+        if (!fields)
+            throw 1;
+        return guid;
+    }
+    bool IsInWorld() const
+    {
+        if (!fields)
+            throw 2;
+        return inWorld;
+    }
+};
+
+struct PlayerbotAI
+{
+    Unit* live = nullptr;
+    Unit* GetUnit(ObjectGuid guid) { return live && live->guid.raw == guid.raw ? live : nullptr; }
+};
+
+struct PerfMonitorOperation { void finish() {} };
+struct PerfMonitorStub
+{
+    PerfMonitorOperation* start(int, std::string const&, void*) { return nullptr; }
+};
+PerfMonitorStub sPerfMonitor;
+constexpr int PERF_MON_VALUE = 0;
+uint32 getMSTime() { return 2; }
+
+struct Context { int performanceStack = 0; };
+struct UnitCalculatedValue
+{
+    PlayerbotAI* botAI = nullptr;
+    Context* context = nullptr;
+    int32 checkInterval = 100;
+    uint32 lastCheckTime = 1;
+    Unit* value = nullptr;
+    ObjectGuid guid;
+    Unit* calculated = nullptr;
+
+    std::string const& getName() const
+    {
+        static std::string const name = "target";
+        return name;
+    }
+    Unit* Calculate() { return calculated; }
+    Unit* Get();
+};
+
+// REAL_BODY
+
+int main()
+{
+    Unit stale;
+    stale.guid = ObjectGuid(42);
+    stale.fields = false;
+    Unit live;
+    live.guid = ObjectGuid(42);
+    PlayerbotAI ai;
+    ai.live = &live;
+    UnitCalculatedValue value;
+    value.botAI = &ai;
+    value.value = &stale;
+    value.guid = ObjectGuid(42);
+    try
+    {
+        Unit* result = value.Get();
+        std::cout << "returned_live=" << (result == &live ? 1 : 0) << "\n";
+        return 0;
+    }
+    catch (...)
+    {
+        std::cout << "stale_pointer_dereferenced\n";
+        return 3;
+    }
+}
+"""
+
+
 def build(root, source_text, *, guid_argument):
     signature = (
         "bool AttackAction::Attack(ObjectGuid targetGuid"
@@ -400,6 +505,25 @@ def build(root, source_text, *, guid_argument):
     )
     if built.returncode != 0:
         raise RuntimeError("harness failed to compile:\n" + built.stderr)
+    return binary
+
+
+def build_unit_value(root, source_text):
+    body = function(source_text, "Unit* UnitCalculatedValue::Get()")
+    (root / "unit-value-replay.cpp").write_text(UNIT_VALUE_HARNESS.replace("// REAL_BODY", body))
+    compiler = shutil.which(os.environ.get("CXX", "c++"))
+    if compiler is None:
+        raise RuntimeError("C++ compiler required for the unit value replay")
+    binary = root / "unit-value-replay"
+    built = subprocess.run(  # noqa: S603 - fixed compiler invocation on harness text
+        [compiler, "-std=c++17", "-o", str(binary), str(root / "unit-value-replay.cpp")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if built.returncode != 0:
+        raise RuntimeError("unit value harness failed to compile:\n" + built.stderr)
     return binary
 
 
@@ -454,6 +578,10 @@ class AttackTargetPatchTest(unittest.TestCase):
             (pinned_root / "src/Ai/Base/Actions/AttackAction.cpp").read_text(),
             guid_argument=False,
         )
+        cls.pinned_unit_value = build_unit_value(
+            pinned_root,
+            (pinned_root / "src/Bot/Engine/Value/Value.cpp").read_text(),
+        )
 
         previous_root = root / "previous"
         copy_fixtures(previous_root)
@@ -487,10 +615,20 @@ class AttackTargetPatchTest(unittest.TestCase):
         cls.choose_target_source = (
             patched_root / "src/Ai/Base/Actions/ChooseTargetActions.cpp"
         ).read_text()
+        cls.unit_value_source = (
+            patched_root / "src/Bot/Engine/Value/Value.cpp"
+        ).read_text()
+        cls.unit_value_header = (
+            patched_root / "src/Bot/Engine/Value/Value.h"
+        ).read_text()
         cls.patched = build(
             patched_root,
             cls.patched_source,
             guid_argument=True,
+        )
+        cls.patched_unit_value = build_unit_value(
+            patched_root,
+            cls.unit_value_source,
         )
 
     def test_pinned_body_faults_on_departed_target(self):
@@ -585,6 +723,18 @@ class AttackTargetPatchTest(unittest.TestCase):
         self.assertIn('Set({guid})', self.choose_target_source)
         self.assertNotIn("rtiTarget->GetGUID()", self.choose_target_source)
         self.assertNotIn("Attack(botAI->GetUnit(", self.choose_target_source)
+
+    def test_legacy_unit_attack_callers_remain_compatible(self):
+        self.assertIn("bool Attack(Unit* target, bool with_pet = true);", self.attack_header_source)
+
+    def test_cached_unit_value_resolves_stale_pointer_by_saved_guid(self):
+        code, out = run(self.pinned_unit_value, "")
+        self.assertEqual(code, 3, out)
+        self.assertIn("stale_pointer_dereferenced", out)
+
+        code, out = run(self.patched_unit_value, "")
+        self.assertEqual(code, 0, out)
+        self.assertIn("returned_live=1", out)
 
 
 if __name__ == "__main__":
