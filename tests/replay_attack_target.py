@@ -450,24 +450,25 @@ struct UnitCalculatedValue
         return name;
     }
     Unit* Calculate() { return calculated; }
+    void Set(Unit* unit);
     Unit* Get();
 };
 
-// REAL_BODY
+// GET_BODY
+// SET_BODY
 
 int main()
 {
     Unit stale;
     stale.guid = ObjectGuid(42);
-    stale.fields = false;
     Unit live;
     live.guid = ObjectGuid(42);
     PlayerbotAI ai;
     ai.live = &live;
     UnitCalculatedValue value;
     value.botAI = &ai;
-    value.value = &stale;
-    value.guid = ObjectGuid(42);
+    value.Set(&stale);
+    stale.fields = false;
     try
     {
         Unit* result = value.Get();
@@ -509,8 +510,13 @@ def build(root, source_text, *, guid_argument):
 
 
 def build_unit_value(root, source_text):
-    body = function(source_text, "Unit* UnitCalculatedValue::Get()")
-    (root / "unit-value-replay.cpp").write_text(UNIT_VALUE_HARNESS.replace("// REAL_BODY", body))
+    get_body = function(source_text, "Unit* UnitCalculatedValue::Get()")
+    try:
+        set_body = function(source_text, "void UnitCalculatedValue::Set(Unit* unit)")
+    except ValueError:
+        set_body = "void UnitCalculatedValue::Set(Unit* unit) { value = unit; }"
+    harness = UNIT_VALUE_HARNESS.replace("// GET_BODY", get_body).replace("// SET_BODY", set_body)
+    (root / "unit-value-replay.cpp").write_text(harness)
     compiler = shutil.which(os.environ.get("CXX", "c++"))
     if compiler is None:
         raise RuntimeError("C++ compiler required for the unit value replay")
