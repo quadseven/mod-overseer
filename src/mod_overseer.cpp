@@ -5278,6 +5278,9 @@ struct PendingDeath
     uint16 mapId = 0;
     uint32 zoneId = 0;
     float x = 0.f, y = 0.f, z = 0.f;
+    // The core's liquid at the death point (#1158): the in-water bit is any
+    // liquid, and this says which. Unread until RecordDeath fills it.
+    OverseerDecisions::DeathLiquid liquid = OverseerDecisions::DeathLiquid::Unread;
 
     std::string killerType;    // 'creature' | 'player' | 'self' | 'environment'
     std::string killerName;
@@ -5607,6 +5610,26 @@ void RecordDeath(Player* player)
     d.x = player->GetPositionX();
     d.y = player->GetPositionY();
     d.z = player->GetPositionZ();
+    // THE SAME LIQUID DATA Unit::IsInWater READS (#1158). The fall guard's
+    // in-water bit is that status, which the core sets for magma and slime as
+    // well as water; Flags says which liquid it was. A body does not move on
+    // death, so the cached reading is still of this point.
+    static_assert(OverseerDecisions::DEATH_LIQUID_WATER == uint32(MAP_LIQUID_TYPE_WATER),
+                  "liquid bits mirror GridTerrainData.h");
+    static_assert(OverseerDecisions::DEATH_LIQUID_OCEAN == uint32(MAP_LIQUID_TYPE_OCEAN),
+                  "liquid bits mirror GridTerrainData.h");
+    static_assert(OverseerDecisions::DEATH_LIQUID_MAGMA == uint32(MAP_LIQUID_TYPE_MAGMA),
+                  "liquid bits mirror GridTerrainData.h");
+    static_assert(OverseerDecisions::DEATH_LIQUID_SLIME == uint32(MAP_LIQUID_TYPE_SLIME),
+                  "liquid bits mirror GridTerrainData.h");
+    static_assert(OverseerDecisions::DEATH_LIQUID_DARK_WATER == uint32(MAP_LIQUID_TYPE_DARK_WATER),
+                  "liquid bits mirror GridTerrainData.h");
+    {
+        LiquidData const& liquid = player->GetLiquidData();
+        d.liquid = liquid.Status == LIQUID_MAP_NO_WATER
+                       ? OverseerDecisions::DeathLiquid::None
+                       : OverseerDecisions::ClassifyDeathLiquid(liquid.Flags);
+    }
 
     if (Group* group = player->GetGroup())
     {
@@ -61074,6 +61097,24 @@ private:
     // when the answer is no.
     SchemaColumns _deathHitColumns{SchemaColumns::Unknown};
 
+    // Does overseer_death have liquid_type (2026_11_05_00_overseer_death_liquid.sql)?
+    // The same once-per-process question, for the same reason (#1158).
+    SchemaColumns _deathLiquidColumn{SchemaColumns::Unknown};
+
+    bool DeathLiquidColumnPresent()
+    {
+        if (_deathLiquidColumn != SchemaColumns::Unknown)
+            return _deathLiquidColumn == SchemaColumns::Present;
+        bool const present = SchemaHasColumns("overseer_death", "'liquid_type'", 1);
+        _deathLiquidColumn = present ? SchemaColumns::Present : SchemaColumns::Absent;
+        if (!present)
+            LOG_WARN("module.overseer",
+                     "overseer: overseer_death has no liquid_type "
+                     "(2026_11_05_00_overseer_death_liquid.sql has not been applied), so "
+                     "death rows are written without it");
+        return present;
+    }
+
     bool DeathHitColumnsPresent()
     {
         if (_deathHitColumns != SchemaColumns::Unknown)
@@ -61210,6 +61251,7 @@ private:
         // The four hit columns ship in a migration that may land in a later
         // image than this writer; without them the row is written as before.
         bool const hitColumns = DeathHitColumnsPresent();
+        bool const liquidColumn = DeathLiquidColumnPresent();
         std::ostringstream ss;
         ss << "INSERT INTO overseer_death (character_name, character_guid, level, "
               "map, zone, pos_x, pos_y, pos_z, killer_type, killer_name, killer_entry, "
@@ -61226,6 +61268,7 @@ private:
               "recovery_rung, recovery_prev_rung, recovery_seconds, "
               "fall_guard_standdown, fall_guard_seconds"
            << (hitColumns ? ", mana_at_death, max_mana_at_death, enemies_engaged, targeted_by" : "")
+           << (liquidColumn ? ", liquid_type" : "")
            << ") VALUES ";
         bool first = true;
         for (PendingDeath const& d : batch)
@@ -61293,6 +61336,14 @@ private:
                 else
                     ss << ",NULL,NULL,NULL,NULL";
             }
+            if (liquidColumn)
+            {
+                char const* const liquid = OverseerDecisions::DeathLiquidName(d.liquid);
+                if (liquid)
+                    ss << ",'" << liquid << "'";
+                else
+                    ss << ",NULL";
+            }
             ss << ')';
         }
         CharacterDatabase.Execute(ss.str().c_str());
@@ -61336,7 +61387,7 @@ private:
                  "overseer: recorded {} death(s), most recently '{}' at level {} "
                  "in zone {} at map {} position ({:.1f}, {:.1f}, {:.1f}) "
                  "(killer: {} '{}'; driven by {}, movement '{}', "
-                 "fell {:.1f} yards which is {}, in combat {}; fall guard {}, "
+                 "fell {:.1f} yards which is {}, in combat {}; liquid {}; fall guard {}, "
                  "and {})",
                  batch.size(), batch.back().characterName,
                  static_cast<uint32>(batch.back().level), batch.back().zoneId,
@@ -61349,6 +61400,10 @@ private:
                  batch.back().inCombat < 0
                      ? "unsampled"
                      : (batch.back().inCombat ? "yes" : "no"),
+                 // #1158: the liquid the drowning clause depends on, named.
+                 OverseerDecisions::DeathLiquidName(batch.back().liquid)
+                     ? OverseerDecisions::DeathLiquidName(batch.back().liquid)
+                     : "unread",
                  // #281. The column keeps the number so it can be grouped and
                  // counted; this is the same answer in words, so a reader
                  // watching the log sees it without a lookup table.
@@ -61361,7 +61416,8 @@ private:
                      OverseerDecisions::ReadSelfDeath(
                          {batch.back().fallGuardStandDown,
                           batch.back().fallGuardSeconds,
-                          batch.back().killerType == "self", account},
+                          batch.back().killerType == "self", account,
+                          batch.back().liquid},
                          DEATH_READING_LIMITS)));
     }
 
