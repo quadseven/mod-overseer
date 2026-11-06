@@ -24333,6 +24333,37 @@ bool MayOpenRunFor(bool sittingOut, bool lentToAGuildRun)
     return !sittingOut && !lentToAGuildRun;
 }
 
+std::vector<DcArmingSubject> DcArmingSubjects(
+    std::vector<std::string> const& rosterNames,
+    std::map<std::string, std::string> const& rosterFamilies,
+    std::vector<FamilyStandin> const& frozen)
+{
+    std::vector<DcArmingSubject> subjects;
+    std::set<std::string> seen;
+    for (std::string const& name : rosterNames)
+    {
+        if (name.empty() || !seen.insert(name).second)
+            continue;
+        auto const family = rosterFamilies.find(name);
+        subjects.push_back(DcArmingSubject{
+            name, family == rosterFamilies.end() ? std::string() : family->second, false});
+    }
+    for (FamilyStandin const& standin : frozen)
+    {
+        if (!standin.Active() || !standin.HasGuest())
+            continue;
+        if (rosterFamilies.count(standin.inName))
+            continue;
+        auto const head = rosterFamilies.find(standin.family);
+        if (head == rosterFamilies.end() || head->second.empty())
+            continue;
+        if (!seen.insert(standin.inName).second)
+            continue;
+        subjects.push_back(DcArmingSubject{standin.inName, head->second, true});
+    }
+    return subjects;
+}
+
 bool CountsAsInADungeonRun(bool onDungeonMap, bool activeRunOnMap, bool namedByAGuildRun)
 {
     return onDungeonMap && (activeRunOnMap || namedByAGuildRun);
