@@ -20398,6 +20398,28 @@ char const* StrandedGhostStepWord(StrandedGhostStep step)
     return "unknown";
 }
 
+GuildBodyStep GuildBodyNext(GuildBodyFacts const& facts)
+{
+    if (facts.ghost || facts.runTakesBack)
+        return GuildBodyStep::Wait;
+    if (!facts.clockRunning || facts.seconds < GUILD_RELEASE_GRACE_SECONDS)
+        return GuildBodyStep::Wait;
+    if (facts.alive)
+        return facts.health == 0 ? GuildBodyStep::Fall : GuildBodyStep::Wait;
+    return GuildBodyStep::Release;
+}
+
+char const* GuildBodyStepWord(GuildBodyStep step)
+{
+    switch (step)
+    {
+        case GuildBodyStep::Wait:    return "wait";
+        case GuildBodyStep::Release: return "release";
+        case GuildBodyStep::Fall:    return "fall";
+    }
+    return "unknown";
+}
+
 int NearestTrainerSpot(std::vector<TrainerSpot> const& spots, uint32_t mapId, float x, float y,
                        float maxYards)
 {

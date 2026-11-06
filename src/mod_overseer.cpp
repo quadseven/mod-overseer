@@ -8058,7 +8058,9 @@ public:
             return;
         RecordEvent(player, "death", 0, "", "");
         RecordDeath(player);
-        if (OnRoster(player->GetName()))
+        // The guild ghost drive's release clock reads the stamp too
+        // (wow-overseer#1879).
+        if (OnRoster(player->GetName()) || InNaturalGuild(player))
             StampDeath(player->GetName());
     }
 
@@ -33430,6 +33432,47 @@ private:
                                                     botAI != nullptr))
                 continue;
 
+            // NOTHING STOOD BEHIND THE DEAD ENGINE (wow-overseer#1879). See
+            // OverseerDecisions::GuildBodyNext: a corpse it did not release, or
+            // a member read alive at zero health, stayed that way for good.
+            // Each spell is timed by the release-prompt clock, so the grace is
+            // a run of this drive's own sightings and a new death restarts it.
+            bool const runTakesBack =
+                InAGuildRun(name) || InAWaitingGuildRun(name) || RaidRunBackWalks(name, now);
+            if (bot->IsAlive())
+                _guildUnreleased.erase(name);
+            if (!bot->IsAlive() || bot->GetHealth() != 0)
+                _guildZeroHealth.erase(name);
+
+            if (bot->IsAlive() && bot->GetHealth() == 0)
+            {
+                OverseerDecisions::ReleasePromptReading const reading =
+                    OverseerDecisions::ReleasePromptObserve(
+                        _guildZeroHealth[name], now, LastDeathAt(name),
+                        OverseerDecisions::RELEASE_PROMPT_MAX_GAP_SECONDS);
+                OverseerDecisions::GuildBodyFacts body;
+                body.alive = true;
+                body.health = 0;
+                body.clockRunning = reading.start == OverseerDecisions::ReleasePromptStart::Running;
+                body.seconds = reading.deadSeconds;
+                body.runTakesBack = runTakesBack;
+                if (OverseerDecisions::GuildBodyNext(body) == OverseerDecisions::GuildBodyStep::Fall)
+                {
+                    LOG_WARN("module.overseer",
+                             "overseer: guild member '{}' (level {}) has read alive at zero "
+                             "health for {}s at map {} ({:.0f}, {:.0f}) - no regeneration, "
+                             "refresh or recovery leaves that reading, so it dies as anything "
+                             "at zero health does (no durability loss) and is released like "
+                             "any other death (wow-overseer#1879)",
+                             name, bot->GetLevel(), reading.deadSeconds,
+                             static_cast<uint32>(bot->GetMapId()), bot->GetPositionX(),
+                             bot->GetPositionY());
+                    _guildZeroHealth.erase(name);
+                    bot->KillSelf(false);
+                    continue;
+                }
+            }
+
             if (bot->IsAlive())
             {
                 EndGhostRecovery(botAI, name);
@@ -33449,6 +33492,56 @@ private:
             // engine's; the second nothing else will ever recover
             // (DriveStrandedGhost).
             Corpse* corpse = bot->GetCorpse();
+            if (bot->HasPlayerFlag(PLAYER_FLAGS_GHOST))
+                _guildUnreleased.erase(name);
+            else
+            {
+                // A CORPSE ONLY EXISTS AFTER THE RELEASE, so an unreleased
+                // member reads exactly like a ghost whose corpse is on another
+                // map until the flag is read, and DriveStrandedGhost leaves it.
+                OverseerDecisions::ReleasePromptReading const reading =
+                    OverseerDecisions::ReleasePromptObserve(
+                        _guildUnreleased[name], now, LastDeathAt(name),
+                        OverseerDecisions::RELEASE_PROMPT_MAX_GAP_SECONDS);
+                OverseerDecisions::GuildBodyFacts body;
+                body.alive = false;
+                body.ghost = false;
+                body.health = bot->GetHealth();
+                body.clockRunning = reading.start == OverseerDecisions::ReleasePromptStart::Running;
+                body.seconds = reading.deadSeconds;
+                body.runTakesBack = runTakesBack;
+                if (OverseerDecisions::GuildBodyNext(body) != OverseerDecisions::GuildBodyStep::Release)
+                    continue;
+
+                // The client's own release request, as the dead engine sends
+                // it (AutoReleaseSpiritAction), so the core's own checks apply.
+                // GuildGhostDriven admits only a bot session, but a session is
+                // still read once and checked rather than assumed.
+                WorldSession* releaseSession = bot->GetSession();
+                if (!releaseSession)
+                    continue;
+                WorldPacket repop(CMSG_REPOP_REQUEST, 1);
+                repop << uint8(0);
+                releaseSession->HandleRepopRequestOpcode(repop);
+                // The handler runs BuildPlayerRepop on this thread, and its
+                // triggered ghost aura sets the flag before it returns, so this
+                // read is the release's own result. A member it did not turn
+                // into a ghost is asked again after a fresh grace.
+                bool const released = bot->HasPlayerFlag(PLAYER_FLAGS_GHOST);
+                LOG_WARN("module.overseer",
+                         "overseer: guild member '{}' (level {}) lay dead and unreleased for "
+                         "{}s at map {} ({:.0f}, {:.0f}) with nothing releasing it - "
+                         "{} (wow-overseer#1879)",
+                         name, bot->GetLevel(), reading.deadSeconds,
+                         static_cast<uint32>(bot->GetMapId()), bot->GetPositionX(),
+                         bot->GetPositionY(),
+                         released ? "released on its behalf, and it is a ghost now"
+                                  : "asked to release on its behalf, and it is not a ghost after "
+                                    "the request (a prevent-resurrection aura?) - asked again "
+                                    "after a fresh grace");
+                _guildUnreleased.erase(name);
+                continue;
+            }
             if (!corpse)
             {
                 DriveStrandedGhost(bot, botAI, name, now);
@@ -83481,6 +83574,10 @@ private:
     // character is seen alive or released; read and advanced only through
     // OverseerDecisions::ReleasePromptObserve (mod-overseer#252).
     std::map<std::string, OverseerDecisions::ReleasePromptClock> _awaitingRelease;
+    // The guild ghost drive's two clocks (wow-overseer#1879): a natural guild
+    // member dead and unreleased, and one read alive at zero health.
+    std::map<std::string, OverseerDecisions::ReleasePromptClock> _guildUnreleased;
+    std::map<std::string, OverseerDecisions::ReleasePromptClock> _guildZeroHealth;
 
     // WHICH DEATHS THIS DRIVE HAS SAID IT IS LEAVING TO THE HEALER, by name.
     // Same ownership and lifetime as _awaitingRelease: DriveStuckRevival on
