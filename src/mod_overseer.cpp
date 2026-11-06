@@ -31208,21 +31208,40 @@ private:
             "SELECT name FROM overseer_roster WHERE enabled = 1");
         if (!result)
             return;
+        std::vector<std::string> rosterNames;
+        do
+            rosterNames.push_back(result->Fetch()[0].Get<std::string>());
+        while (result->NextRow());
 
         // WHERE EACH FAMILY STANDS, BY MAP AND INSTANCE COPY (#620), read once
         // for the pass. A family spread over two copies of one dungeon is not
         // armed there at all: `dc on` in that state starts a run in a copy
-        // the rest of the family is not in.
-        std::map<std::string, std::string> const families = LoadRosterFamilies();
+        // the rest of the family is not in. Roster members only: a guest in
+        // another copy is not armed (below), and does not stop the family.
+        std::map<std::string, std::string> families = LoadRosterFamilies();
         std::map<std::string, std::vector<OverseerDecisions::InstanceSpot>> familySpots;
         for (auto const& [member, family] : families)
             if (Player* p = ObjectAccessor::FindPlayerByName(member); p && p->IsInWorld())
                 familySpots[family].push_back(
                     OverseerDecisions::InstanceSpot{p->GetMapId(), p->GetInstanceId()});
 
-        do
+        // THE ROSTER AND EVERY FROZEN STAND-IN GUEST (2026-11-05). The CLEARING
+        // census counts the guest and waits for `dc on` on it; see
+        // OverseerDecisions::DcArmingSubjects. The guest is filed under its
+        // head's family here so the leader-client hold and the walk out read
+        // it the same way as a member.
+        std::vector<OverseerDecisions::FamilyStandin> frozen;
+        for (auto const& entry : _frozenStandins)
+            frozen.push_back(entry.second);
+        std::vector<OverseerDecisions::DcArmingSubject> const subjects =
+            OverseerDecisions::DcArmingSubjects(rosterNames, families, frozen);
+        for (OverseerDecisions::DcArmingSubject const& subject : subjects)
+            if (subject.guest)
+                families[subject.name] = subject.family;
+
+        for (OverseerDecisions::DcArmingSubject const& subject : subjects)
         {
-            std::string const name = result->Fetch()[0].Get<std::string>();
+            std::string const& name = subject.name;
 
             // SteerableAI, not a bare lookup - a name can resolve to a Player
             // mid-login or mid-teardown with a PlayerbotAI that is non-null
@@ -31361,19 +31380,49 @@ private:
             // guild run's. The record is forgotten so the member is asked
             // afresh if it is ever seen inside for its family again.
             bool const lentToAGuildRun = NamedByAGuildRun(name);
-            if (!OverseerDecisions::MayOpenRunFor(SittingOutOfRuns(name), lentToAGuildRun))
+
+            // A STAND-IN GUEST JOINS ITS FAMILY'S RUN AND NEVER OPENS ONE
+            // (2026-11-05). Its family's members open and keep the row; a row
+            // kept alive by a guest alone would be the solo run #1092 ended.
+            // No row yet, or the guest in another copy from its family, is
+            // nothing to arm this pass.
+            uint32 runId = 0;
+            if (subject.guest)
             {
                 if (lentToAGuildRun)
                 {
                     _dcOnIssued.erase(name);
                     continue;
                 }
-                EndRunLedByMemberSittingOut(name, bot->GetMapId());
-                StandDownDungeonBrain(name, bot, botAI);
-                continue;
+                runId = ActiveRunIdOnMap(bot->GetMapId(), subject.family);
+                if (!runId)
+                    continue;
+                auto const spots = familySpots.find(subject.family);
+                bool sameCopy = false;
+                if (spots != familySpots.end())
+                    for (OverseerDecisions::InstanceSpot const& spot : spots->second)
+                        if (spot.mapId == bot->GetMapId() &&
+                            spot.instanceId == bot->GetInstanceId())
+                            sameCopy = true;
+                if (!sameCopy)
+                    continue;
             }
+            else
+            {
+                if (!OverseerDecisions::MayOpenRunFor(SittingOutOfRuns(name), lentToAGuildRun))
+                {
+                    if (lentToAGuildRun)
+                    {
+                        _dcOnIssued.erase(name);
+                        continue;
+                    }
+                    EndRunLedByMemberSittingOut(name, bot->GetMapId());
+                    StandDownDungeonBrain(name, bot, botAI);
+                    continue;
+                }
 
-            uint32 const runId = OpenOrTouchRun(name, bot->GetMapId());
+                runId = OpenOrTouchRun(name, bot->GetMapId());
+            }
             if (!runId)
             {
                 // The row was closed between the touch and the read-back. Not
@@ -31581,7 +31630,7 @@ private:
                          issuer->GetName(), name,
                          static_cast<uint32>(DUNGEON_DC_ON_RETRY_SECONDS));
             }
-        } while (result->NextRow());
+        }
     }
 
     void DriveBelowTerrainRecovery()

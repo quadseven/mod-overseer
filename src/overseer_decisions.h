@@ -27129,6 +27129,35 @@ bool SitsOutOfRuns(FamilyStandin const* standin, std::string const& name);
 // group, so the family's run table has nothing to say about it.
 bool MayOpenRunFor(bool sittingOut, bool lentToAGuildRun);
 
+// WHO THE ARMING DRIVE ISSUES `dc on` TO: every enabled roster character, and
+// every guest a frozen stand-in seats (2026-11-05). The CLEARING census counts
+// the run's party, guest included (RunParty), and holds its stall clock until
+// `dc on` is accepted on everyone inside. The drive read the roster table
+// alone, so a guest was never issued `dc on`, the census never read "all
+// accepted", and the clock that drives the `dc skip`, re-arm and exit ladder
+// never ran. Measured on the dev realm: a family sat in Maraudon for about
+// 57,000 seconds with the dungeon brain stopped ("the party never became
+// ready after 180s"), one "Not accepted: <guest>" line, and nothing after it,
+// until the guest logged out. A guest seated as the tank is the run's leader,
+// so `dc on` on it is the one that starts the clear.
+//
+// A guest never opens or touches a run row (`guest`): its family's members do
+// that, and a run kept alive by a guest alone would be the solo run #1092
+// ended. `family` is the roster family whose run the character belongs to,
+// empty when the roster does not say. A guest whose head is not on the roster,
+// or who is itself on the roster, is left out; CheckStandin refuses both rows
+// anyway. Roster order first, then guests in frozen order, each name once.
+struct DcArmingSubject
+{
+    std::string name;
+    std::string family;
+    bool guest{false};
+};
+std::vector<DcArmingSubject> DcArmingSubjects(
+    std::vector<std::string> const& rosterNames,
+    std::map<std::string, std::string> const& rosterFamilies,
+    std::vector<FamilyStandin> const& frozen);
+
 // Does a character count as inside a dungeon run, for every drive that stands
 // down for one? Only on a dungeon map, and then when a family run row is open
 // on that map, or when the character is named by a guild run. A guild run
