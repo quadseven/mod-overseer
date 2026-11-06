@@ -11,12 +11,13 @@
  * What TravelAimAtPosition returns is proved in test_catch_up_aim.cpp. What
  * only the adapter can get wrong, and what this file pins:
  *
- *  - TravelAimBook::Claim refuses a target longer than TRAVEL_AIM_COLUMN_CHARS
- *    before it reads a fence or runs the UPDATE, says the refused value, and
- *    answers false, so it writes nothing.
+ *  - TravelAimBook::Claim asks the movement ownership module (#1312), which
+ *    refuses a target longer than TRAVEL_AIM_COLUMN_CHARS before it reads or
+ *    writes anything (proved by behavior in test_movement_ownership.cpp);
+ *    Claim says the refused value and answers false.
  *  - The refusal counts characters through TravelAimFitsColumn, not bytes,
  *    and its LOG_ERROR is said once per name and target (wow-overseer#1517).
- *  - FenceRefuses predicts that refusal.
+ *  - FenceRefuses asks the same module, so it predicts that refusal.
  *  - The catch-up walk start sizes its aim with TravelAimAtPosition, and an
  *    empty answer returns before TravelAimBook::Claim is called.
  */
@@ -56,23 +57,24 @@ int main()
                            std::istreambuf_iterator<char>());
 
     // --- TravelAimBook::Claim -------------------------------------------------
+    // The order (width before any read, fence or write) is the module's and is
+    // proved by behavior in test_movement_ownership.cpp. What the adapter adds
+    // is the log line, said once per name and target, and the false answer.
     std::string const claim = Body(text, "    bool Claim(std::string const& name, std::string const& target,");
     if (claim.empty())
         return Fail("cannot find TravelAimBook::Claim");
+    if (claim.find("_wheel.Claim(") == std::string::npos)
+        return Fail("Claim must ask the movement ownership module");
+    if (claim.find("UPDATE") != std::string::npos || claim.find("Execute") != std::string::npos)
+        return Fail("Claim must not write the column itself; the module's adapter does");
     if (claim.find("target.size() > TRAVEL_AIM_COLUMN_CHARS") != std::string::npos)
         return Fail("Claim must not count the aim in bytes (wow-overseer#1517)");
-    std::size_t const guard = claim.find("if (!OverseerDecisions::TravelAimFitsColumn(target))");
+    std::size_t const guard = claim.find("case OverseerMovement::ClaimAnswer::TooLong:");
     if (guard == std::string::npos)
-        return Fail("Claim must refuse a target longer than TRAVEL_AIM_COLUMN_CHARS");
-    std::size_t const firstFence = claim.find("_state.find(name)");
-    std::size_t const update = claim.find("UPDATE overseer_roster SET travel_npc");
-    if (update == std::string::npos)
-        return Fail("cannot find the travel_npc UPDATE in Claim");
-    if (firstFence == std::string::npos || guard > firstFence || guard > update)
-        return Fail("the width refusal must come before any fence and before the UPDATE");
-    std::size_t const guardEnd = claim.find("\n        }\n", guard);
+        return Fail("Claim must answer the module's width refusal");
+    std::size_t const guardEnd = claim.find("\n            }\n", guard);
     if (guardEnd == std::string::npos)
-        return Fail("cannot find the end of the width refusal block");
+        return Fail("cannot find the end of the width refusal case");
     std::string const refusal = claim.substr(guard, guardEnd - guard);
     if (refusal.find("return false;") == std::string::npos)
         return Fail("the width refusal must answer false");
@@ -89,17 +91,25 @@ int main()
         return Fail("the width refusal must be said once per name and target");
     if (claim.find("_aimTooLongSaid.erase(name);") == std::string::npos)
         return Fail("a written aim must forget the last width refusal");
-    if (refusal.find("Execute") != std::string::npos ||
-        refusal.find("UPDATE") != std::string::npos)
-        return Fail("the width refusal must write nothing");
+
+    // --- the module -----------------------------------------------------------
+    std::ifstream header("src/overseer_movement_ownership.h");
+    if (!header)
+        return Fail("cannot read src/overseer_movement_ownership.h");
+    std::string const module((std::istreambuf_iterator<char>(header)),
+                             std::istreambuf_iterator<char>());
+    if (module.find("aim.size()") != std::string::npos ||
+        module.find("target.size()") != std::string::npos)
+        return Fail("the module must not count the aim in bytes (wow-overseer#1517)");
+    if (module.find("!OverseerDecisions::TravelAimFitsColumn(target)") == std::string::npos)
+        return Fail("the module must refuse an aim wider than the column");
 
     // --- FenceRefuses ---------------------------------------------------------
     std::string const fence = Body(text, "    bool FenceRefuses(std::string const& name, std::string const& target,");
     if (fence.empty())
         return Fail("cannot find TravelAimBook::FenceRefuses");
-    if (fence.find("target.size() > TRAVEL_AIM_COLUMN_CHARS") != std::string::npos ||
-        fence.find("!OverseerDecisions::TravelAimFitsColumn(target)") == std::string::npos)
-        return Fail("FenceRefuses must predict the width refusal");
+    if (fence.find("_wheel.FenceRefuses(") == std::string::npos)
+        return Fail("FenceRefuses must ask the module, which predicts the width refusal");
 
     // --- the catch-up walk start ----------------------------------------------
     char const* const claimCall =
