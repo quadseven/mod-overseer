@@ -174,7 +174,7 @@ void TheModuleAsksTheDecisions()
           body.find("bool const wasDriving = OverseerDecisions::ReleaseLandsAim(") !=
               std::string::npos);
     Check("the landing reads any claim the book holds",
-          body.find("landingFacts.anyClaim = claimedAim != _claimed.end();") !=
+          body.find("landingFacts.anyClaim = released.anyClaim;") !=
               std::string::npos);
     Check("the inverted test is gone",
           body.find("wasDriving = claimed &&") == std::string::npos);
