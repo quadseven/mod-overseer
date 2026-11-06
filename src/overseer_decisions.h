@@ -10306,6 +10306,79 @@ struct StrandedFacts
 
 StrandedWay DecideStrandedWay(StrandedFacts const& facts);
 
+// WHO ELSE DECIDES WHERE A STRANDED MEMBER GOES (#1143), the fact behind
+// `familyOwnsTheWay`. Measured on the dev realm 2026-10-20: a member hearthed
+// to map 1 by a failed EXIT while its leader stood on map 0 stayed there 11 h
+// 50 min with no crossing and no reason line, and crossed 8 minutes after a
+// restart cleared what the module remembered. So what held it was memory, not
+// the roster, and two of the owners the party poll counted are memory that
+// outlives the thing it records:
+//
+//   - ANY ESCORT THAT WAS NOT A CATCH-UP OR ITS OWN CROSSING counted as a run's
+//     escort, so a walk back in or a home errand left from the exit episode
+//     read as the family deciding where the member goes. Neither can cross a
+//     map, and neither is the family moving. WalkToLeadersDoor already reads
+//     a run's escort this way; this is the same rule.
+//   - THE FAMILY'S CROSSING counted from its clock alone, and that clock is
+//     only stopped by the crossing's own drive. A crossing no poll reads is
+//     moving nobody: the crossing hold on the leader is already let go for that
+//     reason (ReleaseUnreadCrossingHold, #758), and so is the member's.
+//
+// A STAND-DOWN IS SAID ONCE PER CHANGE OF WAY, and DriveCatchUp returns without
+// a word for a member any escort holds, so either owner held the member in
+// silence. What the owner was is named in the reason line below.
+struct StrandedOwners
+{
+    // The family's coordinator has a crossing clock running or passengers.
+    bool familyCrossingOpen{false};
+    // The coordinator's last poll read that crossing (crossingReadThisPoll).
+    bool familyCrossingRead{false};
+    // Somebody of the family was a passenger of the crossing on that poll.
+    bool familyAboard{false};
+    // An escort entry holds this member, and which owner it is.
+    bool escort{false};
+    bool escortCatchUp{false};
+    bool escortCrossing{false};
+    bool escortRejoin{false};
+    bool escortHomeBind{false};
+    // It is inside a dungeon a run has open (InDungeonRun).
+    bool insideRun{false};
+    // The leader's dungeon job has its door on this member's continent and the
+    // family walks to doors: the family is coming here.
+    bool familyComesHere{false};
+};
+
+enum class StrandedOwner : std::uint8_t
+{
+    Nobody,
+    FamilyCrossing,
+    RunEscort,
+    InsideRun,
+    FamilyComesHere,
+};
+
+// The first owner that really decides where the member goes, or Nobody.
+StrandedOwner WhoOwnsStrandedWay(StrandedOwners const& owners);
+
+// The owner as the clause a log line says it in.
+char const* StrandedOwnerWhy(StrandedOwner owner);
+
+// A SPLIT IS NEVER SILENT PAST THIS (#1143). Every line beside a verdict is
+// said once per change, so a verdict that holds for hours says nothing after
+// its first poll. Past this much split, one line per member names the verdict
+// and the fact that holds it, and again each time this much more has passed.
+constexpr std::int64_t STRANDED_SPLIT_REASON_SECONDS = 15 * 60;
+
+// Is the reason line due? `splitSeconds` is how long this member has been on
+// another map from its leader; `secondsSinceSaid` is negative while this split
+// has not been explained yet.
+bool StrandedSplitReasonDue(std::int64_t splitSeconds, std::int64_t secondsSinceSaid);
+
+// The line: the member, both maps, how long, the verdict and what holds it.
+std::string StrandedSplitReasonLine(std::string const& name, std::uint32_t memberMap,
+                                    std::uint32_t leaderMap, std::int64_t splitSeconds,
+                                    char const* verdict, std::string const& why);
+
 // STEPPING OFF A DOCKED DECK MEANS LEAVING THE TRANSPORT (#274). The walk-off
 // counted a passenger within its landed distance of surveyed ground as off and
 // moved it no further. But a passenger is a passenger until the transport lets
