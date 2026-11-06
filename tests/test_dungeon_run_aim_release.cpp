@@ -35,6 +35,11 @@ void TheEndedRunCanClearOnlyItsExactPositionalAim()
           !OverseerDecisions::RunAimMayBeReleased("", ""));
 }
 
+// The run finalizer ends its claim, then retires its exact recorded leg,
+// both through the movement ownership module (#1312). What those two calls do
+// is proved by behavior in test_movement_ownership.cpp (the run that ends while
+// a newer aim stands, and the run whose claim a restart lost); this pins that
+// the finalizer asks them in that order and writes no SQL of its own.
 void RunCompletionUsesAnExactCompareAndSwap()
 {
     std::ifstream file("src/mod_overseer.cpp");
@@ -48,26 +53,28 @@ void RunCompletionUsesAnExactCompareAndSwap()
         return;
     std::string const finalizer = source.substr(end, 12000);
     std::size_t const release = finalizer.find(
-        "_travelAims.ReleaseRunAim(");
-    std::size_t const guardedRelease = finalizer.find("RunAimMayBeReleased(");
+        "bool const mayClearRecordedRunAim = _travelAims.ReleaseRunAim(");
+    std::size_t const retire = finalizer.find(
+        "_travelAims.RetireRunAim(leaderName, recordedRunAim, mayClearRecordedRunAim)");
     Check("run-scoped owner release remains", release != std::string::npos);
-    Check("stale run aim is considered after scoped release",
-          release != std::string::npos && guardedRelease > release);
-    std::size_t const clear = finalizer.find("CharacterDatabase.DirectExecute(");
-    std::string const clearCall = clear == std::string::npos
-        ? std::string() : finalizer.substr(clear, 800);
-    Check("database clear compares the character and exact recorded aim",
-          clearCall.find("WHERE name = '{}' AND") != std::string::npos &&
-              clearCall.find("travel_npc = '{}' AND enabled = 1") !=
-                  std::string::npos);
-    Check("the exact fallback clear completes before the next travel poll",
-          finalizer.find("CharacterDatabase.DirectExecute(") != std::string::npos);
-    Check("the CAS uses the captured run leg",
-          finalizer.find("Esc(leaderName), Esc(recordedRunAim)") != std::string::npos);
-    Check("run-specific provenance gates the fallback CAS",
-          finalizer.find("mayClearRecordedRunAim &&") != std::string::npos);
-    Check("completion uses the run-scoped release path",
-          finalizer.find("_travelAims.ReleaseRunAim(") != std::string::npos);
+    Check("the exact leg is retired after the scoped release, gated on its answer",
+          release != std::string::npos && retire != std::string::npos && retire > release);
+    Check("the finalizer writes no travel column SQL of its own",
+          finalizer.find("SET travel_npc") == std::string::npos);
+
+    std::ifstream header("src/overseer_movement_ownership.h");
+    std::stringstream headerContents;
+    headerContents << header.rdbuf();
+    std::string const module = headerContents.str();
+    std::size_t const retireBody = module.find("RunAimRetireResult RetireRunAim(");
+    Check("the module retires a run leg", retireBody != std::string::npos);
+    if (retireBody == std::string::npos)
+        return;
+    std::string const body = module.substr(retireBody, 1200);
+    Check("only the exact positional leg is retired",
+          body.find("OverseerDecisions::RunAimMayBeReleased(") != std::string::npos);
+    Check("by the synchronous compare-and-swap that the next read sees",
+          body.find("_column.ClearNowIfStill(name, recordedRunAim)") != std::string::npos);
 }
 
 void ExitCrossingRecordsTheAimRunCompletionMustRelease()
@@ -97,6 +104,11 @@ void ExitCrossingRecordsTheAimRunCompletionMustRelease()
               recordedAim > doorAim);
 }
 
+// Every travel release asks the movement ownership module, whose release is
+// proved by behavior in test_movement_ownership.cpp: a changed column is not
+// erased by a stale claim, and a run's release leaves a newer aim and its
+// owner's claim in place. What the adapter can still get wrong is ending the
+// newer owner's intent before it looks at the module's answer.
 void GeneralTravelReleaseCannotEraseAChangedAim()
 {
     std::ifstream file("src/mod_overseer.cpp");
@@ -108,26 +120,12 @@ void GeneralTravelReleaseCannotEraseAChangedAim()
     if (release == std::string::npos)
         return;
     std::string const body = source.substr(release, 9000);
-    Check("a claim counts only when its recorded aim still matches",
-          body.find("claimedAim->second == standing") != std::string::npos);
-    // (#822) The changed-column fence moved into TravelReleaseGate: the
-    // release feeds its claim facts to the gate, and the gate's changed-column
-    // behavior is pinned behaviorally in test_release_gate_claimed.cpp. What
-    // this still pins, structurally, is that the release consults whether the
-    // column moved - and whose claim stands - before its column write.
-    Check("a changed live aim fences the stale claim's release",
-          body.find("changedSinceClaim") != std::string::npos &&
-              body.find("TravelReleaseGate(") != std::string::npos);
-    Check("the generic clear compares against the freshly read aim",
-          body.find("AND travel_npc = '{}'\", Esc(name), Esc(standing)") !=
-              std::string::npos);
-    Check("run-scoped release requires the recorded aim",
+    Check("the general release asks the module",
+          body.find("_wheel.Release(name, std::time(nullptr))") != std::string::npos);
+    Check("the run-scoped release asks the module with the recorded aim",
           body.find("bool ReleaseRunAim(") != std::string::npos &&
-              body.find("claimed->second == expectedAim") != std::string::npos);
-    Check("run-scoped release recognizes only run-owned aim kinds",
-          body.find("TravelOwner::WalkBackIn") != std::string::npos &&
-              body.find("TravelOwner::Exit") != std::string::npos);
-    std::size_t const scopedMismatch = body.find("if (mismatchesRunAim)");
+              body.find("_wheel.ReleaseRunAim(name, expectedAim,") != std::string::npos);
+    std::size_t const scopedMismatch = body.find("if (released.leftNewerAim)");
     std::size_t const intentEnd = body.find("EndLeaderColumnIntent(name");
     std::size_t const mismatchReturn = body.find("return;", scopedMismatch);
     Check("a foreign run-end aim returns before ending the newer intent",

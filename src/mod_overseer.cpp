@@ -321,6 +321,9 @@
 #include "overseer_disenchant.h"
 #include "overseer_disenchant_store.h"
 #include "overseer_crash.h"
+// Who holds a character's wheel: the travel column's claim, release and
+// hand-back rules behind one interface (#1312). See RosterAimColumn below.
+#include "overseer_movement_ownership.h"
 // The core and mod-playerbots APIs that differ between the pins build.yml
 // compiles against and the upstream heads (wow-overseer#826).
 #include "overseer_core_compat.h"
@@ -6148,6 +6151,83 @@ void LeaderIntentForTravelOwner(OverseerDecisions::TravelOwner owner,
 // stamp the clock" a question every call site answers again, which is how the
 // asymmetry got here in the first place. Two verbs make it a property of what
 // is being done rather than of who is doing it.
+//
+// THE RULES THEMSELVES LIVE IN OverseerMovement::MovementOwnership (#1312):
+// the fences, the claim memory, the exact-aim release a finished run makes and
+// the hand-back clock. This book keeps the errand memory and the log lines,
+// and asks that module for every column decision. RosterAimColumn is the
+// module's production adapter and the only code in this file that names the
+// column in an UPDATE.
+class RosterAimColumn final : public OverseerMovement::AimColumn
+{
+public:
+    // `travel_npc`, READ FRESH, FOR THE SAME REASON PendingLearnSkill READS
+    // `learn_skill` FRESH (infra#3655): the question is whether a python
+    // economy pass currently owns this column, not what this book last wrote
+    // to it. Unlike a profession errand, a vendor/banker/repair errand has no
+    // separate outstanding flag - the keyword itself, sitting in the column
+    // right now, IS bridge.py's record that _write_trade_errand (or
+    // craft_supply.py's own "get near any vendor first" write) put this
+    // character there and it has not yet resolved into a walk or a completed
+    // transaction.
+    static std::string ReadColumn(std::string const& name)
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT travel_npc FROM overseer_roster WHERE name = '{}'", Esc(name));
+        if (!result)
+            return std::string();
+        return result->Fetch()[0].Get<std::string>();
+    }
+
+    // IS A PROFESSION ERRAND OUTSTANDING FOR `name` RIGHT NOW (mod-overseer#435)?
+    // A single indexed-PK read, done only at the point a claim or a release
+    // is about to overwrite or erase this character's travel_npc - not on
+    // every poll, so it does not reintroduce the whole-roster cost
+    // TravelAimBook::Load was written to avoid. `learn_skill` is the bridge's
+    // own record of "somebody still needs to learn this"; it is cleared by
+    // mod-overseer itself when the trainer verb succeeds (see the
+    // unlearn-drive comment near infra#2757), so a non-zero answer here means
+    // the errand is real, not stale.
+    static uint32 ReadLearnSkill(std::string const& name)
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT learn_skill FROM overseer_roster WHERE name = '{}'", Esc(name));
+        if (!result)
+            return 0;  // no such row, or a schema without the column - same answer as "none"
+        return result->Fetch()[0].Get<uint32>();
+    }
+
+    std::string Read(std::string const& name) override { return ReadColumn(name); }
+    uint32_t PendingLearnSkill(std::string const& name) override { return ReadLearnSkill(name); }
+
+    // Esc() rather than a bare interpolation, the same discipline every other
+    // write in this file applies: the name came out of a table a person edits,
+    // and a later change to the aim format cannot silently reopen the question.
+    void Write(std::string const& name, std::string const& aim) override
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_roster SET travel_npc = '{}' WHERE name = '{}'",
+            Esc(aim), Esc(name));
+    }
+
+    void ClearIfStill(std::string const& name, std::string const& expected) override
+    {
+        CharacterDatabase.Execute(
+            "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}' "
+            "AND travel_npc = '{}'", Esc(name), Esc(expected));
+    }
+
+    // Synchronous, so the travel poll that asked reads the blank. `learn_skill`
+    // is not touched: a trainer trip it names is still walked, by its writer.
+    void ClearNowIfStill(std::string const& name, std::string const& expected) override
+    {
+        CharacterDatabase.DirectExecute(
+            "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}' AND travel_npc = '{}' "
+            "AND enabled = 1",
+            Esc(name), Esc(expected));
+    }
+};
+
 class TravelAimBook
 {
 public:
@@ -6469,40 +6549,12 @@ public:
     // direction: if the bridge overwrites or clears this column, the next
     // DriveTravel poll re-reads it and the poll after that claims again.
 
-    // IS A PROFESSION ERRAND OUTSTANDING FOR `name` RIGHT NOW (mod-overseer#435)?
-    // A single indexed-PK read, done only at the point Claim() or Release()
-    // is about to overwrite or erase this character's travel_npc - not on
-    // every poll, so it does not reintroduce the whole-roster cost Load()
-    // above was written to avoid. `learn_skill` is the bridge's own record of
-    // "somebody still needs to learn this"; it is cleared by mod-overseer
-    // itself when the trainer verb succeeds (see the unlearn-drive comment
-    // near infra#2757), so a non-zero answer here means the errand is real,
-    // not stale.
-    static uint32 LearnSkillPending(std::string const& name)
-    {
-        QueryResult result = CharacterDatabase.Query(
-            "SELECT learn_skill FROM overseer_roster WHERE name = '{}'", Esc(name));
-        if (!result)
-            return 0;  // no such row, or a schema without the column - same answer as "none"
-        return result->Fetch()[0].Get<uint32>();
-    }
-
-    // `travel_npc`, READ FRESH, FOR THE SAME REASON LearnSkillPending READS
-    // `learn_skill` FRESH (infra#3655): the question is whether a python
-    // economy pass currently owns this column, not what this book last wrote
-    // to it. Unlike a profession errand, a vendor/banker/repair errand has no
-    // separate outstanding flag - the keyword itself, sitting in the column
-    // right now, IS bridge.py's record that _write_trade_errand (or
-    // craft_supply.py's own "get near any vendor first" write) put this
-    // character there and it has not yet resolved into a walk or a completed
-    // transaction.
+    // `travel_npc` read fresh. The query lives on RosterAimColumn, the one
+    // adapter that touches the column; this name stays for the readers that
+    // only need to know what stands there.
     static std::string CurrentTravelNpc(std::string const& name)
     {
-        QueryResult result = CharacterDatabase.Query(
-            "SELECT travel_npc FROM overseer_roster WHERE name = '{}'", Esc(name));
-        if (!result)
-            return std::string();
-        return result->Fetch()[0].Get<std::string>();
+        return RosterAimColumn::ReadColumn(name);
     }
 
     // ANSWERS WHETHER THE AIM IS NOW IN THE COLUMN (#560): true when this call
@@ -6521,164 +6573,126 @@ public:
     bool Claim(std::string const& name, std::string const& target,
                OverseerDecisions::TravelOwner owner)
     {
-        // THE AIM HAS TO FIT THE COLUMN BEFORE ANY FENCE IS ASKED (#1139).
-        // `overseer_roster.travel_npc` is TRAVEL_AIM_COLUMN_CHARS wide. In
-        // strict mode MySQL refuses an over-long row (errno 1406) and the core
-        // logs the refusal without the value, so the caller believes the aim
-        // was written; outside strict mode it truncates, and a truncated aim
-        // is one the parser can never read back. Either way the walk never
-        // starts. Every writer is meant to size its own aim
-        // (OverseerDecisions::TravelAimAtPosition); this is the backstop so a
-        // future writer cannot reopen the hole, and it names the value the
-        // core's own error leaves out.
-        //
-        // COUNTED IN CHARACTERS, AND SAID ONCE PER NAME AND TARGET
-        // (wow-overseer#1517). The column is VARCHAR in characters, so a byte
-        // count refused an NPC name with multibyte letters that MySQL would
-        // have stored. And a caller re-asks the same aim on every poll, so the
-        // error is said when the refused aim changes, not every time.
-        if (!OverseerDecisions::TravelAimFitsColumn(target))
-        {
-            auto const said = _aimTooLongSaid.find(name);
-            if (said == _aimTooLongSaid.end() || said->second != target)
-            {
-                _aimTooLongSaid[name] = target;
-                LOG_ERROR("module.overseer",
-                          "overseer: travel aim '{}' for '{}' is {} characters and "
-                          "overseer_roster.travel_npc holds {}, so it is refused and "
-                          "nothing is written (#1139). Said once per aim",
-                          target, name,
-                          uint32(OverseerDecisions::Utf8CharCount(target)),
-                          uint32(TRAVEL_AIM_COLUMN_CHARS));
-            }
-            _claimRefusalSaid[name] = "an aim too long for the travel column";
-            return false;
-        }
-
+        // A cached drive can outlive another owner's change to the column, so
+        // the module trusts it only while the column still holds this aim.
         auto const it = _state.find(name);
-        // A cached drive can outlive another owner's change to the column.
-        std::string const column = CurrentTravelNpc(name);
         bool const cachedDrive = it != _state.end() && it->second.target == target;
-        if (cachedDrive && column == target)
-            return true;
-
-        // TWO FENCES, EACH READ ONCE (#435, #497, #560). A STANDING
-        // PROFESSION ERRAND outranks any aim this book would take:
-        // `learn_skill` non-zero means the bridge has sent this
-        // character to a trainer, a plan that outlives a single poll, and a
-        // dungeon leader mid-crossing must not silently steal the column from
-        // underneath it. A STANDING ECONOMY OR POSITIONAL ERRAND outranks it
-        // the same way: the keyword or `at:` aim sitting in the column is the
-        // bridge's record that a vendor, banker, repair or surveyed walk has
-        // not resolved yet, and re-claiming a catch-up over it every poll is
-        // how a crafter's vial errand never got a sustained shot at completing.
-        //
-        // WHAT IS NEW IS WHERE THE ANSWER LIVES. The decision is
-        // OverseerDecisions::ReadTravelClaim, with the three cases #560 names
-        // under test, and two readings this function did not take before: a
-        // catch-up over an EMPTY column is not refused for a profession errand,
-        // because there is no trainer walk to overwrite, and an aim THIS BOOK
-        // wrote is not foreign, because replacing it disturbs nobody's walk
-        // but the book's own. The second is what lets a catch-up re-aim and a
-        // run's next leg replace the book's previous `at:` aim.
-        OverseerDecisions::TravelClaimFacts facts(owner);
-        facts.learnSkill = LearnSkillPending(name);
-        facts.column = column;
-        auto const ours = _claimed.find(name);
-        facts.columnIsOurs = ours != _claimed.end() && ours->second == facts.column;
-        facts.target = target;
-        OverseerDecisions::TravelClaim const verdict = OverseerDecisions::ReadTravelClaim(facts);
-        bool const writes = verdict == OverseerDecisions::TravelClaim::Write ||
-                            verdict == OverseerDecisions::TravelClaim::Outrank ||
-                            verdict == OverseerDecisions::TravelClaim::Preempt;
-        if (!writes)
-        {
-            // SAID ONCE PER STATE, NOT ONCE PER POLL (#560). A catch-up is
-            // re-asked on every party poll and a refusal can stand for as long
-            // as the errand does, which was the same four lines every thirty
-            // seconds. The fence and its value are the state; the target is
-            // not, because a catch-up target moves with the leader.
-            std::string const why =
-                verdict == OverseerDecisions::TravelClaim::RefusedProfession
-                    ? "a profession errand (skill " + std::to_string(facts.learnSkill) + ")"
-                    : "errand '" + facts.column + "'";
-            auto const said = _claimRefusalSaid.find(name);
-            if (said == _claimRefusalSaid.end() || said->second != why)
-            {
-                _claimRefusalSaid[name] = why;
-                LOG_INFO("module.overseer",
-                         "overseer: travel aim '{}' for '{}' refused - {} is outstanding "
-                         "and this book did not issue it (cached drive: {}). Said once until the fence "
-                         "changes or an aim is written",
-                         target, name, why, cachedDrive);
-            }
-            return false;
-        }
         // A FAMILY LEADER'S COLUMN IS WRITTEN ONLY FOR THE INTENT THAT HOLDS
-        // HIM (wow-overseer#335 follow-up). The fences above are about whose
-        // errand the column already carries; this is about whose turn it is.
-        // A refusal here leaves the column exactly as it was.
-        {
+        // HIM (wow-overseer#335 follow-up). The fences are about whose errand
+        // the column already carries; this is about whose turn it is. The
+        // module asks it only once every fence has passed, and a refusal
+        // leaves the column exactly as it was.
+        auto const leadersTurn = [&]() -> bool {
             OverseerDecisions::LeaderIntentKind kind = OverseerDecisions::LeaderIntentKind::None;
             std::string ownerWord;
             LeaderIntentForTravelOwner(owner, kind, ownerWord);
             bool const fetchHoldsHim =
                 kind == OverseerDecisions::LeaderIntentKind::FetchMember &&
                 LeaderIntentNow(name) == OverseerDecisions::LeaderIntentKind::FetchMember;
-            if (!fetchHoldsHim &&
-                !AskForLeader(name, kind, ownerWord, target, "claims the travel column"))
+            return fetchHoldsHim ||
+                   AskForLeader(name, kind, ownerWord, target, "claims the travel column");
+        };
+        OverseerMovement::ClaimResult const claim =
+            _wheel.Claim(name, target, owner, cachedDrive, leadersTurn);
+        switch (claim.answer)
+        {
+            case OverseerMovement::ClaimAnswer::AlreadyDriving:
+                return true;
+            case OverseerMovement::ClaimAnswer::TooLong:
             {
-                _claimRefusalSaid[name] = "another intent that holds the leader";
+                // THE AIM HAS TO FIT THE COLUMN BEFORE ANY FENCE IS ASKED
+                // (#1139). `overseer_roster.travel_npc` is
+                // TRAVEL_AIM_COLUMN_CHARS wide. In strict mode MySQL refuses an
+                // over-long row (errno 1406) and the core logs the refusal
+                // without the value, so the caller believes the aim was
+                // written; outside strict mode it truncates, and a truncated
+                // aim is one the parser can never read back. The module
+                // refuses it before it reads or writes anything; this names
+                // the value the core's own error leaves out.
+                //
+                // SAID ONCE PER NAME AND TARGET (wow-overseer#1517): a caller
+                // re-asks the same aim on every poll, so the error is said when
+                // the refused aim changes, not every time.
+                auto const said = _aimTooLongSaid.find(name);
+                if (said == _aimTooLongSaid.end() || said->second != target)
+                {
+                    _aimTooLongSaid[name] = target;
+                    LOG_ERROR("module.overseer",
+                              "overseer: travel aim '{}' for '{}' is {} characters and "
+                              "overseer_roster.travel_npc holds {}, so it is refused and "
+                              "nothing is written (#1139). Said once per aim",
+                              target, name,
+                              uint32(OverseerDecisions::Utf8CharCount(target)),
+                              uint32(TRAVEL_AIM_COLUMN_CHARS));
+                }
+                _claimRefusalSaid[name] = "an aim too long for the travel column";
                 return false;
             }
+            case OverseerMovement::ClaimAnswer::Fenced:
+            {
+                // A STANDING PROFESSION, ECONOMY OR POSITIONAL ERRAND OUTRANKS
+                // THE AIM (#435, #497, #560); OverseerDecisions::ReadTravelClaim
+                // decides, through the module. SAID ONCE PER STATE, NOT ONCE PER
+                // POLL (#560): a catch-up is re-asked on every party poll and a
+                // refusal can stand as long as the errand does. The fence and
+                // its value are the state; the target is not, because a
+                // catch-up target moves with the leader.
+                std::string const why =
+                    claim.verdict == OverseerDecisions::TravelClaim::RefusedProfession
+                        ? "a profession errand (skill " + std::to_string(claim.learnSkill) + ")"
+                        : "errand '" + claim.column + "'";
+                auto const said = _claimRefusalSaid.find(name);
+                if (said == _claimRefusalSaid.end() || said->second != why)
+                {
+                    _claimRefusalSaid[name] = why;
+                    LOG_INFO("module.overseer",
+                             "overseer: travel aim '{}' for '{}' refused - {} is outstanding "
+                             "and this book did not issue it (cached drive: {}). Said once until the fence "
+                             "changes or an aim is written",
+                             target, name, why, cachedDrive);
+                }
+                return false;
+            }
+            case OverseerMovement::ClaimAnswer::LeaderBusy:
+                _claimRefusalSaid[name] = "another intent that holds the leader";
+                return false;
+            case OverseerMovement::ClaimAnswer::Written:
+                break;
         }
         _claimRefusalSaid.erase(name);
         _aimTooLongSaid.erase(name);
         // A LIVE RUN TAKING THE COLUMN OVER SOMEBODY'S WALK IS SAID, ONCE PER
         // TAKEOVER (#656). The next claim finds the aim is the book's own and
         // writes quietly, so this prints once for each aim it replaces.
-        if (verdict == OverseerDecisions::TravelClaim::Outrank)
+        if (claim.verdict == OverseerDecisions::TravelClaim::Outrank)
             LOG_INFO("module.overseer",
                      "overseer: a live dungeon run takes the travel column for '{}' - "
                      "'{}' replaces '{}'{}. The run outranks a trainer trip and a "
                      "positional walk, and releasing its aim blanks only the column, so "
                      "the trainer trip is walked after the run (#656)",
-                     name, target, facts.column,
-                     facts.learnSkill != 0
+                     name, target, claim.column,
+                     claim.learnSkill != 0
                          ? ", with a profession errand (skill " +
-                               std::to_string(facts.learnSkill) + ") left pending"
+                               std::to_string(claim.learnSkill) + ") left pending"
                          : std::string());
 
         // A TRAINING STOP TAKING THE COLUMN FROM A TOWN ERRAND IS SAID, ONCE PER
         // TAKEOVER (2026-09-29), for the same reason a run's is: the bridge
         // wrote the errand and will write it again when the column is empty.
-        if (verdict == OverseerDecisions::TravelClaim::Preempt)
+        if (claim.verdict == OverseerDecisions::TravelClaim::Preempt)
             LOG_INFO("module.overseer",
                      "overseer: a training stop takes the travel column for '{}' - '{}' "
                      "replaces the town errand '{}'. The family's class spells and "
                      "professions come before its shopping, and the bridge writes the "
                      "errand again when the stop lets go",
-                     name, target, facts.column);
+                     name, target, claim.column);
 
-        // Esc() rather than a bare interpolation, the same discipline every
-        // other write in this file applies: the name came out of a table a
-        // person edits, and a later change to the aim format cannot silently
-        // reopen the question.
-        CharacterDatabase.Execute(
-            "UPDATE overseer_roster SET travel_npc = '{}' WHERE name = '{}'",
-            Esc(target), Esc(name));
+        // A new aim is a new errand: the walk memory and any landing go. The
+        // module now holds the claim and its owner, which is what tells a
+        // run's own errand from anybody else's (the death breaker reads it).
         _state.erase(name);
         _landed.erase(name);
-        // AND THIS IS THE ONE PLACE THAT KNOWS WHOSE AIM IT IS. Claim is the
-        // dungeon run coordinator's only door into this column, so membership
-        // here IS "a run issued this errand" - the fact the death breaker needs
-        // and the one an escort check cannot supply, because the LEADER on a
-        // staging aim is not escorted, he is aimed. Kept beside `_state` rather
-        // than inside it precisely because the line above erases `_state`: a
-        // new aim is a new errand, and this has to outlive that erase.
-        _claimed[name] = target;
-        _claimOwner[name] = owner;
-        // AND WHAT IT WROTE, KEPT PAST THE CLAIM (#824). `_claimed` ends with
+        // AND WHAT IT WROTE, KEPT PAST THE CLAIM (#824). The claim ends with
         // the errand; this does not, so a poisoned aim found later can be told
         // apart: one this module wrote and lost the claim on, or one a writer
         // outside it put there. One entry per roster character, overwritten.
@@ -6691,41 +6705,21 @@ public:
     bool ClaimedBy(std::string const& name, std::string const& target,
                    OverseerDecisions::TravelOwner& owner) const
     {
-        auto const claimed = _claimed.find(name);
-        auto const by = _claimOwner.find(name);
-        if (claimed == _claimed.end() || claimed->second != target || by == _claimOwner.end())
-            return false;
-        owner = by->second;
-        return true;
+        return _wheel.ClaimedBy(name, target, owner);
     }
 
     // Would Claim refuse this aim on its fences, without writing anything? For
     // a rule that must not start what it cannot carry out: a leader's walk back
     // for a member is refused while the bridge's errand sits in his column, and
-    // starting it anyway was a fetch begun and abandoned inside one poll.
+    // starting it anyway was a fetch begun and abandoned inside one poll. The
+    // width refusal (#1139) counts, and the cached drive is trusted on the
+    // same terms as Claim's (PR #1263).
     bool FenceRefuses(std::string const& name, std::string const& target,
                       OverseerDecisions::TravelOwner owner)
     {
-        // The column-width refusal Claim makes first (#1139) is a refusal too,
-        // counted the same way, in characters (wow-overseer#1517).
-        if (!OverseerDecisions::TravelAimFitsColumn(target))
-            return true;
-        // AI-REVIEW 2026-10-31 [codex/in-process/runtime-trace] T1 (PR #1263):
-        // The forecast must not accept the same stale cache that Claim rejects.
         auto const it = _state.find(name);
-        std::string const column = CurrentTravelNpc(name);
-        if (it != _state.end() && it->second.target == target && column == target)
-            return false;
-        OverseerDecisions::TravelClaimFacts facts(owner);
-        facts.learnSkill = LearnSkillPending(name);
-        facts.column = column;
-        auto const ours = _claimed.find(name);
-        facts.columnIsOurs = ours != _claimed.end() && ours->second == facts.column;
-        facts.target = target;
-        OverseerDecisions::TravelClaim const verdict = OverseerDecisions::ReadTravelClaim(facts);
-        return verdict != OverseerDecisions::TravelClaim::Write &&
-               verdict != OverseerDecisions::TravelClaim::Outrank &&
-               verdict != OverseerDecisions::TravelClaim::Preempt;
+        bool const cachedDrive = it != _state.end() && it->second.target == target;
+        return _wheel.FenceRefuses(name, target, owner, cachedDrive);
     }
 
     // Why this character's last claim was refused, or empty when the last
@@ -6737,50 +6731,46 @@ public:
     }
 
     // GIVE THE ERRAND BACK. THE ONE TERMINAL PATH - every release, in either
-    // drive, goes through here, which is why it does three things and not one.
+    // drive, goes through here. The module decides the column (written only
+    // when TravelReleaseGate says the aim is this book's to erase), forgets
+    // the claim and stamps the hand-back clock that keeps the quest drive off
+    // the wheel (see TravelHoldsTheWheel, case 2); this book ends the errand
+    // memory around it.
     void Release(std::string const& name, std::string const& why = std::string())
     {
-        ReleaseImpl(name, why, nullptr);
+        ReleaseImpl(name, why, _wheel.Release(name, std::time(nullptr)));
     }
 
     // Close a dungeon coordinator's travel state without giving back a newer
-    // route this same book may have claimed for another owner. A claim lost to
-    // a restart can still be cleared later by the coordinator's exact CAS.
+    // route this same book may have claimed for another owner. True when the
+    // run's recorded leg is still its to retire with RetireRunAim: a claim lost
+    // to a restart can still be cleared later by that exact compare-and-swap.
     bool ReleaseRunAim(std::string const& name, std::string const& expectedAim,
                        std::string const& why)
     {
         bool mayClearRecordedAim = true;
-        auto const claimed = _claimed.find(name);
-        if (claimed != _claimed.end())
-        {
-            auto const owner = _claimOwner.find(name);
-            bool const runOwner = owner != _claimOwner.end() &&
-                (owner->second == OverseerDecisions::TravelOwner::Run ||
-                 owner->second == OverseerDecisions::TravelOwner::WalkBackIn ||
-                 owner->second == OverseerDecisions::TravelOwner::Exit);
-            mayClearRecordedAim = runOwner && claimed->second == expectedAim;
-        }
-        ReleaseImpl(name, why, &expectedAim);
+        OverseerMovement::ReleaseResult const released =
+            _wheel.ReleaseRunAim(name, expectedAim, std::time(nullptr), mayClearRecordedAim);
+        ReleaseImpl(name, why, released);
         return mayClearRecordedAim;
     }
 
-    void ReleaseImpl(std::string const& name, std::string const& why,
-                     std::string const* expectedRunAim)
+    // THE RUN'S EXACT FINAL LEG (#812, #813, #814). Release protects every
+    // foreign `at:` aim, so a run whose claim a restart lost could not clear its
+    // own last leg that way. The module retires only that positional value,
+    // synchronously, and says what stands afterwards.
+    OverseerMovement::RunAimRetireResult RetireRunAim(std::string const& name,
+                                                      std::string const& recordedRunAim,
+                                                      bool mayClearRecordedAim)
     {
-        std::string const standing = CurrentTravelNpc(name);
-        auto const claimedAim = _claimed.find(name);
-        bool const claimed = claimedAim != _claimed.end() &&
-                             claimedAim->second == standing;
-        bool const changedSinceClaim = claimedAim != _claimed.end() && !claimed;
-        auto const owner = _claimOwner.find(name);
-        bool const claimedByRun = claimed && owner != _claimOwner.end() &&
-            (owner->second == OverseerDecisions::TravelOwner::Run ||
-             owner->second == OverseerDecisions::TravelOwner::WalkBackIn ||
-             owner->second == OverseerDecisions::TravelOwner::Exit);
-        bool const mismatchesRunAim = expectedRunAim &&
-            (*expectedRunAim != standing ||
-             (claimedAim != _claimed.end() && !claimedByRun));
-        if (mismatchesRunAim)
+        return _wheel.RetireRunAim(name, recordedRunAim, mayClearRecordedAim);
+    }
+
+    void ReleaseImpl(std::string const& name, std::string const& why,
+                     OverseerMovement::ReleaseResult const& released)
+    {
+        std::string const& standing = released.standing;
+        if (released.leftNewerAim)
         {
             // The old coordinator must not end, reset or forget a newer
             // errand's intent and drive state. That owner will release it.
@@ -6799,58 +6789,16 @@ public:
         // tell its berth walk being given up from any other end, once each.
         _lastEnd[name] = ErrandEnd{why.empty() ? std::string("a release that did not name itself")
                                                : why,
-                                   false,
-                                   claimedAim != _claimed.end() ? claimedAim->second : standing,
-                                   ++_endSerial};
+                                   false, released.endedAim, ++_endSerial};
         // A leader's column intent ends with its errand, completed or failed
         // by what the release says; nothing is ended for anybody else.
         EndLeaderColumnIntent(name, why.empty() ? std::string("a release") : why);
-        // THE COLUMN WRITE IS THE ONE PART OF THIS THAT IS NOW CONDITIONAL
-        // (mod-overseer#435). `_claimed` already answers "did this book put
-        // the walker at its CURRENT aim" - so when it says no, this Release
-        // is cleaning up after a claim that either expired or was never this
-        // book's to begin with (PruneVanished's own comment describes the
-        // column having a second owner). Blanking the column on that path is
-        // fine when nothing else is standing on it, but not when a profession
-        // errand is outstanding: a crossing whose leader's job changed out
-        // from under it must not erase an aim bridge.py wrote, any more than
-        // Claim() above may overwrite one. Every other line in this function
-        // still runs unconditionally, exactly as before - only the DB write
-        // is gated, and a release that skips its write is still a release for
-        // this book's own bookkeeping.
-        // infra#3655 extends the same gate to a standing economy errand -
-        // see the identical reasoning on Claim() above. A crossing that
-        // releases a straggler mid-catch-up must not blank a vendor/banker/
-        // repair aim bridge.py wrote and has not resolved yet, any more than
-        // Claim() may overwrite one.
-        // A POSITIONAL AIM IS PROTECTED HERE FOR THE SAME REASON A KEYWORD ONE
-        // IS. IsMaintenanceErrand covers only the four counter keywords, so an
-        // `at:` aim fell through to the else below and was erased mid-walk -
-        // measured at about 21 seconds for a gathering aim, and with four
-        // minutes of lease left for a vault aim 37 yards from its destination.
-        // Nothing else about this gate changes: it still only applies to an aim
-        // this book never claimed, so a claimed aim is still cleared exactly as
-        // before.
         // WHATEVER THIS RELEASE LEAVES STANDING IS REMEMBERED, AND ONLY UNTIL
         // THE NEXT ONE (#558). A release that skips its write leaves a live aim
         // in the column with no memory of it on this side, which the next poll
         // reads as a new errand. The landing recorded below is what stops
         // that; see LandedStep and OverseerDecisions::LandedErrandStep.
         _landed.erase(name);
-        // EACH FENCE IS READ ONCE, AND THE LINE PRINTS WHAT THE GATE TESTED
-        // (#561). The line used to read the column a second time and print it
-        // whichever fence fired, so a profession errand read as "errand ''".
-        // THE GATE DECIDES, NOT THE FENCE ALONE (#822). A self-claimed aim
-        // whose column has not moved since is this book's errand ending, and
-        // the foreign-aim fence does not apply to it: asking the fence alone
-        // read a claimed `repair` as a foreign errand, skipped the column
-        // write, and reborn the same stale aim every poll.
-        OverseerDecisions::TravelReleaseGateFacts gateFacts;
-        gateFacts.claimed = claimed;
-        gateFacts.changedSinceClaim = changedSinceClaim;
-        gateFacts.learnSkill = claimed ? 0 : LearnSkillPending(name);
-        gateFacts.standing = standing;
-        std::string const fence = OverseerDecisions::TravelReleaseGate(gateFacts);
         // ONLY AN AIM THIS BOOK WAS DRIVING LANDS. A release that finds an aim
         // in the column the travel drive was not walking has not walked it at
         // all, and must not stop the travel drive from starting it. AND ONLY AN
@@ -6859,47 +6807,32 @@ public:
         // every landing from #814 on.
         auto const driving = _state.find(name);
         OverseerDecisions::ReleaseLandingFacts landingFacts;
-        landingFacts.anyClaim = claimedAim != _claimed.end();
+        landingFacts.anyClaim = released.anyClaim;
         landingFacts.driving = driving != _state.end() ? driving->second.target : std::string();
         landingFacts.standing = standing;
         bool const wasDriving = OverseerDecisions::ReleaseLandsAim(landingFacts);
-        if (!fence.empty())
+        // THE GATE PRINTS WHAT IT TESTED (#561, #822): a profession errand, a
+        // standing economy or positional errand this book never claimed
+        // (#435, infra#3655), or a column that changed after the claim.
+        if (!released.fence.empty())
         {
             LOG_INFO("module.overseer",
                      "overseer: travel release for '{}' skipped the column "
                      "write - {} and this book did not claim the aim it would "
                      "have erased",
-                     name, fence);
+                     name, released.fence);
             if (wasDriving)
                 _landed[name] = Landing{standing, std::time(nullptr), false};
         }
-        else
-        {
-            CharacterDatabase.Execute(
-                "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}' "
-                "AND travel_npc = '{}'", Esc(name), Esc(standing));
-        }
-        // The run no longer owns what no longer exists. `_refused` is
-        // deliberately NOT swept here: a refusal that died with the errand it
-        // ended would be forgotten before whatever re-arms this column next
-        // writes to it, which is the entire failure it exists to answer.
-        _claimed.erase(name);
-        _claimOwner.erase(name);
         // THE CLOCK DIES WITH THE ERRAND (PR #2840 review). `since` is the
         // twenty-minute backstop, and a state entry outliving its errand is
         // inherited by the NEXT errand at the same target - which is then
         // released as unreachable on its first poll, having walked nowhere.
+        // `_refused` is deliberately NOT swept here: a refusal that died with
+        // the errand it ended would be forgotten before whatever re-arms this
+        // column next writes to it, which is the entire failure it exists to
+        // answer.
         _state.erase(name);
-        // And the quest drive keeps its hands off for a moment: see
-        // TravelHoldsTheWheel, case 2.
-        //
-        // STAMPED WHETHER OR NOT ANYTHING WAS ACTUALLY OUTSTANDING, on purpose.
-        // Asking the table first would cost a query to save at most one
-        // QUEST_POLL_MS of a stand-down that costs nothing - the quest drive
-        // re-asserts the same aim on its next poll - and a conditional side
-        // effect is a side effect a future caller can find itself on the wrong
-        // side of. Unconditional is what makes this impossible to skip.
-        _handback[name] = std::time(nullptr);
     }
 
     // A LANDING THAT IS A VISIT TO A COUNTER (#558). Called by DriveTravel
@@ -6975,12 +6908,11 @@ public:
             }
             // The character may be mid-walk under an aim nobody is renewing any
             // more, so this is a release like any other and takes the same grace.
-            _handback[it->first] = std::time(nullptr);
+            // The module forgets the claim and stamps the hand-back clock.
+            _wheel.ReleaseVanished(it->first, std::time(nullptr));
             _lastEnd[it->first] = ErrandEnd{
                 "the column being emptied outside this module (another owner cleared it)",
                 true};
-            _claimed.erase(it->first);
-            _claimOwner.erase(it->first);
             EndLeaderColumnIntent(it->first, "the column was emptied outside this module");
             it = _state.erase(it);
         }
@@ -7021,16 +6953,10 @@ public:
     //
     // Sweeps the entry once it lapses: a refusal that outlives its reason is its
     // own bug, the same shape the repick memory's give-up set already uses
-    // (infra#2801).
+    // (infra#2801). The clock and its sweep live in the module (#1312).
     bool WithinHandbackGrace(std::string const& name)
     {
-        auto const it = _handback.find(name);
-        if (it == _handback.end())
-            return false;
-        if (std::time(nullptr) - it->second < TRAVEL_HANDBACK_SECONDS)
-            return true;
-        _handback.erase(it);
-        return false;
+        return _wheel.WithinHandbackGrace(name, std::time(nullptr));
     }
 
     // The walk in flight, for the loop that is actually walking it. DriveTravel
@@ -7114,8 +7040,7 @@ public:
     // else's errand for the same character does not answer for it.
     bool RunOwns(std::string const& name, std::string const& target) const
     {
-        auto const it = _claimed.find(name);
-        return it != _claimed.end() && it->second == target;
+        return _wheel.HoldsClaim(name, target);
     }
 
     // A POINT AIM THE PROCESS THAT WROTE IT TOOK WITH IT (#658). Cleared with a
@@ -7126,15 +7051,11 @@ public:
     // character goes with it, as in Release.
     void ForgetLeftover(std::string const& name, std::string const& target)
     {
-        CharacterDatabase.DirectExecute(
-            "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}' AND travel_npc = '{}' "
-            "AND enabled = 1",
-            Esc(name), Esc(target));
+        // The module's exact clear, which also forgets any claim.
+        _wheel.ForgetLeftover(name, target);
         _lastEnd[name] = ErrandEnd{"a point aim left from before this worldserver started (#658)",
                                    false};
         _landed.erase(name);
-        _claimed.erase(name);
-        _claimOwner.erase(name);
         EndLeaderColumnIntent(name, "a point aim left from before this worldserver started");
         _state.erase(name);
     }
@@ -7174,10 +7095,7 @@ public:
     // `learn_skill` is not touched.
     void ClearPoisonedAim(std::string const& name, std::string const& target)
     {
-        CharacterDatabase.DirectExecute(
-            "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}' AND travel_npc = '{}' "
-            "AND enabled = 1",
-            Esc(name), Esc(target));
+        _wheel.ClearPoisonedAim(name, target);
         _lastEnd[name] = ErrandEnd{"the poison-aim breaker (an aim the travel drive could never "
                                    "resolve, refused until it proved a loop, #824)",
                                    false, target, ++_endSerial};
@@ -7440,11 +7358,6 @@ private:
     };
 
     std::map<std::string, TravelState> _state;
-    // Which errands the dungeon run coordinator issued, name -> target. Written
-    // by Claim, which is its only door into the column, and erased by Release
-    // and PruneVanished - every way an errand can end.
-    std::map<std::string, std::string> _claimed;
-    std::map<std::string, OverseerDecisions::TravelOwner> _claimOwner;
     // What ended each character's last errand; see LastEnd. Never erased: one
     // short string per roster character, overwritten by the next ending.
     std::map<std::string, ErrandEnd> _lastEnd;
@@ -7490,12 +7403,13 @@ private:
     // own drain keeps it honest across the gaps, so nothing sweeps it, and it is
     // bounded at the size of the roster.
     std::map<std::string, OverseerDecisions::ErrandSpend> _spend;
-    // When travel last let go of a character, so the quest drive does not pick
-    // it up on the same tick the errand ended. Written by Release and by
-    // PruneVanished - every way an errand can end - and read only by
-    // WithinHandbackGrace, which sweeps an entry once it lapses. World thread
-    // only, like everything else on this loop.
-    std::map<std::string, time_t> _handback;
+    // WHO HOLDS EACH CHARACTER'S WHEEL (#1312): the claims this book wrote and
+    // their owners, and when travel last let go of a character so the quest
+    // drive does not pick it up on the same tick the errand ended. The roster
+    // adapter is declared first because the module holds a reference to it.
+    // World thread only, like everything else on this loop.
+    RosterAimColumn _roster;
+    OverseerMovement::MovementOwnership _wheel{_roster, TRAVEL_HANDBACK_SECONDS};
 };
 }  // namespace
 
@@ -47555,28 +47469,20 @@ private:
             recordedLeg == coord.legAim.end() ? std::string() : recordedLeg->second;
         bool const mayClearRecordedRunAim = _travelAims.ReleaseRunAim(
             leaderName, recordedRunAim, "the dungeon run coordinator");
-        std::string const currentAim = TravelAimBook::CurrentTravelNpc(leaderName);
-        if (mayClearRecordedRunAim &&
-            OverseerDecisions::RunAimMayBeReleased(currentAim, recordedRunAim))
-        {
-            // Release normally protects every foreign `at:` aim. Here the run
-            // has its own exact leg record, so a compare-and-swap can retire
-            // only the positional value this run last claimed. A newer aim or
-            // any other kind of errand is left to its owner.
-            CharacterDatabase.DirectExecute(
-                "UPDATE overseer_roster SET travel_npc = '' WHERE name = '{}' AND "
-                "travel_npc = '{}' AND enabled = 1",
-                Esc(leaderName), Esc(recordedRunAim));
-            std::string const afterRelease = TravelAimBook::CurrentTravelNpc(leaderName);
-            if (afterRelease.empty())
-                LOG_INFO("module.overseer",
-                         "overseer: dungeon run {} retired its exact final travel aim for '{}'",
-                         runId, leaderName);
-            else
-                LOG_INFO("module.overseer",
-                         "overseer: dungeon run {} left '{}'s newer travel aim '{}' in place",
-                         runId, leaderName, afterRelease);
-        }
+        // Release normally protects every foreign `at:` aim. Here the run has
+        // its own exact leg record, so the ownership module retires only the
+        // positional value this run last claimed, by compare-and-swap. A newer
+        // aim or any other kind of errand is left to its owner (#1312).
+        OverseerMovement::RunAimRetireResult const retired =
+            _travelAims.RetireRunAim(leaderName, recordedRunAim, mayClearRecordedRunAim);
+        if (retired.answer == OverseerMovement::RunAimRetire::Retired)
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} retired its exact final travel aim for '{}'",
+                     runId, leaderName);
+        else if (retired.answer == OverseerMovement::RunAimRetire::NewerAimLeft)
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} left '{}'s newer travel aim '{}' in place",
+                     runId, leaderName, retired.after);
 
         uint32 const finished = progress.runsDone;
         uint32 const wanted = coord.runsWanted;
