@@ -23574,6 +23574,60 @@ StrandedGhostStep StrandedGhostNext(StrandedGhostFacts const& facts);
 // "leave", "spirit_healer".
 char const* StrandedGhostStepWord(StrandedGhostStep step);
 
+// ------------------------- a natural guild member nothing releases --
+//
+// StrandedGhostNext leaves an unreleased guild corpse to the dead engine, and
+// nothing stood behind that engine. Measured on the dev realm: a level 20
+// guild hunter died to a city guard on 2026-10-26 at 01:37 and was still a
+// corpse 262 hours later, online, health 0, no ghost flag and no later death
+// row, and in nine minutes of the world log no drive named it. The family has
+// had a backstop since #252 (DriveStuckRevival releases a character left on
+// the release prompt); a guild member had none.
+//
+// The drive times each member's unbroken state with the release-prompt clock
+// (ReleasePromptObserve) and asks this once per poll:
+//
+//   - Release: dead, not a ghost, watched for GUILD_RELEASE_GRACE_SECONDS and
+//     no run owns it. The drive sends the client's own release request, so
+//     the core's checks (a prevent-resurrection aura, a death not yet
+//     processed) apply as for a player pressing the button.
+//   - Fall: read alive at zero health for the grace. No regeneration runs in
+//     combat, the natural guild's refresh sets no health, and every recovery
+//     keys on the death state, so nothing ever leaves that reading. It dies
+//     the way anything at zero health does (no durability loss), and the
+//     release above then follows like any other death.
+//   - Wait: anything else. A ghost is the ghost recovery's, a run's dead are
+//     the run's, and inside the grace the dead engine and a healer still get
+//     their chance.
+constexpr std::int64_t GUILD_RELEASE_GRACE_SECONDS = 120;
+
+enum class GuildBodyStep : std::uint8_t
+{
+    Wait,
+    Release,
+    Fall,
+};
+
+struct GuildBodyFacts
+{
+    bool alive{false};
+    // Released: the ghost flag is set.
+    bool ghost{false};
+    uint32_t health{0};
+    // The clock extended a running spell on this sighting
+    // (ReleasePromptStart::Running), and how long that spell has run.
+    bool clockRunning{false};
+    std::int64_t seconds{0};
+    // A guild run lists it, a waiting guild run seats it, or the raid
+    // run-back walks it: the run recovers its own dead.
+    bool runTakesBack{false};
+};
+
+GuildBodyStep GuildBodyNext(GuildBodyFacts const& facts);
+
+// "wait", "release", "fall".
+char const* GuildBodyStepWord(GuildBodyStep step);
+
 // ------------------------------- a natural guild member goes to its trainer --
 //
 // A natural guild member is granted no spells (playerbots patch 0024), and
