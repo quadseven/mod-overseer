@@ -69,6 +69,13 @@ int main()
     if (walk.find("ReleaseRevivedSickness(", rule) != std::string::npos)
         return Fail("DoWalk must not call ReleaseRevivedSickness: it restores combat (#1377)");
 
+    // The drive defers to MAIL_WALK_HOLD_VERB because that is the verb a walk
+    // of every goal, the vendor walk included, holds under for its journey.
+    if (walk.find("HoldStillAndReport(who, ev.character, MAIL_WALK_HOLD_VERB, ev.hold,\n"
+                  "                           ev.timeoutMs") == std::string::npos)
+        return Fail("DoWalk must hold the walk under MAIL_WALK_HOLD_VERB, the verb "
+                    "DriveRevivedSickness defers to (#1377)");
+
     std::string const drive = BodyOf(text, "void DriveRevivedSickness(Player* bot,");
     if (drive.empty())
         return Fail("cannot find DriveRevivedSickness");

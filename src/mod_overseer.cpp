@@ -33092,7 +33092,9 @@ private:
         // A WALK HOLD IS LEFT ALONE (#1377). A supply walk for a member with
         // nothing to eat released this hold and took its own; holding the
         // member still here would stop that walk on the next poll. The combat
-        // strategies below still come off, so it walks out of combat.
+        // strategies below still come off, so it walks out of combat. Every
+        // walk goal, a vendor walk included, holds under MAIL_WALK_HOLD_VERB
+        // (DoWalk, RetakeWalkHold); there is no vendor hold verb.
         auto const& holds = HoldsInForce();
         auto const walkHold = holds.find(name);
         bool const walkHolds = HeldStill(name) && walkHold != holds.end() &&
