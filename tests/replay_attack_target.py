@@ -44,6 +44,9 @@ FIXTURES = {
     Path("src/Ai/Base/Value/CurrentTargetValue.h"): HERE / "fixtures/attack_target/CurrentTargetValue.h",
     Path("src/Ai/Base/Value/DuelTargetValue.h"): HERE / "fixtures/attack_target/DuelTargetValue.h",
     Path("src/Ai/Base/Value/DuelTargetValue.cpp"): HERE / "fixtures/attack_target/DuelTargetValue.cpp",
+    Path("src/Ai/Base/Value/RtiTargetValue.h"): HERE / "fixtures/attack_target/RtiTargetValue.h",
+    Path("src/Ai/Base/Value/RtiTargetValue.cpp"): HERE / "fixtures/attack_target/RtiTargetValue.cpp",
+    Path("src/Ai/Base/Actions/ChooseTargetActions.cpp"): HERE / "fixtures/attack_target/ChooseTargetActions.cpp",
 }
 
 
@@ -444,6 +447,14 @@ class AttackTargetPatchTest(unittest.TestCase):
             if applied.returncode != 0:
                 raise RuntimeError("patch does not apply to the pinned fixture:\n" + applied.stderr)
 
+        pinned_root = root / "pinned"
+        copy_fixtures(pinned_root)
+        cls.pinned = build(
+            pinned_root,
+            (pinned_root / "src/Ai/Base/Actions/AttackAction.cpp").read_text(),
+            guid_argument=False,
+        )
+
         previous_root = root / "previous"
         copy_fixtures(previous_root)
         apply_patch(previous_root, PREVIOUS_PATCH)
@@ -467,11 +478,25 @@ class AttackTargetPatchTest(unittest.TestCase):
         cls.duel_target_source = (
             patched_root / "src/Ai/Base/Value/DuelTargetValue.cpp"
         ).read_text()
+        cls.rti_target_header_source = (
+            patched_root / "src/Ai/Base/Value/RtiTargetValue.h"
+        ).read_text()
+        cls.rti_target_source = (
+            patched_root / "src/Ai/Base/Value/RtiTargetValue.cpp"
+        ).read_text()
+        cls.choose_target_source = (
+            patched_root / "src/Ai/Base/Actions/ChooseTargetActions.cpp"
+        ).read_text()
         cls.patched = build(
             patched_root,
             cls.patched_source,
             guid_argument=True,
         )
+
+    def test_pinned_body_faults_on_departed_target(self):
+        code, out = run(self.pinned, "departed")
+        self.assertEqual(code, 3, out)
+        self.assertIn("CRASH", out)
 
     def test_previous_patch_faults_while_reading_stale_target_guid(self):
         code, out = run(self.previous, "departed")
@@ -482,6 +507,11 @@ class AttackTargetPatchTest(unittest.TestCase):
         code, out = run(self.patched, "departed")
         self.assertEqual(code, 0, out)
         self.assertIn("returned=0 attacked=0", out)
+
+    def test_pinned_body_attacks_other_map_target(self):
+        code, out = run(self.pinned, "other-map")
+        self.assertEqual(code, 0, out)
+        self.assertIn("returned=1 attacked=1", out)
 
     def test_previous_patch_refuses_other_map_target(self):
         code, out = run(self.previous, "other-map")
@@ -546,6 +576,15 @@ class AttackTargetPatchTest(unittest.TestCase):
         self.assertIn("ObjectGuid GetGuid() const { return selection; }", self.current_target_source)
         self.assertIn("botAI->GetUnit(guid)", self.duel_target_source)
         self.assertIn('GetTargetName() override { return "duel target"; }', self.attack_header_source)
+
+    def test_rti_attack_passes_its_stored_guid_not_a_resolved_pointer(self):
+        self.assertIn("ObjectGuid GetGuid();", self.rti_target_header_source)
+        self.assertIn("ObjectGuid RtiTargetValue::GetGuid()", self.rti_target_source)
+        self.assertIn("botAI->GetUnit(guid)", self.rti_target_source)
+        self.assertIn("bool result = Attack(guid);", self.choose_target_source)
+        self.assertIn('Set({guid})', self.choose_target_source)
+        self.assertNotIn("rtiTarget->GetGUID()", self.choose_target_source)
+        self.assertNotIn("Attack(botAI->GetUnit(", self.choose_target_source)
 
 
 if __name__ == "__main__":

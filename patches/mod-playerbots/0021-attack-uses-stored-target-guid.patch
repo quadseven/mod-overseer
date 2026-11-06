@@ -209,3 +209,89 @@ index cb0a82d..6e5e9c8 100644
  };
  
  #endif
+diff --git a/src/Ai/Base/Actions/ChooseTargetActions.cpp b/src/Ai/Base/Actions/ChooseTargetActions.cpp
+index 7648305..881afb4 100644
+--- a/src/Ai/Base/Actions/ChooseTargetActions.cpp
++++ b/src/Ai/Base/Actions/ChooseTargetActions.cpp
+@@ -162,7 +162,10 @@ bool DpsAssistAction::isUseful()
+ 
+ bool AttackRtiTargetAction::Execute(Event /*event*/)
+ {
+-    Unit* rtiTarget = AI_VALUE(Unit*, "rti target");
++    auto* rtiValue = dynamic_cast<RtiTargetValue*>(
++        botAI->GetAiObjectContext()->GetValue<Unit*>("rti target"));
++    ObjectGuid guid = rtiValue ? rtiValue->GetGuid() : ObjectGuid::Empty;
++    Unit* rtiTarget = rtiValue && guid && rtiValue->Calculate() ? botAI->GetUnit(guid) : nullptr;
+ 
+     // Fallback: if the "rti target" value did not resolve a valid unit yet,
+     // try to resolve the raid icon directly from the group.
+@@ -174,8 +177,8 @@ bool AttackRtiTargetAction::Execute(Event /*event*/)
+             int32 const index = RtiTargetValue::GetRtiIndex(rti);
+             if (index >= 0)
+             {
+-                ObjectGuid const guid = group->GetTargetIcon(index);
+-                if (!guid.IsEmpty())
++                guid = group->GetTargetIcon(index);
++                if (guid)
+                     rtiTarget = botAI->GetUnit(guid);
+             }
+         }
+@@ -183,11 +186,11 @@ bool AttackRtiTargetAction::Execute(Event /*event*/)
+ 
+     if (rtiTarget && rtiTarget->IsInWorld() && rtiTarget->GetMapId() == bot->GetMapId())
+     {
+-        botAI->GetAiObjectContext()->GetValue<GuidVector>("prioritized targets")->Set({rtiTarget->GetGUID()});
+-        bool result = Attack(botAI->GetUnit(rtiTarget->GetGUID()));
++        botAI->GetAiObjectContext()->GetValue<GuidVector>("prioritized targets")->Set({guid});
++        bool result = Attack(guid);
+         if (result)
+         {
+-            context->GetValue<ObjectGuid>("pull target")->Set(rtiTarget->GetGUID());
++            context->GetValue<ObjectGuid>("pull target")->Set(guid);
+             return true;
+         }
+     }
+diff --git a/src/Ai/Base/Value/RtiTargetValue.cpp b/src/Ai/Base/Value/RtiTargetValue.cpp
+index 2139b87..6181ac8 100644
+--- a/src/Ai/Base/Value/RtiTargetValue.cpp
++++ b/src/Ai/Base/Value/RtiTargetValue.cpp
+@@ -32,19 +32,20 @@ int32 RtiTargetValue::GetRtiIndex(std::string const rti)
+     return index;
+ }
+ 
+-Unit* RtiTargetValue::Calculate()
++ObjectGuid RtiTargetValue::GetGuid()
+ {
+     Group* group = bot->GetGroup();
+     if (!group)
+-        return nullptr;
++        return ObjectGuid::Empty;
+ 
+     std::string const rti = AI_VALUE(std::string, type);
+-    int32 index = GetRtiIndex(rti);
+-
+-    if (index == -1)
+-        return nullptr;
++    int32 const index = GetRtiIndex(rti);
++    return index >= 0 ? group->GetTargetIcon(index) : ObjectGuid::Empty;
++}
+ 
+-    ObjectGuid guid = group->GetTargetIcon(index);
++Unit* RtiTargetValue::Calculate()
++{
++    ObjectGuid guid = GetGuid();
+     if (!guid)
+         return nullptr;
+ 
+diff --git a/src/Ai/Base/Value/RtiTargetValue.h b/src/Ai/Base/Value/RtiTargetValue.h
+index 90bf871..fc24252 100644
+--- a/src/Ai/Base/Value/RtiTargetValue.h
++++ b/src/Ai/Base/Value/RtiTargetValue.h
+@@ -22,6 +22,7 @@ public:
+ 
+     static int32 GetRtiIndex(std::string const rti);
+     Unit* Calculate() override;
++    ObjectGuid GetGuid();
+     static const int8 starIndex = 0;
+     static const int8 circleIndex = 1;
+     static const int8 diamondIndex = 2;
