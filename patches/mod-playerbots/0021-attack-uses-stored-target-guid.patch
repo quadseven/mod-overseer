@@ -1,0 +1,376 @@
+Subject: [PATCH] resolve attack targets by stored GUID without breaking actions
+
+Retain the Unit* AttackAction interface used by specialized playerbot actions,
+while resolving cached Unit values by their captured GUID before returning them.
+Cached action targets, including current, duel, and raid-icon targets, pass
+their stored GUIDs directly to the attack implementation.
+
+diff --git a/src/Ai/Base/Actions/AttackAction.cpp b/src/Ai/Base/Actions/AttackAction.cpp
+index be4a709..b597c69 100644
+--- a/src/Ai/Base/Actions/AttackAction.cpp
++++ b/src/Ai/Base/Actions/AttackAction.cpp
+@@ -5,6 +5,9 @@
+  */
+ 
+ #include "AttackAction.h"
++#include "CurrentTargetValue.h"
++#include "DuelTargetValue.h"
++#include "RtiTargetValue.h"
+ #include "CreatureAI.h"
+ #include "Event.h"
+ #include "LastMovementValue.h"
+@@ -16,16 +18,46 @@
+ #include "Unit.h"
+ #include "WaitForAttackStrategy.h"
+ 
+-bool AttackAction::Execute(Event /*event*/)
++ObjectGuid AttackAction::GetTargetGuid()
+ {
+-    Unit* target = GetTarget();
+-    if (!target)
+-        return false;
++    std::string const targetName = GetTargetName();
++    if (targetName == "current target")
++    {
++        auto* value = dynamic_cast<CurrentTargetValue*>(
++            botAI->GetAiObjectContext()->GetValue<Unit*>(targetName));
++        return value ? value->GetGuid() : ObjectGuid::Empty;
++    }
+ 
+-    if (!target->IsInWorld())
+-        return false;
++    if (targetName == "duel target")
++    {
++        auto* value = dynamic_cast<DuelTargetValue*>(
++            botAI->GetAiObjectContext()->GetValue<Unit*>(targetName));
++        return value ? value->GetGuid() : ObjectGuid::Empty;
++    }
++
++    if (targetName == "rti target")
++    {
++        auto* value = dynamic_cast<RtiTargetValue*>(
++            botAI->GetAiObjectContext()->GetValue<Unit*>(targetName));
++        return value ? value->GetGuid() : ObjectGuid::Empty;
++    }
++
++    if (targetName == "self target")
++        return bot->GetGUID();
++
++    auto* value = dynamic_cast<UnitCalculatedValue*>(
++        botAI->GetAiObjectContext()->GetValue<Unit*>(targetName));
++    if (!value)
++        return ObjectGuid::Empty;
++
++    value->Get();
++    return value->GetGuid();
++}
+ 
+-    return Attack(target);
++bool AttackAction::Execute(Event /*event*/)
++{
++    ObjectGuid targetGuid = GetTargetGuid();
++    return targetGuid ? Attack(targetGuid) : false;
+ }
+ 
+ bool AttackMyTargetAction::Execute(Event /*event*/)
+@@ -45,16 +64,24 @@ bool AttackMyTargetAction::Execute(Event /*event*/)
+     }
+ 
+     botAI->GetAiObjectContext()->GetValue<GuidVector>("prioritized targets")->Set({guid});
+-    bool result = Attack(botAI->GetUnit(guid));
++    bool result = Attack(guid);
+     if (result)
+         context->GetValue<ObjectGuid>("pull target")->Set(guid);
+ 
+     return result;
+ }
+ 
+-bool AttackAction::Attack(Unit* target, bool /*with_pet*/ /*true*/)
++bool AttackAction::Attack(Unit* target, bool with_pet)
++{
++    // Specialized callers pass a unit resolved for this action invocation.
++    // Cached target values must enter through GetTargetGuid() and Attack(ObjectGuid).
++    ObjectGuid guid = target ? target->GetGUID() : ObjectGuid::Empty;
++    return Attack(guid, with_pet);
++}
++
++bool AttackAction::Attack(ObjectGuid targetGuid, bool /*with_pet*/ /*true*/)
+ {
+-    if (!target)
++    if (!targetGuid)
+     {
+         if (verbose)
+             botAI->TellError(PlayerbotTextMgr::instance().GetBotTextOrDefault(
+@@ -63,17 +88,8 @@ bool AttackAction::Attack(Unit* target, bool /*with_pet*/ /*true*/)
+         return false;
+     }
+ 
+-    // The target arrives as a raw pointer out of an AI value, and a value
+-    // can outlive the unit it names: a despawned creature, a logged-out
+-    // player, a unit that left for another map. The null check above and
+-    // the IsInWorld() check below cannot see that state - the reaction
+-    // read further down goes through the target's update fields, which
+-    // are already gone by then, and faults. Resolve the target again by
+-    // GUID, the way AttackMyTargetAction in this file already does: the
+-    // accessor answers only for a unit on the bot's own map, so a target
+-    // that is gone or elsewhere comes back null and is refused here.
+-    target = botAI->GetUnit(target->GetGUID());
+-    if (!target)
++    Unit* target = botAI->GetUnit(targetGuid);
++    if (!target || !target->IsInWorld() || target->GetMap() != bot->GetMap())
+         return false;
+ 
+     if (!target->IsInWorld())
+@@ -99,7 +115,7 @@ bool AttackAction::Attack(Unit* target, bool /*with_pet*/ /*true*/)
+ 
+     // Check if bot OR target is in prohibited zone/area (skip for duels)
+     if ((target->IsPlayer() || target->IsPet()) &&
+-        (!bot->duel || bot->duel->Opponent != target) &&
++        (!bot->duel || bot->duel->OpponentGuid != targetGuid) &&
+         (sPlayerbotAIConfig.IsPvpProhibited(bot->GetZoneId(), bot->GetAreaId()) ||
+         sPlayerbotAIConfig.IsPvpProhibited(target->GetZoneId(), target->GetAreaId())))
+     {
+@@ -183,8 +199,8 @@ bool AttackAction::Attack(Unit* target, bool /*with_pet*/ /*true*/)
+     //     bot->GetSession()->HandleCancelMountAuraOpcode(emptyPacket);
+     // }
+ 
+-    ObjectGuid guid = target->GetGUID();
+-    bot->SetSelection(target->GetGUID());
++    ObjectGuid guid = targetGuid;
++    bot->SetSelection(targetGuid);
+ 
+     context->GetValue<Unit*>("old target")->Set(oldTarget);
+     context->GetValue<Unit*>("current target")->Set(target);
+@@ -230,9 +246,17 @@ bool AttackAction::Attack(Unit* target, bool /*with_pet*/ /*true*/)
+     return true;
+ }
+ 
+-bool AttackDuelOpponentAction::isUseful() { return AI_VALUE(Unit*, "duel target"); }
++bool AttackDuelOpponentAction::isUseful()
++{
++    ObjectGuid guid = GetTargetGuid();
++    return guid && botAI->GetUnit(guid);
++}
+ 
+-bool AttackDuelOpponentAction::Execute(Event /*event*/) { return Attack(AI_VALUE(Unit*, "duel target")); }
++bool AttackDuelOpponentAction::Execute(Event /*event*/)
++{
++    ObjectGuid guid = GetTargetGuid();
++    return guid ? Attack(guid) : false;
++}
+ 
+ bool MeleeAction::isUseful()
+ {
+diff --git a/src/Ai/Base/Actions/AttackAction.h b/src/Ai/Base/Actions/AttackAction.h
+index 2911924..5f165c1 100644
+--- a/src/Ai/Base/Actions/AttackAction.h
++++ b/src/Ai/Base/Actions/AttackAction.h
+@@ -8,6 +8,7 @@
+ #define PLAYERBOTS_ATTACKACTION_H
+ 
+ #include "MovementActions.h"
++#include "ObjectGuid.h"
+ 
+ class PlayerbotAI;
+ 
+@@ -19,7 +20,9 @@ public:
+     bool Execute(Event event) override;
+ 
+ protected:
++    ObjectGuid GetTargetGuid();
+     bool Attack(Unit* target, bool with_pet = true);
++    bool Attack(ObjectGuid targetGuid, bool with_pet = true);
+ };
+ 
+ class AttackMyTargetAction : public AttackAction
+@@ -41,6 +44,7 @@ public:
+ public:
+     bool Execute(Event event) override;
+     bool isUseful() override;
++    std::string const GetTargetName() override { return "duel target"; }
+ };
+ 
+ class MeleeAction : public AttackAction
+diff --git a/src/Ai/Base/Actions/ChooseTargetActions.cpp b/src/Ai/Base/Actions/ChooseTargetActions.cpp
+index 092493d..d12c989 100644
+--- a/src/Ai/Base/Actions/ChooseTargetActions.cpp
++++ b/src/Ai/Base/Actions/ChooseTargetActions.cpp
+@@ -8,7 +8,10 @@ bool DpsAssistAction::isUseful()
+ 
+ bool AttackRtiTargetAction::Execute(Event /*event*/)
+ {
+-    Unit* rtiTarget = AI_VALUE(Unit*, "rti target");
++    auto* rtiValue = dynamic_cast<RtiTargetValue*>(
++        botAI->GetAiObjectContext()->GetValue<Unit*>("rti target"));
++    ObjectGuid guid = rtiValue ? rtiValue->GetGuid() : ObjectGuid::Empty;
++    Unit* rtiTarget = rtiValue && guid && rtiValue->Calculate() ? botAI->GetUnit(guid) : nullptr;
+ 
+     // Fallback: if the "rti target" value did not resolve a valid unit yet,
+     // try to resolve the raid icon directly from the group.
+@@ -20,8 +23,8 @@ bool AttackRtiTargetAction::Execute(Event /*event*/)
+             int32 const index = RtiTargetValue::GetRtiIndex(rti);
+             if (index >= 0)
+             {
+-                ObjectGuid const guid = group->GetTargetIcon(index);
+-                if (!guid.IsEmpty())
++                guid = group->GetTargetIcon(index);
++                if (guid)
+                     rtiTarget = botAI->GetUnit(guid);
+             }
+         }
+@@ -29,11 +32,11 @@ bool AttackRtiTargetAction::Execute(Event /*event*/)
+ 
+     if (rtiTarget && rtiTarget->IsInWorld() && rtiTarget->GetMapId() == bot->GetMapId())
+     {
+-        botAI->GetAiObjectContext()->GetValue<GuidVector>("prioritized targets")->Set({rtiTarget->GetGUID()});
+-        bool result = Attack(botAI->GetUnit(rtiTarget->GetGUID()));
++        botAI->GetAiObjectContext()->GetValue<GuidVector>("prioritized targets")->Set({guid});
++        bool result = Attack(guid);
+         if (result)
+         {
+-            context->GetValue<ObjectGuid>("pull target")->Set(rtiTarget->GetGUID());
++            context->GetValue<ObjectGuid>("pull target")->Set(guid);
+             return true;
+         }
+     }
+diff --git a/src/Ai/Base/Value/CurrentTargetValue.h b/src/Ai/Base/Value/CurrentTargetValue.h
+index 09bbc48..7041f21 100644
+--- a/src/Ai/Base/Value/CurrentTargetValue.h
++++ b/src/Ai/Base/Value/CurrentTargetValue.h
+@@ -22,6 +22,7 @@ public:
+ 
+     Unit* Get() override;
+     void Set(Unit* unit) override;
++    ObjectGuid GetGuid() const { return selection; }
+ 
+ private:
+     ObjectGuid selection;
+diff --git a/src/Ai/Base/Value/DuelTargetValue.cpp b/src/Ai/Base/Value/DuelTargetValue.cpp
+index 7d3e6ef..3f1ef06 100644
+--- a/src/Ai/Base/Value/DuelTargetValue.cpp
++++ b/src/Ai/Base/Value/DuelTargetValue.cpp
+@@ -7,4 +7,13 @@
+ #include "DuelTargetValue.h"
+ #include "Playerbots.h"
+ 
+-Unit* DuelTargetValue::Calculate() { return bot->duel ? bot->duel->Opponent : nullptr; }
++Unit* DuelTargetValue::Calculate()
++{
++    ObjectGuid guid = GetGuid();
++    return guid ? botAI->GetUnit(guid) : nullptr;
++}
++
++ObjectGuid DuelTargetValue::GetGuid() const
++{
++    return bot->duel ? bot->duel->OpponentGuid : ObjectGuid::Empty;
++}
+diff --git a/src/Ai/Base/Value/DuelTargetValue.h b/src/Ai/Base/Value/DuelTargetValue.h
+index cb0a82d..6e5e9c8 100644
+--- a/src/Ai/Base/Value/DuelTargetValue.h
++++ b/src/Ai/Base/Value/DuelTargetValue.h
+@@ -18,6 +18,7 @@ public:
+     DuelTargetValue(PlayerbotAI* botAI, std::string const name = "duel target") : TargetValue(botAI, name) {}
+ 
+     Unit* Calculate() override;
++    ObjectGuid GetGuid() const;
+ };
+ 
+ #endif
+diff --git a/src/Ai/Base/Value/RtiTargetValue.cpp b/src/Ai/Base/Value/RtiTargetValue.cpp
+index 513e999..e3a7211 100644
+--- a/src/Ai/Base/Value/RtiTargetValue.cpp
++++ b/src/Ai/Base/Value/RtiTargetValue.cpp
+@@ -21,19 +21,20 @@ int32 RtiTargetValue::GetRtiIndex(std::string const rti)
+     return index;
+ }
+ 
+-Unit* RtiTargetValue::Calculate()
++ObjectGuid RtiTargetValue::GetGuid()
+ {
+     Group* group = bot->GetGroup();
+     if (!group)
+-        return nullptr;
++        return ObjectGuid::Empty;
+ 
+     std::string const rti = AI_VALUE(std::string, type);
+-    int32 index = GetRtiIndex(rti);
+-
+-    if (index == -1)
+-        return nullptr;
++    int32 const index = GetRtiIndex(rti);
++    return index >= 0 ? group->GetTargetIcon(index) : ObjectGuid::Empty;
++}
+ 
+-    ObjectGuid guid = group->GetTargetIcon(index);
++Unit* RtiTargetValue::Calculate()
++{
++    ObjectGuid guid = GetGuid();
+     if (!guid)
+         return nullptr;
+ 
+diff --git a/src/Ai/Base/Value/RtiTargetValue.h b/src/Ai/Base/Value/RtiTargetValue.h
+index 7e18023..4019ace 100644
+--- a/src/Ai/Base/Value/RtiTargetValue.h
++++ b/src/Ai/Base/Value/RtiTargetValue.h
+@@ -8,6 +8,7 @@ public:
+ 
+     static int32 GetRtiIndex(std::string const rti);
+     Unit* Calculate() override;
++    ObjectGuid GetGuid();
+     static const int8 starIndex = 0;
+     static const int8 circleIndex = 1;
+     static const int8 diamondIndex = 2;
+diff --git a/src/Bot/Engine/Value/Value.cpp b/src/Bot/Engine/Value/Value.cpp
+index 9fea17eb..25ed60dc 100644
+--- a/src/Bot/Engine/Value/Value.cpp
++++ b/src/Bot/Engine/Value/Value.cpp
+@@ -126,6 +126,7 @@ Unit* UnitCalculatedValue::Get()
+         PerfMonitorOperation* pmo = sPerfMonitor.start(
+             PERF_MON_VALUE, this->getName(), this->context ? &this->context->performanceStack : nullptr);
+         value = Calculate();
++        guid = value ? value->GetGUID() : ObjectGuid::Empty;
+         if (pmo)
+             pmo->finish();
+     }
+@@ -138,16 +139,24 @@ Unit* UnitCalculatedValue::Get()
+             PerfMonitorOperation* pmo = sPerfMonitor.start(
+                 PERF_MON_VALUE, this->getName(), this->context ? &this->context->performanceStack : nullptr);
+             value = Calculate();
++            guid = value ? value->GetGUID() : ObjectGuid::Empty;
+             if (pmo)
+                 pmo->finish();
+         }
+     }
+-    // Prevent crashing by InWorld check
+-    if (value && value->IsInWorld())
+-        return value;
++    Unit* resolved = guid ? botAI->GetUnit(guid) : nullptr;
++    value = resolved;
++    if (resolved && resolved->IsInWorld())
++        return resolved;
+     return nullptr;
+ }
+ 
++void UnitCalculatedValue::Set(Unit* unit)
++{
++    value = unit;
++    guid = unit ? unit->GetGUID() : ObjectGuid::Empty;
++}
++
+ Unit* UnitManualSetValue::Get()
+ {
+     // Prevent crashing by InWorld check
+diff --git a/src/Bot/Engine/Value/Value.h b/src/Bot/Engine/Value/Value.h
+index 8d34d18..06f9b00 100644
+--- a/src/Bot/Engine/Value/Value.h
++++ b/src/Bot/Engine/Value/Value.h
+@@ -5,4 +5,9 @@ public:
+ 
+     std::string const Format() override;
+     Unit* Get() override;
++    void Set(Unit* unit) override;
++    ObjectGuid GetGuid() const { return guid; }
++
++protected:
++    ObjectGuid guid = ObjectGuid::Empty;
+ };

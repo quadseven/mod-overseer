@@ -34,9 +34,22 @@ from pathlib import Path
 
 
 HERE = Path(__file__).resolve().parent
-PATCH = HERE.parent / "patches/mod-playerbots/0020-attack-target-resolved-before-use.patch"
+PREVIOUS_PATCH = HERE.parent / "patches/mod-playerbots/0020-attack-target-resolved-before-use.patch"
+PATCH = HERE.parent / "patches/mod-playerbots/0021-attack-uses-stored-target-guid.patch"
+CORE_PATCH = HERE.parent / "patches/azerothcore-wotlk/0002-duel-info-retains-opponent-guid.patch"
 FIXTURE = HERE / "fixtures/attack_target/AttackAction.cpp"
-TARGET = Path("src/Ai/Base/Actions/AttackAction.cpp")
+FIXTURES = {
+    Path("src/Ai/Base/Actions/AttackAction.cpp"): FIXTURE,
+    Path("src/Ai/Base/Actions/AttackAction.h"): HERE / "fixtures/attack_target/AttackAction.h",
+    Path("src/Ai/Base/Value/CurrentTargetValue.h"): HERE / "fixtures/attack_target/CurrentTargetValue.h",
+    Path("src/Ai/Base/Value/DuelTargetValue.h"): HERE / "fixtures/attack_target/DuelTargetValue.h",
+    Path("src/Ai/Base/Value/DuelTargetValue.cpp"): HERE / "fixtures/attack_target/DuelTargetValue.cpp",
+    Path("src/Ai/Base/Value/RtiTargetValue.h"): HERE / "fixtures/attack_target/RtiTargetValue.h",
+    Path("src/Ai/Base/Value/RtiTargetValue.cpp"): HERE / "fixtures/attack_target/RtiTargetValue.cpp",
+    Path("src/Ai/Base/Actions/ChooseTargetActions.cpp"): HERE / "fixtures/attack_target/ChooseTargetActions.cpp",
+    Path("src/Bot/Engine/Value/Value.cpp"): HERE / "fixtures/attack_target/Value.cpp",
+    Path("src/Bot/Engine/Value/Value.h"): HERE / "fixtures/attack_target/Value.h",
+}
 
 
 def function(source, signature):
@@ -71,8 +84,10 @@ struct ObjectGuid
     ObjectGuid() = default;
     explicit ObjectGuid(uint64_t value) : raw(value) {}
     bool operator!() const { return raw == 0; }
+    explicit operator bool() const { return raw != 0; }
     bool operator<(ObjectGuid other) const { return raw < other.raw; }
     bool operator==(ObjectGuid other) const { return raw == other.raw; }
+    bool operator!=(ObjectGuid other) const { return raw != other.raw; }
 };
 
 struct Unit
@@ -86,8 +101,14 @@ struct Unit
     int reaction = 1;             // < 5 hostile, >= 5 friendly (stand-in scale)
     std::string name = "target";
 
-    ObjectGuid GetGUID() const { return guid; }  // a direct member read, as in the core
+    ObjectGuid GetGUID() const
+    {
+        if (!fields)
+            throw SegvModel{"GUID read through a null update-field array"};
+        return guid;
+    }
     bool IsInWorld() const { return inWorld; }
+    int GetMap() const { return mapId; }
     bool IsPlayer() const { return player; }
     bool IsPet() const { return pet; }
     bool isDead() const { return dead; }
@@ -130,6 +151,7 @@ struct MotionMaster
 struct DuelInfo
 {
     Unit* Opponent = nullptr;
+    ObjectGuid OpponentGuid;
 };
 
 struct Player : Unit
@@ -310,6 +332,16 @@ int main(int argc, char** argv)
         target.mapId = 2;
         mapStore[{2, target.guid.raw}] = &target;
     }
+    else if (scenario == "out-of-world")
+    {
+        target.inWorld = false;
+        mapStore[{1, target.guid.raw}] = &target;
+    }
+    else if (scenario == "wrong-map-resolver")
+    {
+        target.mapId = 2;
+        mapStore[{1, target.guid.raw}] = &target;
+    }
     else if (scenario == "friendly")
     {
         target.reaction = 9;
@@ -341,9 +373,253 @@ int main(int argc, char** argv)
 """
 
 
-def build(root, source_text):
-    body = function(source_text, "bool AttackAction::Attack(Unit* target")
-    (root / "replay.cpp").write_text(HARNESS.replace("// REAL_BODY", body))
+GUID_HARNESS = HARNESS.replace(
+    "bool Attack(Unit* target, bool with_pet = true);",
+    "bool Attack(ObjectGuid targetGuid, bool with_pet = true);",
+).replace("Unit* passed = &target;", "ObjectGuid passed = target.guid;").replace(
+    "passed = nullptr;", "passed = ObjectGuid();"
+)
+
+
+EXECUTE_HARNESS = GUID_HARNESS.replace(
+    "struct AttackAction\n{\n"
+    "    Player* bot = nullptr;\n"
+    "    PlayerbotAI* botAI = nullptr;\n"
+    "    AiObjectContext* context = nullptr;\n"
+    "    bool verbose = false;\n\n"
+    "    bool Attack(ObjectGuid targetGuid, bool with_pet = true);\n"
+    "};",
+    "struct Event {};\n"
+    "struct AttackAction\n{\n"
+    "    Player* bot = nullptr;\n"
+    "    PlayerbotAI* botAI = nullptr;\n"
+    "    AiObjectContext* context = nullptr;\n"
+    "    bool verbose = false;\n"
+    "    Unit* unitTarget = nullptr;\n"
+    "    ObjectGuid guidTarget;\n\n"
+    "    Unit* GetTarget() { return unitTarget; }\n"
+    "    ObjectGuid GetTargetGuid() { return guidTarget; }\n"
+    "    bool Execute(Event event);\n"
+    "    bool Attack(Unit* target, bool with_pet = true);\n"
+    "    bool Attack(ObjectGuid targetGuid, bool with_pet = true);\n"
+    "};",
+).replace("action.context = &context;", "action.context = &context;\n    action.unitTarget = &target;\n    action.guidTarget = target.guid;").replace(
+    "action.Attack(passed)", "action.Execute(Event{})"
+)
+
+
+TARGET_GUID_HARNESS = r"""
+#include <cstdint>
+#include <iostream>
+#include <map>
+#include <string>
+
+struct ObjectGuid
+{
+    uint64_t raw = 0;
+    ObjectGuid() = default;
+    explicit ObjectGuid(uint64_t value) : raw(value) {}
+    explicit operator bool() const { return raw != 0; }
+    bool operator!() const { return raw == 0; }
+    static ObjectGuid const Empty;
+};
+ObjectGuid const ObjectGuid::Empty{};
+
+struct Unit {};
+template <typename T> struct Value { virtual ~Value() = default; };
+template <> struct Value<Unit*> { virtual ~Value() = default; virtual Unit* Get() = 0; };
+
+class UnitCalculatedValue : public Value<Unit*>
+{
+public:
+    ObjectGuid guid;
+    Unit* Get() override { return nullptr; }
+    ObjectGuid GetGuid() const { return guid; }
+};
+class CurrentTargetValue : public Value<Unit*>
+{
+public:
+    ObjectGuid GetGuid() const { return ObjectGuid(101); }
+    Unit* Get() override { return nullptr; }
+};
+class DuelTargetValue : public UnitCalculatedValue
+{
+public:
+    ObjectGuid GetGuid() const { return ObjectGuid(202); }
+};
+class RtiTargetValue : public UnitCalculatedValue
+{
+public:
+    ObjectGuid GetGuid() const { return ObjectGuid(303); }
+};
+struct AiObjectContext
+{
+    std::map<std::string, Value<Unit*>*> values;
+    template <typename T> Value<T>* GetValue(std::string const& name)
+    {
+        return dynamic_cast<Value<T>*>(values[name]);
+    }
+};
+struct PlayerbotAI
+{
+    AiObjectContext context;
+    AiObjectContext* GetAiObjectContext() { return &context; }
+};
+struct Player
+{
+    ObjectGuid guid{1};
+    ObjectGuid GetGUID() const { return guid; }
+};
+struct AttackAction
+{
+    PlayerbotAI* botAI = nullptr;
+    Player* bot = nullptr;
+    std::string targetName;
+    std::string const GetTargetName() { return targetName; }
+    ObjectGuid GetTargetGuid();
+};
+
+// REAL_BODY
+
+int main(int argc, char** argv)
+{
+    if (argc != 2) return 2;
+    PlayerbotAI ai;
+    Player bot;
+    AttackAction action{&ai, &bot, argv[1]};
+    UnitCalculatedValue calculated;
+    calculated.guid = ObjectGuid(404);
+    CurrentTargetValue current;
+    DuelTargetValue duel;
+    RtiTargetValue rti;
+    if (action.targetName == "dps target" || action.targetName == "find target::boss")
+        ai.context.values[action.targetName] = &calculated;
+    else if (action.targetName == "current target")
+        ai.context.values[action.targetName] = &current;
+    else if (action.targetName == "duel target")
+        ai.context.values[action.targetName] = &duel;
+    else if (action.targetName == "rti target")
+        ai.context.values[action.targetName] = &rti;
+    ObjectGuid guid = action.GetTargetGuid();
+    std::cout << "guid=" << guid.raw << "\n";
+    return 0;
+}
+"""
+
+
+UNIT_VALUE_HARNESS = r"""
+#include <cstdint>
+#include <iostream>
+#include <string>
+
+using uint32 = uint32_t;
+using int32 = int32_t;
+
+struct ObjectGuid
+{
+    uint64_t raw = 0;
+    ObjectGuid() = default;
+    explicit ObjectGuid(uint64_t value) : raw(value) {}
+    explicit operator bool() const { return raw != 0; }
+    static ObjectGuid const Empty;
+};
+ObjectGuid const ObjectGuid::Empty{};
+
+struct Unit
+{
+    ObjectGuid guid;
+    bool inWorld = true;
+    bool fields = true;
+
+    ObjectGuid GetGUID() const
+    {
+        if (!fields)
+            throw 1;
+        return guid;
+    }
+    bool IsInWorld() const
+    {
+        if (!fields)
+            throw 2;
+        return inWorld;
+    }
+};
+
+struct PlayerbotAI
+{
+    Unit* live = nullptr;
+    Unit* GetUnit(ObjectGuid guid) { return live && live->guid.raw == guid.raw ? live : nullptr; }
+};
+
+struct PerfMonitorOperation { void finish() {} };
+struct PerfMonitorStub
+{
+    PerfMonitorOperation* start(int, std::string const&, void*) { return nullptr; }
+};
+PerfMonitorStub sPerfMonitor;
+constexpr int PERF_MON_VALUE = 0;
+uint32 getMSTime() { return 2; }
+
+struct Context { int performanceStack = 0; };
+struct UnitCalculatedValue
+{
+    PlayerbotAI* botAI = nullptr;
+    Context* context = nullptr;
+    int32 checkInterval = 100;
+    uint32 lastCheckTime = 1;
+    Unit* value = nullptr;
+    ObjectGuid guid;
+    Unit* calculated = nullptr;
+
+    std::string const& getName() const
+    {
+        static std::string const name = "target";
+        return name;
+    }
+    Unit* Calculate() { return calculated; }
+    void Set(Unit* unit);
+    Unit* Get();
+};
+
+// GET_BODY
+// SET_BODY
+
+int main()
+{
+    Unit stale;
+    stale.guid = ObjectGuid(42);
+    Unit live;
+    live.guid = ObjectGuid(42);
+    PlayerbotAI ai;
+    ai.live = &live;
+    UnitCalculatedValue value;
+    value.botAI = &ai;
+    value.Set(&stale);
+    stale.fields = false;
+    try
+    {
+        Unit* result = value.Get();
+        std::cout << "returned_live=" << (result == &live ? 1 : 0) << "\n";
+        return 0;
+    }
+    catch (...)
+    {
+        std::cout << "stale_pointer_dereferenced\n";
+        return 3;
+    }
+}
+"""
+
+
+def build(root, source_text, *, guid_argument):
+    signature = (
+        "bool AttackAction::Attack(ObjectGuid targetGuid"
+        if guid_argument
+        else "bool AttackAction::Attack(Unit* target"
+    )
+    harness = GUID_HARNESS if guid_argument else HARNESS
+    body = function(source_text, signature)
+    (root / "replay.cpp").write_text(harness.replace("// REAL_BODY", body))
     compiler = shutil.which(os.environ.get("CXX", "c++"))
     if compiler is None:
         raise RuntimeError("C++ compiler required for the attack target replay")
@@ -357,6 +633,76 @@ def build(root, source_text):
     )
     if built.returncode != 0:
         raise RuntimeError("harness failed to compile:\n" + built.stderr)
+    return binary
+
+
+def build_execute(root, source_text, *, guid_argument):
+    attack_signature = (
+        "bool AttackAction::Attack(ObjectGuid targetGuid"
+        if guid_argument
+        else "bool AttackAction::Attack(Unit* target"
+    )
+    execute = function(source_text, "bool AttackAction::Execute(")
+    attack = function(source_text, attack_signature)
+    harness = EXECUTE_HARNESS.replace("// REAL_BODY", execute + "\n" + attack)
+    (root / "execute_replay.cpp").write_text(harness)
+    compiler = shutil.which(os.environ.get("CXX", "c++"))
+    if compiler is None:
+        raise RuntimeError("C++ compiler required for the execute replay")
+    binary = root / "execute_replay"
+    built = subprocess.run(  # noqa: S603 - fixed compiler invocation on harness text
+        [compiler, "-std=c++17", "-o", str(binary), str(root / "execute_replay.cpp")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if built.returncode != 0:
+        raise RuntimeError("execute harness failed to compile:\n" + built.stderr)
+    return binary
+
+
+def build_target_guid(root, source_text):
+    body = function(source_text, "ObjectGuid AttackAction::GetTargetGuid()")
+    harness = TARGET_GUID_HARNESS.replace("// REAL_BODY", body)
+    (root / "target-guid.cpp").write_text(harness)
+    compiler = shutil.which(os.environ.get("CXX", "c++"))
+    if compiler is None:
+        raise RuntimeError("C++ compiler required for the target GUID replay")
+    binary = root / "target-guid"
+    built = subprocess.run(  # noqa: S603 - fixed compiler invocation on extracted method text
+        [compiler, "-std=c++17", "-o", str(binary), str(root / "target-guid.cpp")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if built.returncode != 0:
+        raise RuntimeError("target GUID harness failed to compile:\n" + built.stderr)
+    return binary
+
+
+def build_unit_value(root, source_text):
+    get_body = function(source_text, "Unit* UnitCalculatedValue::Get()")
+    try:
+        set_body = function(source_text, "void UnitCalculatedValue::Set(Unit* unit)")
+    except ValueError:
+        set_body = "void UnitCalculatedValue::Set(Unit* unit) { value = unit; }"
+    harness = UNIT_VALUE_HARNESS.replace("// GET_BODY", get_body).replace("// SET_BODY", set_body)
+    (root / "unit-value-replay.cpp").write_text(harness)
+    compiler = shutil.which(os.environ.get("CXX", "c++"))
+    if compiler is None:
+        raise RuntimeError("C++ compiler required for the unit value replay")
+    binary = root / "unit-value-replay"
+    built = subprocess.run(  # noqa: S603 - fixed compiler invocation on harness text
+        [compiler, "-std=c++17", "-o", str(binary), str(root / "unit-value-replay.cpp")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if built.returncode != 0:
+        raise RuntimeError("unit value harness failed to compile:\n" + built.stderr)
     return binary
 
 
@@ -378,78 +724,230 @@ class AttackTargetPatchTest(unittest.TestCase):
         cls.addClassCleanup(cls.temp.cleanup)
         root = Path(cls.temp.name)
 
-        pinned_root = root / "pinned"
-        pinned_file = pinned_root / TARGET
-        pinned_file.parent.mkdir(parents=True)
-        shutil.copyfile(FIXTURE, pinned_file)
-        cls.pinned = build(pinned_root, pinned_file.read_text())
-
-        # The replay proves the PATCHED body. Without the patch it would
-        # compile the pinned fixture as the realm ships it and could pass
-        # for the wrong reason, so a missing patch is a failure, not a
-        # skip. When upstream takes the fix and the patch is deleted,
-        # retire this replay or re-pin its fixture in the same change.
-        if not PATCH.exists():
+        if not PREVIOUS_PATCH.exists() or not PATCH.exists():
             raise RuntimeError(
-                "%s is missing: this replay applies it to the fixture and "
-                "proves nothing without it" % PATCH.relative_to(HERE.parent)
+                "both attack target patches are required for this replay"
             )
         git = shutil.which("git")
         if git is None:
             raise RuntimeError("git required to apply the repository patch")
-        patched_root = root / "patched"
-        patched_file = patched_root / TARGET
-        patched_file.parent.mkdir(parents=True)
-        shutil.copyfile(FIXTURE, patched_file)
-        applied = subprocess.run(  # noqa: S603 - repository patch applied to temporary fixtures
-            [git, "apply", str(PATCH)],
-            cwd=patched_root,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=15,
+
+        def copy_fixtures(destination):
+            for target, fixture in FIXTURES.items():
+                target_file = destination / target
+                target_file.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(fixture, target_file)
+
+        def apply_patch(destination, patch):
+            applied = subprocess.run(  # noqa: S603 - repository patch applied to temporary fixtures
+                [git, "apply", str(patch)],
+                cwd=destination,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if applied.returncode != 0:
+                raise RuntimeError("patch does not apply to the pinned fixture:\n" + applied.stderr)
+
+        pinned_root = root / "pinned"
+        copy_fixtures(pinned_root)
+        cls.pinned = build(
+            pinned_root,
+            (pinned_root / "src/Ai/Base/Actions/AttackAction.cpp").read_text(),
+            guid_argument=False,
         )
-        if applied.returncode != 0:
-            raise RuntimeError("patch does not apply to the pinned fixture:\n" + applied.stderr)
-        cls.patched = build(patched_root, patched_file.read_text())
+        pinned_source = (pinned_root / "src/Ai/Base/Actions/AttackAction.cpp").read_text()
+        cls.pinned_execute = build_execute(
+            pinned_root, pinned_source, guid_argument=False
+        )
+        cls.pinned_unit_value = build_unit_value(
+            pinned_root,
+            (pinned_root / "src/Bot/Engine/Value/Value.cpp").read_text(),
+        )
+
+        previous_root = root / "previous"
+        copy_fixtures(previous_root)
+        apply_patch(previous_root, PREVIOUS_PATCH)
+        cls.previous = build(
+            previous_root,
+            (previous_root / "src/Ai/Base/Actions/AttackAction.cpp").read_text(),
+            guid_argument=False,
+        )
+
+        patched_root = root / "patched"
+        copy_fixtures(patched_root)
+        apply_patch(patched_root, PREVIOUS_PATCH)
+        apply_patch(patched_root, PATCH)
+        cls.patched_source = (patched_root / "src/Ai/Base/Actions/AttackAction.cpp").read_text()
+        cls.current_target_source = (
+            patched_root / "src/Ai/Base/Value/CurrentTargetValue.h"
+        ).read_text()
+        cls.attack_header_source = (
+            patched_root / "src/Ai/Base/Actions/AttackAction.h"
+        ).read_text()
+        cls.duel_target_source = (
+            patched_root / "src/Ai/Base/Value/DuelTargetValue.cpp"
+        ).read_text()
+        cls.rti_target_header_source = (
+            patched_root / "src/Ai/Base/Value/RtiTargetValue.h"
+        ).read_text()
+        cls.rti_target_source = (
+            patched_root / "src/Ai/Base/Value/RtiTargetValue.cpp"
+        ).read_text()
+        cls.choose_target_source = (
+            patched_root / "src/Ai/Base/Actions/ChooseTargetActions.cpp"
+        ).read_text()
+        cls.unit_value_source = (
+            patched_root / "src/Bot/Engine/Value/Value.cpp"
+        ).read_text()
+        cls.unit_value_header = (
+            patched_root / "src/Bot/Engine/Value/Value.h"
+        ).read_text()
+        cls.patched = build(
+            patched_root,
+            cls.patched_source,
+            guid_argument=True,
+        )
+        cls.patched_target_guid = build_target_guid(
+            patched_root, cls.patched_source
+        )
+        cls.patched_execute = build_execute(
+            patched_root, cls.patched_source, guid_argument=True
+        )
+        cls.patched_unit_value = build_unit_value(
+            patched_root,
+            cls.unit_value_source,
+        )
 
     def test_pinned_body_faults_on_departed_target(self):
         code, out = run(self.pinned, "departed")
         self.assertEqual(code, 3, out)
         self.assertIn("CRASH", out)
 
+    def test_previous_patch_faults_while_reading_stale_target_guid(self):
+        code, out = run(self.previous, "departed")
+        self.assertEqual(code, 3, out)
+        self.assertIn("GUID read through a null update-field array", out)
+
     def test_patched_body_refuses_departed_target(self):
         code, out = run(self.patched, "departed")
         self.assertEqual(code, 0, out)
         self.assertIn("returned=0 attacked=0", out)
+
+    def test_attack_action_execute_refuses_removed_target(self):
+        code, out = run(self.pinned_execute, "departed")
+        self.assertEqual(code, 3, out)
+        self.assertIn("CRASH", out)
+
+        code, out = run(self.patched_execute, "departed")
+        self.assertEqual(code, 0, out)
+        self.assertIn("returned=0 attacked=0", out)
+
+    def test_calculated_specialized_targets_enter_through_their_stored_guid(self):
+        for target_name, expected in (
+            ("dps target", "guid=404"),
+            ("find target::boss", "guid=404"),
+            ("current target", "guid=101"),
+            ("duel target", "guid=202"),
+            ("rti target", "guid=303"),
+            ("self target", "guid=1"),
+            ("unrecognized target", "guid=0"),
+        ):
+            with self.subTest(target_name=target_name):
+                code, out = run(self.patched_target_guid, target_name)
+                self.assertEqual(code, 0, out)
+                self.assertIn(expected, out)
 
     def test_pinned_body_attacks_other_map_target(self):
         code, out = run(self.pinned, "other-map")
         self.assertEqual(code, 0, out)
         self.assertIn("returned=1 attacked=1", out)
 
+    def test_previous_patch_refuses_other_map_target(self):
+        code, out = run(self.previous, "other-map")
+        self.assertEqual(code, 0, out)
+        self.assertIn("returned=0 attacked=0", out)
+
     def test_patched_body_refuses_other_map_target(self):
         code, out = run(self.patched, "other-map")
         self.assertEqual(code, 0, out)
         self.assertIn("returned=0 attacked=0", out)
 
+    def test_patched_body_refuses_out_of_world_resolved_target(self):
+        code, out = run(self.patched, "out-of-world")
+        self.assertEqual(code, 0, out)
+        self.assertIn("returned=0 attacked=0", out)
+
+    def test_patched_body_refuses_wrong_map_resolver_result(self):
+        code, out = run(self.patched, "wrong-map-resolver")
+        self.assertEqual(code, 0, out)
+        self.assertIn("returned=0 attacked=0", out)
+
     def test_live_target_attacked_with_and_without_patch(self):
-        for binary in (self.pinned, self.patched):
+        for binary in (self.previous, self.patched):
             code, out = run(binary, "live")
             self.assertEqual(code, 0, out)
             self.assertIn("returned=1 attacked=1", out)
 
     def test_friendly_target_refused_with_and_without_patch(self):
-        for binary in (self.pinned, self.patched):
+        for binary in (self.previous, self.patched):
             code, out = run(binary, "friendly")
             self.assertEqual(code, 0, out)
             self.assertIn("returned=0 attacked=0", out)
 
     def test_null_target_refused_with_and_without_patch(self):
-        for binary in (self.pinned, self.patched):
+        for binary in (self.previous, self.patched):
             code, out = run(binary, "null")
             self.assertEqual(code, 0, out)
             self.assertIn("returned=0 attacked=0", out)
+
+    def test_core_patch_caches_the_duel_opponent_guid(self):
+        patch = CORE_PATCH.read_text()
+        self.assertIn("ObjectGuid const OpponentGuid;", patch)
+        header, implementation = patch.split(
+            "diff --git a/src/server/game/Entities/Player/Player.cpp ", 1
+        )
+        self.assertNotIn("opponent->GetGUID()", header)
+        self.assertIn("DuelInfo::DuelInfo(Player* opponent", implementation)
+        self.assertIn("OpponentGuid(opponent ? opponent->GetGUID() : ObjectGuid::Empty)", implementation)
+
+    def test_every_attack_value_enters_through_a_stored_guid(self):
+        self.assertIn("return value ? value->GetGuid() : ObjectGuid::Empty;", self.patched_source)
+        self.assertIn("bool result = Attack(guid);", self.patched_source)
+        self.assertIn("return guid ? Attack(guid) : false;", self.patched_source)
+        self.assertNotIn("Attack(AI_VALUE(Unit*", self.patched_source)
+        self.assertNotIn("Attack(botAI->GetUnit(guid))", self.patched_source)
+        self.assertNotIn("botAI->GetUnit(target->GetGUID())", self.patched_source)
+        self.assertNotIn("ObjectGuid guid = target->GetGUID();", self.patched_source)
+        self.assertIn(
+            "if (!target || !target->IsInWorld() || target->GetMap() != bot->GetMap())",
+            self.patched_source,
+        )
+        self.assertIn("ObjectGuid GetGuid() const { return selection; }", self.current_target_source)
+        self.assertIn("botAI->GetUnit(guid)", self.duel_target_source)
+        self.assertIn('GetTargetName() override { return "duel target"; }', self.attack_header_source)
+
+    def test_rti_attack_passes_its_stored_guid_not_a_resolved_pointer(self):
+        self.assertIn("ObjectGuid GetGuid();", self.rti_target_header_source)
+        self.assertIn("ObjectGuid RtiTargetValue::GetGuid()", self.rti_target_source)
+        self.assertIn("botAI->GetUnit(guid)", self.rti_target_source)
+        self.assertIn("bool result = Attack(guid);", self.choose_target_source)
+        self.assertIn('Set({guid})', self.choose_target_source)
+        self.assertNotIn("rtiTarget->GetGUID()", self.choose_target_source)
+        self.assertNotIn("Attack(botAI->GetUnit(", self.choose_target_source)
+
+    def test_legacy_unit_attack_callers_remain_compatible(self):
+        self.assertIn("bool Attack(Unit* target, bool with_pet = true);", self.attack_header_source)
+
+    def test_cached_unit_value_resolves_stale_pointer_by_saved_guid(self):
+        code, out = run(self.pinned_unit_value, "")
+        self.assertEqual(code, 3, out)
+        self.assertIn("stale_pointer_dereferenced", out)
+
+        code, out = run(self.patched_unit_value, "")
+        self.assertEqual(code, 0, out)
+        self.assertIn("returned_live=1", out)
 
 
 if __name__ == "__main__":
