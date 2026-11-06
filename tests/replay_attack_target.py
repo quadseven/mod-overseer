@@ -84,6 +84,7 @@ struct ObjectGuid
     ObjectGuid() = default;
     explicit ObjectGuid(uint64_t value) : raw(value) {}
     bool operator!() const { return raw == 0; }
+    explicit operator bool() const { return raw != 0; }
     bool operator<(ObjectGuid other) const { return raw < other.raw; }
     bool operator==(ObjectGuid other) const { return raw == other.raw; }
     bool operator!=(ObjectGuid other) const { return raw != other.raw; }
@@ -380,6 +381,33 @@ GUID_HARNESS = HARNESS.replace(
 )
 
 
+EXECUTE_HARNESS = GUID_HARNESS.replace(
+    "struct AttackAction\n{\n"
+    "    Player* bot = nullptr;\n"
+    "    PlayerbotAI* botAI = nullptr;\n"
+    "    AiObjectContext* context = nullptr;\n"
+    "    bool verbose = false;\n\n"
+    "    bool Attack(ObjectGuid targetGuid, bool with_pet = true);\n"
+    "};",
+    "struct Event {};\n"
+    "struct AttackAction\n{\n"
+    "    Player* bot = nullptr;\n"
+    "    PlayerbotAI* botAI = nullptr;\n"
+    "    AiObjectContext* context = nullptr;\n"
+    "    bool verbose = false;\n"
+    "    Unit* unitTarget = nullptr;\n"
+    "    ObjectGuid guidTarget;\n\n"
+    "    Unit* GetTarget() { return unitTarget; }\n"
+    "    ObjectGuid GetTargetGuid() { return guidTarget; }\n"
+    "    bool Execute(Event event);\n"
+    "    bool Attack(Unit* target, bool with_pet = true);\n"
+    "    bool Attack(ObjectGuid targetGuid, bool with_pet = true);\n"
+    "};",
+).replace("action.context = &context;", "action.context = &context;\n    action.unitTarget = &target;\n    action.guidTarget = target.guid;").replace(
+    "action.Attack(passed)", "action.Execute(Event{})"
+)
+
+
 UNIT_VALUE_HARNESS = r"""
 #include <cstdint>
 #include <iostream>
@@ -509,6 +537,32 @@ def build(root, source_text, *, guid_argument):
     return binary
 
 
+def build_execute(root, source_text, *, guid_argument):
+    attack_signature = (
+        "bool AttackAction::Attack(ObjectGuid targetGuid"
+        if guid_argument
+        else "bool AttackAction::Attack(Unit* target"
+    )
+    execute = function(source_text, "bool AttackAction::Execute(")
+    attack = function(source_text, attack_signature)
+    harness = EXECUTE_HARNESS.replace("// REAL_BODY", execute + "\n" + attack)
+    (root / "execute_replay.cpp").write_text(harness)
+    compiler = shutil.which(os.environ.get("CXX", "c++"))
+    if compiler is None:
+        raise RuntimeError("C++ compiler required for the execute replay")
+    binary = root / "execute_replay"
+    built = subprocess.run(  # noqa: S603 - fixed compiler invocation on harness text
+        [compiler, "-std=c++17", "-o", str(binary), str(root / "execute_replay.cpp")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if built.returncode != 0:
+        raise RuntimeError("execute harness failed to compile:\n" + built.stderr)
+    return binary
+
+
 def build_unit_value(root, source_text):
     get_body = function(source_text, "Unit* UnitCalculatedValue::Get()")
     try:
@@ -584,6 +638,10 @@ class AttackTargetPatchTest(unittest.TestCase):
             (pinned_root / "src/Ai/Base/Actions/AttackAction.cpp").read_text(),
             guid_argument=False,
         )
+        pinned_source = (pinned_root / "src/Ai/Base/Actions/AttackAction.cpp").read_text()
+        cls.pinned_execute = build_execute(
+            pinned_root, pinned_source, guid_argument=False
+        )
         cls.pinned_unit_value = build_unit_value(
             pinned_root,
             (pinned_root / "src/Bot/Engine/Value/Value.cpp").read_text(),
@@ -632,6 +690,9 @@ class AttackTargetPatchTest(unittest.TestCase):
             cls.patched_source,
             guid_argument=True,
         )
+        cls.patched_execute = build_execute(
+            patched_root, cls.patched_source, guid_argument=True
+        )
         cls.patched_unit_value = build_unit_value(
             patched_root,
             cls.unit_value_source,
@@ -649,6 +710,15 @@ class AttackTargetPatchTest(unittest.TestCase):
 
     def test_patched_body_refuses_departed_target(self):
         code, out = run(self.patched, "departed")
+        self.assertEqual(code, 0, out)
+        self.assertIn("returned=0 attacked=0", out)
+
+    def test_attack_action_execute_refuses_removed_target(self):
+        code, out = run(self.pinned_execute, "departed")
+        self.assertEqual(code, 3, out)
+        self.assertIn("CRASH", out)
+
+        code, out = run(self.patched_execute, "departed")
         self.assertEqual(code, 0, out)
         self.assertIn("returned=0 attacked=0", out)
 
