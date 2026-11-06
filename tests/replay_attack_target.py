@@ -408,6 +408,105 @@ EXECUTE_HARNESS = GUID_HARNESS.replace(
 )
 
 
+TARGET_GUID_HARNESS = r"""
+#include <cstdint>
+#include <iostream>
+#include <map>
+#include <string>
+
+struct ObjectGuid
+{
+    uint64_t raw = 0;
+    ObjectGuid() = default;
+    explicit ObjectGuid(uint64_t value) : raw(value) {}
+    explicit operator bool() const { return raw != 0; }
+    bool operator!() const { return raw == 0; }
+    static ObjectGuid const Empty;
+};
+ObjectGuid const ObjectGuid::Empty{};
+
+struct Unit {};
+template <typename T> struct Value { virtual ~Value() = default; };
+template <> struct Value<Unit*> { virtual ~Value() = default; virtual Unit* Get() = 0; };
+
+class UnitCalculatedValue : public Value<Unit*>
+{
+public:
+    ObjectGuid guid;
+    Unit* Get() override { return nullptr; }
+    ObjectGuid GetGuid() const { return guid; }
+};
+class CurrentTargetValue : public Value<Unit*>
+{
+public:
+    ObjectGuid GetGuid() const { return ObjectGuid(101); }
+    Unit* Get() override { return nullptr; }
+};
+class DuelTargetValue : public UnitCalculatedValue
+{
+public:
+    ObjectGuid GetGuid() const { return ObjectGuid(202); }
+};
+class RtiTargetValue : public UnitCalculatedValue
+{
+public:
+    ObjectGuid GetGuid() const { return ObjectGuid(303); }
+};
+struct AiObjectContext
+{
+    std::map<std::string, Value<Unit*>*> values;
+    template <typename T> Value<T>* GetValue(std::string const& name)
+    {
+        return dynamic_cast<Value<T>*>(values[name]);
+    }
+};
+struct PlayerbotAI
+{
+    AiObjectContext context;
+    AiObjectContext* GetAiObjectContext() { return &context; }
+};
+struct Player
+{
+    ObjectGuid guid{1};
+    ObjectGuid GetGUID() const { return guid; }
+};
+struct AttackAction
+{
+    PlayerbotAI* botAI = nullptr;
+    Player* bot = nullptr;
+    std::string targetName;
+    std::string const GetTargetName() { return targetName; }
+    ObjectGuid GetTargetGuid();
+};
+
+// REAL_BODY
+
+int main(int argc, char** argv)
+{
+    if (argc != 2) return 2;
+    PlayerbotAI ai;
+    Player bot;
+    AttackAction action{&ai, &bot, argv[1]};
+    UnitCalculatedValue calculated;
+    calculated.guid = ObjectGuid(404);
+    CurrentTargetValue current;
+    DuelTargetValue duel;
+    RtiTargetValue rti;
+    if (action.targetName == "dps target" || action.targetName == "find target::boss")
+        ai.context.values[action.targetName] = &calculated;
+    else if (action.targetName == "current target")
+        ai.context.values[action.targetName] = &current;
+    else if (action.targetName == "duel target")
+        ai.context.values[action.targetName] = &duel;
+    else if (action.targetName == "rti target")
+        ai.context.values[action.targetName] = &rti;
+    ObjectGuid guid = action.GetTargetGuid();
+    std::cout << "guid=" << guid.raw << "\n";
+    return 0;
+}
+"""
+
+
 UNIT_VALUE_HARNESS = r"""
 #include <cstdint>
 #include <iostream>
@@ -563,6 +662,26 @@ def build_execute(root, source_text, *, guid_argument):
     return binary
 
 
+def build_target_guid(root, source_text):
+    body = function(source_text, "ObjectGuid AttackAction::GetTargetGuid()")
+    harness = TARGET_GUID_HARNESS.replace("// REAL_BODY", body)
+    (root / "target-guid.cpp").write_text(harness)
+    compiler = shutil.which(os.environ.get("CXX", "c++"))
+    if compiler is None:
+        raise RuntimeError("C++ compiler required for the target GUID replay")
+    binary = root / "target-guid"
+    built = subprocess.run(  # noqa: S603 - fixed compiler invocation on extracted method text
+        [compiler, "-std=c++17", "-o", str(binary), str(root / "target-guid.cpp")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if built.returncode != 0:
+        raise RuntimeError("target GUID harness failed to compile:\n" + built.stderr)
+    return binary
+
+
 def build_unit_value(root, source_text):
     get_body = function(source_text, "Unit* UnitCalculatedValue::Get()")
     try:
@@ -690,6 +809,9 @@ class AttackTargetPatchTest(unittest.TestCase):
             cls.patched_source,
             guid_argument=True,
         )
+        cls.patched_target_guid = build_target_guid(
+            patched_root, cls.patched_source
+        )
         cls.patched_execute = build_execute(
             patched_root, cls.patched_source, guid_argument=True
         )
@@ -721,6 +843,21 @@ class AttackTargetPatchTest(unittest.TestCase):
         code, out = run(self.patched_execute, "departed")
         self.assertEqual(code, 0, out)
         self.assertIn("returned=0 attacked=0", out)
+
+    def test_calculated_specialized_targets_enter_through_their_stored_guid(self):
+        for target_name, expected in (
+            ("dps target", "guid=404"),
+            ("find target::boss", "guid=404"),
+            ("current target", "guid=101"),
+            ("duel target", "guid=202"),
+            ("rti target", "guid=303"),
+            ("self target", "guid=1"),
+            ("unrecognized target", "guid=0"),
+        ):
+            with self.subTest(target_name=target_name):
+                code, out = run(self.patched_target_guid, target_name)
+                self.assertEqual(code, 0, out)
+                self.assertIn(expected, out)
 
     def test_pinned_body_attacks_other_map_target(self):
         code, out = run(self.pinned, "other-map")

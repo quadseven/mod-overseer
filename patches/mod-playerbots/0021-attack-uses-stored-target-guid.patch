@@ -2,22 +2,24 @@ Subject: [PATCH] resolve attack targets by stored GUID without breaking actions
 
 Retain the Unit* AttackAction interface used by specialized playerbot actions,
 while resolving cached Unit values by their captured GUID before returning them.
-The current, duel, and raid-icon attack paths continue to pass GUIDs directly.
+Cached action targets, including current, duel, and raid-icon targets, pass
+their stored GUIDs directly to the attack implementation.
 
 diff --git a/src/Ai/Base/Actions/AttackAction.cpp b/src/Ai/Base/Actions/AttackAction.cpp
 index be4a709..b597c69 100644
 --- a/src/Ai/Base/Actions/AttackAction.cpp
 +++ b/src/Ai/Base/Actions/AttackAction.cpp
-@@ -5,6 +5,8 @@
+@@ -5,6 +5,9 @@
   */
  
  #include "AttackAction.h"
 +#include "CurrentTargetValue.h"
 +#include "DuelTargetValue.h"
++#include "RtiTargetValue.h"
  #include "CreatureAI.h"
  #include "Event.h"
  #include "LastMovementValue.h"
-@@ -16,16 +18,33 @@
+@@ -16,16 +18,46 @@
  #include "Unit.h"
  #include "WaitForAttackStrategy.h"
  
@@ -44,10 +46,23 @@ index be4a709..b597c69 100644
 +        return value ? value->GetGuid() : ObjectGuid::Empty;
 +    }
 +
++    if (targetName == "rti target")
++    {
++        auto* value = dynamic_cast<RtiTargetValue*>(
++            botAI->GetAiObjectContext()->GetValue<Unit*>(targetName));
++        return value ? value->GetGuid() : ObjectGuid::Empty;
++    }
++
 +    if (targetName == "self target")
 +        return bot->GetGUID();
 +
-+    return ObjectGuid::Empty;
++    auto* value = dynamic_cast<UnitCalculatedValue*>(
++        botAI->GetAiObjectContext()->GetValue<Unit*>(targetName));
++    if (!value)
++        return ObjectGuid::Empty;
++
++    value->Get();
++    return value->GetGuid();
 +}
  
 -    return Attack(target);
@@ -58,7 +73,7 @@ index be4a709..b597c69 100644
  }
  
  bool AttackMyTargetAction::Execute(Event /*event*/)
-@@ -45,16 +64,22 @@ bool AttackMyTargetAction::Execute(Event /*event*/)
+@@ -45,16 +64,24 @@ bool AttackMyTargetAction::Execute(Event /*event*/)
      }
  
      botAI->GetAiObjectContext()->GetValue<GuidVector>("prioritized targets")->Set({guid});
@@ -73,6 +88,8 @@ index be4a709..b597c69 100644
 -bool AttackAction::Attack(Unit* target, bool /*with_pet*/ /*true*/)
 +bool AttackAction::Attack(Unit* target, bool with_pet)
 +{
++    // Specialized callers pass a unit resolved for this action invocation.
++    // Cached target values must enter through GetTargetGuid() and Attack(ObjectGuid).
 +    ObjectGuid guid = target ? target->GetGUID() : ObjectGuid::Empty;
 +    return Attack(guid, with_pet);
 +}
@@ -347,11 +364,12 @@ diff --git a/src/Bot/Engine/Value/Value.h b/src/Bot/Engine/Value/Value.h
 index 8d34d18..06f9b00 100644
 --- a/src/Bot/Engine/Value/Value.h
 +++ b/src/Bot/Engine/Value/Value.h
-@@ -5,4 +5,8 @@ public:
+@@ -5,4 +5,9 @@ public:
  
      std::string const Format() override;
      Unit* Get() override;
 +    void Set(Unit* unit) override;
++    ObjectGuid GetGuid() const { return guid; }
 +
 +protected:
 +    ObjectGuid guid = ObjectGuid::Empty;
