@@ -290,6 +290,9 @@
 #include "GameObject.h"
 // Zul'Farrak's End Door (#1337) sends Weegli with his script's DoAction.
 #include "CreatureAI.h"
+// Zul'Farrak's pyramid event and the walk to Ukorz give up inside a bound
+// (#1389).
+#include "overseer_zf_steps.h"
 #include "Mail.h"
 #include "RBAC.h"
 // kind='bot' `e Hitem:` (#927): the verdict and the scorer mod-playerbots' own
@@ -322,12 +325,16 @@
 #include "overseer_faction_home.h"
 #include "overseer_disenchant_store.h"
 #include "overseer_crash.h"
+// The faction's inn near a door that names no town (#1388).
+#include "overseer_door_inns.h"
 // Who holds a character's wheel: the travel column's claim, release and
 // hand-back rules behind one interface (#1312). See RosterAimColumn below.
 #include "overseer_movement_ownership.h"
 // The core and mod-playerbots APIs that differ between the pins build.yml
 // compiles against and the upstream heads (wow-overseer#826).
 #include "overseer_core_compat.h"
+// A grouped follower with full bags may take its sale walk (#1395).
+#include "overseer_follower_sale.h"
 
 #include <algorithm>
 #include <atomic>
@@ -36420,8 +36427,17 @@ private:
     static OverseerDecisions::CampaignHomeAnchor CampaignHomeAnchorFor(
         DungeonPortal const& portal, std::vector<std::string> const& members)
     {
+        // AND, WHEN NOBODY IN THE FAMILY IS BOUND ON THE DOOR'S CONTINENT, THE
+        // FACTION'S OWN INN NEAR THE DOOR (#1388). Without it a family bound
+        // wholly on the other continent had no anchor, nobody was walked to an
+        // inn, and every failed walk out sent members home across the ocean.
+        // The faction is read off the first member in the world: a family is
+        // one faction, as the party it is kept in requires. A named home is
+        // read for the family's faction only (#1400).
         std::vector<OverseerDecisions::HomeBind> binds;
         std::vector<OverseerFactionHome::Faction> factions;
+        bool knowsFaction = false;
+        bool horde = false;
         for (std::string const& name : members)
         {
             Player* bot = ObjectAccessor::FindPlayerByName(name);
@@ -36429,6 +36445,11 @@ private:
             {
                 binds.push_back(ReadHomeBind(bot));
                 factions.push_back(FactionOf(bot));
+                if (!knowsFaction)
+                {
+                    knowsFaction = true;
+                    horde = bot->GetTeamId() == TEAM_HORDE;
+                }
             }
         }
 
@@ -36437,8 +36458,12 @@ private:
         if (named.known)
             return named;
 
-        return OverseerDecisions::FamilyInnOnDoorMap(binds, portal.outsideMapId,
-                                                     CAMPAIGN_HOME_TOWN_YARDS);
+        if (!knowsFaction)
+            return OverseerDecisions::FamilyInnOnDoorMap(binds, portal.outsideMapId,
+                                                         CAMPAIGN_HOME_TOWN_YARDS);
+        return OverseerDecisions::UnnamedDoorHomeAnchor(binds, portal.insideMapId,
+                                                        portal.outsideMapId, horde,
+                                                        CAMPAIGN_HOME_TOWN_YARDS);
     }
 
     std::vector<std::string> MembersOwedAHome(std::vector<std::string> const& members,
@@ -38493,17 +38518,6 @@ private:
                                  "starts normally",
                                  name, episode.mapId, episode.attempts[name],
                                  OverseerDecisions::EXIT_HEARTH_ATTEMPTS, reason);
-                        if (OverseerDecisions::OffContinentHearthLetThrough(facts))
-                            LOG_WARN("module.overseer",
-                                     "overseer: EXIT HEARTH - '{}' is let through to its bind "
-                                     "on map {}, off map {} where the door lets out, because "
-                                     "{} and the stone is the only way left (#1202, #1316)",
-                                     name, facts.bindMapId, facts.doorMapId,
-                                     facts.familyHearthedOut
-                                         ? std::string("the family has already hearthed out")
-                                         : "the walk out has failed for " +
-                                               std::to_string(facts.failedWalkSeconds) +
-                                               " seconds");
                         WriteExitHearthEvent(
                             family, leaderName, name, episode, phase, "exit_hearth",
                             "hearth cast for " + name + " on map " +
@@ -44768,6 +44782,10 @@ private:
         // and whether Weegli was sent during that stand.
         std::time_t zfDoorNearSince{0};
         bool zfWeegliAsked{false};
+        // ZUL'FARRAK'S LAST TWO STEPS (overseer_zf_steps.h, #1389): the
+        // pyramid phase clock and the walk-to-Ukorz clock.
+        OverseerDecisions::ZulFarrakSummitClock zfSummit;
+        OverseerDecisions::ZulFarrakUkorzClock zfUkorz;
         // THE CARRY LEASE THE ROW KEPT (#1363): set on adoption and cleared
         // once SeedGuildCarryLease has given it to the in-memory lease.
         OverseerDecisions::GuildCarrySaved carrySaved;
@@ -46302,6 +46320,88 @@ private:
         }
     }
 
+    // ZUL'FARRAK'S PYRAMID EVENT AND THE WALK TO UKORZ (overseer_zf_steps.h,
+    // #1389), one poll on a run the verdict left running. Reads DATA_PYRAMID
+    // and DATA_END_DOOR off the core's instance_zulfarrak and the tank's
+    // distance to a living Ukorz; true when a step gave up, with `why` naming
+    // the step and the reason, and the caller ends the run as stalled.
+    bool StepZulFarrakSteps(GuildRun& run, OverseerDecisions::GuildRunPoll const& poll,
+                            std::time_t now, std::string& why)
+    {
+        using OverseerDecisions::ZulFarrakStepVerdict;
+        if (run.mapId != OverseerDecisions::ZF_MAP_ID)
+            return false;
+        Player* const tank = ObjectAccessor::FindPlayerByName(run.tank);
+        InstanceScript* const script =
+            GuildRunAliveInside(run, tank) ? tank->GetInstanceScript() : nullptr;
+
+        OverseerDecisions::ZulFarrakSummitFacts summit;
+        summit.read = script != nullptr;
+        summit.creditedMask = poll.creditedMask;
+        summit.now = now;
+        OverseerDecisions::ZulFarrakUkorzFacts walk;
+        walk.read = script != nullptr;
+        walk.creditedMask = poll.creditedMask;
+        walk.now = now;
+        if (script)
+        {
+            summit.pyramidPhase = script->GetData(OverseerDecisions::ZF_DATA_PYRAMID);
+            summit.endDoorState = script->GetData(OverseerDecisions::ZF_DATA_END_DOOR);
+            walk.endDoorState = summit.endDoorState;
+            if (walk.endDoorState == OverseerDecisions::ZF_END_DOOR_DONE)
+            {
+                // By entry across the instance, as Weegli is found (#1341).
+                std::list<Creature*> found;
+                tank->GetCreatureListWithEntryInGrid(found, OverseerDecisions::ZF_UKORZ_ENTRY,
+                                                     OverseerDecisions::ZF_WEEGLI_SEARCH_YARDS);
+                for (Creature* const candidate : found)
+                {
+                    if (!candidate || !candidate->IsAlive())
+                        continue;
+                    float const yards = tank->GetExactDist(candidate);
+                    if (!walk.ukorzFound || yards < walk.yards)
+                        walk.yards = yards;
+                    walk.ukorzFound = true;
+                }
+            }
+        }
+
+        OverseerDecisions::ZulFarrakSummitStep const summitStep =
+            OverseerDecisions::ZulFarrakSummitNext(summit, run.zfSummit);
+        run.zfSummit = summitStep.clock;
+        OverseerDecisions::ZulFarrakUkorzStep const walkStep =
+            OverseerDecisions::ZulFarrakUkorzNext(walk, run.zfUkorz);
+        run.zfUkorz = walkStep.clock;
+
+        if (summitStep.verdict == ZulFarrakStepVerdict::GiveUp)
+        {
+            why = std::string("Zul'Farrak's ") + OverseerDecisions::ZF_SUMMIT_STEP +
+                  " did not advance: the pyramid stood at phase " +
+                  std::to_string(summitStep.clock.phase) + " for " +
+                  std::to_string(summitStep.seconds / 60) + " min";
+        }
+        else if (walkStep.verdict == ZulFarrakStepVerdict::GiveUp)
+        {
+            why = std::string("Zul'Farrak's End Door is open but ") +
+                  OverseerDecisions::ZF_UKORZ_STEP + " came no " +
+                  std::to_string(static_cast<uint32>(OverseerDecisions::ZF_UKORZ_NEARER_YARDS)) +
+                  "y nearer than " + std::to_string(static_cast<uint32>(walkStep.clock.best)) +
+                  "y in " + std::to_string(walkStep.seconds / 60) + " min";
+        }
+        else
+            return false;
+        // The give-up line the live check counts: run, step, reason.
+        LOG_WARN("module.overseer",
+                 "overseer: guild finder run {} - step '{}' gave up: {}; ending it so its "
+                 "members go free (#1389)",
+                 run.id,
+                 summitStep.verdict == ZulFarrakStepVerdict::GiveUp
+                     ? OverseerDecisions::ZF_SUMMIT_STEP
+                     : OverseerDecisions::ZF_UKORZ_STEP,
+                 why);
+        return true;
+    }
+
     // ONE POLL OF THE STALL LADDER (OverseerDecisions::GuildRunStallNext,
     // #1086), on a run the verdict left running. Sends `dc skip` from the tank
     // on Skip; true on End, when the caller ends the run as stalled and `why`
@@ -46903,6 +47003,20 @@ private:
             // parked at the shut door is let through to Ukorz rather than
             // skipped past him.
             StepZulFarrakEndDoor(run, now);
+            // ZUL'FARRAK'S PYRAMID AND THE WALK TO UKORZ (#1389): each gives up
+            // inside its own bound, which the ladder's stillness clock never
+            // reaches while the party fights, wipes and rests.
+            {
+                std::string why;
+                if (StepZulFarrakSteps(run, poll, now, why))
+                {
+                    EndGuildRun(run,
+                                OverseerDecisions::GuildRunVerdictWord(
+                                    OverseerDecisions::GuildRunVerdict::Stalled),
+                                why, now);
+                    return true;
+                }
+            }
             // THE STALL LADDER (#1086): `dc skip` what the brain cannot reach,
             // and end the run as stalled when skipping does not move it.
             {
@@ -80857,6 +80971,23 @@ private:
         gate.sittingOut = IsStandinSittingOut(ev.character);
         Group* group = who->GetGroup();
         gate.groupedFollower = group && group->GetLeaderGUID() != who->GetGUID();
+        // A GROUPED FOLLOWER WITH FULL BAGS TAKES ITS SALE WALK (#1395). The
+        // follower wall held every quester in a quest group off its sale for
+        // as long as the group lasted, which is hours. Only the sale walk
+        // (`any`), only at the floor the module reads itself; every other
+        // wall below still applies. See overseer_follower_sale.h.
+        if (gate.groupedFollower && goal == D::WalkGoal::Vendor)
+        {
+            uint32 const freeSlots = who->GetFreeInventorySpace();
+            if (OverseerDecisions::FollowerSaleWalkPasses(ev.anyVendor, freeSlots))
+            {
+                gate.groupedFollower = false;
+                LOG_INFO("module.overseer",
+                         "overseer: vendor walk {} for '{}' is a sale with {} free bag slot(s) - "
+                         "the follower wall lets it through (#1395)",
+                         id, ev.character, freeSlots);
+            }
+        }
         for (MailWalkCheck const& check : walking)
             if (check.targetName == ev.character)
                 gate.alreadyWalking = true;

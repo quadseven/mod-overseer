@@ -20090,9 +20090,16 @@ char const* ExitHearthStepWord(ExitHearthStep step)
 
 bool OffContinentHearthLetThrough(ExitHearthFacts const& facts)
 {
-    return facts.doorMapKnown && facts.bindMapId != facts.doorMapId &&
-           (facts.familyHearthedOut ||
-            facts.failedWalkSeconds >= OFF_CONTINENT_HEARTH_AFTER_SECONDS);
+    // NEVER, SINCE #1388. The let-through (#1202, #1316) hearthed a member to a
+    // bind on the other continent once its walk out had failed for ten minutes
+    // or the family had hearthed away, and that is what split the families: a
+    // family bound wholly on the other continent went home across the ocean on
+    // every failed walk out (`went home: map 70 to map 1` 17 times in 48 hours).
+    // The member is held on the walk out instead, and the home bind drive gives
+    // the family an inn on the door's continent (overseer_door_inns.h), so the
+    // stone leads somewhere the family can regroup from.
+    (void)facts;
+    return false;
 }
 
 bool SitOutHearthDue(std::int64_t walkingSeconds, unsigned attempts)
@@ -20122,13 +20129,14 @@ std::string ExitHearthImpossibleReason(ExitHearthFacts const& facts, unsigned ma
     if (facts.attempts >= maxAttempts)
         return "hearth attempts spent";
     // A hearth to another continent splits the family (#1142): the stone is
-    // withheld and the member stays on the walk-out path, until that walk has
-    // failed for the whole bound and the stone is the only way left (#1202).
+    // withheld and the member stays on the walk-out path, however long that
+    // walk has failed (#1388), until it is rebound on the door's continent.
     if (facts.doorMapKnown && facts.bindMapId != facts.doorMapId &&
         !OffContinentHearthLetThrough(facts))
         return "hearthstone bound on map " + std::to_string(facts.bindMapId) +
                ", not on map " + std::to_string(facts.doorMapId) +
-               " where the exit door lets out, so the stone is withheld";
+               " where the exit door lets out, so the stone is withheld and the member "
+               "is held for the walk out (#1388)";
     return "";
 }
 
