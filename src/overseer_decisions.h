@@ -6876,8 +6876,16 @@ struct QuestErrandFacts
     bool giverInReach{false};
     bool rewarded{false};
     int status{0};
-    // Take: CanTakeQuest, SatisfyQuestStatus and CanAddQuest together.
+    // Take: CanTakeQuest and SatisfyQuestStatus together (level, race, class,
+    // prerequisite, exclusive group, the quest's own state).
     bool eligible{false};
+    // Take: CanAddQuest, asked apart (mod-overseer#1393). With the log's room
+    // already read above, the core refuses it only when the item the giver
+    // hands over (quest_template.StartItem) will not fit in the bags. That is
+    // a full bag, not an eligibility rule: quests 94, 106, 118 and 120 were
+    // filed broken as "not eligible" with every rule met and full bags. True
+    // by default, as every quest without a start item is.
+    bool startItemFits{true};
     bool logHasRoom{false};
     // Turn in: CanRewardQuest, asked with the reward the turn-in will take
     // when the quest offers a choice (ChooseQuestReward, #973).
@@ -6891,7 +6899,8 @@ std::string QuestErrandRefusal(QuestErrand const& errand, QuestErrandFacts const
 
 // IS THIS REFUSAL WORTH ASKING AGAIN WITHOUT CHANGING THE ROW (#19). True for
 // the walls that move: the giver or taker is not in reach yet, the quest is not
-// complete yet, the log is full, the core will not reward it now. False for
+// complete yet, the log is full, the bags have no room for the item the giver
+// hands over, the core will not reward it now. False for
 // what the same row will hit for ever, and above all for a quest the world
 // names nothing to hand in to: that is "could not", and a sender that counts it
 // as "did not yet" reports 23 of 24 handed in as nearly done when the 24th can
