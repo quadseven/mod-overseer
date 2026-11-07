@@ -22703,8 +22703,11 @@ char const* ExitHearthStepWord(ExitHearthStep step);
 // Why a member cannot hearth, in the words the log and the timeline use; empty
 // for a member that can, or is not inside. A stone bound off the door's map
 // names both maps and says it is withheld.
-// True when the stone leads off the door's continent and the walk has failed
-// for long enough to allow it anyway (#1202). The cast path logs this rule.
+// Whether a stone bound off the door's continent is let through anyway. It was
+// true once the walk had failed for OFF_CONTINENT_HEARTH_AFTER_SECONDS or the
+// family had hearthed out (#1202, #1316); it is never true since #1388, which
+// holds the member for the walk out and rebinds the family on the door's
+// continent instead. Kept as the one named place that rule lives.
 bool OffContinentHearthLetThrough(ExitHearthFacts const& facts);
 
 // True when a member sitting out has walked for the whole bound and has hearth
