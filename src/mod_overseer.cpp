@@ -322,6 +322,7 @@
 // see overseer_decisions.h for why that was worth a file.
 #include "overseer_decisions.h"
 #include "overseer_disenchant.h"
+#include "overseer_faction_home.h"
 #include "overseer_disenchant_store.h"
 #include "overseer_crash.h"
 // The faction's inn near a door that names no town (#1388).
@@ -35906,8 +35907,10 @@ private:
             // FACTION FIRST (#510). The family sent here is the level 60 one,
             // which is on Kalimdor: the Horde family, whose town is Orgrimmar
             // (`ragefire`), not the Alliance one, whose town is Stormwind
-            // (`stockades`). An Alliance party sent to this door would be walked
-            // into a Horde town to bind, so the job writer must not send one. The
+            // (`stockades`). An Alliance party sent to this door is not walked to
+            // Kargath: OverseerFactionHome lists this home as Horde, and
+            // DungeonHomeAnchor serves it only to a Horde family (#1400); an
+            // Alliance family binds at its own inn on map 0 instead. The
             // innkeepers on map 0 within 3000 yards of trigger 1466, by straight
             // line from the door:
             //
@@ -36272,19 +36275,55 @@ private:
     // home a hearthstone lands on has to be on the map the door is approached
     // from or it is not a home for this campaign at all, so there is nothing for
     // a second copy to disagree with.
+    //
+    // AND ONLY FOR A FAMILY THE TOWN'S INN SERVES (#1400). `family` is the
+    // faction of the family the campaign runs for. A named home of the other
+    // faction (Kargath for an Alliance family on `blackrock-depths`) is no
+    // home for it: its innkeeper refuses the bind and its guards attack, so
+    // the anchor comes back unknown and the caller falls through to the
+    // family's own inn on the door's map, as for a door that names no town.
     static OverseerDecisions::CampaignHomeAnchor DungeonHomeAnchor(
-        DungeonPortal const& portal)
+        DungeonPortal const& portal, OverseerFactionHome::Faction family)
     {
-        OverseerDecisions::CampaignHomeAnchor anchor;
-        if (!OverseerDecisions::StagingPointUsable(portal.homeX, portal.homeY,
-                                                   portal.homeZ))
-            return anchor;
-        anchor.known = true;
-        anchor.mapId = portal.outsideMapId;
-        anchor.x = portal.homeX;
-        anchor.y = portal.homeY;
-        anchor.z = portal.homeZ;
+        bool refused = false;
+        OverseerDecisions::CampaignHomeAnchor const anchor =
+            OverseerFactionHome::NamedHomeAnchor(portal.keyword, portal.outsideMapId,
+                                                 portal.homeX, portal.homeY, portal.homeZ,
+                                                 family, &refused);
+        if (refused)
+            SayNamedHomeRefusedOnce(portal.keyword,
+                                    OverseerFactionHome::HomeFactionOf(portal.keyword),
+                                    family);
         return anchor;
+    }
+
+    // A member's faction as the named-home rule reads it (#1400).
+    static OverseerFactionHome::Faction FactionOf(Player const* bot)
+    {
+        if (!bot)
+            return OverseerFactionHome::Faction::Unknown;
+        return bot->GetTeamId() == TEAM_ALLIANCE ? OverseerFactionHome::Faction::Alliance
+                                                 : OverseerFactionHome::Faction::Horde;
+    }
+
+    // ONCE PER DOOR AND FACTION PER PROCESS, because the anchor is read every
+    // poll by two callers. This is the proof line for #1400: an Alliance
+    // family on `blackrock-depths` prints it instead of being walked to
+    // Kargath.
+    static void SayNamedHomeRefusedOnce(char const* keyword,
+                                        OverseerFactionHome::Faction home,
+                                        OverseerFactionHome::Faction family)
+    {
+        static std::set<std::string> said;
+        std::string const key = std::string(keyword ? keyword : "") + '/' +
+                                OverseerFactionHome::FactionName(family);
+        if (!said.insert(key).second)
+            return;
+        LOG_INFO("module.overseer",
+                 "overseer: the '{}' campaign's named home is a {} inn, which does not "
+                 "serve a {} family; it binds at its own inn on the door's map instead (#1400)",
+                 keyword ? keyword : "", OverseerFactionHome::FactionName(home),
+                 OverseerFactionHome::FactionName(family));
     }
 
     static bool IsDungeonJob(std::string const& job)
@@ -36446,17 +36485,15 @@ private:
     static OverseerDecisions::CampaignHomeAnchor CampaignHomeAnchorFor(
         DungeonPortal const& portal, std::vector<std::string> const& members)
     {
-        OverseerDecisions::CampaignHomeAnchor const named = DungeonHomeAnchor(portal);
-        if (named.known)
-            return named;
-
         // AND, WHEN NOBODY IN THE FAMILY IS BOUND ON THE DOOR'S CONTINENT, THE
         // FACTION'S OWN INN NEAR THE DOOR (#1388). Without it a family bound
         // wholly on the other continent had no anchor, nobody was walked to an
         // inn, and every failed walk out sent members home across the ocean.
         // The faction is read off the first member in the world: a family is
-        // one faction, as the party it is kept in requires.
+        // one faction, as the party it is kept in requires. A named home is
+        // read for the family's faction only (#1400).
         std::vector<OverseerDecisions::HomeBind> binds;
+        std::vector<OverseerFactionHome::Faction> factions;
         bool knowsFaction = false;
         bool horde = false;
         for (std::string const& name : members)
@@ -36465,6 +36502,7 @@ private:
             if (bot && bot->IsInWorld())
             {
                 binds.push_back(ReadHomeBind(bot));
+                factions.push_back(FactionOf(bot));
                 if (!knowsFaction)
                 {
                     knowsFaction = true;
@@ -36472,6 +36510,12 @@ private:
                 }
             }
         }
+
+        OverseerDecisions::CampaignHomeAnchor const named =
+            DungeonHomeAnchor(portal, OverseerFactionHome::FamilyFaction(factions));
+        if (named.known)
+            return named;
+
         if (!knowsFaction)
             return OverseerDecisions::FamilyInnOnDoorMap(binds, portal.outsideMapId,
                                                          CAMPAIGN_HOME_TOWN_YARDS);
@@ -43385,10 +43429,11 @@ private:
 
         // THE TOWN FIRST, WHERE THE PORTAL ROW NAMES ONE, then the
         // approach the staging walk would take - with no staging clock.
-        OverseerDecisions::CampaignHomeAnchor const town = DungeonHomeAnchor(portal);
+        OverseerDecisions::CampaignHomeAnchor const town =
+            DungeonHomeAnchor(portal, FactionOf(leader));
         std::string aim;
         float yards = 0.f;
-        if (town.known && !coord.recoveryTownReached)
+        if (OverseerFactionHome::RestageWalksToTown(town, coord.recoveryTownReached))
         {
             yards = leader->GetExactDist2d(town.x, town.y);
             if (yards <= DUNGEON_RECOVERY_NEAR_YARDS)
