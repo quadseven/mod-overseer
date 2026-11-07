@@ -71,17 +71,19 @@ ExitHearthFacts WithheldStone()
     return facts;
 }
 
-void TheWithheldStoneIsReleasedOnceTheFamilyHasGone()
+void TheWithheldStoneStaysWithheldOnceTheFamilyHasGone()
 {
     ExitHearthFacts facts = WithheldStone();
     Check("the family still inside keeps the stone withheld",
           ExitFailureHearthStep(facts) == ExitHearthStep::Impossible);
 
+    // NOT EVEN ONCE THE FAMILY HAS GONE (#1388): its stones lead to the door's
+    // continent, so this one, bound on the other, would split it again.
     facts.familyHearthedOut = true;
-    Check("the family gone leaves nothing for the withhold to protect",
-          OffContinentHearthLetThrough(facts));
-    Check("so the last member hearths out with them",
-          ExitFailureHearthStep(facts) == ExitHearthStep::Cast);
+    Check("the family gone does not let a stone across the ocean",
+          !OffContinentHearthLetThrough(facts));
+    Check("so the last member is held for the walk out",
+          ExitFailureHearthStep(facts) == ExitHearthStep::Impossible);
 
     ExitHearthFacts cooling = WithheldStone();
     cooling.familyHearthedOut = true;
@@ -223,7 +225,7 @@ void TheReasonNamesWhyTheMemberIsNotComing()
 
 int main()
 {
-    TheWithheldStoneIsReleasedOnceTheFamilyHasGone();
+    TheWithheldStoneStaysWithheldOnceTheFamilyHasGone();
     ARunThatIsOverIsWalkedOutNotStagedInto();
     ARunGivenUpOnDoesNotEndComplete();
     ALivingMemberOutsideEndsTheHoldInsideFiveMinutes();

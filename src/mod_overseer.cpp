@@ -321,6 +321,8 @@
 #include "overseer_disenchant.h"
 #include "overseer_disenchant_store.h"
 #include "overseer_crash.h"
+// The faction's inn near a door that names no town (#1388).
+#include "overseer_door_inns.h"
 // Who holds a character's wheel: the travel column's claim, release and
 // hand-back rules behind one interface (#1312). See RosterAimColumn below.
 #include "overseer_movement_ownership.h"
@@ -36378,15 +36380,34 @@ private:
         if (named.known)
             return named;
 
+        // AND, WHEN NOBODY IN THE FAMILY IS BOUND ON THE DOOR'S CONTINENT, THE
+        // FACTION'S OWN INN NEAR THE DOOR (#1388). Without it a family bound
+        // wholly on the other continent had no anchor, nobody was walked to an
+        // inn, and every failed walk out sent members home across the ocean.
+        // The faction is read off the first member in the world: a family is
+        // one faction, as the party it is kept in requires.
         std::vector<OverseerDecisions::HomeBind> binds;
+        bool knowsFaction = false;
+        bool horde = false;
         for (std::string const& name : members)
         {
             Player* bot = ObjectAccessor::FindPlayerByName(name);
             if (bot && bot->IsInWorld())
+            {
                 binds.push_back(ReadHomeBind(bot));
+                if (!knowsFaction)
+                {
+                    knowsFaction = true;
+                    horde = bot->GetTeamId() == TEAM_HORDE;
+                }
+            }
         }
-        return OverseerDecisions::FamilyInnOnDoorMap(binds, portal.outsideMapId,
-                                                     CAMPAIGN_HOME_TOWN_YARDS);
+        if (!knowsFaction)
+            return OverseerDecisions::FamilyInnOnDoorMap(binds, portal.outsideMapId,
+                                                         CAMPAIGN_HOME_TOWN_YARDS);
+        return OverseerDecisions::UnnamedDoorHomeAnchor(binds, portal.insideMapId,
+                                                        portal.outsideMapId, horde,
+                                                        CAMPAIGN_HOME_TOWN_YARDS);
     }
 
     std::vector<std::string> MembersOwedAHome(std::vector<std::string> const& members,
@@ -38441,17 +38462,6 @@ private:
                                  "starts normally",
                                  name, episode.mapId, episode.attempts[name],
                                  OverseerDecisions::EXIT_HEARTH_ATTEMPTS, reason);
-                        if (OverseerDecisions::OffContinentHearthLetThrough(facts))
-                            LOG_WARN("module.overseer",
-                                     "overseer: EXIT HEARTH - '{}' is let through to its bind "
-                                     "on map {}, off map {} where the door lets out, because "
-                                     "{} and the stone is the only way left (#1202, #1316)",
-                                     name, facts.bindMapId, facts.doorMapId,
-                                     facts.familyHearthedOut
-                                         ? std::string("the family has already hearthed out")
-                                         : "the walk out has failed for " +
-                                               std::to_string(facts.failedWalkSeconds) +
-                                               " seconds");
                         WriteExitHearthEvent(
                             family, leaderName, name, episode, phase, "exit_hearth",
                             "hearth cast for " + name + " on map " +
