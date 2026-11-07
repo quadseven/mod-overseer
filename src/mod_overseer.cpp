@@ -60766,8 +60766,8 @@ private:
         facts.rewarded = bot->GetQuestRewardStatus(questId);
         facts.status = static_cast<int>(bot->GetQuestStatus(questId));
         facts.logHasRoom = bot->SatisfyQuestLog(false);
-        facts.eligible = bot->CanTakeQuest(quest, false) && bot->SatisfyQuestStatus(quest, false) &&
-                         bot->CanAddQuest(quest, false);
+        facts.eligible = bot->CanTakeQuest(quest, false) && bot->SatisfyQuestStatus(quest, false);
+        facts.startItemFits = bot->CanAddQuest(quest, false);
         std::string const refusal = OverseerDecisions::QuestErrandRefusal(errand, facts);
         if (!refusal.empty())
         {
@@ -82773,9 +82773,11 @@ private:
             if (take)
             {
                 facts.logHasRoom = player->SatisfyQuestLog(false);
+                // CanAddQuest apart (#1393): with the log's room read above it
+                // fails only for a start item that will not fit in the bags.
                 facts.eligible = player->CanTakeQuest(quest, false) &&
-                                 player->SatisfyQuestStatus(quest, false) &&
-                                 player->CanAddQuest(quest, false);
+                                 player->SatisfyQuestStatus(quest, false);
+                facts.startItemFits = player->CanAddQuest(quest, false);
             }
             else if (!abandon)
             {

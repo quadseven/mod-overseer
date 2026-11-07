@@ -6148,6 +6148,8 @@ constexpr char const* QUEST_NO_GIVER_OBJECT_IN_REACH = "no object that gives tha
 constexpr char const* QUEST_NO_TAKER_OBJECT_IN_REACH = "no object that takes that quest in reach";
 constexpr char const* QUEST_NOT_COMPLETE = "not complete";
 constexpr char const* QUEST_LOG_FULL = "the quest log is full";
+// CanAddQuest alone failed: the start item does not fit (mod-overseer#1393).
+constexpr char const* QUEST_NO_BAG_ROOM = "no bag room for the item the giver hands over";
 constexpr char const* QUEST_CORE_WILL_NOT_REWARD = "the core will not reward it now";
 }  // namespace
 
@@ -6157,7 +6159,7 @@ bool QuestErrandRefusalRetryable(std::string const& reason)
         QUEST_NO_GIVER_IN_REACH,        QUEST_NO_TAKER_IN_REACH,
         QUEST_NO_GIVER_OBJECT_IN_REACH, QUEST_NO_TAKER_OBJECT_IN_REACH,
         QUEST_NOT_COMPLETE,             QUEST_LOG_FULL,
-        QUEST_CORE_WILL_NOT_REWARD,
+        QUEST_CORE_WILL_NOT_REWARD,     QUEST_NO_BAG_ROOM,
     };
     for (char const* candidate : retryable)
         if (reason == candidate)
@@ -6203,6 +6205,10 @@ std::string QuestErrandRefusal(QuestErrand const& errand, QuestErrandFacts const
             return QUEST_LOG_FULL;
         if (!facts.eligible)
             return "not eligible (level, race, class, prerequisite or exclusive group)";
+        // Only after every eligibility rule passed: bag room is a wall that
+        // moves, and its own words send the reader to the bags (#1393).
+        if (!facts.startItemFits)
+            return QUEST_NO_BAG_ROOM;
         return "";
     }
     if (facts.status != STATUS_COMPLETE)

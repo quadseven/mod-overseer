@@ -270,6 +270,51 @@ void TheAdapterSeams()
            "the kind enum names quest after every value before it");
 }
 
+// A FULL BAG IS NOT "NOT ELIGIBLE" (mod-overseer#1393). CanAddQuest fails when
+// the item the giver hands over (StartItem) will not fit in the bags. Quests
+// 94, 106, 118 and 120 each hand one over and were filed broken on the dev
+// realm as "not eligible (level, race, class, prerequisite or exclusive
+// group)" with every one of those rules met. The bag refusal has its own
+// words and is a wait, not a stop.
+void ABagWithNoRoomIsNotIneligibility()
+{
+    QuestErrand const take = ParseQuestErrand("take quest:94");
+    QuestErrandFacts f = Ready();
+    f.startItemFits = false;
+    std::string const bag = QuestErrandRefusal(take, f);
+    Expect(bag == "no bag room for the item the giver hands over",
+           "only CanAddQuest failing names bag room for the start item");
+    Expect(QuestErrandRefusalRetryable(bag), "a full bag is a wait: retryable");
+    Expect(bag.find("not eligible") == std::string::npos, "and never says not eligible");
+
+    f = Ready();
+    f.eligible = false;
+    f.startItemFits = false;
+    std::string const both = QuestErrandRefusal(take, f);
+    Expect(both.find("not eligible (level, race, class, prerequisite or exclusive group)") == 0,
+           "a failing CanTakeQuest or SatisfyQuestStatus keeps today's words");
+    Expect(!QuestErrandRefusalRetryable(both), "and stays a stop");
+    Expect(QuestErrandFacts{}.startItemFits, "a quest with no start item fits by default");
+
+    // The adapter asks CanAddQuest apart from the eligibility pair, at the
+    // errand and at the trainer's class quest.
+    std::string const module = Read("src/mod_overseer.cpp");
+    std::size_t const doQuest = module.find("static char const* DoQuest(");
+    Expect(doQuest != std::string::npos &&
+               module.find("facts.startItemFits = player->CanAddQuest(quest, false);", doQuest) !=
+                   std::string::npos,
+           "DoQuest reads the start item's room on its own");
+    Expect(module.find("player->SatisfyQuestStatus(quest, false) &&\n"
+                       "                                 player->CanAddQuest(quest, false)") ==
+               std::string::npos,
+           "and no longer folds it into eligible");
+    std::size_t const trainer = module.find("static void TakeClassQuestAtTrainer(");
+    Expect(trainer != std::string::npos &&
+               module.find("facts.startItemFits = bot->CanAddQuest(quest, false);", trainer) !=
+                   std::string::npos,
+           "the trainer's class quest reads it apart too");
+}
+
 }  // namespace
 
 // THE TAKE'S REACH IS THE WALK'S ARRIVAL RADIUS (2026-10-08). The spawn walk that
@@ -298,6 +343,7 @@ int main()
     TheTakeReachIsTheWalksArrivalRadius();
     
     TakingAtLothos();
+    ABagWithNoRoomIsNotIneligibility();
     HandingInTheFragment();
     AQuestHandedInAtAnObject();
     AQuestNothingTakesIn();
