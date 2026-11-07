@@ -3407,6 +3407,10 @@ enum class ClearingClock
     // map" about a leader standing on it (2026-10-10, map 33, after a restart
     // brought the head back headless).
     HeldLeaderClientLost,
+    // Blackrock Depths' walk to the Shrine of Thaurissan (overseer_brd_shrine.h,
+    // #1391): the brain is paused on purpose while the party walks the Ironfel
+    // carrier there, and that walk keeps its own bound.
+    HeldShrineWalk,
 };
 
 ClearingClock ClearingClockState(bool acceptedOnEveryoneInside, bool leaderVisible,

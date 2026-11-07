@@ -293,6 +293,9 @@
 // Zul'Farrak's pyramid event and the walk to Ukorz give up inside a bound
 // (#1389).
 #include "overseer_zf_steps.h"
+// Blackrock Depths walks the Ironfel carrier to the Shrine of Thaurissan
+// (#1391).
+#include "overseer_brd_shrine.h"
 #include "Mail.h"
 #include "RBAC.h"
 // kind='bot' `e Hitem:` (#927): the verdict and the scorer mod-playerbots' own
@@ -37351,6 +37354,12 @@ private:
         // (quest, holder) the turn-in left for the ordinary hand-in because
         // the holder's bags could not take the reward (#1067). Said once each.
         std::set<std::pair<uint32, std::string>> turnInLeftNoRoom;
+        // BLACKROCK DEPTHS' SHRINE OF THAURISSAN (overseer_brd_shrine.h, #1391):
+        // the walk's clock, and whether this run has the dungeon brain paused
+        // for it and when that was last asked.
+        OverseerDecisions::BrdShrineClock brdShrine;
+        bool brdShrinePaused{false};
+        time_t brdShrinePausedAt{0};
         DungeonRunPhase phase{DungeonRunPhase::Idle};
         time_t leaderClientOpenSince{0};
         time_t leaderClientLostSince{0};
@@ -55914,6 +55923,163 @@ private:
         return true;
     }
 
+    // THE SHRINE OF THAURISSAN'S SPAWN (#1391), read once from the world's
+    // gameobject spawns on map 230. Null when the world holds none, and the
+    // Shrine step then never walks.
+    struct BrdShrineSpot
+    {
+        float x{0.f}, y{0.f}, z{0.f};
+    };
+
+    static BrdShrineSpot const* BrdShrineSpawn()
+    {
+        static bool looked = false;
+        static bool found = false;
+        static BrdShrineSpot spot;
+        if (!looked)
+        {
+            looked = true;
+            for (auto const& itr : sObjectMgr->GetAllGOData())
+            {
+                GameObjectData const& data = itr.second;
+                if (data.id != OverseerDecisions::BRD_SHRINE_ENTRY ||
+                    data.mapid != OverseerDecisions::BRD_MAP_ID)
+                    continue;
+                spot.x = data.posX;
+                spot.y = data.posY;
+                spot.z = data.posZ;
+                found = true;
+                break;
+            }
+            if (!found)
+                LOG_WARN("module.overseer",
+                         "overseer: the world holds no Shrine of Thaurissan ({}) on map {}; "
+                         "no Blackrock Depths run walks an Ironfel carrier there (#1391)",
+                         OverseerDecisions::BRD_SHRINE_ENTRY, OverseerDecisions::BRD_MAP_ID);
+        }
+        return found ? &spot : nullptr;
+    }
+
+    // Pause or resume the dungeon brain for the Shrine walk, on every member
+    // alive inside, with the leader as the issuer (the raid repair hold's way).
+    void PauseBrainForBrdShrine(DungeonRunCoordinatorState& coord,
+                                std::vector<Player*> const& inside, Player* leader, bool pause,
+                                time_t now)
+    {
+        for (Player* const member : inside)
+            if (PlayerbotAI* const ai = GET_PLAYERBOT_AI(member))
+                ai->DoSpecificAction("dc pause", Event("dc", pause ? "pause" : "resume", leader),
+                                     true);
+        coord.brdShrinePaused = pause;
+        coord.brdShrinePausedAt = now;
+    }
+
+    // BLACKROCK DEPTHS' SHRINE OF THAURISSAN (overseer_brd_shrine.h, #1391), one
+    // CLEARING poll on map 230. Reads each member's Dark Iron Legacy (3802) and
+    // Ironfel, Fineous Darkvire's state across the instance and the carrier's
+    // distance to the Shrine, and asks BrdShrineNext. True while the Shrine
+    // owns the poll: the brain is paused, every member alive inside is escorted
+    // to the Shrine, and the carrier stands there for the bridge's turn-in. The
+    // module turns nothing in and grants nothing.
+    bool StepBrdShrine(DungeonRunCoordinatorState& coord, std::vector<std::string> const& members,
+                       Player* leader, time_t now)
+    {
+        namespace D = OverseerDecisions;
+        if (coord.brdShrine.over)
+            return false;
+        std::vector<D::BrdShrineHolder> party;
+        std::vector<Player*> inside;
+        for (std::string const& name : members)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            D::BrdShrineHolder holder;
+            holder.name = name;
+            if (p && p->IsInWorld() && p->GetMapId() == D::BRD_MAP_ID)
+            {
+                holder.aliveInside = p->IsAlive();
+                if (holder.aliveInside)
+                    inside.push_back(p);
+                QuestStatus const status = p->GetQuestStatus(D::BRD_DARK_IRON_LEGACY);
+                holder.holdsLegacy =
+                    (status == QUEST_STATUS_INCOMPLETE || status == QUEST_STATUS_COMPLETE) &&
+                    !p->GetQuestRewardStatus(D::BRD_DARK_IRON_LEGACY);
+                holder.ironfel = p->GetItemCount(D::BRD_IRONFEL);
+            }
+            party.push_back(holder);
+        }
+
+        D::BrdShrineFacts facts;
+        facts.carrier = D::BrdShrineCarrier(D::BRD_MAP_ID, party);
+        facts.now = now;
+        Player* const carrier =
+            facts.carrier.empty() ? nullptr : ObjectAccessor::FindPlayerByName(facts.carrier);
+        BrdShrineSpot const* const spot = BrdShrineSpawn();
+        if (carrier && spot)
+        {
+            facts.yards = carrier->GetExactDist(spot->x, spot->y, spot->z);
+            // By entry across the instance, as Weegli is found (#1341): no
+            // living Fineous Darkvire anywhere in it is a dead one.
+            std::list<Creature*> found;
+            carrier->GetCreatureListWithEntryInGrid(found, D::BRD_FINEOUS_ENTRY,
+                                                    D::BRD_FINEOUS_SEARCH_YARDS);
+            facts.fineousDead = true;
+            for (Creature* const fineous : found)
+                if (fineous && fineous->IsAlive())
+                    facts.fineousDead = false;
+        }
+
+        D::BrdShrineClock const before = coord.brdShrine;
+        D::BrdShrineVerdict const verdict = D::BrdShrineNext(facts, before);
+        coord.brdShrine = verdict.clock;
+
+        if (verdict.step == D::BrdShrineStep::Done || verdict.step == D::BrdShrineStep::GiveUp)
+        {
+            if (coord.brdShrinePaused)
+                PauseBrainForBrdShrine(coord, inside, leader, false, now);
+            if (verdict.step == D::BrdShrineStep::Done)
+                LOG_INFO("module.overseer",
+                         "overseer: dungeon run {} - '{}' no longer holds Dark Iron Legacy with "
+                         "Ironfel, {}s after the walk to the Shrine of Thaurissan began; the "
+                         "clear resumes (#1391)",
+                         coord.runId, before.carrier, static_cast<int64>(now - before.walkSince));
+            else
+                LOG_WARN("module.overseer",
+                         "overseer: dungeon run {} - the walk of '{}' to the Shrine of "
+                         "Thaurissan gave up at {:.0f} yards ({}): the clear resumes and the "
+                         "Shrine is not asked again this run (#1391)",
+                         coord.runId, verdict.clock.carrier, facts.yards,
+                         D::BrdShrineReached(facts.yards)
+                             ? "stood there with Dark Iron Legacy still in its log"
+                             : "came no nearer");
+            return false;
+        }
+        if (verdict.step == D::BrdShrineStep::Nothing || !spot)
+            return false;
+
+        if (!before.started)
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} - '{}' holds Dark Iron Legacy ({}) with Ironfel "
+                     "and Fineous Darkvire is dead; the party walks it {:.0f} yards to the "
+                     "Shrine of Thaurissan for the turn-in (#1391)",
+                     coord.runId, facts.carrier, D::BRD_DARK_IRON_LEGACY, facts.yards);
+        if (verdict.step == D::BrdShrineStep::Stand && !before.standing)
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} - '{}' stands {:.1f} yards from the Shrine of "
+                     "Thaurissan; held there up to {}s for the bridge's turn-in (#1391)",
+                     coord.runId, facts.carrier, facts.yards,
+                     static_cast<int64>(D::BRD_SHRINE_STAND_SECONDS));
+
+        if (!coord.brdShrinePaused ||
+            now - coord.brdShrinePausedAt >= D::BRD_SHRINE_PAUSE_RETRY_SECONDS)
+            PauseBrainForBrdShrine(coord, inside, leader, true, now);
+        std::ostringstream aim;
+        aim << "at:" << D::BRD_MAP_ID << ':' << spot->x << ',' << spot->y << ',' << spot->z;
+        for (Player* const member : inside)
+            EscortToward(member->GetName(), aim.str(), "SHRINE OF THAURISSAN",
+                         EscortPurpose::Assemble);
+        return true;
+    }
+
     void DriveDungeonRunFor(std::string const& family,
                             std::vector<std::string> const& members,
                             std::string const& leaderName,
@@ -59116,6 +59282,19 @@ private:
                     return;
                 }
                 HoldClearingClock(coord, OverseerDecisions::ClearingClockState(true, false, true),
+                                  portal->insideMapId);
+                return;
+            }
+
+            // BLACKROCK DEPTHS' SHRINE OF THAURISSAN (#1391): while a member
+            // holds Dark Iron Legacy with Ironfel and Fineous is dead, the poll
+            // is the Shrine's - the party walks there and the carrier stands
+            // for the bridge's turn-in - and the clearing clock is held, so no
+            // stall check, skip or exit fires at a walk the run asked for.
+            if (portal->insideMapId == OverseerDecisions::BRD_MAP_ID &&
+                StepBrdShrine(coord, members, leader, clearingNow))
+            {
+                HoldClearingClock(coord, OverseerDecisions::ClearingClock::HeldShrineWalk,
                                   portal->insideMapId);
                 return;
             }
