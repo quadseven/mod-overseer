@@ -293,6 +293,9 @@
 // Zul'Farrak's pyramid event and the walk to Ukorz give up inside a bound
 // (#1389).
 #include "overseer_zf_steps.h"
+// Blackrock Depths walks the Ironfel carrier to the Shrine of Thaurissan
+// (#1391).
+#include "overseer_brd_shrine.h"
 #include "Mail.h"
 #include "RBAC.h"
 // kind='bot' `e Hitem:` (#927): the verdict and the scorer mod-playerbots' own
@@ -330,6 +333,8 @@
 // Who holds a character's wheel: the travel column's claim, release and
 // hand-back rules behind one interface (#1312). See RosterAimColumn below.
 #include "overseer_movement_ownership.h"
+// A combat flag with nothing behind it is released after ten minutes (#1390).
+#include "overseer_stale_combat.h"
 // The core and mod-playerbots APIs that differ between the pins build.yml
 // compiles against and the upstream heads (wow-overseer#826).
 #include "overseer_core_compat.h"
@@ -772,6 +777,11 @@ constexpr int64 STUCK_REVIVAL_HEALER_SECONDS = 90 + 30;
 // first; when none qualifies the nearest stands.
 constexpr float GRAVEYARD_THREAT_RADIUS = 60.0f;
 constexpr std::size_t GRAVEYARD_CANDIDATES = 6;
+// How far beyond its corpse zone a ghost is walked for a graveyard it can stand
+// at, and how many of them are judged (SafeGraveyardOnMap, wow-overseer#1093).
+// Rut'theran Village to Auberdine is about 2,100 yards.
+constexpr float GRAVEYARD_FAR_YARDS = 3000.0f;
+constexpr std::size_t GRAVEYARD_FAR_CANDIDATES = 8;
 
 // THE GRACE AFTER A REVIVAL. A character revived at half health that is
 // immediately walked off by `follow` or `new rpg` arrives at its next fight
@@ -1364,6 +1374,51 @@ static GraveyardStruct const* SafeGraveyardNear(Player* bot, GraveyardStruct con
         standings.push_back(standing);
     }
     return safest();
+}
+
+// The nearest graveyard on the corpse's map, beyond the core's candidate set,
+// that this ghost can stand at, or null (wow-overseer#1093). For a corpse whose
+// zone links only graveyards that fail the safety test, SafeGraveyardNear has
+// nothing left to offer. Any graveyard on the map within GRAVEYARD_FAR_YARDS of
+// the corpse, not `nearest`, and not on the other faction's home ground
+// (OverseerDecisions::FarHealerConsidered) is judged by the same GraveyardRefusal,
+// nearest first, at most GRAVEYARD_FAR_CANDIDATES of them. High ground alone
+// does not pass here: the walk is long, and the ground at its end must be safe.
+static GraveyardStruct const* SafeGraveyardOnMap(Player* bot, GraveyardStruct const* nearest,
+                                                 uint32 corpseMap, float cx, float cy,
+                                                 GraveyardEvidence const& evidence,
+                                                 std::string& refused)
+{
+    Map* map = corpseMap == bot->GetMapId() ? bot->GetMap() : sMapMgr->FindBaseMap(corpseMap);
+    if (!map)
+        return nullptr;
+    bool const alliance = bot->GetTeamId() == TEAM_ALLIANCE;
+    std::vector<std::pair<float, GraveyardStruct const*>> candidates;
+    for (auto const& entry : sGraveyard->GetGraveyardData())
+    {
+        GraveyardStruct const& g = entry.second;
+        if (g.Map != corpseMap || (nearest && g.ID == nearest->ID))
+            continue;
+        float const yards = std::sqrt((g.x - cx) * (g.x - cx) + (g.y - cy) * (g.y - cy));
+        if (!OverseerDecisions::FarHealerConsidered(
+                alliance, map->GetZoneId(bot->GetPhaseMask(), g.x, g.y, g.z), yards,
+                GRAVEYARD_FAR_YARDS))
+            continue;
+        candidates.emplace_back(yards, &g);
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](auto const& a, auto const& b) { return a.first < b.first; });
+    std::size_t tried = 0;
+    for (auto const& candidate : candidates)
+    {
+        if (tried++ >= GRAVEYARD_FAR_CANDIDATES)
+            break;
+        std::string const why = GraveyardRefusal(bot, *candidate.second, evidence);
+        if (why.empty())
+            return candidate.second;
+        refused += "; '" + candidate.second->name + "': " + why;
+    }
+    return nullptr;
 }
 
 // A class the dungeon module elects to raise the dead (DcRezRecovery's
@@ -8664,6 +8719,9 @@ public:
             // block. Reuses this timer rather than adding a new one; there is
             // no reason this needs a different poll interval.
             DriveStuckRevival();
+            // Same clock: a character whose combat flag never clears is refused
+            // every errand, so it is released here (#1390).
+            DriveStaleCombat();
             DriveGuildGhostRecovery();
             DriveGuildTraining();
             // Same cadence again, and after the revival drive on purpose: a
@@ -30783,6 +30841,135 @@ private:
         } while (result->NextRow());
     }
 
+    // ------------------------------------------------------- stale combat --
+    //
+    // A COMBAT FLAG THAT NEVER CLEARS (#1390). See overseer_stale_combat.h for
+    // the rule and the measured case. Every online character with a bot AI is
+    // read on the engagement clock: in combat, alive, in the open world, with
+    // no hostile in reach for ten unbroken minutes, it gets the core's combat
+    // stop (Unit::CombatStop, which ends every combat reference, drops the
+    // attackers and clears UNIT_FLAG_IN_COMBAT through ClearInCombat). If
+    // anything was really fighting it, the next swing re-engages at once.
+    //
+    // World thread, like every other drive on this clock; nothing here can
+    // block. Keyed by GUID counter, so a rename or relog keeps nothing wrong.
+    void DriveStaleCombat()
+    {
+        using OverseerDecisions::DecideStaleCombat;
+        using OverseerDecisions::SayStaleCombatHeld;
+        using OverseerDecisions::StaleCombatFacts;
+        using OverseerDecisions::StaleCombatStep;
+        using OverseerDecisions::StaleCombatVerdict;
+
+        time_t const now = time(nullptr);
+        std::set<uint32> seen;
+        for (auto const& entry : ObjectAccessor::GetPlayers())
+        {
+            Player* bot = entry.second;
+            if (!bot || !bot->IsInWorld() || !bot->GetSession() || !GET_PLAYERBOT_AI(bot))
+                continue;
+            if (!bot->IsInCombat())
+                continue;
+            uint32 const key = bot->GetGUID().GetCounter();
+            seen.insert(key);
+
+            Map* map = bot->GetMap();
+            StaleCombatFacts facts;
+            facts.alive = bot->IsAlive();
+            facts.inCombat = true;
+            facts.onInstanceMap = !map || map->Instanceable();
+            facts.now = now;
+
+            // The nearest hostile in reach, for the held line: an attacker or
+            // a combat reference holder, alive, on this map, within reach.
+            Unit* nearest = nullptr;
+            float nearestYards = 0.f;
+            auto consider = [&](Unit* other)
+            {
+                if (!other || other == bot || !other->IsInWorld() || !other->IsAlive() ||
+                    other->GetMapId() != bot->GetMapId())
+                    return;
+                // A creature that is evading or cannot reach its target, or is
+                // fighting nobody, is not a fight: it is the dangling reference
+                // this drive exists for (#1399, a family member frozen in
+                // combat 3101 yards from its leader for 13 hours).
+                if (Creature* creature = other->ToCreature())
+                    if (creature->IsInEvadeMode() || creature->CanNotReachTarget() ||
+                        !creature->GetVictim())
+                        return;
+                float const yards = bot->GetDistance(other);
+                if (yards > OverseerDecisions::STALE_COMBAT_REACH_YARDS)
+                    return;
+                ++facts.hostilesInReach;
+                if (!nearest || yards < nearestYards)
+                {
+                    nearest = other;
+                    nearestYards = yards;
+                }
+            };
+            for (Unit* attacker : bot->getAttackers())
+                consider(attacker);
+            for (auto const& ref : bot->GetCombatManager().GetPvECombatRefs())
+                consider(ref.second->GetOther(bot));
+            for (auto const& ref : bot->GetCombatManager().GetPvPCombatRefs())
+                consider(ref.second->GetOther(bot));
+
+            auto since = _staleCombatSince.find(key);
+            StaleCombatStep const step = DecideStaleCombat(
+                facts, since == _staleCombatSince.end() ? 0 : since->second);
+
+            // When this character's combat began, as far as this drive saw.
+            time_t& combatSince = _combatSeenSince[key];
+            if (combatSince == 0)
+                combatSince = now;
+
+            if (step.emptySince)
+                _staleCombatSince[key] = step.emptySince;
+            else
+                _staleCombatSince.erase(key);
+
+            if (step.verdict == StaleCombatVerdict::Release)
+            {
+                std::size_t const refs = bot->GetCombatManager().GetPvECombatRefs().size() +
+                                         bot->GetCombatManager().GetPvPCombatRefs().size();
+                std::size_t const attackers = bot->getAttackers().size();
+                bot->CombatStop(true);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' was in combat with no hostile within {:.0f} yards for "
+                         "{} seconds ({} combat reference(s), {} attacker(s) out of reach) - "
+                         "combat stopped so its errands can run; in combat after the stop: {} "
+                         "(#1390)",
+                         bot->GetName(), OverseerDecisions::STALE_COMBAT_REACH_YARDS,
+                         uint64(step.heldSeconds), refs, attackers,
+                         bot->IsInCombat() ? "yes" : "no");
+                _combatSeenSince.erase(key);
+                _staleCombatSaid.erase(key);
+                continue;
+            }
+
+            if (step.verdict == StaleCombatVerdict::HeldByHostile && nearest)
+            {
+                time_t& lastSaid = _staleCombatSaid[key];
+                if (SayStaleCombatHeld(now, combatSince, lastSaid))
+                {
+                    lastSaid = now;
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' has been in combat for {} seconds and is held by "
+                             "'{}' (entry {}) at {:.1f} yards, one of {} hostile(s) in reach - "
+                             "not released (#1390)",
+                             bot->GetName(), uint64(now - combatSince), nearest->GetName(),
+                             nearest->GetEntry(), nearestYards, facts.hostilesInReach);
+                }
+            }
+        }
+
+        // Out of combat, offline or gone: forget, so the maps stay bounded by
+        // who is in combat now.
+        for (auto* book : {&_staleCombatSince, &_combatSeenSince, &_staleCombatSaid})
+            for (auto it = book->begin(); it != book->end();)
+                it = seen.count(it->first) ? std::next(it) : book->erase(it);
+    }
+
     // ---------------------------------------------------------- stuck dead --
     //
     // WHAT WAS WATCHED. The family found repeatedly dead at the identical
@@ -34786,10 +34973,25 @@ private:
     {
         std::string refused;
         GraveyardStruct const* const nearest = st.healerGrave;
-        GraveyardStruct const* const safe =
+        GraveyardStruct const* safe =
             SafeGraveyardNear(bot, nearest, st.mapId, st.corpseX, st.corpseY,
                               corpse->GetPositionZ(), evidence, refused,
                               /*acceptHighGround*/ true);
+        // NOTHING IN THE CORPSE'S ZONE: A GRAVEYARD BEYOND IT (wow-overseer#1093).
+        // Without this the ghost waited out guards that never move and rose
+        // among them again.
+        if (!safe)
+        {
+            safe = SafeGraveyardOnMap(bot, nearest, st.mapId, st.corpseX, st.corpseY,
+                                      evidence, refused);
+            if (safe)
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' (level {}) has no graveyard in its corpse's zone it "
+                         "can stand at, so its ghost walks to '{}' beyond it, {:.0f} yards "
+                         "(wow-overseer#1093)",
+                         name, bot->GetLevel(), safe->name,
+                         bot->GetExactDist2d(safe->x, safe->y));
+        }
         if (OverseerDecisions::PickGuildHealerGraveyard(false, safe != nullptr) !=
             OverseerDecisions::GuildHealerGraveyard::Alternative)
         {
@@ -37152,6 +37354,12 @@ private:
         // (quest, holder) the turn-in left for the ordinary hand-in because
         // the holder's bags could not take the reward (#1067). Said once each.
         std::set<std::pair<uint32, std::string>> turnInLeftNoRoom;
+        // BLACKROCK DEPTHS' SHRINE OF THAURISSAN (overseer_brd_shrine.h, #1391):
+        // the walk's clock, and whether this run has the dungeon brain paused
+        // for it and when that was last asked.
+        OverseerDecisions::BrdShrineClock brdShrine;
+        bool brdShrinePaused{false};
+        time_t brdShrinePausedAt{0};
         DungeonRunPhase phase{DungeonRunPhase::Idle};
         time_t leaderClientOpenSince{0};
         time_t leaderClientLostSince{0};
@@ -55715,6 +55923,163 @@ private:
         return true;
     }
 
+    // THE SHRINE OF THAURISSAN'S SPAWN (#1391), read once from the world's
+    // gameobject spawns on map 230. Null when the world holds none, and the
+    // Shrine step then never walks.
+    struct BrdShrineSpot
+    {
+        float x{0.f}, y{0.f}, z{0.f};
+    };
+
+    static BrdShrineSpot const* BrdShrineSpawn()
+    {
+        static bool looked = false;
+        static bool found = false;
+        static BrdShrineSpot spot;
+        if (!looked)
+        {
+            looked = true;
+            for (auto const& itr : sObjectMgr->GetAllGOData())
+            {
+                GameObjectData const& data = itr.second;
+                if (data.id != OverseerDecisions::BRD_SHRINE_ENTRY ||
+                    data.mapid != OverseerDecisions::BRD_MAP_ID)
+                    continue;
+                spot.x = data.posX;
+                spot.y = data.posY;
+                spot.z = data.posZ;
+                found = true;
+                break;
+            }
+            if (!found)
+                LOG_WARN("module.overseer",
+                         "overseer: the world holds no Shrine of Thaurissan ({}) on map {}; "
+                         "no Blackrock Depths run walks an Ironfel carrier there (#1391)",
+                         OverseerDecisions::BRD_SHRINE_ENTRY, OverseerDecisions::BRD_MAP_ID);
+        }
+        return found ? &spot : nullptr;
+    }
+
+    // Pause or resume the dungeon brain for the Shrine walk, on every member
+    // alive inside, with the leader as the issuer (the raid repair hold's way).
+    void PauseBrainForBrdShrine(DungeonRunCoordinatorState& coord,
+                                std::vector<Player*> const& inside, Player* leader, bool pause,
+                                time_t now)
+    {
+        for (Player* const member : inside)
+            if (PlayerbotAI* const ai = GET_PLAYERBOT_AI(member))
+                ai->DoSpecificAction("dc pause", Event("dc", pause ? "pause" : "resume", leader),
+                                     true);
+        coord.brdShrinePaused = pause;
+        coord.brdShrinePausedAt = now;
+    }
+
+    // BLACKROCK DEPTHS' SHRINE OF THAURISSAN (overseer_brd_shrine.h, #1391), one
+    // CLEARING poll on map 230. Reads each member's Dark Iron Legacy (3802) and
+    // Ironfel, Fineous Darkvire's state across the instance and the carrier's
+    // distance to the Shrine, and asks BrdShrineNext. True while the Shrine
+    // owns the poll: the brain is paused, every member alive inside is escorted
+    // to the Shrine, and the carrier stands there for the bridge's turn-in. The
+    // module turns nothing in and grants nothing.
+    bool StepBrdShrine(DungeonRunCoordinatorState& coord, std::vector<std::string> const& members,
+                       Player* leader, time_t now)
+    {
+        namespace D = OverseerDecisions;
+        if (coord.brdShrine.over)
+            return false;
+        std::vector<D::BrdShrineHolder> party;
+        std::vector<Player*> inside;
+        for (std::string const& name : members)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            D::BrdShrineHolder holder;
+            holder.name = name;
+            if (p && p->IsInWorld() && p->GetMapId() == D::BRD_MAP_ID)
+            {
+                holder.aliveInside = p->IsAlive();
+                if (holder.aliveInside)
+                    inside.push_back(p);
+                QuestStatus const status = p->GetQuestStatus(D::BRD_DARK_IRON_LEGACY);
+                holder.holdsLegacy =
+                    (status == QUEST_STATUS_INCOMPLETE || status == QUEST_STATUS_COMPLETE) &&
+                    !p->GetQuestRewardStatus(D::BRD_DARK_IRON_LEGACY);
+                holder.ironfel = p->GetItemCount(D::BRD_IRONFEL);
+            }
+            party.push_back(holder);
+        }
+
+        D::BrdShrineFacts facts;
+        facts.carrier = D::BrdShrineCarrier(D::BRD_MAP_ID, party);
+        facts.now = now;
+        Player* const carrier =
+            facts.carrier.empty() ? nullptr : ObjectAccessor::FindPlayerByName(facts.carrier);
+        BrdShrineSpot const* const spot = BrdShrineSpawn();
+        if (carrier && spot)
+        {
+            facts.yards = carrier->GetExactDist(spot->x, spot->y, spot->z);
+            // By entry across the instance, as Weegli is found (#1341): no
+            // living Fineous Darkvire anywhere in it is a dead one.
+            std::list<Creature*> found;
+            carrier->GetCreatureListWithEntryInGrid(found, D::BRD_FINEOUS_ENTRY,
+                                                    D::BRD_FINEOUS_SEARCH_YARDS);
+            facts.fineousDead = true;
+            for (Creature* const fineous : found)
+                if (fineous && fineous->IsAlive())
+                    facts.fineousDead = false;
+        }
+
+        D::BrdShrineClock const before = coord.brdShrine;
+        D::BrdShrineVerdict const verdict = D::BrdShrineNext(facts, before);
+        coord.brdShrine = verdict.clock;
+
+        if (verdict.step == D::BrdShrineStep::Done || verdict.step == D::BrdShrineStep::GiveUp)
+        {
+            if (coord.brdShrinePaused)
+                PauseBrainForBrdShrine(coord, inside, leader, false, now);
+            if (verdict.step == D::BrdShrineStep::Done)
+                LOG_INFO("module.overseer",
+                         "overseer: dungeon run {} - '{}' no longer holds Dark Iron Legacy with "
+                         "Ironfel, {}s after the walk to the Shrine of Thaurissan began; the "
+                         "clear resumes (#1391)",
+                         coord.runId, before.carrier, static_cast<int64>(now - before.walkSince));
+            else
+                LOG_WARN("module.overseer",
+                         "overseer: dungeon run {} - the walk of '{}' to the Shrine of "
+                         "Thaurissan gave up at {:.0f} yards ({}): the clear resumes and the "
+                         "Shrine is not asked again this run (#1391)",
+                         coord.runId, verdict.clock.carrier, facts.yards,
+                         D::BrdShrineReached(facts.yards)
+                             ? "stood there with Dark Iron Legacy still in its log"
+                             : "came no nearer");
+            return false;
+        }
+        if (verdict.step == D::BrdShrineStep::Nothing || !spot)
+            return false;
+
+        if (!before.started)
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} - '{}' holds Dark Iron Legacy ({}) with Ironfel "
+                     "and Fineous Darkvire is dead; the party walks it {:.0f} yards to the "
+                     "Shrine of Thaurissan for the turn-in (#1391)",
+                     coord.runId, facts.carrier, D::BRD_DARK_IRON_LEGACY, facts.yards);
+        if (verdict.step == D::BrdShrineStep::Stand && !before.standing)
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} - '{}' stands {:.1f} yards from the Shrine of "
+                     "Thaurissan; held there up to {}s for the bridge's turn-in (#1391)",
+                     coord.runId, facts.carrier, facts.yards,
+                     static_cast<int64>(D::BRD_SHRINE_STAND_SECONDS));
+
+        if (!coord.brdShrinePaused ||
+            now - coord.brdShrinePausedAt >= D::BRD_SHRINE_PAUSE_RETRY_SECONDS)
+            PauseBrainForBrdShrine(coord, inside, leader, true, now);
+        std::ostringstream aim;
+        aim << "at:" << D::BRD_MAP_ID << ':' << spot->x << ',' << spot->y << ',' << spot->z;
+        for (Player* const member : inside)
+            EscortToward(member->GetName(), aim.str(), "SHRINE OF THAURISSAN",
+                         EscortPurpose::Assemble);
+        return true;
+    }
+
     void DriveDungeonRunFor(std::string const& family,
                             std::vector<std::string> const& members,
                             std::string const& leaderName,
@@ -58917,6 +59282,19 @@ private:
                     return;
                 }
                 HoldClearingClock(coord, OverseerDecisions::ClearingClockState(true, false, true),
+                                  portal->insideMapId);
+                return;
+            }
+
+            // BLACKROCK DEPTHS' SHRINE OF THAURISSAN (#1391): while a member
+            // holds Dark Iron Legacy with Ironfel and Fineous is dead, the poll
+            // is the Shrine's - the party walks there and the carrier stands
+            // for the bridge's turn-in - and the clearing clock is held, so no
+            // stall check, skip or exit fires at a walk the run asked for.
+            if (portal->insideMapId == OverseerDecisions::BRD_MAP_ID &&
+                StepBrdShrine(coord, members, leader, clearingNow))
+            {
+                HoldClearingClock(coord, OverseerDecisions::ClearingClock::HeldShrineWalk,
                                   portal->insideMapId);
                 return;
             }
@@ -83923,6 +84301,13 @@ private:
     // Tanks whose withheld pursuit has been said this fight (#1212), cleared
     // with the set above.
     std::set<std::string> _tankPursuitWithheldSaid;
+    // The stale combat drive (#1390): when each character's empty combat
+    // began, when its combat began as this drive saw it, and when its held
+    // line was last said. Keyed by GUID counter; pruned every poll to the
+    // characters in combat now.
+    std::map<uint32, time_t> _staleCombatSince;
+    std::map<uint32, time_t> _combatSeenSince;
+    std::map<uint32, time_t> _staleCombatSaid;
     uint32 _terrainRecoveryTimer = 0;
     // GATHERING/BARRIER coordinator poll (mod-overseer#88). Its own timer,
     // not piggybacked on QUEST_POLL_MS or ENGAGEMENT_POLL_MS: this drive is
