@@ -36220,22 +36220,15 @@ private:
     static OverseerDecisions::CampaignHomeAnchor DungeonHomeAnchor(
         DungeonPortal const& portal, OverseerFactionHome::Faction family)
     {
-        OverseerDecisions::CampaignHomeAnchor anchor;
-        if (!OverseerDecisions::StagingPointUsable(portal.homeX, portal.homeY,
-                                                   portal.homeZ))
-            return anchor;
-        OverseerFactionHome::Faction const home =
-            OverseerFactionHome::HomeFactionOf(portal.keyword);
-        if (!OverseerFactionHome::NamedHomeServes(home, family))
-        {
-            SayNamedHomeRefusedOnce(portal.keyword, home, family);
-            return anchor;
-        }
-        anchor.known = true;
-        anchor.mapId = portal.outsideMapId;
-        anchor.x = portal.homeX;
-        anchor.y = portal.homeY;
-        anchor.z = portal.homeZ;
+        bool refused = false;
+        OverseerDecisions::CampaignHomeAnchor const anchor =
+            OverseerFactionHome::NamedHomeAnchor(portal.keyword, portal.outsideMapId,
+                                                 portal.homeX, portal.homeY, portal.homeZ,
+                                                 family, &refused);
+        if (refused)
+            SayNamedHomeRefusedOnce(portal.keyword,
+                                    OverseerFactionHome::HomeFactionOf(portal.keyword),
+                                    family);
         return anchor;
     }
 
@@ -43375,7 +43368,7 @@ private:
             DungeonHomeAnchor(portal, FactionOf(leader));
         std::string aim;
         float yards = 0.f;
-        if (town.known && !coord.recoveryTownReached)
+        if (OverseerFactionHome::RestageWalksToTown(town, coord.recoveryTownReached))
         {
             yards = leader->GetExactDist2d(town.x, town.y);
             if (yards <= DUNGEON_RECOVERY_NEAR_YARDS)
