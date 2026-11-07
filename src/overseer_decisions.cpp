@@ -2617,6 +2617,9 @@ char const* ClearingClockHoldReason(ClearingClock clock)
             return "the leader's client is not connected or no groupmate may issue a "
                    "dungeon-clear command, so the leader-client hold keeps everybody inside "
                    "still";
+        case ClearingClock::HeldShrineWalk:
+            return "the party walks the Ironfel carrier to the Shrine of Thaurissan, inside "
+                   "that walk's own bound";
         case ClearingClock::Runs:
             break;
     }
