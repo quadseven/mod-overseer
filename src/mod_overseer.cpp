@@ -327,6 +327,8 @@
 // The core and mod-playerbots APIs that differ between the pins build.yml
 // compiles against and the upstream heads (wow-overseer#826).
 #include "overseer_core_compat.h"
+// A grouped follower with full bags may take its sale walk (#1395).
+#include "overseer_follower_sale.h"
 
 #include <algorithm>
 #include <atomic>
@@ -80804,6 +80806,23 @@ private:
         gate.sittingOut = IsStandinSittingOut(ev.character);
         Group* group = who->GetGroup();
         gate.groupedFollower = group && group->GetLeaderGUID() != who->GetGUID();
+        // A GROUPED FOLLOWER WITH FULL BAGS TAKES ITS SALE WALK (#1395). The
+        // follower wall held every quester in a quest group off its sale for
+        // as long as the group lasted, which is hours. Only the sale walk
+        // (`any`), only at the floor the module reads itself; every other
+        // wall below still applies. See overseer_follower_sale.h.
+        if (gate.groupedFollower && goal == D::WalkGoal::Vendor)
+        {
+            uint32 const freeSlots = who->GetFreeInventorySpace();
+            if (OverseerDecisions::FollowerSaleWalkPasses(ev.anyVendor, freeSlots))
+            {
+                gate.groupedFollower = false;
+                LOG_INFO("module.overseer",
+                         "overseer: vendor walk {} for '{}' is a sale with {} free bag slot(s) - "
+                         "the follower wall lets it through (#1395)",
+                         id, ev.character, freeSlots);
+            }
+        }
         for (MailWalkCheck const& check : walking)
             if (check.targetName == ev.character)
                 gate.alreadyWalking = true;
