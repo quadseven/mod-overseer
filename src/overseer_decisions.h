@@ -1803,6 +1803,18 @@ std::string ApproachWhereOnLeg(ApproachGap const& gap, bool toCorridorStart);
 // the core's own list of the players in that one copy, family or not, so the
 // run waits (and walks its own members out) instead of asking and failing.
 // `occupants` is every player on the instance map; `family` is the roster.
+struct DungeonResetMemberState
+{
+    std::string name;
+    bool onInstanceMap = false;
+    bool inCombat = false;  // observed but not a reset blocker while outside the instance
+};
+
+// The core reset requires an empty instance map. Combat outside the instance
+// does not prevent resetting its bind; the later entry barrier owns combat.
+std::string DungeonResetRosterBlocker(
+    std::vector<DungeonResetMemberState> const& members, std::uint32_t insideMapId);
+
 std::string InstanceOccupiedBlocker(std::uint32_t mapId, std::uint32_t instanceId,
                                     std::vector<std::string> const& occupants,
                                     std::vector<std::string> const& family);
