@@ -18350,9 +18350,9 @@ SpawnWalkRequest ParseSpawnWalkRequest(std::string const& command)
     std::vector<std::string> const words = MailWalkWords(command);
     SpawnWalkRequest bad;
     bad.error = SpawnWalkRefusal::MalformedSpawn;
-    if (words.empty() || words[0] != SPAWN_WALK_VERB || words.size() > 4)
+    if (words.empty() || words[0] != SPAWN_WALK_VERB || words.size() > 5)
         return bad;
-    bool sawSpawn = false, sawMax = false, sawNear = false;
+    bool sawSpawn = false, sawMax = false, sawNear = false, sawStay = false;
     for (std::size_t i = 1; i < words.size(); ++i)
     {
         std::string key, value;
@@ -18379,6 +18379,17 @@ SpawnWalkRequest ParseSpawnWalkRequest(std::string const& command)
                 near > SPAWN_WALK_ARRIVE_YARDS)
                 return bad;
             request.arriveYards = near;
+        }
+        else if (key == "stay" && !sawStay)
+        {
+            sawStay = true;
+            if (value.empty() || value.size() > 5 ||
+                value.find_first_not_of("0123456789") != std::string::npos)
+                return bad;
+            unsigned long const seconds = std::stoul(value);
+            if (seconds < 1 || seconds > SPAWN_WALK_STAY_MAX_SECONDS)
+                return bad;
+            request.staySeconds = static_cast<uint32_t>(seconds);
         }
         else
             return bad;
