@@ -17,7 +17,10 @@
 // player leaves combat: the core's combat stop, which ends every combat
 // reference, drops the attackers and clears the flag. "A hostile in reach" is a
 // unit that is attacking the character, or holds a combat reference to it,
-// that is alive, on the same map and within STALE_COMBAT_REACH_YARDS. A live
+// that is alive, on the same map and within STALE_COMBAT_REACH_YARDS; a
+// creature that is evading, cannot reach its target or fights nobody does not
+// count (#1399: a family member frozen in combat for 13 hours held its
+// campaign's reset and entry the whole time). A live
 // fight always has one, so a real fight is never cut short; and if the release
 // was wrong, the next swing puts the character straight back in combat, which
 // is why the release is safe to take without asking anybody.

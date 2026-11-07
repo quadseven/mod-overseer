@@ -30828,6 +30828,13 @@ private:
                 if (!other || other == bot || !other->IsInWorld() || !other->IsAlive() ||
                     other->GetMapId() != bot->GetMapId())
                     return;
+                // A creature that is evading or cannot reach its target, or is
+                // fighting nobody, is not a fight: it is the dangling reference
+                // this drive exists for (#1399, a family member frozen in
+                // combat 3101 yards from its leader for 13 hours).
+                if (Creature* creature = other->ToCreature())
+                    if (creature->IsEvadingAttacks() || !creature->GetVictim())
+                        return;
                 float const yards = bot->GetDistance(other);
                 if (yards > OverseerDecisions::STALE_COMBAT_REACH_YARDS)
                     return;
