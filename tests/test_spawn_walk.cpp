@@ -319,6 +319,58 @@ void NearNarrowsTheArrival()
           text.find("SpawnWalkArrived(there, ev.spawnArriveYards)") != std::string::npos, true);
 }
 
+// A MEETING'S WALKER WAITS FOR THE OTHERS (wow-overseer#888). On the dev realm
+// 2026-11-07 a class quest helper reached Malformed Defias Drone at 13:08:58,
+// was let go, and 5 s later walked 2,478 yards to a weapon vendor; the leader
+// arrived at 13:12:46 and the meeting failed "stood too far". `stay:` holds the
+// walker at the spawn on arrival.
+void StayHoldsAMeetingWalker()
+{
+    SpawnWalkRequest const meet =
+        ParseSpawnWalkRequest("walk-to-spawn creature:90331 max:20000 stay:720");
+    CheckText("a meeting walk parses", meet.error, "");
+    CheckNumber("its spawn", meet.spawn, 90331);
+    CheckNumber("its stay", meet.staySeconds, 720);
+    CheckNumber("without stay: it is let go",
+                ParseSpawnWalkRequest("walk-to-spawn creature:90331").staySeconds, 0);
+    CheckText("all four keys in any order",
+              ParseSpawnWalkRequest("walk-to-spawn stay:60 near:3 creature:9 max:900").error, "");
+    CheckNumber("the ceiling itself", ParseSpawnWalkRequest(
+                    "walk-to-spawn creature:9 stay:2400").staySeconds,
+                SPAWN_WALK_STAY_MAX_SECONDS);
+    for (char const* row : {
+             "walk-to-spawn creature:9 stay:0",
+             "walk-to-spawn creature:9 stay:2401",
+             "walk-to-spawn creature:9 stay:-5",
+             "walk-to-spawn creature:9 stay:1.5",
+             "walk-to-spawn creature:9 stay:",
+             "walk-to-spawn creature:9 stay:99999999",
+             "walk-to-spawn creature:9 stay:60 stay:70",
+             "walk-to-spawn creature:9 stay:60 near:3 max:500 now",
+             "walk-to-spawn stay:60",
+         })
+    {
+        SpawnWalkRequest const r = ParseSpawnWalkRequest(row);
+        if (std::string(r.error) != S::MalformedSpawn)
+        {
+            std::printf("FAIL '%s' should be malformed, got '%s'\n", row, r.error);
+            ++failures;
+        }
+    }
+
+    std::string const text = Source();
+    Check("the walk keeps the row's stay",
+          text.find("ev.spawnStaySeconds = req.staySeconds;") != std::string::npos, true);
+    std::size_t const arrival = text.find("state == D::MailWalkState::Arrived && ev.goal == "
+                                          "D::WalkGoal::Spawn");
+    std::size_t const hold =
+        text.find("HoldAtTheObjective(bot, check.targetName, ev.spawnStaySeconds);", arrival);
+    std::size_t const release =
+        text.find("ReleaseHold(check.targetName, bot, \"the walk to its work is over\"", arrival);
+    Check("a walker with a stay is held at the spawn before the release branch",
+          arrival != std::string::npos && hold != std::string::npos && hold < release, true);
+}
+
 }  // namespace
 
 int main()
@@ -331,6 +383,7 @@ int main()
     ThereIsNearTheSpawn();
     TheAdapterWiresIt();
     NearNarrowsTheArrival();
+    StayHoldsAMeetingWalker();
 
     if (failures)
     {

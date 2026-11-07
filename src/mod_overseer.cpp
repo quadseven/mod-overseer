@@ -79663,6 +79663,7 @@ private:
         uint32 spawnId{0};
         // A spawn walk's arrival radius: the row's `near:`, else the place radius.
         float spawnArriveYards{OverseerDecisions::SPAWN_WALK_ARRIVE_YARDS};
+        uint32 spawnStaySeconds{0};  // `stay:` (wow-overseer#888), 0: let go on arrival
 
         // A FAR WALK (#633): the destination lies past the goal's near cap, so
         // the walk mounts, may fly and follows the travel survey. `travel` is
@@ -80883,6 +80884,7 @@ private:
             ev.spawnIsObject = req.gameObject;
             ev.spawnId = req.spawn;
             ev.spawnArriveYards = req.arriveYards;
+            ev.spawnStaySeconds = req.staySeconds;
         }
         else
         {
@@ -81878,6 +81880,9 @@ private:
                 // A QUEST PARTY'S LEADER IS HELD AT THE OBJECTIVE instead, until
                 // the party ends; the ceiling is the party's own clock.
                 QuestParty const* const party = QuestPartyOf(check.targetName);
+                // A MEETING'S WALKER WAITS THERE for the others (`stay:`,
+                // wow-overseer#888), held like the party's leader.
+                bool const stays = !party && ev.spawnStaySeconds > 0;
                 if (party)
                 {
                     int64 const left = int64(D::PARTY_CEILING_SECONDS) -
@@ -81885,19 +81890,25 @@ private:
                     HoldAtTheObjective(bot, check.targetName,
                                        left > 0 ? static_cast<uint32>(left) : 0u);
                 }
+                else if (stays)
+                    HoldAtTheObjective(bot, check.targetName, ev.spawnStaySeconds);
                 else
                     ReleaseHold(check.targetName, bot, "the walk to its work is over",
                                 MAIL_WALK_HOLD_VERB);
+                std::string const after =
+                    party ? std::string("held for its party")
+                          : stays ? "held for up to " + std::to_string(ev.spawnStaySeconds) +
+                                        "s for the others"
+                                  : std::string("let go to play");
                 LOG_INFO("module.overseer",
                          "overseer: spawn walk {} - '{}' reached '{}' ({} spawn {}, {:.1f} "
                          "yards) after {}ms and {} leg(s); {} there",
                          check.id, check.targetName, ev.mailboxName,
                          ev.spawnIsObject ? "gameobject" : "creature", ev.spawnId,
-                         ev.reachedYards, ev.waitedMs, ev.legs,
-                         party ? "held for its party" : "let go to play");
+                         ev.reachedYards, ev.waitedMs, ev.legs, after);
                 // ...except a death knight on a deck of Acherus, which settles
                 // there for its next row (2026-10-09).
-                if (!party)
+                if (!party && !stays)
                     SettleOnTheDeck(bot, "spawn walk");
             }
             else if (state == D::MailWalkState::Arrived)
