@@ -1807,6 +1807,20 @@ std::string InstanceOccupiedBlocker(std::uint32_t mapId, std::uint32_t instanceI
                                     std::vector<std::string> const& occupants,
                                     std::vector<std::string> const& family);
 
+// Facts read from the steered roster while checking whether a reset may run.
+// An outdoor combat state is carried for the test but does not block a reset.
+struct DungeonResetMemberState
+{
+    std::string name;
+    bool onInstanceMap = false;
+    bool inCombat = false;  // observed but not a reset blocker while outside the instance
+};
+
+// The core reset requires an empty instance map. Combat outside the instance
+// does not prevent resetting its bind; the later entry barrier owns combat.
+std::string DungeonResetRosterBlocker(
+    std::vector<DungeonResetMemberState> const& members, std::uint32_t insideMapId);
+
 // WHICH GROUP SHAPES REFUSE A DUNGEON RESET, and which one the run undoes
 // itself (#761). Group::ResetInstances returns at once for a battleground,
 // battlefield or dungeon-finder group. The first two are not this module's to

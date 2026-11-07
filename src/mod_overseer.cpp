@@ -41255,22 +41255,12 @@ private:
     //      (Group.cpp:2337). Heroic lockouts are #12 and are not handled here;
     //      what IS handled is saying so instead of resetting nothing.
     //
-    //   4. EVERY MEMBER OUT OF THE INSTANCE. This is the one the coordinator
-    //      has to SEQUENCE rather than merely check, and it is why the reset is
-    //      a phase rather than a line inside EXIT. Group::ResetInstances hands
-    //      each bound save to InstanceMap::Reset (Map.cpp:2210), whose return
-    //      value is m_mapRefMgr.IsEmpty() (Map.cpp:2249) - so an instance with
-    //      anybody still standing in it refuses the reset and tells everyone
-    //      inside instead (SendResetFailedNotify, Map.cpp:2240). The party has
-    //      to be all the way out first, which the existing EXIT crossing is
-    //      already the thing that does.
-    //
-    // Out of combat is on this list too, and it is the one precondition the CORE
-    // does not care about: a party still fighting something that followed them
-    // out of the door is not a party that is about to walk back in, and BARRIER
-    // would refuse to open for them a moment later anyway. Waiting for it here
-    // keeps the reset and the re-entry from disagreeing about when the party is
-    // ready.
+    //   4. THE INSTANCE MAP MUST BE EMPTY. Group::ResetInstances hands each
+    //      bound save to InstanceMap::Reset (Map.cpp:2210), whose return value
+    //      is m_mapRefMgr.IsEmpty() (Map.cpp:2249). A member fighting outside
+    //      that map is not a reset blocker. The run's later entry barrier owns
+    //      combat readiness; making combat a RESET precondition lets one
+    //      outdoor fight fail the run before the instance can even be reset.
     //
     // Returns an empty string when the reset may be attempted, or the reason it
     // may not - phrased so the log line reads as a sentence.
@@ -41308,8 +41298,8 @@ private:
             return "the party is not on normal dungeon difficulty, and INSTANCE_RESET_ALL "
                    "only resets normal five-mans (heroic lockouts are #12)";
 
-        std::string inside;
-        std::string fighting;
+        std::vector<OverseerDecisions::DungeonResetMemberState> rosterState;
+        rosterState.reserve(members.size());
         for (std::string const& name : members)
         {
             Player* member = ObjectAccessor::FindPlayerByName(name);
@@ -41317,25 +41307,15 @@ private:
                 continue;   // not in the world, and therefore not on the map either
 
             // GetMapId  Position.h:281  uint32 GetMapId() const
-            if (member->GetMapId() == insideMapId)
-            {
-                if (!inside.empty())
-                    inside += ", ";
-                inside += name;
-            }
             // IsInCombat  Unit.h:936  bool IsInCombat() const
-            else if (member->IsInCombat())
-            {
-                if (!fighting.empty())
-                    fighting += ", ";
-                fighting += name;
-            }
+            rosterState.push_back({name, member->GetMapId() == insideMapId,
+                                   member->IsInCombat()});
         }
 
-        if (!inside.empty())
-            return "still on map " + std::to_string(insideMapId) + ": " + inside;
-        if (!fighting.empty())
-            return "still in combat: " + fighting;
+        std::string const rosterBlocker =
+            OverseerDecisions::DungeonResetRosterBlocker(rosterState, insideMapId);
+        if (!rosterBlocker.empty())
+            return rosterBlocker;
 
         // AND THE COPY ITSELF MUST BE EMPTY, WHOEVER IS IN IT. The loop above
         // counts only family members this module steers; the core refuses the

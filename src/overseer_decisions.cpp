@@ -1452,6 +1452,21 @@ bool DungeonRunHoldsAtStage(DungeonRunMemberState const& member,
     return ApproachShapeOf(GapOf(member), limits) == ApproachShape::Arrived;
 }
 
+std::string DungeonResetRosterBlocker(
+    std::vector<DungeonResetMemberState> const& members, std::uint32_t insideMapId)
+{
+    std::string inside;
+    for (DungeonResetMemberState const& member : members)
+    {
+        if (!member.onInstanceMap)
+            continue;
+        if (!inside.empty())
+            inside += ", ";
+        inside += member.name;
+    }
+    return inside.empty() ? "" : "still on map " + std::to_string(insideMapId) + ": " + inside;
+}
+
 std::string DungeonRunBarrierBlockers(std::vector<DungeonRunMemberState> const& members,
                                       ApproachLimits const& limits)
 {
