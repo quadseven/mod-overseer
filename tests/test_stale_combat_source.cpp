@@ -73,7 +73,8 @@ int main()
     Check("a hostile counts only within the rule's reach",
           Has(drive, "OverseerDecisions::STALE_COMBAT_REACH_YARDS"));
     Check("an evading creature, or one fighting nobody, is not a hostile (#1399)",
-          Has(drive, "creature->IsEvadingAttacks() || !creature->GetVictim()"));
+          Has(drive, "creature->IsInEvadeMode() || creature->CanNotReachTarget()") &&
+              Has(drive, "!creature->GetVictim()"));
     Check("the drive asks the rule", Has(drive, "DecideStaleCombat("));
     Check("a release stops combat through the core", Has(drive, "bot->CombatStop(true);"));
     std::size_t const stop = drive.find("bot->CombatStop(true);");

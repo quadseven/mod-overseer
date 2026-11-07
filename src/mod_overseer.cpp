@@ -30833,7 +30833,8 @@ private:
                 // this drive exists for (#1399, a family member frozen in
                 // combat 3101 yards from its leader for 13 hours).
                 if (Creature* creature = other->ToCreature())
-                    if (creature->IsEvadingAttacks() || !creature->GetVictim())
+                    if (creature->IsInEvadeMode() || creature->CanNotReachTarget() ||
+                        !creature->GetVictim())
                         return;
                 float const yards = bot->GetDistance(other);
                 if (yards > OverseerDecisions::STALE_COMBAT_REACH_YARDS)
