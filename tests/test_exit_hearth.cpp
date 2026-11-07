@@ -212,13 +212,19 @@ int main()
                   ExitFailureHearthStep(trying), ExitHearthStep::Impossible);
         CheckBool("and no rule has let it through", OffContinentHearthLetThrough(trying), false);
 
+        // AND NOT LET THROUGH ACROSS THE OCEAN AFTER IT EITHER (#1388): the
+        // let-through split families bound wholly on the other continent on
+        // every failed walk out. The member is held for the walk out instead.
         ExitHearthFacts failed = farBind;
         failed.failedWalkSeconds = OFF_CONTINENT_HEARTH_AFTER_SECONDS;
-        CheckStep("the stone is cast once the walk has failed for the whole bound",
-                  ExitFailureHearthStep(failed), ExitHearthStep::Cast);
-        CheckText("nothing is impossible about it then", ExitHearthImpossibleReason(failed), "");
-        CheckBool("and the rule that let it through can be named",
-                  OffContinentHearthLetThrough(failed), true);
+        CheckStep("the stone stays withheld once the walk has failed for the whole bound",
+                  ExitFailureHearthStep(failed), ExitHearthStep::Impossible);
+        CheckText("and the member is held for the walk out, with the reason",
+                  ExitHearthImpossibleReason(failed),
+                  "hearthstone bound on map 1, not on map 0 where the exit door lets out, "
+                  "so the stone is withheld and the member is held for the walk out (#1388)");
+        CheckBool("and no rule lets it through",
+                  OffContinentHearthLetThrough(failed), false);
 
         ExitHearthFacts sameContinent = homeBind;
         sameContinent.failedWalkSeconds = OFF_CONTINENT_HEARTH_AFTER_SECONDS;
