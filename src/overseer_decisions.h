@@ -1803,6 +1803,12 @@ std::string ApproachWhereOnLeg(ApproachGap const& gap, bool toCorridorStart);
 // the core's own list of the players in that one copy, family or not, so the
 // run waits (and walks its own members out) instead of asking and failing.
 // `occupants` is every player on the instance map; `family` is the roster.
+std::string InstanceOccupiedBlocker(std::uint32_t mapId, std::uint32_t instanceId,
+                                    std::vector<std::string> const& occupants,
+                                    std::vector<std::string> const& family);
+
+// Facts read from the steered roster while checking whether a reset may run.
+// An outdoor combat state is carried for the test but does not block a reset.
 struct DungeonResetMemberState
 {
     std::string name;
@@ -1814,10 +1820,6 @@ struct DungeonResetMemberState
 // does not prevent resetting its bind; the later entry barrier owns combat.
 std::string DungeonResetRosterBlocker(
     std::vector<DungeonResetMemberState> const& members, std::uint32_t insideMapId);
-
-std::string InstanceOccupiedBlocker(std::uint32_t mapId, std::uint32_t instanceId,
-                                    std::vector<std::string> const& occupants,
-                                    std::vector<std::string> const& family);
 
 // WHICH GROUP SHAPES REFUSE A DUNGEON RESET, and which one the run undoes
 // itself (#761). Group::ResetInstances returns at once for a battleground,
