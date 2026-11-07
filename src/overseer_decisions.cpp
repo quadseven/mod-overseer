@@ -18398,6 +18398,18 @@ bool SpawnWalkArrived(float yards, float arrive)
     return yards >= 0.f && yards <= arrive;
 }
 
+SpawnWalkArrivalHold SpawnWalkArrivalHoldFor(bool inQuestParty, bool asksStay,
+                                             bool spawnIsQuestHolder)
+{
+    if (inQuestParty)
+        return SpawnWalkArrivalHold::HoldForParty;
+    if (asksStay)
+        return SpawnWalkArrivalHold::Stay;
+    if (spawnIsQuestHolder)
+        return SpawnWalkArrivalHold::LingerForQuest;
+    return SpawnWalkArrivalHold::LetGo;
+}
+
 bool IsTrainerWalkRow(std::string const& command)
 {
     std::vector<std::string> const words = MailWalkWords(command);

@@ -21243,6 +21243,33 @@ SpawnWalkRequest ParseSpawnWalkRequest(std::string const& command);
 // an unread one and never counts.
 bool SpawnWalkArrived(float yards, float arrive = SPAWN_WALK_ARRIVE_YARDS);
 
+// ...EXCEPT AT A QUEST GIVER OR TAKER, WHICH IS A COUNTER (mod-overseer#1392).
+// The bridge walks a member to a quest's giver with `walk-to-spawn creature:`
+// and writes the `take quest:<id>` (or `turnin`) row once the walk reports
+// arrival. Let go at once, the member's own movement took it out of the take's
+// SPAWN_WALK_ARRIVE_YARDS before that row ran: on the dev realm, 84 of 90 "no
+// giver of that quest in reach" refusals between 2026-11-05 and 2026-11-07
+// came within 10 seconds of a `reached` line for the same member, 49 quest and
+// member pairs (Ma Stonefield reached at 0.2 yards, the take refused 4 s
+// later). So a walk whose spawn the world names as a quest starter or ender
+// lingers there, held as a vendor walk lingers for its `buy` row, until the
+// quest row runs or SPAWN_WALK_QUEST_LINGER_SECONDS pass, whichever is first.
+constexpr uint32_t SPAWN_WALK_QUEST_LINGER_SECONDS = 60;
+
+enum class SpawnWalkArrivalHold
+{
+    LetGo,           // the bot's own strategies are the work
+    HoldForParty,    // a quest party's leader, held for the party's clock
+    Stay,            // the row's `stay:` (wow-overseer#888), held for its seconds
+    LingerForQuest,  // at a quest giver or taker, for the quest row
+};
+
+// What a spawn walk does with its walker on arrival. A quest party wins, then
+// the row's own `stay:`, then a spawn the world names in a quest relation
+// (creature or gameobject, starter or ender), else the walker is let go.
+SpawnWalkArrivalHold SpawnWalkArrivalHoldFor(bool inQuestParty, bool asksStay,
+                                             bool spawnIsQuestHolder);
+
 namespace SpawnWalkRefusal
 {
 constexpr char const* MalformedSpawn = "malformed walk-to-spawn command";
