@@ -324,6 +324,8 @@
 // Who holds a character's wheel: the travel column's claim, release and
 // hand-back rules behind one interface (#1312). See RosterAimColumn below.
 #include "overseer_movement_ownership.h"
+// A combat flag with nothing behind it is released after ten minutes (#1390).
+#include "overseer_stale_combat.h"
 // The core and mod-playerbots APIs that differ between the pins build.yml
 // compiles against and the upstream heads (wow-overseer#826).
 #include "overseer_core_compat.h"
@@ -8656,6 +8658,9 @@ public:
             // block. Reuses this timer rather than adding a new one; there is
             // no reason this needs a different poll interval.
             DriveStuckRevival();
+            // Same clock: a character whose combat flag never clears is refused
+            // every errand, so it is released here (#1390).
+            DriveStaleCombat();
             DriveGuildGhostRecovery();
             DriveGuildTraining();
             // Same cadence again, and after the revival drive on purpose: a
@@ -30773,6 +30778,127 @@ private:
                      name, botLevel, victim->GetName(), victimLevel,
                      CON_COLOR_UNKNOWN_LEVEL_DIFF);
         } while (result->NextRow());
+    }
+
+    // ------------------------------------------------------- stale combat --
+    //
+    // A COMBAT FLAG THAT NEVER CLEARS (#1390). See overseer_stale_combat.h for
+    // the rule and the measured case. Every online character with a bot AI is
+    // read on the engagement clock: in combat, alive, in the open world, with
+    // no hostile in reach for ten unbroken minutes, it gets the core's combat
+    // stop (Unit::CombatStop, which ends every combat reference, drops the
+    // attackers and clears UNIT_FLAG_IN_COMBAT through ClearInCombat). If
+    // anything was really fighting it, the next swing re-engages at once.
+    //
+    // World thread, like every other drive on this clock; nothing here can
+    // block. Keyed by GUID counter, so a rename or relog keeps nothing wrong.
+    void DriveStaleCombat()
+    {
+        using OverseerDecisions::DecideStaleCombat;
+        using OverseerDecisions::SayStaleCombatHeld;
+        using OverseerDecisions::StaleCombatFacts;
+        using OverseerDecisions::StaleCombatStep;
+        using OverseerDecisions::StaleCombatVerdict;
+
+        time_t const now = time(nullptr);
+        std::set<uint32> seen;
+        for (auto const& entry : ObjectAccessor::GetPlayers())
+        {
+            Player* bot = entry.second;
+            if (!bot || !bot->IsInWorld() || !bot->GetSession() || !GET_PLAYERBOT_AI(bot))
+                continue;
+            if (!bot->IsInCombat())
+                continue;
+            uint32 const key = bot->GetGUID().GetCounter();
+            seen.insert(key);
+
+            Map* map = bot->GetMap();
+            StaleCombatFacts facts;
+            facts.alive = bot->IsAlive();
+            facts.inCombat = true;
+            facts.onInstanceMap = !map || map->Instanceable();
+            facts.now = now;
+
+            // The nearest hostile in reach, for the held line: an attacker or
+            // a combat reference holder, alive, on this map, within reach.
+            Unit* nearest = nullptr;
+            float nearestYards = 0.f;
+            auto consider = [&](Unit* other)
+            {
+                if (!other || other == bot || !other->IsInWorld() || !other->IsAlive() ||
+                    other->GetMapId() != bot->GetMapId())
+                    return;
+                float const yards = bot->GetDistance(other);
+                if (yards > OverseerDecisions::STALE_COMBAT_REACH_YARDS)
+                    return;
+                ++facts.hostilesInReach;
+                if (!nearest || yards < nearestYards)
+                {
+                    nearest = other;
+                    nearestYards = yards;
+                }
+            };
+            for (Unit* attacker : bot->getAttackers())
+                consider(attacker);
+            for (auto const& ref : bot->GetCombatManager().GetPvECombatRefs())
+                consider(ref.second->GetOther(bot));
+            for (auto const& ref : bot->GetCombatManager().GetPvPCombatRefs())
+                consider(ref.second->GetOther(bot));
+
+            auto since = _staleCombatSince.find(key);
+            StaleCombatStep const step = DecideStaleCombat(
+                facts, since == _staleCombatSince.end() ? 0 : since->second);
+
+            // When this character's combat began, as far as this drive saw.
+            time_t& combatSince = _combatSeenSince[key];
+            if (combatSince == 0)
+                combatSince = now;
+
+            if (step.emptySince)
+                _staleCombatSince[key] = step.emptySince;
+            else
+                _staleCombatSince.erase(key);
+
+            if (step.verdict == StaleCombatVerdict::Release)
+            {
+                std::size_t const refs = bot->GetCombatManager().GetPvECombatRefs().size() +
+                                         bot->GetCombatManager().GetPvPCombatRefs().size();
+                std::size_t const attackers = bot->getAttackers().size();
+                bot->CombatStop(true);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' was in combat with no hostile within {:.0f} yards for "
+                         "{} seconds ({} combat reference(s), {} attacker(s) out of reach) - "
+                         "combat stopped so its errands can run; in combat after the stop: {} "
+                         "(#1390)",
+                         bot->GetName(), OverseerDecisions::STALE_COMBAT_REACH_YARDS,
+                         uint64(step.heldSeconds), refs, attackers,
+                         bot->IsInCombat() ? "yes" : "no");
+                _combatSeenSince.erase(key);
+                _staleCombatSaid.erase(key);
+                continue;
+            }
+
+            if (step.verdict == StaleCombatVerdict::HeldByHostile && nearest)
+            {
+                time_t& lastSaid = _staleCombatSaid[key];
+                if (SayStaleCombatHeld(now, combatSince, lastSaid))
+                {
+                    lastSaid = now;
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' has been in combat for {} seconds and is held by "
+                             "'{}' (entry {}) at {:.1f} yards, one of {} hostile(s) in reach - "
+                             "not released (#1390)",
+                             bot->GetName(), uint64(now - combatSince), nearest->GetName(),
+                             nearest->GetEntry(), nearestYards, facts.hostilesInReach);
+                }
+            }
+        }
+
+        // Out of combat, offline or gone: forget, so the maps stay bounded by
+        // who is in combat now.
+        for (auto* book : {&_staleCombatSince, &_combatSeenSince, &_staleCombatSaid})
+            for (auto it = book->begin(); it != book->end();)
+                it = seen.count(it->first) ? std::next(it) : book->erase(it);
     }
 
     // ---------------------------------------------------------- stuck dead --
@@ -83667,6 +83793,13 @@ private:
     // Tanks whose withheld pursuit has been said this fight (#1212), cleared
     // with the set above.
     std::set<std::string> _tankPursuitWithheldSaid;
+    // The stale combat drive (#1390): when each character's empty combat
+    // began, when its combat began as this drive saw it, and when its held
+    // line was last said. Keyed by GUID counter; pruned every poll to the
+    // characters in combat now.
+    std::map<uint32, time_t> _staleCombatSince;
+    std::map<uint32, time_t> _combatSeenSince;
+    std::map<uint32, time_t> _staleCombatSaid;
     uint32 _terrainRecoveryTimer = 0;
     // GATHERING/BARRIER coordinator poll (mod-overseer#88). Its own timer,
     // not piggybacked on QUEST_POLL_MS or ENGAGEMENT_POLL_MS: this drive is
