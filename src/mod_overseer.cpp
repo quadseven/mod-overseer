@@ -774,6 +774,11 @@ constexpr int64 STUCK_REVIVAL_HEALER_SECONDS = 90 + 30;
 // first; when none qualifies the nearest stands.
 constexpr float GRAVEYARD_THREAT_RADIUS = 60.0f;
 constexpr std::size_t GRAVEYARD_CANDIDATES = 6;
+// How far beyond its corpse zone a ghost is walked for a graveyard it can stand
+// at, and how many of them are judged (SafeGraveyardOnMap, wow-overseer#1093).
+// Rut'theran Village to Auberdine is about 2,100 yards.
+constexpr float GRAVEYARD_FAR_YARDS = 3000.0f;
+constexpr std::size_t GRAVEYARD_FAR_CANDIDATES = 8;
 
 // THE GRACE AFTER A REVIVAL. A character revived at half health that is
 // immediately walked off by `follow` or `new rpg` arrives at its next fight
@@ -1366,6 +1371,51 @@ static GraveyardStruct const* SafeGraveyardNear(Player* bot, GraveyardStruct con
         standings.push_back(standing);
     }
     return safest();
+}
+
+// The nearest graveyard on the corpse's map, beyond the core's candidate set,
+// that this ghost can stand at, or null (wow-overseer#1093). For a corpse whose
+// zone links only graveyards that fail the safety test, SafeGraveyardNear has
+// nothing left to offer. Any graveyard on the map within GRAVEYARD_FAR_YARDS of
+// the corpse, not `nearest`, and not on the other faction's home ground
+// (OverseerDecisions::FarHealerConsidered) is judged by the same GraveyardRefusal,
+// nearest first, at most GRAVEYARD_FAR_CANDIDATES of them. High ground alone
+// does not pass here: the walk is long, and the ground at its end must be safe.
+static GraveyardStruct const* SafeGraveyardOnMap(Player* bot, GraveyardStruct const* nearest,
+                                                 uint32 corpseMap, float cx, float cy,
+                                                 GraveyardEvidence const& evidence,
+                                                 std::string& refused)
+{
+    Map* map = corpseMap == bot->GetMapId() ? bot->GetMap() : sMapMgr->FindBaseMap(corpseMap);
+    if (!map)
+        return nullptr;
+    bool const alliance = bot->GetTeamId() == TEAM_ALLIANCE;
+    std::vector<std::pair<float, GraveyardStruct const*>> candidates;
+    for (auto const& entry : sGraveyard->GetGraveyardData())
+    {
+        GraveyardStruct const& g = entry.second;
+        if (g.Map != corpseMap || (nearest && g.ID == nearest->ID))
+            continue;
+        float const yards = std::sqrt((g.x - cx) * (g.x - cx) + (g.y - cy) * (g.y - cy));
+        if (!OverseerDecisions::FarHealerConsidered(
+                alliance, map->GetZoneId(bot->GetPhaseMask(), g.x, g.y, g.z), yards,
+                GRAVEYARD_FAR_YARDS))
+            continue;
+        candidates.emplace_back(yards, &g);
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](auto const& a, auto const& b) { return a.first < b.first; });
+    std::size_t tried = 0;
+    for (auto const& candidate : candidates)
+    {
+        if (tried++ >= GRAVEYARD_FAR_CANDIDATES)
+            break;
+        std::string const why = GraveyardRefusal(bot, *candidate.second, evidence);
+        if (why.empty())
+            return candidate.second;
+        refused += "; '" + candidate.second->name + "': " + why;
+    }
+    return nullptr;
 }
 
 // A class the dungeon module elects to raise the dead (DcRezRecovery's
@@ -34920,10 +34970,25 @@ private:
     {
         std::string refused;
         GraveyardStruct const* const nearest = st.healerGrave;
-        GraveyardStruct const* const safe =
+        GraveyardStruct const* safe =
             SafeGraveyardNear(bot, nearest, st.mapId, st.corpseX, st.corpseY,
                               corpse->GetPositionZ(), evidence, refused,
                               /*acceptHighGround*/ true);
+        // NOTHING IN THE CORPSE'S ZONE: A GRAVEYARD BEYOND IT (wow-overseer#1093).
+        // Without this the ghost waited out guards that never move and rose
+        // among them again.
+        if (!safe)
+        {
+            safe = SafeGraveyardOnMap(bot, nearest, st.mapId, st.corpseX, st.corpseY,
+                                      evidence, refused);
+            if (safe)
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' (level {}) has no graveyard in its corpse's zone it "
+                         "can stand at, so its ghost walks to '{}' beyond it, {:.0f} yards "
+                         "(wow-overseer#1093)",
+                         name, bot->GetLevel(), safe->name,
+                         bot->GetExactDist2d(safe->x, safe->y));
+        }
         if (OverseerDecisions::PickGuildHealerGraveyard(false, safe != nullptr) !=
             OverseerDecisions::GuildHealerGraveyard::Alternative)
         {

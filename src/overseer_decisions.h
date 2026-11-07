@@ -23539,6 +23539,33 @@ bool GuildGhostDriven(bool onRoster, bool botSession, bool playerClient, bool ha
 // Stormwind City for the Horde.
 bool OnOtherFactionsGround(bool alliance, uint32_t zoneId);
 
+// A GHOST WHOSE CORPSE ZONE OFFERS NO GRAVEYARD IT CAN STAND AT WALKS TO ONE
+// BEYOND IT (wow-overseer#1093). The guild reroute looks only at the graveyards
+// graveyard_zone links to the corpse's zone, the core's own candidate set. On
+// the dev realm a level 20 Horde member died at Rut'theran Village, Teldrassil,
+// to level 75 Darnassus Sentinels: every Teldrassil graveyard was refused, so it
+// waited 1200 s as a ghost, took the refused healer beside the guards and was
+// killed about 11 s after it rose, 107 times from 2026-11-06 to 2026-11-07, about
+// every 20 minutes. Guards never move off, so the wait never helped. A player
+// runs the ghost to the next graveyard on the continent and rises there:
+// Auberdine, 2,100 yards across the water, with no guard beside it.
+//
+// The adapter walks the map's graveyards nearest first and asks this before it
+// judges one (the safety test reads every spawn, so it is asked of few): not the
+// nearest it already refused, within `maxYards` of the corpse, and not on the
+// other faction's home ground (OtherFactionsHomeZone), where a graveyard that
+// passes the 60-yard spawn test still sits inside a town its guards patrol.
+bool FarHealerConsidered(bool alliance, uint32_t zoneId, float yards, float maxYards);
+
+// The other faction's starting zones and capitals, the whole home ground a
+// far graveyard must not stand on: for the Horde, Elwynn Forest, Stormwind,
+// Dun Morogh, Ironforge, Teldrassil, Darnassus, Azuremyst Isle and the Exodar;
+// for the Alliance, Durotar, Orgrimmar, Mulgore, Thunder Bluff, Tirisfal Glades,
+// the Undercity, Eversong Woods and Silvermoon. Wider than
+// OnOtherFactionsGround, which also decides when the healer is taken at once
+// and the bridge hearths the member, and is left as it is.
+bool OtherFactionsHomeZone(bool alliance, uint32_t zoneId);
+
 // ---------------------- a natural guild member's corpse left inside a dungeon --
 //
 // THE GUILD GHOST DRIVE NEVER SAW A CORPSE ON ANOTHER MAP. It reads the corpse
