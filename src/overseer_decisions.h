@@ -21175,8 +21175,8 @@ char const* TrainerVisitWord(TrainerVisitOutcome outcome);
 // SHAPE, on kind='job' and routed on the first word the way `walk-to-trainer`
 // rides kind='cast':
 //
-//   kind='job'  walk-to-spawn gameobject:<spawn id> [max:<yards>] [near:<yards>]
-//   kind='job'  walk-to-spawn creature:<spawn id> [max:<yards>] [near:<yards>]
+//   kind='job'  walk-to-spawn gameobject:<spawn id> [max:<yards>] [near:<yards>] [stay:<seconds>]
+//   kind='job'  walk-to-spawn creature:<spawn id> [max:<yards>] [near:<yards>] [stay:<seconds>]
 //
 // Exactly one of `gameobject:` and `creature:`. `max:` as for the other walks,
 // up to FAR_WALK_MAX_YARDS; past ERRAND_WALK_MAX_YARDS the walk is a far walk.
@@ -21187,8 +21187,23 @@ char const* TrainerVisitWord(TrainerVisitOutcome outcome);
 // SPAWN_WALK_ARRIVE_YARDS of it with the hold lifted at once, like a trainer
 // walk, so the bot's own grind and gather strategies play where it now stands.
 // Nothing is gathered, looted or killed by this verb.
+//
+// ...UNLESS THE ROW SAYS `stay:` (wow-overseer#888). A class quest meeting
+// walks the leader and each helper to the objective spawn at once, and the
+// party forms only when all of them stand together there. On the dev realm
+// (2026-11-07 13:02Z) the helper arrived first, was let go, and 5 s later its
+// own gear drive walked it 2,478 yards to a weapon vendor; the leader landed
+// four minutes later and the meeting failed "stood too far". Every recorded
+// meeting in four days failed the same way. `stay:<seconds>` holds the walker
+// at the spawn on arrival, as a quest party's leader is held, for at most that
+// long (1 to SPAWN_WALK_STAY_MAX_SECONDS); the next walk or party verb for it
+// takes the hold over.
 
 constexpr char const* SPAWN_WALK_VERB = "walk-to-spawn";
+
+// The longest `stay:` a spawn walk takes. A meeting asks for its own walk clock
+// (the bridge follows a far walk for 2100 s) and a minute more.
+constexpr uint32_t SPAWN_WALK_STAY_MAX_SECONDS = 2400;
 
 // How near the spawn counts as there. A node field or a door's surroundings is
 // a place, not a counter: twenty yards puts the node or the stone in sight, and
@@ -21214,12 +21229,13 @@ struct SpawnWalkRequest
     uint32_t spawn{0};        // the spawn id (`gameobject.guid` or `creature.guid`)
     float maxYards{ERRAND_WALK_MAX_YARDS};
     float arriveYards{SPAWN_WALK_ARRIVE_YARDS};  // `near:`, else the place radius
+    uint32_t staySeconds{0};  // `stay:`, else 0: let go on arrival
     char const* error{""};
 };
 
-// `gameobject:` or `creature:` (exactly one, a non-zero id), an optional `max:`
-// and an optional `near:`, each at most once, in any order. Anything else is
-// MalformedSpawn.
+// `gameobject:` or `creature:` (exactly one, a non-zero id), an optional `max:`,
+// an optional `near:` and an optional `stay:`, each at most once, in any order.
+// Anything else is MalformedSpawn.
 SpawnWalkRequest ParseSpawnWalkRequest(std::string const& command);
 
 // Is the walker there? True within `arrive` yards of the spawn
