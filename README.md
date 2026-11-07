@@ -91,6 +91,15 @@ run state. Once every family member is observed outside, normal run
 finalization records the outcome and advances the same campaign. An unseen
 member is not proof of an exit; a member still inside remains in recovery.
 
+A finder row may append `carry <name>` for one seated non-tank member. The
+member follows the dungeon tank with attack and spell actions suppressed in
+both AI engines; ordinary rows retain their existing seat behavior. Companions
+are temporarily unsummoned through the core while carrying. Permanent pets
+retain their saved state and are resummoned through the core on return; temporary
+summons are dismissed rather than recreated. The command row retains the carry
+name when a run is adopted after a restart. Only passive strategies added by
+the run are removed on exit; disconnected members are restored on reconnect.
+
 ### Disenchanting a carried item
 
 A `disenchant` command names one enabled roster character on `job='craft'`.
@@ -165,7 +174,7 @@ legacy row is adopted only when its complete recorded membership identifies
 one family; its current leader can have changed. Mixed or incomplete rows keep
 their blank legacy scope and expire normally. Historical outcomes and roster
 campaign counters are not rewritten. Stable campaign counters across borrowed
-leadership remain separate work in wow-overseer#1688.
+leadership remain separate work in the outside bridge.
 
 CI also runs the actual migration twice on a fresh MySQL 8.4 service. Locally,
 `scripts/check-locally.sh schema` runs that test against an isolated MySQL
@@ -203,6 +212,7 @@ missing-file line and the module runs on its defaults.
 | Travel | `FarWalk.*`, `Route.*`, `PartyWalk.*`, `Cross.*`, `Hunt.*` | How many long walks, crossings and hunts run at once, and route safety. |
 | Leader intent | `LeaderIntent.*` | Whether rules that move a family leader go through one intent book. |
 | Roster | `Natural.*`, `Rename.*`, `Retire.*` | Irreversible naturalize modes, offline renames, and the guilds a retire keeps. |
+| Housekeeping | `ShareRetention.Enable` | Whether answered share rows are pruned (off by default). |
 
 Each key is documented in `conf/mod_overseer.conf.dist`. Everything else is
 worked out from the database when it is needed, so it is not a setting.
@@ -228,8 +238,85 @@ databases, and whatever outside system writes commands and reads the tables.
 
 ## Status
 
-Open work is tracked in the epic
-[a living family: gear up in Deadmines, then live off the world](https://github.com/quadseven/mod-overseer/issues/141).
+Last checked 2026-11-07, against `main` at the time of writing. Open work is
+tracked in the epic
+[a living family: gear up in Deadmines, then live off the world, part 2](https://github.com/quadseven/mod-overseer/issues/1197).
+
+Two labels are used on every line below. **In code** means merged to `main`
+with a unit test under `tests/` that fails without the change, and nothing
+more: the module ships inside a worldserver, so a merge reaches a realm only
+after a roll. **Seen live** means a merged pull request or ticket records
+proof from a realm's logs or tables. Many merged fixes still carry the
+`awaiting-live-check` label, which means no such proof has been recorded yet.
+Treat the section as a dated snapshot, not a promise; the label queue is the
+current truth.
+
+### What works
+
+- **Dungeon runs end instead of looping** (in code). A run now gives up with
+  a named reason where it used to wait forever: a Zul'Farrak pyramid event or
+  walk to the final boss that makes no progress ends the run so its members go
+  free (#1397); a guild finder run that clears every boss ends complete, not
+  stalled (#1350); a run whose dungeon module stopped on all bosses cleared
+  also ends complete (#1328). Zul'Farrak, Stratholme and Upper Blackrock
+  Spire have their own door, yard or step handling. Cleared Zul'Farrak runs
+  were seen live (the measurements in #1397); the new give-up clocks were not.
+- **A stuck combat flag is released** (in code). A character, or a family
+  member frozen far from its party, that stays in combat for ten minutes with
+  no hostile in reach is taken out of combat the way a player leaves it
+  (#1394). Outdoor combat no longer blocks a dungeon reset (#1387); the entry
+  barrier still waits for a fight near the party to end. The visible result:
+  a family no longer sits at a reset for hours. Live proof is pending (#1390,
+  #1399).
+- **Families keep together across the ocean** (in code). A family bound wholly
+  on the other continent is rebound near the door, and the exit hearth never
+  crosses the ocean (#1398). A named campaign home serves only its own faction,
+  so an Alliance family is not walked into Kargath, a Horde inn (#1401).
+  Family mages open portals to capitals instead of walking (#1281). Live proof
+  is pending (#1388, #1400, #1161).
+- **Ghosts find a safe spirit healer** (in code). A ghost with no safe
+  graveyard in its corpse zone walks to one beyond it, never onto the other
+  faction's ground (#1402), and a guild member stuck alive at zero health now
+  dies and is released (#1379). Live proof is pending.
+- **Errands that used to stall** (in code). A grouped follower with full bags
+  may take its sale walk (#1396). A meeting walk can hold a walker at the
+  spawn for the others with `walk-to-spawn stay:<seconds>` (#1403). A bag is
+  bought straight into an empty bag position (#1279). The mailbox visit
+  survives consecutive attachment sends (#1302).
+- **Raid run door** (in code). A `raid:ubrs` job has an Upper Blackrock Spire
+  door for one guild's ten seats (#1310). It has not been seen live.
+- **Breadth of commands** (in code). The command poll handles auction, bank,
+  bind, buy, cast, conjure, give, guild, hearth, job, mail, quest, repair,
+  sell, share, summon and trade rows, plus the prepared `disenchant` command
+  described above.
+- **Internal structure** (in code). The rule for who holds a character's
+  movement sits behind one interface (#1380). The decisions suite builds every
+  `tests/test_*.cpp` against the pure decision code with no realm.
+
+### What does not work yet
+
+- **Disenchanting has not been seen to work.** The first version logged a
+  disenchant queue error at every start because of a collation mismatch. The
+  fix is merged (#1365) and unconfirmed (#1364). No realm has recorded a
+  disenchant yet.
+- **Nothing in the lists above is proven live** except where a line says so.
+  The queue of `awaiting-live-check` tickets is large; read it before relying
+  on any behavior.
+- **Known open bugs.** Eleven dungeon doors still need a surveyed approach
+  (#579), a Razorfen Downs exit aims above the routed floor (#1269), a leader
+  south of Uldaman cannot reach the door (#1257), a quest take refused for bag
+  room is reported as ineligible (#1393), a quest giver is reported out of
+  reach just after the walk arrived (#1392), and a Blackrock Depths run does
+  not yet walk the Ironfel carrier to the Shrine of Thaurissan (#1391).
+- **A worldserver crash ticket is open.** A null or stale attack target in
+  mod-playerbots crashed the worldserver (#1166). Patches that resolve the
+  target again are merged, with no live confirmation.
+- **Fishing and cooking** are tracked as not yet reliable (#530, #534).
+- **The Ragnaros one-shot** is a goal, not a result (#919). The raid repair,
+  straggler summon and Upper Blackrock Spire door are in code, and none has
+  been seen live.
+- **Structural work is proposed, not done:** a dungeon run lifecycle module, a
+  shared group-run shape and a tick schedule (#1313, #1315, #1314).
 
 ## Contributing
 
@@ -237,12 +324,3 @@ Changes land through a pull request; direct pushes to `main`, deletion and
 force-push are refused by a repository ruleset. A pull request must pass the
 decisions check, the adapter compile and the leak scan. Read
 [AGENTS.md](AGENTS.md) first: this repository is public.
-
-A finder row may append `carry <name>` for one seated non-tank member. The
-member follows the dungeon tank with attack and spell actions suppressed in
-both AI engines; ordinary rows retain their existing seat behavior. Companions
-are temporarily unsummoned through the core while carrying. Permanent pets
-retain their saved state and are resummoned through the core on return; temporary
-summons are dismissed rather than recreated. The command row retains the carry
-name when a run is adopted after a restart. Only passive strategies added by
-the run are removed on exit; disconnected members are restored on reconnect.
