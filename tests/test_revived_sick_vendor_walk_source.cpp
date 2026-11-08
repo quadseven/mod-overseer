@@ -87,6 +87,19 @@ int main()
         return Fail("DriveRevivedSickness must defer to a walk hold before it holds the "
                     "member still (#1377)");
 
+    // A walk paused for a fight has let go of its hold (#633); the drive must
+    // see that walk too, or it takes the member back and the walk ends "held
+    // by another verb" when the fight is over (#1377, live 2026-11-08).
+    std::size_t const asks = drive.find("RevivedSicknessDefersToWalk(");
+    if (asks == std::string::npos || asks > still)
+        return Fail("DriveRevivedSickness must ask RevivedSicknessDefersToWalk before it holds "
+                    "the member still (#1377)");
+    std::size_t const paused = drive.find(".ev.paused");
+    if (paused == std::string::npos || paused > asks ||
+        drive.find("_pendingMailWalks") == std::string::npos)
+        return Fail("DriveRevivedSickness must read whether the member's walk in "
+                    "_pendingMailWalks is paused for a fight (#1377)");
+
     std::cout << "revived sickness vendor walk source: contract holds\n";
     return EXIT_SUCCESS;
 }

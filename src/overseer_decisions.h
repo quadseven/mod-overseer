@@ -28183,6 +28183,15 @@ constexpr char const* REVIVED_SICKNESS_HOLD_VERB = "revived sickness";
 bool SupplyWalkReleasesSickHold(std::string const& holdVerb, bool walkIsSupplyFoodOrDrink,
                                 bool carriesFoodOrDrink);
 
+// THE SICKNESS DRIVE DEFERS TO A WALK, PAUSED OR NOT (#1377, live 2026-11-08).
+// A walk lets go of its own hold while its member fights (#633) and takes it
+// back after. The drive re-took its stillness hold in that gap, and the walk
+// then ended "held by another verb" (Swoleblood, vendor walk 1509707, 11 of 48
+// food walks in the first hours of roll 98). True when a walk hold is in force
+// or the member's walk is paused for a fight: the drive then leaves the member
+// to the walk.
+bool RevivedSicknessDefersToWalk(bool walkHoldInForce, bool walkPausedForFight);
+
 // WHICH ROWS A LOGOUT MARKS OFFLINE. The core's logout clears the online flag
 // for every character on the leaving character's ACCOUNT. Under playerbots
 // many characters on one account are in the world at once, so one bot's logout

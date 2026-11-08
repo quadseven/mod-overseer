@@ -33208,7 +33208,15 @@ private:
         auto const walkHold = holds.find(name);
         bool const walkHolds = HeldStill(name) && walkHold != holds.end() &&
                                walkHold->second.verb == MAIL_WALK_HOLD_VERB;
-        if (!walkHolds)
+        // A WALK PAUSED FOR A FIGHT HAS LET GO OF ITS HOLD (#633) and takes it
+        // back when the fight ends. Holding the member here in that gap ended
+        // the walk "held by another verb" (#1377, live 2026-11-08), so a paused
+        // walk of this member counts as the walk's.
+        bool walkPaused = false;
+        for (MailWalkCheck const& check : _pendingMailWalks)
+            if (check.targetName == name && check.ev.paused)
+                walkPaused = true;
+        if (!OverseerDecisions::RevivedSicknessDefersToWalk(walkHolds, walkPaused))
             HoldCharacterStill(bot, botAI, name, REVIVED_SICK_HOLD_VERB,
                                static_cast<uint32>(SPIRIT_HEALER_SICKNESS_SECONDS + 90), false);
         for (char const* strategy : {"pull", "aoe", "grind"})
