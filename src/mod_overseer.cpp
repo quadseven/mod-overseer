@@ -80984,6 +80984,54 @@ private:
         AnchorHoldWhereItStands(hold->second, who);
     }
 
+    // A SPAWN WALK THAT ENDS AT A QUEST GIVER OR TAKER LINGERS (#1392). Does the
+    // world name this spawn's entry as a starter or an ender of any quest?
+    static bool SpawnIsQuestHolder(bool object, uint32 entry)
+    {
+        for (QuestRelations const* relations :
+             {object ? sObjectMgr->GetGOQuestRelationMap()
+                     : sObjectMgr->GetCreatureQuestRelationMap(),
+              object ? sObjectMgr->GetGOQuestInvolvedRelationMap()
+                     : sObjectMgr->GetCreatureQuestInvolvedRelationMap()})
+            if (relations && relations->find(entry) != relations->end())
+                return true;
+        return false;
+    }
+
+    // The deadline each quest linger set, by name, so the quest row lifts only
+    // the hold the linger placed: a later walk or a party re-takes the hold with
+    // another deadline, and that one is not the quest row's to lift.
+    static std::map<std::string, time_t>& QuestHolderLingers()
+    {
+        static std::map<std::string, time_t> lingers;
+        return lingers;
+    }
+
+    static void LingerAtTheQuestHolder(Player* who, std::string const& name)
+    {
+        HoldAtTheObjective(who, name, OverseerDecisions::SPAWN_WALK_QUEST_LINGER_SECONDS);
+        auto const hold = HoldsInForce().find(name);
+        if (hold != HoldsInForce().end())
+            QuestHolderLingers()[name] = hold->second.until;
+    }
+
+    // The quest row ran at the giver: the linger is over, whatever the row's
+    // answer. A hold some other verb or walk has taken since is left alone.
+    static void EndQuestHolderLinger(Player* who)
+    {
+        std::string const name = who->GetName();
+        auto const linger = QuestHolderLingers().find(name);
+        if (linger == QuestHolderLingers().end())
+            return;
+        time_t const until = linger->second;
+        QuestHolderLingers().erase(linger);
+        auto const hold = HoldsInForce().find(name);
+        if (hold == HoldsInForce().end() || hold->second.verb != MAIL_WALK_HOLD_VERB ||
+            hold->second.until != until || hold->second.walkingUntil != 0)
+            return;
+        ReleaseHold(name, who, "the quest row at its giver ran", MAIL_WALK_HOLD_VERB);
+    }
+
     // A GUILD RAIDER'S TALENT RESET, AT THE CLASS TRAINER THE WALK REACHED
     // (#692). The reset is bought through the same door as RespecOnArrival
     // (AskForTalentWipe), and the points are spent with mod-playerbots' premade
@@ -82304,9 +82352,13 @@ private:
                 // the party ends; the ceiling is the party's own clock.
                 QuestParty const* const party = QuestPartyOf(check.targetName);
                 // A MEETING'S WALKER WAITS THERE for the others (`stay:`,
-                // wow-overseer#888), held like the party's leader.
-                bool const stays = !party && ev.spawnStaySeconds > 0;
-                if (party)
+                // wow-overseer#888), held like the party's leader; a QUEST GIVER
+                // OR TAKER LINGERS for the quest row (#1392).
+                D::SpawnWalkArrivalHold const arrivalHold = D::SpawnWalkArrivalHoldFor(
+                    party != nullptr, ev.spawnStaySeconds > 0,
+                    SpawnIsQuestHolder(ev.spawnIsObject, ev.mailboxEntry));
+                bool const stays = arrivalHold == D::SpawnWalkArrivalHold::Stay;
+                if (arrivalHold == D::SpawnWalkArrivalHold::HoldForParty)
                 {
                     int64 const left = int64(D::PARTY_CEILING_SECONDS) -
                                        int64(std::time(nullptr) - party->formedAt);
@@ -82315,14 +82367,19 @@ private:
                 }
                 else if (stays)
                     HoldAtTheObjective(bot, check.targetName, ev.spawnStaySeconds);
+                else if (arrivalHold == D::SpawnWalkArrivalHold::LingerForQuest)
+                    LingerAtTheQuestHolder(bot, check.targetName);
                 else
                     ReleaseHold(check.targetName, bot, "the walk to its work is over",
                                 MAIL_WALK_HOLD_VERB);
                 std::string const after =
                     party ? std::string("held for its party")
-                          : stays ? "held for up to " + std::to_string(ev.spawnStaySeconds) +
-                                        "s for the others"
-                                  : std::string("let go to play");
+                    : stays ? "held for up to " + std::to_string(ev.spawnStaySeconds) +
+                                  "s for the others"
+                    : arrivalHold == D::SpawnWalkArrivalHold::LingerForQuest
+                        ? "held for up to " + std::to_string(D::SPAWN_WALK_QUEST_LINGER_SECONDS) +
+                              "s for the quest row"
+                        : std::string("let go to play");
                 LOG_INFO("module.overseer",
                          "overseer: spawn walk {} - '{}' reached '{}' ({} spawn {}, {:.1f} "
                          "yards) after {}ms and {} leg(s); {} there",
@@ -82331,7 +82388,7 @@ private:
                          ev.reachedYards, ev.waitedMs, ev.legs, after);
                 // ...except a death knight on a deck of Acherus, which settles
                 // there for its next row (2026-10-09).
-                if (!party && !stays)
+                if (arrivalHold == D::SpawnWalkArrivalHold::LetGo)
                     SettleOnTheDeck(bot, "spawn walk");
             }
             else if (state == D::MailWalkState::Arrived)
@@ -82652,7 +82709,14 @@ private:
             // creature of the entry within 120 yards, with its distances, its
             // phase against the player's, and whether it is alive, tells which
             // of range, phase or a moved creature it was.
-            if (Creature* far = player->FindNearestCreature(entry, 120.0f, false))
+            // The third argument is the live state the search wants, not "any":
+            // `false` finds only the dead, which printed "no creature of that
+            // entry within 120 yards" beside a living giver (#1392). Living
+            // first, then a dead one.
+            Creature* far = player->FindNearestCreature(entry, 120.0f, true);
+            if (!far)
+                far = player->FindNearestCreature(entry, 120.0f, false);
+            if (far)
             {
                 LOG_INFO("module.overseer",
                          "overseer: quest {} giver {} for '{}': nearest is {:.1f} yards "
@@ -82806,6 +82870,10 @@ private:
         };
 
         std::string const refusal = OverseerDecisions::QuestErrandRefusal(errand, facts);
+        // The row a spawn walk's linger waited for has run (#1392): the giver
+        // was read above, so the member may go whatever the answer.
+        if (!abandon)
+            EndQuestHolderLinger(player);
         if (!refusal.empty())
         {
             describe("refused", refusal);
