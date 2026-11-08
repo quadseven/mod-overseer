@@ -56089,8 +56089,9 @@ private:
 
     // BLACKROCK DEPTHS' UPPER CITY (overseer_brd_wing.h, #1410), one CLEARING
     // poll on map 230. Once the Detention Block's nine encounters are credited
-    // and the brain still clears only that wing, a party with the Shadowforge
-    // Key in the instance is sent `dc on brd-uc` (the wing argument the raid
+    // and the brain still clears only that wing, a party that can open the
+    // lock-680 doors (the Shadowforge Key, or a rogue's lockpicking at 250) is
+    // sent `dc on brd-uc` (the wing argument the raid
     // door's arming already passes), and a party without it is finished there,
     // the way a credited last boss is. True when this step owns the poll: a
     // chain sent or awaited, or the run finished (its phase is then Exiting).
@@ -56118,12 +56119,16 @@ private:
                 p->GetInstanceId() != leader->GetInstanceId())
                 continue;
             inside.push_back(p);
-            // Alive or not: a dead carrier is revived inside and the doors
-            // open for it then.
-            if (carrier.empty() && p->GetItemCount(D::BRD_SHADOWFORGE_KEY) >= 1)
+            // Alive or not: a dead opener is revived inside and the doors
+            // open for it then. The key, or a rogue's lockpicking at the
+            // lock's 250 (the dungeon brain hands the click to either).
+            uint32 const lockpicking =
+                p->HasSkill(SKILL_LOCKPICKING) ? p->GetSkillValue(SKILL_LOCKPICKING) : 0;
+            if (carrier.empty() &&
+                D::BrdOpensUpperCity(p->GetItemCount(D::BRD_SHADOWFORGE_KEY), lockpicking))
                 carrier = name;
         }
-        facts.keyCarried = !carrier.empty();
+        facts.doorsOpen = !carrier.empty();
 
         D::BrdWingStep const step = D::BrdWingNext(facts);
         if (step == D::BrdWingStep::Nothing)
@@ -56144,10 +56149,11 @@ private:
                      "Block of Blackrock Depths is credited (mask {}) and {}, so the Upper "
                      "City is not cleared this run; EXIT walks the party out (#1410)",
                      coord.runNumber, coord.campaignId, facts.credited,
-                     facts.keyCarried
+                     facts.doorsOpen
                          ? "the dungeon brain did not take 'dc on brd-uc' after " +
                                std::to_string(coord.brdUpperCityTries) + " tries"
-                         : std::string("nobody in the party carries the Shadowforge Key"));
+                         : std::string("nobody in the party carries the Shadowforge Key or "
+                                       "picks locks at 250"));
             return true;
         }
 
@@ -56168,7 +56174,8 @@ private:
         coord.brdUpperCityTriedAt = now;
         LOG_INFO("module.overseer",
                  "overseer: dungeon run {} of campaign {} - the Detention Block of Blackrock "
-                 "Depths is credited (mask {}) and '{}' carries the Shadowforge Key; sent "
+                 "Depths is credited (mask {}) and '{}' opens the Shadowforge doors (the key "
+                 "or lockpicking); sent "
                  "'dc on {}' to {} member(s) inside, try {} of {}: {} (#1410)",
                  coord.runNumber, coord.campaignId, facts.credited, carrier,
                  D::BRD_UPPER_CITY_WING, inside.size(), coord.brdUpperCityTries,
@@ -59401,8 +59408,8 @@ private:
             // BLACKROCK DEPTHS' UPPER CITY (#1410): asked before the completion
             // check, because on map 230 that check reads the whole map's 19 bits
             // and the brain's default wing stops at Bael'Gar. With the Shadowforge
-            // Key in the party the run goes on into the Upper City; without it the
-            // Detention Block is the whole run.
+            // Key or a lockpicker in the party the run goes on into the Upper
+            // City; without one the Detention Block is the whole run.
             if (StepBrdUpperCity(coord, members, leader, *portal, clearingNow))
                 return;
 

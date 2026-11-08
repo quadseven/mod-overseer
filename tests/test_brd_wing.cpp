@@ -6,7 +6,7 @@
  * and the Upper City (brd-uc, bits 9-18), and a bare `dc on` latches brd-db.
  * Nothing named brd-uc, so every run stopped at Bael'Gar and stood until the
  * clearing watchdog ended it. The rules in src/overseer_brd_wing.h chain a key
- * carrier's run to the Upper City and finish a keyless one at once; the
+ * carrier's (or a lockpicker's) run to the Upper City and finish a keyless one at once; the
  * adapter's wiring is pinned in the source because it needs a worldserver.
  *
  * Compiled against src/overseer_decisions.cpp and nothing else.
@@ -50,7 +50,7 @@ BrdWingFacts Facts(std::uint32_t brain, std::uint32_t credited, bool key, unsign
     f.mapId = BRD_WING_MAP_ID;
     f.brainMask = brain;
     f.credited = credited;
-    f.keyCarried = key;
+    f.doorsOpen = key;
     f.tries = tries;
     f.lastTryAt = lastTryAt;
     f.now = now;
@@ -66,6 +66,11 @@ void TheMasks()
            "the two wings are the whole map's 19 bits, and share none");
     Expect(std::string(BRD_UPPER_CITY_WING) == "brd-uc", "the dungeon brain's Upper City token");
     Expect(BRD_SHADOWFORGE_KEY == 11000, "the Shadowforge Key");
+    Expect(BrdOpensUpperCity(1, 0), "the key opens the Upper City");
+    Expect(BrdOpensUpperCity(0, 250) && BrdOpensUpperCity(0, 300),
+           "so does lockpicking at lock 680's 250, as a rogue picks it");
+    Expect(!BrdOpensUpperCity(0, 249) && !BrdOpensUpperCity(0, 0),
+           "lower lockpicking and no key do not");
 }
 
 void TheChain()
@@ -127,8 +132,9 @@ void TheAdapterWiresIt()
     Expect(within("DungeonBrainExpectedEncounterMask(leader)") &&
                within("CompletedEncounters(leader)"),
            "it reads the brain's wing and the instance's credit");
-    Expect(within("p->GetItemCount(D::BRD_SHADOWFORGE_KEY)"),
-           "it reads the Shadowforge Key off each member in the instance");
+    Expect(within("p->GetItemCount(D::BRD_SHADOWFORGE_KEY)") &&
+               within("p->GetSkillValue(SKILL_LOCKPICKING)") && within("D::BrdOpensUpperCity("),
+           "it reads the Shadowforge Key and lockpicking off each member in the instance");
     Expect(within("DoSpecificAction(\"dc on\", Event(\"dc\", D::BRD_UPPER_CITY_WING, issuer)"),
            "the chain is `dc on brd-uc` with an authorized issuer");
     Expect(within("coord.provedComplete = true;") && within("DungeonRunPhase::Exiting"),
