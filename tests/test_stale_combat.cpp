@@ -350,6 +350,43 @@ void AStandoffSurvivesAOnePollGap()
     Check("and the standoff start is kept through it", step.standoffSince == T0);
 }
 
+// #1411 after roll 100: Zork came into combat at 2238 of 2318 health and a
+// player does not regenerate in combat, so "at full health" never held and the
+// standoff never began. The test is no health lost since the stretch began.
+void AHurtCharacterThatLosesNothingMoreIsInAStandoff()
+{
+    using OverseerDecisions::IsStandoff;
+    using OverseerDecisions::NoHealthLost;
+    Check("first poll of a stretch: nothing to compare, unhurt", NoHealthLost(2238, 0));
+    Check("2238 of 2318, unchanged: unhurt", NoHealthLost(2238, 2238));
+    Check("healed a little: unhurt", NoHealthLost(2300, 2238));
+    Check("one point lost: hurt", !NoHealthLost(2237, 2238));
+    Check("below the highest of the stretch after a heal: hurt", !NoHealthLost(2290, 2300));
+    // Zork's poll on the live realm: a creature in reach, Zork short of full
+    // but steady, unmoved. With the old reading it was never a standoff.
+    Check("the measured case reads as a standoff",
+          IsStandoff(1, NoHealthLost(2238, 2238) && NoHealthLost(1450, 1450), 0.f));
+    time_t since = 0;
+    time_t standoffSince = 0;
+    StaleCombatStep step;
+    time_t t = T0;
+    unsigned highest = 0;
+    for (; t < T0 + STALE_COMBAT_STANDOFF_SECONDS; t += 8)
+    {
+        StaleCombatFacts f = Standoff(t);
+        f.standoff = IsStandoff(1, NoHealthLost(2238, highest), 0.f);
+        highest = highest > 2238 ? highest : 2238;
+        step = DecideStaleCombat(f, since, standoffSince);
+        since = step.emptySince;
+        standoffSince = step.standoffSince;
+    }
+    StaleCombatFacts f = Standoff(t);
+    f.standoff = IsStandoff(1, NoHealthLost(2238, highest), 0.f);
+    step = DecideStaleCombat(f, since, standoffSince);
+    CheckVerdict("fifteen minutes short of full health but unhurt is released", step.verdict,
+                 StaleCombatVerdict::ReleaseStandoff);
+}
+
 }  // namespace
 
 int main()
@@ -370,6 +407,7 @@ int main()
     AMoveRestartsTheStandoff();
     AStandoffAfterEmptyCombatCountsFromItsOwnStart();
     AStandoffSurvivesAOnePollGap();
+    AHurtCharacterThatLosesNothingMoreIsInAStandoff();
 
     if (failures)
     {

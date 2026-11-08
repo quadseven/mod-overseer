@@ -47,8 +47,11 @@
 // combat at one spot for hours, at full health, with a creature five yards off
 // and six yards above it, both at full health, neither ever landing a blow
 // (the "held by ... not released" line every thirty minutes, and the same line
-// for four other characters in the same hour). A standoff is a stretch in
-// which the character and every hostile in reach stay at full health and the
+// for four other characters in the same hour). After roll 100 the first
+// reading of a standoff (both sides at full health) still never released that
+// member: it had come into combat at 2238 of 2318 health, and a player does
+// not regenerate health in combat, so it was never "full". A standoff is a stretch in
+// which neither the character nor any hostile in reach loses health and the
 // character does not move more than STALE_COMBAT_STANDOFF_MOVE_YARDS from
 // where the stretch began. After STALE_COMBAT_STANDOFF_SECONDS of it, the
 // character gets the same combat stop and each creature in the standoff is
@@ -112,14 +115,23 @@ struct StaleCombatStep
     time_t heldSeconds = 0;
 };
 
+// Whether a unit has lost no health since its no-fight stretch began (#1411):
+// its health now against the highest it had in the stretch (0 = not seen yet,
+// so unhurt). Not "at full health": a player does not regenerate health in
+// combat, so a character that came into the stretch hurt would never count.
+inline bool NoHealthLost(unsigned current, unsigned highestInStretch)
+{
+    return current >= highestInStretch;
+}
+
 // Whether one poll reads as a standoff (#1411): hostiles in reach, the
-// character and every one of them at full health, and the character no more
+// character and every one of them with no health lost in the stretch, and the character no more
 // than STALE_COMBAT_STANDOFF_MOVE_YARDS from where its no-fight stretch began
 // (a negative distance: no stretch yet, so nothing to have moved from). A blow
 // on either side or a move makes it a fight, which restarts the clock.
-inline bool IsStandoff(unsigned hostilesInReach, bool everyoneFull, float yardsFromAnchor)
+inline bool IsStandoff(unsigned hostilesInReach, bool everyoneUnhurt, float yardsFromAnchor)
 {
-    return hostilesInReach > 0 && everyoneFull &&
+    return hostilesInReach > 0 && everyoneUnhurt &&
            yardsFromAnchor <= STALE_COMBAT_STANDOFF_MOVE_YARDS;
 }
 
