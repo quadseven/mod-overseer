@@ -1,0 +1,75 @@
+Subject: [PATCH] a warlock life taps only from a health floor it can fight from
+
+WHY THIS PATCH EXISTS
+
+On the dev realm the natural guilds' warlocks are caught in death loops far
+more than any other class. Measured over one day (overseer_death and the
+module's "guild death" log lines, members at levels 40 to 49):
+
+  * warlocks died about 60 times a day each; every other class about 32;
+  * 23 of the 36 members in a death loop were warlocks;
+  * the warlocks died to LOWER level creatures than the other classes did
+    (killer level minus member level averaged -1.4 against -0.6, and 21% of
+    warlock deaths were to a creature five or more levels below them).
+
+Dying to easy creatures says the warlock starts its fights hurt. This tree
+makes it do so:
+
+  * LifeTapTrigger (src/Ai/Class/Warlock/WarlockTriggers.cpp) fires whenever
+    mana is below 85% and health is above Playerbots.LowHealth (45 by
+    default). GenericWarlockNonCombatStrategy wires it to "life tap" at 23,
+    out of combat, and each spec's combat strategy wires it again as a
+    filler at 5.1.
+  * The food strategy eats only on "low health" (UseFoodStrategy.cpp), the
+    same 45, because the realm runs with the food cheat off on purpose.
+
+So between pulls a warlock taps its health down to just above 45%, which is
+exactly where eating would start and never does, and walks into the next
+fight at half health. Every cast that costs mana re-arms the tap. Of the
+guild members whose saved health is below full, warlocks are 18 of 52, the
+other classes together 12 of 107.
+
+WHAT IT CHANGES
+
+The trigger's floor: almost full health (Playerbots.AlmostFullHealth, 85)
+out of combat, medium health (Playerbots.MediumHealth, 65) in combat. Out of
+combat a warlock now taps only from near full health and then lets its
+health come back before tapping again; in combat the filler tap stops at
+65% instead of 45%.
+
+WHAT IT DELIBERATELY DOES NOT CHANGE
+
+  * The emergency tap. GenericWarlockStrategy wires "low mana" to "life tap"
+    at 95, and CastLifeTapAction::isUseful keeps its own low-health check.
+    A warlock out of mana in a fight still taps down to 45%.
+  * The thresholds themselves, which every class reads.
+  * Which pet a warlock summons. 25 of the guilds' 51 warlocks at 30 to 55
+    never learned Summon Voidwalker (a class quest reward) and fight with
+    the Imp; that is a class-quest question, not this trigger's.
+
+WHEN THIS PATCH SHOULD BE DELETED. When upstream gives LifeTapTrigger a
+floor above low health. apply-patches.sh fails the build the day the
+context lines change, which is the intended way to find out.
+
+diff --git a/src/Ai/Class/Warlock/WarlockTriggers.cpp b/src/Ai/Class/Warlock/WarlockTriggers.cpp
+index e0e0f39..49166da 100644
+--- a/src/Ai/Class/Warlock/WarlockTriggers.cpp
++++ b/src/Ai/Class/Warlock/WarlockTriggers.cpp
+@@ -90,10 +90,15 @@ bool DecimationTrigger::IsActive()
+     return aura && aura->GetDuration() > 3000;
+ }
+ 
+-// Checks if the bot's mana is below 85% and health is above a low health threshold
++// Checks if the bot's mana is below 85% and health is at least a floor: medium
++// health in combat, almost full health out of combat. Eating starts only below
++// low health, so a floor at low health kept a warlock near half health between
++// pulls, and it opened every fight there.
+ bool LifeTapTrigger::IsActive()
+ {
+-    if (AI_VALUE2(uint8, "health", "self target") <= sPlayerbotAIConfig.LowHealth)
++    uint32 const healthFloor =
++        bot->IsInCombat() ? sPlayerbotAIConfig.MediumHealth : sPlayerbotAIConfig.AlmostFullHealth;
++    if (AI_VALUE2(uint8, "health", "self target") < healthFloor)
+         return false;
+ 
+     if (!AI_VALUE2(bool, "has mana", "self target"))

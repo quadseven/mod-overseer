@@ -40,6 +40,21 @@
 // STALE_COMBAT_SAY_HELD_SECONDS naming the nearest hostile and its distance, so
 // the next live check can tell that case from this one.
 //
+// A STANDOFF IS NOT A FIGHT EITHER (#1411). A creature a few yards away that
+// holds a combat reference, has a victim and is not evading counts as a
+// hostile in reach, and that is right while either side is hurting the other.
+// Measured on the dev realm after #1394 went live: a family member stood in
+// combat at one spot for hours, at full health, with a creature five yards off
+// and six yards above it, both at full health, neither ever landing a blow
+// (the "held by ... not released" line every thirty minutes, and the same line
+// for four other characters in the same hour). A standoff is a stretch in
+// which the character and every hostile in reach stay at full health and the
+// character does not move more than STALE_COMBAT_STANDOFF_MOVE_YARDS from
+// where the stretch began. After STALE_COMBAT_STANDOFF_SECONDS of it, the
+// character gets the same combat stop and each creature in the standoff is
+// sent home. Any damage on either side, or a move, ends the stretch, so a real
+// fight is never cut short: a fight hurts somebody within seconds.
+//
 // No AzerothCore include: tests/test_stale_combat.cpp compiles this alone.
 
 #include <ctime>
@@ -50,6 +65,8 @@ namespace OverseerDecisions
 constexpr time_t STALE_COMBAT_RELEASE_SECONDS = 10 * 60;
 constexpr float STALE_COMBAT_REACH_YARDS = 40.0f;
 constexpr time_t STALE_COMBAT_SAY_HELD_SECONDS = 30 * 60;
+constexpr time_t STALE_COMBAT_STANDOFF_SECONDS = 15 * 60;
+constexpr float STALE_COMBAT_STANDOFF_MOVE_YARDS = 5.0f;
 
 // What the sweep reads about one character on one poll.
 struct StaleCombatFacts
@@ -61,6 +78,10 @@ struct StaleCombatFacts
     // Attackers plus combat-reference holders that are alive, on the same map
     // and within STALE_COMBAT_REACH_YARDS.
     unsigned hostilesInReach = 0;
+    // With hostiles in reach: the character and every one of them are at full
+    // health, and the character is within STALE_COMBAT_STANDOFF_MOVE_YARDS of
+    // where the stretch began (#1411). Nobody is hurting anybody.
+    bool standoff = false;
     time_t now = 0;
 };
 
@@ -71,6 +92,9 @@ enum class StaleCombatVerdict
     HeldByHostile,   // a hostile is in reach: a real fight, the clock restarts
     Watching,        // empty combat, not yet long enough
     Release,         // empty combat for the whole bound: stop combat now
+    StandoffWatching,  // hostiles in reach, nobody hurt, not yet long enough
+    ReleaseStandoff,   // a standoff for the whole bound: stop combat, send
+                       // the standoff creatures home (#1411)
 };
 
 struct StaleCombatStep
@@ -78,12 +102,31 @@ struct StaleCombatStep
     StaleCombatVerdict verdict = StaleCombatVerdict::NotInCombat;
     // When the empty stretch began, to carry to the next poll; 0 = none.
     time_t emptySince = 0;
-    // How long the empty stretch lasted, for the release line.
+    // When the first standoff poll of this stretch was, to carry to the next
+    // poll; 0 = none yet. The standoff bound counts from here, not from the
+    // start of the stretch: empty combat that a full-health creature walks
+    // into has not been a standoff for the empty minutes before it came.
+    time_t standoffSince = 0;
+    // How long the empty stretch lasted, for the release line (for a
+    // standoff, how long the standoff lasted).
     time_t heldSeconds = 0;
 };
 
-// One poll's verdict, given when the empty stretch began (0 = it had not).
-inline StaleCombatStep DecideStaleCombat(StaleCombatFacts const& f, time_t emptySince)
+// Whether one poll reads as a standoff (#1411): hostiles in reach, the
+// character and every one of them at full health, and the character no more
+// than STALE_COMBAT_STANDOFF_MOVE_YARDS from where its no-fight stretch began
+// (a negative distance: no stretch yet, so nothing to have moved from). A blow
+// on either side or a move makes it a fight, which restarts the clock.
+inline bool IsStandoff(unsigned hostilesInReach, bool everyoneFull, float yardsFromAnchor)
+{
+    return hostilesInReach > 0 && everyoneFull &&
+           yardsFromAnchor <= STALE_COMBAT_STANDOFF_MOVE_YARDS;
+}
+
+// One poll's verdict, given when the empty stretch began (0 = it had not) and
+// when its first standoff poll was (0 = none yet).
+inline StaleCombatStep DecideStaleCombat(StaleCombatFacts const& f, time_t emptySince,
+                                         time_t standoffSince)
 {
     StaleCombatStep step;
     if (!f.alive || !f.inCombat)
@@ -93,28 +136,40 @@ inline StaleCombatStep DecideStaleCombat(StaleCombatFacts const& f, time_t empty
         step.verdict = StaleCombatVerdict::OutOfScope;
         return step;
     }
-    if (f.hostilesInReach > 0)
+    bool const standoff = f.hostilesInReach > 0;
+    if (standoff && !f.standoff)
     {
         step.verdict = StaleCombatVerdict::HeldByHostile;
         return step;
     }
+    StaleCombatVerdict const watching =
+        standoff ? StaleCombatVerdict::StandoffWatching : StaleCombatVerdict::Watching;
     // A clock from the future (a restart, a clock step) restarts rather than
     // releasing on a negative or huge difference.
     if (emptySince <= 0 || emptySince > f.now)
     {
-        step.verdict = StaleCombatVerdict::Watching;
+        step.verdict = watching;
         step.emptySince = f.now;
+        step.standoffSince = standoff ? f.now : 0;
         return step;
     }
-    time_t const held = f.now - emptySince;
-    if (held >= STALE_COMBAT_RELEASE_SECONDS)
+    // The standoff's own start: carried through a poll where the creatures
+    // drop out of reach, begun at the first standoff poll otherwise.
+    if (standoffSince < emptySince || standoffSince > f.now)
+        standoffSince = 0;
+    if (standoff && standoffSince == 0)
+        standoffSince = f.now;
+    time_t const held = standoff ? f.now - standoffSince : f.now - emptySince;
+    time_t const bound = standoff ? STALE_COMBAT_STANDOFF_SECONDS : STALE_COMBAT_RELEASE_SECONDS;
+    if (held >= bound)
     {
-        step.verdict = StaleCombatVerdict::Release;
+        step.verdict = standoff ? StaleCombatVerdict::ReleaseStandoff : StaleCombatVerdict::Release;
         step.heldSeconds = held;
         return step;
     }
-    step.verdict = StaleCombatVerdict::Watching;
+    step.verdict = watching;
     step.emptySince = emptySince;
+    step.standoffSince = standoffSince;
     return step;
 }
 

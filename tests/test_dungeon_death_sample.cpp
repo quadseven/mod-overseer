@@ -199,11 +199,25 @@ void TheAdapterIsWired()
     }
     std::string const meter = Between(source, "class OverseerMeterScript : public UnitScript",
                                       "class OverseerAuctionScript");
-    Check("every hit a player takes reaches the dungeon hit ring",
-          meter.find("NoteDungeonHit(attacker, hurt, damage);") != std::string::npos);
+    Check("every hit a player takes reaches the hit ring, with whether it is a family member",
+          meter.find("bool const familyMember = Note(hurt, OverseerDecisions::MeterKind::Taken, damage);") !=
+                  std::string::npos &&
+              meter.find("NoteDeathHit(attacker, hurt, damage, familyMember);") != std::string::npos);
 
-    std::string const note = Between(source, "static void NoteDungeonHit(", "static void SweepDeathHits(");
-    Check("only inside a dungeon", note.find("if (!map || !map->IsDungeon())") != std::string::npos);
+    // #1416: the open world keeps hits for the family and the natural guilds.
+    std::string const note = Between(source, "static void NoteDeathHit(", "static void SweepDeathHits(");
+    Check("an open-world hit is not dropped for being outside a dungeon",
+          !note.empty() && note.find("if (!map || !map->IsDungeon())") == std::string::npos &&
+              note.find("if (!inDungeon && !familyMember)") != std::string::npos);
+    Check("the open-world guild check reads the cached ids, not the config",
+          note.find("g_deathHitGuildIds.count(guildId)") != std::string::npos &&
+              note.find("Overseer.Natural.Guilds") == std::string::npos &&
+              note.find("InNaturalGuild(") == std::string::npos &&
+              note.find("OverseerDecisions::KeepsDeathHits(") != std::string::npos);
+    std::string const sweep = Between(source, "static void SweepDeathHits(", "static OverseerDecisions::DeathHitAccount TakeDeathHits(");
+    Check("the natural guild ids are refreshed on the world thread",
+          sweep.find("sGuildMgr->GetGuildByName(name)") != std::string::npos &&
+              sweep.find("g_deathHitGuildIds = std::move(guildIds);") != std::string::npos);
     Check("the health, the mana and the combat before the hit",
           note.find("hit.healthBefore = hurt->GetHealth();") != std::string::npos &&
               note.find("hurt->GetPower(POWER_MANA)") != std::string::npos &&
@@ -253,6 +267,20 @@ void TheAdapterIsWired()
               write.find(",NULL,NULL,NULL,NULL") != std::string::npos);
     Check("the ring is swept on the death timer",
           source.find("FlushLevels();\n            SweepDeathHits();") != std::string::npos);
+    // The sweep reads the guild manager for the cached ids (#1416), so it must
+    // stay on the world thread: its one caller is the death timer in
+    // OverseerWorldScript::OnUpdate,
+    // next to FlushDeaths.
+    {
+        std::size_t calls = 0;
+        for (std::size_t at = source.find("SweepDeathHits();"); at != std::string::npos;
+             at = source.find("SweepDeathHits();", at + 1))
+            ++calls;
+        Check("the sweep has one caller, the world thread's death timer",
+              calls == 1 &&
+                  source.find("FlushDeaths();\n            FlushLevels();\n            SweepDeathHits();") !=
+                      std::string::npos);
+    }
 
     std::string const migration = Read("data/sql/characters/base/2026_10_10_01_overseer_death_hits.sql");
     Check("the migration adds the four columns, guarded",
@@ -265,9 +293,21 @@ void TheAdapterIsWired()
 
 }  // namespace
 
+// #1416: the guild dies mostly in the open world, where no hit was kept, so
+// its death rows had mana, enemies and damage NULL about 99% of the time.
+void TheOpenWorldKeepsTheRecordedDeathsHits()
+{
+    using OverseerDecisions::KeepsDeathHits;
+    Check("anyone inside a dungeon", KeepsDeathHits(true, false, false));
+    Check("a family character in the open world", KeepsDeathHits(false, true, false));
+    Check("a natural guild member in the open world", KeepsDeathHits(false, false, true));
+    Check("not a stranger in the open world", !KeepsDeathHits(false, false, false));
+}
+
 int main()
 {
     TheRingKeepsTheNewestHits();
+    TheOpenWorldKeepsTheRecordedDeathsHits();
     ADeathIsReadFromTheHitsBeforeIt();
     AHealersManaIsRead();
     OldHitsBelongToNoDeath();

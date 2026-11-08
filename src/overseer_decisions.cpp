@@ -241,6 +241,11 @@ std::string NameTheAttackers(std::vector<std::string> const& names)
     return out;
 }
 
+bool KeepsDeathHits(bool inDungeon, bool familyMember, bool naturalGuildMember)
+{
+    return inDungeon || familyMember || naturalGuildMember;
+}
+
 DeathHitAccount AccountForDeathHits(DeathHitRing const& ring, std::int64_t deathMs)
 {
     DeathHitAccount account;
@@ -2222,6 +2227,9 @@ DoorAimHeight DoorAimOnTheFloor(float triggerZ, bool haveGround, float groundZ,
     // every refusal below is a plain return and none of them has to remember to
     // restore anything.
     out.z = triggerZ;
+    // What the probe said, kept whether or not it is used (#1414).
+    out.probed = haveGround;
+    out.probedZ = haveGround ? groundZ : 0.f;
 
     // Nothing was found under the door. A probe that answers "no surface" is
     // the edge of the world, a hole, or an unloaded grid, and none of those is
@@ -2370,6 +2378,8 @@ DoorAimHeight DoorAimOnTheFloor(bool haveGround, float groundZ, float arrivalYar
 
     DoorAimHeight out;
     out.z = trigger.z;
+    out.probed = haveGround;
+    out.probedZ = haveGround ? groundZ : 0.f;
     if (!haveGround || arrivalYards <= 0.f)
         return out;
 
@@ -2439,6 +2449,47 @@ RatchetVerdict Ratchet(RatchetState& state, float reading, time_t now,
     verdict.stalled = limits.patienceSeconds != 0 && state.since != 0 &&
                       now - state.since > limits.patienceSeconds;
     return verdict;
+}
+
+float CrossingFarthestWalker(std::vector<DungeonRunEntryState> const& states)
+{
+    // Negative is "nobody to measure": DungeonRunCensus leaves distanceFromDoor
+    // negative for a member through, on another map, or not found.
+    float farthest = -1.f;
+    for (DungeonRunEntryState const& state : states)
+        if (!state.through && state.distanceFromDoor >= 0.f &&
+            state.distanceFromDoor > farthest)
+            farthest = state.distanceFromDoor;
+    return farthest;
+}
+
+bool CrossingWalkKeepsClock(CrossingWalkState& state, time_t crossingSince,
+                            float farthestYards, time_t now, float marginYards,
+                            time_t ceilingSeconds)
+{
+    // A clock this state has not seen is a crossing (or a member's crossing)
+    // this walk has not been measured under: start the walk afresh from it.
+    if (state.epoch != crossingSince)
+    {
+        state.walk = RatchetState{};
+        state.epoch = crossingSince;
+        state.walkingSince = crossingSince;
+    }
+    if (farthestYards < 0.f)
+        return false;
+    // Past the ceiling, walking no longer buys time; only a crossing does.
+    if (now - state.walkingSince >= ceilingSeconds)
+        return false;
+    // Patience 0: this ratchet only compares; the crossing's own clock is the
+    // one that stalls.
+    RatchetLimits const limits{RatchetReading::DistanceToTarget, marginYards, 0};
+    RatchetVerdict const verdict = Ratchet(state.walk, farthestYards, now, limits);
+    if (!verdict.progressed)
+        return false;
+    // The caller moves the crossing's clock to `now`; follow it, so the next
+    // poll is measured under the same walk rather than starting a new one.
+    state.epoch = now;
+    return true;
 }
 
 time_t TravelBackstopSeconds(std::string const& target,
@@ -4675,6 +4726,11 @@ constexpr float ITEM_LEVEL_TIEBREAK = 0.5f;
 // A candidate must beat the incumbent by this much before anything moves.
 constexpr float UPGRADE_MARGIN_FRACTION = 0.01f;
 constexpr float UPGRADE_MARGIN_FLOOR = 0.5f;
+// How much a worn item's unread part (an on-equip effect, an unresolved random
+// suffix) may be worth, as a share of its read score, before a candidate may
+// beat it (#221 box 4). Half: a candidate has to score 1.5 times the worn
+// floor, plus the margin, to be worn over it.
+constexpr float FLOOR_INCUMBENT_HEADROOM = 0.5f;
 
 // A SHIELD IS THE ONE PIECE OF ARMOUR YOU WEAR INSTEAD OF A WEAPON, and that
 // makes the same number on it worth something quite different from the same
@@ -5475,9 +5531,25 @@ GearComparison GearCompare(GearVerdict const& candidate, GearIncumbentScore cons
         return GearComparison::Undecided;
 
     // What is worn is itself only a floor, so its true worth is somewhere above
-    // the number and nothing can be proved to beat it.
+    // the number. "Somewhere above" is not "anywhere above" (#221 box 4): the
+    // unread part is one on-equip effect or one random suffix on a piece whose
+    // armour, stats and item level ARE read, and treating it as unbounded left
+    // 253 better pieces in the family's bags for four days on the dev realm -
+    // Zork carried a level 52 rare headdress and wore a level 37 helm because
+    // the helm has an on-use effect. So the unread part is credited with up to
+    // FLOOR_INCUMBENT_HEADROOM of the read score, and a candidate that clears
+    // even that, plus the usual margin, is better. Below it, still undecided.
+    // A candidate that is itself a floor may use its floor here: its true worth
+    // is only higher, so the gap it proves only widens. Still antisymmetric:
+    // the displaced floor is below what replaced it, so it never comes back.
     if (worn.confidence == GearConfidence::Floor)
-        return GearComparison::Undecided;
+    {
+        float const credited = worn.score * (1.f + FLOOR_INCUMBENT_HEADROOM);
+        return candidate.score >
+                       credited * (1.f + UPGRADE_MARGIN_FRACTION) + UPGRADE_MARGIN_FLOOR
+                   ? GearComparison::Better
+                   : GearComparison::Undecided;
+    }
 
     // From here what is worn is exactly known, and the margin is the same one
     // GearIsUpgrade uses - the two must never disagree about where the line is.
