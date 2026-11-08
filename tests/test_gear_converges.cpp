@@ -419,10 +419,10 @@ void ARareWhoseWorthIsPartlyUnreadStillGetsWorn()
                                  Incumbent(40.f, GearConfidence::Exact)),
                      GearComparison::Undecided);
 
-    // AND WHEN WHAT IS WORN IS ITSELF ONLY A FLOOR, nothing above it can be
-    // proved, however certain the candidate is.
-    ExpectComparison("an exact candidate cannot beat an unknown quantity",
-                     GearCompare(Verdict(400.f, GearConfidence::Exact),
+    // AND WHEN WHAT IS WORN IS ITSELF ONLY A FLOOR, a candidate close to it
+    // proves nothing: the unread effect might be worth the difference.
+    ExpectComparison("a candidate near a worn floor is undecided",
+                     GearCompare(Verdict(55.f, GearConfidence::Exact),
                                  Incumbent(40.f, GearConfidence::Floor)),
                      GearComparison::Undecided);
 
@@ -621,6 +621,44 @@ void AnEmptySlotIsNeverSomethingToGiveUpOn()
 
 }  // namespace
 
+// A WORN FLOOR IS NOT AN UNKNOWN QUANTITY (#221 box 4). The worn piece's armour,
+// stats and item level are read; only one on-equip effect or one random suffix
+// is not. Measured on the dev realm 2026-11-04 to 2026-11-08: 253 (member, item)
+// pairs logged "cannot be settled from the numbers ... stays in the bags", Zork
+// among them with a level 52 rare headdress carried over a level 37 helm whose
+// on-use effect made the helm a floor. A candidate that clears the worn floor
+// with half of it again as headroom, plus the margin, is worn; anything closer
+// stays undecided.
+void AWornFloorIsBeatenByAClearlyBetterPiece()
+{
+    ExpectComparison("an exact candidate at ten times a worn floor is worn",
+                     GearCompare(Verdict(400.f, GearConfidence::Exact),
+                                 Incumbent(40.f, GearConfidence::Floor)),
+                     GearComparison::Better);
+    ExpectComparison("a floor candidate well above a worn floor is worn too",
+                     GearCompare(Verdict(131.f, GearConfidence::Floor),
+                                 Incumbent(80.f, GearConfidence::Floor)),
+                     GearComparison::Better);
+    ExpectComparison("just under the headroom is still undecided",
+                     GearCompare(Verdict(60.f, GearConfidence::Exact),
+                                 Incumbent(40.f, GearConfidence::Floor)),
+                     GearComparison::Undecided);
+    ExpectComparison("an opinion still settles nothing against a floor",
+                     GearCompare(Verdict(400.f, GearConfidence::Opinion),
+                                 Incumbent(40.f, GearConfidence::Floor)),
+                     GearComparison::Undecided);
+    // And once worn, the old floor in the bag never comes back: it is below
+    // what replaced it, exact or floor.
+    ExpectComparison("the displaced floor does not beat an exact replacement",
+                     GearCompare(Verdict(40.f, GearConfidence::Floor),
+                                 Incumbent(400.f, GearConfidence::Exact)),
+                     GearComparison::Undecided);
+    ExpectComparison("nor a floor replacement",
+                     GearCompare(Verdict(80.f, GearConfidence::Floor),
+                                 Incumbent(131.f, GearConfidence::Floor)),
+                     GearComparison::Undecided);
+}
+
 int main()
 {
     TheSameTwoGlovesGiveTheSameAnswerWhicheverIsOn();
@@ -629,6 +667,7 @@ int main()
     NothingIsAnUpgradeOverItself();
     ASweepSettlesAndStaysSettled();
     ARareWhoseWorthIsPartlyUnreadStillGetsWorn();
+    AWornFloorIsBeatenByAClearlyBetterPiece();
     AnEmptySlotIsExactlyZeroAndNotAnUnknown();
     APairIsOnlyAsCertainAsItsWeakerHalf();
     AFreshSwapHappensAndIsRemembered();
