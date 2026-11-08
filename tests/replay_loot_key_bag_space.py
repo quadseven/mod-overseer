@@ -83,7 +83,8 @@ struct Case
 {
     char const* name;
     ItemTemplate item;
-    bool taken;  // what the patched code must do at 86 percent
+    bool takenPinned;   // what the pinned code does at 86 percent
+    bool takenPatched;  // what the patched code must do at 86 percent
 };
 
 // True when the real lines `continue` past the item: it is left behind.
@@ -111,16 +112,18 @@ static bool Skipped(ItemTemplate const& item, int bag)
 int main()
 {
     Case const cases[] = {
-        {"Prison Cell Key (11140)", {ITEM_CLASS_KEY, BAG_FAMILY_MASK_KEYS, BIND_WHEN_PICKED_UP, 1}, true},
-        {"Ironfel (10999)", {ITEM_CLASS_QUEST, 0, BIND_QUEST_ITEM, 1}, true},
-        {"an ordinary piece of armor", {ITEM_CLASS_ARMOR, 0, BIND_WHEN_PICKED_UP, 1}, false},
+        {"Prison Cell Key (11140)", {ITEM_CLASS_KEY, BAG_FAMILY_MASK_KEYS, BIND_WHEN_PICKED_UP, 1}, false, true},
+        {"Ironfel (10999)", {ITEM_CLASS_QUEST, 0, BIND_QUEST_ITEM, 1}, false, true},
+        {"an ordinary piece of armor", {ITEM_CLASS_ARMOR, 0, BIND_WHEN_PICKED_UP, 1}, false, false},
     };
     int wrong = 0;
     for (Case const& c : cases)
     {
         bool const taken = !Skipped(c.item, 86);
         std::printf("%s at 86%%: %s\n", c.name, taken ? "taken" : "left on the corpse");
-        if (EXPECT_PATCHED && taken != c.taken)
+        // Checked in both builds: the pinned one must reproduce the defect,
+        // the patched one must not.
+        if (taken != (EXPECT_PATCHED ? c.takenPatched : c.takenPinned))
             ++wrong;
         // Below the shortcut nothing changes either way.
         if (Skipped(c.item, 50))

@@ -26,7 +26,8 @@ would leave both items on the corpse.
 WHAT IT CHANGES
 
 The 80 percent shortcut does not apply to an item that goes to the keyring
-or is a quest item (class 12 or bonding BIND_QUEST_ITEM). Everything else is
+(bag family mask BAG_FAMILY_MASK_KEYS: the Prison Cell Key, class 13) or is a
+quest item (class 12 or bonding BIND_QUEST_ITEM: Ironfel). Everything else is
 as before. Nothing is forced: CMSG_AUTOSTORE_LOOT_ITEM still goes through the
 core's own store check, which refuses an item there is no room for.
 
