@@ -44,11 +44,19 @@ void Expect(char const* what, LockpickErrandStep got, LockpickErrandStep want)
 
 int main()
 {
-    // Target predicate: matching entry (the two pinned live lockbox entries).
-    Check("the Ratchet strongbox entry is a lockpick target",
-          IsLockpickTargetEntry(1660u));
-    Check("the Redridge practice lockbox entry is a lockpick target",
-          IsLockpickTargetEntry(1733u));
+    // Target predicate: matching entry. The entries are the world database's
+    // Buccaneer's Strongbox (123330-123333) and Practice Lockbox
+    // (178244-178246). 1660 and 1733 were a "Silverpine" object and a "Silver
+    // Vein" mining node, which no lockpicker can open (#1440).
+    Check("a Buccaneer's Strongbox entry is a lockpick target",
+          IsLockpickTargetEntry(123330u) && IsLockpickTargetEntry(123333u));
+    Check("a Practice Lockbox entry is a lockpick target",
+          IsLockpickTargetEntry(178244u) && IsLockpickTargetEntry(178246u));
+    Check("the old guessed entries (a herb and a mining vein) are not lockpick targets",
+          !IsLockpickTargetEntry(1660u) && !IsLockpickTargetEntry(1733u));
+    Check("entries next to the two ranges are not lockpick targets",
+          !IsLockpickTargetEntry(123329u) && !IsLockpickTargetEntry(123334u) &&
+          !IsLockpickTargetEntry(178243u) && !IsLockpickTargetEntry(178247u));
     Check("entry zero is not a lockpick target",
           !IsLockpickTargetEntry(0u));
     Check("an arbitrary non-lockbox entry is not a lockpick target",
@@ -56,7 +64,7 @@ int main()
 
     // Candidate predicate: a matching entry that is spawned, in zone and in
     // range is in; dropping any one input keeps it out.
-    std::uint32_t const entry = 1660u;
+    std::uint32_t const entry = 123330u;
     Check("a spawned, in-zone, in-range matching entry is a candidate",
           IsLockpickTargetCandidate(entry, true, true, true));
     Check("a despawned matching entry is not a candidate",
