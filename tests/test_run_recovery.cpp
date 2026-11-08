@@ -302,6 +302,39 @@ void ARunInsideMakesRoomAndLeavesOnlyForALostUpgrade()
           true);
 }
 
+void ALostUpgradeEvacuatesOnlyWhenItStaysLost()
+{
+    // MEASURED 2026-11-08: an 87 minute Blackrock Depths run was walked out the
+    // moment a member with no room stood beside one Black Diamond; the next run
+    // opened a fresh instance and every kill was lost.
+    DungeonBagPressure const inside =
+        DungeonRunBagPressure({15, 0, 6, 10, 6}, 3, true, false);
+    std::time_t const t0 = 1000000;
+    std::time_t since = UpgradeStrandedSinceAfterPoll(true, 0, t0);
+    Check("a first strand starts the clock", since == t0, true);
+    Check("a first strand does not evacuate",
+          DungeonRunBagAnswer(inside, UpgradeStrandBoundReached(since, t0)) ==
+              DungeonBagPressure::MakeRoom,
+          true);
+    since = UpgradeStrandedSinceAfterPoll(true, since, t0 + 120);
+    Check("a continuing strand keeps its first instant", since == t0, true);
+    Check("two minutes in the run still keeps clearing",
+          DungeonRunBagAnswer(inside, UpgradeStrandBoundReached(since, t0 + 120)) ==
+              DungeonBagPressure::MakeRoom,
+          true);
+    Check("just inside the bound it still keeps clearing",
+          UpgradeStrandBoundReached(since, t0 + UPGRADE_STRANDED_GRACE_SECONDS - 1), false);
+    Check("a strand that lasts the whole bound walks the party out",
+          DungeonRunBagAnswer(
+              inside, UpgradeStrandBoundReached(since, t0 + UPGRADE_STRANDED_GRACE_SECONDS)) ==
+              DungeonBagPressure::Evacuate,
+          true);
+    Check("the party moving on clears the clock",
+          UpgradeStrandedSinceAfterPoll(false, since, t0 + 200) == 0, true);
+    Check("a cleared clock never reaches the bound",
+          UpgradeStrandBoundReached(0, t0 + 100000), false);
+}
+
 void AGreyIsDestroyedForRoomDespiteItsPrice()
 {
     DestroySpec grey = ParseDestroySpec("destroy guid:42 count:3 allow:grey");
@@ -340,6 +373,7 @@ int main()
     AGiveUpOnTheGroundLeavesTheErrandAlone();
     TheTimelineSaysWhatEndedTheErrandAndWhichRecovery();
     ARunInsideMakesRoomAndLeavesOnlyForALostUpgrade();
+    ALostUpgradeEvacuatesOnlyWhenItStaysLost();
     AGreyIsDestroyedForRoomDespiteItsPrice();
     if (failures)
         std::printf("%d failure(s)\n", failures);

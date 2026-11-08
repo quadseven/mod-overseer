@@ -4427,6 +4427,28 @@ DungeonBagPressure DungeonRunBagPressure(std::vector<unsigned> const& freeBagSlo
 // through unchanged, so the pre-run town-first gate (HoldOut) is untouched.
 DungeonBagPressure DungeonRunBagAnswer(DungeonBagPressure pressure, bool upgradeStranded);
 
+// A LOST UPGRADE ENDS A RUN ONLY WHEN IT STAYS LOST (#2062 in the bridge repo).
+// Measured 2026-11-08: a Blackrock Depths run 87 minutes deep (three bosses
+// down, heading for the Ring of Law) was walked out the instant one member with
+// no free slot stood beside a Black Diamond, and the next run opened a fresh
+// instance, so every kill was lost. One unlootable Uncommon is worth far less
+// than that. The member simply leaves the drop (nothing non-grey is ever
+// destroyed to make room), the run keeps clearing, and the walk-out is kept
+// only for a strand that does not clear on its own: the same member beside the
+// same unlootable drop for UPGRADE_STRANDED_GRACE_SECONDS in a row, which means
+// the party is not moving on.
+constexpr std::time_t UPGRADE_STRANDED_GRACE_SECONDS = 600;
+
+// The instant a continuous strand began, carried from poll to poll. `since` is
+// the previous value (0 when not stranded before). Returns 0 the moment nobody
+// is stranded, `since` while the strand continues, and `now` for a new one.
+std::time_t UpgradeStrandedSinceAfterPoll(bool strandedNow, std::time_t since,
+                                          std::time_t now);
+
+// Has a continuous strand lasted the whole grace period? This is the value to
+// hand DungeonRunBagAnswer as `upgradeStranded`.
+bool UpgradeStrandBoundReached(std::time_t since, std::time_t now);
+
 // --------------------------- the run yields to an errand it would trample --
 //
 // WHAT THIS IS ACTUALLY FOR, AND IT IS NOT ONLY THE TOWN TRIP (#168). Three

@@ -3687,6 +3687,19 @@ DungeonBagPressure DungeonRunBagAnswer(DungeonBagPressure pressure, bool upgrade
     return upgradeStranded ? DungeonBagPressure::Evacuate : DungeonBagPressure::MakeRoom;
 }
 
+std::time_t UpgradeStrandedSinceAfterPoll(bool strandedNow, std::time_t since,
+                                          std::time_t now)
+{
+    if (!strandedNow)
+        return 0;
+    return since ? since : now;
+}
+
+bool UpgradeStrandBoundReached(std::time_t since, std::time_t now)
+{
+    return since && now >= since && now - since >= UPGRADE_STRANDED_GRACE_SECONDS;
+}
+
 CounterRole CounterRoleForAim(std::string const& aim)
 {
     // The bridge's ECONOMY_ERRANDS, and the same three keywords the travel
