@@ -341,6 +341,8 @@
 #include "overseer_movement_ownership.h"
 // A combat flag with nothing behind it is released after ten minutes (#1390).
 #include "overseer_stale_combat.h"
+// The #1426 teleport probe says one line per character per ten seconds.
+#include "overseer_probe_rate.h"
 // The core and mod-playerbots APIs that differ between the pins build.yml
 // compiles against and the upstream heads (wow-overseer#826).
 #include "overseer_core_compat.h"
@@ -85402,9 +85404,10 @@ public:
     }) {}
 
     bool OnPlayerBeforeTeleport(Player* player, uint32 mapid, float /*x*/, float /*y*/,
-                                float /*z*/, float /*orientation*/, uint32 /*options*/,
-                                Unit* /*target*/) override
+                                float /*z*/, float /*orientation*/, uint32 options,
+                                Unit* target) override
     {
+        ProbeTeleportOut1426(player, mapid, options, target);
         if (!OverseerWorldScript::DoorShutFor(player, mapid))
             return true;
         std::string const name = player->GetName();
@@ -85428,6 +85431,45 @@ public:
     }
 
 private:
+    // DIAGNOSTIC ONLY (#1426): names who sends a roster member out of a
+    // dungeon. It logs and changes nothing; a refusal or a return value is
+    // never decided here. One line per character per ten seconds.
+    static void ProbeTeleportOut1426(Player* player, uint32 mapid, uint32 options, Unit* target)
+    {
+        if (!player)
+            return;
+        Map* const map = player->FindMap();
+        if (!map || !map->Instanceable() || player->GetMapId() == mapid)
+            return;
+        std::string const name = player->GetName();
+        if (!OnRoster(name))
+            return;
+        time_t const now = std::time(nullptr);
+        {
+            std::lock_guard<std::mutex> guard(ProbeLock());
+            time_t& last = ProbeSaid()[name];
+            if (!OverseerDecisions::ProbeLineDue(now, last))
+                return;
+            last = now;
+        }
+        Group* const group = player->GetGroup();
+        LOG_WARN("module.overseer",
+                 "overseer: probe #1426: '{}' on map {} is being teleported to map {} "
+                 "options={} target_null={} in_group={} lfg_group={} finder_watched={}",
+                 name, player->GetMapId(), mapid, options, target ? "no" : "yes",
+                 group ? "yes" : "no", group && group->isLFGGroup() ? "yes" : "no",
+                 OverseerWorldScript::IsFinderWatched(name) ? "yes" : "no");
+    }
+    static std::mutex& ProbeLock()
+    {
+        static std::mutex lock;
+        return lock;
+    }
+    static std::map<std::string, time_t>& ProbeSaid()
+    {
+        static std::map<std::string, time_t> said;
+        return said;
+    }
     static std::mutex& SaidLock()
     {
         static std::mutex lock;
