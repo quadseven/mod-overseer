@@ -226,6 +226,27 @@ int main()
         CheckBool("and no rule lets it through",
                   OffContinentHearthLetThrough(failed), false);
 
+        // A STAND-IN GUEST GOES HOME TO ITS OWN BIND (#1427). Measured on the
+        // dev realm 2026-11-08: a guildmate in a family's damage seat, bound
+        // on map 1, was withheld its stone by the rule above, could not be
+        // walked (a guest has no roster row for a travel aim), and was left
+        // alone inside Blackrock Depths after its stand-in ended.
+        ExitHearthFacts guest = failed;
+        guest.standinGuest = true;
+        CheckStep("a stand-in guest bound off the door's continent is cast for",
+                  ExitFailureHearthStep(guest), ExitHearthStep::Cast);
+        CheckText("and nothing is impossible about it", ExitHearthImpossibleReason(guest), "");
+        ExitHearthFacts guestEarly = farBind;
+        guestEarly.standinGuest = true;
+        CheckStep("from the first failed walk, not after a bound",
+                  ExitFailureHearthStep(guestEarly), ExitHearthStep::Cast);
+        ExitHearthFacts guestCooling = guest;
+        guestCooling.onCooldown = true;
+        CheckStep("a guest's stone on cooldown is still impossible",
+                  ExitFailureHearthStep(guestCooling), ExitHearthStep::Impossible);
+        CheckStep("and a family member with the same facts is still held for the walk",
+                  ExitFailureHearthStep(failed), ExitHearthStep::Impossible);
+
         ExitHearthFacts sameContinent = homeBind;
         sameContinent.failedWalkSeconds = OFF_CONTINENT_HEARTH_AFTER_SECONDS;
         CheckBool("a stone bound on the door's map needs no such rule",
