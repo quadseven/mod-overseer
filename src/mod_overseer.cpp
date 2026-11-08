@@ -299,6 +299,9 @@
 // A Blackrock Depths run that carries the Shadowforge Key goes on into the
 // Upper City (#1410).
 #include "overseer_brd_wing.h"
+// A ghost at Blackrock Mountain of a family that cannot open the Upper City
+// walks to Franclorn Forgewright for Dark Iron Legacy (wow-overseer#2021).
+#include "overseer_brd_legacy_ghost.h"
 #include "Mail.h"
 #include "RBAC.h"
 // kind='bot' `e Hitem:` (#927): the verdict and the scorer mod-playerbots' own
@@ -32732,6 +32735,7 @@ private:
                 _healerExpected.erase(name);
                 EndGhostRecovery(botAI, name);
                 LadderEnd(botAI, name);
+                LegacyDetourEnd(botAI, name);
                 _ladderNoGraveSaid.erase(name);
                 ReleaseRevivalHold(botAI, name);
                 DriveRevivedSickness(bot, botAI, name);
@@ -32993,6 +32997,12 @@ private:
             // Alive again, or released and now a ghost: either way this is no
             // longer a character waiting on a prompt.
             _awaitingRelease.erase(name);
+
+            // A GHOST AT BLACKROCK MOUNTAIN WHOSE FAMILY CANNOT OPEN THE UPPER
+            // CITY WALKS TO FRANCLORN FORGEWRIGHT FIRST (wow-overseer#2021),
+            // once per member; then the recoveries below go on as before.
+            if (DriveLegacyGhostDetour(bot, botAI, name))
+                continue;
 
             // A GHOST ON ITS CORPSE'S MAP IS ASKED WHAT A PLAYER WOULD DO
             // (#664) before the ladder below is: run back, take the
@@ -33610,6 +33620,182 @@ private:
             if (!botAI->HasStrategy(strategy, BOT_STATE_DEAD))
                 botAI->ChangeStrategy("+" + strategy, BOT_STATE_DEAD);
         st.leased.clear();
+    }
+
+    // ------------------------------- Dark Iron Legacy: a ghost at Franclorn --
+    //
+    // A GHOST AT BLACKROCK MOUNTAIN WALKS TO FRANCLORN FORGEWRIGHT FIRST
+    // (wow-overseer#2021). The rules and the measurement are in
+    // overseer_brd_legacy_ghost.h. This reads the facts, walks the ghost the
+    // way the spirit-healer walk does (a MovePoint with a path, never forced,
+    // re-issued from wherever a cut-short path left it), and stands it there
+    // while the bridge's own take and turn-in rows run. Nothing is granted
+    // here: the quest is taken by the rows, which the core refuses for a ghost
+    // out of reach or a quest it would not give.
+    struct LegacyDetourState
+    {
+        GhostRecoveryState lease;  // only `leased` is used: the strategies taken off
+        int64 since{0};
+        int64 arrivedAt{0};
+        bool walkIssued{false};
+    };
+    static constexpr uint32 LEGACY_GHOST_POINT_ID = 0;
+
+    // The family's Blackrock Depths order, and whether a member of it can
+    // already open the Upper City or holds the chain's second quest. Members
+    // not in the world are not read: the family's are always in it.
+    void ReadLegacyFamily(std::string const& name, OverseerDecisions::LegacyGhostFacts& facts)
+    {
+        namespace D = OverseerDecisions;
+        QueryResult fam = CharacterDatabase.Query(
+            "SELECT family FROM overseer_roster WHERE name = '{}' AND enabled = 1", Esc(name));
+        if (!fam)
+            return;
+        std::string const family = fam->Fetch()[0].Get<std::string>();
+        if (family.empty())
+            return;
+        static bool const queueRead =
+            SchemaHasColumns("overseer_dungeon_queue", "'family','keyword','status'", 3);
+        bool order = false;
+        if (queueRead)
+            order = CharacterDatabase.Query(
+                        "SELECT 1 FROM overseer_dungeon_queue WHERE family = '{}' "
+                        "AND keyword = 'blackrock-depths' AND status IN ('queued', 'active') "
+                        "LIMIT 1",
+                        Esc(family)) != nullptr;
+        if (!order && RunFamilyColumnsPresent())
+            order = CharacterDatabase.Query(
+                        "SELECT 1 FROM overseer_dungeon_run WHERE state = 'active' "
+                        "AND map_id = {} AND family = '{}' LIMIT 1",
+                        D::LEGACY_BRD_MAP, Esc(family)) != nullptr;
+        facts.familyBrdOrder = order;
+        QueryResult members = CharacterDatabase.Query(
+            "SELECT name FROM overseer_roster WHERE family = '{}' AND enabled = 1", Esc(family));
+        if (!members)
+            return;
+        do
+        {
+            Player* p = ObjectAccessor::FindPlayerByName(members->Fetch()[0].Get<std::string>());
+            if (!p || !p->IsInWorld())
+                continue;
+            // Held (taken or complete) or rewarded; a failed 3802 is no step
+            // toward the key.
+            QuestStatus const legacy = p->GetQuestStatus(D::LEGACY_KEY_QUEST);
+            if (p->GetItemCount(D::LEGACY_SHADOWFORGE_KEY, true) > 0 ||
+                legacy == QUEST_STATUS_INCOMPLETE || legacy == QUEST_STATUS_COMPLETE ||
+                p->GetQuestRewardStatus(D::LEGACY_KEY_QUEST))
+                facts.familyHasKey = true;
+            if (p->HasSkill(SKILL_LOCKPICKING) &&
+                p->GetSkillValue(SKILL_LOCKPICKING) >= D::LEGACY_LOCKPICKING)
+                facts.familyHasLockpicker = true;
+        } while (members->NextRow());
+    }
+
+    // The detour is over, or never was: hand back what it leased.
+    void LegacyDetourEnd(PlayerbotAI* botAI, std::string const& name)
+    {
+        auto const it = _legacyDetour.find(name);
+        if (it == _legacyDetour.end())
+            return;
+        ReturnCorpseRun(botAI, it->second.lease);
+        _legacyDetour.erase(it);
+        _legacyDetourSpent.insert(name);
+    }
+
+    // One poll of one roster ghost. True when this poll is spoken for and
+    // nothing else may recover the ghost; false to go on as before.
+    bool DriveLegacyGhostDetour(Player* bot, PlayerbotAI* botAI, std::string const& name)
+    {
+        namespace D = OverseerDecisions;
+        D::LegacyGhostFacts facts;
+        facts.ghost = bot->HasPlayerFlag(PLAYER_FLAGS_GHOST);
+        facts.level = bot->GetLevel();
+        facts.ghostMap = bot->GetMapId();
+        facts.ghostFlatYards = bot->GetExactDist2d(D::LEGACY_FRANCLORN_X, D::LEGACY_FRANCLORN_Y);
+        facts.ghostYards = bot->GetExactDist(D::LEGACY_FRANCLORN_X, D::LEGACY_FRANCLORN_Y,
+                                             D::LEGACY_FRANCLORN_Z);
+        // Where the core keeps the corpse across maps; GetCorpse() answers
+        // only for the map the ghost stands on.
+        WorldLocation const corpseAt = bot->GetCorpseLocation();
+        facts.corpseMap = corpseAt.GetMapId();
+        facts.corpseFlatYards = corpseAt.GetExactDist2d(D::LEGACY_FRANCLORN_X, D::LEGACY_FRANCLORN_Y);
+        auto const it = _legacyDetour.find(name);
+        facts.begun = it != _legacyDetour.end();
+        facts.spent = _legacyDetourSpent.count(name) != 0;
+        if (!facts.begun && (facts.spent || !D::LegacyGhostAtMountain(facts)))
+            return false;
+        ReadLegacyFamily(name, facts);
+        int64 const now = time(nullptr);
+        if (facts.begun)
+        {
+            facts.walkSeconds = now - it->second.since;
+            facts.atFranclornSeconds = it->second.arrivedAt ? now - it->second.arrivedAt : 0;
+        }
+
+        D::LegacyGhostStep const step = D::LegacyGhostNext(facts);
+        if (step == D::LegacyGhostStep::None)
+            return false;
+        if (step == D::LegacyGhostStep::Done)
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' ends its detour to Franclorn Forgewright after {}s ({}s at "
+                     "him, {:.0f} yards off): quest {} {}, quest {} {}, family {} the key - "
+                     "back to its ordinary recovery (wow-overseer#2021)",
+                     name, facts.walkSeconds, facts.atFranclornSeconds, facts.ghostYards,
+                     D::LEGACY_TALE_QUEST,
+                     bot->GetQuestRewardStatus(D::LEGACY_TALE_QUEST) ? "rewarded"
+                     : bot->GetQuestStatus(D::LEGACY_TALE_QUEST) != QUEST_STATUS_NONE ? "held"
+                                                                                     : "not taken",
+                     D::LEGACY_KEY_QUEST,
+                     bot->GetQuestStatus(D::LEGACY_KEY_QUEST) != QUEST_STATUS_NONE ? "held"
+                                                                                  : "not taken",
+                     facts.familyHasKey ? "is on the way to" : "still has no way to");
+            LegacyDetourEnd(botAI, name);
+            return false;
+        }
+
+        if (!facts.begun)
+        {
+            // Anything else walking this ghost hands it over first.
+            EndGhostRecovery(botAI, name);
+            LadderEnd(botAI, name);
+            _legacyDetour[name].since = now;
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' (level {}) is a ghost at Blackrock Mountain, its family has "
+                     "a Blackrock Depths order and nobody who can open the Upper City, so it "
+                     "walks {:.0f} yards to Franclorn Forgewright for Dark Iron Legacy before "
+                     "its corpse run (wow-overseer#2021)",
+                     name, facts.level, facts.ghostYards);
+        }
+        LegacyDetourState& st = _legacyDetour[name];
+        MotionMaster* motion = bot->GetMotionMaster();
+        if (step == D::LegacyGhostStep::Wait)
+        {
+            LeaseCorpseRun(bot, botAI, st.lease, false);
+            if (!st.arrivedAt)
+            {
+                st.arrivedAt = now;
+                motion->Clear();
+                bot->StopMoving();
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' stands at Franclorn Forgewright, {:.1f} yards off, and "
+                         "waits up to {}s for Dark Iron Legacy (quests {} and {})",
+                         name, facts.ghostYards, D::LEGACY_WAIT_SECONDS, D::LEGACY_TALE_QUEST,
+                         D::LEGACY_KEY_QUEST);
+            }
+            return true;
+        }
+
+        LeaseCorpseRun(bot, botAI, st.lease, true);
+        if (st.walkIssued && bot->isMoving() &&
+            motion->GetMotionSlotType(MOTION_SLOT_ACTIVE) == POINT_MOTION_TYPE)
+            return true;
+        motion->Clear();
+        st.walkIssued = true;
+        motion->MovePoint(LEGACY_GHOST_POINT_ID, D::LEGACY_FRANCLORN_X, D::LEGACY_FRANCLORN_Y,
+                          D::LEGACY_FRANCLORN_Z, FORCED_MOVEMENT_NONE, 0.f, 0.f,
+                          /*generatePath*/ true, /*forceDestination*/ false);
+        return true;
     }
 
     // ------------------------------------- the natural guilds' own ghosts --
@@ -38805,6 +38991,7 @@ private:
                     ? std::time(nullptr) - episode.walkFailingSince
                     : 0;
                 facts.familyHearthedOut = familyHearthedOut;
+                facts.standinGuest = IsStandinGuest(name);
             }
 
             ExitHearthStep const step = OverseerDecisions::ExitFailureHearthStep(facts);
@@ -41271,6 +41458,7 @@ private:
                     facts.doorMapId = episode.doorMapId;
                     facts.bindMapId = static_cast<uint32_t>(bot->m_homebindMapId);
                     facts.failedWalkSeconds = now - episode.walkFailingSince;
+                    facts.standinGuest = IsStandinGuest(name);
                 }
                 way = OverseerDecisions::DecideEvacuationWay(
                     true, OverseerDecisions::ExitFailureHearthStep(facts));
@@ -84472,6 +84660,11 @@ private:
     // and the death each no-graveyard ghost was last named for. World thread
     // only, cleared when the character is alive again.
     std::map<std::string, GhostRecoveryState> _ladderHealer;
+    // The Franclorn detours in progress (DriveLegacyGhostDetour), and the
+    // members whose detour has ended, so it is walked once per member. World
+    // thread only. Lost on restart, which costs at most one more walk.
+    std::map<std::string, LegacyDetourState> _legacyDetour;
+    std::set<std::string> _legacyDetourSpent;
     std::map<std::string, int64> _ladderNoGraveSaid;
     // A natural guild member's recent deaths (DriveGuildGhostRecovery), by name.
     std::map<std::string, std::vector<OverseerDecisions::GuildDeathMark>> _guildDeathMarks;
