@@ -197,3 +197,12 @@ stays while a fall spline runs, and the settle is held to 50 yards unless the
 bot has a flight flag. Keeping the flag is only safe with the landing clear in
 the same patch: the core clears it at the end of a fall spline for creatures
 only, so a bot with no client would otherwise keep it, and routing with it.
+
+**`mod-playerbots/0023-a-key-or-quest-item-is-not-left-for-a-full-bag.patch`
+fixes upstream behaviour** - dropping it costs the fix and nothing else.
+`StoreLootAction::Execute` skipped every non-stacking item once "bag space" read
+over 80 percent for a bot whose master is not a real player, which is every
+family member. A key goes to the keyring, which that value does not count, and a
+quest item is the reason the corpse was opened, so neither is skipped that way
+any more (#1424: Blackrock Depths' Prison Cell Key and Ironfel). The core's own
+store check still refuses an item with no room.
