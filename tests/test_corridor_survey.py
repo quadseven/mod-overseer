@@ -20,7 +20,8 @@ def game_to_nav(point):
     return y, z, x
 
 
-def write_tile(path, vertices, polygons, tile_x, tile_y, detail_meshes=None):
+def write_tile(path, vertices, polygons, tile_x, tile_y, detail_meshes=None,
+               walkable_climb=0.5):
     nav_vertices = [game_to_nav(point) for point in vertices]
     poly_bytes = bytearray()
     for entry in polygons:
@@ -56,7 +57,7 @@ def write_tile(path, vertices, polygons, tile_x, tile_y, detail_meshes=None):
     )
     mins = tuple(min(point[i] for point in nav_vertices) for i in range(3))
     maxs = tuple(max(point[i] for point in nav_vertices) for i in range(3))
-    mesh_floats = (2.0, 0.5, 0.5, *mins, *maxs, 1.0)
+    mesh_floats = (2.0, 0.5, walkable_climb, *mins, *maxs, 1.0)
     mesh_header = struct.pack("<15i10f", *mesh_ints, *mesh_floats)
     assert len(mesh_header) == 100
 
@@ -140,6 +141,46 @@ class CorridorSurveyTests(unittest.TestCase):
 
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertTrue(json.loads(result.stdout)["legs"])
+
+    def test_external_portal_is_clipped_to_the_climbable_height_interval(self):
+        write_tile(
+            self.maps / "0013333.mmtile",
+            [(0, 0, 10), (10, 0, 10), (10, 10, 10), (0, 10, 10)],
+            [((0, 1, 2, 3), (0, 0x8002, 0, 0))],
+            33, 33, walkable_climb=2.0,
+        )
+        write_tile(
+            self.maps / "0013334.mmtile",
+            [(10, 0, 0), (20, 0, 0), (20, 10, 20), (10, 10, 20)],
+            [((0, 1, 2, 3), (0, 0, 0, 0x8006))],
+            33, 34, walkable_climb=2.0,
+        )
+
+        result = self.run_survey((9, 9, 10), (11, 9, 18), spacing=1)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        points = json.loads(result.stdout)["points"]
+        crossing = [point for point in points if abs(point["x"] - 10) < 0.01]
+        self.assertTrue(crossing)
+        self.assertTrue(all(point["y"] <= 7.01 for point in crossing), crossing)
+
+    def test_detail_vertex_must_belong_to_its_polygon_detail_mesh(self):
+        write_tile(
+            self.maps / "0013333.mmtile",
+            [(0, 0, 10), (10, 0, 10), (0, 10, 10),
+             (20, 20, 10), (30, 20, 10), (20, 30, 10)],
+            [(0, 1, 2), (3, 4, 5)],
+            33, 33,
+            detail_meshes=[
+                ([], [(0, 1, 3, 0)]),
+                ([(25, 25, 30)], [(0, 1, 2, 0)]),
+            ],
+        )
+
+        result = self.run_survey((1, 1, 10), (2, 2, 10))
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("detail mesh 0 references a missing vertex", result.stderr)
 
     def test_disconnected_tiles_report_named_no_path(self):
         write_tile(
