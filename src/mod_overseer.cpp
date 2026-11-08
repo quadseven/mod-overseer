@@ -30924,10 +30924,19 @@ private:
             // a combat reference holder, alive, on this map, within reach.
             Unit* nearest = nullptr;
             float nearestYards = 0.f;
-            // A STANDOFF (#1411): every hostile in reach a creature at full
-            // health, and the character at full health. Any blow on either
-            // side, or a player in reach, makes it a fight.
-            bool allFull = bot->GetHealth() >= bot->GetMaxHealth();
+            // A STANDOFF (#1411): nobody in it has lost health since the
+            // no-fight stretch began - not the character, not any creature in
+            // reach. "At full health" was the first reading, and it never held
+            // for a character that entered combat hurt: a player does not
+            // regenerate health in combat, so Zork stood at 2238 of 2318 for
+            // hours and was never released (#1411). Each poll compares with the
+            // highest health seen in the stretch, so a blow healed back between
+            // polls still shows on a later one in a real fight. Any loss, or a
+            // player in reach, makes it a fight.
+            uint32& selfHighest = _staleCombatSelfHealth[key];
+            bool everyoneUnhurt = OverseerDecisions::NoHealthLost(bot->GetHealth(), selfHighest);
+            selfHighest = std::max(selfHighest, bot->GetHealth());
+            std::map<ObjectGuid, uint32>& foeHighest = _staleCombatFoeHealth[key];
             std::vector<Creature*> standoffCreatures;
             auto consider = [&](Unit* other)
             {
@@ -30949,9 +30958,15 @@ private:
                 // A player, or a pet or guardian a player controls, is never a
                 // standoff: that is PvP, and its owner can act at any moment.
                 Creature* const held = other->ToCreature();
-                if (!held || held->IsControlledByPlayer() ||
-                    other->GetHealth() < other->GetMaxHealth())
-                    allFull = false;
+                bool foeUnhurt = false;
+                if (held && !held->IsControlledByPlayer())
+                {
+                    uint32& highest = foeHighest[held->GetGUID()];
+                    foeUnhurt = OverseerDecisions::NoHealthLost(held->GetHealth(), highest);
+                    highest = std::max(highest, held->GetHealth());
+                }
+                if (!foeUnhurt)
+                    everyoneUnhurt = false;
                 else if (std::find(standoffCreatures.begin(), standoffCreatures.end(), held) ==
                          standoffCreatures.end())
                     standoffCreatures.push_back(held);
@@ -30975,7 +30990,7 @@ private:
                                          ? bot->GetExactDist(&anchor->second)
                                          : -1.f;
             facts.standoff =
-                OverseerDecisions::IsStandoff(facts.hostilesInReach, allFull, fromAnchor);
+                OverseerDecisions::IsStandoff(facts.hostilesInReach, everyoneUnhurt, fromAnchor);
             auto standoffSince = _staleCombatStandoffSince.find(key);
             StaleCombatStep const step = DecideStaleCombat(
                 facts, since == _staleCombatSince.end() ? 0 : since->second,
@@ -31000,6 +31015,8 @@ private:
             {
                 _staleCombatSince.erase(key);
                 _staleCombatAnchor.erase(key);
+                _staleCombatSelfHealth.erase(key);
+                _staleCombatFoeHealth.erase(key);
             }
 
             if (step.verdict == StaleCombatVerdict::ReleaseStandoff)
@@ -31022,15 +31039,17 @@ private:
                         creature->AI()->EnterEvadeMode();
                 bot->CombatStop(true);
                 LOG_INFO("module.overseer",
-                         "overseer: '{}' stood {} seconds in a standoff - in combat at full "
-                         "health with {} at full health within {:.0f} yards, nobody hurt and "
+                         "overseer: '{}' stood {} seconds in a standoff - in combat at {} of {} "
+                         "health with {} within {:.0f} yards, nobody losing health and "
                          "nobody moved - combat stopped and those sent home; in combat after "
                          "the stop: {} (#1411)",
-                         bot->GetName(), uint64(step.heldSeconds), held,
+                         bot->GetName(), uint64(step.heldSeconds), bot->GetHealth(), bot->GetMaxHealth(), held,
                          OverseerDecisions::STALE_COMBAT_REACH_YARDS,
                          bot->IsInCombat() ? "yes" : "no");
                 _staleCombatSince.erase(key);
                 _staleCombatAnchor.erase(key);
+                _staleCombatSelfHealth.erase(key);
+                _staleCombatFoeHealth.erase(key);
                 _combatSeenSince.erase(key);
                 _staleCombatSaid.erase(key);
                 continue;
@@ -31053,6 +31072,8 @@ private:
                 _combatSeenSince.erase(key);
                 _staleCombatSaid.erase(key);
                 _staleCombatAnchor.erase(key);
+                _staleCombatSelfHealth.erase(key);
+                _staleCombatFoeHealth.erase(key);
                 continue;
             }
 
@@ -31082,6 +31103,10 @@ private:
                 it = seen.count(it->first) ? std::next(it) : book->erase(it);
         for (auto it = _staleCombatAnchor.begin(); it != _staleCombatAnchor.end();)
             it = seen.count(it->first) ? std::next(it) : _staleCombatAnchor.erase(it);
+        for (auto it = _staleCombatSelfHealth.begin(); it != _staleCombatSelfHealth.end();)
+            it = seen.count(it->first) ? std::next(it) : _staleCombatSelfHealth.erase(it);
+        for (auto it = _staleCombatFoeHealth.begin(); it != _staleCombatFoeHealth.end();)
+            it = seen.count(it->first) ? std::next(it) : _staleCombatFoeHealth.erase(it);
     }
 
     // ---------------------------------------------------------- stuck dead --
@@ -84778,6 +84803,12 @@ private:
     // standoff can tell a character that never moved from one that did
     // (#1411). Pruned with the books above.
     std::map<uint32, Position> _staleCombatAnchor;
+    // The highest health each character, and each creature in reach of it,
+    // has had since its no-fight stretch began (#1411): a standoff is a
+    // stretch in which nobody's health falls below that. Pruned with the
+    // anchor book.
+    std::map<uint32, uint32> _staleCombatSelfHealth;
+    std::map<uint32, std::map<ObjectGuid, uint32>> _staleCombatFoeHealth;
     uint32 _terrainRecoveryTimer = 0;
     // GATHERING/BARRIER coordinator poll (mod-overseer#88). Its own timer,
     // not piggybacked on QUEST_POLL_MS or ENGAGEMENT_POLL_MS: this drive is

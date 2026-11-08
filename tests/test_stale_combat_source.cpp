@@ -87,15 +87,28 @@ int main()
               Has(drive, "not released (#1390)"));
     Check("the books are pruned to who is in combat now", Has(drive, "seen.count(it->first)"));
 
-    // #1411: a standoff (both sides at full health, the character unmoved) is
-    // released, and each creature in it is sent home before the stop.
-    Check("the drive reads the character's health and each hostile's",
-          Has(drive, "bot->GetHealth() >= bot->GetMaxHealth()") &&
-              Has(drive, "other->GetHealth() < other->GetMaxHealth()"));
+    // #1411: a standoff (nobody has lost health in the stretch, the character
+    // unmoved) is released, and each creature in it is sent home before the
+    // stop. Not "at full health": Zork came into combat at 2238 of 2318 and a
+    // player does not regenerate in combat, so it was never released.
+    Check("the drive compares the character's health with its highest in the stretch",
+          Has(drive, "OverseerDecisions::NoHealthLost(bot->GetHealth(), selfHighest)") &&
+              Has(drive, "selfHighest = std::max(selfHighest, bot->GetHealth());"));
+    Check("and each creature's with its own highest",
+          Has(drive, "OverseerDecisions::NoHealthLost(held->GetHealth(), highest)") &&
+              Has(drive, "highest = std::max(highest, held->GetHealth());"));
+    Check("full health is no longer the test",
+          !Has(drive, "bot->GetHealth() >= bot->GetMaxHealth()") &&
+              !Has(drive, "other->GetHealth() < other->GetMaxHealth()"));
+    Check("the health books reset with the stretch and are pruned",
+          Has(drive, "_staleCombatSelfHealth.erase(key);") &&
+              Has(drive, "_staleCombatFoeHealth.erase(key);") &&
+              Has(drive, "_staleCombatSelfHealth.erase(it)") &&
+              Has(drive, "_staleCombatFoeHealth.erase(it)"));
     Check("the drive measures the move from where the stretch began",
           Has(drive, "_staleCombatAnchor[key] = bot->GetPosition();"));
     Check("the rule is told whether it is a standoff",
-          Has(drive, "OverseerDecisions::IsStandoff(facts.hostilesInReach, allFull, fromAnchor)") &&
+          Has(drive, "OverseerDecisions::IsStandoff(facts.hostilesInReach, everyoneUnhurt, fromAnchor)") &&
               Has(drive, "bot->GetExactDist(&anchor->second)"));
     std::size_t const standoff = drive.find("StaleCombatVerdict::ReleaseStandoff");
     std::size_t const evade = drive.find("creature->AI()->EnterEvadeMode();");
