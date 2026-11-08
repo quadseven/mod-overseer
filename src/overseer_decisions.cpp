@@ -241,6 +241,11 @@ std::string NameTheAttackers(std::vector<std::string> const& names)
     return out;
 }
 
+bool KeepsDeathHits(bool inDungeon, bool familyMember, bool naturalGuildMember)
+{
+    return inDungeon || familyMember || naturalGuildMember;
+}
+
 DeathHitAccount AccountForDeathHits(DeathHitRing const& ring, std::int64_t deathMs)
 {
     DeathHitAccount account;

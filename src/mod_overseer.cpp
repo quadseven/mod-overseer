@@ -5402,7 +5402,7 @@ struct PendingDeath
     int32 fallGuardStandDown = -1;
     int32 fallGuardSeconds = -1;
 
-    // THE HITS BEFORE A DUNGEON DEATH (OverseerDecisions::DeathHit). False when
+    // THE HITS BEFORE A DEATH (OverseerDecisions::DeathHit). False when
     // the damage hook saw no hit inside DEATH_HIT_WINDOW_MS, and the four
     // columns below are then written NULL, never 0.
     bool hitSampled = false;
@@ -5448,14 +5448,20 @@ uint64 g_droppedDeaths = 0;
 // name, under g_deathMutex. One entry per guild member at most.
 std::map<std::string, std::int64_t> g_guildDeathAt;
 
-// THE LAST HITS EACH PLAYER IN A DUNGEON TOOK (OverseerDecisions::DeathHit),
-// by guid. Written by the damage hook on whatever map thread owns the victim,
+// THE LAST HITS EACH PLAYER TOOK (OverseerDecisions::DeathHit), by guid, for
+// the players whose deaths are recorded (OverseerDecisions::KeepsDeathHits):
+// anyone inside a dungeon, and the family and the natural guilds everywhere
+// (#1416). Written by the damage hook on whatever map thread owns the victim,
 // read and erased by RecordDeath, and swept of anybody whose newest hit is old
-// by SweepDeathHits on the world thread. It holds only players who were hit
-// inside a dungeon in the last minute, so it stays the size of the fights
-// going on.
+// by SweepDeathHits on the world thread. It holds only players hit in the last
+// minute, so it stays the size of the fights going on.
 std::mutex g_deathHitMutex;
 std::map<uint32, OverseerDecisions::DeathHitRing> g_deathHits;
+// The natural guilds' ids, under g_deathHitMutex. The damage hook fires for
+// every hit in the world, so it asks this set instead of parsing
+// Overseer.Natural.Guilds on each hit; SweepDeathHits refreshes it from the
+// config on the world thread, every death flush.
+std::set<uint32> g_deathHitGuildIds;
 
 // Called from OverseerMeterScript::OnDamage, on the map thread that owns the
 // victim, BEFORE the core subtracts the damage (Unit::DealDamage calls the
@@ -5463,13 +5469,30 @@ std::map<uint32, OverseerDecisions::DeathHitRing> g_deathHits;
 // hit found. Everything read here is gone by the time any death hook runs:
 // setDeathState zeroes the health and stops the combat, and the attacker
 // list empties with it.
-static void NoteDungeonHit(Unit* attacker, Player* hurt, uint32 damage)
+// `familyMember` is the meter's answer for the victim: a roster character.
+static void NoteDeathHit(Unit* attacker, Player* hurt, uint32 damage, bool familyMember)
 {
     if (!hurt || !damage || !hurt->IsInWorld())
         return;
     Map* const map = hurt->GetMap();
-    if (!map || !map->IsDungeon())
+    if (!map)
         return;
+    bool const inDungeon = map->IsDungeon();
+    // In the open world only a death this module records keeps its hits
+    // (#1416). Guildless strangers leave before any lock is taken.
+    if (!inDungeon && !familyMember)
+    {
+        uint32 const guildId = hurt->GetGuildId();
+        if (!guildId)
+            return;
+        bool naturalGuildMember = false;
+        {
+            std::lock_guard<std::mutex> guard(g_deathHitMutex);
+            naturalGuildMember = g_deathHitGuildIds.count(guildId) != 0;
+        }
+        if (!OverseerDecisions::KeepsDeathHits(false, false, naturalGuildMember))
+            return;
+    }
     OverseerDecisions::DeathHit hit;
     hit.atMs = static_cast<std::int64_t>(GameTime::GetGameTimeMS().count());
     hit.amount = damage;
@@ -5500,7 +5523,15 @@ static void NoteDungeonHit(Unit* attacker, Player* hurt, uint32 damage)
 static void SweepDeathHits()
 {
     std::int64_t const now = static_cast<std::int64_t>(GameTime::GetGameTimeMS().count());
+    // The natural guilds by id, for the damage hook (#1416). A guild that does
+    // not exist yet simply has no id until it does.
+    std::set<uint32> guildIds;
+    for (std::string const& name : OverseerDecisions::ParseNameList(
+             sConfigMgr->GetOption<std::string>("Overseer.Natural.Guilds", "")))
+        if (Guild* guild = sGuildMgr->GetGuildByName(name))
+            guildIds.insert(guild->GetId());
     std::lock_guard<std::mutex> guard(g_deathHitMutex);
+    g_deathHitGuildIds = std::move(guildIds);
     for (auto it = g_deathHits.begin(); it != g_deathHits.end();)
         it = it->second.empty() ||
                      now - it->second.back().atMs > 2 * OverseerDecisions::DEATH_HIT_WINDOW_MS
@@ -5731,7 +5762,8 @@ void RecordDeath(Player* player)
         }
     }
 
-    // A DUNGEON DEATH IS READ HIT BY HIT. The damage hook saw each hit with the
+    // A RECORDED DEATH IS READ HIT BY HIT (dungeon or open world, #1416). The
+    // damage hook saw each hit with the
     // state it found, so its account outranks the five-second sample above:
     // the health and mana before the killing blow, whether it was fighting,
     // how many were on it and who, and the last hits with their sources.
@@ -85193,9 +85225,9 @@ public:
         if (!source && !hurt)
             return;
         Note(source, OverseerDecisions::MeterKind::Damage, damage);
-        Note(hurt, OverseerDecisions::MeterKind::Taken, damage);
-        // The hits a dungeon death is read from (RecordDeath).
-        NoteDungeonHit(attacker, hurt, damage);
+        bool const familyMember = Note(hurt, OverseerDecisions::MeterKind::Taken, damage);
+        // The hits a recorded death is read from (RecordDeath, #1416).
+        NoteDeathHit(attacker, hurt, damage, familyMember);
     }
 
     void OnHeal(Unit* healer, Unit* /*reciever*/, uint32& gain) override
@@ -85207,15 +85239,16 @@ public:
     }
 
 private:
-    static void Note(Player* player, OverseerDecisions::MeterKind kind, uint32 amount)
+    // True when `player` holds a meter seat: a family (roster) character.
+    static bool Note(Player* player, OverseerDecisions::MeterKind kind, uint32 amount)
     {
         if (!player)
-            return;
+            return false;
         std::time_t const now = GameTime::GetGameTime().count();
         std::lock_guard<std::mutex> guard(g_meterMutex);
         auto const seat = g_meterSeats.find(player->GetGUID().GetCounter());
         if (seat == g_meterSeats.end())
-            return;
+            return false;
         OverseerDecisions::MeterRecord(g_meterBooks[seat->second.family], seat->second.name, kind,
                                        amount, now);
         // The run's running total (#971): only a roster member gets this far,
@@ -85226,6 +85259,7 @@ private:
             !OverseerDecisions::RunDamageNote(g_runDamageBook, seat->second.name,
                                               player->GetMapId(), instanceId, kind, amount))
             ++g_droppedRunDamage;
+        return true;
     }
 };
 
