@@ -30906,8 +30906,11 @@ private:
                 if (yards > OverseerDecisions::STALE_COMBAT_REACH_YARDS)
                     return;
                 ++facts.hostilesInReach;
+                // A player, or a pet or guardian a player controls, is never a
+                // standoff: that is PvP, and its owner can act at any moment.
                 Creature* const held = other->ToCreature();
-                if (!held || other->GetHealth() < other->GetMaxHealth())
+                if (!held || held->IsControlledByPlayer() ||
+                    other->GetHealth() < other->GetMaxHealth())
                     allFull = false;
                 else if (std::find(standoffCreatures.begin(), standoffCreatures.end(), held) ==
                          standoffCreatures.end())
@@ -30932,14 +30935,20 @@ private:
                                bot->GetExactDist(&anchor->second) >
                                    OverseerDecisions::STALE_COMBAT_STANDOFF_MOVE_YARDS;
             facts.standoff = facts.hostilesInReach > 0 && allFull && !moved;
+            auto standoffSince = _staleCombatStandoffSince.find(key);
             StaleCombatStep const step = DecideStaleCombat(
-                facts, since == _staleCombatSince.end() ? 0 : since->second);
+                facts, since == _staleCombatSince.end() ? 0 : since->second,
+                standoffSince == _staleCombatStandoffSince.end() ? 0 : standoffSince->second);
 
             // When this character's combat began, as far as this drive saw.
             time_t& combatSince = _combatSeenSince[key];
             if (combatSince == 0)
                 combatSince = now;
 
+            if (step.standoffSince)
+                _staleCombatStandoffSince[key] = step.standoffSince;
+            else
+                _staleCombatStandoffSince.erase(key);
             if (step.emptySince)
             {
                 _staleCombatSince[key] = step.emptySince;
@@ -31026,7 +31035,8 @@ private:
 
         // Out of combat, offline or gone: forget, so the maps stay bounded by
         // who is in combat now.
-        for (auto* book : {&_staleCombatSince, &_combatSeenSince, &_staleCombatSaid})
+        for (auto* book :
+             {&_staleCombatSince, &_combatSeenSince, &_staleCombatSaid, &_staleCombatStandoffSince})
             for (auto it = book->begin(); it != book->end();)
                 it = seen.count(it->first) ? std::next(it) : book->erase(it);
         for (auto it = _staleCombatAnchor.begin(); it != _staleCombatAnchor.end();)
@@ -84373,6 +84383,9 @@ private:
     std::map<uint32, time_t> _staleCombatSince;
     std::map<uint32, time_t> _combatSeenSince;
     std::map<uint32, time_t> _staleCombatSaid;
+    // When each character's current standoff began (#1411), so the standoff
+    // bound counts standoff minutes only, not empty combat before it.
+    std::map<uint32, time_t> _staleCombatStandoffSince;
     // Where each character stood when its no-fight stretch began, so a
     // standoff can tell a character that never moved from one that did
     // (#1411). Pruned with the books above.

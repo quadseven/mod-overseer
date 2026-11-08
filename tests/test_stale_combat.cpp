@@ -97,13 +97,13 @@ void EmptyCombatPastTheBoundIsReleased()
     time_t t = T0;
     for (; t < T0 + STALE_COMBAT_RELEASE_SECONDS; t += 8)
     {
-        step = DecideStaleCombat(Stale(t), since);
+        step = DecideStaleCombat(Stale(t), since, 0);
         CheckVerdict("empty combat under the bound is watched", step.verdict,
                      StaleCombatVerdict::Watching);
         since = step.emptySince;
     }
     Check("the stretch began at the first poll", since == T0);
-    step = DecideStaleCombat(Stale(t), since);
+    step = DecideStaleCombat(Stale(t), since, 0);
     CheckVerdict("empty combat at the bound is released", step.verdict,
                  StaleCombatVerdict::Release);
     Check("the release says how long it was held", step.heldSeconds == t - T0);
@@ -113,7 +113,7 @@ void EmptyCombatPastTheBoundIsReleased()
 void UnderTheBoundIsNotReleased()
 {
     StaleCombatStep const step =
-        DecideStaleCombat(Stale(T0 + STALE_COMBAT_RELEASE_SECONDS - 1), T0);
+        DecideStaleCombat(Stale(T0 + STALE_COMBAT_RELEASE_SECONDS - 1), T0, 0);
     CheckVerdict("one second under the bound is watched", step.verdict,
                  StaleCombatVerdict::Watching);
     Check("and the stretch is carried", step.emptySince == T0);
@@ -123,7 +123,7 @@ void ALiveAttackerIsNeverReleased()
 {
     StaleCombatFacts f = Stale(T0 + 29 * 3600);
     f.hostilesInReach = 1;
-    StaleCombatStep const step = DecideStaleCombat(f, T0);
+    StaleCombatStep const step = DecideStaleCombat(f, T0, 0);
     CheckVerdict("a hostile in reach holds, however long", step.verdict,
                  StaleCombatVerdict::HeldByHostile);
     Check("and restarts the stretch", step.emptySince == 0);
@@ -133,14 +133,14 @@ void ALiveAttackerIsNeverReleased()
 // stretch counts, so a fight with a gap in it is never released at its end.
 void AHostileMidStretchRestartsTheClock()
 {
-    time_t since = DecideStaleCombat(Stale(T0), 0).emptySince;
+    time_t since = DecideStaleCombat(Stale(T0), 0, 0).emptySince;
     StaleCombatFacts back = Stale(T0 + 300);
     back.hostilesInReach = 2;
-    since = DecideStaleCombat(back, since).emptySince;
+    since = DecideStaleCombat(back, since, 0).emptySince;
     Check("a hostile ends the stretch", since == 0);
-    since = DecideStaleCombat(Stale(T0 + 308), since).emptySince;
+    since = DecideStaleCombat(Stale(T0 + 308), since, 0).emptySince;
     Check("the next empty poll starts a new one", since == T0 + 308);
-    StaleCombatStep const step = DecideStaleCombat(Stale(T0 + 600), since);
+    StaleCombatStep const step = DecideStaleCombat(Stale(T0 + 600), since, 0);
     CheckVerdict("ten minutes after the first poll is not ten unbroken minutes",
                  step.verdict, StaleCombatVerdict::Watching);
 }
@@ -149,12 +149,12 @@ void OutOfCombatOrDeadForgets()
 {
     StaleCombatFacts f = Stale(T0 + 900);
     f.inCombat = false;
-    StaleCombatStep step = DecideStaleCombat(f, T0);
+    StaleCombatStep step = DecideStaleCombat(f, T0, 0);
     CheckVerdict("out of combat", step.verdict, StaleCombatVerdict::NotInCombat);
     Check("out of combat forgets the stretch", step.emptySince == 0);
     f = Stale(T0 + 900);
     f.alive = false;
-    step = DecideStaleCombat(f, T0);
+    step = DecideStaleCombat(f, T0, 0);
     CheckVerdict("dead", step.verdict, StaleCombatVerdict::NotInCombat);
 }
 
@@ -162,7 +162,7 @@ void AnInstancedMapIsNotJudged()
 {
     StaleCombatFacts f = Stale(T0 + 3600);
     f.onInstanceMap = true;
-    StaleCombatStep const step = DecideStaleCombat(f, T0);
+    StaleCombatStep const step = DecideStaleCombat(f, T0, 0);
     CheckVerdict("dungeon, raid, battleground or arena", step.verdict,
                  StaleCombatVerdict::OutOfScope);
     Check("and nothing is carried", step.emptySince == 0);
@@ -170,7 +170,7 @@ void AnInstancedMapIsNotJudged()
 
 void AClockFromTheFutureRestarts()
 {
-    StaleCombatStep const step = DecideStaleCombat(Stale(T0), T0 + 5000);
+    StaleCombatStep const step = DecideStaleCombat(Stale(T0), T0 + 5000, 0);
     CheckVerdict("a stretch that began after now restarts", step.verdict,
                  StaleCombatVerdict::Watching);
     Check("from now", step.emptySince == T0);
@@ -209,15 +209,17 @@ void AStandoffPastTheBoundIsReleased()
     time_t since = 0;
     StaleCombatStep step;
     time_t t = T0;
+    time_t standoffSince = 0;
     for (; t < T0 + STALE_COMBAT_STANDOFF_SECONDS; t += 8)
     {
-        step = DecideStaleCombat(Standoff(t), since);
+        step = DecideStaleCombat(Standoff(t), since, standoffSince);
         CheckVerdict("a standoff under the bound is watched", step.verdict,
                      StaleCombatVerdict::StandoffWatching);
         since = step.emptySince;
+        standoffSince = step.standoffSince;
     }
-    Check("the standoff began at the first poll", since == T0);
-    step = DecideStaleCombat(Standoff(t), since);
+    Check("the standoff began at the first poll", since == T0 && standoffSince == T0);
+    step = DecideStaleCombat(Standoff(t), since, standoffSince);
     CheckVerdict("a standoff at the bound is released", step.verdict,
                  StaleCombatVerdict::ReleaseStandoff);
     Check("the standoff release says how long it was held", step.heldSeconds == t - T0);
@@ -226,13 +228,13 @@ void AStandoffPastTheBoundIsReleased()
 void AStandoffUnderTheBoundIsNotReleased()
 {
     StaleCombatStep const step =
-        DecideStaleCombat(Standoff(T0 + STALE_COMBAT_STANDOFF_SECONDS - 1), T0);
+        DecideStaleCombat(Standoff(T0 + STALE_COMBAT_STANDOFF_SECONDS - 1), T0, T0);
     CheckVerdict("one second under the standoff bound is watched", step.verdict,
                  StaleCombatVerdict::StandoffWatching);
     Check("and the stretch is carried", step.emptySince == T0);
     // The empty-combat bound (ten minutes) does not release a standoff.
     StaleCombatStep const ten =
-        DecideStaleCombat(Standoff(T0 + STALE_COMBAT_RELEASE_SECONDS), T0);
+        DecideStaleCombat(Standoff(T0 + STALE_COMBAT_RELEASE_SECONDS), T0, T0);
     CheckVerdict("ten minutes of standoff is not enough", ten.verdict,
                  StaleCombatVerdict::StandoffWatching);
 }
@@ -241,15 +243,17 @@ void AStandoffUnderTheBoundIsNotReleased()
 // is a fight, and it restarts the clock however long the standoff ran.
 void AHurtSideOrAMoveRestartsTheStandoff()
 {
-    time_t since = DecideStaleCombat(Standoff(T0), 0).emptySince;
+    time_t since = DecideStaleCombat(Standoff(T0), 0, 0).emptySince;
     StaleCombatFacts hurt = Standoff(T0 + 840);
     hurt.standoff = false;
-    StaleCombatStep step = DecideStaleCombat(hurt, since);
+    StaleCombatStep step = DecideStaleCombat(hurt, since, T0);
     CheckVerdict("a blow lands: a fight", step.verdict, StaleCombatVerdict::HeldByHostile);
-    Check("the fight ends the stretch", step.emptySince == 0);
-    since = DecideStaleCombat(Standoff(T0 + 848), step.emptySince).emptySince;
-    Check("a new standoff starts after it", since == T0 + 848);
-    step = DecideStaleCombat(Standoff(T0 + STALE_COMBAT_STANDOFF_SECONDS), since);
+    Check("the fight ends the stretch", step.emptySince == 0 && step.standoffSince == 0);
+    step = DecideStaleCombat(Standoff(T0 + 848), step.emptySince, step.standoffSince);
+    since = step.emptySince;
+    Check("a new standoff starts after it", since == T0 + 848 && step.standoffSince == T0 + 848);
+    step = DecideStaleCombat(Standoff(T0 + STALE_COMBAT_STANDOFF_SECONDS), since,
+                             step.standoffSince);
     CheckVerdict("fifteen minutes after the first poll is not fifteen unbroken",
                  step.verdict, StaleCombatVerdict::StandoffWatching);
 }
@@ -258,11 +262,64 @@ void AHurtSideOrAMoveRestartsTheStandoff()
 // is released on its own (shorter) bound from the same start.
 void HostilesLeavingKeepTheStretch()
 {
-    time_t const since = DecideStaleCombat(Standoff(T0), 0).emptySince;
-    StaleCombatStep const step =
-        DecideStaleCombat(Stale(T0 + STALE_COMBAT_RELEASE_SECONDS), since);
+    StaleCombatStep const first = DecideStaleCombat(Standoff(T0), 0, 0);
+    StaleCombatStep const step = DecideStaleCombat(Stale(T0 + STALE_COMBAT_RELEASE_SECONDS),
+                                                   first.emptySince, first.standoffSince);
     CheckVerdict("no hostile left, ten minutes after a standoff began", step.verdict,
                  StaleCombatVerdict::Release);
+}
+
+// Empty combat a full-health creature walks into (Grug Elder on PR 1413):
+// nine empty minutes, then a standoff. The standoff bound counts from the
+// first standoff poll, so it is not released five minutes later on the
+// empty minutes before the creature came.
+void AStandoffAfterEmptyCombatCountsFromItsOwnStart()
+{
+    time_t since = 0;
+    time_t standoffSince = 0;
+    StaleCombatStep step;
+    for (time_t t = T0; t < T0 + 9 * 60; t += 8)
+    {
+        step = DecideStaleCombat(Stale(t), since, standoffSince);
+        since = step.emptySince;
+        standoffSince = step.standoffSince;
+    }
+    Check("empty combat carries no standoff start", standoffSince == 0);
+    time_t const arrived = T0 + 9 * 60;
+    step = DecideStaleCombat(Standoff(arrived), since, standoffSince);
+    CheckVerdict("the creature arrives: a standoff is watched", step.verdict,
+                 StaleCombatVerdict::StandoffWatching);
+    Check("the standoff starts when the creature arrives", step.standoffSince == arrived);
+    since = step.emptySince;
+    standoffSince = step.standoffSince;
+    step = DecideStaleCombat(Standoff(T0 + STALE_COMBAT_STANDOFF_SECONDS), since, standoffSince);
+    CheckVerdict("fifteen minutes after the stretch began, six into the standoff",
+                 step.verdict, StaleCombatVerdict::StandoffWatching);
+    step = DecideStaleCombat(Standoff(arrived + STALE_COMBAT_STANDOFF_SECONDS - 1), since,
+                             standoffSince);
+    CheckVerdict("one second under fifteen standoff minutes", step.verdict,
+                 StaleCombatVerdict::StandoffWatching);
+    step = DecideStaleCombat(Standoff(arrived + STALE_COMBAT_STANDOFF_SECONDS), since,
+                             standoffSince);
+    CheckVerdict("fifteen standoff minutes", step.verdict, StaleCombatVerdict::ReleaseStandoff);
+    Check("the release says how long the standoff was", step.heldSeconds ==
+                                                          STALE_COMBAT_STANDOFF_SECONDS);
+}
+
+// A creature that drops out of reach for one poll mid-standoff does not
+// restart the standoff's own clock.
+void AStandoffSurvivesAOnePollGap()
+{
+    StaleCombatStep step = DecideStaleCombat(Standoff(T0), 0, 0);
+    time_t since = step.emptySince;
+    time_t standoffSince = step.standoffSince;
+    Check("a standoff from the first poll starts both clocks",
+          since == T0 && standoffSince == T0);
+    step = DecideStaleCombat(Stale(T0 + 300), since, standoffSince);
+    CheckVerdict("a poll with nobody in reach is empty combat", step.verdict,
+                 StaleCombatVerdict::Watching);
+    step = DecideStaleCombat(Standoff(T0 + 308), step.emptySince, step.standoffSince);
+    Check("and the standoff start is kept through it", step.standoffSince == T0);
 }
 
 }  // namespace
@@ -282,6 +339,8 @@ int main()
     AStandoffUnderTheBoundIsNotReleased();
     AHurtSideOrAMoveRestartsTheStandoff();
     HostilesLeavingKeepTheStretch();
+    AStandoffAfterEmptyCombatCountsFromItsOwnStart();
+    AStandoffSurvivesAOnePollGap();
 
     if (failures)
     {

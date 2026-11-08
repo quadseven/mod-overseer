@@ -109,6 +109,12 @@ int main()
     Check("only a creature fighting this character is sent home",
           Has(drive, "creature->GetVictim() == bot"));
     Check("the anchor book is pruned too", Has(drive, "_staleCombatAnchor.erase(it)"));
+    Check("a player's pet or guardian is never a standoff creature",
+          Has(drive, "held->IsControlledByPlayer()"));
+    Check("the standoff start is carried poll to poll and pruned",
+          Has(drive, "standoffSince == _staleCombatStandoffSince.end() ? 0 : standoffSince->second") &&
+              Has(drive, "_staleCombatStandoffSince[key] = step.standoffSince;") &&
+              Has(drive, "&_staleCombatStandoffSince})"));
 
     if (failures)
     {

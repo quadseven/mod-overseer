@@ -102,12 +102,20 @@ struct StaleCombatStep
     StaleCombatVerdict verdict = StaleCombatVerdict::NotInCombat;
     // When the empty stretch began, to carry to the next poll; 0 = none.
     time_t emptySince = 0;
-    // How long the empty stretch lasted, for the release line.
+    // When the first standoff poll of this stretch was, to carry to the next
+    // poll; 0 = none yet. The standoff bound counts from here, not from the
+    // start of the stretch: empty combat that a full-health creature walks
+    // into has not been a standoff for the empty minutes before it came.
+    time_t standoffSince = 0;
+    // How long the empty stretch lasted, for the release line (for a
+    // standoff, how long the standoff lasted).
     time_t heldSeconds = 0;
 };
 
-// One poll's verdict, given when the empty stretch began (0 = it had not).
-inline StaleCombatStep DecideStaleCombat(StaleCombatFacts const& f, time_t emptySince)
+// One poll's verdict, given when the empty stretch began (0 = it had not) and
+// when its first standoff poll was (0 = none yet).
+inline StaleCombatStep DecideStaleCombat(StaleCombatFacts const& f, time_t emptySince,
+                                         time_t standoffSince)
 {
     StaleCombatStep step;
     if (!f.alive || !f.inCombat)
@@ -131,9 +139,16 @@ inline StaleCombatStep DecideStaleCombat(StaleCombatFacts const& f, time_t empty
     {
         step.verdict = watching;
         step.emptySince = f.now;
+        step.standoffSince = standoff ? f.now : 0;
         return step;
     }
-    time_t const held = f.now - emptySince;
+    // The standoff's own start: carried through a poll where the creatures
+    // drop out of reach, begun at the first standoff poll otherwise.
+    if (standoffSince < emptySince || standoffSince > f.now)
+        standoffSince = 0;
+    if (standoff && standoffSince == 0)
+        standoffSince = f.now;
+    time_t const held = standoff ? f.now - standoffSince : f.now - emptySince;
     time_t const bound = standoff ? STALE_COMBAT_STANDOFF_SECONDS : STALE_COMBAT_RELEASE_SECONDS;
     if (held >= bound)
     {
@@ -143,6 +158,7 @@ inline StaleCombatStep DecideStaleCombat(StaleCombatFacts const& f, time_t empty
     }
     step.verdict = watching;
     step.emptySince = emptySince;
+    step.standoffSince = standoffSince;
     return step;
 }
 
