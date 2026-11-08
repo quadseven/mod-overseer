@@ -317,6 +317,13 @@ constexpr std::int64_t DEATH_HIT_WINDOW_MS = 30000;
 // Keep only the newest DEATH_HIT_RING_SIZE hits, oldest first.
 void RememberDeathHit(DeathHitRing& ring, DeathHit hit);
 
+// WHOSE HITS ARE KEPT (#1416). Every player inside a dungeon, as before, and
+// in the open world anyone whose death this module records: a family (roster)
+// character or a member of a natural guild. Before this, only dungeon hits
+// were kept, so about 99% of the guild's death rows, nearly all of them in the
+// open world, had their mana, enemy count, attackers and damage NULL.
+bool KeepsDeathHits(bool inDungeon, bool familyMember, bool naturalGuildMember);
+
 // "Goblin Woodcarver x2, Defias Miner": the attackers by how many of each,
 // most first, then by name. Empty for none, and never longer than
 // DEATH_TARGETED_BY_MAX characters.
