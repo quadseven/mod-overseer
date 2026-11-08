@@ -296,6 +296,9 @@
 // Blackrock Depths walks the Ironfel carrier to the Shrine of Thaurissan
 // (#1391).
 #include "overseer_brd_shrine.h"
+// A Blackrock Depths run that carries the Shadowforge Key goes on into the
+// Upper City (#1410).
+#include "overseer_brd_wing.h"
 #include "Mail.h"
 #include "RBAC.h"
 // kind='bot' `e Hitem:` (#927): the verdict and the scorer mod-playerbots' own
@@ -37360,6 +37363,10 @@ private:
         OverseerDecisions::BrdShrineClock brdShrine;
         bool brdShrinePaused{false};
         time_t brdShrinePausedAt{0};
+        // BLACKROCK DEPTHS' UPPER CITY (overseer_brd_wing.h, #1410): how many
+        // times this run has sent `dc on brd-uc`, and when it last did.
+        unsigned brdUpperCityTries{0};
+        time_t brdUpperCityTriedAt{0};
         DungeonRunPhase phase{DungeonRunPhase::Idle};
         time_t leaderClientOpenSince{0};
         time_t leaderClientLostSince{0};
@@ -56080,6 +56087,98 @@ private:
         return true;
     }
 
+    // BLACKROCK DEPTHS' UPPER CITY (overseer_brd_wing.h, #1410), one CLEARING
+    // poll on map 230. Once the Detention Block's nine encounters are credited
+    // and the brain still clears only that wing, a party with the Shadowforge
+    // Key in the instance is sent `dc on brd-uc` (the wing argument the raid
+    // door's arming already passes), and a party without it is finished there,
+    // the way a credited last boss is. True when this step owns the poll: a
+    // chain sent or awaited, or the run finished (its phase is then Exiting).
+    bool StepBrdUpperCity(DungeonRunCoordinatorState& coord,
+                          std::vector<std::string> const& members, Player* leader,
+                          DungeonPortal const& portal, time_t now)
+    {
+        namespace D = OverseerDecisions;
+        if (!leader || portal.insideMapId != D::BRD_WING_MAP_ID)
+            return false;
+
+        D::BrdWingFacts facts;
+        facts.mapId = portal.insideMapId;
+        facts.brainMask = DungeonBrainExpectedEncounterMask(leader);
+        facts.credited = CompletedEncounters(leader);
+        facts.tries = coord.brdUpperCityTries;
+        facts.lastTryAt = coord.brdUpperCityTriedAt;
+        facts.now = now;
+        std::vector<Player*> inside;
+        std::string carrier;
+        for (std::string const& name : members)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            if (!p || !p->IsInWorld() || p->GetMapId() != D::BRD_WING_MAP_ID ||
+                p->GetInstanceId() != leader->GetInstanceId())
+                continue;
+            inside.push_back(p);
+            // Alive or not: a dead carrier is revived inside and the doors
+            // open for it then.
+            if (carrier.empty() && p->GetItemCount(D::BRD_SHADOWFORGE_KEY) >= 1)
+                carrier = name;
+        }
+        facts.keyCarried = !carrier.empty();
+
+        D::BrdWingStep const step = D::BrdWingNext(facts);
+        if (step == D::BrdWingStep::Nothing)
+            return false;
+        if (step == D::BrdWingStep::WaitChain)
+            return true;
+
+        if (step == D::BrdWingStep::FinishDetentionBlock)
+        {
+            coord.provedComplete = true;
+            coord.phase = DungeonRunPhase::Exiting;
+            coord.crossing.best = 0.f;
+            coord.crossing.since = std::time(nullptr);
+            coord.loggedCrossingAim = false;
+            coord.loggedCrossingWaiting = false;
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} of campaign {} is FINISHED - the Detention "
+                     "Block of Blackrock Depths is credited (mask {}) and {}, so the Upper "
+                     "City is not cleared this run; EXIT walks the party out (#1410)",
+                     coord.runNumber, coord.campaignId, facts.credited,
+                     facts.keyCarried
+                         ? "the dungeon brain did not take 'dc on brd-uc' after " +
+                               std::to_string(coord.brdUpperCityTries) + " tries"
+                         : std::string("nobody in the party carries the Shadowforge Key"));
+            return true;
+        }
+
+        // ChainUpperCity: every member inside, as the arming drive does, so the
+        // brain's elected leader is among them; the others take the follow
+        // branch and change nothing.
+        bool allAccepted = !inside.empty();
+        for (Player* const member : inside)
+        {
+            PlayerbotAI* const ai = GET_PLAYERBOT_AI(member);
+            Player* const issuer = AuthorizedDcIssuer(member);
+            bool const accepted =
+                ai && issuer &&
+                ai->DoSpecificAction("dc on", Event("dc", D::BRD_UPPER_CITY_WING, issuer), true);
+            allAccepted = allAccepted && accepted;
+        }
+        ++coord.brdUpperCityTries;
+        coord.brdUpperCityTriedAt = now;
+        LOG_INFO("module.overseer",
+                 "overseer: dungeon run {} of campaign {} - the Detention Block of Blackrock "
+                 "Depths is credited (mask {}) and '{}' carries the Shadowforge Key; sent "
+                 "'dc on {}' to {} member(s) inside, try {} of {}: {} (#1410)",
+                 coord.runNumber, coord.campaignId, facts.credited, carrier,
+                 D::BRD_UPPER_CITY_WING, inside.size(), coord.brdUpperCityTries,
+                 D::BRD_UPPER_CITY_TRIES,
+                 allAccepted ? "accepted, the run clears the Upper City next"
+                             : "REFUSED or unavailable - the dungeon module's log says why "
+                               "under 'DC command refused'");
+        return true;
+    }
+
     void DriveDungeonRunFor(std::string const& family,
                             std::vector<std::string> const& members,
                             std::string const& leaderName,
@@ -59298,6 +59397,14 @@ private:
                                   portal->insideMapId);
                 return;
             }
+
+            // BLACKROCK DEPTHS' UPPER CITY (#1410): asked before the completion
+            // check, because on map 230 that check reads the whole map's 19 bits
+            // and the brain's default wing stops at Bael'Gar. With the Shadowforge
+            // Key in the party the run goes on into the Upper City; without it the
+            // Detention Block is the whole run.
+            if (StepBrdUpperCity(coord, members, leader, *portal, clearingNow))
+                return;
 
             // HAS THE RUN ACTUALLY GONE ANYWHERE (#171)? Asked BEFORE the
             // arming verdict below, because that verdict answers itself once
