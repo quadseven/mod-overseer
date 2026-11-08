@@ -59,6 +59,7 @@ run_decisions() {
   python3 -B tests/replay_main_tank_cache.py
   python3 -B tests/replay_guild_carry.py
   python3 -B tests/replay_loot_key_bag_space.py
+  python3 -B tests/replay_legacy_quest_log.py
   python3 -B tests/replay_door_floor.py
   python3 -B tests/replay_long_navmesh.py
   python3 -B tests/replay_buy_bag.py

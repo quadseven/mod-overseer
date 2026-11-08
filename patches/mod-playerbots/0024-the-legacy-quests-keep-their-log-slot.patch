@@ -1,0 +1,90 @@
+Subject: [PATCH] new rpg: the Dark Iron Legacy quests keep their quest log slot
+
+WHY THIS PATCH EXISTS
+
+mod-overseer#1444. NewRpgBaseAction::OrganizeQuestLog runs at the start of
+SearchQuestGiverAndAcceptOrReward for a bot in the New RPG state, and does
+nothing while the log has two free slots. With fewer, it removes in turn:
+
+  1. every quest IsQuestCapableDoing refuses (Quest::GetType() != 0, a
+     dungeon-type quest) or IsQuestWorthDoing refuses, or that has failed;
+  2. every quest of another zone than the bot stands in;
+  3. if that freed fewer than 8, every quest left in the log.
+
+Dark Iron Legacy (3801, 3802) is a dungeon-type quest (QuestInfoID 81) in the
+Blackrock Depths zone (1584), so the first two passes always take it, and
+the family's logs sit at 18 to 23 of 25 slots. Measured on the dev realm,
+2026-11-08: the ghost detour (#1422) took 3801 and 3802 for Zug, Oz and Zrog
+at 09:30 UTC; by 16:30 UTC 3801 was rewarded for all three, 3802 was in nobody's
+log, and no character on the realm held any dungeon-type quest in progress.
+Zug's run then killed Fineous Darkvire with no 3802, so Ironfel could not drop
+and the family still had no Shadowforge Key.
+
+WHAT IT CHANGES
+
+OrganizeQuestLog skips 3801 and 3802 in all three passes. Every other quest is
+removed exactly as before, and the quest still obeys every other rule (a
+completed 3802 is turned in; an abandoned one is abandoned by whoever asks).
+
+WHAT WOULD LET THIS PATCH BE DELETED
+
+Upstream leaving dungeon-type quests a bot already holds alone when it tidies
+its log, or the family leaving the New RPG state for good.
+
+APPLIES TO
+
+    mod-playerbots @ 40884e9c135c1daf27ffd894a6047502a5701130
+    src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp, OrganizeQuestLog
+    Replayed by tests/replay_legacy_quest_log.py against the pinned file
+    (tests/fixtures/legacy_quest_log/NewRpgBaseAction.cpp).
+
+diff --git a/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp b/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
+index ba23668..baddd2a 100644
+--- a/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
++++ b/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
+@@ -595,6 +595,15 @@ bool NewRpgBaseAction::IsQuestCapableDoing(Quest const* quest)
+     return true;
+ }
+ 
++// The Dark Iron Legacy chain (3801, 3802) is how a family earns the Shadowforge
++// Key. Both are dungeon-type quests in the Blackrock Depths zone, so the three
++// passes below read them as "not capable" and "other zone" and removed them at
++// the first tidy of a nearly full log (mod-overseer#1444).
++static bool KeepsItsLogSlot(uint32 questId)
++{
++    return questId == 3801 || questId == 3802;
++}
++
+ bool NewRpgBaseAction::OrganizeQuestLog()
+ {
+     int32 freeSlotNum = 0;
+@@ -618,6 +627,9 @@ bool NewRpgBaseAction::OrganizeQuestLog()
+         if (!questId)
+             continue;
+ 
++        if (KeepsItsLogSlot(questId))
++            continue;
++
+         Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+         if (!IsQuestWorthDoing(quest) || !IsQuestCapableDoing(quest) ||
+             bot->GetQuestStatus(questId) == QUEST_STATUS_FAILED)
+@@ -649,6 +661,9 @@ bool NewRpgBaseAction::OrganizeQuestLog()
+         if (!questId)
+             continue;
+ 
++        if (KeepsItsLogSlot(questId))
++            continue;
++
+         Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+         const int64_t botZoneId = this->bot->GetZoneId();
+ 
+@@ -680,6 +695,9 @@ bool NewRpgBaseAction::OrganizeQuestLog()
+         if (!questId)
+             continue;
+ 
++        if (KeepsItsLogSlot(questId))
++            continue;
++
+         Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+         LOG_DEBUG("playerbots", "[New RPG] {} drop quest {}", bot->GetName(), questId);
+         WorldPacket packet(CMSG_QUESTLOG_REMOVE_QUEST);
