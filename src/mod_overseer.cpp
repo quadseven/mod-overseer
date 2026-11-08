@@ -37990,6 +37990,11 @@ private:
         // set this run, and who was told once that no grey was left.
         std::set<std::string> roomLootRuleSet;
         std::set<std::string> roomNoGreySaid;
+        // When any member with no room first stood beside a drop it could not
+        // take, 0 when nobody is. One clock for the whole party, not per member
+        // or drop: the run is walked out only after UPGRADE_STRANDED_GRACE_SECONDS
+        // of unbroken strand (wow-overseer#2062).
+        std::time_t upgradeStrandedSince{0};
         bool loggedCorridor{false};
         // Said once per phase entry rather than once per poll - the log-once
         // flags every other drive in this file already uses (`arrived` in
@@ -53422,10 +53427,14 @@ private:
                     {
                         LOG_WARN("module.overseer",
                                  "overseer: '{}' has no bag room and '{}' (entry {}, "
-                                 "quality {}) is on a corpse {:.0f}y away - an upgrade "
-                                 "would be lost, so this run walks out for bags",
+                                 "quality {}) is on a corpse {:.0f}y away - it cannot be "
+                                 "taken and nothing non-grey is destroyed for it, so it is left; "
+                                 "the run keeps clearing and walks out for bags only if some "
+                                 "member stays beside a drop it cannot take for {} seconds in a row",
                                  name, proto->Name1, item.itemid, proto->Quality,
-                                 bot->GetExactDist2d(corpse));
+                                 bot->GetExactDist2d(corpse),
+                                 static_cast<uint32>(
+                                     OverseerDecisions::UPGRADE_STRANDED_GRACE_SECONDS));
                         return true;
                     }
                 }
@@ -56903,9 +56912,20 @@ private:
                 OverseerDecisions::DungeonRunBagPressure(
                     bags.freeSlots, TOWN_TRIP_LIMITS.freeBagSlotsToGo,
                     bags.anyMemberInside, coord.phase == DungeonRunPhase::Exiting);
+            // A LOST UPGRADE ONLY EVACUATES WHEN IT STAYS LOST (wow-overseer#2062). The
+            // member leaves the drop and the run keeps clearing; a walk-out
+            // wipes the instance, and the kills with it.
+            {
+                std::time_t const strandNow = std::time(nullptr);
+                bool const stranded =
+                    pressure == OverseerDecisions::DungeonBagPressure::Evacuate &&
+                    UpgradeStrandedOnTheFloor(members);
+                coord.upgradeStrandedSince = OverseerDecisions::UpgradeStrandedSinceAfterPoll(
+                    stranded, coord.upgradeStrandedSince, strandNow);
+            }
             switch (OverseerDecisions::DungeonRunBagAnswer(
-                pressure, pressure == OverseerDecisions::DungeonBagPressure::Evacuate &&
-                              UpgradeStrandedOnTheFloor(members)))
+                pressure, OverseerDecisions::UpgradeStrandBoundReached(
+                              coord.upgradeStrandedSince, std::time(nullptr))))
             {
                 case OverseerDecisions::DungeonBagPressure::MakeRoom:
                     MakeRoomInside(coord, members);
