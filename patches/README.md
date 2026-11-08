@@ -206,3 +206,12 @@ family member. A key goes to the keyring, which that value does not count, and a
 quest item is the reason the corpse was opened, so neither is skipped that way
 any more (#1424: Blackrock Depths' Prison Cell Key and Ironfel). The core's own
 store check still refuses an item with no room.
+
+**`mod-playerbots/0024-the-legacy-quests-keep-their-log-slot.patch` fixes
+upstream behaviour** - dropping it costs the fix and nothing else.
+`NewRpgBaseAction::OrganizeQuestLog` removes every dungeon-type quest and every
+quest of another zone once a bot's log has fewer than two free slots, and
+clears the log if that is not enough. Dark Iron Legacy (3801, 3802) is both, so
+a family member that took 3802 at Franclorn Forgewright lost it before the
+Fineous Darkvire kill and never earned the Shadowforge Key (#1444). The three
+passes now skip those two quests; every other quest is tidied as before.
