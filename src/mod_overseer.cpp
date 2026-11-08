@@ -55738,12 +55738,25 @@ private:
             }
             Player* const guest = ObjectAccessor::FindPlayerByName(guestName);
             Player* const headPlayer = ObjectAccessor::FindPlayerByName(head);
-            Group* const group = headPlayer ? headPlayer->GetGroup() : nullptr;
+            Group* const headsGroup = headPlayer ? headPlayer->GetGroup() : nullptr;
             if (!guest)
             {
                 ++it;   // out of the world; its seat is let go when it is back
                 continue;
             }
+            // THE FAMILY'S GROUP IS FOUND THROUGH THE GUEST WHEN THE HEAD IS NOT IN
+            // THE WORLD (#1450). The party outlives its leader's absence; with
+            // no head player there was no group, no leave was tried and the
+            // entry below was erased as if the guest had left, so a guest whose
+            // seat ended while the head was mid-hearth stayed grouped inside
+            // the dungeon.
+            Group* const guestGroup = guest->GetGroup();
+            bool const groupLedByHead = guestGroup && guestGroup->GetLeaderName() == head;
+            Group* const group = OverseerDecisions::GuestGroupIsFamilys(
+                                     headPlayer != nullptr,
+                                     headsGroup && guestGroup == headsGroup, groupLedByHead)
+                                     ? guestGroup
+                                     : headsGroup;
             PlayerbotAI* const guestAI = GET_PLAYERBOT_AI(guest);
             // The wander the family's following took off it, handed back.
             auto const hadRpg = _standinGuestHadRpg.find(guestName);
