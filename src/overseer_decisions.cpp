@@ -25594,6 +25594,11 @@ bool SupplyWalkReleasesSickHold(std::string const& holdVerb, bool walkIsSupplyFo
            !carriesFoodOrDrink;
 }
 
+bool RevivedSicknessDefersToWalk(bool walkHoldInForce, bool walkPausedForFight)
+{
+    return walkHoldInForce || walkPausedForFight;
+}
+
 LogoutScope LogoutOfflineScope(uint32_t otherInWorldOnAccount)
 {
     return otherInWorldOnAccount == 0 ? LogoutScope::Account
