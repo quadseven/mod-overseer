@@ -208,6 +208,7 @@ void TheAdapterWiresIt()
            "a queued or active order, or an active run on map 230, is the BRD order");
     Expect(inFamily("GetItemCount(D::LEGACY_SHADOWFORGE_KEY, true)") &&
                inFamily("GetQuestStatus(D::LEGACY_KEY_QUEST)") &&
+               inFamily("legacy == QUEST_STATUS_INCOMPLETE || legacy == QUEST_STATUS_COMPLETE") &&
                inFamily("GetQuestRewardStatus(D::LEGACY_KEY_QUEST)") &&
                inFamily("GetSkillValue(SKILL_LOCKPICKING) >= D::LEGACY_LOCKPICKING"),
            "the key, 3802 held or rewarded, and lockpicking 250 are read off every member");

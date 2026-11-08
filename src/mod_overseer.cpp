@@ -33572,8 +33572,11 @@ private:
             Player* p = ObjectAccessor::FindPlayerByName(members->Fetch()[0].Get<std::string>());
             if (!p || !p->IsInWorld())
                 continue;
+            // Held (taken or complete) or rewarded; a failed 3802 is no step
+            // toward the key.
+            QuestStatus const legacy = p->GetQuestStatus(D::LEGACY_KEY_QUEST);
             if (p->GetItemCount(D::LEGACY_SHADOWFORGE_KEY, true) > 0 ||
-                p->GetQuestStatus(D::LEGACY_KEY_QUEST) != QUEST_STATUS_NONE ||
+                legacy == QUEST_STATUS_INCOMPLETE || legacy == QUEST_STATUS_COMPLETE ||
                 p->GetQuestRewardStatus(D::LEGACY_KEY_QUEST))
                 facts.familyHasKey = true;
             if (p->HasSkill(SKILL_LOCKPICKING) &&
