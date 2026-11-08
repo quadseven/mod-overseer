@@ -258,6 +258,34 @@ void AHurtSideOrAMoveRestartsTheStandoff()
                  step.verdict, StaleCombatVerdict::StandoffWatching);
 }
 
+// A move is a fight too (Grug Elder on PR 1413): the drive measures the
+// character from where the stretch began, IsStandoff turns a move past
+// STALE_COMBAT_STANDOFF_MOVE_YARDS into standoff=false, and the rule restarts.
+void AMoveRestartsTheStandoff()
+{
+    using OverseerDecisions::IsStandoff;
+    Check("unmoved, everyone full: a standoff", IsStandoff(2, true, 0.f));
+    Check("drift inside five yards: still a standoff",
+          IsStandoff(2, true, STALE_COMBAT_STANDOFF_MOVE_YARDS));
+    Check("no stretch yet: nothing to have moved from", IsStandoff(1, true, -1.f));
+    Check("moved past five yards: a fight",
+          !IsStandoff(2, true, STALE_COMBAT_STANDOFF_MOVE_YARDS + 0.5f));
+    Check("somebody hurt: a fight", !IsStandoff(2, false, 0.f));
+    Check("nobody in reach: not a standoff", !IsStandoff(0, true, 0.f));
+
+    StaleCombatStep step = DecideStaleCombat(Standoff(T0), 0, 0);
+    StaleCombatFacts walked = Standoff(T0 + 800);
+    walked.standoff = IsStandoff(walked.hostilesInReach, true, 12.f);
+    step = DecideStaleCombat(walked, step.emptySince, step.standoffSince);
+    CheckVerdict("a move ends the standoff", step.verdict, StaleCombatVerdict::HeldByHostile);
+    Check("and its clock", step.emptySince == 0 && step.standoffSince == 0);
+    step = DecideStaleCombat(Standoff(T0 + 808), step.emptySince, step.standoffSince);
+    step = DecideStaleCombat(Standoff(T0 + STALE_COMBAT_STANDOFF_SECONDS + 1), step.emptySince,
+                             step.standoffSince);
+    CheckVerdict("fifteen minutes from before the move is not fifteen unbroken",
+                 step.verdict, StaleCombatVerdict::StandoffWatching);
+}
+
 // The hostiles leave mid-standoff: the stretch goes on as empty combat, which
 // is released on its own (shorter) bound from the same start.
 void HostilesLeavingKeepTheStretch()
@@ -339,6 +367,7 @@ int main()
     AStandoffUnderTheBoundIsNotReleased();
     AHurtSideOrAMoveRestartsTheStandoff();
     HostilesLeavingKeepTheStretch();
+    AMoveRestartsTheStandoff();
     AStandoffAfterEmptyCombatCountsFromItsOwnStart();
     AStandoffSurvivesAOnePollGap();
 

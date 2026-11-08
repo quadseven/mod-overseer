@@ -93,10 +93,10 @@ int main()
           Has(drive, "bot->GetHealth() >= bot->GetMaxHealth()") &&
               Has(drive, "other->GetHealth() < other->GetMaxHealth()"));
     Check("the drive measures the move from where the stretch began",
-          Has(drive, "_staleCombatAnchor[key] = bot->GetPosition();") &&
-              Has(drive, "OverseerDecisions::STALE_COMBAT_STANDOFF_MOVE_YARDS"));
+          Has(drive, "_staleCombatAnchor[key] = bot->GetPosition();"));
     Check("the rule is told whether it is a standoff",
-          Has(drive, "facts.standoff = facts.hostilesInReach > 0 && allFull && !moved;"));
+          Has(drive, "OverseerDecisions::IsStandoff(facts.hostilesInReach, allFull, fromAnchor)") &&
+              Has(drive, "bot->GetExactDist(&anchor->second)"));
     std::size_t const standoff = drive.find("StaleCombatVerdict::ReleaseStandoff");
     std::size_t const evade = drive.find("creature->AI()->EnterEvadeMode();");
     std::size_t const stopAfter =

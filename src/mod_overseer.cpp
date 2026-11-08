@@ -30931,10 +30931,11 @@ private:
             auto since = _staleCombatSince.find(key);
             bool const stretchRunning = since != _staleCombatSince.end();
             auto anchor = _staleCombatAnchor.find(key);
-            bool const moved = stretchRunning && anchor != _staleCombatAnchor.end() &&
-                               bot->GetExactDist(&anchor->second) >
-                                   OverseerDecisions::STALE_COMBAT_STANDOFF_MOVE_YARDS;
-            facts.standoff = facts.hostilesInReach > 0 && allFull && !moved;
+            float const fromAnchor = stretchRunning && anchor != _staleCombatAnchor.end()
+                                         ? bot->GetExactDist(&anchor->second)
+                                         : -1.f;
+            facts.standoff =
+                OverseerDecisions::IsStandoff(facts.hostilesInReach, allFull, fromAnchor);
             auto standoffSince = _staleCombatStandoffSince.find(key);
             StaleCombatStep const step = DecideStaleCombat(
                 facts, since == _staleCombatSince.end() ? 0 : since->second,

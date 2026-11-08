@@ -112,6 +112,17 @@ struct StaleCombatStep
     time_t heldSeconds = 0;
 };
 
+// Whether one poll reads as a standoff (#1411): hostiles in reach, the
+// character and every one of them at full health, and the character no more
+// than STALE_COMBAT_STANDOFF_MOVE_YARDS from where its no-fight stretch began
+// (a negative distance: no stretch yet, so nothing to have moved from). A blow
+// on either side or a move makes it a fight, which restarts the clock.
+inline bool IsStandoff(unsigned hostilesInReach, bool everyoneFull, float yardsFromAnchor)
+{
+    return hostilesInReach > 0 && everyoneFull &&
+           yardsFromAnchor <= STALE_COMBAT_STANDOFF_MOVE_YARDS;
+}
+
 // One poll's verdict, given when the empty stretch began (0 = it had not) and
 // when its first standoff poll was (0 = none yet).
 inline StaleCombatStep DecideStaleCombat(StaleCombatFacts const& f, time_t emptySince,
