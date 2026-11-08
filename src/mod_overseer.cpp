@@ -37990,9 +37990,10 @@ private:
         // set this run, and who was told once that no grey was left.
         std::set<std::string> roomLootRuleSet;
         std::set<std::string> roomNoGreySaid;
-        // When a member with no room first stood beside a drop it could not
-        // take, 0 when nobody is. The run is walked out for it only after
-        // UPGRADE_STRANDED_GRACE_SECONDS of the same strand (#2062).
+        // When any member with no room first stood beside a drop it could not
+        // take, 0 when nobody is. One clock for the whole party, not per member
+        // or drop: the run is walked out only after UPGRADE_STRANDED_GRACE_SECONDS
+        // of unbroken strand (wow-overseer#2062).
         std::time_t upgradeStrandedSince{0};
         bool loggedCorridor{false};
         // Said once per phase entry rather than once per poll - the log-once
@@ -53428,8 +53429,8 @@ private:
                                  "overseer: '{}' has no bag room and '{}' (entry {}, "
                                  "quality {}) is on a corpse {:.0f}y away - it cannot be "
                                  "taken and nothing non-grey is destroyed for it, so it is left; "
-                                 "the run keeps clearing and walks out for bags only if this "
-                                 "lasts {} seconds",
+                                 "the run keeps clearing and walks out for bags only if some "
+                                 "member stays beside a drop it cannot take for {} seconds in a row",
                                  name, proto->Name1, item.itemid, proto->Quality,
                                  bot->GetExactDist2d(corpse),
                                  static_cast<uint32>(
@@ -56911,7 +56912,7 @@ private:
                 OverseerDecisions::DungeonRunBagPressure(
                     bags.freeSlots, TOWN_TRIP_LIMITS.freeBagSlotsToGo,
                     bags.anyMemberInside, coord.phase == DungeonRunPhase::Exiting);
-            // A LOST UPGRADE ONLY EVACUATES WHEN IT STAYS LOST (#2062). The
+            // A LOST UPGRADE ONLY EVACUATES WHEN IT STAYS LOST (wow-overseer#2062). The
             // member leaves the drop and the run keeps clearing; a walk-out
             // wipes the instance, and the kills with it.
             {
