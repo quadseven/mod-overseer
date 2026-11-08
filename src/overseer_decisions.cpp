@@ -24650,6 +24650,11 @@ bool StandinGuestIsSteerable(bool registeredGuest, bool clientAttached, bool inW
     return clientAttached || (inWorld && isBotSession);
 }
 
+bool MayClearMasterOnRelease(bool inHeadsGroup)
+{
+    return !inHeadsGroup;
+}
+
 std::string StandinGuestWord(FamilyStandin const& standin)
 {
     return standin.HasGuest() ? standin.inName : std::string("nobody");
