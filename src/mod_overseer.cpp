@@ -37558,6 +37558,11 @@ private:
         // the same way and now through the same function. Shared by ENTER and
         // EXIT because only one crossing is ever in progress.
         OverseerDecisions::RatchetState crossing;
+        // THE WALK TO THE DOOR, BESIDE THE COUNT (#1414). The farthest member
+        // getting nearer the door restarts `crossing`'s clock too, up to a
+        // ceiling - see CrossingWalkKeepsClock. Keyed to `crossing.since`, so
+        // every place that opens a crossing resets it by setting that clock.
+        OverseerDecisions::CrossingWalkState crossingWalk;
         // STAGED_INSIDE'S OWN PROGRESS, IN A RATCHET OF ITS OWN (#384). The
         // reading is how many members the census found on the instance map, so
         // "progress" is one more of them getting in there and the clock
@@ -40681,9 +40686,19 @@ private:
         // cannot fake. The comparison and the clock are the shared ratchet;
         // the log-once flag is this site's own reaction to progress and stays
         // with it.
+        //
+        // AND SO DOES THE PARTY STILL CLOSING ON THE DOOR (#1414). EXIT starts
+        // at the last boss, hundreds of yards from the door, and nobody is
+        // knocked through until everybody is on the doorstep, so a count of
+        // members through stays at zero for the whole walk. The farthest
+        // member getting nearer restarts the same clock, up to a ceiling.
+        std::time_t const now = std::time(nullptr);
+        float const farthest = OverseerDecisions::CrossingFarthestWalker(states);
+        if (OverseerDecisions::CrossingWalkKeepsClock(coord.crossingWalk, coord.crossing.since,
+                                                      farthest, now))
+            coord.crossing.since = now;
         OverseerDecisions::RatchetVerdict const progress = OverseerDecisions::Ratchet(
-            coord.crossing, static_cast<float>(through), std::time(nullptr),
-            DUNGEON_CROSSING_RATCHET);
+            coord.crossing, static_cast<float>(through), now, DUNGEON_CROSSING_RATCHET);
         if (progress.progressed)
             coord.loggedCrossingWaiting = false;
 
@@ -40700,11 +40715,17 @@ private:
         {
             LOG_WARN("module.overseer",
                      "overseer: dungeon run {} has got {} of {} through areatrigger {} and "
-                     "nobody else has crossed for {} minutes - giving up. Still short: {}",
+                     "nobody else has crossed for {} minutes - giving up. Still short: {}. "
+                     "The farthest member still walking is {:.0f}y from the door (negative: "
+                     "none), {:.0f}y at best; walking keeps the clock for at most {} "
+                     "minutes from the start of a crossing or from its last member "
+                     "through (#1414)",
                      what, through, static_cast<uint32>(states.size()), triggerId,
                      static_cast<uint32>(DUNGEON_CROSSING_BACKSTOP_SECONDS / 60),
                      OverseerDecisions::DungeonRunEntryBlockers(
-                         states, DUNGEON_DOORSTEP_RADIUS_YARDS));
+                         states, DUNGEON_DOORSTEP_RADIUS_YARDS),
+                     farthest, coord.crossingWalk.walk.best,
+                     static_cast<uint32>(OverseerDecisions::CROSSING_WALK_CEILING_SECONDS / 60));
             return DungeonCrossingResult::GaveUp;
         }
 
@@ -40821,19 +40842,36 @@ private:
         {
             coord.loggedCrossingAim = true;
             coord.loggedCrossingAimGrounded = doorHeight.grounded;
+            // WHAT THE FLOOR PROBE FOUND (#1414), used or not, so a door that
+            // never grounds says whether it found no floor or a floor too far
+            // below its middle.
+            std::string probeNote =
+                "found no ground (an unloaded grid, a hole, or no surface under the door)";
+            if (doorHeight.probed)
+            {
+                char note[192];
+                if (doorHeight.grounded)
+                    std::snprintf(note, sizeof(note), "found ground at z %.2f", doorHeight.probedZ);
+                else
+                    std::snprintf(note, sizeof(note),
+                                  "found ground at z %.2f, %.2fy from the door's middle, too "
+                                  "far for the arrival to fit inside the trigger",
+                                  doorHeight.probedZ, doorHeight.probedZ - door->z);
+                probeNote = note;
+            }
             LOG_INFO("module.overseer",
                      "overseer: dungeon run {} walks the party the last yards onto "
                      "areatrigger {} ({}) - every member under its own power, and nobody "
                      "is knocked through until everybody is on the doorstep. Leader '{}' "
                      "is {:.0f}y out. That aim's z is {}, {:.2f}y from the middle of the "
-                     "door's own box (#376)",
+                     "door's own box (#376). The floor probe {} (#1414)",
                      what, triggerId, doorAim, leaderName,
                      leaderState ? leaderState->distanceFromDoor : -1.f,
                      doorHeight.grounded
                          ? "the floor under the door"
                          : "the trigger's own row, because no floor inside the door "
-                           "was found under it this poll",
-                     doorHeight.correctionYards);
+                           "was found or usable under it this poll",
+                     doorHeight.correctionYards, probeNote);
         }
 
         if (!OverseerDecisions::DungeonRunEntryReady(states, DUNGEON_DOORSTEP_RADIUS_YARDS))

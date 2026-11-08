@@ -2906,6 +2906,14 @@ struct DoorAimHeight
     bool grounded{false};
     // How far the aim moved, for that same line. Zero when it did not move.
     float correctionYards{0.f};
+    // WHAT THE FLOOR PROBE FOUND, WHETHER OR NOT IT WAS USED (#1414). Uldaman's
+    // way out (areatrigger 288) never grounded in 15 EXITs, and the aim line
+    // could not say whether the probe found no floor or found one too far below
+    // the middle of the door for the arrival to fit inside it. `probed` is the
+    // probe's own answer and `probedZ` the floor it found, so the line names
+    // the height that was refused instead of leaving it to a debugger.
+    bool probed{false};
+    float probedZ{0.f};
 };
 
 DoorAimHeight DoorAimOnTheFloor(float triggerZ, bool haveGround, float groundZ,
@@ -3218,6 +3226,61 @@ bool RatchetProgressed(float reading, float best, RatchetLimits const& limits,
 // restarted the clock - so the two verdicts read as the alternatives they are.
 RatchetVerdict Ratchet(RatchetState& state, float reading, time_t now,
                        RatchetLimits const& limits);
+
+// ------------------------------------- the walk to a door is progress (#1414) --
+//
+// A CROSSING USED TO COUNT ONLY MEMBERS ALREADY THROUGH THE DOOR. That is the
+// right test for ENTER, which starts at a staging point a few yards out, and
+// the wrong one for EXIT, which starts wherever the last boss died. Measured
+// on the dev realm over 72 hours: every Uldaman EXIT began 376 to 406 yards
+// from areatrigger 288 and every Maraudon EXIT 861 to 1124 yards from 3131,
+// and 33 of them were given up exactly five minutes in with nobody through,
+// while the party was still walking: one Uldaman party was routed 1249 yards
+// round to the door and had closed from 376 to 349 yards in its first 15
+// seconds when the backstop fired. A party given up on hearths out.
+//
+// SO THE FARTHEST MEMBER GETTING NEARER THE DOOR IS PROGRESS TOO. The
+// reading is the largest distance to the door among the members still on the
+// door's map and not through: the slowest walker is the one the knock waits
+// for, and a member stuck behind a wall keeps that number where it is however
+// fast the others arrive, so a party that has stopped getting anywhere is
+// still given up on after the same five minutes. It is a DistanceToTarget
+// ratchet with CROSSING_WALK_MARGIN_YARDS, the same shape the travel drive
+// trusts for its own walks.
+//
+// AND A CEILING, SO A WALK CANNOT HOLD A DOOR FOREVER. From the moment a
+// crossing (or the last member's crossing) started, walking keeps the clock
+// for at most CROSSING_WALK_CEILING_SECONDS; after that only a member crossing
+// restarts it, and the ordinary five minutes runs out. A walk that keeps
+// finding ten more yards for twenty minutes is a walk that should have
+// arrived.
+//
+// KEYED TO THE CROSSING'S OWN CLOCK. Every place that starts a crossing sets
+// that clock, and a member crossing moves it; when the clock is not the one
+// this state last saw, the walk is measured afresh from that moment. That is
+// how the six places that open an EXIT need no new line each.
+constexpr float CROSSING_WALK_MARGIN_YARDS = 10.f;
+constexpr time_t CROSSING_WALK_CEILING_SECONDS = 20 * 60;
+
+struct CrossingWalkState
+{
+    RatchetState walk;       // the farthest walker's distance, best so far
+    time_t epoch{0};         // the crossing clock this walk was measured under
+    time_t walkingSince{0};  // when this walk began, for the ceiling
+};
+
+// The largest distance to the door among `states` still on the door's map and
+// not through it; negative when there is none (everybody through, or nobody
+// on that map to walk).
+float CrossingFarthestWalker(std::vector<DungeonRunEntryState> const& states);
+
+// Whether the crossing's clock should restart this poll because the party is
+// still closing on the door. `crossingSince` is the crossing's own clock; the
+// caller sets that clock to `now` when this answers true.
+bool CrossingWalkKeepsClock(CrossingWalkState& state, time_t crossingSince,
+                            float farthestYards, time_t now,
+                            float marginYards = CROSSING_WALK_MARGIN_YARDS,
+                            time_t ceilingSeconds = CROSSING_WALK_CEILING_SECONDS);
 
 // Emergency economy errands must not use the ordinary twenty-minute travel
 // fuse: a zero-room character cannot loot, so waiting that long is itself a
