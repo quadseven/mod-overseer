@@ -27551,6 +27551,18 @@ bool StandinGuestIsSteerable(bool registeredGuest, bool clientAttached, bool inW
 // The guest's name for a log line, or "nobody" for a row with no guest.
 std::string StandinGuestWord(FamilyStandin const& standin);
 
+// MAY THE MODULE CLEAR THE MASTER OF A CHARACTER IT LETS GO OF THE HEAD? (#1437)
+// That is a released stand-in guest, or the member sitting out. Only once the
+// character is out of the head's group. Upstream (PlayerbotAI::
+// UpdateAIGroupMaster) gives a grouped bot that has no master the group leader
+// again on its very next AI tick, with ResetStrategies, `+follow` and a "Hello,
+// I follow you!" whisper to him. So a clear made while the character is still
+// in the head's group - a dungeon finder, battleground or battlefield group the
+// module may not take it out of, or a leave the core refused - undoes itself at
+// once, and made every poll it is that whisper every poll: a released guest
+// stuck in the family's finder group greeted the head every 5 seconds.
+bool MayClearMasterOnRelease(bool inHeadsGroup);
+
 // ------------------------------------- a party for a quest that needs help --
 //
 // A CLASS QUEST THAT NEEDS HELP IS ASKED FOR AND ANSWERED, AND THEN THE ANSWERERS

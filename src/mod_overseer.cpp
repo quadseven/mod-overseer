@@ -55454,28 +55454,38 @@ private:
         Player* const head = ObjectAccessor::FindPlayerByName(standin.family);
         if (!out || !out->IsInWorld())
             return;
+        Group* const group = out->GetGroup();
+        if (group && head && head->GetGroup() == group && !group->isBGGroup() &&
+            !group->isBFGroup() && !group->isLFGGroup())
+        {
+            out->RemoveFromGroup(GROUP_REMOVEMETHOD_LEAVE);
+            if (!out->GetGroup())
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' left the family group of '{}' to sit out ({}); {} "
+                         "stands in as {}",
+                         standin.outName, standin.family,
+                         standin.reason.empty() ? std::string("no reason given")
+                                                : standin.reason,
+                         standin.HasGuest() ? "'" + standin.inName + "'"
+                                            : std::string("nobody"),
+                         OverseerDecisions::StandinSeatWord(standin.seat));
+            // else the core refused; asked again next poll
+        }
+        // THE MASTER IS LET GO ONLY ONCE IT IS OUT OF THE HEAD'S GROUP (#1437).
+        // Still in it - a finder group the core owns, or a refused leave -
+        // upstream hands it the head again on its next tick with a "Hello, I
+        // follow you!" whisper, so clearing it here every poll was that
+        // whisper every poll.
+        bool const inHeadsGroup = head && out->GetGroup() && head->GetGroup() == out->GetGroup();
         if (PlayerbotAI* const outAI = GET_PLAYERBOT_AI(out))
-            if (head && outAI->GetMaster() == head)
+            if (head && outAI->GetMaster() == head &&
+                OverseerDecisions::MayClearMasterOnRelease(inHeadsGroup))
             {
                 outAI->SetMaster(nullptr);
                 LOG_INFO("module.overseer",
                          "overseer: '{}' sits out of the family of '{}' and no longer "
                          "follows him", standin.outName, standin.family);
             }
-        Group* const group = out->GetGroup();
-        if (!group || !head || head->GetGroup() != group || group->isBGGroup() ||
-            group->isBFGroup() || group->isLFGGroup())
-            return;
-        out->RemoveFromGroup(GROUP_REMOVEMETHOD_LEAVE);
-        if (out->GetGroup())
-            return;   // the core refused; asked again next poll
-        LOG_INFO("module.overseer",
-                 "overseer: '{}' left the family group of '{}' to sit out ({}); {} stands "
-                 "in as {}",
-                 standin.outName, standin.family,
-                 standin.reason.empty() ? std::string("no reason given") : standin.reason,
-                 standin.HasGuest() ? "'" + standin.inName + "'" : std::string("nobody"),
-                 OverseerDecisions::StandinSeatWord(standin.seat));
     }
 
     // SEAT THE GUEST IN THE HEAD'S GROUP, modelled on PrepareRitualSummoner:
@@ -55571,8 +55581,6 @@ private:
                 continue;
             }
             PlayerbotAI* const guestAI = GET_PLAYERBOT_AI(guest);
-            if (guestAI && headPlayer && guestAI->GetMaster() == headPlayer)
-                guestAI->SetMaster(nullptr);
             // The wander the family's following took off it, handed back.
             auto const hadRpg = _standinGuestHadRpg.find(guestName);
             if (hadRpg != _standinGuestHadRpg.end())
@@ -55582,26 +55590,37 @@ private:
                     guestAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
                 _standinGuestHadRpg.erase(hadRpg);
             }
-            if (!group || guest->GetGroup() != group)
+            // A group the core owns is waited out rather than left; any other
+            // is left now, and a refused leave is asked again next poll.
+            bool leftNow = false;
+            if (group && guest->GetGroup() == group && !group->isBGGroup() &&
+                !group->isBFGroup() && !group->isLFGGroup())
             {
-                it = _standinLeaving.erase(it);
+                guest->RemoveFromGroup(GROUP_REMOVEMETHOD_LEAVE);
+                leftNow = guest->GetGroup() != group;
+            }
+            // THE MASTER IS LET GO ONLY ONCE IT IS OUT OF THE HEAD'S GROUP
+            // (#1437). This sweep runs every dungeon poll, 5 seconds, and a
+            // guest still in the family's finder group that lost its master
+            // here was handed the head again by upstream on its next tick, with
+            // a "Hello, I follow you!" whisper to him - every 5 seconds until
+            // the finder group broke up.
+            bool const inHeadsGroup = group && guest->GetGroup() == group;
+            if (guestAI && headPlayer && guestAI->GetMaster() == headPlayer &&
+                OverseerDecisions::MayClearMasterOnRelease(inHeadsGroup))
+                guestAI->SetMaster(nullptr);
+            if (inHeadsGroup)
+            {
+                ++it;   // still in it: waited out, or the core refused the leave
                 continue;
             }
-            if (group->isBGGroup() || group->isBFGroup() || group->isLFGGroup())
+            if (leftNow)
             {
-                ++it;
-                continue;
+                group->SendUpdate();
+                LOG_INFO("module.overseer",
+                         "overseer: stand-in '{}' left the family party of '{}' - the "
+                         "stand-in is over", guestName, head);
             }
-            guest->RemoveFromGroup(GROUP_REMOVEMETHOD_LEAVE);
-            if (guest->GetGroup() == group)
-            {
-                ++it;   // the core refused; asked again next poll
-                continue;
-            }
-            group->SendUpdate();
-            LOG_INFO("module.overseer",
-                     "overseer: stand-in '{}' left the family party of '{}' - the stand-in "
-                     "is over", guestName, head);
             it = _standinLeaving.erase(it);
         }
     }
