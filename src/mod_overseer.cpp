@@ -8674,6 +8674,7 @@ public:
         {
             _lockpickTimer = 0;
             DriveLockpick();
+            DriveGuildLockpick();
         }
         if (_recipeManualTimer >= RECIPE_MANUAL_POLL_MS)
         {
@@ -18121,6 +18122,10 @@ private:
     // Sweep radius for a live lockbox in the bot's zone, in yards.
     static constexpr float LOCKPICK_SWEEP_YARDS = 200.0f;
 
+    // How far a natural guild rogue is willing to walk to a known box spot on
+    // its map, in yards: a continent's width, as the trainer walk's is.
+    static constexpr float GUILD_LOCKPICK_WALK_YARDS = 6000.0f;
+
     // The predicate the zone sweep runs over each gameobject: a spawned,
     // matching-entry lockbox in the bot's own map and zone.
     struct LockboxNearbyCheck
@@ -18199,9 +18204,12 @@ private:
                 continue;
 
             // Max achievable skill at a level is 5 * level; at the cap there is
-            // nothing left to train, so clear the errand.
+            // nothing left to train, so clear the errand. The CURRENT value is
+            // what is compared (#1440): the maximum a rogue holds rises with its
+            // level by itself, so reading it here read "at the cap" for every
+            // rogue on the first poll and cleared the errand before one cast.
             uint32 const level = bot->GetLevel();
-            if (OverseerDecisions::ShouldClearLockpickErrand(bot->GetPureMaxSkillValue(SKILL_LOCKPICKING), level))
+            if (OverseerDecisions::ShouldClearLockpickErrand(bot->GetPureSkillValue(SKILL_LOCKPICKING), level))
             {
                 ClearLockpickErrand(name);
                 LOG_INFO("module.overseer",
@@ -18272,6 +18280,153 @@ private:
             // failed, or the skill did not rise; the next poll picks the nearest
             // live lockbox and tries again.
         }
+    }
+
+    // ------------------------------- a natural guild rogue's Lockpicking (#1440) --
+    //
+    // The natural guild's members keep their own kit and are not randomised to
+    // their level's skills as a random bot is (352 of 357 random-bot rogues sit
+    // at their cap; the guild's rogues sat at Lockpicking 1 at levels 35 to 53).
+    // DriveLockpick above only serves a roster row with `lockpick` set and
+    // nothing sets it for a guild member, so they never practiced. This walks a
+    // natural guild rogue to the practice boxes the way a player does, one
+    // aim at a time, through the character's own new-rpg status: the nearest
+    // live box in its zone when there is one, else the nearest known box spot
+    // on its map. OverseerDecisions::DecideNaturalLockpick decides each poll;
+    // the cast and the skill read-back are DriveLockpick's.
+    void LoadLockpickSpots()
+    {
+        _lockpickSpotsLoaded = true;
+        for (auto const& spawn : sObjectMgr->GetAllGOData())
+        {
+            GameObjectData const& data = spawn.second;
+            if (!OverseerDecisions::IsLockpickTargetEntry(data.id))
+                continue;
+            _lockpickSpots.push_back({data.mapid, data.posX, data.posY});
+            _lockpickSpotZs.push_back(data.posZ);
+        }
+        LOG_INFO("module.overseer",
+                 "overseer: guild lockpicking - {} practice box spawn(s) cached",
+                 _lockpickSpots.size());
+    }
+
+    void DriveGuildLockpick()
+    {
+        std::vector<std::string> const guilds = NaturalGuilds();
+        if (guilds.empty())
+            return;
+        std::vector<uint32> guildIds;
+        for (std::string const& guildName : guilds)
+            if (Guild* guild = sGuildMgr->GetGuildByName(guildName))
+                guildIds.push_back(guild->GetId());
+        if (guildIds.empty())
+            return;
+        if (!_lockpickSpotsLoaded)
+            LoadLockpickSpots();
+
+        for (auto const& itr : ObjectAccessor::GetPlayers())
+        {
+            Player* bot = itr.second;
+            if (!bot || !bot->IsInWorld() || bot->IsBeingTeleported() ||
+                bot->getClass() != CLASS_ROGUE ||
+                std::find(guildIds.begin(), guildIds.end(), bot->GetGuildId()) == guildIds.end())
+                continue;
+            std::string const name = bot->GetName();
+            WorldSession* session = bot->GetSession();
+            PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+            // A family stand-in is the family's while it stands in, and the
+            // family's run directs it (same line DriveGuildTraining draws).
+            bool const familyDirects = OnRoster(name) || IsStandinGuest(name);
+            if (!OverseerDecisions::GuildGhostDriven(familyDirects, session && OverseerCompat::SessionIsHeadless(*session),
+                                                    ClientAttached(bot) && !(session && OverseerCompat::SessionIsHeadless(*session)),
+                                                    botAI != nullptr))
+                continue;
+            if (!bot->IsAlive() || bot->GetGroup() || bot->IsInFlight() || !bot->GetMap() ||
+                bot->GetMap()->Instanceable() ||
+                !botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+                continue;
+
+            uint32 const skill = bot->GetPureSkillValue(SKILL_LOCKPICKING);
+            if (!OverseerDecisions::LockpickErrandApplies(false, true, true, bot->HasSpell(1804),
+                                                          skill, bot->GetLevel()))
+                continue;
+
+            GameObject* target = FindNearestLockpickTarget(bot);
+            bool const hasTarget = (target != nullptr);
+            bool const inReach =
+                hasTarget && bot->GetDistance(target) <= LOCKPICK_REACH_YARDS;
+            std::vector<OverseerDecisions::TrainerSpot> mapSpots;
+            std::vector<std::size_t> mapSpotAt;
+            for (std::size_t i = 0; i < _lockpickSpots.size(); ++i)
+                if (_lockpickSpots[i].mapId == bot->GetMapId())
+                {
+                    mapSpots.push_back(_lockpickSpots[i]);
+                    mapSpotAt.push_back(i);
+                }
+            int const spot = OverseerDecisions::NearestTrainerSpot(
+                mapSpots, bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(),
+                GUILD_LOCKPICK_WALK_YARDS);
+
+            switch (OverseerDecisions::DecideNaturalLockpick(
+                OverseerDecisions::LockpickBracketOpen(skill), hasTarget, inReach,
+                bot->IsInCombat(), bot->isMoving(), spot >= 0))
+            {
+                case OverseerDecisions::NaturalLockpickStep::Idle:
+                    continue;
+                case OverseerDecisions::NaturalLockpickStep::GoToTarget:
+                {
+                    // GO_CAMP walks to a position by the long-route mover and
+                    // then mills about within ten yards of it.
+                    WorldPosition const aim(target->GetMapId(), target->GetPositionX(),
+                                            target->GetPositionY(), target->GetPositionZ());
+                    AimGuildLockpicker(bot, botAI, name, aim,
+                                       "a practice box in its zone", skill);
+                    continue;
+                }
+                case OverseerDecisions::NaturalLockpickStep::GoToSpot:
+                {
+                    std::size_t const at = mapSpotAt[static_cast<std::size_t>(spot)];
+                    WorldPosition const aim(_lockpickSpots[at].mapId, _lockpickSpots[at].x,
+                                            _lockpickSpots[at].y, _lockpickSpotZs[at]);
+                    AimGuildLockpicker(bot, botAI, name, aim,
+                                       "the nearest practice box spot on its map", skill);
+                    continue;
+                }
+                case OverseerDecisions::NaturalLockpickStep::Cast:
+                    break;
+            }
+
+            if (!session)
+                continue;
+            // "delivered is not done": trust the skill read-back, not the cast.
+            uint32 const before = bot->GetSkillValue(SKILL_LOCKPICKING);
+            DriveChestOpen(session, 1804, target->GetGUID());
+            uint32 const after = bot->GetSkillValue(SKILL_LOCKPICKING);
+            LOG_INFO("module.overseer",
+                     "overseer: natural guild rogue '{}' cast Pick Lock at {} ({}) and Lockpicking "
+                     "{} ({}/{})",
+                     name, target->GetName(), static_cast<uint32>(target->GetEntry()),
+                     after > before ? "rose" : "did not rise", static_cast<uint32>(before),
+                     static_cast<uint32>(after));
+            if (after > before)
+                RecordEvent(bot, "lockpick", 1804, "Pick Lock", "skill rose at a world lockbox");
+        }
+    }
+
+    // Aim a natural rogue at `aim`, once: the status already names a camp, so
+    // re-aiming every poll would restart its lease, and says so in the log only
+    // when the aim changes.
+    void AimGuildLockpicker(Player* bot, PlayerbotAI* botAI, std::string const& name,
+                            WorldPosition const& aim, char const* what, uint32 skill)
+    {
+        if (botAI->rpgInfo.GetStatus() == RPG_GO_CAMP && _guildLockpickAim[name] == aim)
+            return;
+        _guildLockpickAim[name] = aim;
+        botAI->rpgInfo.ChangeToGoCamp(aim);
+        LOG_INFO("module.overseer",
+                 "overseer: natural guild rogue '{}' (level {}, Lockpicking {}) walks {:.0f} "
+                 "yards to {} to practice picking locks",
+                 name, bot->GetLevel(), skill, bot->GetExactDist2d(aim.GetPositionX(), aim.GetPositionY()), what);
     }
 
     // ------------------------ a recipe manual bought from a vendor (#1098) --
@@ -84668,6 +84823,10 @@ private:
     uint32 _craftTimer = 0;
     uint32 _fishTimer = 0;
     uint32 _lockpickTimer = 0;
+    bool _lockpickSpotsLoaded = false;
+    std::vector<OverseerDecisions::TrainerSpot> _lockpickSpots;
+    std::vector<float> _lockpickSpotZs;
+    std::map<std::string, WorldPosition> _guildLockpickAim;
     uint32 _recipeManualTimer = 0;
     // WHEN A DEAD CHARACTER WAS FIRST SEEN STILL WAITING TO RELEASE, by name.
     //

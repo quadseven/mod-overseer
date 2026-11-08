@@ -26080,7 +26080,13 @@ bool IsLockpickTargetEntry(std::uint32_t entry)
     // can find anything. An entry that does not match the live database fails
     // safe: FindNearestLockpickTarget finds nothing, the errand stands, and the
     // bot walks nowhere. Do not ship a guess here.
-    return entry == 1660u || entry == 1733u;
+    // Buccaneer's Strongbox (the Barrens shore, 123330-123333) and Practice
+    // Lockbox (Redridge, 178244-178246): chest-type gameobjects whose lock is
+    // lock 5, the one the bracket-1 lockpicker practices on. The entries this
+    // table held before (1660 and 1733) read back from the world database as a
+    // generic "Silverpine" object and a "Silver Vein" mining node, so the drive
+    // never had a lockbox to find (mod-overseer#1440).
+    return (entry >= 123330u && entry <= 123333u) || (entry >= 178244u && entry <= 178246u);
 }
 
 bool IsLockpickTargetCandidate(std::uint32_t entry, bool spawned, bool sameZone,
@@ -26092,6 +26098,35 @@ bool IsLockpickTargetCandidate(std::uint32_t entry, bool spawned, bool sameZone,
 bool ShouldClearLockpickErrand(std::uint32_t skill, std::uint32_t level)
 {
     return skill >= 5u * level;
+}
+
+bool LockpickErrandApplies(bool rosterErrand, bool naturalGuildMember, bool rogue,
+                           bool knowsPickLock, std::uint32_t skill, std::uint32_t level)
+{
+    if (!rogue || !knowsPickLock)
+        return false;
+    if (!rosterErrand && !naturalGuildMember)
+        return false;
+    return !ShouldClearLockpickErrand(skill, level);
+}
+
+bool LockpickBracketOpen(std::uint32_t skill)
+{
+    return skill < LOCKPICK_OPEN_WORLD_SKILL_CEILING;
+}
+
+NaturalLockpickStep DecideNaturalLockpick(bool bracketOpen, bool hasTarget, bool inReach,
+                                          bool inCombat, bool moving, bool hasSpotOnMap)
+{
+    if (!bracketOpen || inCombat)
+        return NaturalLockpickStep::Idle;
+    if (hasTarget)
+    {
+        if (!inReach)
+            return NaturalLockpickStep::GoToTarget;
+        return moving ? NaturalLockpickStep::Idle : NaturalLockpickStep::Cast;
+    }
+    return hasSpotOnMap ? NaturalLockpickStep::GoToSpot : NaturalLockpickStep::Idle;
 }
 
 LockpickErrandStep DecideLockpickErrand(bool hasTarget, bool inReach,

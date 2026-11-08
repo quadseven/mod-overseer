@@ -28765,6 +28765,41 @@ enum class LockpickErrandStep : std::uint8_t
 LockpickErrandStep DecideLockpickErrand(bool hasTarget, bool inReach,
                                         bool inCombat, bool moving);
 
+// WHO PRACTICES LOCKPICKING (mod-overseer#1440). A standing errand was only ever
+// a roster row with `lockpick` set, and nothing sets it for anyone, so the
+// natural guild's rogues (which keep their own kit and are not randomised to
+// their level's skill the way a random bot is) stayed at Lockpicking 1 for
+// ever. A rogue that knows Pick Lock and is below the level cap (5 * level)
+// practices when it carries a roster errand OR is a natural guild member. The
+// skill passed is the CURRENT value, not the maximum: a rogue's maximum rises
+// with its level on its own, so judging the cap by it cleared the errand of
+// every rogue at once.
+bool LockpickErrandApplies(bool rosterErrand, bool naturalGuildMember, bool rogue,
+                           bool knowsPickLock, std::uint32_t skill, std::uint32_t level);
+
+// A lock-5 box teaches Lockpicking from its own requirement up to about 100
+// (the 1-100 open-world bracket of #445), so below this the boxes still teach
+// and from it up they do not, and a natural rogue stops walking to them.
+constexpr std::uint32_t LOCKPICK_OPEN_WORLD_SKILL_CEILING = 100u;
+bool LockpickBracketOpen(std::uint32_t skill);
+
+// The decision for one natural guild rogue on one poll. Idle: nothing to do now
+// (bracket closed, in combat, or no box and no known spot on this map, or in
+// reach but still moving: retried next poll). Cast: in reach and still. GoToTarget:
+// a live box is in its zone but out of reach, so aim the character at it.
+// GoToSpot: no live box in its zone, so aim it at the nearest known box spot
+// on its map.
+enum class NaturalLockpickStep : std::uint8_t
+{
+    Idle,
+    Cast,
+    GoToTarget,
+    GoToSpot,
+};
+
+NaturalLockpickStep DecideNaturalLockpick(bool bracketOpen, bool hasTarget, bool inReach,
+                                          bool inCombat, bool moving, bool hasSpotOnMap);
+
 // -- Stratholme exit yard way out (#645) --------------------------------------
 // What a family does once it stands in the exit yard after a run. Walk: the
 // Service Entrance is open. Button: press gameobject 175432, then walk. Hearth:
