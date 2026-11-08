@@ -267,6 +267,20 @@ void TheAdapterIsWired()
               write.find(",NULL,NULL,NULL,NULL") != std::string::npos);
     Check("the ring is swept on the death timer",
           source.find("FlushLevels();\n            SweepDeathHits();") != std::string::npos);
+    // The sweep reads the guild manager for the cached ids (#1416), so it must
+    // stay on the world thread: its one caller is the death timer in
+    // OverseerWorldScript::OnUpdate,
+    // next to FlushDeaths.
+    {
+        std::size_t calls = 0;
+        for (std::size_t at = source.find("SweepDeathHits();"); at != std::string::npos;
+             at = source.find("SweepDeathHits();", at + 1))
+            ++calls;
+        Check("the sweep has one caller, the world thread's death timer",
+              calls == 1 &&
+                  source.find("FlushDeaths();\n            FlushLevels();\n            SweepDeathHits();") !=
+                      std::string::npos);
+    }
 
     std::string const migration = Read("data/sql/characters/base/2026_10_10_01_overseer_death_hits.sql");
     Check("the migration adds the four columns, guarded",
