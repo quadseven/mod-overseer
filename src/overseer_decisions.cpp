@@ -4675,6 +4675,11 @@ constexpr float ITEM_LEVEL_TIEBREAK = 0.5f;
 // A candidate must beat the incumbent by this much before anything moves.
 constexpr float UPGRADE_MARGIN_FRACTION = 0.01f;
 constexpr float UPGRADE_MARGIN_FLOOR = 0.5f;
+// How much a worn item's unread part (an on-equip effect, an unresolved random
+// suffix) may be worth, as a share of its read score, before a candidate may
+// beat it (#221 box 4). Half: a candidate has to score 1.5 times the worn
+// floor, plus the margin, to be worn over it.
+constexpr float FLOOR_INCUMBENT_HEADROOM = 0.5f;
 
 // A SHIELD IS THE ONE PIECE OF ARMOUR YOU WEAR INSTEAD OF A WEAPON, and that
 // makes the same number on it worth something quite different from the same
@@ -5475,9 +5480,25 @@ GearComparison GearCompare(GearVerdict const& candidate, GearIncumbentScore cons
         return GearComparison::Undecided;
 
     // What is worn is itself only a floor, so its true worth is somewhere above
-    // the number and nothing can be proved to beat it.
+    // the number. "Somewhere above" is not "anywhere above" (#221 box 4): the
+    // unread part is one on-equip effect or one random suffix on a piece whose
+    // armour, stats and item level ARE read, and treating it as unbounded left
+    // 253 better pieces in the family's bags for four days on the dev realm -
+    // Zork carried a level 52 rare headdress and wore a level 37 helm because
+    // the helm has an on-use effect. So the unread part is credited with up to
+    // FLOOR_INCUMBENT_HEADROOM of the read score, and a candidate that clears
+    // even that, plus the usual margin, is better. Below it, still undecided.
+    // A candidate that is itself a floor may use its floor here: its true worth
+    // is only higher, so the gap it proves only widens. Still antisymmetric:
+    // the displaced floor is below what replaced it, so it never comes back.
     if (worn.confidence == GearConfidence::Floor)
-        return GearComparison::Undecided;
+    {
+        float const credited = worn.score * (1.f + FLOOR_INCUMBENT_HEADROOM);
+        return candidate.score >
+                       credited * (1.f + UPGRADE_MARGIN_FRACTION) + UPGRADE_MARGIN_FLOOR
+                   ? GearComparison::Better
+                   : GearComparison::Undecided;
+    }
 
     // From here what is worn is exactly known, and the margin is the same one
     // GearIsUpgrade uses - the two must never disagree about where the line is.
