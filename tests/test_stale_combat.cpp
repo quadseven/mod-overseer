@@ -26,6 +26,8 @@ using OverseerDecisions::SayStaleCombatHeld;
 using OverseerDecisions::STALE_COMBAT_REACH_YARDS;
 using OverseerDecisions::STALE_COMBAT_RELEASE_SECONDS;
 using OverseerDecisions::STALE_COMBAT_SAY_HELD_SECONDS;
+using OverseerDecisions::STALE_COMBAT_STANDOFF_MOVE_YARDS;
+using OverseerDecisions::STALE_COMBAT_STANDOFF_SECONDS;
 using OverseerDecisions::StaleCombatFacts;
 using OverseerDecisions::StaleCombatStep;
 using OverseerDecisions::StaleCombatVerdict;
@@ -44,6 +46,8 @@ char const* Name(StaleCombatVerdict v)
         case StaleCombatVerdict::HeldByHostile: return "held by hostile";
         case StaleCombatVerdict::Watching:      return "watching";
         case StaleCombatVerdict::Release:       return "release";
+        case StaleCombatVerdict::StandoffWatching: return "standoff watching";
+        case StaleCombatVerdict::ReleaseStandoff:  return "release standoff";
     }
     return "unknown";
 }
@@ -187,6 +191,80 @@ void TheHeldLineIsBounded()
     Check("never without a combat start", !SayStaleCombatHeld(T0 + 99999, 0, 0));
 }
 
+// #1411, the measured case: a character at full health, a creature five yards
+// off at full health, the character unmoved, for hours. On the 8 second poll
+// it is watched for fifteen minutes and then released as a standoff.
+StaleCombatFacts Standoff(time_t now)
+{
+    StaleCombatFacts f = Stale(now);
+    f.hostilesInReach = 2;
+    f.standoff = true;
+    return f;
+}
+
+void AStandoffPastTheBoundIsReleased()
+{
+    Check("standoff bound is fifteen minutes", STALE_COMBAT_STANDOFF_SECONDS == 900);
+    Check("a standoff allows five yards of drift", STALE_COMBAT_STANDOFF_MOVE_YARDS == 5.0f);
+    time_t since = 0;
+    StaleCombatStep step;
+    time_t t = T0;
+    for (; t < T0 + STALE_COMBAT_STANDOFF_SECONDS; t += 8)
+    {
+        step = DecideStaleCombat(Standoff(t), since);
+        CheckVerdict("a standoff under the bound is watched", step.verdict,
+                     StaleCombatVerdict::StandoffWatching);
+        since = step.emptySince;
+    }
+    Check("the standoff began at the first poll", since == T0);
+    step = DecideStaleCombat(Standoff(t), since);
+    CheckVerdict("a standoff at the bound is released", step.verdict,
+                 StaleCombatVerdict::ReleaseStandoff);
+    Check("the standoff release says how long it was held", step.heldSeconds == t - T0);
+}
+
+void AStandoffUnderTheBoundIsNotReleased()
+{
+    StaleCombatStep const step =
+        DecideStaleCombat(Standoff(T0 + STALE_COMBAT_STANDOFF_SECONDS - 1), T0);
+    CheckVerdict("one second under the standoff bound is watched", step.verdict,
+                 StaleCombatVerdict::StandoffWatching);
+    Check("and the stretch is carried", step.emptySince == T0);
+    // The empty-combat bound (ten minutes) does not release a standoff.
+    StaleCombatStep const ten =
+        DecideStaleCombat(Standoff(T0 + STALE_COMBAT_RELEASE_SECONDS), T0);
+    CheckVerdict("ten minutes of standoff is not enough", ten.verdict,
+                 StaleCombatVerdict::StandoffWatching);
+}
+
+// Damage on either side, or a move, makes the drive say standoff=false: that
+// is a fight, and it restarts the clock however long the standoff ran.
+void AHurtSideOrAMoveRestartsTheStandoff()
+{
+    time_t since = DecideStaleCombat(Standoff(T0), 0).emptySince;
+    StaleCombatFacts hurt = Standoff(T0 + 840);
+    hurt.standoff = false;
+    StaleCombatStep step = DecideStaleCombat(hurt, since);
+    CheckVerdict("a blow lands: a fight", step.verdict, StaleCombatVerdict::HeldByHostile);
+    Check("the fight ends the stretch", step.emptySince == 0);
+    since = DecideStaleCombat(Standoff(T0 + 848), step.emptySince).emptySince;
+    Check("a new standoff starts after it", since == T0 + 848);
+    step = DecideStaleCombat(Standoff(T0 + STALE_COMBAT_STANDOFF_SECONDS), since);
+    CheckVerdict("fifteen minutes after the first poll is not fifteen unbroken",
+                 step.verdict, StaleCombatVerdict::StandoffWatching);
+}
+
+// The hostiles leave mid-standoff: the stretch goes on as empty combat, which
+// is released on its own (shorter) bound from the same start.
+void HostilesLeavingKeepTheStretch()
+{
+    time_t const since = DecideStaleCombat(Standoff(T0), 0).emptySince;
+    StaleCombatStep const step =
+        DecideStaleCombat(Stale(T0 + STALE_COMBAT_RELEASE_SECONDS), since);
+    CheckVerdict("no hostile left, ten minutes after a standoff began", step.verdict,
+                 StaleCombatVerdict::Release);
+}
+
 }  // namespace
 
 int main()
@@ -200,6 +278,10 @@ int main()
     AnInstancedMapIsNotJudged();
     AClockFromTheFutureRestarts();
     TheHeldLineIsBounded();
+    AStandoffPastTheBoundIsReleased();
+    AStandoffUnderTheBoundIsNotReleased();
+    AHurtSideOrAMoveRestartsTheStandoff();
+    HostilesLeavingKeepTheStretch();
 
     if (failures)
     {
