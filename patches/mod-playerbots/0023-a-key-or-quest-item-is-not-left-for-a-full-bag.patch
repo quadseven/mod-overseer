@@ -1,0 +1,65 @@
+Subject: [PATCH] loot: a key or a quest item is not left for a nearly full bag
+
+WHY THIS PATCH EXISTS
+
+mod-overseer#1424. StoreLootAction::Execute skips every item that does not
+stack (max stack 1) once the bot's "bag space" reads over 80 percent, for a
+bot whose master is not a real player. Every family member is such a bot:
+its master carries a PlayerbotAI too, so IsRealPlayer() is false.
+
+Two kinds of item it skips that way should never be:
+
+  * A KEY. It goes to the keyring (bag family mask 0x100), which BagSpaceValue
+    (src/Ai/Base/Value/StatsValues.cpp:203) does not count at all, so a bag
+    80 percent full says nothing about whether it fits. Blackrock Depths'
+    Prison Cell Key (11140, High Interrogator Gerstahn, 100 percent) opens
+    the eight Detention Block cell doors (lock 699) on the route to
+    Houndmaster Grebmar for a party with no lockpicker.
+  * A QUEST ITEM. Ironfel (10999, Fineous Darkvire) is the one item between
+    a family and the Shadowforge Key (quest 3802). IsLootAllowed already
+    says yes to it for the quest in the log; the bag shortcut then drops it.
+
+Measured on the dev realm, 2026-11-08, "bag space" as BagSpaceValue computes
+it for the family with no rogue: 86, 81, 82, 67 and 94 percent. Four of five
+would leave both items on the corpse.
+
+WHAT IT CHANGES
+
+The 80 percent shortcut does not apply to an item that goes to the keyring
+(bag family mask BAG_FAMILY_MASK_KEYS: the Prison Cell Key, class 13) or is a
+quest item (class 12 or bonding BIND_QUEST_ITEM: Ironfel). Everything else is
+as before. Nothing is forced: CMSG_AUTOSTORE_LOOT_ITEM still goes through the
+core's own store check, which refuses an item there is no room for.
+
+WHAT WOULD LET THIS PATCH BE DELETED
+
+Upstream exempting keyring and quest items from the bag-space shortcut, or
+the shortcut asking the core (CanStoreNewItem) instead of a percentage.
+
+APPLIES TO
+
+    mod-playerbots @ 40884e9c135c1daf27ffd894a6047502a5701130
+    src/Ai/Base/Actions/LootAction.cpp, StoreLootAction::Execute
+    Replayed by tests/replay_loot_key_bag_space.py against the pinned file
+    (tests/fixtures/loot_key/LootAction.cpp).
+
+diff --git a/src/Ai/Base/Actions/LootAction.cpp b/src/Ai/Base/Actions/LootAction.cpp
+index d8a50e4..e56f3c9 100644
+--- a/src/Ai/Base/Actions/LootAction.cpp
++++ b/src/Ai/Base/Actions/LootAction.cpp
+@@ -430,7 +430,14 @@ bool StoreLootAction::Execute(Event event)
+         if (!proto)
+             continue;
+ 
+-        if (!IsRealPlayer(botAI->GetMaster()) && AI_VALUE(uint8, "bag space") > 80)
++        // A key goes to the keyring, which "bag space" does not count, and a
++        // quest item is the reason the corpse was opened at all (mod-overseer
++        // #1424): neither is left behind for a nearly full bag. The core
++        // still refuses one there is no room for.
++        bool const takenAnyway = (proto->BagFamily & BAG_FAMILY_MASK_KEYS) != 0 ||
++                                 proto->Class == ITEM_CLASS_QUEST ||
++                                 proto->Bonding == BIND_QUEST_ITEM;
++        if (!takenAnyway && !IsRealPlayer(botAI->GetMaster()) && AI_VALUE(uint8, "bag space") > 80)
+         {
+             uint32 maxStack = proto->GetMaxStackSize();
+             if (maxStack == 1)
