@@ -30919,6 +30919,11 @@ private:
             // a combat reference holder, alive, on this map, within reach.
             Unit* nearest = nullptr;
             float nearestYards = 0.f;
+            // A STANDOFF (#1411): every hostile in reach a creature at full
+            // health, and the character at full health. Any blow on either
+            // side, or a player in reach, makes it a fight.
+            bool allFull = bot->GetHealth() >= bot->GetMaxHealth();
+            std::vector<Creature*> standoffCreatures;
             auto consider = [&](Unit* other)
             {
                 if (!other || other == bot || !other->IsInWorld() || !other->IsAlive() ||
@@ -30936,6 +30941,15 @@ private:
                 if (yards > OverseerDecisions::STALE_COMBAT_REACH_YARDS)
                     return;
                 ++facts.hostilesInReach;
+                // A player, or a pet or guardian a player controls, is never a
+                // standoff: that is PvP, and its owner can act at any moment.
+                Creature* const held = other->ToCreature();
+                if (!held || held->IsControlledByPlayer() ||
+                    other->GetHealth() < other->GetMaxHealth())
+                    allFull = false;
+                else if (std::find(standoffCreatures.begin(), standoffCreatures.end(), held) ==
+                         standoffCreatures.end())
+                    standoffCreatures.push_back(held);
                 if (!nearest || yards < nearestYards)
                 {
                     nearest = other;
@@ -30950,18 +30964,72 @@ private:
                 consider(ref.second->GetOther(bot));
 
             auto since = _staleCombatSince.find(key);
+            bool const stretchRunning = since != _staleCombatSince.end();
+            auto anchor = _staleCombatAnchor.find(key);
+            float const fromAnchor = stretchRunning && anchor != _staleCombatAnchor.end()
+                                         ? bot->GetExactDist(&anchor->second)
+                                         : -1.f;
+            facts.standoff =
+                OverseerDecisions::IsStandoff(facts.hostilesInReach, allFull, fromAnchor);
+            auto standoffSince = _staleCombatStandoffSince.find(key);
             StaleCombatStep const step = DecideStaleCombat(
-                facts, since == _staleCombatSince.end() ? 0 : since->second);
+                facts, since == _staleCombatSince.end() ? 0 : since->second,
+                standoffSince == _staleCombatStandoffSince.end() ? 0 : standoffSince->second);
 
             // When this character's combat began, as far as this drive saw.
             time_t& combatSince = _combatSeenSince[key];
             if (combatSince == 0)
                 combatSince = now;
 
-            if (step.emptySince)
-                _staleCombatSince[key] = step.emptySince;
+            if (step.standoffSince)
+                _staleCombatStandoffSince[key] = step.standoffSince;
             else
+                _staleCombatStandoffSince.erase(key);
+            if (step.emptySince)
+            {
+                _staleCombatSince[key] = step.emptySince;
+                if (!stretchRunning || anchor == _staleCombatAnchor.end())
+                    _staleCombatAnchor[key] = bot->GetPosition();
+            }
+            else
+            {
                 _staleCombatSince.erase(key);
+                _staleCombatAnchor.erase(key);
+            }
+
+            if (step.verdict == StaleCombatVerdict::ReleaseStandoff)
+            {
+                std::string held;
+                for (Creature* creature : standoffCreatures)
+                {
+                    if (!held.empty())
+                        held += ", ";
+                    held += "'" + creature->GetName() + "' (entry " +
+                            std::to_string(creature->GetEntry()) + ")";
+                }
+                // Each creature in the standoff goes home first, the way one
+                // does when its target is out of its reach, so it does not
+                // hold the character again from where it stands; asked before
+                // the stop, which would clear the victim it is matched on.
+                for (Creature* creature : standoffCreatures)
+                    if (creature->IsInWorld() && creature->IsAlive() && creature->AI() &&
+                        creature->GetVictim() == bot)
+                        creature->AI()->EnterEvadeMode();
+                bot->CombatStop(true);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' stood {} seconds in a standoff - in combat at full "
+                         "health with {} at full health within {:.0f} yards, nobody hurt and "
+                         "nobody moved - combat stopped and those sent home; in combat after "
+                         "the stop: {} (#1411)",
+                         bot->GetName(), uint64(step.heldSeconds), held,
+                         OverseerDecisions::STALE_COMBAT_REACH_YARDS,
+                         bot->IsInCombat() ? "yes" : "no");
+                _staleCombatSince.erase(key);
+                _staleCombatAnchor.erase(key);
+                _combatSeenSince.erase(key);
+                _staleCombatSaid.erase(key);
+                continue;
+            }
 
             if (step.verdict == StaleCombatVerdict::Release)
             {
@@ -30979,10 +31047,13 @@ private:
                          bot->IsInCombat() ? "yes" : "no");
                 _combatSeenSince.erase(key);
                 _staleCombatSaid.erase(key);
+                _staleCombatAnchor.erase(key);
                 continue;
             }
 
-            if (step.verdict == StaleCombatVerdict::HeldByHostile && nearest)
+            if ((step.verdict == StaleCombatVerdict::HeldByHostile ||
+                 step.verdict == StaleCombatVerdict::StandoffWatching) &&
+                nearest)
             {
                 time_t& lastSaid = _staleCombatSaid[key];
                 if (SayStaleCombatHeld(now, combatSince, lastSaid))
@@ -31000,9 +31071,12 @@ private:
 
         // Out of combat, offline or gone: forget, so the maps stay bounded by
         // who is in combat now.
-        for (auto* book : {&_staleCombatSince, &_combatSeenSince, &_staleCombatSaid})
+        for (auto* book :
+             {&_staleCombatSince, &_combatSeenSince, &_staleCombatSaid, &_staleCombatStandoffSince})
             for (auto it = book->begin(); it != book->end();)
                 it = seen.count(it->first) ? std::next(it) : book->erase(it);
+        for (auto it = _staleCombatAnchor.begin(); it != _staleCombatAnchor.end();)
+            it = seen.count(it->first) ? std::next(it) : _staleCombatAnchor.erase(it);
     }
 
     // ---------------------------------------------------------- stuck dead --
@@ -84494,6 +84568,13 @@ private:
     std::map<uint32, time_t> _staleCombatSince;
     std::map<uint32, time_t> _combatSeenSince;
     std::map<uint32, time_t> _staleCombatSaid;
+    // When each character's current standoff began (#1411), so the standoff
+    // bound counts standoff minutes only, not empty combat before it.
+    std::map<uint32, time_t> _staleCombatStandoffSince;
+    // Where each character stood when its no-fight stretch began, so a
+    // standoff can tell a character that never moved from one that did
+    // (#1411). Pruned with the books above.
+    std::map<uint32, Position> _staleCombatAnchor;
     uint32 _terrainRecoveryTimer = 0;
     // GATHERING/BARRIER coordinator poll (mod-overseer#88). Its own timer,
     // not piggybacked on QUEST_POLL_MS or ENGAGEMENT_POLL_MS: this drive is

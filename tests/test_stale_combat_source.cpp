@@ -87,6 +87,35 @@ int main()
               Has(drive, "not released (#1390)"));
     Check("the books are pruned to who is in combat now", Has(drive, "seen.count(it->first)"));
 
+    // #1411: a standoff (both sides at full health, the character unmoved) is
+    // released, and each creature in it is sent home before the stop.
+    Check("the drive reads the character's health and each hostile's",
+          Has(drive, "bot->GetHealth() >= bot->GetMaxHealth()") &&
+              Has(drive, "other->GetHealth() < other->GetMaxHealth()"));
+    Check("the drive measures the move from where the stretch began",
+          Has(drive, "_staleCombatAnchor[key] = bot->GetPosition();"));
+    Check("the rule is told whether it is a standoff",
+          Has(drive, "OverseerDecisions::IsStandoff(facts.hostilesInReach, allFull, fromAnchor)") &&
+              Has(drive, "bot->GetExactDist(&anchor->second)"));
+    std::size_t const standoff = drive.find("StaleCombatVerdict::ReleaseStandoff");
+    std::size_t const evade = drive.find("creature->AI()->EnterEvadeMode();");
+    std::size_t const stopAfter =
+        evade == std::string::npos ? std::string::npos : drive.find("bot->CombatStop(true);", evade);
+    std::size_t const standoffLine = drive.find("stood {} seconds in a standoff");
+    Check("a standoff sends its creatures home, then stops combat, then says so",
+          standoff != std::string::npos && evade != std::string::npos &&
+              stopAfter != std::string::npos && standoffLine != std::string::npos &&
+              standoff < evade && evade < stopAfter && stopAfter < standoffLine);
+    Check("only a creature fighting this character is sent home",
+          Has(drive, "creature->GetVictim() == bot"));
+    Check("the anchor book is pruned too", Has(drive, "_staleCombatAnchor.erase(it)"));
+    Check("a player's pet or guardian is never a standoff creature",
+          Has(drive, "held->IsControlledByPlayer()"));
+    Check("the standoff start is carried poll to poll and pruned",
+          Has(drive, "standoffSince == _staleCombatStandoffSince.end() ? 0 : standoffSince->second") &&
+              Has(drive, "_staleCombatStandoffSince[key] = step.standoffSince;") &&
+              Has(drive, "&_staleCombatStandoffSince})"));
+
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);
