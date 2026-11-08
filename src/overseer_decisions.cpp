@@ -241,6 +241,11 @@ std::string NameTheAttackers(std::vector<std::string> const& names)
     return out;
 }
 
+bool KeepsDeathHits(bool inDungeon, bool familyMember, bool naturalGuildMember)
+{
+    return inDungeon || familyMember || naturalGuildMember;
+}
+
 DeathHitAccount AccountForDeathHits(DeathHitRing const& ring, std::int64_t deathMs)
 {
     DeathHitAccount account;
@@ -2222,6 +2227,9 @@ DoorAimHeight DoorAimOnTheFloor(float triggerZ, bool haveGround, float groundZ,
     // every refusal below is a plain return and none of them has to remember to
     // restore anything.
     out.z = triggerZ;
+    // What the probe said, kept whether or not it is used (#1414).
+    out.probed = haveGround;
+    out.probedZ = haveGround ? groundZ : 0.f;
 
     // Nothing was found under the door. A probe that answers "no surface" is
     // the edge of the world, a hole, or an unloaded grid, and none of those is
@@ -2370,6 +2378,8 @@ DoorAimHeight DoorAimOnTheFloor(bool haveGround, float groundZ, float arrivalYar
 
     DoorAimHeight out;
     out.z = trigger.z;
+    out.probed = haveGround;
+    out.probedZ = haveGround ? groundZ : 0.f;
     if (!haveGround || arrivalYards <= 0.f)
         return out;
 
@@ -2439,6 +2449,47 @@ RatchetVerdict Ratchet(RatchetState& state, float reading, time_t now,
     verdict.stalled = limits.patienceSeconds != 0 && state.since != 0 &&
                       now - state.since > limits.patienceSeconds;
     return verdict;
+}
+
+float CrossingFarthestWalker(std::vector<DungeonRunEntryState> const& states)
+{
+    // Negative is "nobody to measure": DungeonRunCensus leaves distanceFromDoor
+    // negative for a member through, on another map, or not found.
+    float farthest = -1.f;
+    for (DungeonRunEntryState const& state : states)
+        if (!state.through && state.distanceFromDoor >= 0.f &&
+            state.distanceFromDoor > farthest)
+            farthest = state.distanceFromDoor;
+    return farthest;
+}
+
+bool CrossingWalkKeepsClock(CrossingWalkState& state, time_t crossingSince,
+                            float farthestYards, time_t now, float marginYards,
+                            time_t ceilingSeconds)
+{
+    // A clock this state has not seen is a crossing (or a member's crossing)
+    // this walk has not been measured under: start the walk afresh from it.
+    if (state.epoch != crossingSince)
+    {
+        state.walk = RatchetState{};
+        state.epoch = crossingSince;
+        state.walkingSince = crossingSince;
+    }
+    if (farthestYards < 0.f)
+        return false;
+    // Past the ceiling, walking no longer buys time; only a crossing does.
+    if (now - state.walkingSince >= ceilingSeconds)
+        return false;
+    // Patience 0: this ratchet only compares; the crossing's own clock is the
+    // one that stalls.
+    RatchetLimits const limits{RatchetReading::DistanceToTarget, marginYards, 0};
+    RatchetVerdict const verdict = Ratchet(state.walk, farthestYards, now, limits);
+    if (!verdict.progressed)
+        return false;
+    // The caller moves the crossing's clock to `now`; follow it, so the next
+    // poll is measured under the same walk rather than starting a new one.
+    state.epoch = now;
+    return true;
 }
 
 time_t TravelBackstopSeconds(std::string const& target,

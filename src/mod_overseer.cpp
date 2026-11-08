@@ -5402,7 +5402,7 @@ struct PendingDeath
     int32 fallGuardStandDown = -1;
     int32 fallGuardSeconds = -1;
 
-    // THE HITS BEFORE A DUNGEON DEATH (OverseerDecisions::DeathHit). False when
+    // THE HITS BEFORE A DEATH (OverseerDecisions::DeathHit). False when
     // the damage hook saw no hit inside DEATH_HIT_WINDOW_MS, and the four
     // columns below are then written NULL, never 0.
     bool hitSampled = false;
@@ -5448,14 +5448,20 @@ uint64 g_droppedDeaths = 0;
 // name, under g_deathMutex. One entry per guild member at most.
 std::map<std::string, std::int64_t> g_guildDeathAt;
 
-// THE LAST HITS EACH PLAYER IN A DUNGEON TOOK (OverseerDecisions::DeathHit),
-// by guid. Written by the damage hook on whatever map thread owns the victim,
+// THE LAST HITS EACH PLAYER TOOK (OverseerDecisions::DeathHit), by guid, for
+// the players whose deaths are recorded (OverseerDecisions::KeepsDeathHits):
+// anyone inside a dungeon, and the family and the natural guilds everywhere
+// (#1416). Written by the damage hook on whatever map thread owns the victim,
 // read and erased by RecordDeath, and swept of anybody whose newest hit is old
-// by SweepDeathHits on the world thread. It holds only players who were hit
-// inside a dungeon in the last minute, so it stays the size of the fights
-// going on.
+// by SweepDeathHits on the world thread. It holds only players hit in the last
+// minute, so it stays the size of the fights going on.
 std::mutex g_deathHitMutex;
 std::map<uint32, OverseerDecisions::DeathHitRing> g_deathHits;
+// The natural guilds' ids, under g_deathHitMutex. The damage hook fires for
+// every hit in the world, so it asks this set instead of parsing
+// Overseer.Natural.Guilds on each hit; SweepDeathHits refreshes it from the
+// config on the world thread, every death flush.
+std::set<uint32> g_deathHitGuildIds;
 
 // Called from OverseerMeterScript::OnDamage, on the map thread that owns the
 // victim, BEFORE the core subtracts the damage (Unit::DealDamage calls the
@@ -5463,13 +5469,30 @@ std::map<uint32, OverseerDecisions::DeathHitRing> g_deathHits;
 // hit found. Everything read here is gone by the time any death hook runs:
 // setDeathState zeroes the health and stops the combat, and the attacker
 // list empties with it.
-static void NoteDungeonHit(Unit* attacker, Player* hurt, uint32 damage)
+// `familyMember` is the meter's answer for the victim: a roster character.
+static void NoteDeathHit(Unit* attacker, Player* hurt, uint32 damage, bool familyMember)
 {
     if (!hurt || !damage || !hurt->IsInWorld())
         return;
     Map* const map = hurt->GetMap();
-    if (!map || !map->IsDungeon())
+    if (!map)
         return;
+    bool const inDungeon = map->IsDungeon();
+    // In the open world only a death this module records keeps its hits
+    // (#1416). Guildless strangers leave before any lock is taken.
+    if (!inDungeon && !familyMember)
+    {
+        uint32 const guildId = hurt->GetGuildId();
+        if (!guildId)
+            return;
+        bool naturalGuildMember = false;
+        {
+            std::lock_guard<std::mutex> guard(g_deathHitMutex);
+            naturalGuildMember = g_deathHitGuildIds.count(guildId) != 0;
+        }
+        if (!OverseerDecisions::KeepsDeathHits(false, false, naturalGuildMember))
+            return;
+    }
     OverseerDecisions::DeathHit hit;
     hit.atMs = static_cast<std::int64_t>(GameTime::GetGameTimeMS().count());
     hit.amount = damage;
@@ -5500,7 +5523,15 @@ static void NoteDungeonHit(Unit* attacker, Player* hurt, uint32 damage)
 static void SweepDeathHits()
 {
     std::int64_t const now = static_cast<std::int64_t>(GameTime::GetGameTimeMS().count());
+    // The natural guilds by id, for the damage hook (#1416). A guild that does
+    // not exist yet simply has no id until it does.
+    std::set<uint32> guildIds;
+    for (std::string const& name : OverseerDecisions::ParseNameList(
+             sConfigMgr->GetOption<std::string>("Overseer.Natural.Guilds", "")))
+        if (Guild* guild = sGuildMgr->GetGuildByName(name))
+            guildIds.insert(guild->GetId());
     std::lock_guard<std::mutex> guard(g_deathHitMutex);
+    g_deathHitGuildIds = std::move(guildIds);
     for (auto it = g_deathHits.begin(); it != g_deathHits.end();)
         it = it->second.empty() ||
                      now - it->second.back().atMs > 2 * OverseerDecisions::DEATH_HIT_WINDOW_MS
@@ -5731,7 +5762,8 @@ void RecordDeath(Player* player)
         }
     }
 
-    // A DUNGEON DEATH IS READ HIT BY HIT. The damage hook saw each hit with the
+    // A RECORDED DEATH IS READ HIT BY HIT (dungeon or open world, #1416). The
+    // damage hook saw each hit with the
     // state it found, so its account outranks the five-second sample above:
     // the health and mana before the killing blow, whether it was fighting,
     // how many were on it and who, and the last hits with their sources.
@@ -30887,6 +30919,11 @@ private:
             // a combat reference holder, alive, on this map, within reach.
             Unit* nearest = nullptr;
             float nearestYards = 0.f;
+            // A STANDOFF (#1411): every hostile in reach a creature at full
+            // health, and the character at full health. Any blow on either
+            // side, or a player in reach, makes it a fight.
+            bool allFull = bot->GetHealth() >= bot->GetMaxHealth();
+            std::vector<Creature*> standoffCreatures;
             auto consider = [&](Unit* other)
             {
                 if (!other || other == bot || !other->IsInWorld() || !other->IsAlive() ||
@@ -30904,6 +30941,15 @@ private:
                 if (yards > OverseerDecisions::STALE_COMBAT_REACH_YARDS)
                     return;
                 ++facts.hostilesInReach;
+                // A player, or a pet or guardian a player controls, is never a
+                // standoff: that is PvP, and its owner can act at any moment.
+                Creature* const held = other->ToCreature();
+                if (!held || held->IsControlledByPlayer() ||
+                    other->GetHealth() < other->GetMaxHealth())
+                    allFull = false;
+                else if (std::find(standoffCreatures.begin(), standoffCreatures.end(), held) ==
+                         standoffCreatures.end())
+                    standoffCreatures.push_back(held);
                 if (!nearest || yards < nearestYards)
                 {
                     nearest = other;
@@ -30918,18 +30964,72 @@ private:
                 consider(ref.second->GetOther(bot));
 
             auto since = _staleCombatSince.find(key);
+            bool const stretchRunning = since != _staleCombatSince.end();
+            auto anchor = _staleCombatAnchor.find(key);
+            float const fromAnchor = stretchRunning && anchor != _staleCombatAnchor.end()
+                                         ? bot->GetExactDist(&anchor->second)
+                                         : -1.f;
+            facts.standoff =
+                OverseerDecisions::IsStandoff(facts.hostilesInReach, allFull, fromAnchor);
+            auto standoffSince = _staleCombatStandoffSince.find(key);
             StaleCombatStep const step = DecideStaleCombat(
-                facts, since == _staleCombatSince.end() ? 0 : since->second);
+                facts, since == _staleCombatSince.end() ? 0 : since->second,
+                standoffSince == _staleCombatStandoffSince.end() ? 0 : standoffSince->second);
 
             // When this character's combat began, as far as this drive saw.
             time_t& combatSince = _combatSeenSince[key];
             if (combatSince == 0)
                 combatSince = now;
 
-            if (step.emptySince)
-                _staleCombatSince[key] = step.emptySince;
+            if (step.standoffSince)
+                _staleCombatStandoffSince[key] = step.standoffSince;
             else
+                _staleCombatStandoffSince.erase(key);
+            if (step.emptySince)
+            {
+                _staleCombatSince[key] = step.emptySince;
+                if (!stretchRunning || anchor == _staleCombatAnchor.end())
+                    _staleCombatAnchor[key] = bot->GetPosition();
+            }
+            else
+            {
                 _staleCombatSince.erase(key);
+                _staleCombatAnchor.erase(key);
+            }
+
+            if (step.verdict == StaleCombatVerdict::ReleaseStandoff)
+            {
+                std::string held;
+                for (Creature* creature : standoffCreatures)
+                {
+                    if (!held.empty())
+                        held += ", ";
+                    held += "'" + creature->GetName() + "' (entry " +
+                            std::to_string(creature->GetEntry()) + ")";
+                }
+                // Each creature in the standoff goes home first, the way one
+                // does when its target is out of its reach, so it does not
+                // hold the character again from where it stands; asked before
+                // the stop, which would clear the victim it is matched on.
+                for (Creature* creature : standoffCreatures)
+                    if (creature->IsInWorld() && creature->IsAlive() && creature->AI() &&
+                        creature->GetVictim() == bot)
+                        creature->AI()->EnterEvadeMode();
+                bot->CombatStop(true);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' stood {} seconds in a standoff - in combat at full "
+                         "health with {} at full health within {:.0f} yards, nobody hurt and "
+                         "nobody moved - combat stopped and those sent home; in combat after "
+                         "the stop: {} (#1411)",
+                         bot->GetName(), uint64(step.heldSeconds), held,
+                         OverseerDecisions::STALE_COMBAT_REACH_YARDS,
+                         bot->IsInCombat() ? "yes" : "no");
+                _staleCombatSince.erase(key);
+                _staleCombatAnchor.erase(key);
+                _combatSeenSince.erase(key);
+                _staleCombatSaid.erase(key);
+                continue;
+            }
 
             if (step.verdict == StaleCombatVerdict::Release)
             {
@@ -30947,10 +31047,13 @@ private:
                          bot->IsInCombat() ? "yes" : "no");
                 _combatSeenSince.erase(key);
                 _staleCombatSaid.erase(key);
+                _staleCombatAnchor.erase(key);
                 continue;
             }
 
-            if (step.verdict == StaleCombatVerdict::HeldByHostile && nearest)
+            if ((step.verdict == StaleCombatVerdict::HeldByHostile ||
+                 step.verdict == StaleCombatVerdict::StandoffWatching) &&
+                nearest)
             {
                 time_t& lastSaid = _staleCombatSaid[key];
                 if (SayStaleCombatHeld(now, combatSince, lastSaid))
@@ -30968,9 +31071,12 @@ private:
 
         // Out of combat, offline or gone: forget, so the maps stay bounded by
         // who is in combat now.
-        for (auto* book : {&_staleCombatSince, &_combatSeenSince, &_staleCombatSaid})
+        for (auto* book :
+             {&_staleCombatSince, &_combatSeenSince, &_staleCombatSaid, &_staleCombatStandoffSince})
             for (auto it = book->begin(); it != book->end();)
                 it = seen.count(it->first) ? std::next(it) : book->erase(it);
+        for (auto it = _staleCombatAnchor.begin(); it != _staleCombatAnchor.end();)
+            it = seen.count(it->first) ? std::next(it) : _staleCombatAnchor.erase(it);
     }
 
     // ---------------------------------------------------------- stuck dead --
@@ -37558,6 +37664,11 @@ private:
         // the same way and now through the same function. Shared by ENTER and
         // EXIT because only one crossing is ever in progress.
         OverseerDecisions::RatchetState crossing;
+        // THE WALK TO THE DOOR, BESIDE THE COUNT (#1414). The farthest member
+        // getting nearer the door restarts `crossing`'s clock too, up to a
+        // ceiling - see CrossingWalkKeepsClock. Keyed to `crossing.since`, so
+        // every place that opens a crossing resets it by setting that clock.
+        OverseerDecisions::CrossingWalkState crossingWalk;
         // STAGED_INSIDE'S OWN PROGRESS, IN A RATCHET OF ITS OWN (#384). The
         // reading is how many members the census found on the instance map, so
         // "progress" is one more of them getting in there and the clock
@@ -40681,9 +40792,19 @@ private:
         // cannot fake. The comparison and the clock are the shared ratchet;
         // the log-once flag is this site's own reaction to progress and stays
         // with it.
+        //
+        // AND SO DOES THE PARTY STILL CLOSING ON THE DOOR (#1414). EXIT starts
+        // at the last boss, hundreds of yards from the door, and nobody is
+        // knocked through until everybody is on the doorstep, so a count of
+        // members through stays at zero for the whole walk. The farthest
+        // member getting nearer restarts the same clock, up to a ceiling.
+        std::time_t const now = std::time(nullptr);
+        float const farthest = OverseerDecisions::CrossingFarthestWalker(states);
+        if (OverseerDecisions::CrossingWalkKeepsClock(coord.crossingWalk, coord.crossing.since,
+                                                      farthest, now))
+            coord.crossing.since = now;
         OverseerDecisions::RatchetVerdict const progress = OverseerDecisions::Ratchet(
-            coord.crossing, static_cast<float>(through), std::time(nullptr),
-            DUNGEON_CROSSING_RATCHET);
+            coord.crossing, static_cast<float>(through), now, DUNGEON_CROSSING_RATCHET);
         if (progress.progressed)
             coord.loggedCrossingWaiting = false;
 
@@ -40700,11 +40821,17 @@ private:
         {
             LOG_WARN("module.overseer",
                      "overseer: dungeon run {} has got {} of {} through areatrigger {} and "
-                     "nobody else has crossed for {} minutes - giving up. Still short: {}",
+                     "nobody else has crossed for {} minutes - giving up. Still short: {}. "
+                     "The farthest member still walking is {:.0f}y from the door (negative: "
+                     "none), {:.0f}y at best; walking keeps the clock for at most {} "
+                     "minutes from the start of a crossing or from its last member "
+                     "through (#1414)",
                      what, through, static_cast<uint32>(states.size()), triggerId,
                      static_cast<uint32>(DUNGEON_CROSSING_BACKSTOP_SECONDS / 60),
                      OverseerDecisions::DungeonRunEntryBlockers(
-                         states, DUNGEON_DOORSTEP_RADIUS_YARDS));
+                         states, DUNGEON_DOORSTEP_RADIUS_YARDS),
+                     farthest, coord.crossingWalk.walk.best,
+                     static_cast<uint32>(OverseerDecisions::CROSSING_WALK_CEILING_SECONDS / 60));
             return DungeonCrossingResult::GaveUp;
         }
 
@@ -40821,19 +40948,36 @@ private:
         {
             coord.loggedCrossingAim = true;
             coord.loggedCrossingAimGrounded = doorHeight.grounded;
+            // WHAT THE FLOOR PROBE FOUND (#1414), used or not, so a door that
+            // never grounds says whether it found no floor or a floor too far
+            // below its middle.
+            std::string probeNote =
+                "found no ground (an unloaded grid, a hole, or no surface under the door)";
+            if (doorHeight.probed)
+            {
+                char note[192];
+                if (doorHeight.grounded)
+                    std::snprintf(note, sizeof(note), "found ground at z %.2f", doorHeight.probedZ);
+                else
+                    std::snprintf(note, sizeof(note),
+                                  "found ground at z %.2f, %.2fy from the door's middle, too "
+                                  "far for the arrival to fit inside the trigger",
+                                  doorHeight.probedZ, doorHeight.probedZ - door->z);
+                probeNote = note;
+            }
             LOG_INFO("module.overseer",
                      "overseer: dungeon run {} walks the party the last yards onto "
                      "areatrigger {} ({}) - every member under its own power, and nobody "
                      "is knocked through until everybody is on the doorstep. Leader '{}' "
                      "is {:.0f}y out. That aim's z is {}, {:.2f}y from the middle of the "
-                     "door's own box (#376)",
+                     "door's own box (#376). The floor probe {} (#1414)",
                      what, triggerId, doorAim, leaderName,
                      leaderState ? leaderState->distanceFromDoor : -1.f,
                      doorHeight.grounded
                          ? "the floor under the door"
                          : "the trigger's own row, because no floor inside the door "
-                           "was found under it this poll",
-                     doorHeight.correctionYards);
+                           "was found or usable under it this poll",
+                     doorHeight.correctionYards, probeNote);
         }
 
         if (!OverseerDecisions::DungeonRunEntryReady(states, DUNGEON_DOORSTEP_RADIUS_YARDS))
@@ -84424,6 +84568,13 @@ private:
     std::map<uint32, time_t> _staleCombatSince;
     std::map<uint32, time_t> _combatSeenSince;
     std::map<uint32, time_t> _staleCombatSaid;
+    // When each character's current standoff began (#1411), so the standoff
+    // bound counts standoff minutes only, not empty combat before it.
+    std::map<uint32, time_t> _staleCombatStandoffSince;
+    // Where each character stood when its no-fight stretch began, so a
+    // standoff can tell a character that never moved from one that did
+    // (#1411). Pruned with the books above.
+    std::map<uint32, Position> _staleCombatAnchor;
     uint32 _terrainRecoveryTimer = 0;
     // GATHERING/BARRIER coordinator poll (mod-overseer#88). Its own timer,
     // not piggybacked on QUEST_POLL_MS or ENGAGEMENT_POLL_MS: this drive is
@@ -85155,9 +85306,9 @@ public:
         if (!source && !hurt)
             return;
         Note(source, OverseerDecisions::MeterKind::Damage, damage);
-        Note(hurt, OverseerDecisions::MeterKind::Taken, damage);
-        // The hits a dungeon death is read from (RecordDeath).
-        NoteDungeonHit(attacker, hurt, damage);
+        bool const familyMember = Note(hurt, OverseerDecisions::MeterKind::Taken, damage);
+        // The hits a recorded death is read from (RecordDeath, #1416).
+        NoteDeathHit(attacker, hurt, damage, familyMember);
     }
 
     void OnHeal(Unit* healer, Unit* /*reciever*/, uint32& gain) override
@@ -85169,15 +85320,16 @@ public:
     }
 
 private:
-    static void Note(Player* player, OverseerDecisions::MeterKind kind, uint32 amount)
+    // True when `player` holds a meter seat: a family (roster) character.
+    static bool Note(Player* player, OverseerDecisions::MeterKind kind, uint32 amount)
     {
         if (!player)
-            return;
+            return false;
         std::time_t const now = GameTime::GetGameTime().count();
         std::lock_guard<std::mutex> guard(g_meterMutex);
         auto const seat = g_meterSeats.find(player->GetGUID().GetCounter());
         if (seat == g_meterSeats.end())
-            return;
+            return false;
         OverseerDecisions::MeterRecord(g_meterBooks[seat->second.family], seat->second.name, kind,
                                        amount, now);
         // The run's running total (#971): only a roster member gets this far,
@@ -85188,6 +85340,7 @@ private:
             !OverseerDecisions::RunDamageNote(g_runDamageBook, seat->second.name,
                                               player->GetMapId(), instanceId, kind, amount))
             ++g_droppedRunDamage;
+        return true;
     }
 };
 

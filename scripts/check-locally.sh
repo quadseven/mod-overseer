@@ -63,6 +63,7 @@ run_decisions() {
   python3 -B tests/replay_long_navmesh.py
   python3 -B tests/replay_buy_bag.py
   python3 -B tests/replay_run_family.py
+  python3 -B tests/replay_life_tap_floor.py
 
   # CI and the lane contract both run this function, so the workflow's single
   # step cannot drift from it (#1295). This test enforces that shape.
