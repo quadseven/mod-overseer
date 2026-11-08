@@ -20235,7 +20235,9 @@ std::string ExitHearthImpossibleReason(ExitHearthFacts const& facts, unsigned ma
     // A hearth to another continent splits the family (#1142): the stone is
     // withheld and the member stays on the walk-out path, however long that
     // walk has failed (#1388), until it is rebound on the door's continent.
-    if (facts.doorMapKnown && facts.bindMapId != facts.doorMapId &&
+    // A stand-in guest is not family, so there is no family to keep together
+    // and no walk out that could ever move it (#1427): its own bind is home.
+    if (facts.doorMapKnown && facts.bindMapId != facts.doorMapId && !facts.standinGuest &&
         !OffContinentHearthLetThrough(facts))
         return "hearthstone bound on map " + std::to_string(facts.bindMapId) +
                ", not on map " + std::to_string(facts.doorMapId) +

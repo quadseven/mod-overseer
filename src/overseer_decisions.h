@@ -22769,6 +22769,15 @@ struct ExitHearthFacts
     // this member inside alone, IDLE adopts it at STAGED_INSIDE, and the family
     // is sent straight back to the door it has just left.
     bool familyHearthedOut{false};
+    // A STAND-IN GUEST IS NOT FAMILY (#1427). The #1388 withhold keeps a
+    // family on the door's continent so it can regroup; a guildmate standing
+    // in for a member leaves the family group the moment the run ends, its
+    // home is its own bind, and it cannot be walked out at all: a travel aim
+    // is its overseer_roster row and a guest has none. Measured on the dev
+    // realm 2026-11-08: a guest bound on map 1 was the one member of a
+    // Blackrock Depths party left inside after EXIT HEARTH, and stayed there
+    // after its stand-in ended. Its stone is never withheld for its bind map.
+    bool standinGuest{false};
 };
 
 // How long a walk out must have failed before a stone bound off the door's

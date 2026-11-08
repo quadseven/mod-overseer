@@ -38805,6 +38805,7 @@ private:
                     ? std::time(nullptr) - episode.walkFailingSince
                     : 0;
                 facts.familyHearthedOut = familyHearthedOut;
+                facts.standinGuest = IsStandinGuest(name);
             }
 
             ExitHearthStep const step = OverseerDecisions::ExitFailureHearthStep(facts);
@@ -41271,6 +41272,7 @@ private:
                     facts.doorMapId = episode.doorMapId;
                     facts.bindMapId = static_cast<uint32_t>(bot->m_homebindMapId);
                     facts.failedWalkSeconds = now - episode.walkFailingSince;
+                    facts.standinGuest = IsStandinGuest(name);
                 }
                 way = OverseerDecisions::DecideEvacuationWay(
                     true, OverseerDecisions::ExitFailureHearthStep(facts));
