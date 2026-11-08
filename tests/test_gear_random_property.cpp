@@ -251,8 +251,11 @@ void TheSlotNobodyCouldSettleIsSettled()
     GearVerdict const candidateBefore = GearScore(candidateUnread, TheOneWearingIt());
     Expect("before: what is worn is only a floor",
            wornBefore.confidence == GearConfidence::Floor);
-    Expect("before: so nothing can be proved against it",
-           GearCompare(candidateBefore, GearWorn(wornBefore)) == GearComparison::Undecided);
+    // Since #221 box 4 a worn floor is credited with half again for what is
+    // unread, not with everything: mail at 186 armour clears a leather 43 by
+    // far more than that, so even unread the swap was provable.
+    Expect("before: a far better piece clears even a worn floor",
+           GearCompare(candidateBefore, GearWorn(wornBefore)) == GearComparison::Better);
 
     // And what it is now, from the effects the items actually carry.
     GearItem const wornRead = WithProperty(
