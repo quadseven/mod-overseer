@@ -42003,6 +42003,15 @@ private:
         }
         time_t const walkNow = std::time(nullptr);
         std::vector<std::string> hearthers;
+        // A member that is no longer being walked (it got through, or is not
+        // alive) loses its clock, so a later stranding starts a fair walk of
+        // its own rather than inheriting the old one's age.
+        for (auto clock = coord.strandedWalkSince.begin();
+             clock != coord.strandedWalkSince.end();)
+            clock = std::find(stranded.walk.begin(), stranded.walk.end(), clock->first) ==
+                            stranded.walk.end()
+                ? coord.strandedWalkSince.erase(clock)
+                : std::next(clock);
         for (std::string const& name : stranded.walk)
         {
             time_t const walkSince = coord.strandedWalkSince.emplace(name, walkNow).first->second;

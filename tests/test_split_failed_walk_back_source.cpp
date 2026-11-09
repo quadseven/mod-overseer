@@ -68,6 +68,7 @@ int main()
     Require(walk, "OverseerDecisions::StrandedWalkBackFailed(", "a stuck walk back is bounded");
     Require(walk, "OverseerDecisions::DecideEvacuationWay(", "a failed walk may hearth");
     Require(walk, "DriveExitHearths(", "the stone is the existing hearth drive");
+    Require(walk, "coord.strandedWalkSince.erase(clock)", "a member that leaves the walk loses its clock");
     Require(walk, "_strandedHearths[family]", "the episode is the family's own");
     Require(walk, "\"the walk back to the door failed\"",
             "the hearth is cast with its reason, which DriveExitHearths writes to the run timeline");
