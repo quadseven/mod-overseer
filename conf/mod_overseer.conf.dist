@@ -245,6 +245,19 @@
 #
 #Overseer.Raid.FreeSlotFloor = 6
 #
+#    Overseer.Raid.QuorumSeats
+#    Overseer.Raid.QuorumTanks
+#    Overseer.Raid.QuorumHealers
+#        Description: The raid at the door must have at least this many members,
+#                     tanks and healers before ENTER. Short when the assemble
+#                     wait ends, the raid holds at the door and the log names the
+#                     shortfall; after a second bounded wait the order ends.
+#        Default:     36, 3, 8
+#
+#Overseer.Raid.QuorumSeats = 36
+#Overseer.Raid.QuorumTanks = 3
+#Overseer.Raid.QuorumHealers = 8
+#
 ########################################
 #
 #    THE ROSTER AND ITS CLIENTS

@@ -238,9 +238,12 @@ RaidRunFacts Ready()
     facts.headStreaming = true;
     facts.raidFormed = true;
     facts.addable = 0;
-    facts.inWorld = 35;
-    facts.assembled = 35;
-    facts.othersAssembled = 34;
+    facts.inWorld = 38;
+    facts.assembled = 38;
+    facts.othersAssembled = 37;
+    facts.assembledTanks = 4;
+    facts.assembledHealers = 10;
+    facts.seatsTotal = 40;
     facts.headAssembled = true;
     return facts;
 }
@@ -345,7 +348,7 @@ void AssembleWaitsForTheRaidThenForNobodyForever()
     Check("with the head held on the staging point", waiting.aimStaging);
 
     facts.headAssembled = false;
-    facts.assembled = 35;
+    facts.assembled = 38;
     RaidRunStep const walking = StepRaidRun(RaidRunPhase::Assemble, facts);
     CheckPhase("the raid without its head does not enter", walking.phase,
                RaidRunPhase::Assemble);
@@ -357,7 +360,7 @@ void AssembleWaitsForTheRaidThenForNobodyForever()
     Check("and the members are knocked", all.knockMembers);
     Check("but not the head, on the first poll", !all.knockHead);
 
-    facts.assembled = 20;
+    facts.assembled = 36;
     facts.heldSeconds = RAID_ASSEMBLE_WAIT_SECONDS;
     RaidRunStep const late = StepRaidRun(RaidRunPhase::Assemble, facts);
     CheckPhase("after the wait, the raid goes with who is there", late.phase,
@@ -374,6 +377,79 @@ void AssembleWaitsForTheRaidThenForNobodyForever()
     facts.heldSeconds = 60;
     RaidRunStep const latecomers = StepRaidRun(RaidRunPhase::Assemble, facts);
     Check("a seat that logged in during ASSEMBLE is still invited", latecomers.form);
+}
+
+void TheRaidEntersOnlyWithAQuorumAtTheDoor()
+{
+    RaidRunFacts facts = Ready();
+    facts.inWorld = 12;
+    facts.assembled = 12;
+    facts.othersAssembled = 11;
+    facts.assembledTanks = 2;
+    facts.assembledHealers = 3;
+    facts.heldSeconds = RAID_ASSEMBLE_WAIT_SECONDS;
+    RaidRunStep const few = StepRaidRun(RaidRunPhase::Assemble, facts);
+    CheckPhase("12 at the door after the wait stays ASSEMBLE", few.phase,
+               RaidRunPhase::Assemble);
+    Check("and holds the head on the staging point", few.aimStaging);
+    Check("and does not knock anybody through", !few.knockMembers);
+    CheckString("and names the shortfall by duty", few.shortfall.c_str(),
+                "12 of 40, short 24 seats, 1 tanks, 5 healers");
+    Check("everyone in the world there is still not a quorum", !OverseerDecisions::RaidQuorumMet(facts));
+
+    facts = Ready();
+    facts.inWorld = 38;
+    facts.assembled = 38;
+    facts.heldSeconds = RAID_ASSEMBLE_WAIT_SECONDS;
+    RaidRunStep const quorum = StepRaidRun(RaidRunPhase::Assemble, facts);
+    CheckPhase("38 with 4 tanks and 10 healers enters", quorum.phase, RaidRunPhase::Enter);
+    Check("with no shortfall to log", quorum.shortfall.empty());
+
+    facts.assembledTanks = 1;
+    RaidRunStep const noTanks = StepRaidRun(RaidRunPhase::Assemble, facts);
+    CheckPhase("38 with one tank stays ASSEMBLE", noTanks.phase, RaidRunPhase::Assemble);
+    CheckString("and the shortfall is the tanks", noTanks.shortfall.c_str(),
+                "38 of 40, short 2 tanks");
+
+    facts = Ready();
+    facts.assembledHealers = 7;
+    facts.heldSeconds = RAID_ASSEMBLE_WAIT_SECONDS;
+    CheckPhase("one healer under the floor stays ASSEMBLE",
+               StepRaidRun(RaidRunPhase::Assemble, facts).phase, RaidRunPhase::Assemble);
+
+    facts = Ready();
+    facts.assembled = 35;
+    facts.inWorld = 35;
+    facts.heldSeconds = RAID_ASSEMBLE_WAIT_SECONDS;
+    CheckPhase("35 of 40 is one under the floor", StepRaidRun(RaidRunPhase::Assemble, facts).phase,
+               RaidRunPhase::Assemble);
+    facts.assembled = 36;
+    facts.inWorld = 36;
+    CheckPhase("36 of 40 is the floor", StepRaidRun(RaidRunPhase::Assemble, facts).phase,
+               RaidRunPhase::Enter);
+
+    facts.assembled = 20;
+    facts.inWorld = 38;
+    facts.heldSeconds = 60;
+    CheckPhase("before the wait ends a short raid waits quietly",
+               StepRaidRun(RaidRunPhase::Assemble, facts).phase, RaidRunPhase::Assemble);
+    Check("with nothing to log yet", StepRaidRun(RaidRunPhase::Assemble, facts).shortfall.empty());
+
+    facts.heldSeconds = RAID_ASSEMBLE_WAIT_SECONDS + OverseerDecisions::RAID_QUORUM_EXTRA_WAIT_SECONDS - 1;
+    CheckPhase("inside the second wait it still holds",
+               StepRaidRun(RaidRunPhase::Assemble, facts).phase, RaidRunPhase::Assemble);
+    facts.heldSeconds = RAID_ASSEMBLE_WAIT_SECONDS + OverseerDecisions::RAID_QUORUM_EXTRA_WAIT_SECONDS;
+    RaidRunStep const ended = StepRaidRun(RaidRunPhase::Assemble, facts);
+    CheckPhase("after the second wait the run is Idle", ended.phase, RaidRunPhase::Idle);
+    Check("the raid is released", ended.release);
+    Check("and the quorum is the named reason", ended.quorumEnds);
+
+    RaidRunFacts after = Ready();
+    after.quorumEnded = true;
+    RaidRunStep const idle = StepRaidRun(RaidRunPhase::Idle, after);
+    CheckPhase("an order ended for want of a quorum does not re-form", idle.phase,
+               RaidRunPhase::Idle);
+    Check("and forms nothing", !idle.form);
 }
 
 void TheHeadCrossesLast()
@@ -531,7 +607,7 @@ void EveryRaiderIsWalkedToTheDoorAndTheWaitScalesWithTheFarthest()
           RaidAssembleWaitSeconds(3) ==
               RAID_ASSEMBLE_WAIT_SECONDS + RAID_ASSEMBLE_CROSSING_EXTRA_SECONDS);
 
-    facts.assembled = 20;
+    facts.assembled = 36;
     facts.heldSeconds = RAID_ASSEMBLE_WAIT_SECONDS;
     facts.awayOnOtherMap = 5;
     RaidRunStep const abroad = StepRaidRun(RaidRunPhase::Assemble, facts);
@@ -792,6 +868,7 @@ int main()
     AHeadWithoutAClientHoldsTheRunWhereItIs();
     AnOrderFormsFirstAndKeepsFormingWhileSeatsCanJoin();
     AssembleWaitsForTheRaidThenForNobodyForever();
+    TheRaidEntersOnlyWithAQuorumAtTheDoor();
     TheHeadCrossesLast();
     InsideHoldsAndLetsStragglersThrough();
     ARaidMapIsNotArmedUntilClearingIsOrdered();
