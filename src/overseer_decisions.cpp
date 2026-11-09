@@ -263,6 +263,27 @@ DeathHitAccount AccountForDeathHits(DeathHitRing const& ring, std::int64_t death
     account.maxMana = last.maxMana;
     account.inCombat = last.inCombat;
     account.enemiesEngaged = last.enemiesEngaged;
+    account.attackers = last.attackers;
+    account.movement = last.movement;
+    account.controller = last.controller;
+    account.pet = last.pet;
+    // A few seconds earlier: the oldest hit within DEATH_EARLIER_WINDOW_MS of
+    // the newest one, never the newest itself.
+    for (DeathHit const* hit : inWindow)
+    {
+        if (hit == &last)
+            break;
+        if (last.atMs - hit->atMs <= DEATH_EARLIER_WINDOW_MS)
+        {
+            account.earlierSeen = true;
+            account.earlierSeconds = static_cast<std::uint32_t>((last.atMs - hit->atMs) / 1000);
+            account.earlierHealth = hit->healthBefore;
+            account.earlierMaxHealth = hit->maxHealth;
+            account.earlierMana = hit->manaBefore;
+            account.earlierMaxMana = hit->maxMana;
+            break;
+        }
+    }
     for (auto it = inWindow.rbegin(); it != inWindow.rend() && account.targetedBy.empty(); ++it)
         account.targetedBy = (*it)->targetedBy;
     std::size_t const first =
@@ -276,6 +297,66 @@ DeathHitAccount AccountForDeathHits(DeathHitRing const& ring, std::int64_t death
         account.damage.push_back(std::move(taken));
     }
     return account;
+}
+
+std::string NameThePetState(PetFacts const& facts)
+{
+    if (!facts.petClass)
+        return "not a pet class";
+    if (facts.out)
+        return facts.alive ? "out" : "out and dead";
+    return facts.unsummoned ? "put away" : "none summoned";
+}
+
+std::string NameTheController(ControllerFacts const& facts)
+{
+    if (!facts.bot)
+        return "a player";
+    if (facts.stay)
+        return "a playerbot on 'stay'";
+    if (facts.follow)
+        return "a playerbot on 'follow'";
+    if (facts.newRpg)
+        return "a playerbot on 'new rpg'";
+    if (facts.grind)
+        return "a playerbot on 'grind'";
+    return "a playerbot with no movement strategy";
+}
+
+namespace
+{
+// "41%" of a bar; "no bar" when the pool is 0.
+std::string Percent(std::uint32_t value, std::uint32_t maximum)
+{
+    if (!maximum)
+        return "no bar";
+    return std::to_string(static_cast<std::uint64_t>(value) * 100 / maximum) + "%";
+}
+}  // namespace
+
+std::string GuildDeathAttackers(DeathHitAccount const& account)
+{
+    return account.seen ? std::to_string(account.attackers) : std::string("unsampled");
+}
+
+std::string GuildDeathTelemetry(DeathHitAccount const& account)
+{
+    if (!account.seen)
+        return ", mover, pet, health and mana unsampled (no hit seen in the last " +
+               std::to_string(DEATH_HIT_WINDOW_MS / 1000) + "s)";
+    std::ostringstream out;
+    out << ", moved by " << (account.controller.empty() ? std::string("an unread controller") : account.controller)
+        << " (movement '" << MoveGeneratorName(account.movement) << "'), pet "
+        << (account.pet.empty() ? std::string("unread") : account.pet) << ", health "
+        << Percent(account.healthBefore, account.maxHealth) << " at the last hit";
+    if (account.earlierSeen)
+        out << " (" << Percent(account.earlierHealth, account.earlierMaxHealth) << " "
+            << account.earlierSeconds << "s before)";
+    out << ", mana " << Percent(account.manaBefore, account.maxMana);
+    if (account.earlierSeen && account.earlierMaxMana)
+        out << " (" << Percent(account.earlierMana, account.earlierMaxMana) << " "
+            << account.earlierSeconds << "s before)";
+    return out.str();
 }
 
 std::string DeathSampleLine(std::string const& name, unsigned mapId, DeathHitAccount const& account)

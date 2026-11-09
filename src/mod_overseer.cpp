@@ -5513,15 +5513,44 @@ static void NoteDeathHit(Unit* attacker, Player* hurt, uint32 damage, bool famil
     hit.manaBefore = hit.maxMana ? hurt->GetPower(POWER_MANA) : 0;
     hit.inCombat = hurt->IsInCombat();
     hit.enemiesEngaged = static_cast<uint32>(hurt->GetCombatManager().GetPvECombatRefs().size());
-    // The killing blow: who had this member as its target, while the list
-    // still exists.
-    if (damage >= hit.healthBefore)
+    // Who has this member as its target, counted on EVERY hit because the
+    // guild death line is written after the core has emptied the list (#1468),
+    // and named on the killing blow only.
     {
         std::vector<std::string> names;
         for (Unit* who : hurt->getAttackers())
             if (who && who->GetVictim() == hurt)
                 names.push_back(who->GetName());
-        hit.targetedBy = OverseerDecisions::NameTheAttackers(names);
+        hit.attackers = static_cast<uint32>(names.size());
+        if (damage >= hit.healthBefore)
+            hit.targetedBy = OverseerDecisions::NameTheAttackers(names);
+    }
+    // What was moving it and who was in charge, and whether its pet was out
+    // (#1468): the motion master is cleared and the pet dismissed by the time
+    // any death hook runs.
+    if (MotionMaster const* motion = hurt->GetMotionMaster())
+        hit.movement = FoldMovementGenerator(motion->GetCurrentMovementGeneratorType());
+    {
+        OverseerDecisions::ControllerFacts controller;
+        if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(hurt))
+        {
+            controller.bot = true;
+            controller.stay = botAI->HasStrategy("stay", BOT_STATE_NON_COMBAT);
+            controller.follow = botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT);
+            controller.newRpg = botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT);
+            controller.grind = botAI->HasStrategy("grind", BOT_STATE_NON_COMBAT);
+        }
+        hit.controller = OverseerDecisions::NameTheController(controller);
+        OverseerDecisions::PetFacts pet;
+        pet.petClass = hurt->getClass() == CLASS_WARLOCK || hurt->getClass() == CLASS_HUNTER;
+        if (Pet* const out = hurt->GetPet())
+        {
+            pet.out = true;
+            pet.alive = out->IsAlive();
+        }
+        else
+            pet.unsummoned = hurt->GetTemporaryUnsummonedPetNumber() != 0;
+        hit.pet = OverseerDecisions::NameThePetState(pet);
     }
     std::lock_guard<std::mutex> guard(g_deathHitMutex);
     OverseerDecisions::RememberDeathHit(g_deathHits[hurt->GetGUID().GetCounter()], std::move(hit));
@@ -5560,6 +5589,18 @@ static OverseerDecisions::DeathHitAccount TakeDeathHits(uint32 guid)
         OverseerDecisions::AccountForDeathHits(it->second, now);
     g_deathHits.erase(it);
     return account;
+}
+
+// The account of `guid`'s last hits, left in place: the guild death line is
+// written from a kill hook, and RecordDeath takes the ring afterwards.
+static OverseerDecisions::DeathHitAccount PeekDeathHits(uint32 guid)
+{
+    std::int64_t const now = static_cast<std::int64_t>(GameTime::GetGameTimeMS().count());
+    std::lock_guard<std::mutex> guard(g_deathHitMutex);
+    auto const it = g_deathHits.find(guid);
+    if (it == g_deathHits.end())
+        return {};
+    return OverseerDecisions::AccountForDeathHits(it->second, now);
 }
 
 // A death is never coalesced, unlike g_eventQueue. Every keyed queue in this
@@ -5622,14 +5663,20 @@ static void LogGuildDeath(Player* killed, char const* kind, std::string const& k
             ilvl += item->GetTemplate()->ItemLevel;
             ++items;
         }
+    // The attackers, the mover, the pet and the health come from the damage
+    // hook's last hits, not from the dead Player: the core has emptied the
+    // attacker list and cleared the motion master before this hook runs, which
+    // is why this line said "0 attacker(s)" for every death (#1468).
+    OverseerDecisions::DeathHitAccount const hits = PeekDeathHits(killed->GetGUID().GetCounter());
     LOG_INFO("module.overseer",
              "overseer: guild death - '{}' (level {}, class {}, {} max health, {} item(s) "
              "averaging item level {}) killed by {} '{}' (entry {}, level {}, rank {}) with {} "
-             "attacker(s) on it, map {} zone {}{}",
+             "attacker(s) on it, map {} zone {}{}{}",
              killed->GetName(), killed->GetLevel(), killed->getClass(), killed->GetMaxHealth(),
              items, items ? ilvl / items : 0, kind, killerName, killerEntry, killerLevel,
-             killerRank, killed->getAttackers().size(), killed->GetMapId(), killed->GetZoneId(),
-             killed->GetGroup() ? ", grouped" : "");
+             killerRank, OverseerDecisions::GuildDeathAttackers(hits), killed->GetMapId(),
+             killed->GetZoneId(), killed->GetGroup() ? ", grouped" : "",
+             OverseerDecisions::GuildDeathTelemetry(hits));
     // Killed by something far above it: remembered for LeaveGuildDeathSpot,
     // which sends the member home after this first death (2026-10-10).
     std::string const memberName = killed->GetName();
@@ -5917,6 +5964,15 @@ void RecordDeath(Player* player)
                 d.leaderZ = leader->second.z;
             }
         }
+    }
+    // A member nobody samples on the snapshot (a natural guild member) has no
+    // movement history; the damage hook's last hit supplies it (#1468), so the
+    // row and the log line stop saying "unknown" and ''.
+    if (!attribution.sampled && hits.seen && hits.movement != OverseerDecisions::MoveGenerator::Unsampled)
+    {
+        attribution.sampled = true;
+        attribution.movement = hits.movement;
+        d.movement = OverseerDecisions::MoveGeneratorName(hits.movement);
     }
     d.driver = OverseerDecisions::DeathDriverName(
         OverseerDecisions::NameTheDriver(attribution));
