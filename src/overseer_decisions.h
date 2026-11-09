@@ -19537,6 +19537,62 @@ RaidPullSeatStep RaidPullSeatRepairStep(unsigned lowestDurabilityPct, unsigned f
                                         bool holdTimedOut, bool alreadyAttempted,
                                         bool repairerInReach);
 
+// -- consumables before the Majordomo and Ragnaros pulls (#1460) ---------------
+//
+// A seat carries Greater Fire Protection Potions and flasks (the stock the raid
+// page counts), and nothing used them. This is the TABLE of what the run uses,
+// not a use-any-item verb: each entry is one item, the aura it leaves, and the
+// group of auras it competes with. Making or buying them is not here.
+enum class RaidConsumableGroup { FireProtection, Flask, Elixir };
+
+struct RaidConsumable
+{
+    std::uint32_t itemEntry;
+    std::uint32_t auraSpell;
+    RaidConsumableGroup group;
+    char const* name;
+};
+
+std::vector<RaidConsumable> const& RaidConsumableTable();
+
+// An aura with less than this left is used again at the pull hold: a flask
+// lasts about two hours and a potion or elixir about one on 3.3.5.
+constexpr long RAID_CONSUMABLE_MIN_REMAINING_SECONDS = 600;
+
+// What one seat reads before a pull. `carried` maps item entry to count;
+// `auraSecondsLeft` maps a spell id to the seconds left on it (absent means the
+// aura is not on the seat); `tried` holds item entries already used for this
+// pull, so a refused or lost use is not repeated for ever.
+struct RaidConsumableSeatFacts
+{
+    bool inCombat = false;
+    std::map<std::uint32_t, unsigned> carried;
+    std::map<std::uint32_t, long> auraSecondsLeft;
+    std::set<std::uint32_t> tried;
+};
+
+// NothingToUse: no listed consumable is carried (never holds the pull).
+// Satisfied: every carried group has an aura with time to spare, or was tried.
+// Combat: something is owed but the seat is fighting; wait, use nothing.
+// Use: use `item` now.
+enum class RaidConsumableStep { NothingToUse, Satisfied, Combat, Use };
+
+struct RaidConsumableDecision
+{
+    RaidConsumableStep step = RaidConsumableStep::NothingToUse;
+    RaidConsumable const* item = nullptr;
+};
+
+RaidConsumableDecision RaidSeatConsumableStep(RaidConsumableSeatFacts const& facts,
+                                              long minRemainingSeconds);
+
+// Use and Combat hold the pull; NothingToUse and Satisfied do not.
+bool RaidConsumableHoldsPull(RaidConsumableStep step);
+
+// The boss a pull hold is before ("Majordomo Executus" for 8 bosses done,
+// "Ragnaros" for 9), empty for any other count.
+char const* RaidPullBossName(unsigned bossesDone);
+
 // One poll of the raid run.
 //
 // THE ORDER OF THE CHECKS IS THE ORDER OF THE THINGS THAT OVERRIDE EACH OTHER.
