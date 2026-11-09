@@ -5541,10 +5541,29 @@ bool GearPieceForRole(GearItem const& item, GearRole role)
     float total = armour + DpsWeight(role) * item.dps;
     float own = role == GearRole::Tank ? armour : 0.f;
     bool healerStat = false;
+    // A TANK'S PIECE IS NOT READ OFF ARMOUR AND STAMINA ALONE (#1475). A stat
+    // a tank prices at zero never enters `total`, so it cannot dilute the
+    // share below either: epic mail gloves of spirit and intellect scored as
+    // all survival to the tank who was handed them, because nothing he could
+    // not use was ever counted. So the stats are read as a budget as well: a
+    // caster stat is one a tank prices at nothing and a healer or a caster
+    // prices above nothing, and a piece whose every non-stamina stat is one
+    // is a caster's piece wearing armour, not a tank's.
+    bool nonStaminaStat = false;
+    bool everyNonStaminaIsCaster = true;
     for (GearStat const& stat : item.stats)
     {
         if (stat.value <= 0)
             continue;
+        if (stat.type != MOD_STAMINA)
+        {
+            nonStaminaStat = true;
+            bool const casterStat = StatWeight(GearRole::Tank, stat.type) == 0.f &&
+                                    (StatWeight(GearRole::Healer, stat.type) > 0.f ||
+                                     StatWeight(GearRole::Caster, stat.type) > 0.f);
+            if (!casterStat)
+                everyNonStaminaIsCaster = false;
+        }
         float const worth = StatWeight(role, stat.type) * static_cast<float>(stat.value);
         total += worth;
         bool counts = false;
@@ -5563,9 +5582,49 @@ bool GearPieceForRole(GearItem const& item, GearRole role)
         if (counts)
             own += worth;
     }
+    if (role == GearRole::Tank && nonStaminaStat && everyNonStaminaIsCaster)
+        return false;
     if (total <= 0.f || own * 2.f < total)
         return false;
     return role == GearRole::Tank || healerStat;
+}
+
+bool GearOwnArmourClass(GearItem const& item, GearWearer const& who)
+{
+    // A cloak, a tabard and a shirt are filed under an armour subclass and
+    // worn by every class regardless; the core exempts them from the
+    // proficiency rule (see ArmourProficient), and none of them is the
+    // armour a class wears as its own.
+    if (item.itemClass != CLASS_ARMOUR || item.inventoryType == INV_CLOAK ||
+        item.inventoryType == INV_TABARD || item.inventoryType == INV_BODY)
+        return false;
+    switch (item.subClass)
+    {
+        case ARMOUR_CLOTH: return who.cloth && !who.leather && !who.mail && !who.plate;
+        case ARMOUR_LEATHER: return who.leather && !who.mail && !who.plate;
+        case ARMOUR_MAIL: return who.mail && !who.plate;
+        case ARMOUR_PLATE: return who.plate;
+        default: return false;  // a shield, a relic, a ring: no class's own
+    }
+}
+
+bool GearStatsFitRole(GearItem const& item, GearRole role)
+{
+    // Half a point of armour per point of stat is the line between a stat a
+    // role builds on and one it merely tolerates: a tank prices crit at
+    // exactly that and attack power below it, and neither makes a piece fit
+    // him. The same line the bridge's gate reads, so the two halves of the
+    // council judge a fit the same way.
+    if (role == GearRole::Unknown)
+        return false;
+    for (GearStat const& stat : item.stats)
+    {
+        if (stat.value <= 0 || stat.type == MOD_STAMINA)
+            continue;
+        if (StatWeight(role, stat.type) > 0.5f)
+            return true;
+    }
+    return false;
 }
 
 float GearIncumbent(float mainHandScore, float offHandScore, bool takesBothHands)
@@ -6110,14 +6169,42 @@ LootCouncilPick LootCouncilHeuristic(std::vector<LootCandidate> const& candidate
               });
 
     LootCouncilPick pick;
-    for (LootCandidate const* c : eligible)
-        pick.ranked.push_back(c->name);
     if (eligible.empty())
     {
         pick.why = "it is not an upgrade for anybody who could take it";
         return pick;
     }
-    LootCandidate const& best = *eligible.front();
+
+    // THE ARMOUR FIT GATE (#1475). The order above once handed epic mail
+    // gloves to the plate-wearing main tank on his first call, over the
+    // family's shaman whose own armour mail is and whose role the gloves'
+    // stats fit: nothing in the ranking knew whose armour mail was. So a
+    // member the order puts first whose own armour the drop is not is never
+    // named while a member stands among those it upgrades whose own armour
+    // it is and whose role its stats fit - and who is at least as certain
+    // an upgrade, since a certain upgrade outranks an unsettled one here
+    // as everywhere else in this council. The fitted member is named
+    // instead, and heads the ranking. When the first member's armour is
+    // his own, or nobody fits - a weapon, a shield, a group whose classes
+    // are still growing into their armour - the gate stays silent and the
+    // order runs as it always has.
+    LootCandidate const* const stoodFirst = eligible.front();
+    LootCandidate const* chosen = stoodFirst;
+    if (!stoodFirst->ownArmour)
+        for (LootCandidate const* c : eligible)
+            if (c->ownArmour && c->statsFit &&
+                LootCouncilCertainty(*c) <= LootCouncilCertainty(*stoodFirst))
+            {
+                chosen = c;
+                break;
+            }
+    bool const gated = chosen != stoodFirst;
+    if (gated)
+        pick.ranked.push_back(chosen->name);
+    for (LootCandidate const* c : eligible)
+        if (!gated || c != chosen)
+            pick.ranked.push_back(c->name);
+    LootCandidate const& best = *chosen;
     pick.recipient = best.name;
     std::string const who = best.family ? "the family" : "the guild's raiders";
     std::string const role = best.role.empty() || best.role == "unknown"
@@ -6154,6 +6241,21 @@ LootCouncilPick LootCouncilHeuristic(std::vector<LootCandidate> const& candidate
     else
         pick.why = "an upgrade in " + who + role +
                    " the numbers cannot settle (" + best.why + "), and nobody gains more";
+    if (gated)
+    {
+        // Only what is true of the member passed over: the gate fired on
+        // the armour class, and the stats are named only when they failed
+        // him too.
+        std::string const stoodRole =
+            stoodFirst->role.empty() || stoodFirst->role == "unknown"
+                ? std::string()
+                : " as a " + stoodFirst->role;
+        pick.why += "; not " + stoodFirst->name + ": the armour class is not " +
+                    stoodFirst->name + "'s own";
+        if (!stoodFirst->statsFit)
+            pick.why += " and its stats do not fit " + stoodFirst->name + stoodRole;
+        pick.why += "; its stats fit " + best.name + role;
+    }
     return pick;
 }
 
