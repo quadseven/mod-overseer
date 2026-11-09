@@ -495,6 +495,79 @@ void TheEnterRowSaysWhoReachedTheDoor()
 
 }  // namespace
 
+void TheTimelineNamesEachBossAndTheWipe()
+{
+    using namespace OverseerDecisions;
+    typedef std::vector<uint8_t> Slots;
+    Check("slot 0 is Lucifron", RaidBossName("moltencore", 0) == "Lucifron");
+    Check("slot 5 is Baron Geddon", RaidBossName("moltencore", 5) == "Baron Geddon");
+    Check("slot 8 is Majordomo", RaidBossName("moltencore", 8) == "Majordomo Executus");
+    Check("slot 9 is Ragnaros", RaidBossName("moltencore", 9) == "Ragnaros");
+    Check("slot 10 has no name", RaidBossName("moltencore", 10).empty());
+    Check("another door has no names", RaidBossName("ubrs", 9).empty());
+
+    Slots none(10, RAID_SLOT_IDLE);
+    Slots lucifron = none;
+    lucifron[0] = RAID_SLOT_DONE;
+    Slots both = lucifron;
+    both[8] = RAID_SLOT_DONE;
+    both[9] = RAID_SLOT_DONE;
+    Check("no change credits nothing", RaidBossesCredited("moltencore", none, none).empty());
+    std::vector<std::string> const one = RaidBossesCredited("moltencore", none, lucifron);
+    Check("one new DONE is one name", one.size() == 1 && one[0] == "Lucifron");
+    std::vector<std::string> const two = RaidBossesCredited("moltencore", lucifron, both);
+    Check("Majordomo and Ragnaros are named in script order",
+          two.size() == 2 && two[0] == "Majordomo Executus" && two[1] == "Ragnaros");
+    Check("a lost DONE is no credit", RaidBossesCredited("moltencore", both, none).empty());
+    Check("an empty baseline credits nothing",
+          RaidBossesCredited("moltencore", Slots(), both).empty());
+
+    Slots geddon = lucifron;
+    geddon[5] = RAID_SLOT_IN_PROGRESS;
+    CheckString("in progress wins", std::to_string(RaidFightingSlot(-1, geddon)), "5");
+    CheckString("a wiped boss back to idle is still remembered",
+                std::to_string(RaidFightingSlot(5, lucifron)), "5");
+    CheckString("a killed boss is forgotten", std::to_string(RaidFightingSlot(0, lucifron)),
+                "-1");
+    CheckString("wipe names the boss", RaidWipeOn("moltencore", 5), "wipe on Baron Geddon");
+    CheckString("wipe with no fight is trash", RaidWipeOn("moltencore", -1), "wipe on trash");
+    CheckString("a door with no names says nothing", RaidWipeOn("ubrs", 3), "");
+
+    RaidTimelineSnapshot before;
+    before.phase = "CLEAR";
+    before.keyword = "moltencore";
+    before.bossesTotal = 10;
+    before.slots = none;
+    RaidTimelineSnapshot after = before;
+    after.bossesDone = 1;
+    after.slots = lucifron;
+    std::vector<RunTimelineEvent> const rows = RaidTimelineEvents(before, after);
+    Check("the count row stays and the name row follows", rows.size() == 2);
+    if (rows.size() == 2)
+    {
+        CheckString("count text kept", rows[0].detail, "1 encounter done, 1 of 10 in all");
+        CheckString("boss kind", rows[1].kind, "boss");
+        CheckString("name row", rows[1].detail, "Lucifron done");
+    }
+
+    RaidTimelineSnapshot wiped = after;
+    wiped.wipes = 1;
+    wiped.fighting = -1;
+    after.fighting = 5;
+    std::vector<RunTimelineEvent> const wipe = RaidTimelineEvents(after, wiped);
+    Check("a wipe is one row", wipe.size() == 1);
+    if (wipe.size() == 1)
+        CheckString("wipe names the boss from before", wipe[0].detail,
+                    "wipe on Baron Geddon: the raid wiped (wipe 1)");
+    after.fighting = -1;
+    std::vector<RunTimelineEvent> const trash = RaidTimelineEvents(after, wiped);
+    if (trash.size() == 1)
+        CheckString("a wipe with no fight is trash", trash[0].detail,
+                    "wipe on trash: the raid wiped (wipe 1)");
+    else
+        Check("a trash wipe is one row", false);
+}
+
 int main()
 {
     TheNamesAreThePhases();
@@ -508,6 +581,7 @@ int main()
     AnEndedOrderStillReleasesFromInside();
     TheTimelineWritesEachStepOnce();
     TheEnterRowSaysWhoReachedTheDoor();
+    TheTimelineNamesEachBossAndTheWipe();
 
     if (failures)
     {

@@ -53627,6 +53627,8 @@ private:
         // The instance script's encounters, DONE and in all, as last read.
         unsigned bossesDone{0};
         unsigned bossesTotal{0};
+        // The boss slots as last read (#1459), for the timeline's boss names.
+        std::vector<uint8_t> slotStates;
         // Who was at the door when ASSEMBLE ended (#1207), for the timeline's
         // ASSEMBLE -> ENTER row: members within RAID_ASSEMBLE_YARDS of the
         // staging point, the head included, and the raid's members.
@@ -54176,7 +54178,8 @@ private:
     // including the two the script summons, so DONE here is what the instance
     // itself believes. Nobody inside to read it through is zero of zero.
     static void RaidEncounters(Group* group, OverseerDecisions::RaidDoor const* door,
-                               unsigned& done, unsigned& total)
+                               unsigned& done, unsigned& total,
+                               std::vector<uint8_t>* states = nullptr)
     {
         done = 0;
         total = 0;
@@ -54193,8 +54196,17 @@ private:
             if (!script)
                 continue;
             std::vector<bool> slots(script->GetEncounterCount(), false);
+            if (states)
+                states->assign(slots.size(), OverseerDecisions::RAID_SLOT_IDLE);
             for (uint32 slot = 0; slot < slots.size(); ++slot)
-                slots[slot] = script->GetBossState(slot) == DONE;
+            {
+                EncounterState const state = script->GetBossState(slot);
+                slots[slot] = state == DONE;
+                if (states && state == DONE)
+                    (*states)[slot] = OverseerDecisions::RAID_SLOT_DONE;
+                else if (states && state == IN_PROGRESS)
+                    (*states)[slot] = OverseerDecisions::RAID_SLOT_IN_PROGRESS;
+            }
             OverseerDecisions::RaidClearCount const count =
                 OverseerDecisions::RaidClearProgress(*door, slots);
             done = count.done;
@@ -54544,6 +54556,7 @@ private:
         snap.cleared = run.bossesTotal && run.bossesDone >= run.bossesTotal;
         snap.atDoor = run.atDoor;
         snap.inRaid = run.inRaid;
+        snap.slots = run.slotStates;
         return snap;
     }
 
@@ -54554,8 +54567,13 @@ private:
         OverseerDecisions::RaidTimelineSnapshot& seen = _raidTimelineSeen[roster.family];
         if (now.keyword.empty())
             now.keyword = seen.keyword;
+        // The fight is remembered across polls: a wiped boss is back to idle by
+        // the time the wipe is seen. A wipe forgets it once its row is made.
+        now.fighting = OverseerDecisions::RaidFightingSlot(seen.fighting, now.slots);
         std::vector<OverseerDecisions::RunTimelineEvent> events =
             OverseerDecisions::RaidTimelineEvents(seen, now);
+        if (now.wipes > seen.wipes)
+            now.fighting = OverseerDecisions::RaidFightingSlot(-1, now.slots);
         if (!events.empty())
         {
             // The dungeon run row the arming drive opened for the raid map, when
@@ -54846,8 +54864,9 @@ private:
             // The instance's own credit, and CLEAR's stall ladder on it.
             unsigned bossesDone = 0;
             unsigned bossesTotal = 0;
+            std::vector<uint8_t> slotStates;
             if (facts.raidFormed && door)
-                RaidEncounters(group, door, bossesDone, bossesTotal);
+                RaidEncounters(group, door, bossesDone, bossesTotal, &slotStates);
             facts.cleared = bossesTotal > 0 && bossesDone >= bossesTotal;
 
             // Read the seats before every next encounter. A boss count advances
@@ -55039,6 +55058,7 @@ private:
                              roster.family, bossesDone, bossesTotal, door ? door->name : "?");
                 run.bossesDone = bossesDone;
                 run.bossesTotal = bossesTotal;
+                run.slotStates = slotStates;
             }
 
             if (facts.ordered && seats.empty() && run.phase == RaidRunPhase::Idle)
