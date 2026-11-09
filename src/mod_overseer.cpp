@@ -38136,6 +38136,15 @@ private:
         OverseerDecisions::RatchetState assembly;
         // The patience the assembly clock last ran under (#1316).
         time_t assemblyPatience{DUNGEON_STAGED_INSIDE_BACKSTOP_SECONDS};
+        // The patience the split warning last STATED (#1472), so the line is
+        // said again when the number it carries changes. Zero until said.
+        time_t warnedPatience{0};
+        // Said once per stretch: the run is held past the ceiling because four or
+        // more members inside are fighting or crediting bosses (#1472).
+        bool loggedSplitHeld{false};
+        // When each stranded member's walk back to the door began, for the
+        // bound after which its stone is used (#1472).
+        std::map<std::string, time_t> strandedWalkSince;
         // THE STAGING WATCHDOG'S PER-MEMBER MEMORY (#164): whether each member
         // is actually closing on the staging point, and how far up the
         // correction ladder it has been taken. It lives on the RUN rather than
@@ -39034,6 +39043,10 @@ private:
         std::set<std::string> hearthedOut;
     };
     std::map<std::string, ExitHearthEpisode> _exitHearths;
+    // A stranded member's hearth episode while the party waits inside for it
+    // (#1472). Keyed by family; the episode's map is the DOOR'S map, where the
+    // member stands, so a stone bound on another continent stays withheld.
+    std::map<std::string, ExitHearthEpisode> _strandedHearths;
     // A family's run that is over while somebody still stands in it, so IDLE walks
     // them out instead of staging the family back in (#1316). Set when a failed EXIT
     // sent the family home and when a run closes split_failed. It outlives a failed
@@ -41964,7 +41977,13 @@ private:
         OverseerDecisions::DungeonWrongSide const stranded =
             OverseerDecisions::DungeonRunWrongSide(states);
         if (stranded.walk.empty() && stranded.wait.empty())
-            return 0;   // nobody is outside on this door's map
+        {
+            // Nobody is outside on this door's map: the next stranding starts
+            // its clocks and its hearth attempts afresh (#1472).
+            coord.strandedWalkSince.clear();
+            _strandedHearths.erase(FamilyOfCharacter(leaderName));
+            return 0;
+        }
 
         // THE SAME QUESTION WalkStragglersOut ASKS, of the entrance (#577).
         // This walk is an `at:` aim under a rejoin escort, and the escort
@@ -42024,8 +42043,95 @@ private:
         // knocking after its run had closed would put one member inside a fresh
         // instance on its own, which is the trickle this module refuses
         // everywhere else.
+        //
+        // A WALK THAT CANNOT GET THERE USES THE STONE (#1472). A caster released
+        // at the Blackrock Mountain graveyard stalled about 350 yards from the
+        // door with every bearing refused, and was re-aimed at the same door for
+        // the whole of the run's ceiling. A player whose walk cannot be done
+        // hearths and walks from the inn, as a failed walk OUT already does
+        // (the evacuation above). After STRANDED_WALK_BACK_BOUND_SECONDS, or
+        // sooner when the ground gave the walk up, a member with a usable
+        // stone is cast for through the existing hearth drive; one without
+        // keeps its walk. The stone is withheld when it is bound off the door's
+        // continent (#1388), so this never strands a member across the sea.
+        std::string const family = FamilyOfCharacter(leaderName);
+        ExitHearthEpisode& episode = _strandedHearths[family];
+        if (episode.mapId != door->map)
+        {
+            episode = ExitHearthEpisode();
+            episode.mapId = door->map;
+            episode.doorMapKnown = true;
+            episode.doorMapId = door->map;
+            episode.since = std::time(nullptr);
+        }
+        time_t const walkNow = std::time(nullptr);
+        std::vector<std::string> hearthers;
+        // A member that is no longer being walked (it got through, or is not
+        // alive) loses its clock, so a later stranding starts a fair walk of
+        // its own rather than inheriting the old one's age.
+        for (auto clock = coord.strandedWalkSince.begin();
+             clock != coord.strandedWalkSince.end();)
+            clock = std::find(stranded.walk.begin(), stranded.walk.end(), clock->first) ==
+                            stranded.walk.end()
+                ? coord.strandedWalkSince.erase(clock)
+                : std::next(clock);
         for (std::string const& name : stranded.walk)
-            RejoinToward(name, doorAim, arriveWithin, portal.insideMapId);
+        {
+            time_t const walkSince = coord.strandedWalkSince.emplace(name, walkNow).first->second;
+            auto const gaveUp = _strandedGroundGiveUp.find(name);
+            bool way = false;
+            if (OverseerDecisions::StrandedWalkBackFailed(
+                    walkSince, gaveUp == _strandedGroundGiveUp.end() ? 0 : gaveUp->second,
+                    walkNow))
+            {
+                Player* bot = ObjectAccessor::FindPlayerByName(name);
+                OverseerDecisions::ExitHearthFacts facts;
+                facts.inWorld = bot && bot->IsInWorld();
+                facts.onInsideMap = facts.inWorld && bot->GetMapId() == episode.mapId;
+                if (facts.onInsideMap)
+                {
+                    uint32 const spellId = HearthstoneSpellOf(bot);
+                    facts.alive = bot->IsAlive();
+                    facts.carriesStone = spellId != 0;
+                    facts.onCooldown = spellId && bot->HasSpellCooldown(spellId);
+                    facts.inCombat = bot->IsInCombat();
+                    facts.moving = bot->isMoving();
+                    facts.pending = HearthPendingFor(name);
+                    facts.attempts = episode.attempts[name];
+                    facts.doorMapKnown = true;
+                    facts.doorMapId = episode.doorMapId;
+                    facts.bindMapId = static_cast<uint32_t>(bot->m_homebindMapId);
+                    facts.standinGuest = IsStandinGuest(name);
+                }
+                way = OverseerDecisions::DecideEvacuationWay(
+                          true, OverseerDecisions::ExitFailureHearthStep(facts)) ==
+                      OverseerDecisions::EvacuationWay::Hearth;
+            }
+            if (way)
+            {
+                hearthers.push_back(name);
+                // Stop being walked: the lease is ended so the escort does not
+                // keep the member moving under the cast.
+                auto const lease = _dungeonEscorts.find(name);
+                if (lease != _dungeonEscorts.end() && lease->second.rejoin)
+                {
+                    EndOneEscort(name, lease->second.granted);
+                    _dungeonEscorts.erase(lease);
+                }
+            }
+            else
+                RejoinToward(name, doorAim, arriveWithin, portal.insideMapId);
+        }
+        if (!hearthers.empty())
+        {
+            if (!episode.runId)
+                episode.runId = coord.runId ? coord.runId : ActiveRunIdOnMap(portal.insideMapId, FamilyOfCoordinator(coord));
+            episode.campaignId = coord.campaignId;
+            episode.runNumber = coord.runNumber;
+            episode.portal = coord.portalKeyword;
+            DriveExitHearths(family, leaderName, hearthers, episode, "STAGED_INSIDE",
+                             "the walk back to the door failed");
+        }
 
         // KNOCKED FOR ONLY THE LIVING, matched back out of the census by name
         // because five names is a list rather than a set - the same matching
@@ -60326,6 +60432,17 @@ private:
                                                    std::time(nullptr), assemblyLimits);
                     if (assembling.progressed)
                         coord.loggedStagedWaiting = false;
+                    // THE LINE STATES THE PATIENCE THE CEILING USES (#1472). It
+                    // was said once with fifteen minutes while the missing
+                    // member was a ghost, and the five minutes a living member
+                    // gets replaced it unannounced, so the close read as
+                    // contradicting its own warning.
+                    if (OverseerDecisions::StagedInsideWarningStale(
+                            coord.warnedPatience, assemblyLimits.patienceSeconds))
+                    {
+                        coord.warnedPatience = assemblyLimits.patienceSeconds;
+                        coord.loggedStagedWaiting = false;
+                    }
 
                     // SOME IN, SOME OUT. Said out loud once rather than held
                     // silently: a party split across a portal is the exact
@@ -60379,7 +60496,57 @@ private:
                     // nobody has got inside for a whole backstop, not that the
                     // phase has merely been running that long. A party that is
                     // still filing in is never touched by it.
-                    if (assembling.stalled)
+                    //
+                    // A PARTY OF FOUR THAT IS FIGHTING IS NOT CLOSED ON IT
+                    // (#1472). A boss credited while the run waits for one
+                    // missing member counts as progress, read here because the
+                    // clearing watchdog that stamps it does not run in this
+                    // phase; the ceiling then waits while four or more inside
+                    // are fighting or have credited a boss in the last two
+                    // minutes, and the hold lapses by itself once they have
+                    // not (SplitFailedHeldByProgress).
+                    time_t const stagedNow = std::time(nullptr);
+                    bool fightingInside = false;
+                    // The credited mask is a set of bits, so what every member
+                    // inside reads is OR-ed together, and a bit not yet in
+                    // `clearEncounters` is a new boss. A mask that shrinks (a
+                    // restored copy) adds no bit and so stamps nothing.
+                    uint32 creditedInside = 0;
+                    for (OverseerDecisions::DungeonRunEntryState const& state : states)
+                    {
+                        if (!state.through)
+                            continue;
+                        fightingInside = fightingInside || state.inCombat;
+                        creditedInside |= CompletedEncounters(
+                            ObjectAccessor::FindPlayerByName(state.name));
+                    }
+                    if (creditedInside & ~coord.clearEncounters)
+                    {
+                        coord.clearEncounters |= creditedInside;
+                        coord.clearAdvancedAt = std::time(nullptr);
+                    }
+                    bool const fightingOn = OverseerDecisions::SplitFailedHeldByProgress(
+                        inside, fightingInside, coord.clearAdvancedAt, stagedNow,
+                        OverseerDecisions::SPLIT_HOLD_FIGHT_CEILING_SECONDS);
+                    if (fightingOn && assembling.stalled && !coord.loggedSplitHeld)
+                    {
+                        coord.loggedSplitHeld = true;
+                        LOG_WARN("module.overseer",
+                                 "overseer: dungeon run {} of campaign {} is NOT closed "
+                                 "'split_failed' although nobody has got in for {} minutes - "
+                                 "{} members are inside map {} and are fighting or credited "
+                                 "a boss in the last {} minutes. Still outside: {}. The "
+                                 "ceiling applies again once they have not",
+                                 coord.runNumber, coord.campaignId,
+                                 static_cast<uint32>(assemblyLimits.patienceSeconds / 60),
+                                 inside, portal->insideMapId,
+                                 static_cast<uint32>(
+                                     OverseerDecisions::SPLIT_HOLD_PROGRESS_SECONDS / 60),
+                                 blockers);
+                    }
+                    else if (!fightingOn)
+                        coord.loggedSplitHeld = false;
+                    if (assembling.stalled && !fightingOn)
                         FailSplitInside(coord, leaderName, members, *portal, inside,
                                         static_cast<uint32>(states.size()), blockers,
                                         IsDungeonJob(leaderJob),

@@ -2744,6 +2744,44 @@ time_t StagedInsideBackstopSeconds(std::vector<DungeonRunEntryState> const& memb
 // shorter patience from now and not from a clock that may already be past it.
 time_t StagedInsideClockAfter(time_t since, time_t oldPatience, time_t patience, time_t now);
 
+// ---------------------------------- a stuck member does not close a fight (#1472)
+//
+// MEASURED ON THE DEV REALM 2026-11-09, TWO BLACKROCK DEPTHS RUNS. A caster died
+// in the arena and took the spirit healer on the mountain. Its walk back to the
+// door stalled about 350 yards short, and after five minutes with nobody else
+// getting in the run was closed 'split_failed'. In one of them that was ten
+// seconds after a boss was credited, with four members inside and fighting. The
+// warning line said fifteen minutes: it was said once, while the member was a
+// ghost, and the living member's five minutes (STAGED_INSIDE_LIVING_MEMBER_SECONDS)
+// replaced the patience without the line being said again.
+//
+// A PARTY OF FOUR OR MORE THAT IS GETTING SOMEWHERE IS NOT A STANDING PARTY. The
+// ceiling exists for five characters standing still with no bound on them; it
+// is not for a party mid-boss that is merely one short. Progress is a boss
+// credited or the leader thirty yards on (the clearing watchdog's own reading,
+// `clearAdvancedAt`). Progress no older than SPLIT_HOLD_PROGRESS_SECONDS always
+// holds; older progress holds only while a member inside is in combat and is
+// still no older than `fightCeilingSeconds`, so a combat flag that never clears
+// cannot hold a run for ever.
+constexpr unsigned SPLIT_HOLD_MIN_INSIDE = 4;
+constexpr time_t SPLIT_HOLD_PROGRESS_SECONDS = 2 * 60;
+constexpr time_t SPLIT_HOLD_FIGHT_CEILING_SECONDS = 15 * 60;
+
+bool SplitFailedHeldByProgress(unsigned inside, bool anyInsideInCombat, time_t advancedAt,
+                               time_t now, time_t fightCeilingSeconds);
+
+// The warning line states the patience the ceiling is using, so it is said
+// again whenever that number changes rather than once with the first one.
+bool StagedInsideWarningStale(time_t warnedPatience, time_t patience);
+
+// HOW LONG A STRANDED MEMBER'S WALK BACK TO THE DOOR MAY RUN WITHOUT GETTING IT
+// THERE before the stone is used instead. Under the run's five minutes, so the
+// hearth has been tried before the ceiling is reached. Same rule as a walk out
+// (EvacuationWalkFailed): a ground give-up after the walk began, or the bound.
+constexpr std::int64_t STRANDED_WALK_BACK_BOUND_SECONDS = 3 * 60;
+bool StrandedWalkBackFailed(std::int64_t walkSince, std::int64_t groundGaveUpAt,
+                            std::int64_t now);
+
 // ------------------------------------------- getting one member back out --
 //
 // A CROSSING WALKS A PARTY THROUGH A DOOR TOGETHER. THIS IS THE OTHER CASE,
