@@ -36,6 +36,7 @@ using OverseerDecisions::EXIT_WALK_FAILING_GAP_SECONDS;
 using OverseerDecisions::ExitWalkFailingSince;
 using OverseerDecisions::OFF_CONTINENT_HEARTH_AFTER_SECONDS;
 using OverseerDecisions::OffContinentHearthLetThrough;
+using OverseerDecisions::SEALED_WALK_HEARTH_AFTER_SECONDS;
 using OverseerDecisions::SitOutHearthDue;
 
 namespace
@@ -225,6 +226,30 @@ int main()
                   "so the stone is withheld and the member is held for the walk out (#1388)");
         CheckBool("and no rule lets it through",
                   OffContinentHearthLetThrough(failed), false);
+
+        // A SEALED WING HEARTHS OUT (#1478). Measured on the dev realm
+        // 2026-11-09: a family in Maraudon's purple wing, every boss credited,
+        // 885 yards from the door with no survey node in reach, looped 65 EXIT
+        // cycles and 321 exit_no_hearth rows because every stone was withheld.
+        ExitHearthFacts sealed = farBind;
+        sealed.failedWalkSeconds = SEALED_WALK_HEARTH_AFTER_SECONDS;
+        CheckStep("a walk that has failed for the sealed bound casts the stone",
+                  ExitFailureHearthStep(sealed), ExitHearthStep::Cast);
+        CheckText("and nothing is impossible about it", ExitHearthImpossibleReason(sealed), "");
+        CheckBool("the let-through is the rule that says so",
+                  OffContinentHearthLetThrough(sealed), true);
+        ExitHearthFacts almost = farBind;
+        almost.failedWalkSeconds = SEALED_WALK_HEARTH_AFTER_SECONDS - 1;
+        CheckStep("a walk still inside the bound keeps the withhold",
+                  ExitFailureHearthStep(almost), ExitHearthStep::Impossible);
+        ExitHearthFacts sealedSpent = sealed;
+        sealedSpent.attempts = EXIT_HEARTH_ATTEMPTS;
+        CheckStep("the let-through is bounded by the attempts",
+                  ExitFailureHearthStep(sealedSpent), ExitHearthStep::Impossible);
+        ExitHearthFacts sealedCooling = sealed;
+        sealedCooling.onCooldown = true;
+        CheckStep("a stone on cooldown is still impossible",
+                  ExitFailureHearthStep(sealedCooling), ExitHearthStep::Impossible);
 
         // A STAND-IN GUEST GOES HOME TO ITS OWN BIND (#1427). Measured on the
         // dev realm 2026-11-08: a guildmate in a family's damage seat, bound

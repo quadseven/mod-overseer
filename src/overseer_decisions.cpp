@@ -20674,16 +20674,21 @@ char const* ExitHearthStepWord(ExitHearthStep step)
 
 bool OffContinentHearthLetThrough(ExitHearthFacts const& facts)
 {
-    // NEVER, SINCE #1388. The let-through (#1202, #1316) hearthed a member to a
-    // bind on the other continent once its walk out had failed for ten minutes
-    // or the family had hearthed away, and that is what split the families: a
-    // family bound wholly on the other continent went home across the ocean on
-    // every failed walk out (`went home: map 70 to map 1` 17 times in 48 hours).
-    // The member is held on the walk out instead, and the home bind drive gives
-    // the family an inn on the door's continent (overseer_door_inns.h), so the
-    // stone leads somewhere the family can regroup from.
-    (void)facts;
-    return false;
+    // NEVER, SINCE #1388, EXCEPT FOR A PARTY THAT CANNOT WALK OUT AT ALL (#1478).
+    // The let-through (#1202, #1316) hearthed a member to a bind on the other
+    // continent once its walk out had failed for ten minutes or the family had
+    // hearthed away, and that is what split the families: a family bound wholly
+    // on the other continent went home across the ocean on every failed walk out
+    // (`went home: map 70 to map 1` 17 times in 48 hours). The member is held on
+    // the walk out instead, and the home bind drive gives the family an inn on
+    // the door's continent (overseer_door_inns.h).
+    // That hold has no end for a party the ground has sealed in: Maraudon's
+    // purple wing, 885 yards from the door with no survey node in reach, looped
+    // 65 EXIT cycles. The withhold gives way only once the walk has failed for
+    // SEALED_WALK_HEARTH_AFTER_SECONDS, which the failing-walk clock reaches only
+    // across repeated failed EXITs, and only until the attempts are spent.
+    return facts.doorMapKnown && facts.bindMapId != facts.doorMapId &&
+           facts.failedWalkSeconds >= SEALED_WALK_HEARTH_AFTER_SECONDS;
 }
 
 bool SitOutHearthDue(std::int64_t walkingSeconds, unsigned attempts)

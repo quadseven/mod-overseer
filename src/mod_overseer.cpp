@@ -39300,6 +39300,13 @@ private:
                     if (refusal.empty())
                     {
                         episode.hearthedOut.insert(name);
+                        if (OverseerDecisions::OffContinentHearthLetThrough(facts))
+                            LOG_WARN("module.overseer",
+                                     "overseer: EXIT HEARTH - '{}' is sealed in: the walk out of "
+                                     "map {} has failed for {} seconds, so the stone bound on "
+                                     "map {} is no longer withheld for the door's map {} (#1478)",
+                                     name, episode.mapId, facts.failedWalkSeconds,
+                                     facts.bindMapId, facts.doorMapId);
                         LOG_WARN("module.overseer",
                                  "overseer: EXIT HEARTH - '{}' is hearthing out of map {} "
                                  "(attempt {} of {}) because {}; the campaign stays as it is "
@@ -60367,6 +60374,23 @@ private:
                                   "whoever is left inside out through that same door, and "
                                   "if this repeats, the party cannot reach its own exit",
                                   triggerId, portal->insideMapId);
+                        // WHERE EACH MEMBER STANDS (#1478), so the survey node the
+                        // walk lacks can be found: the map and the spot, once per
+                        // failed EXIT.
+                        for (std::string const& standing : members)
+                        {
+                            Player* const stuck = ObjectAccessor::FindPlayerByName(standing);
+                            if (stuck && stuck->IsInWorld() &&
+                                stuck->GetMapId() == portal->insideMapId)
+                                LOG_ERROR("module.overseer",
+                                          "overseer: dungeon run EXIT walk failing - '{}' "
+                                          "stands on map {} at ({:.0f}, {:.0f}, {:.1f}) and "
+                                          "cannot walk out through areatrigger {}; a survey "
+                                          "node near that spot would give it a route",
+                                          standing, portal->insideMapId, stuck->GetPositionX(),
+                                          stuck->GetPositionY(), stuck->GetPositionZ(),
+                                          triggerId);
+                        }
                         _travelAims.Release(leaderName, "the dungeon run coordinator");
                         // AND WHOEVER IS STILL INSIDE HEARTHS OUT (2026-09-24),
                         // the way a person would once the walk to the door has

@@ -167,7 +167,7 @@ ExitHearthFacts BoundAcrossTheOcean(std::uint32_t doorMap, std::uint32_t bindMap
     facts.doorMapKnown = true;
     facts.doorMapId = doorMap;
     facts.bindMapId = bindMap;
-    facts.failedWalkSeconds = OFF_CONTINENT_HEARTH_AFTER_SECONDS * 6;
+    facts.failedWalkSeconds = OFF_CONTINENT_HEARTH_AFTER_SECONDS * 2;
     return facts;
 }
 
@@ -175,7 +175,7 @@ void TheExitHearthHoldsInBothDirections()
 {
     // Uldaman: door on map 0, member bound on map 1.
     ExitHearthFacts uldaman = BoundAcrossTheOcean(0, 1);
-    Check("Uldaman: an hour of failed walking does not let the stone across",
+    Check("Uldaman: twenty minutes of failed walking does not let the stone across",
           !OffContinentHearthLetThrough(uldaman));
     Check("Uldaman: the member is held, not hearthed",
           ExitFailureHearthStep(uldaman) == ExitHearthStep::Impossible);

@@ -23137,6 +23137,11 @@ struct ExitHearthFacts
 // gives a walk, which is the module's measure of a walk that is not coming back.
 constexpr std::int64_t OFF_CONTINENT_HEARTH_AFTER_SECONDS = 10 * 60;
 
+// HOW LONG A WALK OUT MUST HAVE FAILED BEFORE THE #1388 WITHHOLD GIVES WAY
+// (#1478): three of the ten-minute bounds above, so only a party the ground has
+// sealed in (every EXIT failing for half an hour) hearths across the ocean.
+constexpr std::int64_t SEALED_WALK_HEARTH_AFTER_SECONDS = 30 * 60;
+
 // A failed EXIT ends its coordinator and the next poll adopts the same party at
 // the same door, so one coordinator's clock never reaches the bound above. This
 // is the longest gap between two failures that still counts as the same walk.
