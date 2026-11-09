@@ -299,6 +299,8 @@
 // The Dark Iron Legacy carrier loots Ironfel from Fineous Darkvire's corpse
 // (#1454).
 #include "overseer_brd_ironfel.h"
+// Each attunement holder loots the Core Fragment chest (#1456).
+#include "overseer_brd_core_fragment.h"
 // A Blackrock Depths run that carries the Shadowforge Key goes on into the
 // Upper City (#1410).
 #include "overseer_brd_wing.h"
@@ -359,6 +361,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <deque>
 // std::exception, for the one catch in this file. Pulled in
@@ -37853,6 +37856,11 @@ private:
         OverseerDecisions::BrdIronfelClock brdIronfel;
         bool brdIronfelPaused{false};
         time_t brdIronfelPausedAt{0};
+        // BLACKROCK DEPTHS' CORE FRAGMENT CHEST (overseer_brd_core_fragment.h,
+        // #1456): the same three fields for the visit to the chest.
+        OverseerDecisions::BrdCoreFragmentClock brdCoreFragment;
+        bool brdCoreFragmentPaused{false};
+        time_t brdCoreFragmentPausedAt{0};
         // BLACKROCK DEPTHS' UPPER CITY (overseer_brd_wing.h, #1410): how many
         // times this run has sent `dc on brd-uc`, and when it last did.
         unsigned brdUpperCityTries{0};
@@ -53627,6 +53635,8 @@ private:
         // The instance script's encounters, DONE and in all, as last read.
         unsigned bossesDone{0};
         unsigned bossesTotal{0};
+        // The boss slots as last read (#1459), for the timeline's boss names.
+        std::vector<uint8_t> slotStates;
         // Who was at the door when ASSEMBLE ended (#1207), for the timeline's
         // ASSEMBLE -> ENTER row: members within RAID_ASSEMBLE_YARDS of the
         // staging point, the head included, and the raid's members.
@@ -53684,8 +53694,55 @@ private:
         bool repairHoldDecisionSaid{false};
         bool repairBrainPaused{false};
         time_t repairHoldRefusedAt{0};
+        // Consumable item entries already used for this pull, per seat, and the
+        // seats already logged as having nothing to use (#1460).
+        std::map<std::string, std::set<uint32>> consumableTried;
+        std::set<std::string> consumableNothingSaid;
     };
     std::map<std::string, RaidRunState> _raidRuns;
+
+    // Uses one carried consumable through the core's own CMSG_USE_ITEM handler,
+    // the way the hearth verb does (#1460). Returns a refusal word, or nullptr
+    // when the packet went out. The aura is read back on a later poll; this
+    // never judges the result.
+    static char const* UseRaidConsumable(Player* who, Item* item)
+    {
+        WorldSession* session = who->GetSession();
+        if (!session || !who->IsInWorld() || !who->IsAlive())
+            return "seat is not in the world and alive";
+        if (who->m_mover != who || who->IsInCombat() || who->IsInFlight() ||
+            who->isMoving() || who->IsNonMeleeSpellCast(false) || who->GetTransport())
+            return "seat is busy";
+        ItemTemplate const* proto = item->GetTemplate();
+        if (!proto)
+            return "item has no template";
+        uint32 spellId = 0;
+        for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+        {
+            if (proto->Spells[i].SpellId > 0 &&
+                proto->Spells[i].SpellTrigger == ITEM_SPELLTRIGGER_ON_USE)
+            {
+                spellId = static_cast<uint32>(proto->Spells[i].SpellId);
+                break;
+            }
+        }
+        if (!spellId)
+            return "item has no on-use spell";
+        if (who->HasSpellCooldown(spellId))
+            return "item is on cooldown";
+        WorldPacket raw(CMSG_USE_ITEM, 1 + 1 + 1 + 4 + 8 + 4 + 1 + 4);
+        raw << uint8(item->GetBagSlot());
+        raw << uint8(item->GetSlot());
+        raw << uint8(1);  // castCount
+        raw << uint32(spellId);
+        raw << item->GetGUID();
+        raw << uint32(0);  // glyphIndex
+        raw << uint8(0);   // castFlags
+        raw << uint32(TARGET_FLAG_NONE);
+        raw.rpos(0);
+        session->HandleUseItemOpcode(raw);
+        return nullptr;
+    }
     // What the raid timeline last wrote for each family (#640).
     std::map<std::string, OverseerDecisions::RaidTimelineSnapshot> _raidTimelineSeen;
     // Roster characters whose ghost the raid run-back is walking this poll, so
@@ -54204,7 +54261,8 @@ private:
     // including the two the script summons, so DONE here is what the instance
     // itself believes. Nobody inside to read it through is zero of zero.
     static void RaidEncounters(Group* group, OverseerDecisions::RaidDoor const* door,
-                               unsigned& done, unsigned& total)
+                               unsigned& done, unsigned& total,
+                               std::vector<uint8_t>* states = nullptr)
     {
         done = 0;
         total = 0;
@@ -54221,8 +54279,17 @@ private:
             if (!script)
                 continue;
             std::vector<bool> slots(script->GetEncounterCount(), false);
+            if (states)
+                states->assign(slots.size(), OverseerDecisions::RAID_SLOT_IDLE);
             for (uint32 slot = 0; slot < slots.size(); ++slot)
-                slots[slot] = script->GetBossState(slot) == DONE;
+            {
+                EncounterState const state = script->GetBossState(slot);
+                slots[slot] = state == DONE;
+                if (states && state == DONE)
+                    (*states)[slot] = OverseerDecisions::RAID_SLOT_DONE;
+                else if (states && state == IN_PROGRESS)
+                    (*states)[slot] = OverseerDecisions::RAID_SLOT_IN_PROGRESS;
+            }
             OverseerDecisions::RaidClearCount const count =
                 OverseerDecisions::RaidClearProgress(*door, slots);
             done = count.done;
@@ -54575,6 +54642,7 @@ private:
         snap.misSaved = run.misSaved;
         snap.creditedEncounters = run.creditedEncounters;
         snap.encounterSlots = run.encounterSlots;
+        snap.slots = run.slotStates;
         return snap;
     }
 
@@ -54585,8 +54653,13 @@ private:
         OverseerDecisions::RaidTimelineSnapshot& seen = _raidTimelineSeen[roster.family];
         if (now.keyword.empty())
             now.keyword = seen.keyword;
+        // The fight is remembered across polls: a wiped boss is back to idle by
+        // the time the wipe is seen. A wipe forgets it once its row is made.
+        now.fighting = OverseerDecisions::RaidFightingSlot(seen.fighting, now.slots);
         std::vector<OverseerDecisions::RunTimelineEvent> events =
             OverseerDecisions::RaidTimelineEvents(seen, now);
+        if (now.wipes > seen.wipes)
+            now.fighting = OverseerDecisions::RaidFightingSlot(-1, now.slots);
         if (!events.empty())
         {
             // The dungeon run row the arming drive opened for the raid map, when
@@ -54931,8 +55004,9 @@ private:
             // The instance's own credit, and CLEAR's stall ladder on it.
             unsigned bossesDone = 0;
             unsigned bossesTotal = 0;
+            std::vector<uint8_t> slotStates;
             if (facts.raidFormed && door)
-                RaidEncounters(group, door, bossesDone, bossesTotal);
+                RaidEncounters(group, door, bossesDone, bossesTotal, &slotStates);
             facts.cleared = bossesTotal > 0 && bossesDone >= bossesTotal;
 
             // Read the seats before every next encounter. A boss count advances
@@ -54991,6 +55065,8 @@ private:
                     run.repairHoldDecisionSaid = false;
                     run.repairBrainPaused = false;
                     run.repairHoldRefusedAt = 0;
+                    run.consumableTried.clear();
+                    run.consumableNothingSaid.clear();
                 }
                 // One clock read per poll, so the per-seat timeout below and the
                 // hold decision after the loop can never disagree across a
@@ -55052,6 +55128,65 @@ private:
                                  roster.family, name, bossesDone + 1, afterPct,
                                  answer ? answer : "repair was partial or unaffordable");
                 }
+                // CONSUMABLES (#1460). Each seat that carries a listed
+                // consumable and lacks its aura, or has under ten minutes left,
+                // uses it out of combat. A seat with nothing listed is logged
+                // once and never holds the pull; the same five minutes end it.
+                bool consumableHold = false;
+                for (auto const& [name, subgroup] : seats)
+                {
+                    (void)subgroup;
+                    Player* member = ObjectAccessor::FindPlayerByName(name);
+                    if (!member || !member->IsInWorld() || !member->IsAlive())
+                        continue;
+                    OverseerDecisions::RaidConsumableSeatFacts cf;
+                    cf.inCombat = member->IsInCombat();
+                    cf.tried = run.consumableTried[name];
+                    for (auto const& entry : OverseerDecisions::RaidConsumableTable())
+                    {
+                        uint32 const have = member->GetItemCount(entry.itemEntry, false);
+                        if (have)
+                            cf.carried[entry.itemEntry] = have;
+                        if (Aura const* aura = member->GetAura(entry.auraSpell))
+                        {
+                            int32 const ms = aura->GetDuration();
+                            cf.auraSecondsLeft[entry.auraSpell] =
+                                ms < 0 ? 24L * 3600L : long(ms / 1000);
+                        }
+                    }
+                    auto const decision = OverseerDecisions::RaidSeatConsumableStep(
+                        cf, OverseerDecisions::RAID_CONSUMABLE_MIN_REMAINING_SECONDS);
+                    if (decision.step == OverseerDecisions::RaidConsumableStep::NothingToUse &&
+                        run.consumableNothingSaid.insert(name).second)
+                        LOG_INFO("module.overseer",
+                                 "overseer: raid run for family '{}': {} has nothing to use "
+                                 "before {}",
+                                 roster.family, name,
+                                 OverseerDecisions::RaidPullBossName(bossesDone));
+                    if (!OverseerDecisions::RaidConsumableHoldsPull(decision.step) ||
+                        repairHoldTimedOut)
+                        continue;
+                    consumableHold = true;
+                    if (decision.step != OverseerDecisions::RaidConsumableStep::Use)
+                        continue;
+                    Item* item = member->GetItemByEntry(decision.item->itemEntry);
+                    char const* refusal = item ? UseRaidConsumable(member, item)
+                                               : "item is no longer carried";
+                    if (refusal && std::strcmp(refusal, "seat is busy") == 0)
+                        continue;
+                    run.consumableTried[name].insert(decision.item->itemEntry);
+                    if (refusal)
+                        LOG_WARN("module.overseer",
+                                 "overseer: raid run for family '{}': {} could not use {} "
+                                 "before {}: {}",
+                                 roster.family, name, decision.item->name,
+                                 OverseerDecisions::RaidPullBossName(bossesDone), refusal);
+                    else
+                        LOG_INFO("module.overseer",
+                                 "overseer: raid run for family '{}': {} used {} before {}",
+                                 roster.family, name, decision.item->name,
+                                 OverseerDecisions::RaidPullBossName(bossesDone));
+                }
                 auto const action = OverseerDecisions::RaidPullRepairForSeats(
                     bossesDone, seatPcts, repairFloor, heldNow, 300);
                 if (!run.repairHoldDecisionSaid &&
@@ -55069,7 +55204,8 @@ private:
                                  roster.family, bossesDone + 1, repairFloor);
                     run.repairHoldDecisionSaid = true;
                 }
-                repairHold = action == OverseerDecisions::RaidPullRepairAction::Hold;
+                repairHold = action == OverseerDecisions::RaidPullRepairAction::Hold ||
+                             consumableHold;
             }
             if (run.phase == RaidRunPhase::Clear && head)
             {
@@ -55124,6 +55260,7 @@ private:
                              roster.family, bossesDone, bossesTotal, door ? door->name : "?");
                 run.bossesDone = bossesDone;
                 run.bossesTotal = bossesTotal;
+                run.slotStates = slotStates;
             }
 
             if (facts.ordered && seats.empty() && run.phase == RaidRunPhase::Idle)
@@ -56924,6 +57061,214 @@ private:
                 continue;
             }
             EscortToward(member->GetName(), aim.str(), "FINEOUS DARKVIRE'S CORPSE",
+                         EscortPurpose::Assemble);
+        }
+        return true;
+    }
+
+    // THE CORE FRAGMENT CHEST'S SPAWN (#1456), read once from the world's
+    // gameobject spawns on map 230. Null when the world holds none, and the
+    // visit then never walks.
+    static BrdShrineSpot const* BrdCoreFragmentSpawn()
+    {
+        static bool looked = false;
+        static bool found = false;
+        static BrdShrineSpot spot;
+        if (!looked)
+        {
+            looked = true;
+            for (auto const& itr : sObjectMgr->GetAllGOData())
+            {
+                GameObjectData const& data = itr.second;
+                if (data.id != OverseerDecisions::BRD_CORE_FRAGMENT_CHEST ||
+                    data.mapid != OverseerDecisions::BRD_MAP_ID)
+                    continue;
+                spot.x = data.posX;
+                spot.y = data.posY;
+                spot.z = data.posZ;
+                found = true;
+                break;
+            }
+            if (!found)
+                LOG_WARN("module.overseer",
+                         "overseer: the world holds no Core Fragment chest ({}) on map {}; no "
+                         "Blackrock Depths run walks an attunement holder there (#1456)",
+                         OverseerDecisions::BRD_CORE_FRAGMENT_CHEST,
+                         OverseerDecisions::BRD_MAP_ID);
+        }
+        return found ? &spot : nullptr;
+    }
+
+    void PauseBrainForBrdCoreFragment(DungeonRunCoordinatorState& coord,
+                                      std::vector<Player*> const& inside, Player* leader,
+                                      bool pause, time_t now)
+    {
+        for (Player* const member : inside)
+            if (PlayerbotAI* const ai = GET_PLAYERBOT_AI(member))
+                ai->DoSpecificAction("dc pause", Event("dc", pause ? "pause" : "resume", leader),
+                                     true);
+        coord.brdCoreFragmentPaused = pause;
+        coord.brdCoreFragmentPausedAt = now;
+    }
+
+    // BLACKROCK DEPTHS' CORE FRAGMENT CHEST (overseer_brd_core_fragment.h,
+    // #1456), one CLEARING poll on map 230, asked after the Shrine step. Reads
+    // each member's attunement quest (7848 or 7487) and Core Fragment (18412)
+    // and the chest's spawn from the world database, and asks
+    // BrdCoreFragmentNext. True while the visit owns the poll: the brain is
+    // paused, every member alive inside is escorted to the chest, and the
+    // member whose turn it is opens it the way a client does (the chest's
+    // opening spell, else a click; the opener takes the loot as the window
+    // opens, TakeChestLoot). The item is the chest's own loot; nothing is
+    // granted here and no quest is handed in.
+    bool StepBrdCoreFragment(DungeonRunCoordinatorState& coord,
+                             std::vector<std::string> const& members, Player* leader, time_t now)
+    {
+        namespace D = OverseerDecisions;
+        if (coord.brdCoreFragment.over)
+            return false;
+        std::vector<D::BrdCoreFragmentMember> party;
+        std::vector<Player*> inside;
+        for (std::string const& name : members)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            D::BrdCoreFragmentMember member;
+            member.name = name;
+            if (p && p->IsInWorld() && p->GetMapId() == D::BRD_MAP_ID)
+            {
+                member.aliveInside = p->IsAlive();
+                if (member.aliveInside)
+                    inside.push_back(p);
+                for (uint32 const questId :
+                     {D::BRD_ATTUNE_CORE_ALLIANCE, D::BRD_ATTUNE_CORE_HORDE})
+                {
+                    QuestStatus const status = p->GetQuestStatus(questId);
+                    if ((status == QUEST_STATUS_INCOMPLETE || status == QUEST_STATUS_COMPLETE) &&
+                        !p->GetQuestRewardStatus(questId))
+                        member.holdsQuest = true;
+                }
+                member.fragments = p->GetItemCount(D::BRD_CORE_FRAGMENT);
+            }
+            party.push_back(member);
+        }
+
+        D::BrdCoreFragmentFacts facts;
+        facts.wanters = D::BrdCoreFragmentWanters(D::BRD_MAP_ID, party);
+        facts.now = now;
+        BrdShrineSpot const* const spot = BrdCoreFragmentSpawn();
+        facts.chestFound = spot != nullptr;
+
+        D::BrdCoreFragmentClock const before = coord.brdCoreFragment;
+        // Whose turn it is, as BrdCoreFragmentNext picks it: the first wanter not
+        // given up.
+        std::string turn;
+        for (std::string const& name : facts.wanters)
+            if (std::find(before.settled.begin(), before.settled.end(), name) ==
+                before.settled.end())
+            {
+                turn = name;
+                break;
+            }
+        Player* const wanter = turn.empty() ? nullptr : ObjectAccessor::FindPlayerByName(turn);
+        if (wanter && spot)
+        {
+            facts.inCombat = wanter->IsInCombat();
+            facts.yards = wanter->GetExactDist(spot->x, spot->y, spot->z);
+        }
+
+        D::BrdCoreFragmentVerdict const verdict = D::BrdCoreFragmentNext(facts, before);
+        coord.brdCoreFragment = verdict.clock;
+
+        // One line per member: the ones skipped from the start, then each one
+        // as its turn ends.
+        if (!before.started && verdict.clock.started)
+            for (D::BrdCoreFragmentMember const& member : party)
+            {
+                D::BrdCoreFragmentSkip const skip = D::BrdCoreFragmentSkipFor(member);
+                if (skip != D::BrdCoreFragmentSkip::None)
+                    LOG_INFO("module.overseer", "overseer: dungeon run {} - {} (#1456)",
+                             coord.runId,
+                             D::BrdCoreFragmentLine(member.name, D::BrdCoreFragmentSkipWord(skip)));
+            }
+        if (!verdict.ended.empty())
+        {
+            ForgetChestOpen(verdict.ended);
+            Player* const ended = ObjectAccessor::FindPlayerByName(verdict.ended);
+            bool const holds = ended && ended->GetItemCount(D::BRD_CORE_FRAGMENT) > 0;
+            LOG_INFO("module.overseer", "overseer: dungeon run {} - {} (#1456)", coord.runId,
+                     D::BrdCoreFragmentLine(verdict.ended,
+                                            holds ? std::string() : std::string("not alive inside")));
+        }
+        if (!verdict.gaveUp.empty())
+        {
+            ForgetChestOpen(verdict.gaveUp);
+            LOG_WARN("module.overseer", "overseer: dungeon run {} - {} (#1456)", coord.runId,
+                     D::BrdCoreFragmentLine(verdict.gaveUp, verdict.reason));
+        }
+
+        if (verdict.step == D::BrdCoreFragmentStep::Done ||
+            verdict.step == D::BrdCoreFragmentStep::GiveUp)
+        {
+            if (coord.brdCoreFragmentPaused)
+                PauseBrainForBrdCoreFragment(coord, inside, leader, false, now);
+            if (verdict.step == D::BrdCoreFragmentStep::GiveUp)
+                LOG_WARN("module.overseer",
+                         "overseer: dungeon run {} - the Core Fragment chest left the world "
+                         "mid-visit; the clear resumes (#1456)",
+                         coord.runId);
+            return false;
+        }
+        if (verdict.step == D::BrdCoreFragmentStep::Nothing || !spot)
+            return false;
+        // A member was just given up: the next poll is the next member's.
+        if (verdict.step == D::BrdCoreFragmentStep::Skip || !wanter)
+            return true;
+
+        if (!coord.brdCoreFragmentPaused ||
+            now - coord.brdCoreFragmentPausedAt >= D::BRD_CORE_FRAGMENT_PAUSE_RETRY_SECONDS)
+            PauseBrainForBrdCoreFragment(coord, inside, leader, true, now);
+
+        if (verdict.step == D::BrdCoreFragmentStep::Loot)
+        {
+            GameObject* const chest =
+                wanter->FindNearestGameObject(D::BRD_CORE_FRAGMENT_CHEST, 30.f, true);
+            WorldSession* const session = wanter->GetSession();
+            uint32 opener = 0;
+            if (chest && session)
+            {
+                if (wanter->isMoving())
+                    wanter->StopMoving();
+                // The opener takes the loot as the window opens (TakeChestLoot).
+                NoteChestOpen(turn, chest->GetGUID());
+                if (chest->GetGoType() == GAMEOBJECT_TYPE_CHEST)
+                    opener = ChestOpenerFor(wanter, chest);
+                if (opener)
+                    DriveChestOpen(session, opener, chest->GetGUID());
+                else
+                    DriveGameObjectUse(session, chest->GetGUID());
+            }
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} - '{}' opened the Core Fragment chest ({}, opening "
+                     "spell {}, {} free bag slot(s), attempt {}) (#1456)",
+                     coord.runId, turn, chest ? "found" : "not found near the member", opener,
+                     wanter->GetFreeInventorySpace(), coord.brdCoreFragment.lootTries);
+            return true;
+        }
+
+        std::ostringstream aim;
+        aim << "at:" << D::BRD_MAP_ID << ':' << spot->x << ',' << spot->y << ',' << spot->z;
+        for (Player* const member : inside)
+        {
+            // The last stretch is the member's own: an escort ends within its
+            // arrival radius of the point, which is not always inside the reach
+            // a chest opens from.
+            if (member == wanter && D::BrdCoreFragmentClose(facts.yards))
+            {
+                if (!member->isMoving())
+                    member->GetMotionMaster()->MovePoint(0, spot->x, spot->y, spot->z);
+                continue;
+            }
+            EscortToward(member->GetName(), aim.str(), "THE CORE FRAGMENT CHEST",
                          EscortPurpose::Assemble);
         }
         return true;
@@ -60265,6 +60610,17 @@ private:
                 StepBrdShrine(coord, members, leader, clearingNow))
             {
                 HoldClearingClock(coord, OverseerDecisions::ClearingClock::HeldShrineWalk,
+                                  portal->insideMapId);
+                return;
+            }
+
+            // BLACKROCK DEPTHS' CORE FRAGMENT CHEST (#1456): each member whose log
+            // holds an attunement quest and who has no fragment is walked to the
+            // chest by the Molten Bridge and opens it, before the run goes on.
+            if (portal->insideMapId == OverseerDecisions::BRD_MAP_ID &&
+                StepBrdCoreFragment(coord, members, leader, clearingNow))
+            {
+                HoldClearingClock(coord, OverseerDecisions::ClearingClock::HeldCoreFragmentChest,
                                   portal->insideMapId);
                 return;
             }

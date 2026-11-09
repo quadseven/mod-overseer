@@ -3486,6 +3486,11 @@ enum class ClearingClock
     // party walks the Dark Iron Legacy carrier there, and that walk keeps its
     // own bound.
     HeldIronfelPickup,
+    // Blackrock Depths' visit to the Core Fragment chest
+    // (overseer_brd_core_fragment.h, #1456): the brain is paused on purpose
+    // while the party walks each attunement holder there, and the visit keeps
+    // its own bound.
+    HeldCoreFragmentChest,
 };
 
 ClearingClock ClearingClockState(bool acceptedOnEveryoneInside, bool leaderVisible,
@@ -19217,6 +19222,39 @@ struct RaidClearCount
 // `doneBySlot` is the instance script's encounters by slot, true for DONE.
 RaidClearCount RaidClearProgress(RaidDoor const& door, std::vector<bool> const& doneBySlot);
 
+// THE BOSS A TIMELINE ROW NAMES (#1459). One instance-script boss slot as the
+// poll read it: nothing yet, the encounter in progress, or DONE. The values
+// are this module's own, mapped from the core's EncounterState by the adapter.
+enum RaidSlotState : uint8_t
+{
+    RAID_SLOT_IDLE = 0,
+    RAID_SLOT_IN_PROGRESS = 1,
+    RAID_SLOT_DONE = 2,
+};
+
+// The name of boss `slot` in the door's script order, or "" when the door has no
+// names written down (only Molten Core has) or the slot is out of range. Molten
+// Core is molten_core.h DATA_LUCIFRON 0 to DATA_RAGNAROS 9; Majordomo (8) and
+// Ragnaros (9) are named so the final kill has its own row.
+std::string RaidBossName(std::string const& keyword, int slot);
+
+// The names of every slot that is DONE in `after` and was not in `before`, in
+// script order. An empty `before` is no baseline and credits nothing; a slot
+// past its end counts as not done, and a slot that lost DONE (an instance reset) is not a credit.
+std::vector<std::string> RaidBossesCredited(std::string const& keyword,
+                                            std::vector<uint8_t> const& before,
+                                            std::vector<uint8_t> const& after);
+
+// The slot to remember as the fight the raid is in, given the one remembered
+// before the poll (-1 for none) and the slots now. A slot IN_PROGRESS now wins;
+// otherwise the old one is kept until its slot is DONE, because the script puts
+// a wiped boss back to idle before the wipe is noticed.
+int RaidFightingSlot(int remembered, std::vector<uint8_t> const& slotsNow);
+
+// The wipe row's boss: "wipe on <name>", or "wipe on trash" when no slot was in
+// progress. "" when the door has no names, so the old text stands alone.
+std::string RaidWipeOn(std::string const& keyword, int fightingSlot);
+
 // The door for `keyword`, or nullptr. Exact, lower case: the queue writes the
 // keyword and nothing else does.
 RaidDoor const* RaidDoorFor(std::string const& keyword);
@@ -19536,6 +19574,62 @@ enum class RaidPullSeatStep { Ready, TimedOut, Attempted, Walk, Repair };
 RaidPullSeatStep RaidPullSeatRepairStep(unsigned lowestDurabilityPct, unsigned floorPct,
                                         bool holdTimedOut, bool alreadyAttempted,
                                         bool repairerInReach);
+
+// -- consumables before the Majordomo and Ragnaros pulls (#1460) ---------------
+//
+// A seat carries Greater Fire Protection Potions and flasks (the stock the raid
+// page counts), and nothing used them. This is the TABLE of what the run uses,
+// not a use-any-item verb: each entry is one item, the aura it leaves, and the
+// group of auras it competes with. Making or buying them is not here.
+enum class RaidConsumableGroup { FireProtection, Flask, Elixir };
+
+struct RaidConsumable
+{
+    std::uint32_t itemEntry;
+    std::uint32_t auraSpell;
+    RaidConsumableGroup group;
+    char const* name;
+};
+
+std::vector<RaidConsumable> const& RaidConsumableTable();
+
+// An aura with less than this left is used again at the pull hold: a flask
+// lasts about two hours and a potion or elixir about one on 3.3.5.
+constexpr long RAID_CONSUMABLE_MIN_REMAINING_SECONDS = 600;
+
+// What one seat reads before a pull. `carried` maps item entry to count;
+// `auraSecondsLeft` maps a spell id to the seconds left on it (absent means the
+// aura is not on the seat); `tried` holds item entries already used for this
+// pull, so a refused or lost use is not repeated for ever.
+struct RaidConsumableSeatFacts
+{
+    bool inCombat = false;
+    std::map<std::uint32_t, unsigned> carried;
+    std::map<std::uint32_t, long> auraSecondsLeft;
+    std::set<std::uint32_t> tried;
+};
+
+// NothingToUse: no listed consumable is carried (never holds the pull).
+// Satisfied: every carried group has an aura with time to spare, or was tried.
+// Combat: something is owed but the seat is fighting; wait, use nothing.
+// Use: use `item` now.
+enum class RaidConsumableStep { NothingToUse, Satisfied, Combat, Use };
+
+struct RaidConsumableDecision
+{
+    RaidConsumableStep step = RaidConsumableStep::NothingToUse;
+    RaidConsumable const* item = nullptr;
+};
+
+RaidConsumableDecision RaidSeatConsumableStep(RaidConsumableSeatFacts const& facts,
+                                              long minRemainingSeconds);
+
+// Use and Combat hold the pull; NothingToUse and Satisfied do not.
+bool RaidConsumableHoldsPull(RaidConsumableStep step);
+
+// The boss a pull hold is before ("Majordomo Executus" for 8 bosses done,
+// "Ragnaros" for 9), empty for any other count.
+char const* RaidPullBossName(unsigned bossesDone);
 
 // One poll of the raid run.
 //
@@ -22282,6 +22376,11 @@ struct RaidTimelineSnapshot
     std::vector<std::string> misSaved;
     unsigned creditedEncounters{0};
     unsigned encounterSlots{0};
+    // THE SCRIPT'S BOSS SLOTS (#1459), as RaidSlotState, empty when nobody
+    // inside could be read. `fighting` is the slot remembered as the current
+    // fight (RaidFightingSlot), -1 for none.
+    std::vector<uint8_t> slots;
+    int fighting{-1};
 };
 
 // -- the door reads each seat's save before ENTER (#1458) ---------------------
