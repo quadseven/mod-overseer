@@ -50,6 +50,13 @@ using OverseerDecisions::RaidPullRepairDecision;
 using OverseerDecisions::RaidPullRepairForSeats;
 using OverseerDecisions::RaidPullSeatRepairStep;
 using OverseerDecisions::RaidPullSeatStep;
+using OverseerDecisions::RAID_CONSUMABLE_MIN_REMAINING_SECONDS;
+using OverseerDecisions::RaidConsumableDecision;
+using OverseerDecisions::RaidConsumableHoldsPull;
+using OverseerDecisions::RaidConsumableSeatFacts;
+using OverseerDecisions::RaidConsumableStep;
+using OverseerDecisions::RaidPullBossName;
+using OverseerDecisions::RaidSeatConsumableStep;
 using OverseerDecisions::RaidRunPhase;
 using OverseerDecisions::RaidRunPhaseName;
 using OverseerDecisions::RaidRunStep;
@@ -187,6 +194,98 @@ void CheckString(char const* what, std::string const& got, std::string const& wa
         return;
     ++failures;
     std::printf("FAIL %s: expected '%s', got '%s'\n", what, want.c_str(), got.c_str());
+}
+
+// The pre-pull consumable decision (#1460): a carried fire protection potion or
+// flask is used when its aura is missing or under the floor, never in combat,
+// never twice for one pull, and a seat with nothing listed never holds the pull.
+void ASeatUsesItsCarriedConsumableBeforeThePull()
+{
+    long const floor = RAID_CONSUMABLE_MIN_REMAINING_SECONDS;
+    unsigned const potion = 13457;
+    unsigned const titans = 13510;
+    unsigned const supreme = 13512;
+
+    RaidConsumableSeatFacts none;
+    RaidConsumableDecision d = RaidSeatConsumableStep(none, floor);
+    Check("nothing carried is nothing to use", d.step == RaidConsumableStep::NothingToUse);
+    Check("nothing to use does not hold the pull", !RaidConsumableHoldsPull(d.step));
+
+    RaidConsumableSeatFacts missing;
+    missing.carried[potion] = 2;
+    d = RaidSeatConsumableStep(missing, floor);
+    Check("a carried potion with no aura is used",
+          d.step == RaidConsumableStep::Use && d.item && d.item->itemEntry == potion);
+    Check("a use holds the pull", RaidConsumableHoldsPull(d.step));
+
+    RaidConsumableSeatFacts fresh = missing;
+    fresh.auraSecondsLeft[17543] = floor;
+    d = RaidSeatConsumableStep(fresh, floor);
+    Check("an aura at the floor is satisfied", d.step == RaidConsumableStep::Satisfied);
+    Check("a satisfied seat does not hold the pull", !RaidConsumableHoldsPull(d.step));
+
+    RaidConsumableSeatFacts low = missing;
+    low.auraSecondsLeft[17543] = floor - 1;
+    d = RaidSeatConsumableStep(low, floor);
+    Check("an aura under the floor is used again",
+          d.step == RaidConsumableStep::Use && d.item && d.item->itemEntry == potion);
+
+    RaidConsumableSeatFacts fighting = missing;
+    fighting.inCombat = true;
+    d = RaidSeatConsumableStep(fighting, floor);
+    Check("in combat nothing is used", d.step == RaidConsumableStep::Combat && !d.item);
+    Check("in combat still holds the pull", RaidConsumableHoldsPull(d.step));
+
+    RaidConsumableSeatFacts tried = missing;
+    tried.tried.insert(potion);
+    d = RaidSeatConsumableStep(tried, floor);
+    Check("a tried item is not repeated", d.step == RaidConsumableStep::Satisfied);
+
+    RaidConsumableSeatFacts empty;
+    empty.carried[potion] = 0;
+    d = RaidSeatConsumableStep(empty, floor);
+    Check("a zero count is not carried", d.step == RaidConsumableStep::NothingToUse);
+
+    RaidConsumableSeatFacts flasks;
+    flasks.carried[titans] = 1;
+    flasks.carried[supreme] = 1;
+    flasks.auraSecondsLeft[17628] = 3600;
+    d = RaidSeatConsumableStep(flasks, floor);
+    Check("one flask aura covers every other flask", d.step == RaidConsumableStep::Satisfied);
+
+    RaidConsumableSeatFacts elixir;
+    elixir.carried[13452] = 1;
+    elixir.auraSecondsLeft[17626] = 3600;
+    d = RaidSeatConsumableStep(elixir, floor);
+    Check("a live flask covers the elixirs", d.step == RaidConsumableStep::Satisfied);
+    elixir.auraSecondsLeft.clear();
+    d = RaidSeatConsumableStep(elixir, floor);
+    Check("an elixir with no flask is used", d.step == RaidConsumableStep::Use);
+
+    if (std::string(RaidPullBossName(8)) != "Majordomo Executus" ||
+        std::string(RaidPullBossName(9)) != "Ragnaros" || *RaidPullBossName(3) != '\0')
+        Check("the pull names its boss", false);
+}
+
+void TheConsumableUseIsWiredIntoThePullHold()
+{
+    std::ifstream in("src/mod_overseer.cpp");
+    std::stringstream text;
+    text << in.rdbuf();
+    std::string const source = text.str();
+    std::size_t const at = source.find("// CONSUMABLES (#1460).");
+    Check("the consumable pass exists", at != std::string::npos);
+    std::size_t const end = at == std::string::npos ? at : source.find("RaidClearStall(", at);
+    std::string const body = end == std::string::npos ? "" : source.substr(at, end - at);
+    Check("the pass reads the decision", Has(body, "RaidSeatConsumableStep("));
+    Check("the pass holds the pull", Has(body, "consumableHold = true;"));
+    Check("a use is logged with the boss",
+          Has(body, "overseer: raid run for family '{}': {} used {} before {}"));
+    Check("nothing to use is logged", Has(body, "has nothing to use"));
+    Check("the hold includes the consumable pass", Has(body, "consumableHold;"));
+    Check("the use goes through the core handler",
+          source.find("session->HandleUseItemOpcode(raw);",
+                      source.find("static char const* UseRaidConsumable")) != std::string::npos);
 }
 
 void CheckPhase(char const* what, RaidRunPhase got, RaidRunPhase want)
@@ -736,6 +835,8 @@ int main()
     ThePullHoldReadsEverySeat();
     EachSeatInThePullHoldWalksRepairsOrWaits();
     ThePrePullHoldIsWiredIntoTheRun();
+    ASeatUsesItsCarriedConsumableBeforeThePull();
+    TheConsumableUseIsWiredIntoThePullHold();
     TheMoltenCoreDoorIsTheWorldsOwnNumbers();
     OnlyAnExactRaidJobNamesADoor();
     NoOrderIsIdleAndAnEndedOrderReleases();

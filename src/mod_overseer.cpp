@@ -359,6 +359,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <deque>
 // std::exception, for the one catch in this file. Pulled in
@@ -53674,8 +53675,55 @@ private:
         bool repairHoldDecisionSaid{false};
         bool repairBrainPaused{false};
         time_t repairHoldRefusedAt{0};
+        // Consumable item entries already used for this pull, per seat, and the
+        // seats already logged as having nothing to use (#1460).
+        std::map<std::string, std::set<uint32>> consumableTried;
+        std::set<std::string> consumableNothingSaid;
     };
     std::map<std::string, RaidRunState> _raidRuns;
+
+    // Uses one carried consumable through the core's own CMSG_USE_ITEM handler,
+    // the way the hearth verb does (#1460). Returns a refusal word, or nullptr
+    // when the packet went out. The aura is read back on a later poll; this
+    // never judges the result.
+    static char const* UseRaidConsumable(Player* who, Item* item)
+    {
+        WorldSession* session = who->GetSession();
+        if (!session || !who->IsInWorld() || !who->IsAlive())
+            return "seat is not in the world and alive";
+        if (who->m_mover != who || who->IsInCombat() || who->IsInFlight() ||
+            who->isMoving() || who->IsNonMeleeSpellCast(false) || who->GetTransport())
+            return "seat is busy";
+        ItemTemplate const* proto = item->GetTemplate();
+        if (!proto)
+            return "item has no template";
+        uint32 spellId = 0;
+        for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
+        {
+            if (proto->Spells[i].SpellId > 0 &&
+                proto->Spells[i].SpellTrigger == ITEM_SPELLTRIGGER_ON_USE)
+            {
+                spellId = static_cast<uint32>(proto->Spells[i].SpellId);
+                break;
+            }
+        }
+        if (!spellId)
+            return "item has no on-use spell";
+        if (who->HasSpellCooldown(spellId))
+            return "item is on cooldown";
+        WorldPacket raw(CMSG_USE_ITEM, 1 + 1 + 1 + 4 + 8 + 4 + 1 + 4);
+        raw << uint8(item->GetBagSlot());
+        raw << uint8(item->GetSlot());
+        raw << uint8(1);  // castCount
+        raw << uint32(spellId);
+        raw << item->GetGUID();
+        raw << uint32(0);  // glyphIndex
+        raw << uint8(0);   // castFlags
+        raw << uint32(TARGET_FLAG_NONE);
+        raw.rpos(0);
+        session->HandleUseItemOpcode(raw);
+        return nullptr;
+    }
     // What the raid timeline last wrote for each family (#640).
     std::map<std::string, OverseerDecisions::RaidTimelineSnapshot> _raidTimelineSeen;
     // Roster characters whose ghost the raid run-back is walking this poll, so
@@ -54906,6 +54954,8 @@ private:
                     run.repairHoldDecisionSaid = false;
                     run.repairBrainPaused = false;
                     run.repairHoldRefusedAt = 0;
+                    run.consumableTried.clear();
+                    run.consumableNothingSaid.clear();
                 }
                 // One clock read per poll, so the per-seat timeout below and the
                 // hold decision after the loop can never disagree across a
@@ -54967,6 +55017,65 @@ private:
                                  roster.family, name, bossesDone + 1, afterPct,
                                  answer ? answer : "repair was partial or unaffordable");
                 }
+                // CONSUMABLES (#1460). Each seat that carries a listed
+                // consumable and lacks its aura, or has under ten minutes left,
+                // uses it out of combat. A seat with nothing listed is logged
+                // once and never holds the pull; the same five minutes end it.
+                bool consumableHold = false;
+                for (auto const& [name, subgroup] : seats)
+                {
+                    (void)subgroup;
+                    Player* member = ObjectAccessor::FindPlayerByName(name);
+                    if (!member || !member->IsInWorld() || !member->IsAlive())
+                        continue;
+                    OverseerDecisions::RaidConsumableSeatFacts cf;
+                    cf.inCombat = member->IsInCombat();
+                    cf.tried = run.consumableTried[name];
+                    for (auto const& entry : OverseerDecisions::RaidConsumableTable())
+                    {
+                        uint32 const have = member->GetItemCount(entry.itemEntry, false);
+                        if (have)
+                            cf.carried[entry.itemEntry] = have;
+                        if (Aura const* aura = member->GetAura(entry.auraSpell))
+                        {
+                            int32 const ms = aura->GetDuration();
+                            cf.auraSecondsLeft[entry.auraSpell] =
+                                ms < 0 ? 24L * 3600L : long(ms / 1000);
+                        }
+                    }
+                    auto const decision = OverseerDecisions::RaidSeatConsumableStep(
+                        cf, OverseerDecisions::RAID_CONSUMABLE_MIN_REMAINING_SECONDS);
+                    if (decision.step == OverseerDecisions::RaidConsumableStep::NothingToUse &&
+                        run.consumableNothingSaid.insert(name).second)
+                        LOG_INFO("module.overseer",
+                                 "overseer: raid run for family '{}': {} has nothing to use "
+                                 "before {}",
+                                 roster.family, name,
+                                 OverseerDecisions::RaidPullBossName(bossesDone));
+                    if (!OverseerDecisions::RaidConsumableHoldsPull(decision.step) ||
+                        repairHoldTimedOut)
+                        continue;
+                    consumableHold = true;
+                    if (decision.step != OverseerDecisions::RaidConsumableStep::Use)
+                        continue;
+                    Item* item = member->GetItemByEntry(decision.item->itemEntry);
+                    char const* refusal = item ? UseRaidConsumable(member, item)
+                                               : "item is no longer carried";
+                    if (refusal && std::strcmp(refusal, "seat is busy") == 0)
+                        continue;
+                    run.consumableTried[name].insert(decision.item->itemEntry);
+                    if (refusal)
+                        LOG_WARN("module.overseer",
+                                 "overseer: raid run for family '{}': {} could not use {} "
+                                 "before {}: {}",
+                                 roster.family, name, decision.item->name,
+                                 OverseerDecisions::RaidPullBossName(bossesDone), refusal);
+                    else
+                        LOG_INFO("module.overseer",
+                                 "overseer: raid run for family '{}': {} used {} before {}",
+                                 roster.family, name, decision.item->name,
+                                 OverseerDecisions::RaidPullBossName(bossesDone));
+                }
                 auto const action = OverseerDecisions::RaidPullRepairForSeats(
                     bossesDone, seatPcts, repairFloor, heldNow, 300);
                 if (!run.repairHoldDecisionSaid &&
@@ -54984,7 +55093,8 @@ private:
                                  roster.family, bossesDone + 1, repairFloor);
                     run.repairHoldDecisionSaid = true;
                 }
-                repairHold = action == OverseerDecisions::RaidPullRepairAction::Hold;
+                repairHold = action == OverseerDecisions::RaidPullRepairAction::Hold ||
+                             consumableHold;
             }
             if (run.phase == RaidRunPhase::Clear && head)
             {
