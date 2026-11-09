@@ -276,6 +276,21 @@ constexpr std::size_t DEATH_DAMAGE_HISTORY_SIZE = 3;
 // Keep only the most recent damage observations, in chronological order.
 void RememberDamage(DamageHistory& history, DamageTaken sample);
 
+// What the core's motion master was running. The long comment on why it is
+// sampled and not read live sits above DeathDriver below; the enum is declared
+// here because a DeathHit keeps one.
+enum class MoveGenerator
+{
+    Unsampled,  // no snapshot has been taken for this character yet
+    Idle,       // IDLE_MOTION_TYPE: nothing had hold of it
+    Follow,     // FOLLOW_MOTION_TYPE: it was following its leader
+    Point,      // POINT_MOTION_TYPE: a scripted move to a coordinate
+    Chase,      // CHASE_MOTION_TYPE: it was pursuing something
+    Flee,       // FLEEING / TIMED_FLEEING / CONFUSED: combat put it there too
+    Thrown,     // EFFECT_MOTION_TYPE: a spline SOMETHING ELSE put it on
+    Other,      // waypoint, flight, home, rotate: named so it is not guessed at
+};
+
 // WHAT KILLED A MEMBER IN A DUNGEON, SEEN HIT BY HIT. The death row's context
 // (damage_1..3, health_at_death, in_combat) came only from caches the 5 s
 // snapshot fills for roster characters, so every natural guild member's death
@@ -305,6 +320,17 @@ struct DeathHit
     // Who had the member as its target, read on the killing blow only
     // (NameTheAttackers). Empty on every other hit.
     std::string targetedBy;
+    // READ ON EVERY HIT, not only the killing one, because the death hook
+    // reads none of it (the core has emptied the attacker list, cleared the
+    // motion master and dismissed nothing it can still answer for): the units
+    // whose victim was the member, what the motion master was running, who
+    // was in charge of the member's moves, and whether its pet was out.
+    // `attackers` counts units whose victim is the member; it is NOT the
+    // enemies in combat with it (`enemiesEngaged`).
+    std::uint32_t attackers{0};
+    MoveGenerator movement{MoveGenerator::Unsampled};
+    std::string controller;
+    std::string pet;
 };
 
 using DeathHitRing = std::vector<DeathHit>;
@@ -343,9 +369,57 @@ struct DeathHitAccount
     bool inCombat{false};
     std::uint32_t enemiesEngaged{0};
     std::string targetedBy;
+    // As the newest hit found them (the killing blow when the hook saw it).
+    std::uint32_t attackers{0};
+    MoveGenerator movement{MoveGenerator::Unsampled};
+    std::string controller;
+    std::string pet;
+    // The oldest hit within DEATH_EARLIER_WINDOW_MS before the newest one, when
+    // there is one other than it: the member's health and mana a few seconds
+    // before the killing blow.
+    bool earlierSeen{false};
+    std::uint32_t earlierSeconds{0};
+    std::uint32_t earlierHealth{0};
+    std::uint32_t earlierMaxHealth{0};
+    std::uint32_t earlierMana{0};
+    std::uint32_t earlierMaxMana{0};
     // The newest DEATH_DAMAGE_HISTORY_SIZE hits, oldest first, with their sources.
     DamageHistory damage;
 };
+
+// How far before the newest hit the "a few seconds earlier" reading may come from.
+constexpr std::int64_t DEATH_EARLIER_WINDOW_MS = 10000;
+
+// Whether the member's pet was there, read on each hit. `petClass` is a class
+// that summons one (warlock, hunter); every other class is "not a pet class",
+// which is not the same answer as "none summoned".
+struct PetFacts
+{
+    bool petClass{false};
+    bool out{false};
+    bool alive{false};
+    bool unsummoned{false};  // no pet out, but the core remembers one it put away
+};
+std::string NameThePetState(PetFacts const& facts);
+
+// Who was in charge of the member's moves: a player, or a playerbot and the
+// movement strategy it was running.
+struct ControllerFacts
+{
+    bool bot{false};
+    bool stay{false};
+    bool follow{false};
+    bool newRpg{false};
+    bool grind{false};
+};
+std::string NameTheController(ControllerFacts const& facts);
+
+// The log line's pieces for a guild death: the attacker count, or "unsampled"
+// (never 0 for a count nobody took), and the rest of the telemetry, ready to
+// append: ", moved by a playerbot on 'new rpg' (movement 'chase'), pet out,
+// health 41% at the last hit (100% 6s before), mana 12% (80% 6s before)".
+std::string GuildDeathAttackers(DeathHitAccount const& account);
+std::string GuildDeathTelemetry(DeathHitAccount const& account);
 
 DeathHitAccount AccountForDeathHits(DeathHitRing const& ring, std::int64_t deathMs);
 
@@ -8012,17 +8086,6 @@ char const* ExtendedCostRefusal(ExtendedCostShape const& cost, BuyRequest const&
 // time. The last sample before the death is the only place those facts still
 // exist, and at a five-second cadence against falls that complete in nought to
 // five seconds it is the right resolution for exactly this question.
-enum class MoveGenerator
-{
-    Unsampled,  // no snapshot has been taken for this character yet
-    Idle,       // IDLE_MOTION_TYPE: nothing had hold of it
-    Follow,     // FOLLOW_MOTION_TYPE: it was following its leader
-    Point,      // POINT_MOTION_TYPE: a scripted move to a coordinate
-    Chase,      // CHASE_MOTION_TYPE: it was pursuing something
-    Flee,       // FLEEING / TIMED_FLEEING / CONFUSED: combat put it there too
-    Thrown,     // EFFECT_MOTION_TYPE: a spline SOMETHING ELSE put it on
-    Other,      // waypoint, flight, home, rotate: named so it is not guessed at
-};
 
 // WHAT THIS MODULE THINKS WAS DRIVING IT. Deliberately a small vocabulary: a
 // column somebody groups by is only useful if the values are few and mean the
