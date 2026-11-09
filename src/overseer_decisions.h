@@ -22245,7 +22245,40 @@ struct RaidTimelineSnapshot
     // zero until ASSEMBLE has ended, and then the row says nothing extra.
     unsigned atDoor{0};
     unsigned inRaid{0};
+    // The raiders saved to another copy of the raid, and how many of the copy's
+    // `encounterSlots` encounters are already credited (#1458). Set with atDoor.
+    std::vector<std::string> misSaved;
+    unsigned creditedEncounters{0};
+    unsigned encounterSlots{0};
 };
+
+// -- the door reads each seat's save before ENTER (#1458) ---------------------
+//
+// A raider saved to another copy of a raid is refused at the door by the core,
+// and the raid runner reads no saves, so one such seat held ENTER until its
+// wait ceiling. Each seat's save is told apart by instance id (0 = no save).
+enum class RaidSeatBind : std::uint8_t { None, SameCopy, OtherCopy };
+RaidSeatBind RaidSeatBindFor(std::uint32_t seatInstanceId, std::uint32_t groupInstanceId);
+
+struct RaidSeatBindFact
+{
+    std::string name;
+    RaidSeatBind bind{RaidSeatBind::None};
+};
+
+// Who may enter, and who is named as saved to another copy (seat order kept).
+// A named seat is left out of the ENTER count; it is never reset or moved.
+struct RaidBindVerdict
+{
+    std::vector<std::string> mayEnter;
+    std::vector<std::string> misSaved;
+};
+RaidBindVerdict RaidBindVerdictFor(std::vector<RaidSeatBindFact> const& seats);
+
+// How many of the door's own encounters a copy's completed-encounter mask
+// already credits, among `slotCount` script slots.
+unsigned RaidCreditedEncounters(RaidDoor const& door, std::uint32_t completedMask,
+                                unsigned slotCount);
 
 std::vector<RunTimelineEvent> RaidTimelineEvents(RaidTimelineSnapshot const& before,
                                                  RaidTimelineSnapshot const& after);
