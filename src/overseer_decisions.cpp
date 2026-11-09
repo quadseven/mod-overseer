@@ -2064,6 +2064,29 @@ time_t StagedInsideClockAfter(time_t since, time_t oldPatience, time_t patience,
     return patience < oldPatience ? now : since;
 }
 
+bool SplitFailedHeldByProgress(unsigned inside, bool anyInsideInCombat, time_t advancedAt,
+                               time_t now, time_t fightCeilingSeconds)
+{
+    if (inside < SPLIT_HOLD_MIN_INSIDE || advancedAt <= 0 || now < advancedAt)
+        return false;
+    time_t const age = now - advancedAt;
+    if (age <= SPLIT_HOLD_PROGRESS_SECONDS)
+        return true;
+    return anyInsideInCombat && age <= fightCeilingSeconds;
+}
+
+bool StagedInsideWarningStale(time_t warnedPatience, time_t patience)
+{
+    return warnedPatience != patience;
+}
+
+bool StrandedWalkBackFailed(std::int64_t walkSince, std::int64_t groundGaveUpAt,
+                            std::int64_t now)
+{
+    return EvacuationWalkFailed(walkSince, groundGaveUpAt, now,
+                                STRANDED_WALK_BACK_BOUND_SECONDS);
+}
+
 std::vector<std::string> DungeonRunOtherCopy(std::vector<DungeonRunEntryState> const& members)
 {
     std::vector<std::string> walk;
