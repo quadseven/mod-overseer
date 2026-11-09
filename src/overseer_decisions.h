@@ -3481,6 +3481,11 @@ enum class ClearingClock
     // #1391): the brain is paused on purpose while the party walks the Ironfel
     // carrier there, and that walk keeps its own bound.
     HeldShrineWalk,
+    // Blackrock Depths' walk to Fineous Darkvire's corpse for Ironfel
+    // (overseer_brd_ironfel.h, #1454): the brain is paused on purpose while the
+    // party walks the Dark Iron Legacy carrier there, and that walk keeps its
+    // own bound.
+    HeldIronfelPickup,
 };
 
 ClearingClock ClearingClockState(bool acceptedOnEveryoneInside, bool leaderVisible,
