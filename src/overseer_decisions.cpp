@@ -16412,6 +16412,78 @@ RaidPullSeatStep RaidPullSeatRepairStep(unsigned lowestDurabilityPct, unsigned f
     return repairerInReach ? RaidPullSeatStep::Repair : RaidPullSeatStep::Walk;
 }
 
+std::vector<RaidConsumable> const& RaidConsumableTable()
+{
+    // Item entry, aura spell, group, name. The aura ids are the ones the live
+    // check reads from character_aura; verify them in Spell.dbc before a roll.
+    static std::vector<RaidConsumable> const table = {
+        {13457, 17543, RaidConsumableGroup::FireProtection, "Greater Fire Protection Potion"},
+        {13510, 17626, RaidConsumableGroup::Flask, "Flask of the Titans"},
+        {13511, 17627, RaidConsumableGroup::Flask, "Flask of Distilled Wisdom"},
+        {13512, 17628, RaidConsumableGroup::Flask, "Flask of Supreme Power"},
+        {13452, 17538, RaidConsumableGroup::Elixir, "Elixir of the Mongoose"},
+        {9206, 11405, RaidConsumableGroup::Elixir, "Elixir of Giants"},
+        {13454, 17539, RaidConsumableGroup::Elixir, "Greater Arcane Elixir"},
+    };
+    return table;
+}
+
+RaidConsumableDecision RaidSeatConsumableStep(RaidConsumableSeatFacts const& facts,
+                                              long minRemainingSeconds)
+{
+    auto const secondsLeft = [&](RaidConsumable const& entry) -> long
+    {
+        auto const aura = facts.auraSecondsLeft.find(entry.auraSpell);
+        return aura == facts.auraSecondsLeft.end() ? -1 : aura->second;
+    };
+    // A group is covered when any of its auras has the time. A flask also
+    // covers the elixirs, which a flask replaces on 3.3.5.
+    auto const covered = [&](RaidConsumableGroup group) -> bool
+    {
+        for (RaidConsumable const& entry : RaidConsumableTable())
+        {
+            bool const counts = entry.group == group ||
+                                (group == RaidConsumableGroup::Elixir &&
+                                 entry.group == RaidConsumableGroup::Flask);
+            if (counts && secondsLeft(entry) >= minRemainingSeconds)
+                return true;
+        }
+        return false;
+    };
+
+    RaidConsumableDecision decision;
+    for (RaidConsumable const& entry : RaidConsumableTable())
+    {
+        auto const have = facts.carried.find(entry.itemEntry);
+        if (have == facts.carried.end() || have->second == 0)
+            continue;
+        if (decision.step == RaidConsumableStep::NothingToUse)
+            decision.step = RaidConsumableStep::Satisfied;
+        if (decision.item || facts.tried.count(entry.itemEntry) || covered(entry.group))
+            continue;
+        decision.item = &entry;
+    }
+    if (decision.item)
+        decision.step = facts.inCombat ? RaidConsumableStep::Combat : RaidConsumableStep::Use;
+    if (facts.inCombat && decision.item)
+        decision.item = nullptr;
+    return decision;
+}
+
+bool RaidConsumableHoldsPull(RaidConsumableStep step)
+{
+    return step == RaidConsumableStep::Use || step == RaidConsumableStep::Combat;
+}
+
+char const* RaidPullBossName(unsigned bossesDone)
+{
+    if (bossesDone == 8)
+        return "Majordomo Executus";
+    if (bossesDone == 9)
+        return "Ragnaros";
+    return "";
+}
+
 bool RaidGhostMayBeWalked(long ghostSeconds)
 {
     return ghostSeconds < RAID_RUNBACK_WAIT_SECONDS;
