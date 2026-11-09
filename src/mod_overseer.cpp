@@ -296,6 +296,9 @@
 // Blackrock Depths walks the Ironfel carrier to the Shrine of Thaurissan
 // (#1391).
 #include "overseer_brd_shrine.h"
+// The Dark Iron Legacy carrier loots Ironfel from Fineous Darkvire's corpse
+// (#1454).
+#include "overseer_brd_ironfel.h"
 // A Blackrock Depths run that carries the Shadowforge Key goes on into the
 // Upper City (#1410).
 #include "overseer_brd_wing.h"
@@ -37845,6 +37848,11 @@ private:
         OverseerDecisions::BrdShrineClock brdShrine;
         bool brdShrinePaused{false};
         time_t brdShrinePausedAt{0};
+        // BLACKROCK DEPTHS' IRONFEL PICKUP (overseer_brd_ironfel.h, #1454): the
+        // same three fields for the walk to Fineous Darkvire's corpse.
+        OverseerDecisions::BrdIronfelClock brdIronfel;
+        bool brdIronfelPaused{false};
+        time_t brdIronfelPausedAt{0};
         // BLACKROCK DEPTHS' UPPER CITY (overseer_brd_wing.h, #1410): how many
         // times this run has sent `dc on brd-uc`, and when it last did.
         unsigned brdUpperCityTries{0};
@@ -56650,6 +56658,171 @@ private:
         return true;
     }
 
+    // Pause or resume the dungeon brain for the Ironfel pickup, the Shrine walk's
+    // way (#1454).
+    void PauseBrainForBrdIronfel(DungeonRunCoordinatorState& coord,
+                                 std::vector<Player*> const& inside, Player* leader, bool pause,
+                                 time_t now)
+    {
+        for (Player* const member : inside)
+            if (PlayerbotAI* const ai = GET_PLAYERBOT_AI(member))
+                ai->DoSpecificAction("dc pause", Event("dc", pause ? "pause" : "resume", leader),
+                                     true);
+        coord.brdIronfelPaused = pause;
+        coord.brdIronfelPausedAt = now;
+    }
+
+    // BLACKROCK DEPTHS' IRONFEL (overseer_brd_ironfel.h, #1454), one CLEARING poll
+    // on map 230, asked before the Shrine step. Reads each member's Dark Iron
+    // Legacy (3802) and Ironfel, whether every Fineous Darkvire in the instance
+    // is dead and whether a corpse still offers Ironfel to the member who wants
+    // it, and asks BrdIronfelNext. True while the pickup owns the poll: the
+    // brain is paused, every member alive inside is escorted to the corpse, and
+    // the member who wants Ironfel opens it the way a client does (the hunt's
+    // corpse looter). The item is the core's drop; nothing is granted here.
+    bool StepBrdIronfel(DungeonRunCoordinatorState& coord, std::vector<std::string> const& members,
+                        Player* leader, time_t now)
+    {
+        namespace D = OverseerDecisions;
+        if (coord.brdIronfel.over)
+            return false;
+        std::vector<D::BrdIronfelHolder> party;
+        std::vector<Player*> inside;
+        for (std::string const& name : members)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            D::BrdIronfelHolder holder;
+            holder.name = name;
+            if (p && p->IsInWorld() && p->GetMapId() == D::BRD_MAP_ID)
+            {
+                holder.aliveInside = p->IsAlive();
+                if (holder.aliveInside)
+                    inside.push_back(p);
+                QuestStatus const status = p->GetQuestStatus(D::BRD_DARK_IRON_LEGACY);
+                holder.holdsLegacy =
+                    (status == QUEST_STATUS_INCOMPLETE || status == QUEST_STATUS_COMPLETE) &&
+                    !p->GetQuestRewardStatus(D::BRD_DARK_IRON_LEGACY);
+                holder.ironfel = p->GetItemCount(D::BRD_IRONFEL);
+            }
+            party.push_back(holder);
+        }
+
+        D::BrdIronfelFacts facts;
+        facts.wanter = D::BrdIronfelWanter(D::BRD_MAP_ID, party);
+        facts.now = now;
+        Player* const wanter =
+            facts.wanter.empty() ? nullptr : ObjectAccessor::FindPlayerByName(facts.wanter);
+        Creature* corpse = nullptr;
+        if (wanter)
+        {
+            // By entry across the instance, as the Shrine step finds him: a
+            // Fineous found and none of them alive is a dead one.
+            std::list<Creature*> found;
+            wanter->GetCreatureListWithEntryInGrid(found, D::BRD_FINEOUS_ENTRY,
+                                                   D::BRD_FINEOUS_SEARCH_YARDS);
+            facts.fineousDead = !found.empty();
+            for (Creature* const fineous : found)
+            {
+                if (!fineous)
+                    continue;
+                if (fineous->IsAlive())
+                {
+                    facts.fineousDead = false;
+                    continue;
+                }
+                if (corpse || fineous->loot.isLooted())
+                    continue;
+                // Ironfel is a quest slot: the core offers it to the member
+                // that holds 3802, and only while it has not been taken.
+                for (LootItem const& item : fineous->loot.quest_items)
+                    if (item.itemid == D::BRD_IRONFEL && !item.is_looted &&
+                        item.AllowedForPlayer(wanter, fineous->GetGUID()))
+                    {
+                        corpse = fineous;
+                        break;
+                    }
+            }
+            facts.corpseOffers = corpse != nullptr;
+            facts.wanterInCombat = wanter->IsInCombat();
+            if (corpse)
+                facts.yards = wanter->GetExactDist(corpse->GetPositionX(), corpse->GetPositionY(),
+                                                   corpse->GetPositionZ());
+        }
+
+        D::BrdIronfelClock const before = coord.brdIronfel;
+        D::BrdIronfelVerdict const verdict = D::BrdIronfelNext(facts, before);
+        coord.brdIronfel = verdict.clock;
+
+        if (verdict.step == D::BrdIronfelStep::Done || verdict.step == D::BrdIronfelStep::GiveUp)
+        {
+            if (coord.brdIronfelPaused)
+                PauseBrainForBrdIronfel(coord, inside, leader, false, now);
+            if (verdict.step == D::BrdIronfelStep::Done)
+                LOG_INFO("module.overseer",
+                         "overseer: dungeon run {} - '{}' no longer wants Ironfel, {}s after the "
+                         "walk to Fineous Darkvire's corpse began; the clear resumes (#1454)",
+                         coord.runId, before.wanter, static_cast<int64>(now - before.walkSince));
+            else
+                LOG_WARN("module.overseer",
+                         "overseer: dungeon run {} - the pickup of Ironfel by '{}' from Fineous "
+                         "Darkvire's corpse gave up ({}): the clear resumes and the corpse is not "
+                         "asked again this run (#1454)",
+                         coord.runId, verdict.clock.wanter,
+                         !facts.corpseOffers ? "the corpse no longer offers it"
+                         : D::BrdIronfelAtCorpse(facts.yards)
+                             ? "opened three times and it was not taken"
+                             : "came no nearer");
+            return false;
+        }
+        if (verdict.step == D::BrdIronfelStep::Nothing || !corpse || !wanter)
+            return false;
+
+        if (!before.started)
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} - '{}' holds Dark Iron Legacy ({}) without Ironfel "
+                     "and Fineous Darkvire is dead with Ironfel on his corpse; the party walks it "
+                     "{:.0f} yards to loot it (#1454)",
+                     coord.runId, facts.wanter, D::BRD_DARK_IRON_LEGACY, facts.yards);
+
+        if (!coord.brdIronfelPaused ||
+            now - coord.brdIronfelPausedAt >= D::BRD_IRONFEL_PAUSE_RETRY_SECONDS)
+            PauseBrainForBrdIronfel(coord, inside, leader, true, now);
+
+        if (verdict.step == D::BrdIronfelStep::Loot)
+        {
+            uint32 const taken = HuntLootCorpse(wanter, corpse);
+            LOG_INFO("module.overseer",
+                     "overseer: dungeon run {} - '{}' opened Fineous Darkvire's corpse for Ironfel "
+                     "({} loot item(s), {} quest item(s), {} entry(ies) taken, {} free bag "
+                     "slot(s), attempt {}) (#1454)",
+                     coord.runId, facts.wanter, corpse->loot.items.size(),
+                     corpse->loot.quest_items.size(), taken, wanter->GetFreeInventorySpace(),
+                     coord.brdIronfel.lootTries);
+            return true;
+        }
+
+        std::ostringstream aim;
+        aim << "at:" << D::BRD_MAP_ID << ':' << corpse->GetPositionX() << ','
+            << corpse->GetPositionY() << ',' << corpse->GetPositionZ();
+        for (Player* const member : inside)
+        {
+            // The last stretch is the member's own, as the hunt walks to its
+            // corpse: an escort ends within its arrival radius of the point, which
+            // is not always inside the reach a corpse opens from.
+            if (member == wanter && D::BrdIronfelClose(facts.yards))
+            {
+                if (!member->isMoving())
+                    member->GetMotionMaster()->MovePoint(0, corpse->GetPositionX(),
+                                                         corpse->GetPositionY(),
+                                                         corpse->GetPositionZ());
+                continue;
+            }
+            EscortToward(member->GetName(), aim.str(), "FINEOUS DARKVIRE'S CORPSE",
+                         EscortPurpose::Assemble);
+        }
+        return true;
+    }
+
     // BLACKROCK DEPTHS' UPPER CITY (overseer_brd_wing.h, #1410), one CLEARING
     // poll on map 230. Once the Detention Block's nine encounters are credited
     // and the brain still clears only that wing, a party that can open the
@@ -59971,6 +60144,17 @@ private:
             // is the Shrine's - the party walks there and the carrier stands
             // for the bridge's turn-in - and the clearing clock is held, so no
             // stall check, skip or exit fires at a walk the run asked for.
+            // BLACKROCK DEPTHS' IRONFEL (#1454): asked before the Shrine, because
+            // the Shrine needs a carrier that holds Ironfel and nothing else
+            // makes the Dark Iron Legacy holder open Fineous Darkvire's corpse.
+            if (portal->insideMapId == OverseerDecisions::BRD_MAP_ID &&
+                StepBrdIronfel(coord, members, leader, clearingNow))
+            {
+                HoldClearingClock(coord, OverseerDecisions::ClearingClock::HeldIronfelPickup,
+                                  portal->insideMapId);
+                return;
+            }
+
             if (portal->insideMapId == OverseerDecisions::BRD_MAP_ID &&
                 StepBrdShrine(coord, members, leader, clearingNow))
             {

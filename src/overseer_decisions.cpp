@@ -2671,6 +2671,9 @@ char const* ClearingClockHoldReason(ClearingClock clock)
         case ClearingClock::HeldShrineWalk:
             return "the party walks the Ironfel carrier to the Shrine of Thaurissan, inside "
                    "that walk's own bound";
+        case ClearingClock::HeldIronfelPickup:
+            return "the party walks the Dark Iron Legacy carrier to Fineous Darkvire's corpse "
+                   "for Ironfel, inside that walk's own bound";
         case ClearingClock::Runs:
             break;
     }
