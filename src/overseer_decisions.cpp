@@ -2674,6 +2674,9 @@ char const* ClearingClockHoldReason(ClearingClock clock)
         case ClearingClock::HeldIronfelPickup:
             return "the party walks the Dark Iron Legacy carrier to Fineous Darkvire's corpse "
                    "for Ironfel, inside that walk's own bound";
+        case ClearingClock::HeldCoreFragmentChest:
+            return "the party walks the attunement holders to the Core Fragment chest, inside "
+                   "that visit's own bound";
         case ClearingClock::Runs:
             break;
     }
@@ -16252,6 +16255,58 @@ RaidClearCount RaidClearProgress(RaidDoor const& door, std::vector<bool> const& 
     return count;
 }
 
+std::string RaidBossName(std::string const& keyword, int slot)
+{
+    static char const* const moltenCore[] = {
+        "Lucifron", "Magmadar", "Gehennas", "Garr", "Shazzrah",
+        "Baron Geddon", "Sulfuron Harbinger", "Golemagg the Incinerator",
+        "Majordomo Executus", "Ragnaros",
+    };
+    if (keyword != "moltencore" || slot < 0 || slot >= 10)
+        return std::string();
+    return moltenCore[slot];
+}
+
+std::vector<std::string> RaidBossesCredited(std::string const& keyword,
+                                            std::vector<uint8_t> const& before,
+                                            std::vector<uint8_t> const& after)
+{
+    std::vector<std::string> names;
+    // No earlier read is no baseline: a run that has only just started reading
+    // the script would otherwise announce every boss an earlier run killed.
+    if (before.empty())
+        return names;
+    for (size_t slot = 0; slot < after.size(); ++slot)
+    {
+        bool const wasDone = slot < before.size() && before[slot] == RAID_SLOT_DONE;
+        if (after[slot] != RAID_SLOT_DONE || wasDone)
+            continue;
+        std::string const name = RaidBossName(keyword, int(slot));
+        if (!name.empty())
+            names.push_back(name);
+    }
+    return names;
+}
+
+int RaidFightingSlot(int remembered, std::vector<uint8_t> const& slotsNow)
+{
+    for (size_t slot = 0; slot < slotsNow.size(); ++slot)
+        if (slotsNow[slot] == RAID_SLOT_IN_PROGRESS)
+            return int(slot);
+    if (remembered >= 0 && size_t(remembered) < slotsNow.size() &&
+        slotsNow[size_t(remembered)] == RAID_SLOT_DONE)
+        return -1;
+    return remembered;
+}
+
+std::string RaidWipeOn(std::string const& keyword, int fightingSlot)
+{
+    if (keyword != "moltencore")
+        return std::string();
+    std::string const name = RaidBossName(keyword, fightingSlot);
+    return "wipe on " + (name.empty() ? std::string("trash") : name);
+}
+
 std::string RaidKeywordForJob(std::string const& job)
 {
     std::string const prefix = RAID_JOB_PREFIX;
@@ -19918,8 +19973,17 @@ std::vector<RunTimelineEvent> RaidTimelineEvents(RaidTimelineSnapshot const& bef
                             (after.bossesDone - before.bossesDone == 1 ? "" : "s") +
                             " done, " + std::to_string(after.bossesDone) + " of " +
                             std::to_string(after.bossesTotal) + " in all");
+        for (std::string const& name : RaidBossesCredited(who.keyword, before.slots, after.slots))
+            add("boss", name + " done");
         if (after.wipes > before.wipes)
-            add("wipe", "the raid wiped (wipe " + std::to_string(after.wipes) + ")");
+        {
+            // The fight remembered before the wipe, or the one still in
+            // progress on the poll that saw it.
+            std::string const on =
+                RaidWipeOn(who.keyword, after.fighting >= 0 ? after.fighting : before.fighting);
+            add("wipe", (on.empty() ? std::string() : on + ": ") + "the raid wiped (wipe " +
+                            std::to_string(after.wipes) + ")");
+        }
         if (after.released > before.released)
             add("released", std::to_string(after.released - before.released) +
                                 " corpse" + (after.released - before.released == 1 ? "" : "s") +
