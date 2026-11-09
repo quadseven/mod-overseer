@@ -199,6 +199,32 @@ void WhatMakesARolePiece()
     GearItem const mp5 = Piece(4, 1, 60, {{5, 6}, {43, 4}});
     Expect(GearPieceForRole(mp5, GearRole::Healer), "mana regeneration makes a healer's piece");
     Expect(!GearPieceForRole(Piece(4, 0, 0, {}), GearRole::Tank), "nothing on it is nothing");
+
+    // The Blackrock Depths gloves (#1475): epic mail, 238 armour, spirit 20,
+    // intellect 10, stamina 10. To a tank the spirit and intellect are worth
+    // nothing, so they never dilute the share test - armour and stamina alone
+    // made it a tank's piece, and the council gave a healer's gloves to the
+    // plate-wearing tank. A piece whose every non-stamina stat is a caster
+    // stat is not a tank's piece, however much armour it carries.
+    GearItem const casterGloves = Piece(4, 3, 238, {{6, 20}, {5, 10}, {7, 10}});
+    Expect(!GearPieceForRole(casterGloves, GearRole::Tank),
+           "mail whose stats are spirit and intellect is not a tank's piece");
+    Expect(GearPieceForRole(casterGloves, GearRole::Healer),
+           "and is still a healer's piece");
+    Expect(!GearPieceForRole(casterHood, GearRole::Tank),
+           "a cloth hood of intellect and spell power is not a tank's piece either");
+    Expect(!GearPieceForRole(necklace, GearRole::Tank),
+           "a necklace of intellect and spirit is not a tank's piece");
+
+    // The gate is about stat fit, not about spirit alone: a tank stat beside
+    // the caster splash keeps the piece a tank's, and a piece of nothing but
+    // stamina and armour is the plainest tank piece there is.
+    GearItem const defenseSplash = Piece(4, 0, 0, {{12, 10}, {6, 5}});
+    Expect(GearPieceForRole(defenseSplash, GearRole::Tank),
+           "defense with a splash of spirit is still a tank's piece");
+    GearItem const plainPlate = Piece(4, 4, 300, {{7, 15}});
+    Expect(GearPieceForRole(plainPlate, GearRole::Tank),
+           "armour and stamina alone are a tank's piece");
 }
 
 LootCandidate Seat(std::string const& name, std::string const& role, float gain, float score,
@@ -210,6 +236,166 @@ LootCandidate Seat(std::string const& name, std::string const& role, float gain,
     c.mainTank = mainTank;
     c.rolePiece = rolePiece;
     return c;
+}
+
+GearWearer Wearer(bool cloth, bool leather, bool mail, bool plate)
+{
+    GearWearer who;
+    who.cloth = cloth;
+    who.leather = leather;
+    who.mail = mail;
+    who.plate = plate;
+    return who;
+}
+
+void ArmourClassAndStatFit()
+{
+    // The same mail gloves (#1475). Whose own armour mail is comes off the
+    // character's skills: a shaman's heaviest is mail, a warrior's is the
+    // plate over it, a druid's the leather under it.
+    GearItem const gloves = Piece(4, 3, 238, {{6, 20}, {5, 10}, {7, 10}});
+    Expect(GearOwnArmourClass(gloves, Wearer(true, true, true, false)),
+           "mail is the shaman's own armour class");
+    Expect(!GearOwnArmourClass(gloves, Wearer(true, true, true, true)),
+           "mail sits under the warrior's plate");
+    Expect(!GearOwnArmourClass(gloves, Wearer(true, true, false, false)),
+           "mail sits over the druid's leather");
+    // The shaman's wearer above is also a warrior who has not learned
+    // plate: the skills are the same, so the answer is the same - the class
+    // name is never consulted.
+
+    // A shield, a ring and a sword are no class's own armour, and neither is
+    // a cloak, which every class wears whatever it is filed under.
+    GearWearer const warrior = Wearer(true, true, true, true);
+    Expect(!GearOwnArmourClass(Piece(4, 6, 500, {{7, 10}}), warrior),
+           "a shield is no class's own armour");
+    Expect(!GearOwnArmourClass(Piece(4, 0, 0, {{7, 10}}), warrior),
+           "a ring is no class's own armour");
+    Expect(!GearOwnArmourClass(Piece(2, 7, 0, {{4, 5}}, 30.f), warrior),
+           "a sword is no class's own armour");
+    GearItem cloak = Piece(4, 1, 40, {{5, 8}});
+    cloak.inventoryType = 16;  // INVTYPE_CLOAK
+    Expect(!GearOwnArmourClass(cloak, Wearer(true, false, false, false)),
+           "a cloak is no class's own armour");
+
+    // The stats: spirit and intellect are what a healer and a caster build
+    // on, and no physical role builds on either - which is why the family's
+    // melee shaman is not these gloves' wearer either.
+    Expect(GearStatsFitRole(gloves, GearRole::Healer), "spirit and intellect fit a healer");
+    Expect(GearStatsFitRole(gloves, GearRole::Caster), "spirit and intellect fit a caster");
+    Expect(!GearStatsFitRole(gloves, GearRole::Melee), "spirit and intellect fit no melee");
+    Expect(!GearStatsFitRole(gloves, GearRole::Tank), "and fit no tank");
+    Expect(!GearStatsFitRole(gloves, GearRole::Unknown), "an unread role is no fit either");
+
+    // A role's consolation prices are not a fit: a tank prices crit at half
+    // a point of armour per point, which settles ties and builds nothing.
+    Expect(!GearStatsFitRole(Piece(4, 4, 300, {{32, 10}, {7, 10}}), GearRole::Tank),
+           "crit alone does not fit a tank");
+    Expect(GearStatsFitRole(Piece(4, 4, 300, {{4, 10}, {7, 10}}), GearRole::Tank),
+           "strength fits a tank");
+}
+
+LootCandidate FitSeat(std::string const& name, std::string const& role, float gain, float score,
+                      bool rolePiece, bool ownArmour, bool statsFit, bool mainTank = false,
+                      bool family = true, GearComparison comparison = GearComparison::Better)
+{
+    LootCandidate c = Seat(name, role, gain, score, rolePiece, mainTank, family, comparison);
+    c.ownArmour = ownArmour;
+    c.statsFit = statsFit;
+    return c;
+}
+
+void TheClassificationFeedsFirstCall()
+{
+    // Priority reads rolePiece and nothing else, so the classification fix
+    // reaches it unchanged: on the mail gloves the main tank's first call
+    // is gone and the healer's stands.
+    GearItem const gloves = Piece(4, 3, 238, {{6, 20}, {5, 10}, {7, 10}});
+    LootCandidate tank = Candidate("Zug", true, GearComparison::Better, 50.f, 100.f, 8, "tank");
+    tank.tank = true;
+    tank.mainTank = true;
+    tank.rolePiece = GearPieceForRole(gloves, GearRole::Tank);
+    Expect(LootCouncilPriority(tank) == 3, "a main tank has no first call on a caster's gloves");
+    LootCandidate healer = Candidate("Zrog", true, GearComparison::Better, 30.f, 100.f, 8, "healer");
+    healer.rolePiece = GearPieceForRole(gloves, GearRole::Healer);
+    Expect(LootCouncilPriority(healer) == 2, "a healer's first call on them stands");
+}
+
+void TheHeuristicRespectsArmourFit()
+{
+    // The incident as the module saw it that night (#1475): the gloves were
+    // classified a tank's piece, so the main tank held first call at 50% new,
+    // ahead of the family's healing shaman at 30% - whose own armour mail is,
+    // and whose role the stats fit. The tank is never named while she is
+    // there to wear them, first call or not.
+    std::vector<LootCandidate> c = {
+        FitSeat("Zug", "tank", 50.f, 100.f, true, false, false, true),
+        FitSeat("Zrog", "healer", 30.f, 100.f, true, true, true),
+    };
+    LootCouncilPick const pick = LootCouncilHeuristic(c);
+    Expect(pick.recipient == "Zrog",
+           "the shaman whose own armour mail is gets the mail gloves, not the tank");
+    Expect(pick.ranked.size() == 2 && pick.ranked[0] == "Zrog" && pick.ranked[1] == "Zug",
+           "the fitted wearer heads the ranking");
+    Expect(pick.why.find("armour class is not Zug's own") != std::string::npos,
+           "the reason names the armour class and who was passed over");
+    Expect(pick.why.find("fit Zrog as a healer") != std::string::npos,
+           "and whose role the stats fit");
+
+    // A fitted caster is promoted the same way: first call is no shelter.
+    std::vector<LootCandidate> elemental = {
+        FitSeat("Zug", "tank", 50.f, 100.f, true, false, false, true),
+        FitSeat("Zrok", "caster", 30.f, 100.f, false, true, true),
+    };
+    Expect(LootCouncilHeuristic(elemental).recipient == "Zrok",
+           "a caster whose own armour it is takes it over the tank's first call");
+
+    // The fitted member need not be family: a guild raider the piece fits
+    // is named over the family's tank it does not.
+    std::vector<LootCandidate> raider = {
+        FitSeat("Zug", "tank", 50.f, 100.f, true, false, false, true),
+        FitSeat("Raidhealer", "healer", 30.f, 100.f, true, true, true, false, false),
+    };
+    Expect(LootCouncilHeuristic(raider).recipient == "Raidhealer",
+           "a fitted raider is named over a family tank the piece does not fit");
+
+    // With nobody in the group the piece fits - here the shaman's own
+    // armour is mail but the stats fit no role she plays - the gate stays
+    // silent and the council runs as it always has.
+    c[1].statsFit = false;
+    Expect(LootCouncilHeuristic(c).recipient == "Zug",
+           "nobody fitting leaves the main tank's first call standing");
+
+    // A fitted member the drop does not upgrade is not promoted into it,
+    // and neither is one whose upgrade the numbers cannot settle, over a
+    // certain one.
+    std::vector<LootCandidate> notAnUpgrade = {
+        FitSeat("Zug", "tank", 50.f, 100.f, true, false, false, true),
+        FitSeat("Zrog", "healer", 30.f, 100.f, true, true, true, false, true,
+                GearComparison::NotBetter),
+    };
+    Expect(LootCouncilHeuristic(notAnUpgrade).recipient == "Zug",
+           "a fitted member it does not upgrade is not named either");
+    std::vector<LootCandidate> unsettled = {
+        FitSeat("Zug", "tank", 50.f, 100.f, true, false, false, true),
+        FitSeat("Zrog", "healer", 30.f, 100.f, true, true, true, false, true,
+                GearComparison::Undecided),
+    };
+    Expect(LootCouncilHeuristic(unsettled).recipient == "Zug",
+           "an unsettled fitted member is not named over a certain one");
+
+    // A piece that is the front's own armour class is untouched by the
+    // gate, even when its stats fit him badly: that misfit is the
+    // classification's and the bridge's business, not this gate's.
+    std::vector<LootCandidate> plate = {
+        FitSeat("Zug", "tank", 50.f, 100.f, false, true, false, true),
+        FitSeat("Ugga", "healer", 30.f, 100.f, false, true, true),
+    };
+    LootCouncilPick const platePick = LootCouncilHeuristic(plate);
+    Expect(platePick.recipient == "Zug",
+           "the tank keeps a piece that is his own armour class");
+    Expect(platePick.why.find("armour class is not") == std::string::npos,
+           "and the reason does not claim otherwise");
 }
 
 void TheMainTankIsGearedFirst()
@@ -492,6 +678,12 @@ void TheAdapterSeams()
     Expect(module.find("c.rolePiece = OverseerDecisions::GearPieceForRole(") !=
                std::string::npos,
            "each candidate is told whether the drop is a piece for its role");
+    Expect(module.find("c.ownArmour = OverseerDecisions::GearOwnArmourClass(") !=
+                   std::string::npos &&
+               module.find("c.statsFit = OverseerDecisions::GearStatsFitRole(") !=
+                   std::string::npos,
+           "each candidate is told whether the drop's armour class is its own and "
+           "whether the drop's stats fit its role");
     Expect(module.find("candidates.back().tank && p->GetName() == family") != std::string::npos &&
                module.find("candidates.back().mainTank = OverseerDecisions::LootMainTank(") !=
                    std::string::npos,
@@ -533,6 +725,9 @@ int main()
     NobodyItUpgrades();
     TiesAreSettledByName();
     WhatMakesARolePiece();
+    ArmourClassAndStatFit();
+    TheClassificationFeedsFirstCall();
+    TheHeuristicRespectsArmourFit();
     TheMainTankIsGearedFirst();
     TanksThenHealersThenTheRest();
     VotesOnAnOpenRoll();

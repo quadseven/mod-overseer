@@ -21452,7 +21452,10 @@ private:
         c.why = candidate.why;
         if (!candidate.wearable)
             return c;
-        c.rolePiece = OverseerDecisions::GearPieceForRole(GearItemFor(proto, random), who.role);
+        OverseerDecisions::GearItem const item = GearItemFor(proto, random);
+        c.rolePiece = OverseerDecisions::GearPieceForRole(item, who.role);
+        c.ownArmour = OverseerDecisions::GearOwnArmourClass(item, who);
+        c.statsFit = OverseerDecisions::GearStatsFitRole(item, who.role);
 
         uint8 const found = bot->FindEquipSlot(proto, NULL_SLOT, true);
         if (found == NULL_SLOT || found >= EQUIPMENT_SLOT_END)

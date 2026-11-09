@@ -6418,7 +6418,13 @@ GearVerdict GearScore(GearItem const& item, GearWearer const& who);
 // (plate, 396 armour, 12 strength, 12 stamina, 8 crit) is 90% survival to a
 // tank and went to the Retribution paladin, because 40% of it was new to him
 // against 36% to the main tank. A tank's weapon is mostly damage and is not a
-// tank's piece; neither is a ring of agility and hit.
+// tank's piece; neither is a ring of agility and hit. And the worth is read
+// against the piece's whole stat budget, not only the part a tank prices: a
+// piece whose every non-stamina stat is a caster stat (one a tank prices at
+// nothing and a healer or a caster prices above nothing) is not a tank's
+// piece however much armour it carries - epic mail gloves of spirit and
+// intellect were handed to a plate-wearing tank on their armour and stamina
+// alone, because the stats he could not use never entered the worth at all.
 //
 // A HEALER'S PIECE carries the healer's own stats, spirit or mana regeneration,
 // and intellect, spirit, mana regeneration and spell power are at least half of
@@ -6430,6 +6436,22 @@ GearVerdict GearScore(GearItem const& item, GearWearer const& who);
 // Every other role answers false: melee, ranged and caster pieces are shared
 // out by the size of the upgrade, as before.
 bool GearPieceForRole(GearItem const& item, GearRole role);
+
+// IS THIS ARMOUR THE ARMOUR CLASS THE CHARACTER WEARS AS ITS OWN? The
+// heaviest armour its skills train: plate for a warrior who has learned it,
+// mail for one who has not, and for a shaman at any level. Read off the
+// wearer's proficiencies rather than the class name, for the reason the
+// proficiency note above gives. A shield, a ring, a weapon and a cloak are
+// no class's own armour: a shield is held, not worn as a class, and a cloak
+// is filed under cloth but every class wears one.
+bool GearOwnArmourClass(GearItem const& item, GearWearer const& who);
+
+// DO THE PIECE'S STATS FIT THE ROLE? At least one stat beyond stamina that
+// the role prices above half a point of armour per point - the price a role
+// builds on, as opposed to its consolation prices (a tank's half point for
+// crit), which settle ties and make nothing fit. An unknown role has no
+// prices to fit, and answers false rather than guess.
+bool GearStatsFitRole(GearItem const& item, GearRole role);
 
 struct GearUsability
 {
@@ -6837,6 +6859,16 @@ struct LootCandidate
     // GearPieceForRole for the role above: the piece is what this role wears
     // gear FOR (survival for a tank, healing for a healer).
     bool rolePiece{false};
+    // The drop's armour class is the one this character's class wears as
+    // its own (GearOwnArmourClass, filled by the caller from the same item
+    // and wearer), and the drop's stats fit the role above
+    // (GearStatsFitRole). Two facts because the heuristic spends them
+    // differently: it never names a member whose own armour the drop is not
+    // while a member stands among those it upgrades whose own it is and
+    // whose role its stats fit. False by default on both - a candidate
+    // nobody measured keeps the council as it always ran.
+    bool ownArmour{false};
+    bool statsFit{false};
     // GearVerdict::why, or the refusal sentence.
     std::string why;
 };
@@ -6896,8 +6928,12 @@ int LootCouncilPriority(LootCandidate const& candidate);
 // each, a certain upgrade (GearComparison::Better) before one the numbers
 // cannot settle, then LootCouncilPriority (the main tank, then the other tanks,
 // on a tank's piece; a healer on a healer's piece), and then the larger
-// UpgradePercent, then the name. A drop that is not an upgrade for anybody
-// names nobody.
+// UpgradePercent, then the name. One rule stands over that order: a member
+// the drop does not fit (LootCandidate::armourFit) is never named while a
+// member it fits stands among those it upgrades - a plate-wearing tank is
+// not handed mail gloves whose stats fit the group's shaman, first call or
+// not. With nobody fitting, the order above runs exactly as it always has. A
+// drop that is not an upgrade for anybody names nobody.
 LootCouncilPick LootCouncilHeuristic(std::vector<LootCandidate> const& candidates);
 
 // What one member votes on an open group-loot roll the council is deciding.
