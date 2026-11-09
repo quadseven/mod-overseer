@@ -276,6 +276,21 @@ constexpr std::size_t DEATH_DAMAGE_HISTORY_SIZE = 3;
 // Keep only the most recent damage observations, in chronological order.
 void RememberDamage(DamageHistory& history, DamageTaken sample);
 
+// What the core's motion master was running. The long comment on why it is
+// sampled and not read live sits above DeathDriver below; the enum is declared
+// here because a DeathHit keeps one.
+enum class MoveGenerator
+{
+    Unsampled,  // no snapshot has been taken for this character yet
+    Idle,       // IDLE_MOTION_TYPE: nothing had hold of it
+    Follow,     // FOLLOW_MOTION_TYPE: it was following its leader
+    Point,      // POINT_MOTION_TYPE: a scripted move to a coordinate
+    Chase,      // CHASE_MOTION_TYPE: it was pursuing something
+    Flee,       // FLEEING / TIMED_FLEEING / CONFUSED: combat put it there too
+    Thrown,     // EFFECT_MOTION_TYPE: a spline SOMETHING ELSE put it on
+    Other,      // waypoint, flight, home, rotate: named so it is not guessed at
+};
+
 // WHAT KILLED A MEMBER IN A DUNGEON, SEEN HIT BY HIT. The death row's context
 // (damage_1..3, health_at_death, in_combat) came only from caches the 5 s
 // snapshot fills for roster characters, so every natural guild member's death
@@ -305,6 +320,17 @@ struct DeathHit
     // Who had the member as its target, read on the killing blow only
     // (NameTheAttackers). Empty on every other hit.
     std::string targetedBy;
+    // READ ON EVERY HIT, not only the killing one, because the death hook
+    // reads none of it (the core has emptied the attacker list, cleared the
+    // motion master and dismissed nothing it can still answer for): the units
+    // whose victim was the member, what the motion master was running, who
+    // was in charge of the member's moves, and whether its pet was out.
+    // `attackers` counts units whose victim is the member; it is NOT the
+    // enemies in combat with it (`enemiesEngaged`).
+    std::uint32_t attackers{0};
+    MoveGenerator movement{MoveGenerator::Unsampled};
+    std::string controller;
+    std::string pet;
 };
 
 using DeathHitRing = std::vector<DeathHit>;
@@ -343,9 +369,57 @@ struct DeathHitAccount
     bool inCombat{false};
     std::uint32_t enemiesEngaged{0};
     std::string targetedBy;
+    // As the newest hit found them (the killing blow when the hook saw it).
+    std::uint32_t attackers{0};
+    MoveGenerator movement{MoveGenerator::Unsampled};
+    std::string controller;
+    std::string pet;
+    // The oldest hit within DEATH_EARLIER_WINDOW_MS before the newest one, when
+    // there is one other than it: the member's health and mana a few seconds
+    // before the killing blow.
+    bool earlierSeen{false};
+    std::uint32_t earlierSeconds{0};
+    std::uint32_t earlierHealth{0};
+    std::uint32_t earlierMaxHealth{0};
+    std::uint32_t earlierMana{0};
+    std::uint32_t earlierMaxMana{0};
     // The newest DEATH_DAMAGE_HISTORY_SIZE hits, oldest first, with their sources.
     DamageHistory damage;
 };
+
+// How far before the newest hit the "a few seconds earlier" reading may come from.
+constexpr std::int64_t DEATH_EARLIER_WINDOW_MS = 10000;
+
+// Whether the member's pet was there, read on each hit. `petClass` is a class
+// that summons one (warlock, hunter); every other class is "not a pet class",
+// which is not the same answer as "none summoned".
+struct PetFacts
+{
+    bool petClass{false};
+    bool out{false};
+    bool alive{false};
+    bool unsummoned{false};  // no pet out, but the core remembers one it put away
+};
+std::string NameThePetState(PetFacts const& facts);
+
+// Who was in charge of the member's moves: a player, or a playerbot and the
+// movement strategy it was running.
+struct ControllerFacts
+{
+    bool bot{false};
+    bool stay{false};
+    bool follow{false};
+    bool newRpg{false};
+    bool grind{false};
+};
+std::string NameTheController(ControllerFacts const& facts);
+
+// The log line's pieces for a guild death: the attacker count, or "unsampled"
+// (never 0 for a count nobody took), and the rest of the telemetry, ready to
+// append: ", moved by a playerbot on 'new rpg' (movement 'chase'), pet out,
+// health 41% at the last hit (100% 6s before), mana 12% (80% 6s before)".
+std::string GuildDeathAttackers(DeathHitAccount const& account);
+std::string GuildDeathTelemetry(DeathHitAccount const& account);
 
 DeathHitAccount AccountForDeathHits(DeathHitRing const& ring, std::int64_t deathMs);
 
@@ -2669,6 +2743,44 @@ time_t StagedInsideBackstopSeconds(std::vector<DungeonRunEntryState> const& memb
 // When the patience shortens, as when a ghost stands up, the member gets the
 // shorter patience from now and not from a clock that may already be past it.
 time_t StagedInsideClockAfter(time_t since, time_t oldPatience, time_t patience, time_t now);
+
+// ---------------------------------- a stuck member does not close a fight (#1472)
+//
+// MEASURED ON THE DEV REALM 2026-11-09, TWO BLACKROCK DEPTHS RUNS. A caster died
+// in the arena and took the spirit healer on the mountain. Its walk back to the
+// door stalled about 350 yards short, and after five minutes with nobody else
+// getting in the run was closed 'split_failed'. In one of them that was ten
+// seconds after a boss was credited, with four members inside and fighting. The
+// warning line said fifteen minutes: it was said once, while the member was a
+// ghost, and the living member's five minutes (STAGED_INSIDE_LIVING_MEMBER_SECONDS)
+// replaced the patience without the line being said again.
+//
+// A PARTY OF FOUR OR MORE THAT IS GETTING SOMEWHERE IS NOT A STANDING PARTY. The
+// ceiling exists for five characters standing still with no bound on them; it
+// is not for a party mid-boss that is merely one short. Progress is a boss
+// credited or the leader thirty yards on (the clearing watchdog's own reading,
+// `clearAdvancedAt`). Progress no older than SPLIT_HOLD_PROGRESS_SECONDS always
+// holds; older progress holds only while a member inside is in combat and is
+// still no older than `fightCeilingSeconds`, so a combat flag that never clears
+// cannot hold a run for ever.
+constexpr unsigned SPLIT_HOLD_MIN_INSIDE = 4;
+constexpr time_t SPLIT_HOLD_PROGRESS_SECONDS = 2 * 60;
+constexpr time_t SPLIT_HOLD_FIGHT_CEILING_SECONDS = 15 * 60;
+
+bool SplitFailedHeldByProgress(unsigned inside, bool anyInsideInCombat, time_t advancedAt,
+                               time_t now, time_t fightCeilingSeconds);
+
+// The warning line states the patience the ceiling is using, so it is said
+// again whenever that number changes rather than once with the first one.
+bool StagedInsideWarningStale(time_t warnedPatience, time_t patience);
+
+// HOW LONG A STRANDED MEMBER'S WALK BACK TO THE DOOR MAY RUN WITHOUT GETTING IT
+// THERE before the stone is used instead. Under the run's five minutes, so the
+// hearth has been tried before the ceiling is reached. Same rule as a walk out
+// (EvacuationWalkFailed): a ground give-up after the walk began, or the bound.
+constexpr std::int64_t STRANDED_WALK_BACK_BOUND_SECONDS = 3 * 60;
+bool StrandedWalkBackFailed(std::int64_t walkSince, std::int64_t groundGaveUpAt,
+                            std::int64_t now);
 
 // ------------------------------------------- getting one member back out --
 //
@@ -6344,7 +6456,13 @@ GearVerdict GearScore(GearItem const& item, GearWearer const& who);
 // (plate, 396 armour, 12 strength, 12 stamina, 8 crit) is 90% survival to a
 // tank and went to the Retribution paladin, because 40% of it was new to him
 // against 36% to the main tank. A tank's weapon is mostly damage and is not a
-// tank's piece; neither is a ring of agility and hit.
+// tank's piece; neither is a ring of agility and hit. And the worth is read
+// against the piece's whole stat budget, not only the part a tank prices: a
+// piece whose every non-stamina stat is a caster stat (one a tank prices at
+// nothing and a healer or a caster prices above nothing) is not a tank's
+// piece however much armour it carries - epic mail gloves of spirit and
+// intellect were handed to a plate-wearing tank on their armour and stamina
+// alone, because the stats he could not use never entered the worth at all.
 //
 // A HEALER'S PIECE carries the healer's own stats, spirit or mana regeneration,
 // and intellect, spirit, mana regeneration and spell power are at least half of
@@ -6356,6 +6474,22 @@ GearVerdict GearScore(GearItem const& item, GearWearer const& who);
 // Every other role answers false: melee, ranged and caster pieces are shared
 // out by the size of the upgrade, as before.
 bool GearPieceForRole(GearItem const& item, GearRole role);
+
+// IS THIS ARMOUR THE ARMOUR CLASS THE CHARACTER WEARS AS ITS OWN? The
+// heaviest armour its skills train: plate for a warrior who has learned it,
+// mail for one who has not, and for a shaman at any level. Read off the
+// wearer's proficiencies rather than the class name, for the reason the
+// proficiency note above gives. A shield, a ring, a weapon and a cloak are
+// no class's own armour: a shield is held, not worn as a class, and a cloak
+// is filed under cloth but every class wears one.
+bool GearOwnArmourClass(GearItem const& item, GearWearer const& who);
+
+// DO THE PIECE'S STATS FIT THE ROLE? At least one stat beyond stamina that
+// the role prices above half a point of armour per point - the price a role
+// builds on, as opposed to its consolation prices (a tank's half point for
+// crit), which settle ties and make nothing fit. An unknown role has no
+// prices to fit, and answers false rather than guess.
+bool GearStatsFitRole(GearItem const& item, GearRole role);
 
 struct GearUsability
 {
@@ -6763,6 +6897,16 @@ struct LootCandidate
     // GearPieceForRole for the role above: the piece is what this role wears
     // gear FOR (survival for a tank, healing for a healer).
     bool rolePiece{false};
+    // The drop's armour class is the one this character's class wears as
+    // its own (GearOwnArmourClass, filled by the caller from the same item
+    // and wearer), and the drop's stats fit the role above
+    // (GearStatsFitRole). Two facts because the heuristic spends them
+    // differently: it never names a member whose own armour the drop is not
+    // while a member stands among those it upgrades whose own it is and
+    // whose role its stats fit. False by default on both - a candidate
+    // nobody measured keeps the council as it always ran.
+    bool ownArmour{false};
+    bool statsFit{false};
     // GearVerdict::why, or the refusal sentence.
     std::string why;
 };
@@ -6822,8 +6966,12 @@ int LootCouncilPriority(LootCandidate const& candidate);
 // each, a certain upgrade (GearComparison::Better) before one the numbers
 // cannot settle, then LootCouncilPriority (the main tank, then the other tanks,
 // on a tank's piece; a healer on a healer's piece), and then the larger
-// UpgradePercent, then the name. A drop that is not an upgrade for anybody
-// names nobody.
+// UpgradePercent, then the name. One rule stands over that order: a member
+// the drop does not fit (LootCandidate::armourFit) is never named while a
+// member it fits stands among those it upgrades - a plate-wearing tank is
+// not handed mail gloves whose stats fit the group's shaman, first call or
+// not. With nobody fitting, the order above runs exactly as it always has. A
+// drop that is not an upgrade for anybody names nobody.
 LootCouncilPick LootCouncilHeuristic(std::vector<LootCandidate> const& candidates);
 
 // What one member votes on an open group-loot roll the council is deciding.
@@ -8012,17 +8160,6 @@ char const* ExtendedCostRefusal(ExtendedCostShape const& cost, BuyRequest const&
 // time. The last sample before the death is the only place those facts still
 // exist, and at a five-second cadence against falls that complete in nought to
 // five seconds it is the right resolution for exactly this question.
-enum class MoveGenerator
-{
-    Unsampled,  // no snapshot has been taken for this character yet
-    Idle,       // IDLE_MOTION_TYPE: nothing had hold of it
-    Follow,     // FOLLOW_MOTION_TYPE: it was following its leader
-    Point,      // POINT_MOTION_TYPE: a scripted move to a coordinate
-    Chase,      // CHASE_MOTION_TYPE: it was pursuing something
-    Flee,       // FLEEING / TIMED_FLEEING / CONFUSED: combat put it there too
-    Thrown,     // EFFECT_MOTION_TYPE: a spline SOMETHING ELSE put it on
-    Other,      // waypoint, flight, home, rotate: named so it is not guessed at
-};
 
 // WHAT THIS MODULE THINKS WAS DRIVING IT. Deliberately a small vocabulary: a
 // column somebody groups by is only useful if the values are few and mean the
@@ -22395,12 +22532,45 @@ struct RaidTimelineSnapshot
     // zero until ASSEMBLE has ended, and then the row says nothing extra.
     unsigned atDoor{0};
     unsigned inRaid{0};
+    // The raiders saved to another copy of the raid, and how many of the copy's
+    // `encounterSlots` encounters are already credited (#1458). Set with atDoor.
+    std::vector<std::string> misSaved;
+    unsigned creditedEncounters{0};
+    unsigned encounterSlots{0};
     // THE SCRIPT'S BOSS SLOTS (#1459), as RaidSlotState, empty when nobody
     // inside could be read. `fighting` is the slot remembered as the current
     // fight (RaidFightingSlot), -1 for none.
     std::vector<uint8_t> slots;
     int fighting{-1};
 };
+
+// -- the door reads each seat's save before ENTER (#1458) ---------------------
+//
+// A raider saved to another copy of a raid is refused at the door by the core,
+// and the raid runner reads no saves, so one such seat held ENTER until its
+// wait ceiling. Each seat's save is told apart by instance id (0 = no save).
+enum class RaidSeatBind : std::uint8_t { None, SameCopy, OtherCopy };
+RaidSeatBind RaidSeatBindFor(std::uint32_t seatInstanceId, std::uint32_t groupInstanceId);
+
+struct RaidSeatBindFact
+{
+    std::string name;
+    RaidSeatBind bind{RaidSeatBind::None};
+};
+
+// Who may enter, and who is named as saved to another copy (seat order kept).
+// A named seat is left out of the ENTER count; it is never reset or moved.
+struct RaidBindVerdict
+{
+    std::vector<std::string> mayEnter;
+    std::vector<std::string> misSaved;
+};
+RaidBindVerdict RaidBindVerdictFor(std::vector<RaidSeatBindFact> const& seats);
+
+// How many of the door's own encounters a copy's completed-encounter mask
+// already credits, among `slotCount` script slots.
+unsigned RaidCreditedEncounters(RaidDoor const& door, std::uint32_t completedMask,
+                                unsigned slotCount);
 
 std::vector<RunTimelineEvent> RaidTimelineEvents(RaidTimelineSnapshot const& before,
                                                  RaidTimelineSnapshot const& after);
