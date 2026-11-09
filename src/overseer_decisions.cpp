@@ -20189,8 +20189,51 @@ std::vector<RunTimelineEvent> RaidTimelineEvents(RaidTimelineSnapshot const& bef
             detail += (after.why.empty() ? ": " : "; ") + std::to_string(after.atDoor) +
                       " of " + std::to_string(after.inRaid) + " raiders at the door";
         add("phase", detail);
+        // THE DOOR'S SAVES (#1458): who is kept out of the count, and what the
+        // copy already has credited. A partly cleared copy is entered as is.
+        if (before.phase == "ASSEMBLE" && after.phase == "ENTER" && after.encounterSlots > 0)
+        {
+            std::string row = "the raid enters its copy as is, with " +
+                              std::to_string(after.creditedEncounters) + " of " +
+                              std::to_string(after.encounterSlots) +
+                              " encounters already credited";
+            std::string names;
+            for (std::string const& name : after.misSaved)
+                names += (names.empty() ? "" : ", ") + name;
+            if (!names.empty())
+                row += "; kept out of the count: " + names;
+            add("enter", row);
+            if (!names.empty())
+                add("enter_refused", names + (after.misSaved.size() == 1 ? " is" : " are") +
+                                         " saved to another copy and cannot enter this one");
+        }
     }
     return events;
+}
+
+RaidSeatBind RaidSeatBindFor(std::uint32_t seatInstanceId, std::uint32_t groupInstanceId)
+{
+    if (seatInstanceId == 0)
+        return RaidSeatBind::None;
+    return seatInstanceId == groupInstanceId ? RaidSeatBind::SameCopy : RaidSeatBind::OtherCopy;
+}
+
+RaidBindVerdict RaidBindVerdictFor(std::vector<RaidSeatBindFact> const& seats)
+{
+    RaidBindVerdict verdict;
+    for (RaidSeatBindFact const& seat : seats)
+        (seat.bind == RaidSeatBind::OtherCopy ? verdict.misSaved : verdict.mayEnter)
+            .push_back(seat.name);
+    return verdict;
+}
+
+unsigned RaidCreditedEncounters(RaidDoor const& door, std::uint32_t completedMask,
+                                unsigned slotCount)
+{
+    std::vector<bool> slots(slotCount, false);
+    for (unsigned slot = 0; slot < slotCount && slot < 32; ++slot)
+        slots[slot] = (completedMask >> slot) & 1u;
+    return RaidClearProgress(door, slots).done;
 }
 
 std::vector<DcOnTimelineEvent> DcOnTimelineEvents(std::map<std::string, DcOnMark> const& before,

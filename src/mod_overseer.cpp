@@ -53806,6 +53806,11 @@ private:
         // ASSEMBLE -> ENTER row: members within RAID_ASSEMBLE_YARDS of the
         // staging point, the head included, and the raid's members.
         unsigned atDoor{0};
+        // The door saves, read each poll before the raid is inside (#1458):
+        // raiders saved to another copy, and the copy credited encounters.
+        std::vector<std::string> misSaved;
+        unsigned creditedEncounters{0};
+        unsigned encounterSlots{0};
         unsigned inRaid{0};
         // The quorum hold (#1457): the shortfall last logged, so a hold logs
         // when it changes and not every poll; and whether the order ended for
@@ -54397,6 +54402,24 @@ private:
                member->GetCorpseLocation().GetMapId() == door->insideMapId;
     }
 
+    // THE DOOR READS EACH SEAT SAVE (#1458). The raid copy is the head bind on
+    // the raid map; a seat bound to any other copy is refused at the door by
+    // the core, so it is named and kept out of the ENTER count.
+    // PlayerGetBoundInstance  InstanceSaveMgr.h:207; InstancePlayerBind::save
+    // InstanceSaveMgr.h:39-41. Reads only: nothing is reset or unbound.
+    static uint32 RaidBoundInstanceId(Player* member, uint32 mapId, uint32* mask = nullptr)
+    {
+        if (!member)
+            return 0;
+        InstancePlayerBind* const bind = sInstanceSaveMgr->PlayerGetBoundInstance(
+            member->GetGUID(), mapId, DUNGEON_DIFFICULTY_NORMAL);
+        if (!bind || !bind->save)
+            return 0;
+        if (mask)
+            *mask = bind->save->GetCompletedEncounterMask();
+        return bind->save->GetInstanceId();
+    }
+
     // THE CORE'S OWN CREDIT, read off the instance script through any member
     // standing inside. Molten Core keeps ten boss slots (molten_core.h,
     // DATA_LUCIFRON 0 to DATA_RAGNAROS 9) and sets each through SetBossState,
@@ -54781,6 +54804,9 @@ private:
         snap.cleared = run.bossesTotal && run.bossesDone >= run.bossesTotal;
         snap.atDoor = run.atDoor;
         snap.inRaid = run.inRaid;
+        snap.misSaved = run.misSaved;
+        snap.creditedEncounters = run.creditedEncounters;
+        snap.encounterSlots = run.encounterSlots;
         snap.slots = run.slotStates;
         return snap;
     }
@@ -55024,12 +55050,45 @@ private:
             // BUSY, FOR CLEAR'S STALL LADDER: somebody inside fighting, dead
             // and waiting on a healer, or the head eating or drinking.
             bool anyBusy = false;
+            std::set<std::string> misSavedNow;
             if (facts.raidFormed && door)
             {
+                uint32 headMask = 0;
+                uint32 const groupCopy = RaidBoundInstanceId(head, door->insideMapId, &headMask);
+                std::vector<OverseerDecisions::RaidSeatBindFact> bindFacts;
+                for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+                {
+                    Player* member = ref->GetSource();
+                    if (!member || !member->IsInWorld() || member == head)
+                        continue;
+                    OverseerDecisions::RaidSeatBindFact fact;
+                    fact.name = member->GetName();
+                    fact.bind = OverseerDecisions::RaidSeatBindFor(
+                        RaidBoundInstanceId(member, door->insideMapId), groupCopy);
+                    bindFacts.push_back(std::move(fact));
+                }
+                OverseerDecisions::RaidBindVerdict const verdict =
+                    OverseerDecisions::RaidBindVerdictFor(bindFacts);
+                misSavedNow.insert(verdict.misSaved.begin(), verdict.misSaved.end());
+                // Kept while the raid is outside; once inside the row is history.
+                if (run.phase == RaidRunPhase::Assemble || run.phase == RaidRunPhase::Enter ||
+                    run.phase == RaidRunPhase::Form)
+                {
+                    run.misSaved = verdict.misSaved;
+                    // MC keeps ten boss slots (molten_core.h DATA_LUCIFRON..DATA_RAGNAROS).
+                    run.encounterSlots = 10;
+                    run.creditedEncounters = OverseerDecisions::RaidCreditedEncounters(
+                        *door, headMask, run.encounterSlots);
+                }
                 for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
                 {
                     Player* member = ref->GetSource();
                     if (!member || !member->IsInWorld())
+                        continue;
+                    // A seat saved to another copy, still outside, is not part of
+                    // the count ENTER waits on (#1458).
+                    if (member->GetMapId() != door->insideMapId &&
+                        misSavedNow.count(member->GetName()))
                         continue;
                     ++facts.inWorld;
                     // A party member still carrying Resurrection Sickness holds
@@ -55671,6 +55730,7 @@ private:
                         Player* member = ref->GetSource();
                         if (member && member->IsInWorld() &&
                             (member->IsAlive() || RaidGhostOf(member, door)) &&
+                            !misSavedNow.count(member->GetName()) &&
                             member->IsInAreaTriggerRadius(trigger))
                             inDoor.push_back(member->GetName());
                     }
