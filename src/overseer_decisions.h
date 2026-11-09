@@ -19245,6 +19245,19 @@ constexpr long RAID_ASSEMBLE_CROSSING_EXTRA_SECONDS = 30 * 60;
 long RaidAssembleWaitSeconds(unsigned awayOnOtherMap);
 constexpr long RAID_ENTER_WAIT_SECONDS = 3 * 60;
 
+// THE QUORUM AT THE DOOR (#1457). The wait above ends ASSEMBLE, but it does not
+// make the raid fit to walk in: twelve of forty seats at the door die to the
+// first pack. ENTER needs at least this many raid members at the door, with at
+// least this many tanks and healers among them. Short at the end of the wait,
+// the raid holds at the door and the log names the shortfall by duty; after
+// RAID_QUORUM_EXTRA_WAIT_SECONDS more the order ends with a named reason. The
+// adapter reads Overseer.Raid.QuorumSeats, QuorumTanks and QuorumHealers over
+// these defaults.
+constexpr unsigned RAID_QUORUM_SEATS = 36;
+constexpr unsigned RAID_QUORUM_TANKS = 3;
+constexpr unsigned RAID_QUORUM_HEALERS = 8;
+constexpr long RAID_QUORUM_EXTRA_WAIT_SECONDS = 15 * 60;
+
 // -- inside: HOLD, CLEAR, RECOVER (#640) --------------------------------------
 //
 // HOLD IS WHERE A RAID GETS READY, AND IT IS BOUNDED BOTH WAYS. At least
@@ -19332,6 +19345,17 @@ struct RaidRunFacts
     // The same count without the head, taken in the same pass, so ENTER's
     // "everyone else has crossed" never subtracts a head that was not counted.
     unsigned othersAssembled{0};
+    // The quorum at the door (#1457): tanks and healers among `assembled`, the
+    // seats the order holds, and the floor to meet (tunable by the adapter).
+    unsigned assembledTanks{0};
+    unsigned assembledHealers{0};
+    unsigned seatsTotal{0};
+    unsigned quorumSeats{RAID_QUORUM_SEATS};
+    unsigned quorumTanks{RAID_QUORUM_TANKS};
+    unsigned quorumHealers{RAID_QUORUM_HEALERS};
+    // A previous attempt of this order ended for want of a quorum; the order
+    // does not re-form until it is given again.
+    bool quorumEnded{false};
     // Raid members in the world on a map that is neither the door's outside
     // map nor its inside map: they still have a crossing to make (#765).
     unsigned awayOnOtherMap{0};
@@ -19401,8 +19425,16 @@ struct RaidRunStep
     bool runBack{false};      // RECOVER: walk every ghost of the raid to the door
     // ASSEMBLE, after the walk: summon one straggler at a meeting stone (#922)
     bool summonStragglers{false};
+    // ASSEMBLE held short of the quorum: the shortfall by duty, for the log.
+    std::string shortfall;
+    // The release is the quorum ending the order (#1457).
+    bool quorumEnds{false};
     char const* why{""};
 };
+
+// Is the raid at the door a quorum? And when it is not, what is short, by duty.
+bool RaidQuorumMet(RaidRunFacts const& facts);
+std::string RaidQuorumShortfall(RaidRunFacts const& facts);
 
 // Is the raid wiped, by RAID_WIPE_PCT? See that constant.
 bool RaidWiped(RaidRunFacts const& facts);

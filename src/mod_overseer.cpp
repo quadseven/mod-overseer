@@ -53637,6 +53637,11 @@ private:
         unsigned creditedEncounters{0};
         unsigned encounterSlots{0};
         unsigned inRaid{0};
+        // The quorum hold (#1457): the shortfall last logged, so a hold logs
+        // when it changes and not every poll; and whether the order ended for
+        // want of a quorum, carried across the release.
+        std::string quorumShortSaid;
+        bool quorumEnded{false};
         // CLEAR's stall ladder: the head's position mark, the ratchet on it,
         // when the raid last credited a boss or moved, and the regroups spent
         // since that progress. Reset on every entry to CLEAR.
@@ -54722,6 +54727,19 @@ private:
             std::map<std::string, unsigned> seats;
             if (facts.ordered)
                 seats = LoadRaidSeats(roster.family, keyword);
+            if (keyword.empty())
+                run.quorumEnded = false;  // the order is gone; a new one starts clean
+            facts.seatsTotal = unsigned(seats.size());
+            facts.quorumEnded = run.quorumEnded;
+            facts.quorumSeats = sConfigMgr->GetOption<uint32>(
+                "Overseer.Raid.QuorumSeats", OverseerDecisions::RAID_QUORUM_SEATS);
+            facts.quorumTanks = sConfigMgr->GetOption<uint32>(
+                "Overseer.Raid.QuorumTanks", OverseerDecisions::RAID_QUORUM_TANKS);
+            facts.quorumHealers = sConfigMgr->GetOption<uint32>(
+                "Overseer.Raid.QuorumHealers", OverseerDecisions::RAID_QUORUM_HEALERS);
+            std::map<std::string, uint8> quorumSpecs;
+            if (facts.ordered && run.phase == RaidRunPhase::Assemble)
+                quorumSpecs = LoadGearSpecs();
 
             // REPAIR BEFORE FORM. A raid order first walks every seat whose
             // lowest wearable item is below the configured floor to a repairer.
@@ -54880,6 +54898,14 @@ private:
                                  OverseerDecisions::RAID_ASSEMBLE_YARDS)
                     {
                         ++facts.assembled;
+                        auto const specIt = quorumSpecs.find(member->GetName());
+                        OverseerDecisions::GearRole const duty = GearRoleFor(
+                            member->getClass(),
+                            specIt == quorumSpecs.end() ? uint8(255) : specIt->second);
+                        if (duty == OverseerDecisions::GearRole::Tank)
+                            ++facts.assembledTanks;
+                        else if (duty == OverseerDecisions::GearRole::Healer)
+                            ++facts.assembledHealers;
                         // THE HEAD IS TOLD APART IN THE SAME LOOP that counts
                         // him, so "everyone else at the door" can never
                         // subtract a head this loop did not count.
@@ -55144,6 +55170,24 @@ private:
             OverseerDecisions::RaidRunStep const step =
                 OverseerDecisions::StepRaidRun(run.phase, facts);
 
+            if (step.shortfall.empty())
+                run.quorumShortSaid.clear();
+            else if (run.quorumShortSaid != step.shortfall)
+            {
+                run.quorumShortSaid = step.shortfall;
+                LOG_WARN("module.overseer",
+                         "overseer: raid run for family '{}' holds at the door - {}",
+                         roster.family, step.shortfall);
+            }
+            if (step.quorumEnds)
+            {
+                run.quorumEnded = true;
+                LOG_WARN("module.overseer",
+                         "overseer: raid run for family '{}' ends the order - no quorum at "
+                         "the door ({})",
+                         roster.family, step.shortfall);
+            }
+
             if (step.release)
             {
                 // An attempt ended by a wipe (#1165) still has its corpses
@@ -55164,7 +55208,9 @@ private:
                     unsigned const wipes = run.wipes;
                     time_t const lastWipeAt = run.lastWipeAt;
                     uint32_t const lastWipeMap = run.lastWipeMap;
+                    bool const quorumEnded = run.quorumEnded;
                     run = RaidRunState();
+                    run.quorumEnded = quorumEnded;
                     run.wipes = wipes;
                     run.lastWipeAt = lastWipeAt;
                     run.lastWipeMap = lastWipeMap;
