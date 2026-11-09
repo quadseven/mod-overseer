@@ -16623,6 +16623,29 @@ long RaidAssembleWaitSeconds(unsigned awayOnOtherMap)
            (awayOnOtherMap > 0 ? RAID_ASSEMBLE_CROSSING_EXTRA_SECONDS : 0);
 }
 
+bool RaidQuorumMet(RaidRunFacts const& facts)
+{
+    return facts.assembled >= facts.quorumSeats && facts.assembledTanks >= facts.quorumTanks &&
+           facts.assembledHealers >= facts.quorumHealers;
+}
+
+std::string RaidQuorumShortfall(RaidRunFacts const& facts)
+{
+    std::string text = std::to_string(facts.assembled) + " of " +
+                       std::to_string(facts.seatsTotal);
+    char const* sep = ", short ";
+    auto const add = [&](unsigned have, unsigned want, char const* duty) {
+        if (have >= want)
+            return;
+        text += sep + std::to_string(want - have) + " " + duty;
+        sep = ", ";
+    };
+    add(facts.assembled, facts.quorumSeats, "seats");
+    add(facts.assembledTanks, facts.quorumTanks, "tanks");
+    add(facts.assembledHealers, facts.quorumHealers, "healers");
+    return text;
+}
+
 RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
 {
     RaidRunStep step;
@@ -16679,6 +16702,13 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
     switch (current)
     {
         case RaidRunPhase::Idle:
+            if (facts.quorumEnded)
+            {
+                step.phase = RaidRunPhase::Idle;
+                step.why = "the last attempt ended for want of a quorum at the door; "
+                           "the order does not re-form until it is given again";
+                return step;
+            }
             // THE SICKNESS HOLD OUTLIVES THE RELEASE (#1201). An attempt ended
             // by a wipe is let go and the order still stands, so the next poll
             // is here; the wipe book is carried across the release, and the
@@ -16719,6 +16749,7 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
             return step;
 
         case RaidRunPhase::Assemble:
+        {
             if (!facts.raidFormed)
             {
                 step.phase = RaidRunPhase::Form;
@@ -16728,9 +16759,11 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
             }
             // A seat whose character logged in since is still invited.
             step.form = facts.addable > 0;
-            if (facts.headAssembled &&
-                (facts.assembled >= facts.inWorld ||
-                 facts.heldSeconds >= RaidAssembleWaitSeconds(facts.awayOnOtherMap)))
+            long const assembleWait = RaidAssembleWaitSeconds(facts.awayOnOtherMap);
+            bool const waitOver = facts.heldSeconds >= assembleWait;
+            bool const quorum = RaidQuorumMet(facts);
+            if (facts.headAssembled && quorum &&
+                (facts.assembled >= facts.inWorld || waitOver))
             {
                 step.phase = RaidRunPhase::Enter;
                 step.aimDoor = true;
@@ -16739,6 +16772,25 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
                                ? "every raid member in the world is at the door"
                                : "the wait for stragglers is over; the raid goes "
                                  "with whoever is at the door";
+                return step;
+            }
+            if (facts.headAssembled && waitOver && !quorum)
+            {
+                step.shortfall = RaidQuorumShortfall(facts);
+                if (facts.heldSeconds >= assembleWait + RAID_QUORUM_EXTRA_WAIT_SECONDS)
+                {
+                    step.phase = RaidRunPhase::Idle;
+                    step.release = true;
+                    step.quorumEnds = true;
+                    step.why = "the raid never reached a quorum at the door; the order ends";
+                    return step;
+                }
+                step.phase = RaidRunPhase::Assemble;
+                step.aimStaging = true;
+                step.aimSeats = true;
+                step.summonStragglers = true;
+                step.why = "the wait is over but the raid at the door is short of a "
+                           "quorum; it holds at the door";
                 return step;
             }
             step.phase = RaidRunPhase::Assemble;
@@ -16752,6 +16804,7 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
                              "at the meeting stone"
                            : "waiting for the raid at the door";
             return step;
+        }
 
         case RaidRunPhase::Enter:
         {
