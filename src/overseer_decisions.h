@@ -19217,6 +19217,39 @@ struct RaidClearCount
 // `doneBySlot` is the instance script's encounters by slot, true for DONE.
 RaidClearCount RaidClearProgress(RaidDoor const& door, std::vector<bool> const& doneBySlot);
 
+// THE BOSS A TIMELINE ROW NAMES (#1459). One instance-script boss slot as the
+// poll read it: nothing yet, the encounter in progress, or DONE. The values
+// are this module's own, mapped from the core's EncounterState by the adapter.
+enum RaidSlotState : uint8_t
+{
+    RAID_SLOT_IDLE = 0,
+    RAID_SLOT_IN_PROGRESS = 1,
+    RAID_SLOT_DONE = 2,
+};
+
+// The name of boss `slot` in the door's script order, or "" when the door has no
+// names written down (only Molten Core has) or the slot is out of range. Molten
+// Core is molten_core.h DATA_LUCIFRON 0 to DATA_RAGNAROS 9; Majordomo (8) and
+// Ragnaros (9) are named so the final kill has its own row.
+std::string RaidBossName(std::string const& keyword, int slot);
+
+// The names of every slot that is DONE in `after` and was not in `before`, in
+// script order. An empty `before` is no baseline and credits nothing; a slot
+// past its end counts as not done, and a slot that lost DONE (an instance reset) is not a credit.
+std::vector<std::string> RaidBossesCredited(std::string const& keyword,
+                                            std::vector<uint8_t> const& before,
+                                            std::vector<uint8_t> const& after);
+
+// The slot to remember as the fight the raid is in, given the one remembered
+// before the poll (-1 for none) and the slots now. A slot IN_PROGRESS now wins;
+// otherwise the old one is kept until its slot is DONE, because the script puts
+// a wiped boss back to idle before the wipe is noticed.
+int RaidFightingSlot(int remembered, std::vector<uint8_t> const& slotsNow);
+
+// The wipe row's boss: "wipe on <name>", or "wipe on trash" when no slot was in
+// progress. "" when the door has no names, so the old text stands alone.
+std::string RaidWipeOn(std::string const& keyword, int fightingSlot);
+
 // The door for `keyword`, or nullptr. Exact, lower case: the queue writes the
 // keyword and nothing else does.
 RaidDoor const* RaidDoorFor(std::string const& keyword);
@@ -22333,6 +22366,11 @@ struct RaidTimelineSnapshot
     // zero until ASSEMBLE has ended, and then the row says nothing extra.
     unsigned atDoor{0};
     unsigned inRaid{0};
+    // THE SCRIPT'S BOSS SLOTS (#1459), as RaidSlotState, empty when nobody
+    // inside could be read. `fighting` is the slot remembered as the current
+    // fight (RaidFightingSlot), -1 for none.
+    std::vector<uint8_t> slots;
+    int fighting{-1};
 };
 
 std::vector<RunTimelineEvent> RaidTimelineEvents(RaidTimelineSnapshot const& before,
