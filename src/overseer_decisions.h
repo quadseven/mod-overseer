@@ -19688,6 +19688,30 @@ bool DungeonWipeHoldsAdoption(DungeonWipeBook const& book, std::uint32_t mapId,
 // measurement; callers pass the already-computed lowest percentage.
 bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct);
 
+// BAG ROOM FOR A RAID SEAT (#1461). A Molten Core kill drops three to five
+// pieces per boss; a seat with no free slots passes on every roll. Before FORM
+// and after each boss a seat under the floor is walked to a vendor and stood
+// there while the bridge's sell rows land. The hold is bounded by
+// RAID_HOLD_WAIT_SECONDS, after which a seat still short is named in the log
+// and the pull goes on.
+constexpr unsigned RAID_FREE_SLOT_FLOOR_DEFAULT = 6;
+
+// Under the floor needs room. A floor of 0 disables the gate.
+bool RaidSeatNeedsRoom(unsigned freeSlots, unsigned floorSlots);
+
+enum class RaidBagStep { Ready, TimedOut, Walk, Stand };
+
+// Ready: at or above the floor. TimedOut: still under it when the hold wait
+// ended (the seat could not free room). Stand: under it with a vendor in
+// reach. Walk: under it with none.
+RaidBagStep RaidSeatBagStep(unsigned freeSlots, unsigned floorSlots, long heldSeconds,
+                            bool vendorInReach);
+
+// Whether the pull is held: some readable seat is under the floor and the hold
+// wait has not run out.
+bool RaidBagHold(std::vector<unsigned> const& seatFreeSlots, unsigned floorSlots,
+                 long heldSeconds);
+
 enum class RaidPullRepairAction { Ignore, Hold, Resume, TimedOut };
 
 // The Molten Core repair gate is only before Majordomo Executus and Ragnaros.

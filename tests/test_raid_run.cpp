@@ -45,6 +45,12 @@ using OverseerDecisions::RaidKeywordForJob;
 using OverseerDecisions::RaidKnockOrder;
 using OverseerDecisions::RaidRunFacts;
 using OverseerDecisions::RaidSeatNeedsRepair;
+using OverseerDecisions::RAID_FREE_SLOT_FLOOR_DEFAULT;
+using OverseerDecisions::RAID_HOLD_WAIT_SECONDS;
+using OverseerDecisions::RaidBagHold;
+using OverseerDecisions::RaidBagStep;
+using OverseerDecisions::RaidSeatBagStep;
+using OverseerDecisions::RaidSeatNeedsRoom;
 using OverseerDecisions::RaidPullRepairAction;
 using OverseerDecisions::RaidPullRepairDecision;
 using OverseerDecisions::RaidPullRepairForSeats;
@@ -76,6 +82,36 @@ void Check(char const* what, bool held)
         return;
     ++failures;
     std::printf("FAIL %s\n", what);
+}
+
+void TheFreeSlotFloorDecidesWhoIsSentToFreeRoom()
+{
+    unsigned const floor = RAID_FREE_SLOT_FLOOR_DEFAULT;
+    Check("the default floor covers a boss's drops", floor >= 5);
+    Check("under the floor needs room", RaidSeatNeedsRoom(floor - 1, floor));
+    Check("at the floor needs no room", !RaidSeatNeedsRoom(floor, floor));
+    Check("zero free slots needs room", RaidSeatNeedsRoom(0, floor));
+    Check("a zero floor disables the gate", !RaidSeatNeedsRoom(0, 0));
+
+    Check("a seat at the floor is ready",
+          RaidSeatBagStep(floor, floor, 0, false) == RaidBagStep::Ready);
+    Check("a seat under the floor with no vendor near walks to one",
+          RaidSeatBagStep(2, floor, 10, false) == RaidBagStep::Walk);
+    Check("a seat under the floor at a vendor stands for the sales",
+          RaidSeatBagStep(2, floor, 10, true) == RaidBagStep::Stand);
+    Check("a seat that cannot sell is let go at the hold wait and named",
+          RaidSeatBagStep(2, floor, RAID_HOLD_WAIT_SECONDS, true) == RaidBagStep::TimedOut);
+    Check("a ready seat stays ready after the hold wait",
+          RaidSeatBagStep(floor, floor, RAID_HOLD_WAIT_SECONDS + 1, false) == RaidBagStep::Ready);
+
+    Check("one seat under the floor holds the pull",
+          RaidBagHold({floor, 0, floor}, floor, 10));
+    Check("every seat at the floor releases the pull",
+          !RaidBagHold({floor, floor + 4}, floor, 10));
+    Check("no readable seat does not hold the pull", !RaidBagHold({}, floor, 10));
+    Check("a seat under the floor never holds the pull past the hold wait",
+          !RaidBagHold({0}, floor, RAID_HOLD_WAIT_SECONDS) &&
+              RaidBagHold({0}, floor, RAID_HOLD_WAIT_SECONDS - 1));
 }
 
 void TheRepairFloorIsStrictAndConfigurable()
@@ -885,6 +921,20 @@ void ADungeonTypeRaidDoorHoldsTheBrainUntilClear()
     Check("until the run is in CLEAR", DungeonClearMayArmHere(false, true, true));
 }
 
+void TheAdapterLogsAndWalksTheBagGate()
+{
+    std::ifstream in("src/mod_overseer.cpp");
+    std::stringstream text;
+    text << in.rdbuf();
+    std::string const source = text.str();
+    Check("the adapter logs each seat's free slots",
+          Has(source, "overseer: raid run for family '{}': free slots {} {}"));
+    Check("the adapter reads the gate's floor from config",
+          Has(source, "Overseer.Raid.FreeSlotFloor"));
+    Check("each seat steps through the bag decision", Has(source, "RaidSeatBagStep("));
+    Check("the pull hold reads every seat", Has(source, "RaidBagHold("));
+}
+
 void TheAdapterArmsTheRunsWing()
 {
     std::ifstream in("src/mod_overseer.cpp");
@@ -934,6 +984,8 @@ int main()
     TheUpperSpireIsClearedByItsOwnBossesOnly();
     ADungeonTypeRaidDoorHoldsTheBrainUntilClear();
     TheAdapterArmsTheRunsWing();
+    TheFreeSlotFloorDecidesWhoIsSentToFreeRoom();
+    TheAdapterLogsAndWalksTheBagGate();
 
     if (failures)
     {

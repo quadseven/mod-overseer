@@ -53859,11 +53859,101 @@ private:
         bool repairHoldDecisionSaid{false};
         bool repairBrainPaused{false};
         time_t repairHoldRefusedAt{0};
+        // The bag-room gate (#1461): one key per gate (pre-FORM, or the boss
+        // count after a kill), the clock it started on, and what was said.
+        unsigned bagGateKey{std::numeric_limits<unsigned>::max()};
+        time_t bagGateSince{0};
+        std::set<std::string> bagSlotsSaid;
+        std::set<std::string> bagWalkSaid;
+        std::set<std::string> bagTimedOutSaid;
         // Consumable item entries already used for this pull, per seat, and the
         // seats already logged as having nothing to use (#1460).
         std::map<std::string, std::set<uint32>> consumableTried;
         std::set<std::string> consumableNothingSaid;
     };
+
+    // THE BAG-ROOM GATE (#1461). Reads each seat's free slots (logged once per
+    // seat per gate), walks a seat under the floor to a vendor and holds it
+    // there while the bridge's sell rows land. True while the pull is held; it
+    // is never true past RAID_HOLD_WAIT_SECONDS from the gate's start, and a seat
+    // still short then is named in the log.
+    bool DriveRaidBagRoom(RaidRunState& run, std::string const& family,
+                          std::map<std::string, unsigned> const& seats, unsigned gateKey)
+    {
+        uint32 const floorSlots = sConfigMgr->GetOption<uint32>(
+            "Overseer.Raid.FreeSlotFloor", OverseerDecisions::RAID_FREE_SLOT_FLOOR_DEFAULT);
+        if (run.bagGateKey != gateKey)
+        {
+            run.bagGateKey = gateKey;
+            run.bagGateSince = std::time(nullptr);
+            run.bagSlotsSaid.clear();
+            run.bagWalkSaid.clear();
+            run.bagTimedOutSaid.clear();
+        }
+        long const heldNow = long(std::time(nullptr) - run.bagGateSince);
+        std::vector<unsigned> seatFree;
+        for (auto const& [name, subgroup] : seats)
+        {
+            (void)subgroup;
+            Player* member = ObjectAccessor::FindPlayerByName(name);
+            if (!member || !member->IsInWorld())
+                continue;
+            unsigned const freeSlots = member->GetFreeInventorySpace();
+            seatFree.push_back(freeSlots);
+            if (run.bagSlotsSaid.insert(name).second)
+                LOG_INFO("module.overseer",
+                         "overseer: raid run for family '{}': free slots {} {}", family, name,
+                         freeSlots);
+            if (floorSlots == 0)
+                continue;
+            bool oneIsNearby = false;
+            float nearestYards = -1.f;
+            bool const inReach = OverseerDecisions::RaidSeatNeedsRoom(freeSlots, floorSlots) &&
+                                 CounterInReach(member, OverseerDecisions::CounterRole::Vendor,
+                                                oneIsNearby, nearestYards);
+            auto const step = OverseerDecisions::RaidSeatBagStep(freeSlots, floorSlots, heldNow,
+                                                                 inReach);
+            switch (step)
+            {
+                case OverseerDecisions::RaidBagStep::Ready:
+                    if (HasCounterHold(name))
+                        ReleaseCounterHold(name, "raid bag room freed");
+                    _travelAims.Release(name, "raid bag room freed");
+                    break;
+                case OverseerDecisions::RaidBagStep::TimedOut:
+                    if (HasCounterHold(name))
+                        ReleaseCounterHold(name, "raid bag room hold timed out");
+                    _travelAims.Release(name, "raid bag room hold timed out");
+                    if (run.bagTimedOutSaid.insert(name).second)
+                        LOG_WARN("module.overseer",
+                                 "overseer: raid run for family '{}' could not free bag room "
+                                 "for '{}' ({} free, floor {}); the pull goes on",
+                                 family, name, freeSlots, floorSlots);
+                    break;
+                case OverseerDecisions::RaidBagStep::Walk:
+                    _travelAims.Claim(name, "vendor", OverseerDecisions::TravelOwner::Run);
+                    if (run.bagWalkSaid.insert(name).second)
+                        LOG_INFO("module.overseer",
+                                 "overseer: raid run for family '{}' bag walk for '{}' - {} "
+                                 "free slots, floor {}",
+                                 family, name, freeSlots, floorSlots);
+                    break;
+                case OverseerDecisions::RaidBagStep::Stand:
+                    HoldAtTheCounter(member, name);
+                    break;
+            }
+        }
+        bool const hold = OverseerDecisions::RaidBagHold(seatFree, floorSlots, heldNow);
+        if (!hold)
+            for (auto const& [name, subgroup] : seats)
+            {
+                (void)subgroup;
+                if (HasCounterHold(name))
+                    ReleaseCounterHold(name, "raid bag room gate ended");
+            }
+        return hold;
+    }
+
     std::map<std::string, RaidRunState> _raidRuns;
 
     // Uses one carried consumable through the core's own CMSG_USE_ITEM handler,
@@ -55047,6 +55137,14 @@ private:
             if (repairPending)
                 continue;
 
+            // BAG ROOM BEFORE FORM (#1461). Same shape as the repair walk: a
+            // seat under the free-slot floor goes to a vendor first, bounded
+            // by RAID_HOLD_WAIT_SECONDS.
+            if (facts.ordered && run.phase == RaidRunPhase::Idle && !seats.empty() &&
+                DriveRaidBagRoom(run, roster.family, seats,
+                                 std::numeric_limits<unsigned>::max() - 1))
+                continue;
+
             // BUSY, FOR CLEAR'S STALL LADDER: somebody inside fighting, dead
             // and waiting on a healer, or the head eating or drinking.
             bool anyBusy = false;
@@ -55173,6 +55271,13 @@ private:
             if (facts.raidFormed && door)
                 RaidEncounters(group, door, bossesDone, bossesTotal, &slotStates);
             facts.cleared = bossesTotal > 0 && bossesDone >= bossesTotal;
+
+            // BAG ROOM AFTER EACH BOSS (#1461): the gate restarts on each new
+            // boss count and pauses the brain through the same hold below.
+            bool bagHold = false;
+            if (run.phase == RaidRunPhase::Clear && facts.ordered && bossesDone > 0 &&
+                bossesDone < bossesTotal)
+                bagHold = DriveRaidBagRoom(run, roster.family, seats, bossesDone);
 
             // Read the seats before every next encounter. A boss count advances
             // only after the previous encounter is DONE, so this is the pre-pull
@@ -55372,6 +55477,7 @@ private:
                 repairHold = action == OverseerDecisions::RaidPullRepairAction::Hold ||
                              consumableHold;
             }
+            repairHold = repairHold || bagHold;
             if (run.phase == RaidRunPhase::Clear && head)
             {
                 bool const shouldPause = repairHold && !repairHoldTimedOut;
