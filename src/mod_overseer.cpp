@@ -55111,7 +55111,9 @@ private:
             OverseerDecisions::RaidRunStep const step =
                 OverseerDecisions::StepRaidRun(run.phase, facts);
 
-            if (!step.shortfall.empty() && run.quorumShortSaid != step.shortfall)
+            if (step.shortfall.empty())
+                run.quorumShortSaid.clear();
+            else if (run.quorumShortSaid != step.shortfall)
             {
                 run.quorumShortSaid = step.shortfall;
                 LOG_WARN("module.overseer",
