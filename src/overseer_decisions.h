@@ -3486,6 +3486,11 @@ enum class ClearingClock
     // party walks the Dark Iron Legacy carrier there, and that walk keeps its
     // own bound.
     HeldIronfelPickup,
+    // Blackrock Depths' visit to the Core Fragment chest
+    // (overseer_brd_core_fragment.h, #1456): the brain is paused on purpose
+    // while the party walks each attunement holder there, and the visit keeps
+    // its own bound.
+    HeldCoreFragmentChest,
 };
 
 ClearingClock ClearingClockState(bool acceptedOnEveryoneInside, bool leaderVisible,

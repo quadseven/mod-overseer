@@ -2674,6 +2674,9 @@ char const* ClearingClockHoldReason(ClearingClock clock)
         case ClearingClock::HeldIronfelPickup:
             return "the party walks the Dark Iron Legacy carrier to Fineous Darkvire's corpse "
                    "for Ironfel, inside that walk's own bound";
+        case ClearingClock::HeldCoreFragmentChest:
+            return "the party walks the attunement holders to the Core Fragment chest, inside "
+                   "that visit's own bound";
         case ClearingClock::Runs:
             break;
     }
