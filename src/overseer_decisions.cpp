@@ -16348,6 +16348,32 @@ bool RaidSeatNeedsRepair(unsigned lowestDurabilityPct, unsigned floorPct)
     return lowestDurabilityPct < floorPct;
 }
 
+bool RaidSeatNeedsRoom(unsigned freeSlots, unsigned floorSlots)
+{
+    return freeSlots < floorSlots;
+}
+
+RaidBagStep RaidSeatBagStep(unsigned freeSlots, unsigned floorSlots, long heldSeconds,
+                            bool vendorInReach)
+{
+    if (!RaidSeatNeedsRoom(freeSlots, floorSlots))
+        return RaidBagStep::Ready;
+    if (heldSeconds >= RAID_HOLD_WAIT_SECONDS)
+        return RaidBagStep::TimedOut;
+    return vendorInReach ? RaidBagStep::Stand : RaidBagStep::Walk;
+}
+
+bool RaidBagHold(std::vector<unsigned> const& seatFreeSlots, unsigned floorSlots,
+                 long heldSeconds)
+{
+    if (heldSeconds >= RAID_HOLD_WAIT_SECONDS)
+        return false;
+    for (unsigned const free : seatFreeSlots)
+        if (RaidSeatNeedsRoom(free, floorSlots))
+            return true;
+    return false;
+}
+
 RaidPullRepairAction RaidPullRepairDecision(unsigned bossesDone, bool anySeatBelowFloor,
                                            long heldSeconds, long maximumHoldSeconds)
 {

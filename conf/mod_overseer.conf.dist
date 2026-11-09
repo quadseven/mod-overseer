@@ -234,6 +234,16 @@
 #        Default:     70
 #
 #Overseer.Raid.RepairFloorPct = 70
+
+#    Overseer.Raid.FreeSlotFloor
+#        Description: Before forming an ordered raid and after each boss, a
+#                     seat with fewer free bag slots than this is walked to a
+#                     vendor to free room. The wait is bounded by the raid
+#                     hold wait (5 minutes); a seat still short is logged by
+#                     name. Set to 0 to disable the check.
+#        Default:     6
+#
+#Overseer.Raid.FreeSlotFloor = 6
 #
 ########################################
 #
