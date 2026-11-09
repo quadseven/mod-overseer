@@ -55,6 +55,8 @@ constexpr std::time_t BRD_SHRINE_WALK_SECONDS = 10 * 60;
 constexpr std::time_t BRD_SHRINE_STAND_SECONDS = 4 * 60;
 // The dungeon brain is asked again to stay paused this often while the walk runs.
 constexpr std::time_t BRD_SHRINE_PAUSE_RETRY_SECONDS = 30;
+// A walk is not begun while any member alive inside is below this health percent.
+constexpr float BRD_SHRINE_MIN_HEALTH_PCT = 60.f;
 
 // One party member as the Shrine step reads it.
 struct BrdShrineHolder
@@ -111,6 +113,12 @@ struct BrdShrineFacts
 {
     std::string carrier;     // BrdShrineCarrier, empty for none
     bool fineousDead{false};
+    // A Fineous was actually found in the instance. None found is a boss the
+    // run has not reached (its grid is not loaded), never a dead one.
+    bool fineousSeen{false};
+    bool partyInCombat{false};  // any member alive inside is fighting
+    // The lowest health percent among members alive inside (100 when unread).
+    float lowestHealthPct{100.f};
     float yards{-1.f};       // the carrier to the Shrine; negative unread
     std::time_t now{0};
 };
@@ -138,7 +146,10 @@ inline BrdShrineVerdict BrdShrineNext(BrdShrineFacts const& f, BrdShrineClock co
         }
         return v;
     }
-    if (!clock.started && !f.fineousDead)
+    // Before a walk: Fineous found and dead in THIS run, the party out of
+    // combat and healthy. Nothing found is a boss not yet reached (#1470).
+    if (!clock.started && (!f.fineousSeen || !f.fineousDead || f.partyInCombat ||
+                           f.lowestHealthPct < BRD_SHRINE_MIN_HEALTH_PCT))
         return v;
     if (f.yards < 0.f)
     {

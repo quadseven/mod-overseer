@@ -57114,10 +57114,21 @@ private:
             std::list<Creature*> found;
             carrier->GetCreatureListWithEntryInGrid(found, D::BRD_FINEOUS_ENTRY,
                                                     D::BRD_FINEOUS_SEARCH_YARDS);
-            facts.fineousDead = true;
+            // None found is a Fineous the run has not reached (his grid is not
+            // loaded), never a dead one (#1470).
+            facts.fineousSeen = !found.empty();
+            facts.fineousDead = facts.fineousSeen;
             for (Creature* const fineous : found)
                 if (fineous && fineous->IsAlive())
                     facts.fineousDead = false;
+        }
+        for (Player* const member : inside)
+        {
+            if (member->IsInCombat())
+                facts.partyInCombat = true;
+            if (member->GetMaxHealth() > 0)
+                facts.lowestHealthPct = std::min(
+                    facts.lowestHealthPct, 100.f * member->GetHealth() / member->GetMaxHealth());
         }
 
         D::BrdShrineClock const before = coord.brdShrine;

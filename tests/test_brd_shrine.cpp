@@ -88,6 +88,7 @@ BrdShrineFacts Facts(char const* carrier, bool fineousDead, float yards, std::ti
     BrdShrineFacts f;
     f.carrier = carrier;
     f.fineousDead = fineousDead;
+    f.fineousSeen = fineousDead;
     f.yards = yards;
     f.now = now;
     return f;
@@ -134,6 +135,38 @@ void TheWalk()
     Expect(v.step == BrdShrineStep::Nothing, "the Shrine is asked once per run");
 }
 
+void ThePrematureStart()
+{
+    BrdShrineClock clock;
+    BrdShrineFacts f = Facts("Oz", true, 157.f, 1000);
+    f.fineousSeen = false;
+    BrdShrineVerdict v = BrdShrineNext(f, clock);
+    Expect(v.step == BrdShrineStep::Nothing && !v.clock.started,
+           "no Fineous found (run 1698238: not reached yet) is not a dead Fineous");
+
+    f = Facts("Oz", true, 157.f, 1000);
+    f.partyInCombat = true;
+    v = BrdShrineNext(f, clock);
+    Expect(v.step == BrdShrineStep::Nothing && !v.clock.started, "no walk begins mid-fight");
+
+    f = Facts("Oz", true, 157.f, 1000);
+    f.lowestHealthPct = BRD_SHRINE_MIN_HEALTH_PCT - 1.f;
+    v = BrdShrineNext(f, clock);
+    Expect(v.step == BrdShrineStep::Nothing && !v.clock.started,
+           "no walk begins with a member below the health floor");
+
+    f = Facts("Oz", true, 157.f, 1000);
+    f.lowestHealthPct = BRD_SHRINE_MIN_HEALTH_PCT;
+    v = BrdShrineNext(f, clock);
+    Expect(v.step == BrdShrineStep::Walk, "at the floor, out of combat, Fineous seen dead: walks");
+    clock = v.clock;
+    f = Facts("Oz", true, 120.f, 1100);
+    f.partyInCombat = true;
+    f.lowestHealthPct = 10.f;
+    v = BrdShrineNext(f, clock);
+    Expect(v.step == BrdShrineStep::Walk, "a walk under way is carried on through a fight");
+}
+
 void TheBounds()
 {
     BrdShrineClock clock;
@@ -175,6 +208,9 @@ void TheAdapterWiresIt()
     Expect(src.find("EscortToward(member->GetName(), aim.str(), \"SHRINE OF THAURISSAN\"", step) !=
                std::string::npos,
            "the party is escorted to the Shrine");
+    Expect(src.find("facts.fineousSeen = !found.empty();", step) != std::string::npos &&
+               src.find("facts.partyInCombat = true;", step) != std::string::npos,
+           "no Fineous found is not dead, and combat and health are read (#1470)");
     std::size_t const end = src.find("    void DriveDungeonRunFor(", step);
     Expect(src.find("AddQuestAndCheckCompletion", step) > end &&
                src.find("RewardQuest", step) > end,
@@ -199,6 +235,7 @@ int main()
     TheCarrier();
     TheReach();
     TheWalk();
+    ThePrematureStart();
     TheBounds();
     TheAdapterWiresIt();
     if (failures)
