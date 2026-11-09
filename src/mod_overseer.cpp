@@ -60227,19 +60227,22 @@ private:
                     // not (SplitFailedHeldByProgress).
                     time_t const stagedNow = std::time(nullptr);
                     bool fightingInside = false;
+                    // The credited mask is a set of bits, so what every member
+                    // inside reads is OR-ed together, and a bit not yet in
+                    // `clearEncounters` is a new boss. A mask that shrinks (a
+                    // restored copy) adds no bit and so stamps nothing.
                     uint32 creditedInside = 0;
                     for (OverseerDecisions::DungeonRunEntryState const& state : states)
                     {
                         if (!state.through)
                             continue;
                         fightingInside = fightingInside || state.inCombat;
-                        if (!creditedInside)
-                            creditedInside = CompletedEncounters(
-                                ObjectAccessor::FindPlayerByName(state.name));
+                        creditedInside |= CompletedEncounters(
+                            ObjectAccessor::FindPlayerByName(state.name));
                     }
-                    if (creditedInside > coord.clearEncounters)
+                    if (creditedInside & ~coord.clearEncounters)
                     {
-                        coord.clearEncounters = creditedInside;
+                        coord.clearEncounters |= creditedInside;
                         coord.clearAdvancedAt = std::time(nullptr);
                     }
                     bool const fightingOn = OverseerDecisions::SplitFailedHeldByProgress(

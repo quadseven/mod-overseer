@@ -69,6 +69,8 @@ int main()
     Require(walk, "OverseerDecisions::DecideEvacuationWay(", "a failed walk may hearth");
     Require(walk, "DriveExitHearths(", "the stone is the existing hearth drive");
     Require(walk, "_strandedHearths[family]", "the episode is the family's own");
+    Require(walk, "\"the walk back to the door failed\"",
+            "the hearth is cast with its reason, which DriveExitHearths writes to the run timeline");
 
     if (failures)
         return EXIT_FAILURE;

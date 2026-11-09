@@ -2685,8 +2685,9 @@ time_t StagedInsideClockAfter(time_t since, time_t oldPatience, time_t patience,
 // ceiling exists for five characters standing still with no bound on them; it
 // is not for a party mid-boss that is merely one short. Progress is a boss
 // credited or the leader thirty yards on (the clearing watchdog's own reading,
-// `clearAdvancedAt`), and combat extends the hold only while that progress is
-// no older than `fightCeilingSeconds`, so a combat flag that never clears
+// `clearAdvancedAt`). Progress no older than SPLIT_HOLD_PROGRESS_SECONDS always
+// holds; older progress holds only while a member inside is in combat and is
+// still no older than `fightCeilingSeconds`, so a combat flag that never clears
 // cannot hold a run for ever.
 constexpr unsigned SPLIT_HOLD_MIN_INSIDE = 4;
 constexpr time_t SPLIT_HOLD_PROGRESS_SECONDS = 2 * 60;
