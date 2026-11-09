@@ -27585,6 +27585,15 @@ std::string StandinGuestWord(FamilyStandin const& standin);
 // stuck in the family's finder group greeted the head every 5 seconds.
 bool MayClearMasterOnRelease(bool inHeadsGroup);
 
+// WHICH GROUP IS THE FAMILY'S FOR A RELEASED STAND-IN GUEST? (#1450) The head's
+// own group while he is in the world. While he is not (mid-hearth, mid-teleport,
+// a poll or two), the group he leads that the guest is in: the party outlives
+// its leader's absence, and finding it only through the head's player made the
+// release sweep see no group, try no leave and forget the guest, which then sat
+// grouped on the dungeon map for 46 minutes (the bridge's stranded-member pass
+// skips grouped members). True when the guest's own group is the one to leave.
+bool GuestGroupIsFamilys(bool headInWorld, bool inHeadsGroup, bool groupLedByHead);
+
 // ------------------------------------- a party for a quest that needs help --
 //
 // A CLASS QUEST THAT NEEDS HELP IS ASKED FOR AND ANSWERED, AND THEN THE ANSWERERS

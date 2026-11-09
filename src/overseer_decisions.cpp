@@ -24668,6 +24668,11 @@ bool MayClearMasterOnRelease(bool inHeadsGroup)
     return !inHeadsGroup;
 }
 
+bool GuestGroupIsFamilys(bool headInWorld, bool inHeadsGroup, bool groupLedByHead)
+{
+    return headInWorld ? inHeadsGroup : groupLedByHead;
+}
+
 std::string StandinGuestWord(FamilyStandin const& standin)
 {
     return standin.HasGuest() ? standin.inName : std::string("nobody");
