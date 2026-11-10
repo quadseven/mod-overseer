@@ -109,10 +109,43 @@ void TheRetries()
                BrdWingStep::ChainUpperCity,
            "a chain that did not take is sent again after the retry");
     Expect(BrdWingNext(Facts(db, db, true, BRD_UPPER_CITY_TRIES, 1000,
-                             1000 + BRD_UPPER_CITY_RETRY_SECONDS)) ==
-               BrdWingStep::FinishDetentionBlock,
-           "past the tries the run ends as a Detention Block clear");
+                             1000 + BRD_UPPER_CITY_RETRY_SECONDS)) == BrdWingStep::Nothing,
+           "past the tries a key carrier's run is NOT finished: the whole map's mask decides "
+           "and the watchdog ends a stuck run 'stalled' (mod-overseer#1490)");
     Expect(BRD_UPPER_CITY_TRIES >= 2 && BRD_UPPER_CITY_TRIES <= 5, "a bounded handful of tries");
+}
+
+// mod-overseer#1490: a run with 17 of 19 encounters credited was called
+// complete after a restart because the chain counter counted every chain ever
+// sent, and a keyless finish ignored an Upper City already under way.
+void NoFalseComplete()
+{
+    std::uint32_t const db = BRD_DETENTION_BLOCK_MASK;
+    std::uint32_t const seventeen = 0x1FFFFu;  // 9 Detention Block and 8 Upper City bosses
+    Expect(BrdBrainOnUpperCity(BRD_UPPER_CITY_MASK) && BrdBrainOnUpperCity(0x7FFFFu),
+           "a brain on the Upper City, alone or with the Detention Block, is on it");
+    Expect(!BrdBrainOnUpperCity(db) && !BrdBrainOnUpperCity(0),
+           "the Detention Block alone, or an unread brain, is not");
+    Expect(BrdTriesAfterPoll(BRD_UPPER_CITY_TRIES, BRD_UPPER_CITY_MASK) == 0,
+           "a brain seen on the Upper City has taken the chain: the count starts over");
+    Expect(BrdTriesAfterPoll(2, db) == 2 && BrdTriesAfterPoll(2, 0) == 2,
+           "a brain still on the Detention Block, or unread, keeps the count");
+
+    // The measured run: three accepted chains, then a bare `dc on` put the
+    // brain back on brd-db with 17 encounters credited and the doors openable.
+    for (unsigned tries = 0; tries <= BRD_UPPER_CITY_TRIES; ++tries)
+    {
+        BrdWingStep const step =
+            BrdWingNext(Facts(db, seventeen, true, tries, 1000, 1000 + BRD_UPPER_CITY_RETRY_SECONDS));
+        Expect(step != BrdWingStep::FinishDetentionBlock,
+               "17 of 19 credited with the doors openable is never finished as a Detention Block clear");
+    }
+    Expect(BrdWingNext(Facts(db, seventeen, false)) == BrdWingStep::Nothing,
+           "a keyless party past the doors (the key holder fell out of the count) is not finished");
+    Expect(BrdWingNext(Facts(db, db, false)) == BrdWingStep::FinishDetentionBlock,
+           "a keyless party with nothing past Bael'Gar still finishes there");
+    Expect(!BrdUpperCityStarted(db) && BrdUpperCityStarted(db | (1u << 9)),
+           "the Upper City has started once bit 9 or above is credited");
 }
 
 void TheAdapterWiresIt()
@@ -139,6 +172,11 @@ void TheAdapterWiresIt()
            "the chain is `dc on brd-uc` with an authorized issuer");
     Expect(within("coord.provedComplete = true;") && within("DungeonRunPhase::Exiting"),
            "a keyless Detention Block clear ends the run as complete");
+    Expect(within("coord.brdUpperCityTries = D::BrdTriesAfterPoll(coord.brdUpperCityTries, "
+                  "facts.brainMask);") &&
+               src.find("coord.brdUpperCityTries = D::BrdTriesAfterPoll(", step) <
+                   src.find("D::BrdWingNext(facts)", step),
+           "the chain count is reset off the brain's mask before the rules are asked");
 
     std::size_t const shrine = src.find("StepBrdShrine(coord, members, leader, clearingNow)");
     std::size_t const hook =
@@ -157,6 +195,7 @@ int main()
     TheMasks();
     TheChain();
     TheRetries();
+    NoFalseComplete();
     TheAdapterWiresIt();
     if (failures)
     {

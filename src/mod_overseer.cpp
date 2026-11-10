@@ -57747,6 +57747,7 @@ private:
         facts.mapId = portal.insideMapId;
         facts.brainMask = DungeonBrainExpectedEncounterMask(leader);
         facts.credited = CompletedEncounters(leader);
+        coord.brdUpperCityTries = D::BrdTriesAfterPoll(coord.brdUpperCityTries, facts.brainMask);
         facts.tries = coord.brdUpperCityTries;
         facts.lastTryAt = coord.brdUpperCityTriedAt;
         facts.now = now;
@@ -57789,11 +57790,8 @@ private:
                      "Block of Blackrock Depths is credited (mask {}) and {}, so the Upper "
                      "City is not cleared this run; EXIT walks the party out (#1410)",
                      coord.runNumber, coord.campaignId, facts.credited,
-                     facts.doorsOpen
-                         ? "the dungeon brain did not take 'dc on brd-uc' after " +
-                               std::to_string(coord.brdUpperCityTries) + " tries"
-                         : std::string("nobody in the party carries the Shadowforge Key or "
-                                       "picks locks at 250"));
+                     std::string("nobody in the party carries the Shadowforge Key or "
+                                 "picks locks at 250"));
             return true;
         }
 

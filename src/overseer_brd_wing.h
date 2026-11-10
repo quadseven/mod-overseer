@@ -23,8 +23,23 @@
 //     clearing; the run is then complete on the whole map's mask;
 //   - a party that cannot is finished there and then, not five minutes later.
 // A chain the brain does not take (it is still on `brd-db` after the issue) is
-// tried BRD_UPPER_CITY_TRIES times, BRD_UPPER_CITY_RETRY_SECONDS apart, and
-// then the run ends as a Detention Block clear.
+// tried BRD_UPPER_CITY_TRIES times in a row, BRD_UPPER_CITY_RETRY_SECONDS apart.
+//
+// A RUN IS NEVER CALLED COMPLETE FOR WHAT IT DID NOT KILL (#1490). Measured
+// 2026-11-10: a run had 17 of the map's 19 encounters credited, the Upper City
+// well under way, when a worldserver restart and a stretch of lost leader
+// client made the arming drive send a bare `dc on` three more times. Each one
+// put the brain back on `brd-db`, each was followed by a chain that WAS
+// accepted and took, and the counter - never reset, so a count of every chain
+// the run had ever sent rather than of chains in a row that did not take -
+// reached its limit and ended the run 'complete' with Magmus and the Emperor
+// alive. So:
+//   - the count is of consecutive chains that did not take: a brain seen on
+//     the Upper City resets it (BrdTriesAfterPoll);
+//   - exhausting it ends nothing. The run reads NotYet on the whole map's mask
+//     and the clearing watchdog ends it 'stalled', which is what it was;
+//   - a Detention Block finish is only for a party that cannot open the doors
+//     AND has credited nothing past Bael'Gar.
 //
 // No AzerothCore include: tests/test_brd_wing.cpp compiles this alone.
 
@@ -53,7 +68,7 @@ enum class BrdWingStep : std::uint8_t
                            // brain already clears the Upper City
     ChainUpperCity,        // send `dc on brd-uc` this poll
     WaitChain,             // a chain was sent; give the brain until the retry
-    FinishDetentionBlock,  // no key (or the chain never took): the run is done
+    FinishDetentionBlock,  // no key and nothing past Bael'Gar credited: the run is done
 };
 
 struct BrdWingFacts
@@ -91,6 +106,25 @@ inline bool BrdBrainOnDetentionBlock(std::uint32_t brainMask)
     return brainMask != 0 && (brainMask & ~BRD_DETENTION_BLOCK_MASK) == 0;
 }
 
+// The brain clears the Upper City (alone or with the Detention Block).
+inline bool BrdBrainOnUpperCity(std::uint32_t brainMask)
+{
+    return (brainMask & BRD_UPPER_CITY_MASK) != 0;
+}
+
+// Any Upper City encounter credited: the party is, or was, past the doors.
+inline bool BrdUpperCityStarted(std::uint32_t credited)
+{
+    return (credited & BRD_UPPER_CITY_MASK) != 0;
+}
+
+// The chain counter after one poll: a brain seen on the Upper City has taken
+// the chain, so the count of chains that did not take starts over.
+inline unsigned BrdTriesAfterPoll(unsigned tries, std::uint32_t brainMask)
+{
+    return BrdBrainOnUpperCity(brainMask) ? 0u : tries;
+}
+
 inline BrdWingStep BrdWingNext(BrdWingFacts const& f)
 {
     if (f.mapId != BRD_WING_MAP_ID || !BrdDetentionBlockDone(f.credited))
@@ -100,13 +134,14 @@ inline BrdWingStep BrdWingNext(BrdWingFacts const& f)
     if (!BrdBrainOnDetentionBlock(f.brainMask))
         return BrdWingStep::Nothing;
     if (!f.doorsOpen)
-        return BrdWingStep::FinishDetentionBlock;
+        return BrdUpperCityStarted(f.credited) ? BrdWingStep::Nothing
+                                               : BrdWingStep::FinishDetentionBlock;
     if (f.tries == 0)
         return BrdWingStep::ChainUpperCity;
     if (f.now - f.lastTryAt < BRD_UPPER_CITY_RETRY_SECONDS)
         return BrdWingStep::WaitChain;
     if (f.tries >= BRD_UPPER_CITY_TRIES)
-        return BrdWingStep::FinishDetentionBlock;
+        return BrdWingStep::Nothing;  // never a 'complete' for a chain that did not take
     return BrdWingStep::ChainUpperCity;
 }
 
