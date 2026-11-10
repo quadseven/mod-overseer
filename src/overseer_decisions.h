@@ -25279,6 +25279,63 @@ FinderStep FinderNext(FinderPollFacts const& facts);
 // "join", "wait", "accept", "inside", "give up".
 char const* FinderStepWord(FinderStep step);
 
+// ------------------------------- a member the finder's family lost outside --
+//
+// THE FINDER'S OWN WAY BACK IN, KEPT AFTER THE RUN IS STAGED (#1488). The
+// finder rung presses the finder's "teleport in" for a member the core left
+// outside, but only while the rung itself is waiting. A family the finder took
+// into its dungeon is STAGED_INSIDE the poll it is all there, and from then on
+// a member put back outside (measured 2026-11-10: the member who carries the
+// Shadowforge Key, teleported out two seconds after the family went in) was
+// only walked back to the door on foot, from 11000 yards away. The finder group
+// is still in its dungeon, so the same teleport in the rung uses puts the
+// member back at once. The core refuses it in combat and does not try again,
+// so the run asks again, bounded.
+constexpr std::time_t FINDER_RETURN_RETRY_SECONDS = 15;
+constexpr unsigned FINDER_RETURN_MAX_ATTEMPTS = 8;
+
+struct FinderReturnFacts
+{
+    // The head's group is a finder group that is in its dungeon.
+    bool groupInDungeon{false};
+    // This member is in that group.
+    bool inGroup{false};
+    bool inWorld{false};
+    bool alive{false};
+    bool inCombat{false};
+    bool beingTeleported{false};
+    // Already on the dungeon's map, in the head's copy.
+    bool inside{false};
+    // Tries made for this member in this run.
+    unsigned attempts{0};
+    // Seconds since the last try (a member never tried carries the retry
+    // interval, so the first try is due at once).
+    std::time_t sinceLastAttempt{FINDER_RETURN_RETRY_SECONDS};
+};
+
+// Is the finder's teleport in due for this member now?
+bool FinderReturnDue(FinderReturnFacts const& facts);
+
+// ------------------------------------- the key holder before the brain is on --
+//
+// A DOOR INSIDE THE DUNGEON TAKES A KEY ONE MEMBER CARRIES (#1488). Blackrock
+// Depths' Shadowforge gates open for the member who carries the Shadowforge Key
+// (item 11000) and for nobody else in the family, so a run whose key holder is
+// outside its copy is not the run the family set out to do: measured
+// 2026-11-10, four members cleared the Detention Block corridors for eleven
+// minutes while the key holder stood outside. The dungeon brain is not switched
+// on while the key holder is outside, for a bounded time: the lower city needs
+// no key, so a holder who cannot get back must not hold the run for ever.
+constexpr std::time_t KEY_HOLDER_ARMING_HOLD_SECONDS = 180;
+
+// The item a keyed dungeon's inner doors want a member to carry, or zero.
+std::uint32_t DungeonDoorKeyItem(std::uint32_t mapId);
+
+// Is `dc on` held for the key holder? `outside` is true when a member of the
+// group who carries the dungeon's key is not in the head's copy of the
+// dungeon; `heldSeconds` is how long the hold has run.
+bool ArmingHeldForKeyHolder(bool outside, std::time_t heldSeconds);
+
 // ------------------------------------ a guild group by the dungeon finder --
 //
 // THE GUILD'S OWN FIVE-MAN (wow-overseer's guild coordinator). The families

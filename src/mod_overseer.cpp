@@ -31584,6 +31584,18 @@ private:
     };
     std::map<std::string, DcOnRecord> _dcOnIssued;
 
+    // THE KEY HOLDER HOLD'S CLOCK, PER FAMILY (#1488): when the dungeon brain
+    // was first held for a key holder outside, the last poll that saw it, and
+    // whether each end of the hold has been said.
+    struct KeyHolderHold
+    {
+        time_t since{0};
+        time_t seen{0};
+        bool said{false};
+        bool saidOver{false};
+    };
+    std::map<std::string, KeyHolderHold> _keyHolderHold;
+
     // Has this process had `dc on` ACCEPTED for this character, for this run?
     // Accepted means DcOnAction::Execute returned true - and for a character
     // that is not the run's leader tank that is trivially true
@@ -31992,6 +32004,83 @@ private:
                              "overseer: '{}' is inside map {} and its family is in one copy "
                              "of it again - arming may go ahead",
                              name, static_cast<uint32>(bot->GetMapId()));
+                }
+            }
+
+            // THE KEY HOLDER IS IN BEFORE THE BRAIN IS SWITCHED ON (#1488). A
+            // keyed dungeon's inner doors open for the one member who carries
+            // its key; with that member outside the copy, four members would
+            // clear without him (Blackrock Depths, 2026-11-10, eleven minutes).
+            // Held for a bounded time, because the lower city needs no key and a
+            // holder who cannot get back must not hold the run for ever.
+            {
+                time_t const holdNow = std::time(nullptr);
+                uint32 const keyItem = OverseerDecisions::DungeonDoorKeyItem(bot->GetMapId());
+                auto const family = families.find(name);
+                std::string const familyName = family != families.end() ? family->second : name;
+                std::string outsideName;
+                if (keyItem && bot->GetGroup())
+                    for (auto const& [member, memberFamily] : families)
+                    {
+                        if (member == name || memberFamily != familyName)
+                            continue;
+                        Player* const holder = ObjectAccessor::FindPlayerByName(member);
+                        if (!holder || !holder->IsInWorld() ||
+                            holder->GetGroup() != bot->GetGroup() ||
+                            !holder->HasItemCount(keyItem, 1, false))
+                            continue;
+                        if (holder->GetMapId() == bot->GetMapId() &&
+                            holder->GetInstanceId() == bot->GetInstanceId())
+                            continue;
+                        outsideName = member;
+                        break;
+                    }
+                KeyHolderHold& keyHold = _keyHolderHold[familyName];
+                // A hold not seen for a minute belongs to an earlier run.
+                if (keyHold.since && holdNow - keyHold.seen > 60)
+                    keyHold = KeyHolderHold();
+                if (outsideName.empty())
+                {
+                    if (keyHold.since && keyHold.said)
+                        LOG_INFO("module.overseer",
+                                 "overseer: the key holder is inside map {} again - the "
+                                 "dungeon brain of family '{}' may be switched on (#1488)",
+                                 static_cast<uint32>(bot->GetMapId()), familyName);
+                    keyHold = KeyHolderHold();
+                }
+                else
+                {
+                    if (!keyHold.since)
+                        keyHold.since = holdNow;
+                    keyHold.seen = holdNow;
+                    if (OverseerDecisions::ArmingHeldForKeyHolder(true, holdNow - keyHold.since))
+                    {
+                        if (!keyHold.said)
+                        {
+                            keyHold.said = true;
+                            LOG_WARN("module.overseer",
+                                     "overseer: '{}' is inside map {} but '{}', who carries "
+                                     "the key its inner doors want, is not - the dungeon brain "
+                                     "of family '{}' is not switched on until the key holder is "
+                                     "in, for at most {} seconds (#1488)",
+                                     name, static_cast<uint32>(bot->GetMapId()), outsideName,
+                                     familyName,
+                                     static_cast<uint32>(
+                                         OverseerDecisions::KEY_HOLDER_ARMING_HOLD_SECONDS));
+                        }
+                        continue;
+                    }
+                    if (!keyHold.saidOver)
+                    {
+                        keyHold.saidOver = true;
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' is still outside map {} after {} seconds - the "
+                                 "dungeon brain of family '{}' goes on without it (#1488)",
+                                 outsideName, static_cast<uint32>(bot->GetMapId()),
+                                 static_cast<uint32>(
+                                     OverseerDecisions::KEY_HOLDER_ARMING_HOLD_SECONDS),
+                                 familyName);
+                    }
                 }
             }
 
@@ -38148,6 +38237,10 @@ private:
         // When each stranded member's walk back to the door began, for the
         // bound after which its stone is used (#1472).
         std::map<std::string, time_t> strandedWalkSince;
+        // When the finder's teleport in was last pressed for each member of
+        // this run, and how many times (#1488).
+        std::map<std::string, time_t> finderReturnAt;
+        std::map<std::string, unsigned> finderReturnTries;
         // THE STAGING WATCHDOG'S PER-MEMBER MEMORY (#164): whether each member
         // is actually closing on the staging point, and how far up the
         // correction ladder it has been taken. It lives on the RUN rather than
@@ -45084,6 +45177,77 @@ private:
                 return FinderRungOutcome::Waiting;
         }
         return FinderRungOutcome::Waiting;
+    }
+
+    // A MEMBER OF A FINDER-ENTERED RUN WHO IS OUTSIDE GOES BACK IN BY THE
+    // FINDER, NOT ON FOOT (#1488). The family the finder took into its dungeon
+    // is STAGED_INSIDE the poll it is all there; a member put back outside
+    // afterwards (2026-11-10: the Shadowforge Key's holder, teleported out two
+    // seconds after the family went in, then 11000 yards from the door) was
+    // only walked back to the door. The finder group is still in its dungeon,
+    // so the finder's own "teleport in" - the one the rung presses for a member
+    // the core left outside - puts it back at once. The core refuses it in
+    // combat and does not retry, so this asks again, bounded
+    // (FinderReturnDue). True when it pressed one this poll: the walk back on
+    // foot then waits for the next poll rather than starting a journey the
+    // teleport has already ended.
+    bool ReturnStrandedByFinder(std::string const& leaderName, DungeonPortal const& portal,
+                                std::vector<OverseerDecisions::DungeonRunEntryState> const& states,
+                                DungeonRunCoordinatorState& coord)
+    {
+        Player* const leader = ObjectAccessor::FindPlayerByName(leaderName);
+        Group* const group = leader ? leader->GetGroup() : nullptr;
+        if (!group || !group->isLFGGroup())
+            return false;
+        bool const groupInDungeon =
+            FinderStateOf(sLFGMgr->GetState(group->GetGUID())) ==
+            OverseerDecisions::FinderState::Dungeon;
+        if (!groupInDungeon)
+            return false;
+        uint32 const headInstance =
+            leader->IsInWorld() && leader->GetMapId() == portal.insideMapId
+                ? leader->GetInstanceId()
+                : 0;
+        time_t const now = std::time(nullptr);
+        bool pressed = false;
+        OverseerDecisions::DungeonWrongSide const outside =
+            OverseerDecisions::DungeonRunWrongSide(states);
+        for (std::string const& name : outside.walk)
+        {
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            if (!p || !p->GetSession())
+                continue;
+            OverseerDecisions::FinderReturnFacts facts;
+            facts.groupInDungeon = groupInDungeon;
+            facts.inGroup = p->GetGroup() == group;
+            facts.inWorld = p->IsInWorld();
+            facts.alive = p->IsAlive();
+            facts.inCombat = p->IsInCombat();
+            facts.beingTeleported = p->IsBeingTeleported();
+            facts.inside = headInstance && p->GetMapId() == portal.insideMapId &&
+                           p->GetInstanceId() == headInstance;
+            auto const tries = coord.finderReturnTries.find(name);
+            facts.attempts = tries == coord.finderReturnTries.end() ? 0 : tries->second;
+            auto const last = coord.finderReturnAt.find(name);
+            if (last != coord.finderReturnAt.end())
+                facts.sinceLastAttempt = now - last->second;
+            if (!OverseerDecisions::FinderReturnDue(facts))
+                continue;
+            WorldPacket in(CMSG_LFG_TELEPORT, 1);
+            in << uint8(0);  // false: in, not out
+            in.rpos(0);
+            p->GetSession()->HandleLfgTeleportOpcode(in);
+            coord.finderReturnAt[name] = now;
+            unsigned const attempt = ++coord.finderReturnTries[name];
+            pressed = true;
+            LOG_WARN("module.overseer",
+                     "overseer: dungeon run {} of campaign {} puts '{}' back into map {} by "
+                     "the dungeon finder's own teleport in (try {} of {}) - the finder group "
+                     "is still in its dungeon and the member is outside it (#1488)",
+                     coord.runNumber, coord.campaignId, name, portal.insideMapId, attempt,
+                     OverseerDecisions::FINDER_RETURN_MAX_ATTEMPTS);
+        }
+        return pressed;
     }
 
     // Out of the finder's queue, when the family is still in it.
@@ -60692,8 +60856,14 @@ private:
                     // acting on it has been getting nowhere. A rejoin that
                     // works shows up as the census going up, which is the
                     // ratchet's own reading and restarts its clock.
-                    WalkStrandedBackIn(leaderName, *portal, door, triggerId, states,
-                                       coord);
+                    //
+                    // A FINDER-ENTERED RUN ASKS THE FINDER FIRST (#1488): its
+                    // group is still in its dungeon, and its own teleport in
+                    // puts the member back where a walk from thousands of
+                    // yards away cannot.
+                    if (!ReturnStrandedByFinder(leaderName, *portal, states, coord))
+                        WalkStrandedBackIn(leaderName, *portal, door, triggerId, states,
+                                           coord);
 
                     // AND THE CEILING ITSELF, WHICH IS THE WHOLE OF #384's
                     // FIRST HALF. Read with the ratchet above, `stalled` means
@@ -86718,10 +86888,12 @@ private:
         Group* const group = player->GetGroup();
         LOG_WARN("module.overseer",
                  "overseer: probe #1426: '{}' on map {} is being teleported to map {} "
-                 "options={} target_null={} in_group={} lfg_group={} finder_watched={}",
+                 "options={} target_null={} in_group={} lfg_group={} finder_watched={} "
+                 "alive={} in_combat={}",
                  name, player->GetMapId(), mapid, options, target ? "no" : "yes",
                  group ? "yes" : "no", group && group->isLFGGroup() ? "yes" : "no",
-                 OverseerWorldScript::IsFinderWatched(name) ? "yes" : "no");
+                 OverseerWorldScript::IsFinderWatched(name) ? "yes" : "no",
+                 player->IsAlive() ? "yes" : "no", player->IsInCombat() ? "yes" : "no");
     }
     static std::mutex& ProbeLock()
     {
