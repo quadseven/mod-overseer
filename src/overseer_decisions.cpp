@@ -22266,6 +22266,30 @@ char const* FinderStepWord(FinderStep step)
     return "unknown";
 }
 
+bool FinderReturnDue(FinderReturnFacts const& facts)
+{
+    if (!facts.groupInDungeon || !facts.inGroup || !facts.inWorld || !facts.alive)
+        return false;
+    // The core refuses a teleport in combat, or while one is under way, and
+    // does not retry; a member already inside has nothing to return to.
+    if (facts.inCombat || facts.beingTeleported || facts.inside)
+        return false;
+    if (facts.attempts >= FINDER_RETURN_MAX_ATTEMPTS)
+        return false;
+    return facts.sinceLastAttempt >= FINDER_RETURN_RETRY_SECONDS;
+}
+
+std::uint32_t DungeonDoorKeyItem(std::uint32_t mapId)
+{
+    // Blackrock Depths: the Shadowforge Key.
+    return mapId == 230 ? 11000u : 0u;
+}
+
+bool ArmingHeldForKeyHolder(bool outside, std::time_t heldSeconds)
+{
+    return outside && heldSeconds < KEY_HOLDER_ARMING_HOLD_SECONDS;
+}
+
 // ------------------------------------ a guild group by the dungeon finder --
 
 namespace
