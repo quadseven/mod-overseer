@@ -1,0 +1,38 @@
+WHY THIS PATCH EXISTS
+    In Blackrock Depths the six Ironhand Guardians flank the Iron Hall
+    between Magmus and the throne room and breathe Gout of Flames (spell
+    15529, a fire cone, every 16s) only while Magmus is being fought:
+    `instance_blackrock_depths::SetData(TYPE_IRON_HALL, ...)` calls
+    `brd_ironhand_guardian::SetData(0, value)` in its NOT_STARTED and
+    IN_PROGRESS cases (instance_blackrock_depths.cpp, the TYPE_IRON_HALL
+    switch, about line 621). Magmus engaging sets IN_PROGRESS (flames on).
+    Magmus dying sets DONE, and the DONE case only opens the throne door:
+    it never switches the flames off, and a dead Magmus cannot reset to
+    NOT_STARTED. The guardians therefore keep casting until the map resets.
+    A party that waits or walks in the hall after the kill takes the cone
+    from creatures that never enter combat, so it reads as out of combat
+    while it burns. Live: a five-member party died in the hall 30 minutes
+    after killing Magmus (mod-overseer#1485).
+
+WHAT WOULD LET THIS PATCH BE DELETED
+    An upstream change that turns the guardians' flames off when
+    TYPE_IRON_HALL becomes DONE. No upstream PR exists yet.
+
+APPLIES TO
+    mod-playerbots/azerothcore-wotlk @ 8a4e76eac8c4ccebf547113afe7b51d6c3e91641
+    instance_blackrock_depths::SetData, case TYPE_IRON_HALL, case DONE.
+
+diff --git a/src/server/scripts/EasternKingdoms/BlackrockMountain/BlackrockDepths/instance_blackrock_depths.cpp b/src/server/scripts/EasternKingdoms/BlackrockMountain/BlackrockDepths/instance_blackrock_depths.cpp
+index ffa43fc..f596660 100644
+--- a/src/server/scripts/EasternKingdoms/BlackrockMountain/BlackrockDepths/instance_blackrock_depths.cpp
++++ b/src/server/scripts/EasternKingdoms/BlackrockMountain/BlackrockDepths/instance_blackrock_depths.cpp
+@@ -630,6 +630,9 @@ struct instance_blackrock_depths : public InstanceScript
+                     break;
+                 case DONE:
+                     HandleGameObject(GetGuidData(DATA_THRONE_DOOR), true);
++                    for (int i = 0; i < 6; i++)
++                        if (Creature* ironhand = instance->GetCreature(IronhandGUID[i]))
++                            ironhand->AI()->SetData(0, 0);
+                     break;
+                 default:
+                     break;
