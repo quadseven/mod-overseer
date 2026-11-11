@@ -50,13 +50,15 @@ void CheckStep(char const* what, IdleCampaignPlan got, IdleCampaignStep want,
     ++failures;
 }
 
-CampaignRecoveryRow Row(unsigned attempt, bool applied, bool openedSince = false)
+CampaignRecoveryRow Row(unsigned attempt, bool applied, bool openedSince = false,
+                        char const* appliedRecovery = "")
 {
     CampaignRecoveryRow row;
     row.present = true;
     row.attempt = attempt;
     row.applied = applied;
     row.attemptOpenedSince = openedSince;
+    row.appliedRecovery = appliedRecovery;
     return row;
 }
 
@@ -84,7 +86,34 @@ void EverythingElseIsAsItWas()
               "streak: a new request",
               IdleCampaignRecovery(3, false, Row(2, true)), IdleCampaignStep::EnterRecovery, 3);
     CheckStep("the town trip's applied row opens the attempt it was for",
-              IdleCampaignRecovery(4, true, Row(4, true)), IdleCampaignStep::OpenAttempt, 0);
+              IdleCampaignRecovery(4, true, Row(4, true, false, "town_for_bags")),
+              IdleCampaignStep::OpenAttempt, 0);
+    // The heuristic town trip, in words: the bridge stayed silent (it
+    // answered nothing), the heuristic applied the recovery itself, and the
+    // word written in the applied column is town_for_bags. That trip was
+    // the errand, so the attempt it was for opens directly; it must not be
+    // recovered a second time because the bridge's answer column is empty.
+    CheckStep("a town trip applied by the heuristic, the bridge silent, opens the attempt",
+              IdleCampaignRecovery(4, true, Row(4, true, false, "town_for_bags")),
+              IdleCampaignStep::OpenAttempt, 0);
+}
+
+void AnAppliedNonTownTripRecoveryReentersRecovery()
+{
+    // The staging-barrier shape: the streak's recovery was applied, but the
+    // recovery was not itself the errand that clears the blocker, so opening
+    // the next attempt directly re-arms into the same barrier at once.
+    CheckStep("an applied hearth regroup for the current streak re-enters recovery",
+              IdleCampaignRecovery(4, true, Row(4, true, false, "hearth_regroup")),
+              IdleCampaignStep::EnterRecovery, 4);
+    CheckStep("an applied regroup for the current streak re-enters recovery",
+              IdleCampaignRecovery(2, true, Row(2, true, false, "regroup")),
+              IdleCampaignStep::EnterRecovery, 2);
+    // An applied row for an older attempt is not this streak's answer: the
+    // run rows decide, as before.
+    CheckStep("an applied non-town-trip row for an older attempt changes nothing",
+              IdleCampaignRecovery(3, false, Row(2, true, false, "hearth_regroup")),
+              IdleCampaignStep::EnterRecovery, 3);
 }
 
 void AStaleRowIsNotResumed()
@@ -135,6 +164,10 @@ void TheAdapterIsWired()
         "            \"ORDER BY r.id DESC LIMIT 1\"");
     has("the answer on the resumed row is still the one read",
         "\"AND status = 'answered' ORDER BY id DESC LIMIT 1\"");
+    has("the newest row's applied recovery is read from the applied column, not the answer",
+        "\"SELECT r.attempt, r.status, r.applied, r.failure, \"");
+    has("the newest row's applied recovery reaches the decision",
+        "row.appliedRecovery =");
 }
 
 }  // namespace
@@ -143,6 +176,7 @@ int main()
 {
     TheMeasuredRestartResumesRow46();
     EverythingElseIsAsItWas();
+    AnAppliedNonTownTripRecoveryReentersRecovery();
     AStaleRowIsNotResumed();
     TheAdapterIsWired();
     if (failures)
