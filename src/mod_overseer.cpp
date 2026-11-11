@@ -40663,6 +40663,27 @@ private:
             return false;
         }
 
+        if (action == OverseerDecisions::DungeonClearStallAction::Skip &&
+            OverseerDecisions::StallSkipWouldSpendLastBoss(
+                insideMapId, ExpectedEncounterMask(insideMapId, leader),
+                CompletedEncounters(leader)))
+        {
+            // THE LAST BOSS OF BLACKROCK DEPTHS IS NOT SKIPPED. The rung is
+            // spent without a skip so the ladder still reaches its exit.
+            ++coord.clearSkips;
+            std::string const brainSays = DungeonBrainStallReason(leader);
+            LOG_WARN("module.overseer",
+                     "overseer: dungeon run CLEARING has not moved '{}' {}y on map {} for {} "
+                     "minutes, but the one boss left is the last of the dungeon, so 'dc skip' "
+                     "({} of {}) is NOT sent: it would skip that boss and lose the clear. "
+                     "The dungeon brain says: {}",
+                     leader->GetName(), static_cast<uint32>(DUNGEON_CLEAR_STALL_YARDS),
+                     insideMapId, static_cast<uint32>(DUNGEON_CLEAR_STALL_SECONDS / 60),
+                     coord.clearSkips, static_cast<uint32>(DUNGEON_CLEAR_SKIPS),
+                     brainSays.empty() ? "nothing" : brainSays);
+            return false;
+        }
+
         if (action == OverseerDecisions::DungeonClearStallAction::Skip)
         {
             ++coord.clearSkips;
@@ -47599,6 +47620,26 @@ private:
         // leader's. The tank is the issuer every other verb of this run uses
         // and the brain accepts.
         Player* const issuer = tank;
+        if (tankInside && OverseerDecisions::StallSkipWouldSpendLastBoss(
+                              run.mapId,
+                              OverseerDecisions::GuildRunExpectedMask(
+                                  run.mapId, MapEncounterMask(run.mapId),
+                                  DungeonBrainExpectedEncounterMask(tank), run.finderEndsDungeon,
+                                  tank->GetTeamId() == TEAM_ALLIANCE),
+                              CompletedEncounters(tank)))
+        {
+            // THE LAST BOSS OF BLACKROCK DEPTHS IS NOT SKIPPED: the rung is
+            // spent without a skip so the ladder still ends the run.
+            ++run.stallSkips;
+            run.stillSince = now;
+            run.creditSince = now;
+            run.stallMarked = false;
+            LOG_WARN("module.overseer",
+                     "overseer: guild finder run {} - dc skip {} of {} NOT sent: the one boss "
+                     "left is the last of the dungeon and a skip would lose the clear ({})",
+                     run.id, run.stallSkips, OverseerDecisions::GUILD_RUN_MAX_SKIPS, seen);
+            return false;
+        }
         bool any = false;
         bool all = true;
         for (std::string const& name : run.names)

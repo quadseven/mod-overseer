@@ -3458,6 +3458,15 @@ bool DungeonClearWaitStopRearms(std::string const& stopReason, unsigned rearms,
 // stall clock runs and the refused skip ends the run.
 float DungeonClearWatchdogYards(float yardsFromMark, std::string const& stopReason);
 
+// A STALL SKIP MUST NOT SPEND THE LAST BOSS OF BLACKROCK DEPTHS. `dc skip`
+// abandons the objective the dungeon module is on. With one encounter left
+// on map 230 that objective is the Emperor, and skipping it leaves the module
+// "no next boss (all dead/skipped)" and the run stalled with his bit never
+// credited (Grug's run, held out of aggro in the throne room). True means the
+// watchdog must not send the skip, and lets the ladder reach its exit instead.
+// Only map 230 with a known expectation and exactly one uncredited bit.
+bool StallSkipWouldSpendLastBoss(uint32_t mapId, uint32_t expectedMask, uint32_t creditedMask);
+
 // WHY THE MODULE STOPPED, NOT HOW THE EXIT WAS CLEANED UP (#1089). A run that
 // stalls after the dungeon module switched itself off used to record only that
 // a `dc skip` was refused, and then the exit's own wording ("the failed exit

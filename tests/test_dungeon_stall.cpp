@@ -157,10 +157,41 @@ void YardsWithTheBrainOffAreNotProgress()
           DungeonClearStallAction::Skip);
 }
 
+void AStallSkipNeverSpendsTheLastBossOfBlackrockDepths()
+{
+    using OverseerDecisions::StallSkipWouldSpendLastBoss;
+    uint32_t const expected = (1u << 19) - 1; // bits 0..18, the Emperor is bit 18
+    uint32_t const allButEmperor = expected & ~(1u << 18);
+    uint32_t const twoLeft = expected & ~(1u << 18) & ~(1u << 17);
+    Check("brd, only the Emperor left",
+          StallSkipWouldSpendLastBoss(230, expected, allButEmperor)
+              ? DungeonClearStallAction::Nothing
+              : DungeonClearStallAction::Skip,
+          DungeonClearStallAction::Nothing);
+    Check("brd, two bosses left",
+          StallSkipWouldSpendLastBoss(230, expected, twoLeft)
+              ? DungeonClearStallAction::Nothing
+              : DungeonClearStallAction::Skip,
+          DungeonClearStallAction::Skip);
+    Check("brd, nothing credited yet",
+          StallSkipWouldSpendLastBoss(230, expected, 0) ? DungeonClearStallAction::Nothing
+                                                        : DungeonClearStallAction::Skip,
+          DungeonClearStallAction::Skip);
+    Check("brd, unknown expectation",
+          StallSkipWouldSpendLastBoss(230, 0, 0) ? DungeonClearStallAction::Nothing
+                                                 : DungeonClearStallAction::Skip,
+          DungeonClearStallAction::Skip);
+    Check("other dungeon keeps skipping its last boss",
+          StallSkipWouldSpendLastBoss(36, 0x7, 0x3) ? DungeonClearStallAction::Nothing
+                                                    : DungeonClearStallAction::Skip,
+          DungeonClearStallAction::Skip);
+}
+
 } // namespace
 
 int main()
 {
+    AStallSkipNeverSpendsTheLastBossOfBlackrockDepths();
     HealthyProgressIsNeverInterrupted();
     APartyWaitStopRearmsBeforeTheLadder();
     StalledRunGetsBoundedSkips();
