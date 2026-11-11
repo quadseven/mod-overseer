@@ -3447,6 +3447,22 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
 bool DungeonClearWaitStopRearms(std::string const& stopReason, unsigned rearms,
                                 unsigned maximumRearms);
 
+// THE SAME RE-ARM WHILE THE RUN REASSEMBLES (#1500). The clearing watchdog above
+// only runs in CLEARING and only once its stall clock runs, and a dead member
+// holds that clock out. Dev realm 2026-11-11: the module stopped on a party wait,
+// a member died and was released, the run left CLEARING to reassemble, and four
+// living members then stood inside with the module off for about sixteen
+// minutes until the split ceiling closed the run. True while the stop is a
+// party-wait stop, `rearms` (the watchdog's own counter) is under
+// `maximumRearms`, at least SPLIT_HOLD_MIN_INSIDE members inside are alive (a
+// smaller party is not asked to clear without its missing member), and the last
+// re-arm is at least STAGED_INSIDE_REARM_GAP_SECONDS old, so one stop is not
+// answered with every re-arm in the bound before the first `dc on` has gone out.
+constexpr time_t STAGED_INSIDE_REARM_GAP_SECONDS = 60;
+bool StagedInsideBrainRearms(std::string const& stopReason, unsigned rearms,
+                             unsigned maximumRearms, unsigned aliveInside,
+                             time_t secondsSinceLastRearm);
+
 // YARDS WALKED WITH THE BRAIN OFF ARE NOT A RUN GOING ANYWHERE. The CLEARING
 // watchdog takes the tank's yards as progress, which is only true while the
 // dungeon module is driving. On 2026-10-31 it stopped itself at 08:21:05 ("the

@@ -2641,6 +2641,15 @@ bool DungeonClearWaitStopRearms(std::string const& stopReason, unsigned rearms,
            stopReason.find("the party never became ready") != std::string::npos;
 }
 
+bool StagedInsideBrainRearms(std::string const& stopReason, unsigned rearms,
+                             unsigned maximumRearms, unsigned aliveInside,
+                             time_t secondsSinceLastRearm)
+{
+    return aliveInside >= SPLIT_HOLD_MIN_INSIDE &&
+           secondsSinceLastRearm >= STAGED_INSIDE_REARM_GAP_SECONDS &&
+           DungeonClearWaitStopRearms(stopReason, rearms, maximumRearms);
+}
+
 bool StallSkipWouldSpendLastBoss(uint32_t mapId, uint32_t expectedMask, uint32_t creditedMask)
 {
     if (mapId != 230 || !expectedMask)
