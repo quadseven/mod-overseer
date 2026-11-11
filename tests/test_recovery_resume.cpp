@@ -51,14 +51,14 @@ void CheckStep(char const* what, IdleCampaignPlan got, IdleCampaignStep want,
 }
 
 CampaignRecoveryRow Row(unsigned attempt, bool applied, bool openedSince = false,
-                        char const* appliedAnswer = "")
+                        char const* appliedRecovery = "")
 {
     CampaignRecoveryRow row;
     row.present = true;
     row.attempt = attempt;
     row.applied = applied;
     row.attemptOpenedSince = openedSince;
-    row.appliedAnswer = appliedAnswer;
+    row.appliedRecovery = appliedRecovery;
     return row;
 }
 
@@ -86,6 +86,14 @@ void EverythingElseIsAsItWas()
               "streak: a new request",
               IdleCampaignRecovery(3, false, Row(2, true)), IdleCampaignStep::EnterRecovery, 3);
     CheckStep("the town trip's applied row opens the attempt it was for",
+              IdleCampaignRecovery(4, true, Row(4, true, false, "town_for_bags")),
+              IdleCampaignStep::OpenAttempt, 0);
+    // The heuristic town trip, in words: the bridge stayed silent (it
+    // answered nothing), the heuristic applied the recovery itself, and the
+    // word written in the applied column is town_for_bags. That trip was
+    // the errand, so the attempt it was for opens directly; it must not be
+    // recovered a second time because the bridge's answer column is empty.
+    CheckStep("a town trip applied by the heuristic, the bridge silent, opens the attempt",
               IdleCampaignRecovery(4, true, Row(4, true, false, "town_for_bags")),
               IdleCampaignStep::OpenAttempt, 0);
 }
@@ -156,8 +164,10 @@ void TheAdapterIsWired()
         "            \"ORDER BY r.id DESC LIMIT 1\"");
     has("the answer on the resumed row is still the one read",
         "\"AND status = 'answered' ORDER BY id DESC LIMIT 1\"");
-    has("the newest row's applied answer reaches the decision",
-        "row.appliedAnswer =");
+    has("the newest row's applied recovery is read from the applied column, not the answer",
+        "\"SELECT r.attempt, r.status, r.applied, r.failure, \"");
+    has("the newest row's applied recovery reaches the decision",
+        "row.appliedRecovery =");
 }
 
 }  // namespace

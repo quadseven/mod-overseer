@@ -3933,7 +3933,7 @@ struct CampaignRecoveryRow
     unsigned attempt{0};             // the newest one's attempt
     bool applied{false};             // its status reads 'applied'
     bool attemptOpenedSince{false};  // a run of this campaign started after it
-    std::string appliedAnswer;       // the recovery that was applied, when applied
+    std::string appliedRecovery;     // the recovery that was applied, when applied
 };
 
 enum class IdleCampaignStep : std::uint8_t

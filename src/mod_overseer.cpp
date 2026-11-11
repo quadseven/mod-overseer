@@ -43304,7 +43304,7 @@ private:
         if (!RunRecoveryPresent() || !campaignId)
             return row;
         QueryResult result = CharacterDatabase.Query(
-            "SELECT r.attempt, r.status, r.answer, r.failure, "
+            "SELECT r.attempt, r.status, r.applied, r.failure, "
             "COALESCE(TIMESTAMPDIFF(SECOND, r.created_at, NOW()), 0), "
             "(SELECT COUNT(*) FROM overseer_dungeon_run d WHERE d.campaign_id = r.campaign_id "
             " AND d.started_at > r.created_at + INTERVAL {} SECOND) "
@@ -43318,7 +43318,7 @@ private:
         row.present = true;
         row.attempt = fields[0].Get<uint32>();
         row.applied = fields[1].Get<std::string>() == "applied";
-        row.appliedAnswer =
+        row.appliedRecovery =
             row.applied ? fields[2].Get<std::string>() : std::string();
         failure = fields[3].Get<std::string>();
         // Expressions come back as BIGINT; see CampaignIdAfterTable.

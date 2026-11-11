@@ -3066,7 +3066,7 @@ IdleCampaignPlan IdleCampaignRecovery(unsigned trailingFailures, bool recoveryAp
     }
     else if (DungeonCampaignRecovers(trailingFailures) && recoveryAppliedForStreak &&
              newest.present && newest.applied && newest.attempt == trailingFailures &&
-             newest.appliedAnswer != RunRecoveryWord(RunRecovery::TownForBags))
+             newest.appliedRecovery != RunRecoveryWord(RunRecovery::TownForBags))
     {
         // The streak's recovery was applied, but it was not the town trip:
         // applying it did not itself clear the condition that blocked the
