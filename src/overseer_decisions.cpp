@@ -2641,6 +2641,14 @@ bool DungeonClearWaitStopRearms(std::string const& stopReason, unsigned rearms,
            stopReason.find("the party never became ready") != std::string::npos;
 }
 
+bool StallSkipWouldSpendLastBoss(uint32_t mapId, uint32_t expectedMask, uint32_t creditedMask)
+{
+    if (mapId != 230 || !expectedMask)
+        return false;
+    uint32_t const left = expectedMask & ~creditedMask;
+    return left != 0 && (left & (left - 1)) == 0;
+}
+
 std::string DungeonModuleStopWords(std::string const& raw)
 {
     static std::string const prefix = "Dungeon clear stopped:";
