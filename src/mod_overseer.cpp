@@ -38304,6 +38304,10 @@ private:
         // `dc on`s sent again for a party-wait stop since the last boss credit
         // (#1308). Yards do not clear it: a tank drifts with its brain off.
         unsigned clearRearms{0};
+        // When the reassembly phase last sent `dc on` again for a party-wait stop
+        // (#1500); 0 = never. Spaces the re-arms so one stop is not answered with
+        // the whole bound before the first command has gone out.
+        time_t stagedRearmAt{0};
         // The dungeon module refused a `dc skip`: the run walks out at once and
         // its row says so (DungeonClearStallDecision, skipRefused).
         bool clearSkipRefused{false};
@@ -60905,6 +60909,42 @@ private:
                     if (!ReturnStrandedByFinder(leaderName, *portal, states, coord))
                         WalkStrandedBackIn(leaderName, *portal, door, triggerId, states,
                                            coord);
+
+                    // THE DUNGEON MODULE IS ARMED AGAIN WHILE THE FOUR WAIT (#1500).
+                    // It switches itself off on a party wait ("the party never
+                    // became ready after 180s"), and the re-arm for that stop
+                    // lives in the clearing watchdog, which a dead member holds
+                    // out and which no longer runs once the run is here. Without
+                    // this the living members stand idle until the ceiling below
+                    // closes the run (dev realm 2026-11-11: four alive inside, the
+                    // module off, sixteen minutes). The counter is the watchdog's
+                    // own, so the two paths share one bound.
+                    {
+                        unsigned aliveInside = 0;
+                        for (OverseerDecisions::DungeonRunEntryState const& state : states)
+                            if (state.through && state.alive)
+                                ++aliveInside;
+                        time_t const rearmNow = std::time(nullptr);
+                        std::string const stopReason = DungeonBrainStopReason(
+                            ObjectAccessor::FindPlayerByName(leaderName));
+                        if (OverseerDecisions::StagedInsideBrainRearms(
+                                stopReason, coord.clearRearms, DUNGEON_CLEAR_WAIT_REARMS,
+                                aliveInside, rearmNow - coord.stagedRearmAt))
+                        {
+                            ++coord.clearRearms;
+                            coord.stagedRearmAt = rearmNow;
+                            for (OverseerDecisions::DungeonRunEntryState const& state : states)
+                                _dcOnIssued.erase(state.name);
+                            LOG_WARN("module.overseer",
+                                     "overseer: dungeon run {} of campaign {} is waiting for "
+                                     "a member with {} alive inside and the dungeon module "
+                                     "off, so it is armed again ({} of {}): {}",
+                                     coord.runNumber, coord.campaignId, aliveInside,
+                                     coord.clearRearms,
+                                     static_cast<uint32>(DUNGEON_CLEAR_WAIT_REARMS),
+                                     OverseerDecisions::DungeonModuleStopWords(stopReason));
+                        }
+                    }
 
                     // AND THE CEILING ITSELF, WHICH IS THE WHOLE OF #384's
                     // FIRST HALF. Read with the ratchet above, `stalled` means
