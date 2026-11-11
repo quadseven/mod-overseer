@@ -47624,7 +47624,8 @@ private:
                               run.mapId,
                               OverseerDecisions::GuildRunExpectedMask(
                                   run.mapId, MapEncounterMask(run.mapId),
-                                  DungeonBrainExpectedEncounterMask(tank), run.finderEndsDungeon),
+                                  DungeonBrainExpectedEncounterMask(tank), run.finderEndsDungeon,
+                                  tank->GetTeamId() == TEAM_ALLIANCE),
                               CompletedEncounters(tank)))
         {
             // THE LAST BOSS OF BLACKROCK DEPTHS IS NOT SKIPPED: the rung is
