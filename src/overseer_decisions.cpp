@@ -3064,6 +3064,18 @@ IdleCampaignPlan IdleCampaignRecovery(unsigned trailingFailures, bool recoveryAp
         plan.step = IdleCampaignStep::EnterRecovery;
         plan.attempt = trailingFailures;
     }
+    else if (DungeonCampaignRecovers(trailingFailures) && recoveryAppliedForStreak &&
+             newest.present && newest.applied && newest.attempt == trailingFailures &&
+             newest.appliedAnswer != RunRecoveryWord(RunRecovery::TownForBags))
+    {
+        // The streak's recovery was applied, but it was not the town trip:
+        // applying it did not itself clear the condition that blocked the
+        // attempt, so opening the next attempt directly re-arms into the
+        // same block. Only the town trip opens directly, because the trip
+        // was the errand and the attempt it was for is the next step.
+        plan.step = IdleCampaignStep::EnterRecovery;
+        plan.attempt = trailingFailures;
+    }
     return plan;
 }
 
