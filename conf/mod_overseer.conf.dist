@@ -424,6 +424,21 @@
 #
 #Overseer.DungeonFinder.Default = 0
 
+#    Overseer.DungeonFinder.StageAtInn
+#        Description: Before the family is queued in the dungeon finder, every
+#                     member that is more than 1000 yards from the inn most of
+#                     the family is bound at hearths to it with its own
+#                     hearthstone (nobody is teleported), because the core puts
+#                     each living member back where it stood at the queue when
+#                     the run ends (#1510). Bounded to 240 seconds, a member that
+#                     cannot hearth (no stone, on cooldown, bound elsewhere) is
+#                     left where it is, and a stage that failed is skipped by the
+#                     next finder attempt of the campaign.
+#
+#        Default:     1
+#
+#Overseer.DungeonFinder.StageAtInn = 1
+
 #    Overseer.GuildFinder.Enable
 #        Description: Let the control plane's guild coordinator send a bot
 #                     guild's own five-man through the dungeon finder: a

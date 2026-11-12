@@ -38150,6 +38150,14 @@ private:
         uint32 finderDefaultRun{0};
         std::map<std::string, uint32> finderAccepted;
         std::string finderSaid;
+        // STAGING AT THE INN BEFORE THE QUEUE (#1510): when this attempt's stage
+        // began (0 = not begun), the casts asked per member, the verdict last
+        // said, and whether the previous attempt's stage failed (carried across
+        // attempts and runs of the campaign, see OverseerDecisions::FinderStageNext).
+        std::time_t finderStageSince{0};
+        std::map<std::string, unsigned> finderStageAttempts;
+        std::string finderStageSaid;
+        bool finderStageFailed{false};
         // MAKING ROOM INSIDE (see MakeRoomInside): who has had the loot rule
         // set this run, and who was told once that no grey was left.
         std::set<std::string> roomLootRuleSet;
@@ -43448,6 +43456,14 @@ private:
                                            OverseerDecisions::RUN_FINDER_IS_DEFAULT);
     }
 
+    // Overseer.DungeonFinder.StageAtInn: hearth the family to its inn before the
+    // finder queues it (#1510). On unless a realm's conf turns it off.
+    static bool FinderStagesAtInn()
+    {
+        return sConfigMgr->GetOption<bool>("Overseer.DungeonFinder.StageAtInn",
+                                           OverseerDecisions::FINDER_STAGE_AT_INN_DEFAULT);
+    }
+
     // `finderGroupGoesFirst` is the IDLE coordinator's question, asked while the
     // group a finder run made still stands: RESETTING disbands it before the
     // queue (LeaveTheFinderGroup), so it is no reason to say no.
@@ -43846,6 +43862,7 @@ private:
         next.resetSince = std::time(nullptr);
         next.recoveryStreak = coord.recoveryStreak;
         next.finderDefaultRun = coord.finderDefaultRun;
+        next.finderStageFailed = coord.finderStageFailed;
         coord = next;
     }
 
@@ -44161,6 +44178,9 @@ private:
             coord.finderDungeonId = 0;
             coord.finderAccepted.clear();
             coord.finderSaid.clear();
+            coord.finderStageSince = 0;
+            coord.finderStageAttempts.clear();
+            coord.finderStageSaid.clear();
             // HOW OFTEN THE CLASSIC ROAD HAS FAILED TODAY, read before this
             // row is marked (the mark is queued) and counted with it.
             unsigned finderUsesToday = 0;
@@ -44323,7 +44343,9 @@ private:
             {
                 // The rung's own clock is FINDER_CEILING_SECONDS from its join;
                 // this ceiling is the backstop behind it.
-                wait.ceilingSeconds = OverseerDecisions::FINDER_CEILING_SECONDS * 2;
+                // Plus the hearth stage that may come before the queue (#1510).
+                wait.ceilingSeconds = OverseerDecisions::FINDER_CEILING_SECONDS * 2 +
+                                      OverseerDecisions::FINDER_STAGE_BUDGET_SECONDS;
                 FinderRungOutcome const outcome =
                     DriveFinderRung(coord, leaderName, members, portal, now, doneWhy);
                 if (outcome == FinderRungOutcome::Inside)
@@ -44969,6 +44991,120 @@ private:
             p->SetFallInformation(GameTime::GetGameTime().count(), p->GetPositionZ());
     }
 
+    // THE HEARTH STAGE BEFORE THE QUEUE (#1510). The finder returns every living
+    // member to the spot it queued from, so the family is brought to its inn
+    // first, by the stone each member carries (the cast is DoHearth's, the same
+    // one DriveHearthRegroup and kind='hearth' run). Nobody is walked, held or
+    // teleported here: a member that cannot hearth is left where it stands and
+    // the queue goes ahead. True while the queue is held back; false when the
+    // family queues now. The verdict, the budget and the skip rules are
+    // OverseerDecisions::FinderStageNext's.
+    bool FinderStageHoldsTheQueue(DungeonRunCoordinatorState& coord,
+                                  std::string const& leaderName,
+                                  std::vector<std::string> const& names,
+                                  std::vector<std::string> const& members,
+                                  DungeonPortal const& portal, std::time_t now)
+    {
+        if (!coord.finderStageSince)
+            coord.finderStageSince = now;
+        OverseerDecisions::HearthRegroupPlan const plan =
+            PlanFamilyHearthRegroup(leaderName, members, portal);
+        OverseerDecisions::FinderStageFacts facts;
+        facts.enabled = FinderStagesAtInn();
+        facts.failedLastTime = coord.finderStageFailed;
+        facts.waitedSeconds = static_cast<unsigned>(now - coord.finderStageSince);
+        facts.planReady = plan.ready;
+        facts.planWhyNot = plan.whyNot;
+        std::map<std::string, Player*> bots;
+        if (plan.ready)
+        {
+            for (std::string const& name : names)
+            {
+                Player* const bot = ObjectAccessor::FindPlayerByName(name);
+                bots[name] = bot;
+                OverseerDecisions::FinderStageMember m;
+                m.name = name;
+                OverseerDecisions::ExitHearthFacts cast;
+                if (bot && bot->IsInWorld())
+                {
+                    uint32 const spellId = HearthstoneSpellOf(bot);
+                    m.yardsFromInn = bot->GetMapId() == plan.inn.mapId
+                                         ? bot->GetExactDist2d(plan.inn.x, plan.inn.y)
+                                         : -1.f;
+                    m.alive = bot->IsAlive();
+                    m.carriesStone = spellId != 0;
+                    m.onCooldown = spellId && bot->HasSpellCooldown(spellId);
+                    m.inHearthSet =
+                        bot->m_homebindMapId == plan.inn.mapId &&
+                        std::hypot(bot->m_homebindX - plan.inn.x,
+                                   bot->m_homebindY - plan.inn.y) <=
+                            OverseerDecisions::HEARTH_REGROUP_INN_YARDS;
+                    m.attempts = coord.finderStageAttempts[name];
+                    cast.inWorld = true;
+                    cast.onInsideMap = m.inHearthSet;
+                    cast.alive = m.alive;
+                    cast.carriesStone = m.carriesStone;
+                    cast.onCooldown = m.onCooldown;
+                    cast.inCombat = bot->IsInCombat();
+                    cast.moving = bot->isMoving();
+                    cast.pending = HearthPendingFor(name);
+                    cast.attempts = m.attempts;
+                }
+                m.hearth = OverseerDecisions::ExitFailureHearthStep(cast);
+                facts.family.push_back(m);
+            }
+        }
+        OverseerDecisions::FinderStageVerdict const verdict =
+            OverseerDecisions::FinderStageNext(facts);
+
+        std::string said = std::string(OverseerDecisions::FinderStageStepWord(verdict.step)) +
+                           ": " + verdict.why;
+        for (std::string const& skip : verdict.skipped)
+            said += "; " + skip;
+        if (said != coord.finderStageSaid)
+        {
+            coord.finderStageSaid = said;
+            LOG_WARN("module.overseer",
+                     "overseer: DUNGEON FINDER - the family of '{}' {} ({}s into the stage, "
+                     "at most {}s): {}",
+                     leaderName,
+                     verdict.step == OverseerDecisions::FinderStageStep::Queue
+                         ? "is queued as it stands"
+                         : "is hearthed to its inn before it is queued",
+                     facts.waitedSeconds, OverseerDecisions::FINDER_STAGE_BUDGET_SECONDS,
+                     said);
+        }
+
+        for (std::string const& name : verdict.cast)
+        {
+            Player* const bot = bots[name];
+            if (!bot)
+                continue;
+            if (bot->isMoving())
+            {
+                CastHoldReport report;
+                HoldStillAndReport(bot, name, "hearth", report);
+                NoteHearthHold(name, "moving, held still first for the finder's hearth stage",
+                               bot->GetMapId());
+                continue;
+            }
+            char const* status = "error";
+            std::string evidence;
+            ++coord.finderStageAttempts[name];
+            char const* const refusal = DoHearth(bot, "use", status, evidence, _pendingHearths, 0);
+            LOG_WARN("module.overseer",
+                     "overseer: finder hearth stage - '{}' {} (cast {} of {})", name,
+                     refusal && *refusal ? std::string("could not hearth: ") + refusal
+                                         : std::string("is hearthing to the family's inn"),
+                     coord.finderStageAttempts[name], OverseerDecisions::EXIT_HEARTH_ATTEMPTS);
+        }
+
+        if (verdict.step != OverseerDecisions::FinderStageStep::Queue)
+            return true;
+        coord.finderStageFailed = verdict.failed;
+        return false;
+    }
+
     FinderRungOutcome DriveFinderRung(DungeonRunCoordinatorState& coord,
                                       std::string const& leaderName,
                                       std::vector<std::string> const& members,
@@ -45093,6 +45229,11 @@ private:
                     doneWhy = "the family could not be queued in the dungeon finder";
                     return FinderRungOutcome::Over;
                 }
+                // THE FAMILY IS BROUGHT TO ITS INN FIRST (#1510): the core puts
+                // each member back where it stood at the queue. Bounded, and
+                // never twice in a row after a stage that failed.
+                if (FinderStageHoldsTheQueue(coord, leaderName, names, members, portal, now))
+                    return FinderRungOutcome::Waiting;
                 ClearFinderBook(names);
                 for (std::string const& name : names)
                     ReanchorFallForTheFinder(ObjectAccessor::FindPlayerByName(name));
@@ -45327,6 +45468,9 @@ private:
         coord.finderDungeonId = 0;
         coord.finderAccepted.clear();
         coord.finderSaid.clear();
+        coord.finderStageSince = 0;
+        coord.finderStageAttempts.clear();
+        coord.finderStageSaid.clear();
         coord.recoveryNote = "run " + std::to_string(coord.runNumber) +
                              ": in by the dungeon finder";
         LOG_WARN("module.overseer",
@@ -45351,6 +45495,7 @@ private:
         next.runsWanted = coord.runsWanted;
         next.capKnown = coord.capKnown;
         next.recoveryStreak = coord.recoveryStreak;
+        next.finderStageFailed = coord.finderStageFailed;
         coord = next;
     }
 

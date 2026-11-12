@@ -22289,6 +22289,107 @@ FinderReadiness ReadFinderReadiness(FinderFacts const& facts, bool now)
     return out;
 }
 
+char const* FinderStageStepWord(FinderStageStep step)
+{
+    switch (step)
+    {
+        case FinderStageStep::Queue:  return "queue";
+        case FinderStageStep::Hearth: return "hearth";
+        case FinderStageStep::Wait:   return "wait";
+    }
+    return "unknown";
+}
+
+FinderStageVerdict FinderStageNext(FinderStageFacts const& facts)
+{
+    FinderStageVerdict v;
+    if (!facts.enabled)
+    {
+        v.why = "staging at the inn is switched off";
+        return v;
+    }
+    if (facts.failedLastTime)
+    {
+        // Skipped once, then tried again: the flag is cleared by this verdict.
+        v.why = "the last finder stage ran out of time or its stone did not land, so "
+                "this attempt queues as it stands";
+        return v;
+    }
+    if (!facts.planReady)
+    {
+        v.why = "no hearth stage (" + facts.planWhyNot + ")";
+        return v;
+    }
+
+    bool anyFar = false;
+    bool anyActive = false;
+    bool anyTried = false;
+    for (FinderStageMember const& m : facts.family)
+    {
+        bool const far = m.yardsFromInn < 0.f || m.yardsFromInn > RUN_RECOVERY_HEARTH_SPREAD_YARDS;
+        if (!far)
+            continue;
+        anyFar = true;
+        bool const casts = m.inHearthSet && (m.hearth == ExitHearthStep::Cast ||
+                                             m.hearth == ExitHearthStep::StopFirst);
+        bool const waits = m.inHearthSet && m.hearth == ExitHearthStep::Waiting;
+        if (casts)
+        {
+            v.cast.push_back(m.name);
+            anyActive = true;
+            continue;
+        }
+        if (waits)
+        {
+            anyActive = true;
+            continue;
+        }
+        if (m.attempts > 0)
+            anyTried = true;
+        std::string why;
+        if (!m.alive)
+            why = "dead";
+        else if (!m.carriesStone)
+            why = "no hearthstone";
+        else if (m.onCooldown)
+            why = "hearthstone on cooldown";
+        else if (!m.inHearthSet)
+            why = "bound at another inn";
+        else if (m.attempts > 0)
+            why = "its stone was cast " + std::to_string(m.attempts) + " time(s) and did not land";
+        else
+            why = "it cannot use its stone now";
+        v.skipped.push_back(m.name + ": " + why);
+    }
+
+    if (!anyFar)
+    {
+        v.why = "the family is already within " +
+                std::to_string(static_cast<unsigned>(RUN_RECOVERY_HEARTH_SPREAD_YARDS)) +
+                " yards of its inn";
+        return v;
+    }
+    if (anyActive && facts.waitedSeconds >= facts.budgetSeconds)
+    {
+        v.failed = true;
+        v.cast.clear();
+        v.why = "the hearth stage used its " + std::to_string(facts.budgetSeconds) +
+                "s and the family queues as it stands";
+        return v;
+    }
+    if (anyActive)
+    {
+        v.step = v.cast.empty() ? FinderStageStep::Wait : FinderStageStep::Hearth;
+        v.why = v.cast.empty() ? "a hearth is in flight or combat has to end first"
+                               : "members far from the inn hearth to it before the queue";
+        return v;
+    }
+    v.failed = anyTried;
+    v.why = anyTried ? "the stones were tried and did not bring the family to the inn"
+                     : "nobody far from the inn can use a stone now";
+    return v;
+}
+
 FinderStep FinderNext(FinderPollFacts const& facts)
 {
     if (facts.familySize && facts.inside >= facts.familySize)
