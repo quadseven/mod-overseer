@@ -367,6 +367,21 @@ void AHealersPieceIsNotReadOffATokenCasterStat()
     healer.rolePiece = GearPieceForRole(hitRing, GearRole::Healer);
     Expect(LootCouncilPriority(healer) == 3,
            "a healer has no first call on a ring of hit");
+
+    // The group the incident was (#1477 criterion 2): a melee wearer and a
+    // healer both upgraded by the same rogue leather, each classified off that
+    // one physical item. Read as a healer's piece, it gave the healer first
+    // call (priority 2) over the rogue's larger upgrade; read off its whole
+    // budget, neither has first call and the bigger upgrade takes it.
+    LootCandidate rogue = Candidate("Zak", true, GearComparison::Better, 40.f, 100.f, 8, "melee");
+    rogue.rolePiece = GearPieceForRole(rogueLeather, GearRole::Melee);
+    LootCandidate priest = Candidate("Zrog", true, GearComparison::Better, 30.f, 100.f, 8, "healer");
+    priest.rolePiece = GearPieceForRole(rogueLeather, GearRole::Healer);
+    LootCouncilPick const leather = LootCouncilHeuristic({priest, rogue});
+    Expect(leather.recipient == "Zak",
+           "the melee wearer the leather was made for gets it, not the healer");
+    Expect(leather.ranked.size() == 2 && leather.ranked[0] == "Zak" && leather.ranked[1] == "Zrog",
+           "the melee wearer heads the ranking over the healer");
 }
 
 void TheHeuristicRespectsArmourFit()
