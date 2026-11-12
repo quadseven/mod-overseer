@@ -336,6 +336,15 @@ void AHealersPieceIsNotReadOffATokenCasterStat()
     GearItem const rogueLeather = Piece(4, 2, 120, {{3, 18}, {31, 10}, {6, 3}});
     Expect(!GearPieceForRole(rogueLeather, GearRole::Healer),
            "leather of agility and hit with a splash of spirit is not a healer's piece");
+    // The same shapes with armour small against the spirit, as a low-level
+    // leather or mail piece has: the armour share no longer sinks the healer's
+    // reading, so the old code read these as the healer's piece.
+    GearItem const lowLeather = Piece(4, 2, 30, {{3, 18}, {31, 10}, {6, 3}});
+    Expect(!GearPieceForRole(lowLeather, GearRole::Healer),
+           "light leather of agility and hit with a splash of spirit is not a healer's piece");
+    GearItem const lowMail = Piece(4, 3, 40, {{4, 16}, {37, 8}, {6, 3}});
+    Expect(!GearPieceForRole(lowMail, GearRole::Healer),
+           "light mail of strength and expertise with a splash of spirit is not a healer's piece");
     GearItem const warriorMail = Piece(4, 3, 238, {{4, 16}, {37, 8}, {6, 2}});
     Expect(!GearPieceForRole(warriorMail, GearRole::Healer),
            "mail of strength and expertise with a splash of spirit is not a healer's piece");
@@ -373,16 +382,16 @@ void AHealersPieceIsNotReadOffATokenCasterStat()
 
     // The group the incident was (#1477 criterion 2): a melee wearer and a
     // healer both upgraded by the same physical piece, each classified off
-    // that one item, the healer with the smaller upgrade. The piece must be
-    // one the old code read as the healer's: armour-bearing leather is already
-    // refused by the share test (its armour points are not healer points), so
-    // the group is built on armour-free pieces, whose whole budget the old
-    // code read as the one token spirit. Read as a healer's piece, a ring of
-    // hit gave the healer first call (priority 2) over the fighter's larger
+    // that one item, the healer with the smaller upgrade. Every piece here is
+    // one the old code read as the healer's: a ring and a cloak with no armour
+    // at all, and leather and mail whose armour is small against the spirit
+    // (the heavier leather and mail above were already refused by the share
+    // test, so they are guards, not regressions). Read as a healer's piece, it
+    // gave the healer first call (priority 2) over the fighter's larger
     // upgrade; read off its whole budget, neither has first call and the
     // larger upgrade takes it. Each piece gets its own group, so a fix that
     // covers only one stat mix still fails.
-    GearItem const physicalPieces[] = {hitRing, agilityCloak};
+    GearItem const physicalPieces[] = {hitRing, agilityCloak, lowLeather, lowMail};
     for (GearItem const& piece : physicalPieces)
     {
         LootCandidate rogue = Candidate("Zak", true, GearComparison::Better, 40.f, 100.f, 8, "melee");
