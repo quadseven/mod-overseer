@@ -215,3 +215,13 @@ clears the log if that is not enough. Dark Iron Legacy (3801, 3802) is both, so
 a family member that took 3802 at Franclorn Forgewright lost it before the
 Fineous Darkvire kill and never earned the Shadowforge Key (#1444). The three
 passes now skip those two quests; every other quest is tidied as before.
+
+**`mod-playerbots/0025-the-guild-advertisements-are-pruned-from-bot-speech.patch`
+fixes upstream data** - dropping it costs the prune and nothing else. It adds
+one update file to `data/sql/playerbots/updates/`, the folder the module's own
+database updater applies, deleting the four `suggest_something` rows of
+`ai_playerbot_texts` that are guild searches (741, 743, 801, 816): a bot already
+in a guild said it was looking for one. The prune had been merged in the site's
+repository, where nothing applies it (site #2252). Proven by
+`tests/replay_guild_ads_prune.py`, which applies the patch and runs the SQL
+against the seed rows.
