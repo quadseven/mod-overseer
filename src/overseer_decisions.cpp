@@ -5580,10 +5580,30 @@ bool GearPieceForRole(GearItem const& item, GearRole role)
     // is a caster's piece wearing armour, not a tank's.
     bool nonStaminaStat = false;
     bool everyNonStaminaIsCaster = true;
+    // THE HEALER SIDE READS THE WHOLE BUDGET TOO (#1477). A stat a healer
+    // prices at nothing never enters `total` either, so leather of agility and
+    // hit with a token spirit scored as all healer: the physical stats that
+    // made it a rogue's piece were never counted against it. The points a
+    // healer builds on are set against the points only a fighter builds on,
+    // and a piece whose physical points reach its caster points is a fighter's
+    // piece with a splash, not a healer's.
+    int casterPoints = 0;
+    int physicalPoints = 0;
     for (GearStat const& stat : item.stats)
     {
         if (stat.value <= 0)
             continue;
+        if (role == GearRole::Healer)
+        {
+            if (stat.type == MOD_INTELLECT || stat.type == MOD_SPIRIT ||
+                stat.type == MOD_MANA_REGENERATION || stat.type == MOD_SPELL_POWER)
+                casterPoints += stat.value;
+            else if (StatWeight(GearRole::Healer, stat.type) == 0.f && stat.type != MOD_HEALTH &&
+                     (StatWeight(GearRole::Tank, stat.type) > 0.f ||
+                      StatWeight(GearRole::Melee, stat.type) > 0.f ||
+                      StatWeight(GearRole::Ranged, stat.type) > 0.f))
+                physicalPoints += stat.value;
+        }
         if (stat.type != MOD_STAMINA)
         {
             nonStaminaStat = true;
@@ -5612,6 +5632,8 @@ bool GearPieceForRole(GearItem const& item, GearRole role)
             own += worth;
     }
     if (role == GearRole::Tank && nonStaminaStat && everyNonStaminaIsCaster)
+        return false;
+    if (role == GearRole::Healer && physicalPoints >= casterPoints && physicalPoints > 0)
         return false;
     if (total <= 0.f || own * 2.f < total)
         return false;

@@ -321,6 +321,96 @@ void TheClassificationFeedsFirstCall()
     Expect(LootCouncilPriority(healer) == 2, "a healer's first call on them stands");
 }
 
+void AHealersPieceIsNotReadOffATokenCasterStat()
+{
+    // The mirror of #1475 (#1477). A healer prices intellect, spirit, mana
+    // regeneration and spell power, and prices strength, agility, attack power
+    // and hit at nothing, so those never entered the share test: a ring of hit
+    // or a cloak of agility with a splash of spirit read as all healer, and the
+    // council gave it first call to the healer over the melee wearer it was
+    // made for. Armour-bearing pieces (the leather, the mail) were already
+    // refused by the share test, so they are guards here, not regressions; the
+    // armour-free ones (the ring, the cloak, the even split) are the regressions.
+    // ItemModType ids: 3 agility, 4 strength, 5 intellect, 6 spirit, 7 stamina,
+    // 31 hit, 37 expertise, 38 attack power, 43 mana regeneration, 45 spell power.
+    GearItem const rogueLeather = Piece(4, 2, 120, {{3, 18}, {31, 10}, {6, 3}});
+    Expect(!GearPieceForRole(rogueLeather, GearRole::Healer),
+           "leather of agility and hit with a splash of spirit is not a healer's piece");
+    // The same shapes with armour small against the spirit, as a low-level
+    // leather or mail piece has: the armour share no longer sinks the healer's
+    // reading, so the old code read these as the healer's piece.
+    GearItem const lowLeather = Piece(4, 2, 30, {{3, 18}, {31, 10}, {6, 3}});
+    Expect(!GearPieceForRole(lowLeather, GearRole::Healer),
+           "light leather of agility and hit with a splash of spirit is not a healer's piece");
+    GearItem const lowMail = Piece(4, 3, 40, {{4, 16}, {37, 8}, {6, 3}});
+    Expect(!GearPieceForRole(lowMail, GearRole::Healer),
+           "light mail of strength and expertise with a splash of spirit is not a healer's piece");
+    GearItem const warriorMail = Piece(4, 3, 238, {{4, 16}, {37, 8}, {6, 2}});
+    Expect(!GearPieceForRole(warriorMail, GearRole::Healer),
+           "mail of strength and expertise with a splash of spirit is not a healer's piece");
+    GearItem const hitRing = Piece(4, 0, 0, {{31, 8}, {6, 2}});
+    Expect(!GearPieceForRole(hitRing, GearRole::Healer),
+           "a ring of hit with a speck of spirit is not either");
+    GearItem const staminaShare = Piece(4, 2, 120, {{3, 18}, {31, 10}, {6, 3}, {7, 12}});
+    Expect(!GearPieceForRole(staminaShare, GearRole::Healer),
+           "a stamina share does not turn a physical budget into a healer's");
+    GearItem const agilityCloak = Piece(4, 0, 0, {{3, 12}, {37, 4}, {6, 3}});
+    Expect(!GearPieceForRole(agilityCloak, GearRole::Healer),
+           "a token spirit on agility and expertise is not a healer's piece");
+    GearItem const evenSplit = Piece(4, 0, 0, {{3, 6}, {6, 6}});
+    Expect(!GearPieceForRole(evenSplit, GearRole::Healer),
+           "a budget that is as much physical as caster is not a healer's");
+
+    // The guards: a caster budget with a stamina or armour share, and a small
+    // physical splash on a caster budget, are still a healer's piece.
+    GearItem const hybridMail = Piece(4, 3, 238, {{5, 12}, {6, 9}, {7, 8}});
+    Expect(GearPieceForRole(hybridMail, GearRole::Healer),
+           "a caster budget with a stamina and armour share is a healer's piece");
+    GearItem const splash = Piece(4, 3, 200, {{5, 12}, {6, 9}, {4, 3}});
+    Expect(GearPieceForRole(splash, GearRole::Healer),
+           "a few points of strength on a caster budget leave it a healer's piece");
+    GearItem const mp5 = Piece(4, 1, 60, {{5, 6}, {43, 4}, {32, 3}});
+    Expect(GearPieceForRole(mp5, GearRole::Healer),
+           "crit rating, which a healer prices too, is not a physical stat");
+
+    // The classification feeds first call unchanged: a melee wearer's piece
+    // is no longer the healer's to call first.
+    LootCandidate healer = Candidate("Zrog", true, GearComparison::Better, 30.f, 100.f, 8, "healer");
+    healer.rolePiece = GearPieceForRole(hitRing, GearRole::Healer);
+    Expect(LootCouncilPriority(healer) == 3,
+           "a healer has no first call on a ring of hit");
+
+    // The group the incident was (#1477 criterion 2): a melee wearer and a
+    // healer both upgraded by the same physical piece, each classified off
+    // that one item, the healer with the smaller upgrade. Every piece here is
+    // one the old code read as the healer's: a ring and a cloak with no armour
+    // at all, and leather and mail whose armour is small against the spirit
+    // (the heavier leather and mail above were already refused by the share
+    // test, so they are guards, not regressions). Read as a healer's piece, it
+    // gave the healer first call (priority 2) over the fighter's larger
+    // upgrade; read off its whole budget, neither has first call and the
+    // larger upgrade takes it. Each piece gets its own group, so a fix that
+    // covers only one stat mix still fails.
+    // AI-REVIEW 2026-11-12 [gpt-6.1-sol/native correctness] R1 (PR #1503):
+    // Compare both eligible candidates from the same item and exercise recipient and rank.
+    GearItem const physicalPieces[] = {hitRing, agilityCloak, lowLeather, lowMail};
+    for (GearItem const& piece : physicalPieces)
+    {
+        LootCandidate rogue = Candidate("Zak", true, GearComparison::Better, 40.f, 100.f, 8, "melee");
+        rogue.rolePiece = GearPieceForRole(piece, GearRole::Melee);
+        LootCandidate priest = Candidate("Zrog", true, GearComparison::Better, 30.f, 100.f, 8, "healer");
+        priest.rolePiece = GearPieceForRole(piece, GearRole::Healer);
+        Expect(!priest.rolePiece, "the healer is not classified off the token spirit");
+        Expect(LootCouncilPriority(priest) == LootCouncilPriority(rogue),
+               "neither wearer has first call on a physical piece");
+        LootCouncilPick const group = LootCouncilHeuristic({priest, rogue});
+        Expect(group.recipient == "Zak",
+               "the fighter with the larger upgrade gets it, not the healer");
+        Expect(group.ranked.size() == 2 && group.ranked[0] == "Zak" && group.ranked[1] == "Zrog",
+               "the fighter heads the ranking over the healer");
+    }
+}
+
 void TheHeuristicRespectsArmourFit()
 {
     // The incident as the module saw it that night (#1475): the gloves were
@@ -727,6 +817,7 @@ int main()
     WhatMakesARolePiece();
     ArmourClassAndStatFit();
     TheClassificationFeedsFirstCall();
+    AHealersPieceIsNotReadOffATokenCasterStat();
     TheHeuristicRespectsArmourFit();
     TheMainTankIsGearedFirst();
     TanksThenHealersThenTheRest();
