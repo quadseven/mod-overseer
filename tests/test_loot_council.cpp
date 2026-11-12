@@ -325,11 +325,14 @@ void AHealersPieceIsNotReadOffATokenCasterStat()
 {
     // The mirror of #1475 (#1477). A healer prices intellect, spirit, mana
     // regeneration and spell power, and prices strength, agility, attack power
-    // and hit at nothing, so those never entered the share test: leather of
-    // agility and hit with a splash of spirit read as all healer, and the
+    // and hit at nothing, so those never entered the share test: a ring of hit
+    // or a cloak of agility with a splash of spirit read as all healer, and the
     // council gave it first call to the healer over the melee wearer it was
-    // made for. ItemModType ids: 3 agility, 4 strength, 5 intellect, 6 spirit,
-    // 7 stamina, 31 hit, 38 attack power, 43 mana regeneration, 45 spell power.
+    // made for. Armour-bearing pieces (the leather, the mail) were already
+    // refused by the share test, so they are guards here, not regressions; the
+    // armour-free ones (the ring, the cloak, the even split) are the regressions.
+    // ItemModType ids: 3 agility, 4 strength, 5 intellect, 6 spirit, 7 stamina,
+    // 31 hit, 37 expertise, 38 attack power, 43 mana regeneration, 45 spell power.
     GearItem const rogueLeather = Piece(4, 2, 120, {{3, 18}, {31, 10}, {6, 3}});
     Expect(!GearPieceForRole(rogueLeather, GearRole::Healer),
            "leather of agility and hit with a splash of spirit is not a healer's piece");
@@ -369,19 +372,32 @@ void AHealersPieceIsNotReadOffATokenCasterStat()
            "a healer has no first call on a ring of hit");
 
     // The group the incident was (#1477 criterion 2): a melee wearer and a
-    // healer both upgraded by the same rogue leather, each classified off that
-    // one physical item. Read as a healer's piece, it gave the healer first
-    // call (priority 2) over the rogue's larger upgrade; read off its whole
-    // budget, neither has first call and the bigger upgrade takes it.
-    LootCandidate rogue = Candidate("Zak", true, GearComparison::Better, 40.f, 100.f, 8, "melee");
-    rogue.rolePiece = GearPieceForRole(rogueLeather, GearRole::Melee);
-    LootCandidate priest = Candidate("Zrog", true, GearComparison::Better, 30.f, 100.f, 8, "healer");
-    priest.rolePiece = GearPieceForRole(rogueLeather, GearRole::Healer);
-    LootCouncilPick const leather = LootCouncilHeuristic({priest, rogue});
-    Expect(leather.recipient == "Zak",
-           "the melee wearer the leather was made for gets it, not the healer");
-    Expect(leather.ranked.size() == 2 && leather.ranked[0] == "Zak" && leather.ranked[1] == "Zrog",
-           "the melee wearer heads the ranking over the healer");
+    // healer both upgraded by the same physical piece, each classified off
+    // that one item, the healer with the smaller upgrade. The piece must be
+    // one the old code read as the healer's: armour-bearing leather is already
+    // refused by the share test (its armour points are not healer points), so
+    // the group is built on armour-free pieces, whose whole budget the old
+    // code read as the one token spirit. Read as a healer's piece, a ring of
+    // hit gave the healer first call (priority 2) over the fighter's larger
+    // upgrade; read off its whole budget, neither has first call and the
+    // larger upgrade takes it. Each piece gets its own group, so a fix that
+    // covers only one stat mix still fails.
+    GearItem const physicalPieces[] = {hitRing, agilityCloak};
+    for (GearItem const& piece : physicalPieces)
+    {
+        LootCandidate rogue = Candidate("Zak", true, GearComparison::Better, 40.f, 100.f, 8, "melee");
+        rogue.rolePiece = GearPieceForRole(piece, GearRole::Melee);
+        LootCandidate priest = Candidate("Zrog", true, GearComparison::Better, 30.f, 100.f, 8, "healer");
+        priest.rolePiece = GearPieceForRole(piece, GearRole::Healer);
+        Expect(!priest.rolePiece, "the healer is not classified off the token spirit");
+        Expect(LootCouncilPriority(priest) == LootCouncilPriority(rogue),
+               "neither wearer has first call on a physical piece");
+        LootCouncilPick const group = LootCouncilHeuristic({priest, rogue});
+        Expect(group.recipient == "Zak",
+               "the fighter with the larger upgrade gets it, not the healer");
+        Expect(group.ranked.size() == 2 && group.ranked[0] == "Zak" && group.ranked[1] == "Zrog",
+               "the fighter heads the ranking over the healer");
+    }
 }
 
 void TheHeuristicRespectsArmourFit()
