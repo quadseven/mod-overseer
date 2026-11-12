@@ -391,6 +391,8 @@ void AHealersPieceIsNotReadOffATokenCasterStat()
     // upgrade; read off its whole budget, neither has first call and the
     // larger upgrade takes it. Each piece gets its own group, so a fix that
     // covers only one stat mix still fails.
+    // AI-REVIEW 2026-11-12 [gpt-6.1-sol/native correctness] R1 (PR #1503):
+    // Compare both eligible candidates from the same item and exercise recipient and rank.
     GearItem const physicalPieces[] = {hitRing, agilityCloak, lowLeather, lowMail};
     for (GearItem const& piece : physicalPieces)
     {
