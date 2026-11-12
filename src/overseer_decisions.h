@@ -25093,6 +25093,82 @@ constexpr unsigned FINDER_GROUP_SIZE = 5;
 // (LFG_TIME_ROLECHECK, LFG_TIME_PROPOSAL); this bounds the whole.
 constexpr unsigned FINDER_CEILING_SECONDS = 180;
 
+// THE FAMILY IS STAGED AT ITS INN BEFORE THE FINDER QUEUES IT (#1510).
+//
+// The core remembers where each member stood when the finder pulled it in
+// (Player::SetEntryPoint in LFGMgr::TeleportPlayer) and puts every living member
+// back exactly there when the run ends (Player::TeleportToEntryPoint, through the
+// door walk and the finder's own teleport out). Nothing chooses that spot: the
+// finder road queued the family from wherever it stood, so on the dev realm a
+// full clear ended with the head in Eastern Plaguelands and the rest 8,000 to
+// 10,000 yards from it, and the bag-room errand that followed walked for 86
+// minutes. The walk-in road stages first (PlanHearthRegroup); this is the same
+// stone, cast by every member that is far from the inn and can use it, before
+// JoinLfg. Nobody is teleported: it is the hearthstone every player carries.
+//
+// BOUNDED: the stage ends after FINDER_STAGE_BUDGET_SECONDS whatever happened
+// (one cast is about ten seconds, three tries a member), and a stage that ended
+// by running out of time, or by a stone that did not land, is skipped by the next
+// finder attempt of the campaign, so a broken stone costs one delay and never two
+// in a row.
+constexpr bool FINDER_STAGE_AT_INN_DEFAULT = true;
+constexpr unsigned FINDER_STAGE_BUDGET_SECONDS = 240;
+
+struct FinderStageMember
+{
+    std::string name;
+    // Bound at the inn PlanHearthRegroup chose (the plan's hearth set also
+    // needs a stone off cooldown; this member-level fact is only the bind).
+    bool inHearthSet{false};
+    // Yards from the inn; negative when it is on another map or unmeasured.
+    float yardsFromInn{-1.f};
+    bool alive{false};
+    bool carriesStone{false};
+    bool onCooldown{false};
+    // Casts already asked of this member in this stage.
+    unsigned attempts{0};
+    // ExitFailureHearthStep for the member, read by the adapter.
+    ExitHearthStep hearth{ExitHearthStep::NotInside};
+};
+
+struct FinderStageFacts
+{
+    bool enabled{true};
+    // The previous finder attempt of this campaign ended its stage by running
+    // out of time or by a stone that did not land.
+    bool failedLastTime{false};
+    unsigned waitedSeconds{0};
+    unsigned budgetSeconds{FINDER_STAGE_BUDGET_SECONDS};
+    // PlanHearthRegroup's answer for this family on the door's continent.
+    bool planReady{false};
+    std::string planWhyNot;
+    std::vector<FinderStageMember> family;
+};
+
+enum class FinderStageStep : std::uint8_t
+{
+    Queue,   // stage is over or not needed: JoinLfg now
+    Hearth,  // cast for `cast` this poll, and hold the queue
+    Wait,    // a cast is in flight or combat has to end: hold the queue
+};
+
+struct FinderStageVerdict
+{
+    FinderStageStep step{FinderStageStep::Queue};
+    // Members the adapter casts for (or holds still first) on this poll.
+    std::vector<std::string> cast;
+    // Value for the campaign's "the last stage failed" flag when the step is
+    // Queue; unused otherwise.
+    bool failed{false};
+    // One line: why it queues now, or what it waits on.
+    std::string why;
+    // One line per far member that does not hearth, and why not.
+    std::vector<std::string> skipped;
+};
+
+FinderStageVerdict FinderStageNext(FinderStageFacts const& facts);
+char const* FinderStageStepWord(FinderStageStep step);
+
 // WHICH FINDER DUNGEON IS THIS DOOR? LFGDungeons.dbc can hold several rows on
 // one map: Scarlet Monastery, Maraudon, Dire Maul, Blackrock Depths and
 // Stratholme are each several wings of one map, and the core's
