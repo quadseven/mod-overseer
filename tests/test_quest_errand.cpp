@@ -235,7 +235,8 @@ void TheAdapterSeams()
     Expect(module.find("GetCreatureQuestRelationMap()") != std::string::npos &&
                module.find("GetCreatureQuestInvolvedRelationMap()") != std::string::npos,
            "the giver and taker come from the world's own quest relations");
-    Expect(module.find("player->AddQuestAndCheckCompletion(quest, giver);") != std::string::npos &&
+    Expect(module.find("player->AddQuestAndCheckCompletion(quest, giver ? static_cast<Object*>(giver)") !=
+               std::string::npos &&
                module.find("RewardQuestChosen(player, quest, reward, giver);") != std::string::npos,
            "the core's own calls take and hand in");
     std::size_t const chosen = module.find("void RewardQuestChosen(");
@@ -315,6 +316,49 @@ void ABagWithNoRoomIsNotIneligibility()
            "the trainer's class quest reads it apart too");
 }
 
+// WOW-OVERSEER#2297: A QUEST AN ITEM STARTS. Redemption's class chain hands a
+// paladin an item (Tome of Divinity 6916, or 6775 for human and dwarf) whose use
+// starts quest 1646 (1642); no creature or object gives those two, so a take
+// that only read the relation maps was refused for ever. The world names the
+// item in item_template.StartQuest, and a taker who carries it takes the quest.
+void AQuestAnItemStarts()
+{
+    QuestErrand const take = ParseQuestErrand("take quest:1646");
+    QuestErrandFacts f = Ready();
+    f.holder = QuestRelationHolder::Item;
+    Expect(QuestErrandRefusal(take, f).empty(),
+           "a taker who carries the start item and is eligible takes the quest");
+    Expect(std::string(QuestRelationHolderName(QuestRelationHolder::Item)) == "item",
+           "the row says item");
+
+    f.giverInReach = false;
+    std::string const missing = QuestErrandRefusal(take, f);
+    Expect(missing == "the quest starts from an item the taker does not carry",
+           "an item quest without the item says so, not 'no giver in reach'");
+    Expect(!QuestErrandRefusalRetryable(missing),
+           "no walk brings the item: a stop, not a wait");
+
+    f = Ready();
+    f.holder = QuestRelationHolder::Item;
+    f.eligible = false;
+    Expect(QuestErrandRefusal(take, f).find("not eligible") == 0,
+           "the item does not skip CanTakeQuest (the world's quest 1646 needs 1645 rewarded)");
+    f = Ready();
+    f.holder = QuestRelationHolder::Item;
+    f.logHasRoom = false;
+    Expect(QuestErrandRefusal(take, f) == "the quest log is full", "a full log still refuses");
+
+    std::string const module = Read("src/mod_overseer.cpp");
+    std::size_t const doQuest = module.find("static char const* DoQuest(");
+    Expect(doQuest != std::string::npos &&
+               module.find("QuestStartItemCarried(player, errand.questId)", doQuest) !=
+                   std::string::npos &&
+               module.find("static_cast<Object*>(startItem)", doQuest) != std::string::npos,
+           "the errand takes an item-started quest with the item as the core's quest giver");
+    Expect(module.find("proto.StartQuest != questId") != std::string::npos,
+           "the item is the one the world's item_template names as starting the quest");
+}
+
 }  // namespace
 
 // THE TAKE'S REACH IS THE WALK'S ARRIVAL RADIUS (2026-10-08). The spawn walk that
@@ -347,6 +391,7 @@ int main()
     HandingInTheFragment();
     AQuestHandedInAtAnObject();
     AQuestNothingTakesIn();
+    AQuestAnItemStarts();
     WhichRefusalsAreAWait();
     TheAdapterSeams();
     if (failures)
