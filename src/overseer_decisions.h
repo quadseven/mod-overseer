@@ -7137,9 +7137,14 @@ enum class QuestRelationHolder
     Creature,
     GameObject,
     None,
+    // An item that starts the quest when used (item_template.StartQuest), as
+    // the Tome of Divinity chain does for quests 1646 and 1642: no creature
+    // or object gives them. Only a take names it, and only when no creature
+    // or object does (wow-overseer#2297).
+    Item,
 };
 
-// "creature", "gameobject" or "none", as the row's result carries it.
+// "creature", "gameobject", "item" or "none", as the row's result carries it.
 char const* QuestRelationHolderName(QuestRelationHolder holder);
 
 // What the adapter read, for one row. `status` is the core's QuestStatus
@@ -7152,7 +7157,8 @@ struct QuestErrandFacts
     // is what every row meant before #19.
     QuestRelationHolder holder{QuestRelationHolder::Creature};
     // A live creature, or a spawned object, of an entry the relation names,
-    // within SPAWN_WALK_ARRIVE_YARDS.
+    // within SPAWN_WALK_ARRIVE_YARDS. For holder Item: the taker carries an
+    // item whose StartQuest is this quest.
     bool giverInReach{false};
     bool rewarded{false};
     int status{0};

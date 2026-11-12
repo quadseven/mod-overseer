@@ -6458,6 +6458,8 @@ char const* QuestRelationHolderName(QuestRelationHolder holder)
             return "creature";
         case QuestRelationHolder::GameObject:
             return "gameobject";
+        case QuestRelationHolder::Item:
+            return "item";
         case QuestRelationHolder::None:
             break;
     }
@@ -6476,6 +6478,9 @@ constexpr char const* QUEST_NOT_COMPLETE = "not complete";
 constexpr char const* QUEST_LOG_FULL = "the quest log is full";
 // CanAddQuest alone failed: the start item does not fit (mod-overseer#1393).
 constexpr char const* QUEST_NO_BAG_ROOM = "no bag room for the item the giver hands over";
+// The quest starts from an item and the taker does not carry it (#2297). Not
+// retryable: no walk brings the item, the quest before it hands it over.
+constexpr char const* QUEST_NO_START_ITEM = "the quest starts from an item the taker does not carry";
 constexpr char const* QUEST_CORE_WILL_NOT_REWARD = "the core will not reward it now";
 }  // namespace
 
@@ -6519,6 +6524,8 @@ std::string QuestErrandRefusal(QuestErrand const& errand, QuestErrandFacts const
                     : "the world names no creature and no object that takes that quest in";
     if (!facts.giverInReach)
     {
+        if (facts.holder == QuestRelationHolder::Item)
+            return QUEST_NO_START_ITEM;
         if (facts.holder == QuestRelationHolder::GameObject)
             return take ? QUEST_NO_GIVER_OBJECT_IN_REACH : QUEST_NO_TAKER_OBJECT_IN_REACH;
         return take ? QUEST_NO_GIVER_IN_REACH : QUEST_NO_TAKER_IN_REACH;

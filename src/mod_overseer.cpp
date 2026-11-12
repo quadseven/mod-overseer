@@ -84750,6 +84750,38 @@ private:
         return QuestRelationHolder::None;
     }
 
+    // A QUEST AN ITEM STARTS (wow-overseer#2297). The Tome of Divinity chain
+    // hands the paladin an item (6916, 6775) whose use starts the next quest
+    // (1646, 1642): no creature or object row gives those, so a take that only
+    // read the relation maps could never start them. The world names the item
+    // in item_template.StartQuest; this finds whether one exists, and the one
+    // the taker carries.
+    static bool QuestStartedByItem(uint32 questId)
+    {
+        ItemTemplateContainer const* store = sObjectMgr->GetItemTemplateStore();
+        if (!store)
+            return false;
+        for (auto const& [entry, proto] : *store)
+            if (proto.StartQuest == questId)
+                return true;
+        return false;
+    }
+
+    static Item* QuestStartItemCarried(Player* player, uint32 questId)
+    {
+        ItemTemplateContainer const* store = sObjectMgr->GetItemTemplateStore();
+        if (!store)
+            return nullptr;
+        for (auto const& [entry, proto] : *store)
+        {
+            if (proto.StartQuest != questId)
+                continue;
+            if (Item* item = player->GetItemByEntry(entry))
+                return item;
+        }
+        return nullptr;
+    }
+
     static char const* DoQuest(Player* player, std::string const& command, char const*& status,
                                std::string& out)
     {
@@ -84765,6 +84797,9 @@ private:
         // creature in reach wins, then an object in reach (#19); with neither,
         // `holder` still says which kind the world names, or that it names none.
         WorldObject* giver = nullptr;
+        // The item that starts the quest, when no creature or object does
+        // (wow-overseer#2297); the core's AddQuest takes an Item as the giver.
+        Item* startItem = nullptr;
         QuestRewardChosen reward;
         if (quest && errand.verb != OverseerDecisions::QuestErrandVerb::None)
         {
@@ -84782,8 +84817,15 @@ private:
                 }
                 else
                     facts.holder = QuestHolderKind(errand.questId, take);
+                // Nothing in the world's relations gives it: an item may.
+                if (take && !giver && facts.holder == OverseerDecisions::QuestRelationHolder::None)
+                {
+                    startItem = QuestStartItemCarried(player, errand.questId);
+                    if (startItem || QuestStartedByItem(errand.questId))
+                        facts.holder = OverseerDecisions::QuestRelationHolder::Item;
+                }
             }
-            facts.giverInReach = giver != nullptr;
+            facts.giverInReach = giver != nullptr || startItem != nullptr;
             facts.rewarded = player->GetQuestRewardStatus(errand.questId);
             facts.status = static_cast<int>(player->GetQuestStatus(errand.questId));
             if (take)
@@ -84810,7 +84852,7 @@ private:
             std::ostringstream o;
             o << "{\"outcome\":" << J(outcome) << ",\"reason\":" << J(reason)
               << ",\"who\":" << J(player->GetName()) << ",\"quest_id\":" << errand.questId
-              << ",\"giver\":" << (giver ? giver->GetEntry() : 0)
+              << ",\"giver\":" << (giver ? giver->GetEntry() : startItem ? startItem->GetEntry() : 0)
               << ",\"holder\":"
               << J(abandon ? "" : OverseerDecisions::QuestRelationHolderName(facts.holder))
               << ",\"status\":" << static_cast<int>(player->GetQuestStatus(errand.questId));
@@ -84866,14 +84908,17 @@ private:
 
         if (take)
         {
-            player->AddQuestAndCheckCompletion(quest, giver);
+            player->AddQuestAndCheckCompletion(quest, giver ? static_cast<Object*>(giver)
+                                                            : static_cast<Object*>(startItem));
             if (player->GetQuestStatus(errand.questId) == QUEST_STATUS_NONE)
             {
                 describe("error", "the quest did not land in the log");
                 return "the quest did not land in the log";
             }
             LOG_INFO("module.overseer", "overseer: '{}' took quest {} ({}) from '{}'",
-                     player->GetName(), errand.questId, quest->GetTitle(), giver->GetName());
+                     player->GetName(), errand.questId, quest->GetTitle(),
+                     giver ? giver->GetName() : std::string("an item (") +
+                                                    std::to_string(startItem->GetEntry()) + ")");
             describe("taken", "");
         }
         else
