@@ -279,7 +279,8 @@ class WholeDirectoryMigrationTest(unittest.TestCase):
         owned = self.run_sql(
             reads["Owned"].replace("?", "'CrafterA'") + ";", "Owned read"
         )
-        self.assertEqual(["CrafterA\tcraft\t1"], [r.split("\t", 1)[1] for r in owned.splitlines()])
+        # The command text rides along so a named row (`guid:<n>`) reaches the drive.
+        self.assertEqual(["CrafterA\tcraft\t1\titem 2"], [r.split("\t", 1)[1] for r in owned.splitlines()])
 
 
 def store_selects(path):
