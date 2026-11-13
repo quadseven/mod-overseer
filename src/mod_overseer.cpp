@@ -66368,7 +66368,10 @@ private:
         // raid keyword is refused here, so an order for a raid nothing can run
         // never parks the family on a job every other drive stands down for.
         bool const knownRaid = !OverseerDecisions::RaidKeywordForJob(mode).empty();
-        if (!knownMode && !knownDungeon && !knownRaid)
+        // `farm:<item entry>` or `farm:<mining|herbalism>` (#1521): the
+        // bridge's farm drive reads what to gather from the suffix.
+        bool const knownFarm = OverseerDecisions::IsFarmJob(mode);
+        if (!knownMode && !knownDungeon && !knownRaid && !knownFarm)
             return "unknown job mode";
 
         QueryResult before = CharacterDatabase.Query(
