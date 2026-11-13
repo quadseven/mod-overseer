@@ -28202,6 +28202,44 @@ constexpr char const* NotAnObjective     = "party-walk takes a creature spawn, n
 constexpr char const* MalformedWalk      = "a party-walk row is: party-walk creature:<spawn id> [max:<yards>]";
 }  // namespace PartyRefusal
 
+// ------------------------------ leaving somebody else's group ------------
+//
+// A GUILD BOT LED OFF BY A STRANGER. Random bots of the realm invite guild
+// members they pass, and a member that accepts follows that leader wherever it
+// goes: on the dev realm 13 guild members were followers of four random bots,
+// some a continent away from their leader, and every errand the control plane
+// asked of them was held because a follower walks with its group. The control
+// plane decides who has been led off long enough; this verb takes the member
+// itself out of the group, the way a player's /leave does, and nothing else.
+// It never removes anybody else and never disbands.
+constexpr char LEAVE_GROUP_VERB[] = "leave-group";
+
+// `leave-group` on kind='guild', alone on the row.
+bool IsLeaveGroupRow(std::string const& command);
+
+struct LeaveGroupFacts
+{
+    bool isBot{false};         // the character has a bot AI; a person is never moved
+    bool inGroup{false};
+    bool leadsGroup{false};
+    bool battleground{false};  // a battleground, battlefield or dungeon finder group
+    bool inInstance{false};
+    bool inCombat{false};
+};
+
+namespace LeaveGroupRefusal
+{
+constexpr char const* NotABot      = "the character is not a bot";
+constexpr char const* NotInGroup   = "the character is in no group";
+constexpr char const* LeadsGroup   = "the character leads its group";
+constexpr char const* Battleground = "the group is a battleground or dungeon finder group";
+constexpr char const* InInstance   = "the character is inside an instance or a battleground";
+constexpr char const* InCombat     = "the character is in combat";
+}  // namespace LeaveGroupRefusal
+
+// "" when the character may leave; otherwise the first wall, a person first.
+char const* LeaveGroupGate(LeaveGroupFacts const& facts);
+
 // A helper's group standing against the party being formed.
 enum class PartyGroupState : std::uint8_t
 {

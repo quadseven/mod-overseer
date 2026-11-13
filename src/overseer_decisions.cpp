@@ -25364,6 +25364,30 @@ bool IsPartyDisbandRow(std::string const& command)
     return PartyVerbIs(command, PARTY_DISBAND_VERB);
 }
 
+bool IsLeaveGroupRow(std::string const& command)
+{
+    std::vector<std::string> const words = GuildFinderWords(command);
+    return words.size() == 1 && words[0] == LEAVE_GROUP_VERB;
+}
+
+char const* LeaveGroupGate(LeaveGroupFacts const& facts)
+{
+    namespace R = LeaveGroupRefusal;
+    if (!facts.isBot)
+        return R::NotABot;
+    if (!facts.inGroup)
+        return R::NotInGroup;
+    if (facts.leadsGroup)
+        return R::LeadsGroup;
+    if (facts.battleground)
+        return R::Battleground;
+    if (facts.inInstance)
+        return R::InInstance;
+    if (facts.inCombat)
+        return R::InCombat;
+    return "";
+}
+
 PartyUpRequest ParsePartyUpRequest(std::string const& command, std::string const& leader)
 {
     PartyUpRequest out;
