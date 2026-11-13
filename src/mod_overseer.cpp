@@ -40757,8 +40757,14 @@ private:
         // campaign spent no run on it, and the planner read a clear as a
         // failure. It ends the way a credited last boss does, `provedComplete`
         // read by EXIT, and every other stop keeps the stalled ending below.
+        // BUT ONLY WHEN THE INSTANCE MASK DOES NOT CONTRADICT IT (#1514). The
+        // module's boss list can be shorter than the map's: run 1903593 on map 230
+        // was booked 'complete' at mask 495 with the Emperor alive.
         if (coord.clearSkipRefused &&
-            OverseerDecisions::DungeonModuleStopIsCleared(DungeonBrainStopReason(leader)))
+            OverseerDecisions::DungeonModuleStopProvesComplete(
+                DungeonBrainStopReason(leader),
+                OverseerDecisions::DungeonRunCompletion(
+                    ExpectedEncounterMask(insideMapId, leader), CompletedEncounters(leader))))
         {
             coord.provedComplete = true;
             coord.stalledReason.clear();
