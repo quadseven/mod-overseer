@@ -25651,9 +25651,23 @@ private:
                OverseerDecisions::GuardWalkSteers(it->second.walk);
     }
 
+    // AN ERRAND OF ITS OWN, IN INDIVIDUAL MODE (#1517). The followers this
+    // travel poll found walking an errand of their own while their family is
+    // on no dungeon or raid job (OverseerDecisions::IndividualErrandSteers).
+    // Refreshed once per travel poll by RefreshIndividualErrands and read by
+    // every gate that asks MaySteerItself, by DriveCatchUp, by the regroup
+    // wait, by the fetch and by the errand death breaker, so none of them can
+    // disagree about it. The errand ends, the column clears, the next poll
+    // drops the name, and the follow sweep takes `new rpg` back.
+    std::set<std::string> _individualErrands;
+    bool WalksItsOwnErrand(std::string const& name) const
+    {
+        return _individualErrands.count(name) != 0;
+    }
+
     bool MaySteerItself(std::string const& name) const
     {
-        return IsEscorted(name) || WalksItsGuard(name) ||
+        return IsEscorted(name) || WalksItsGuard(name) || WalksItsOwnErrand(name) ||
                (SplitFromLeader(name) &&
                 OverseerDecisions::CutOffFollowerRoams(TownJobFor(name),
                                                        _travelAims.TargetFor(name)));
@@ -26275,6 +26289,9 @@ private:
         // in the same poll, and a refusal recorded below is never a stale one.
         // All of it runs on the world thread.
         _catchUpRefused.erase(name);
+        // ITS OWN ERRAND (#1517): not walked back to its leader while it runs.
+        if (WalksItsOwnErrand(name))
+            return;
 
         // GetMapId  Position.h:281; GetDistance2d  Object.h:537-538. Read
         // BEFORE the escorted early-return below, so that a split is forgotten
@@ -27035,6 +27052,8 @@ private:
             // THE LEADER IS GOING BACK FOR IT (2026-09-23). DriveFetch ran
             // earlier in this poll, so this is this poll's answer.
             member.beingFetched = member.name == FetchTargetOf(leaderName);
+            // ITS OWN ERRAND (#1517): the leader is never held for it.
+            member.onItsOwnErrand = WalksItsOwnErrand(member.name);
             members.push_back(member);
         }
 
@@ -27484,6 +27503,8 @@ private:
             member.heldTooFar = HeldWaitingForLeader(member.name);
             member.heldOffLethalLeg = HeldOffLethalLeg(member.name);
             member.stoodDown = WithinFetchStandDown(member.name);
+            // ITS OWN ERRAND (#1517): the leader never goes back for it.
+            member.onItsOwnErrand = WalksItsOwnErrand(member.name);
             if (member.sameMap)
                 member.yards = p->GetDistance2d(leader);
             candidates.push_back(member);
@@ -28541,6 +28562,69 @@ private:
         return true;
     }
 
+    // WHO WALKS AN ERRAND OF ITS OWN THIS POLL (#1517). Behind
+    // Overseer.Individual.Enable, off by default: the bridge already writes
+    // aims on followers, and with the switch on each of them walks. Fails
+    // closed: a member whose family the roster does not name, or whose family
+    // holds a dungeon or raid job, follows as before.
+    void RefreshIndividualErrands(std::map<std::string, std::string> const& aims,
+                                  std::map<std::string, std::string> const& jobs)
+    {
+        bool const enabled =
+            sConfigMgr->GetOption<bool>("Overseer.Individual.Enable", false, false);
+        std::set<std::string> next;
+        if (enabled && !aims.empty())
+        {
+            std::map<std::string, std::string> const families = LoadRosterFamilies();
+            std::map<std::string, std::vector<std::string>> jobsByFamily;
+            for (auto const& [member, job] : jobs)
+            {
+                auto const f = families.find(member);
+                if (f != families.end())
+                    jobsByFamily[f->second].push_back(job);
+            }
+            for (auto const& [name, aim] : aims)
+            {
+                Player* const bot = ObjectAccessor::FindPlayerByName(name);
+                if (!SteerableAI(bot))
+                    continue;
+                auto const f = families.find(name);
+                std::string const family = f == families.end() ? std::string() : f->second;
+                Group* const group = bot->GetGroup();
+                Player* const leader =
+                    group ? ObjectAccessor::FindPlayer(group->GetLeaderGUID()) : nullptr;
+                OverseerDecisions::IndividualErrandFacts facts;
+                facts.enabled = true;
+                facts.leadsItsParty = LeadsItsParty(bot);
+                facts.familyLinked =
+                    family.empty() || OverseerDecisions::FamilyLinked(jobsByFamily[family]);
+                facts.inARun = InAnyDungeonRun(bot);
+                facts.sameMapAsLeader = leader && leader != bot && leader->IsInWorld() &&
+                                        leader->GetMapId() == bot->GetMapId();
+                facts.ownAim = aim;
+                facts.claimedByAnotherOwner = IsEscorted(name) || IsCatchingUp(name) ||
+                                              IsWalkingHome(name) ||
+                                              _travelAims.RunOwns(name, aim);
+                if (OverseerDecisions::IndividualErrandSteers(facts))
+                    next.insert(name);
+            }
+        }
+        for (std::string const& name : next)
+            if (!_individualErrands.count(name))
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' walks its own errand '{}' - its family is on no "
+                         "dungeon or raid job, so it steers itself and its leader does not "
+                         "wait for it (individual mode, #1517)",
+                         name, aims.at(name));
+        for (std::string const& name : _individualErrands)
+            if (!next.count(name))
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' no longer walks an errand of its own - it follows "
+                         "its leader again (#1517)",
+                         name);
+        _individualErrands.swap(next);
+    }
+
     void DriveTravel()
     {
         // Before anything else, so a death is read against the route the walker
@@ -28599,6 +28683,7 @@ private:
         // rule that would otherwise starve it, rather than the generic rule
         // being weakened for everybody.
         std::map<std::string, std::string> const jobs = LoadJobs();
+        RefreshIndividualErrands(aims, jobs);
         if (aims.empty())
         {
             // No errands anywhere, so nothing this loop remembers is still
@@ -28960,6 +29045,10 @@ private:
                 // never reaches the database; RecentDeathCount owns that too.
                 toll.deaths = RecentDeathCount(name, window);
                 toll.partyDeaths = RecentPartyDeathCount(bot, window);
+                // A member on its own errand answers for its own deaths only
+                // (#1517): the rest of its family is somewhere else.
+                if (WalksItsOwnErrand(name))
+                    toll.partyDeaths = toll.deaths;
                 toll.strikes = _travelAims.LethalStrikes(name, target);
 
                 OverseerDecisions::ErrandDeathVerdict const verdict =

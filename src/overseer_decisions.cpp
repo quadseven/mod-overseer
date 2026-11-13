@@ -7895,6 +7895,29 @@ UnissuedFlightStep TownLeaderUnissuedFlight(bool mayCarryNewRpg, bool statusIsTr
     return statusIsTravelFlight ? UnissuedFlightStep::Cancel : UnissuedFlightStep::Leave;
 }
 
+bool IsLinkingJob(std::string const& job)
+{
+    return job == "dungeon" || job.rfind("dungeon:", 0) == 0 ||
+           job.rfind(RAID_JOB_PREFIX, 0) == 0;
+}
+
+bool FamilyLinked(std::vector<std::string> const& memberJobs)
+{
+    for (std::string const& job : memberJobs)
+        if (IsLinkingJob(job))
+            return true;
+    return false;
+}
+
+bool IndividualErrandSteers(IndividualErrandFacts const& facts)
+{
+    if (!facts.enabled || facts.leadsItsParty || facts.familyLinked || facts.inARun)
+        return false;
+    if (!facts.sameMapAsLeader || facts.claimedByAnotherOwner)
+        return false;
+    return !facts.ownAim.empty() && !IsTravelGuardAim(facts.ownAim);
+}
+
 bool CutOffFollowerRoams(std::string const& job, std::string const& target)
 {
     if (!SplitFollowerDrivesItself(target))
@@ -7918,6 +7941,7 @@ char const* RegroupClaimName(RegroupClaim claim)
         case RegroupClaim::TooFarToWaitFor:
             return "too far back to hold the leader still for; it walks back while the "
                    "family carries on";
+        case RegroupClaim::OwnErrand:     return "on an errand of its own";
     }
     return "unknown";
 }
@@ -7967,6 +7991,11 @@ RegroupClaim ReadRegroupClaim(RegroupMember const& member,
     // hold refused, and "refused" is the sentence the fetch makes untrue.
     if (member.beingFetched)
         return RegroupClaim::Fetched;
+    // AFTER THE FETCH AND BEFORE THE WAIT (#1517): a member walking its own
+    // errand is walking away on purpose, so holding the leader for it is a
+    // family standing still until the errand ends.
+    if (member.onItsOwnErrand)
+        return RegroupClaim::OwnErrand;
     if (!member.aimRefusedBecause.empty())
         return RegroupClaim::AimRefused;
     if (limits.maxWaitYards > 0.f && member.yards > limits.maxWaitYards)
@@ -8090,6 +8119,9 @@ std::string PickFetchTarget(std::vector<FetchCandidate> const& members,
         // Nothing unmeasured is anywhere: off the map, not in the world, or a
         // ghost is neither a member to fetch nor one still walking back.
         if (!member.seen || !member.sameMap || !member.alive || member.yards < 0.f)
+            continue;
+        // ITS OWN ERRAND (#1517): never fetched, and not still walking back.
+        if (member.onItsOwnErrand)
             continue;
         if (!member.heldTooFar)
         {

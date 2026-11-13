@@ -616,6 +616,19 @@
 #
 #Overseer.LeaderIntent.DwellSeconds = 90
 
+#
+#    Overseer.Individual.Enable
+#        Description: Individual mode outside dungeons (#1517). 1 lets a
+#                     follower walk an errand of its own (its own travel_npc)
+#                     while no member of its family holds a dungeon or raid
+#                     job and it stands on its leader's map; its leader does
+#                     not wait for it and does not go back for it, and it
+#                     follows again when the errand ends. 0 restores the old
+#                     behaviour, where only the leader walks an errand.
+#        Default:     0
+#
+#Overseer.Individual.Enable = 0
+
 ########################################
 #
 #    TRAINING THE ROSTER

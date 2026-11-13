@@ -8859,6 +8859,46 @@ UnissuedFlightStep TownLeaderUnissuedFlight(bool mayCarryNewRpg, bool statusIsTr
 // is where they meet.
 bool CutOffFollowerRoams(std::string const& job, std::string const& target);
 
+// ---------- a follower walks its own errand in individual mode (#1517) -----
+//
+// quadseven/wow-overseer#2395: outside a dungeon or a raid, each family member
+// may walk to its own trainer, vendor or banker. Before this a follower's own
+// aim answered AimedMover::RefuseInFormation and moved nobody, so only the
+// leader ever ran an errand.
+//
+// WHAT LINKS A FAMILY. A dungeon job (`dungeon`, `dungeon:<keyword>`) or a raid
+// job (`raid:<keyword>`) on any enabled member. `town run` and `raid prep` do
+// not: the operator links a family only for a dungeon or a raid. The bridge's
+// individual.links holds the same three shapes.
+bool IsLinkingJob(std::string const& job);
+bool FamilyLinked(std::vector<std::string> const& memberJobs);
+
+// Everything the answer turns on. The defaults are the safe reading of
+// "nothing is known": switched off, linked, and no aim, which moves nobody.
+struct IndividualErrandFacts
+{
+    // Overseer.Individual.Enable. Off by default, so the module ships dark:
+    // the bridge already writes aims on followers (the trade errand, the learn
+    // aim, the site's orders), and with the switch on every one of them walks.
+    bool enabled{false};
+    // The leader walks as leader (GrantToLeader); this rule is for followers.
+    bool leadsItsParty{false};
+    bool familyLinked{true};
+    // A dungeon run owns the member (InAnyDungeonRun).
+    bool inARun{false};
+    // THE CAP. An errand is walked alone only on the leader's map; a member on
+    // another map is the split-family path's (SplitFollowerDrivesItself).
+    bool sameMapAsLeader{false};
+    // The member's own `travel_npc`.
+    std::string ownAim;
+    // A catch-up walk, a walk home, an escort or a run's claim holds the
+    // column: the aim is somebody else's, not the member's own errand.
+    bool claimedByAnotherOwner{false};
+};
+
+// May this follower steer itself to its own errand this poll?
+bool IndividualErrandSteers(IndividualErrandFacts const& facts);
+
 // -------------- the family waits for the member it left behind (#404) -------
 //
 // THE MEASUREMENT, AND IT IS NOT A NAVIGATION FAULT. Four of five characters
@@ -8963,6 +9003,10 @@ struct RegroupMember
     // holding the leader still would stop the fetch, and not carried on
     // without, since the family is on its way to it. See PickFetchTarget.
     bool beingFetched{false};
+    // IT WALKS AN ERRAND OF ITS OWN (#1517, IndividualErrandSteers). Never
+    // waited for: holding the leader still for a member that is walking away
+    // on purpose is a family standing still until the errand ends.
+    bool onItsOwnErrand{false};
 };
 
 // What one member asks of the family, and each value is a separate answer
@@ -9003,6 +9047,9 @@ enum class RegroupClaim : std::uint8_t
     // FURTHER BACK THAN ANYBODY STANDS STILL FOR (RegroupLimits::maxWaitYards).
     // It walks back under its catch-up aim while the family carries on.
     TooFarToWaitFor,
+    // IT WALKS AN ERRAND OF ITS OWN (#1517). Not waited for, and not fetched:
+    // it rejoins by `follow` when the errand ends.
+    OwnErrand,
 };
 
 char const* RegroupClaimName(RegroupClaim claim);
@@ -9237,6 +9284,9 @@ struct FetchCandidate
     // It was fetched, or given up on, within the fetch stand-down.
     bool stoodDown{false};
     // How far from the leader, when `seen` and `sameMap`.
+    // IT WALKS AN ERRAND OF ITS OWN (#1517). Never fetched, and not a member
+    // still walking back: it is walking away on purpose.
+    bool onItsOwnErrand{false};
     float yards{-1.f};
 };
 
