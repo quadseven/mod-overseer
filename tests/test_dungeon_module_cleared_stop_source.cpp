@@ -36,7 +36,8 @@ int main()
 
     std::size_t const cleared = ending.find(
         "coord.clearSkipRefused &&\n"
-        "            OverseerDecisions::DungeonModuleStopIsCleared(DungeonBrainStopReason(leader)))");
+        "            OverseerDecisions::DungeonModuleStopProvesComplete(\n"
+        "                DungeonBrainStopReason(leader),");
     if (cleared == std::string::npos)
         return Fail("the stall path must ask whether a refused skip followed a cleared stop");
 
