@@ -8415,6 +8415,128 @@ static OverseerDecisions::TaxiRouteScan ScanTaxiRouteFor(Player* who,
     return OverseerDecisions::ScanTaxiRoute(hops);
 }
 
+// ----------------------------------------- what a cast needs in the bags (#1531) --
+//
+// ROOM FOR WHAT IT MAKES. Spell::CheckItems asks CanStoreNewItem for every
+// SPELL_EFFECT_CREATE_ITEM and refuses a full bag with SPELL_FAILED_DONT_REPORT,
+// telling only a client. Guild crafters with full bags drew that refusal on
+// every cast and their rows said every wall was clear. Asked here with the
+// core's own arithmetic; OverseerDecisions::CastProductHasRoom decides which
+// answers count.
+static bool CastHasRoomForWhatItMakes(Player* who, SpellInfo const* spell)
+{
+    if (!who || !spell)
+        return true;
+    for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+    {
+        uint32 const effect = spell->Effects[i].Effect;
+        if (effect != SPELL_EFFECT_CREATE_ITEM && effect != SPELL_EFFECT_CREATE_ITEM_2)
+            continue;
+        uint32 const itemType = spell->Effects[i].ItemType;
+        OverseerDecisions::CastMakesFacts facts;
+        facts.randomPool = effect == SPELL_EFFECT_CREATE_ITEM_2;
+        facts.makesItem = itemType != 0 || facts.randomPool;
+        facts.freeSlots = who->GetFreeInventorySpace();
+        if (itemType)
+        {
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemType);
+            if (!proto)
+                continue;  // the core answers SPELL_FAILED_ITEM_NOT_FOUND itself
+            facts.limitCategory = proto->ItemLimitCategory != 0;
+            int32 const made = spell->Effects[i].CalcValue();
+            uint32 const count = std::clamp<uint32>(uint32(made > 1 ? made : 1), 1u,
+                                                    std::max<uint32>(1u, proto->GetMaxStackSize()));
+            ItemPosCountVec dest;
+            facts.fits =
+                who->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemType, count) == EQUIP_ERR_OK;
+        }
+        if (!OverseerDecisions::CastProductHasRoom(facts))
+            return false;
+    }
+    return true;
+}
+
+// THE TOOLS: a Blacksmith Hammer, a Mining Pick, a Runed Copper Rod. The same
+// two checks Spell::CheckItems makes, SPELL_FAILED_TOTEMS and
+// SPELL_FAILED_TOTEM_CATEGORY, both told only to a client.
+static bool CastHasItsTools(Player* who, SpellInfo const* spell)
+{
+    if (!who || !spell)
+        return true;
+    for (int i = 0; i < 2; ++i)
+    {
+        if (spell->Totem[i] && !who->HasItemCount(spell->Totem[i]))
+            return false;
+        if (spell->TotemCategory[i] && !who->HasItemTotemCategory(spell->TotemCategory[i]))
+            return false;
+    }
+    return true;
+}
+
+// EVERY REAGENT, NOT ONLY THE FIRST. A Heavy Linen Bandage takes Linen Cloth
+// and nothing else, but a bag takes bolts and thread, and a missing second
+// reagent is SPELL_FAILED_REAGENTS told only to a client. Skipped where the core
+// skips it (Player::CanNoReagentCast).
+static bool CastHasAllItsReagents(Player* who, SpellInfo const* spell)
+{
+    if (!who || !spell || who->CanNoReagentCast(spell))
+        return true;
+    for (std::size_t i = 0; i < spell->Reagent.size(); ++i)
+    {
+        if (spell->Reagent[i] <= 0 || spell->ReagentCount[i] == 0)
+            continue;
+        if (!who->HasItemCount(uint32(spell->Reagent[i]), spell->ReagentCount[i]))
+            return false;
+    }
+    return true;
+}
+
+// THE CORE'S ANSWER TO A CAST THIS MODULE DRIVES (#1531). HandleCastSpellOpcode
+// ends in Spell::prepare, which answers a refused cast through
+// Spell::SendCastResult and the cast-result hook (OverseerCastFailureScript) on
+// the same thread, before the handler returns. A listener placed around the
+// call hears that answer for its own caster and spell. thread_local, because
+// the hook also fires on map update threads for every other caster in the
+// world, and those must neither see nor touch this one.
+class CastAnswerListener
+{
+public:
+    CastAnswerListener(ObjectGuid caster, uint32 spellId)
+        : _caster(caster), _spellId(spellId), _outer(Current())
+    {
+        Current() = this;
+    }
+    ~CastAnswerListener() { Current() = _outer; }
+    CastAnswerListener(CastAnswerListener const&) = delete;
+    CastAnswerListener& operator=(CastAnswerListener const&) = delete;
+
+    std::string const& Heard() const { return _heard; }
+
+    // Called by the cast-result hook for every refused cast on this thread.
+    // The first answer is the one prepare gave; anything after it is not.
+    static void Hear(Player* caster, uint32 spellId, SpellCastResult result)
+    {
+        CastAnswerListener* const ear = Current();
+        if (!ear || !caster || result == SPELL_CAST_OK || !ear->_heard.empty())
+            return;
+        if (caster->GetGUID() != ear->_caster || spellId != ear->_spellId)
+            return;
+        ear->_heard = EnumUtils::ToConstant(result);
+    }
+
+private:
+    static CastAnswerListener*& Current()
+    {
+        static thread_local CastAnswerListener* current = nullptr;
+        return current;
+    }
+
+    ObjectGuid _caster;
+    uint32 _spellId;
+    CastAnswerListener* _outer;
+    std::string _heard;
+};
+
 class OverseerWorldScript : public WorldScript
 {
     // The level-up and login hooks spend a guild raider's points with the same
@@ -17973,6 +18095,26 @@ private:
                              "overseer: '{}' does not cast '{}' ({}) yet - {}; the errand "
                              "stands (wow-overseer#1786)",
                              name, info->SpellName[LOCALE_enUS], spellId, reason);
+                }
+                continue;
+            }
+
+            // NO ROOM FOR WHAT IT MAKES (#1531). The core answers a full bag
+            // with SPELL_FAILED_DONT_REPORT, which this drive logged as
+            // `unknown` and retried every poll: one tailor drew 83 of them on a
+            // Bolt of Woolen Cloth in a week. Said once; the errand stands for
+            // the passes that empty bags.
+            if (!CastHasRoomForWhatItMakes(bot, info))
+            {
+                char const* const full = "its bags have no room for what the recipe makes";
+                if (SayCraftPrepOnce(name, full))
+                {
+                    RecordEvent(bot, "craft-deferred", spellId, info->SpellName[LOCALE_enUS],
+                                full);
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' does not cast '{}' ({}) yet - {}; the errand "
+                             "stands (#1531)",
+                             name, info->SpellName[LOCALE_enUS], spellId, full);
                 }
                 continue;
             }
@@ -76747,6 +76889,7 @@ private:
         int32 castingAfterCall{-1};  // -1 never asked, 0 no, 1 yes
         int32 queuedAfterCall{-1};   // ...and whether the core parked it instead
         char const* castBlocker{""}; // why the cast did not start, when it did not
+        std::string coreResult;      // the core's SpellCastResult, when it refused (#1531)
 
         CastHoldReport hold;
         OverseerDecisions::HomeBind from;
@@ -76852,6 +76995,7 @@ private:
         o << ",\"queued_after_call\":";
         tri(o, ev.queuedAfterCall);
         o << ",\"cast_blocker\":" << J(ev.castBlocker)
+          << ",\"core_result\":" << J(ev.coreResult)
           << ",\"hold_applied\":" << (ev.hold.applied ? "true" : "false")
           << ",\"hold_placed_by_this_row\":" << (ev.hold.placed ? "true" : "false")
           << ",\"hold_took_stay\":" << (ev.hold.tookStay ? "true" : "false")
@@ -77023,6 +77167,19 @@ private:
                 return refuse(Refusal::MissingReagent);
         }
 
+        // THE THREE WALLS IN Spell::CheckItems A BOT IS NEVER TOLD ABOUT (#1531).
+        // Asked before the hold, so a crafter with full bags is not stopped for
+        // 45 seconds over something standing still cannot fix, and refused
+        // `elsewhere`: a vendor, a mailbox or a bank answers each of them.
+        if (!CastHasAllItsReagents(who, spell))
+            return refuse(Refusal::MissingReagent);
+        if (!CastHasItsTools(who, spell))
+            return refuse(Refusal::MissingTool);
+        // Only a cast at the caster itself: the core checks the explicit target's
+        // bags for one aimed at somebody else, and the row's target has its own.
+        if (request.target != CastTargetKind::Named && !CastHasRoomForWhatItMakes(who, spell))
+            return refuse(Refusal::NoBagRoom);
+
         // ---- who is being cast at ---------------------------------------------
         Player* target = who;
         if (request.target == CastTargetKind::Named)
@@ -77152,7 +77309,12 @@ private:
             else
                 raw << uint32(TARGET_FLAG_NONE);
             raw.rpos(0);
+            // THE CORE'S ANSWER, HEARD WHILE IT IS GIVEN (#1531). Spell::prepare
+            // refuses through SendCastResult inside this call; the listener
+            // keeps the first refusal for this caster and spell.
+            CastAnswerListener const listening(who->GetGUID(), ev.spellId);
             session->HandleCastSpellOpcode(raw);
+            ev.coreResult = listening.Heard();
         }
 
         // ---- believe nothing, and do not judge yet ---------------------------
@@ -77194,13 +77356,16 @@ private:
                 gate.globalReady = !who->GetGlobalCooldownMgr().HasGlobalCooldown(spell);
                 gate.free = !who->IsNonMeleeSpellCast(false);
                 char const* const wall = OverseerDecisions::CastWallBlocker(gate);
-                ev.castBlocker = *wall ? wall : OverseerDecisions::CastWall::NoneNamed;
+                // The core's own answer outranks any wall read after the fact.
+                ev.castBlocker = !ev.coreResult.empty() ? OverseerDecisions::CastWall::CoreRefused
+                                 : *wall                ? wall
+                                                        : OverseerDecisions::CastWall::NoneNamed;
             }
         }
 
         LOG_INFO("module.overseer",
                  "overseer: '{}' is casting spell {} at {} - a {}ms cast; judging in {}ms, "
-                 "not now. Expecting {}. It was {} for the cast (stand state {}, mount {}). {}",
+                 "not now. Expecting {}. It was {} for the cast (stand state {}, mount {}). {} {}",
                  ev.character, ev.spellId,
                  ev.targetName.empty() ? "itself" : ev.targetName.c_str(), ev.castMs,
                  ev.windowMs,
@@ -77211,7 +77376,8 @@ private:
                  ev.hold.applied ? "held" : "NOT held",
                  ev.hold.stoodItUp ? "stood up" : "left as it was",
                  ev.hold.dismountedIt ? "taken off" : "left as it was",
-                 ev.castingAfterCall ? "A cast is running." : ev.castBlocker);
+                 ev.castingAfterCall ? "A cast is running." : ev.castBlocker,
+                 ev.coreResult.empty() ? "" : ev.coreResult.c_str());
 
         CastCheck check;
         check.id = id;
@@ -77378,6 +77544,7 @@ private:
 
             char const* status = "error";
             char const* detail = "";
+            std::string nothingDetail;  // owns `detail` on a `nothing` verdict
             char const* outcome = CastOutcomeWord(check.ev.verdict);
 
             switch (check.ev.verdict)
@@ -77416,11 +77583,17 @@ private:
                     // and not `error`: nothing broke, the cast simply did not
                     // happen, and the sentence says which reading was taken.
                     status = "unchanged";
-                    detail = check.ev.objectExpected
-                                 ? "the cast went out and the object it makes is not there"
-                             : check.ev.teleportExpected
-                                 ? "the cast went out and the character never moved"
-                                 : "the cast went out and it cost the character nothing";
+                    // `the cast went out` ONLY ABOUT A CAST THAT DID (#1531). One
+                    // that never started says the core's answer or the wall.
+                    nothingDetail = OverseerDecisions::CastNothingDetail(
+                        check.ev.castingAfterCall > 0, check.ev.queuedAfterCall > 0,
+                        check.ev.castBlocker, check.ev.coreResult,
+                        check.ev.objectExpected
+                            ? "the cast went out and the object it makes is not there"
+                        : check.ev.teleportExpected
+                            ? "the cast went out and the character never moved"
+                            : "the cast went out and it cost the character nothing");
+                    detail = nothingDetail.c_str();
                     LOG_WARN("module.overseer",
                              "overseer: cast {} - '{}' cast spell {} and nothing came of it: "
                              "{} (the wall named at the packet was: {})",
@@ -87418,6 +87591,9 @@ public:
     void OnSpellCastResult(Player* caster, uint32 spellId, SpellCastResult result,
                            WorldObject* /*target*/) override
     {
+        // Before the roster filter: a guild crafter's `cast` row needs the
+        // answer as much as a family member's (#1531).
+        CastAnswerListener::Hear(caster, spellId, result);
         if (!caster || result == SPELL_CAST_OK || !OnRoster(caster->GetName()))
             return;
 

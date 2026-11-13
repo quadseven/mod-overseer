@@ -16685,7 +16685,53 @@ constexpr char const* Queued =
 // walls this row is able to read were all clear, so the next place to look is a
 // wall it cannot read rather than one of these.
 constexpr char const* NoneNamed = "the cast did not start and every wall this row can read was clear";
+// AND THE WALL IT COULD NOT READ, WHICH THE CORE NOW TELLS IT (#1531). The
+// handler ends in Spell::prepare, which answers a refused cast through
+// Spell::SendCastResult, and the cast-result hook hears that answer on the same
+// thread before HandleCastSpellOpcode returns. The row keeps the answer
+// (`core_result` in its JSON) and says so here instead of NoneNamed.
+constexpr char const* CoreRefused = "the core refused the cast and core_result names its answer";
 }  // namespace CastWall
+
+// ---------------------------------- room for what a cast makes (#1531) --
+//
+// THE WALL THE CRAFTERS HIT, MEASURED. On the dev realm on 2026-11-13 every
+// guild crafter whose casts came back `the cast did not start and every wall
+// this row can read was clear` had full bags: one held 44 items in 44 slots,
+// four of them full stacks of the Linen Bandage it was asked to make, another
+// 40 in 40 general slots (its quiver takes only ammunition). Spell::CheckItems
+// asks Player::CanStoreNewItem for every SPELL_EFFECT_CREATE_ITEM and answers a
+// refusal with SPELL_FAILED_DONT_REPORT and an inventory error, both to a
+// client a bot has not got. A family tailor drew 83 of the same answer on a
+// Bolt of Woolen Cloth in one week. Each crafter had cast the same recipe
+// successfully until the product filled the last slot.
+//
+// So the cast executor asks the core's own question before it sends anything,
+// and the craft drive asks it before it casts. What is decided here is only
+// which answers count as "no room"; the measuring is CanStoreNewItem's.
+struct CastMakesFacts
+{
+    bool makesItem{false};      // a SPELL_EFFECT_CREATE_ITEM or _2 with an item
+    bool randomPool{false};     // SPELL_EFFECT_CREATE_ITEM_2: a random pick
+    bool limitCategory{false};  // the item has an ItemLimitCategory
+    bool fits{true};            // CanStoreNewItem answered EQUIP_ERR_OK
+    unsigned freeSlots{0};      // Player::GetFreeInventorySpace
+};
+
+// True when the cast has room for what it makes, or makes nothing. Mirrors
+// Spell::CheckItems: a random pick needs one free slot whatever it picks, and
+// an item that does not fit is a refusal unless it carries an ItemLimitCategory,
+// where the core takes a branch of its own (the mage conjures) that this module
+// leaves to the core and to the cast-result hook.
+bool CastProductHasRoom(CastMakesFacts const& facts);
+
+// The sentence a `nothing` verdict writes (#1531). A cast seen running or
+// parked on the core queue keeps the post-condition sentence it always had,
+// because something may still have been cast. One that never started gets the
+// core's own answer when the hook heard one, else the wall read at the packet,
+// so the row no longer says `the cast went out` about a cast that did not.
+std::string CastNothingDetail(bool castWasSeen, bool castWasQueued, char const* wall,
+                              std::string const& coreAnswer, char const* postCondition);
 
 // THE `stayed` VERDICT HAS TWO CAUSES AND THE ROW ASSERTED ONLY ONE OF THEM.
 // `the cast went out and the character never left` was written into every
@@ -17872,6 +17918,14 @@ constexpr char const* NotEnoughPower = "the character has too little mana for th
 // row is not cast into a client error. Standing somewhere else answers it.
 constexpr char const* NoSpellFocus = "no spell focus object of that spell is in reach";
 constexpr char const* MissingReagent = "the character is missing a reagent for that spell";
+// Spell::CheckItems refuses a full bag with SPELL_FAILED_DONT_REPORT and says
+// why only to a client (#1531). Elsewhere: a vendor, a mailbox or a bank is what
+// makes room, and standing still never does.
+constexpr char const* NoBagRoom = "the character has no room in its bags for what that spell makes";
+// A Blacksmith Hammer, a Mining Pick, a Runed Copper Rod: Spell::CheckItems
+// refuses SPELL_FAILED_TOTEMS or SPELL_FAILED_TOTEM_CATEGORY when the bags do
+// not hold the tool (#1531). Elsewhere, for the same reason as the reagent.
+constexpr char const* MissingTool = "the character does not carry the tool that spell needs";
 constexpr char const* NoSuchTarget = "no character of that name is in the world";
 constexpr char const* TargetOtherMap = "the target is on another map";
 constexpr char const* TargetDead = "the target is dead";
