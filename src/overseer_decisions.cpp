@@ -12,6 +12,7 @@
 #include "overseer_decisions.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
@@ -7895,6 +7896,88 @@ UnissuedFlightStep TownLeaderUnissuedFlight(bool mayCarryNewRpg, bool statusIsTr
     return statusIsTravelFlight ? UnissuedFlightStep::Cancel : UnissuedFlightStep::Leave;
 }
 
+bool IsLinkingJob(std::string const& job)
+{
+    std::size_t const first = job.find_first_not_of(" \t");
+    if (first == std::string::npos)
+        return false;
+    std::size_t const last = job.find_last_not_of(" \t");
+    std::string value = job.substr(first, last - first + 1);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value == "dungeon" || value.rfind("dungeon:", 0) == 0 ||
+           value.rfind(RAID_JOB_PREFIX, 0) == 0;
+}
+
+bool FamilyLinked(std::vector<std::string> const& memberJobs)
+{
+    for (std::string const& job : memberJobs)
+        if (IsLinkingJob(job))
+            return true;
+    return false;
+}
+
+bool IndividualErrandSteers(IndividualErrandFacts const& facts)
+{
+    if (!facts.enabled || facts.leadsItsParty || facts.familyLinked || facts.inARun)
+        return false;
+    if (!facts.sameMapAsLeader || facts.claimedByAnotherOwner || facts.landedOnIt)
+        return false;
+    std::string const& aim = facts.ownAim;
+    if (aim.empty() || IsTravelGuardAim(aim))
+        return false;
+    // Off the family's ground: a portal or a flight is not walked alone.
+    if (aim.rfind("trigger:", 0) == 0 || aim == "flight master")
+        return false;
+    if (aim.rfind("at:", 0) == 0)
+    {
+        std::istringstream in(aim.substr(3));
+        uint32_t map = 0;
+        char colon = 0;
+        if (!(in >> map >> colon) || colon != ':')
+            return false;
+        return map == facts.leaderMapId;
+    }
+    return true;
+}
+
+std::set<std::string> IndividualErrandSet(
+    bool enabled, std::vector<std::pair<std::string, IndividualErrandFacts>> const& members)
+{
+    std::set<std::string> out;
+    if (!enabled)
+        return out;
+    for (auto const& [name, facts] : members)
+    {
+        IndividualErrandFacts asked = facts;
+        asked.enabled = true;
+        if (IndividualErrandSteers(asked))
+            out.insert(name);
+    }
+    return out;
+}
+
+IndividualErrandChange IndividualErrandChanges(std::set<std::string> const& before,
+                                               std::set<std::string> const& after)
+{
+    IndividualErrandChange change;
+    std::set_difference(after.begin(), after.end(), before.begin(), before.end(),
+                        std::back_inserter(change.started));
+    std::set_difference(before.begin(), before.end(), after.begin(), after.end(),
+                        std::back_inserter(change.stopped));
+    return change;
+}
+
+uint32_t ErrandPartyDeaths(bool onItsOwnErrand, uint32_t ownDeaths, uint32_t partyDeaths)
+{
+    return onItsOwnErrand ? ownDeaths : partyDeaths;
+}
+
+bool PartyTollCounts(bool memberOnItsOwnErrand)
+{
+    return !memberOnItsOwnErrand;
+}
+
 bool CutOffFollowerRoams(std::string const& job, std::string const& target)
 {
     if (!SplitFollowerDrivesItself(target))
@@ -7918,6 +8001,7 @@ char const* RegroupClaimName(RegroupClaim claim)
         case RegroupClaim::TooFarToWaitFor:
             return "too far back to hold the leader still for; it walks back while the "
                    "family carries on";
+        case RegroupClaim::OwnErrand:     return "on an errand of its own";
     }
     return "unknown";
 }
@@ -7967,6 +8051,11 @@ RegroupClaim ReadRegroupClaim(RegroupMember const& member,
     // hold refused, and "refused" is the sentence the fetch makes untrue.
     if (member.beingFetched)
         return RegroupClaim::Fetched;
+    // AFTER THE FETCH AND BEFORE THE WAIT (#1517): a member walking its own
+    // errand is walking away on purpose, so holding the leader for it is a
+    // family standing still until the errand ends.
+    if (member.onItsOwnErrand)
+        return RegroupClaim::OwnErrand;
     if (!member.aimRefusedBecause.empty())
         return RegroupClaim::AimRefused;
     if (limits.maxWaitYards > 0.f && member.yards > limits.maxWaitYards)
@@ -8090,6 +8179,9 @@ std::string PickFetchTarget(std::vector<FetchCandidate> const& members,
         // Nothing unmeasured is anywhere: off the map, not in the world, or a
         // ghost is neither a member to fetch nor one still walking back.
         if (!member.seen || !member.sameMap || !member.alive || member.yards < 0.f)
+            continue;
+        // ITS OWN ERRAND (#1517): never fetched, and not still walking back.
+        if (member.onItsOwnErrand)
             continue;
         if (!member.heldTooFar)
         {
