@@ -20,6 +20,7 @@
 using uint8 = uint8_t;
 using uint32 = uint32_t;
 using uint64 = uint64_t;
+using int64 = int64_t;
 using Cell = std::variant<int64_t, std::string>;
 inline int64_t sqlClock=1000;
 struct Field
@@ -111,6 +112,9 @@ public:
         if (sqlite3_open(":memory:", &db) != SQLITE_OK) throw std::runtime_error("SQLite unavailable");
         sqlite3_create_function(db, "NOW", 0, SQLITE_UTF8, nullptr,
             [](sqlite3_context* c, int, sqlite3_value**) { sqlite3_result_int64(c, sqlClock); }, nullptr, nullptr);
+        // Timestamps here are already seconds, so UNIX_TIMESTAMP is the identity.
+        sqlite3_create_function(db, "UNIX_TIMESTAMP", 1, SQLITE_UTF8, nullptr,
+            [](sqlite3_context* c, int, sqlite3_value** v) { sqlite3_result_int64(c, sqlite3_value_int64(v[0])); }, nullptr, nullptr);
         // The store names MySQL's utf8mb4_unicode_ci to join columns of two
         // collations; stand it in as a case-insensitive ASCII compare.
         sqlite3_create_collation(db, "utf8mb4_unicode_ci", SQLITE_UTF8, nullptr,
@@ -124,7 +128,7 @@ public:
                 return la - lb;
             });
         Exec("CREATE TABLE overseer_roster(name TEXT PRIMARY KEY, enabled INTEGER, job TEXT);"
-             "CREATE TABLE overseer_command(id INTEGER PRIMARY KEY,target_name TEXT,kind TEXT,status TEXT,claimed_by TEXT DEFAULT '',result TEXT DEFAULT '',updated_at INTEGER DEFAULT 0);");
+             "CREATE TABLE overseer_command(id INTEGER PRIMARY KEY,target_name TEXT,kind TEXT,status TEXT,claimed_by TEXT DEFAULT '',result TEXT DEFAULT '',updated_at INTEGER DEFAULT 0,command TEXT,created_at INTEGER DEFAULT 0);");
         return 0;
     }
     bool PrepareStatements()
@@ -173,6 +177,15 @@ public:
             std::string message = error; sqlite3_free(error); throw std::runtime_error(message);
         }
     }
+    std::string ResultText(uint32 id)
+    {
+        sqlite3_stmt* s = nullptr;
+        sqlite3_prepare_v2(db, "SELECT result FROM overseer_command WHERE id=?", -1, &s, nullptr);
+        sqlite3_bind_int(s,1,int(id));
+        std::string result;
+        if (sqlite3_step(s)==SQLITE_ROW && sqlite3_column_text(s,0)) result=reinterpret_cast<char const*>(sqlite3_column_text(s,0));
+        sqlite3_finalize(s); return result;
+    }
     std::string Status(uint32 id)
     {
         sqlite3_stmt* s = nullptr;
@@ -218,18 +231,23 @@ private:
         return result->rows.empty() ? PreparedQueryResult{} : result;
     }
 };
+enum class HighGuid { Item };
 class ObjectGuid
 {
     uint64 value = 0;
 public:
     explicit ObjectGuid(uint64 v=0) : value(v) {}
+    // Item guids here are their own counters, so a named row's guid:<n> is the raw value.
+    template<HighGuid> static ObjectGuid Create(uint32 counter) { return ObjectGuid(counter); }
     uint64 GetRawValue() const { return value; }
+    uint32 GetCounter() const { return uint32(value); }
     bool IsEmpty() const { return !value; }
     bool IsItem() const { return value && value<10000; }
     bool IsGameObject() const { return value>=10000; }
     bool operator==(ObjectGuid other) const { return value==other.value; }
     bool operator!=(ObjectGuid other) const { return !(*this==other); }
 };
+constexpr uint32 ITEM_CLASS_WEAPON=2, ITEM_CLASS_ARMOR=4, ITEM_CLASS_TRADE_GOODS=7;
 constexpr uint32 ITEM_QUALITY_UNCOMMON=2, SKILL_ENCHANTING=333, TRIGGERED_NONE=0;
 constexpr uint32 PLAYER_FLAGS_NO_PLAY_TIME=1;
 enum InventoryResult { EQUIP_ERR_OK, EQUIP_ERR_REFUSED };
@@ -247,17 +265,18 @@ struct Loot
         return true;
     }
 };
-struct ItemTemplate { uint32 Quality=2,DisenchantID=1; int32_t RequiredDisenchantSkill=1; bool usable=false; };
+struct ItemTemplate { uint32 Quality=2,Class=ITEM_CLASS_ARMOR,DisenchantID=1; int32_t RequiredDisenchantSkill=1; bool usable=false; };
 struct Item
 {
     ItemTemplate proto;
     uint64 guid=42,owner=100;
-    bool bound=true,m_lootGenerated=false,kept=false;
+    bool bound=true,m_lootGenerated=false,kept=false,equipped=false;
     Loot loot;
     ItemTemplate const* GetTemplate() const { return &proto; }
     ObjectGuid GetGUID() const { return ObjectGuid(guid); }
     ObjectGuid GetOwnerGUID() const { return ObjectGuid(owner); }
     bool IsSoulBound() const { return bound; }
+    bool IsEquipped() const { return equipped; }
 };
 struct SpellInfo {};
 struct SpellMgr { SpellInfo info; SpellInfo const* GetSpellInfo(uint32) { return &info; } };

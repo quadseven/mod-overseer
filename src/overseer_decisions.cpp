@@ -19313,6 +19313,92 @@ bool MayCraftNow(std::string const& job, bool inDungeonRun, bool alive, bool inC
     return campaignJob && !inDungeonRun && alive && !inCombat && !moving;
 }
 
+int PickEnchantTarget(EnchantSpellFacts const& spell,
+                      std::vector<EnchantTargetCandidate> const& candidates,
+                      EnchantRanks const& ranks)
+{
+    int bag = -1;
+    for (std::size_t i = 0; i < candidates.size(); ++i)
+    {
+        EnchantTargetCandidate const& c = candidates[i];
+        if (!c.fitsSpell || !c.levelOk || c.equipped || c.kept || c.questItem || c.quality > 2)
+            continue;
+        if (bag < 0 || c.quality < candidates[static_cast<std::size_t>(bag)].quality)
+            bag = static_cast<int>(i);
+    }
+    if (bag >= 0)
+        return bag;
+
+    int overwrite = -1;
+    for (std::size_t i = 0; i < candidates.size(); ++i)
+    {
+        EnchantTargetCandidate const& c = candidates[i];
+        if (!c.fitsSpell || !c.levelOk || !c.equipped)
+            continue;
+        if (!c.permEnchant || (spell.ownEnchant && c.permEnchant == spell.ownEnchant))
+            return static_cast<int>(i);
+        if (overwrite >= 0 || !spell.ownRank)
+            continue;
+        auto const found = ranks.find(c.permEnchant);
+        if (found != ranks.end() && found->second && found->second <= spell.ownRank)
+            overwrite = static_cast<int>(i);
+    }
+    return overwrite;
+}
+
+DisenchantTarget ParseDisenchantTarget(std::string const& command)
+{
+    DisenchantTarget target;
+    std::vector<std::string> tokens;
+    std::istringstream in(command);
+    for (std::string token; in >> token;)
+        tokens.push_back(token);
+    bool anyGuid = false;
+    for (std::string const& token : tokens)
+        if (token.compare(0, 5, "guid:") == 0)
+            anyGuid = true;
+    if (!anyGuid)
+        return target;
+    target.named = true;
+    uint32_t guid = 0;
+    uint32_t count = 0;
+    bool const ok = !tokens.empty() && tokens.size() <= 2 &&
+                    KeyedNumber(tokens[0], "guid", guid) && guid != 0 &&
+                    (tokens.size() == 1 || (KeyedNumber(tokens[1], "count", count) && count == 1));
+    if (!ok)
+    {
+        target.malformed = true;
+        return target;
+    }
+    target.guid = guid;
+    return target;
+}
+
+NamedDisenchantVerdict JudgeNamedDisenchant(NamedDisenchantFacts const& facts,
+                                            int64_t ageSeconds)
+{
+    bool const late = ageSeconds >= NAMED_DISENCHANT_ARRIVAL_SECONDS;
+    if (!facts.found)
+        return late ? NamedDisenchantVerdict{NamedDisenchantStep::End,
+                                             "named item never reached the enchanter"}
+                    : NamedDisenchantVerdict{NamedDisenchantStep::Hold,
+                                             "named item not owned yet"};
+    if (!facts.inBags)
+        return late ? NamedDisenchantVerdict{NamedDisenchantStep::End,
+                                             "named item never reached the enchanter's bags "
+                                             "(worn or banked)"}
+                    : NamedDisenchantVerdict{NamedDisenchantStep::Hold,
+                                             "named item is not in the bags yet (worn or banked)"};
+    if (facts.kept)
+        return {NamedDisenchantStep::End, "named item is kept by a keep reservation"};
+    if (facts.quality < 2 || facts.quality > 4 || !facts.weaponOrArmor || !facts.disenchantId ||
+        facts.requiredSkill < 0)
+        return {NamedDisenchantStep::End, "named item is not disenchantable"};
+    if (facts.skill < static_cast<uint32_t>(facts.requiredSkill))
+        return {NamedDisenchantStep::Hold, "Enchanting skill too low for the named item"};
+    return {NamedDisenchantStep::Cast, ""};
+}
+
 unsigned CraftLoneDeathsInZone(std::vector<CraftLoneDeath> const& deaths, uint32_t mapId,
                                uint32_t zoneId, int64_t now, CraftLoneDeathLimits const& limits)
 {

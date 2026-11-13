@@ -16839,6 +16839,9 @@ private:
     {
         std::string name;
         std::string job;
+        std::string command;  // `guid:<n>[ count:1]` names the item (#1523)
+        int64 ageSeconds = 0; // since the row's created_at, database clock
+        time_t endedAt = 0;   // when an End was last written, 0 = never
         bool enabled = false;
         bool completing = false;
         std::string refusal;
@@ -17048,6 +17051,25 @@ private:
                  id, task.name, reason);
     }
 
+    // End a named row as status 'error' (#1523). The owned read then drops it
+    // and the enchanter's other rows stop being deferred behind it. Written
+    // again at most every 30 seconds until that read has seen it end.
+    void EndDisenchant(uint32 id, DisenchantTask& task, char const* reason)
+    {
+        time_t const now = GameTime::GetGameTime().count();
+        if (task.endedAt && now - task.endedAt < 30)
+            return;
+        task.endedAt = now;
+        task.refusal = reason;
+        auto* statement = _disenchantStore.Bound(OverseerDisenchant::Fail);
+        statement->SetData(0, std::string(reason));
+        statement->SetData(1, id);
+        statement->SetData(2, g_runToken);
+        _disenchantStore.Execute(statement);
+        LOG_INFO("module.overseer", "overseer: disenchant {} for '{}' ended as error: {}",
+                 id, task.name, reason);
+    }
+
     void ReadDisenchantCommands()
     {
         if (!_disenchantStore.Ready())
@@ -17084,6 +17106,8 @@ private:
                             task.name = fields[1].Get<std::string>();
                             task.job = fields[2].Get<std::string>();
                             task.enabled = fields[3].Get<uint8>() != 0;
+                            task.command = fields[4].Get<std::string>();
+                            task.ageSeconds = fields[5].Get<int64>();
                             _disenchantClaiming.erase(task.name);
                         } while (result->NextRow());
                         // AI-REVIEW 2026-11-01 [claude-haiku-5-5] DE-STALE (Elder, PR #1303):
@@ -17183,6 +17207,29 @@ private:
         return nullptr;
     }
 
+    // The item a named row means, and the facts its refusal is judged on.
+    // Looked up by guid counter in everything the player owns, so an item
+    // that is worn or banked is "not in the bags", not "not owned".
+    static Item* NamedDisenchantItem(Player* player, uint32 guid,
+                                     OverseerDecisions::NamedDisenchantFacts& facts)
+    {
+        Item* item = player->GetItemByGuid(ObjectGuid::Create<HighGuid::Item>(guid));
+        facts.found = item && item->GetOwnerGUID() == player->GetGUID();
+        if (!facts.found)
+            return nullptr;
+        std::vector<Item*> const carried = GearCarried(player);
+        facts.inBags = !item->IsEquipped() &&
+                       std::find(carried.begin(), carried.end(), item) != carried.end();
+        facts.kept = ItemKept(player, item);
+        ItemTemplate const* proto = item->GetTemplate();
+        facts.quality = proto->Quality;
+        facts.weaponOrArmor = proto->Class == ITEM_CLASS_WEAPON || proto->Class == ITEM_CLASS_ARMOR;
+        facts.disenchantId = proto->DisenchantID;
+        facts.requiredSkill = proto->RequiredDisenchantSkill;
+        facts.skill = player->GetSkillValue(SKILL_ENCHANTING);
+        return item;
+    }
+
     void DriveDisenchant()
     {
         if (!_disenchantStore.Ready())
@@ -17206,8 +17253,14 @@ private:
                 continue;
             }
             if (!_disenchantFactsReadable || GameTime::GetGameTime().count() - _disenchantFactsAt > 5 ||
-                !task.enabled || task.job != "craft" || InAnyDungeonRun(player) ||
-                player->IsInCombat() || player->isMoving() || _craftLoneHeld.count(task.name))
+                !task.enabled ||
+                // BETWEEN RUNS TOO (#1523): an enchanter waiting in town on a
+                // campaign job disenchants the way it already crafts.
+                !OverseerDecisions::MayCraftNow(task.job, InAnyDungeonRun(player),
+                                                player->IsAlive(), player->IsInCombat(),
+                                                player->isMoving()) ||
+                InAnyDungeonRun(player) || player->IsInCombat() || player->isMoving() ||
+                _craftLoneHeld.count(task.name))
             {
                 HoldDisenchant(id, task, "waiting for fresh craft permission and a safe idle moment");
                 continue;
@@ -17234,13 +17287,46 @@ private:
                 HoldDisenchant(id, task, "disenchant spell is not known");
                 continue;
             }
-            Item* item = window.proof.source ? inventory.ItemOf(window.proof.source)
-                                              : DisenchantCandidate(player);
-            SpellInfo const* info = sSpellMgr->GetSpellInfo(13262);
-            if (!MayDisenchantItem(player, item) || !info)
+            // A NAMED ROW (#1523): `guid:<item_instance.guid>[ count:1]`. The
+            // writer already applied the guild's keep rules, so soulbound and
+            // usability are not asked; ownership, the bags, a keep reservation,
+            // the item itself and the skill are. A row with no guid keeps the
+            // module's own candidate rule below, unchanged.
+            OverseerDecisions::DisenchantTarget const named =
+                OverseerDecisions::ParseDisenchantTarget(task.command);
+            if (named.malformed)
             {
-                HoldDisenchant(id, task, "no eligible soulbound unusable green is carried");
+                EndDisenchant(id, task, "the command names an item but is not guid:<n> [count:1]");
                 continue;
+            }
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(13262);
+            Item* item = nullptr;
+            if (named.named)
+            {
+                OverseerDecisions::NamedDisenchantFacts facts;
+                item = NamedDisenchantItem(player, named.guid, facts);
+                OverseerDecisions::NamedDisenchantVerdict const verdict =
+                    OverseerDecisions::JudgeNamedDisenchant(facts, task.ageSeconds);
+                if (verdict.step == OverseerDecisions::NamedDisenchantStep::End)
+                {
+                    EndDisenchant(id, task, verdict.reason);
+                    continue;
+                }
+                if (verdict.step == OverseerDecisions::NamedDisenchantStep::Hold || !info)
+                {
+                    HoldDisenchant(id, task, info ? verdict.reason : "disenchant spell is not known");
+                    continue;
+                }
+            }
+            else
+            {
+                item = window.proof.source ? inventory.ItemOf(window.proof.source)
+                                           : DisenchantCandidate(player);
+                if (!MayDisenchantItem(player, item) || !info)
+                {
+                    HoldDisenchant(id, task, "no eligible soulbound unusable green is carried");
+                    continue;
+                }
             }
             window.proof.source = item->GetGUID().GetRawValue();
             // Publish the target before the cast can synchronously open loot.
@@ -17715,6 +17801,95 @@ private:
         }
     }
 
+    // The permanent enchant an Enchanting recipe applies, 0 when it applies
+    // none (a rod, an oil, a wand: CREATE_ITEM, cast as before).
+    static uint32 EnchantOfSpell(SpellInfo const* info)
+    {
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+            if (info->Effects[i].Effect == SPELL_EFFECT_ENCHANT_ITEM && info->Effects[i].MiscValue > 0)
+                return static_cast<uint32>(info->Effects[i].MiscValue);
+        return 0;
+    }
+
+    static bool CraftEnchantsItem(SpellInfo const* info)
+    {
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+            if (info->Effects[i].Effect == SPELL_EFFECT_ENCHANT_ITEM)
+                return true;
+        return false;
+    }
+
+    // enchant id -> the MinSkillLineRank of the Enchanting spell that applies
+    // it (SkillLineAbility, skill 333). Built once, lazily: the DBC stores do
+    // not change while the world runs. An enchant applied by two Enchanting
+    // spells keeps the higher rank, so it is the harder one to write over.
+    static OverseerDecisions::EnchantRanks const& EnchantRankMap()
+    {
+        static OverseerDecisions::EnchantRanks const ranks = []
+        {
+            OverseerDecisions::EnchantRanks built;
+            for (uint32 row = 0; row < sSkillLineAbilityStore.GetNumRows(); ++row)
+            {
+                SkillLineAbilityEntry const* ability = sSkillLineAbilityStore.LookupEntry(row);
+                if (!ability || ability->SkillLine != SKILL_ENCHANTING)
+                    continue;
+                SpellInfo const* spell = sSpellMgr->GetSpellInfo(ability->Spell);
+                uint32 const enchant = spell ? EnchantOfSpell(spell) : 0;
+                if (!enchant)
+                    continue;
+                uint32& rank = built[enchant];
+                rank = std::max(rank, ability->MinSkillLineRank);
+            }
+            return built;
+        }();
+        return ranks;
+    }
+
+    // The item an enchant-item recipe goes on, or nullptr for none. The facts
+    // are read here; the choice is OverseerDecisions::PickEnchantTarget.
+    Item* EnchantTargetFor(Player* bot, SpellInfo const* info, uint32 spellId)
+    {
+        OverseerDecisions::EnchantSpellFacts spell;
+        spell.ownEnchant = EnchantOfSpell(info);
+        OverseerDecisions::EnchantRanks const& ranks = EnchantRankMap();
+        auto const own = ranks.find(spell.ownEnchant);
+        spell.ownRank = own != ranks.end() ? own->second : 0;
+        // The recipe's own rank first, from its own SkillLineAbility row.
+        SkillLineAbilityMapBounds const bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spellId);
+        for (auto it = bounds.first; it != bounds.second; ++it)
+            if (it->second->SkillLine == SKILL_ENCHANTING)
+                spell.ownRank = it->second->MinSkillLineRank;
+
+        std::vector<Item*> items;
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+            if (Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                items.push_back(item);
+        for (Item* item : GearCarried(bot))
+            items.push_back(item);
+
+        std::vector<OverseerDecisions::EnchantTargetCandidate> candidates;
+        for (Item* item : items)
+        {
+            ItemTemplate const* proto = item->GetTemplate();
+            OverseerDecisions::EnchantTargetCandidate c;
+            c.fitsSpell = item->GetOwnerGUID() == bot->GetGUID() &&
+                          item->IsFitToSpellRequirements(info);
+            // Spell::CheckItems' item-level gate, asked the same way.
+            uint32 const requiredLevel = proto->RequiredLevel ? proto->RequiredLevel : proto->ItemLevel;
+            c.levelOk = info->HasAttribute(SPELL_ATTR2_ALLOW_LOW_LEVEL_BUFF) ||
+                        requiredLevel >= info->BaseLevel;
+            c.equipped = item->IsEquipped();
+            c.kept = ItemKept(bot, item);
+            c.quality = proto->Quality;
+            c.questItem = proto->Class == ITEM_CLASS_QUEST || proto->StartQuest != 0 ||
+                          proto->Bonding == BIND_QUEST_ITEM;
+            c.permEnchant = item->GetEnchantmentId(PERM_ENCHANTMENT_SLOT);
+            candidates.push_back(c);
+        }
+        int const pick = OverseerDecisions::PickEnchantTarget(spell, candidates, ranks);
+        return pick >= 0 ? items[static_cast<std::size_t>(pick)] : nullptr;
+    }
+
     void DriveCraft()
     {
         std::map<std::string, std::string> const jobs = LoadJobs();
@@ -18008,9 +18183,49 @@ private:
                 continue;
             }
 
+            // AN ENCHANT IS CAST ON AN ITEM (#1523). Every Enchanting rung past
+            // the rods is SPELL_EFFECT_ENCHANT_ITEM, which Spell::CheckItems
+            // refuses with SPELL_FAILED_ITEM_NOT_FOUND unless the cast names an
+            // item, and which overwrites that item's permanent enchant. The
+            // item is chosen by OverseerDecisions::PickEnchantTarget; with none
+            // to choose, the errand waits and says so once.
+            Item* enchantTarget = nullptr;
+            if (CraftEnchantsItem(info))
+            {
+                enchantTarget = EnchantTargetFor(bot, info, spellId);
+                if (!enchantTarget)
+                {
+                    if (SayCraftPrepOnce(name, "no item to enchant"))
+                    {
+                        RecordEvent(bot, "craft-deferred", spellId, info->SpellName[LOCALE_enUS],
+                                    "no item to enchant");
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' does not cast '{}' ({}) yet - no item to "
+                                 "enchant: nothing in the bags fits it, and no worn item "
+                                 "fits it without losing a better enchant; the errand "
+                                 "stands (#1523)",
+                                 name, info->SpellName[LOCALE_enUS], spellId);
+                    }
+                    continue;
+                }
+            }
+
             // natural-only: a recipe the character knows (HasSpell above), cast untriggered with
-            // its own reagents.
-            SpellCastResult const result = bot->CastSpell(bot, spellId, false);
+            // its own reagents. An enchant goes on the item chosen above, with
+            // the same ordinary core cast checks.
+            SpellCastResult result = SPELL_CAST_OK;
+            if (enchantTarget)
+            {
+                SpellCastTargets targets;
+                targets.SetItemTarget(enchantTarget);
+                // natural-only: a known recipe on the crafter's own item, untriggered.
+                result = bot->CastSpell(targets, info, nullptr, TRIGGERED_NONE);
+            }
+            else
+            {
+                // natural-only: a known recipe, untriggered, with its own reagents.
+                result = bot->CastSpell(bot, spellId, false);
+            }
             if (result == SPELL_CAST_OK)
             {
                 LOG_INFO("module.overseer",

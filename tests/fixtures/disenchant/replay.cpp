@@ -1,4 +1,5 @@
 #include "core.h"
+#include "overseer_decisions.h"
 #include "overseer_disenchant.h"
 #include "overseer_disenchant_store.h"
 #include <cstdio>
@@ -24,7 +25,7 @@ class Runtime
     static std::vector<Item*> GearCarried(Player* player)
     {
         std::vector<Item*> items;
-        for (auto const& item:player->items) items.push_back(item.second.get());
+        for (auto const& item:player->items) if (!item.second->equipped) items.push_back(item.second.get());
         return items;
     }
 public:
@@ -68,6 +69,19 @@ public:
         _disenchantStore.Exec("INSERT INTO overseer_roster VALUES('Jones',1,'craft');"
             "INSERT INTO overseer_command(id,target_name,kind,status) VALUES(100,'Jones','disenchant','pending');");
     }
+    // A row naming an item (#1523), for a member on `job`.
+    void AddNamed(Player& player,char const* job,char const* command)
+    {
+        ObjectAccessor::players[player.name]=&player;
+        std::string sql="INSERT INTO overseer_roster VALUES('Smith',1,'";
+        sql+=job; sql+="');INSERT INTO overseer_command(id,target_name,kind,status,command,created_at) VALUES(1,'Smith','disenchant','pending','";
+        sql+=command; sql+="',"+std::to_string(GameTime::now)+");";
+        _disenchantStore.Exec(sql.c_str());
+    }
+    std::string Said() { return _disenchantStore.ResultText(1); }
+    // A second pending row for the same member, unnamed, to see it unblocked.
+    void AddLater() { _disenchantStore.Exec("INSERT INTO overseer_command(id,target_name,kind,status) VALUES(3,'Smith','disenchant','pending');"); }
+    std::string LaterStatus() { return _disenchantStore.Status(3); }
     std::string SecondStatus() { return _disenchantStore.Status(100); }
     std::size_t Queued() { return _disenchantStore.Queued(); }
 };
@@ -214,6 +228,92 @@ int main()
         player.currentLoot=ObjectGuid(42);player.casting=false;
         beforeLoot(&player,player.currentLoot,source->loot);runtime.Ticks(4);
         Check("a cancelled in-flight cast retains proof for its later loot callback", runtime.Status()=="error" && player.casts==1 && player.GetItemCount(10940)==9 && !player.GetItemByGuid(ObjectGuid(42)));
+    }
+    // ---- named rows and the campaign-job gate (#1523) ----
+    {
+        Runtime runtime; Player player;
+        Item& named=*player.items.at(42); named.bound=false; named.proto.usable=true;
+        auto spare=std::make_unique<Item>(); spare->guid=84; player.items.emplace(84,std::move(spare));
+        runtime.AddNamed(player,"craft","guid:42 count:1"); runtime.Ticks(6);
+        Check("a named usable unbound green is disenchanted", runtime.Status()=="delivered" && player.casts==1 && player.GetItemCount(10940)==9 && !player.GetItemByGuid(ObjectGuid(42)));
+        Check("and the module's own candidate is left alone", player.GetItemByGuid(ObjectGuid(84))!=nullptr);
+    }
+    {
+        Runtime runtime; Player player;
+        Item& named=*player.items.at(42); named.proto.Quality=3; named.proto.Class=ITEM_CLASS_WEAPON;
+        runtime.AddNamed(player,"craft","guid:42"); runtime.Ticks(6);
+        Check("a named rare weapon is disenchanted", runtime.Status()=="delivered" && player.casts==1);
+    }
+    {
+        Runtime runtime; Player player; runtime.AddNamed(player,"craft","guid:99 count:1"); runtime.Ticks(7);
+        Check("a named item not owned yet stays standing with that reason", player.casts==0 && runtime.Status()=="claimed" && runtime.Said()=="named item not owned yet");
+    }
+    {
+        Runtime runtime; Player player; player.items.at(42)->equipped=true;
+        runtime.AddNamed(player,"craft","guid:42 count:1"); runtime.Ticks(7);
+        Check("a named worn item is held as not in the bags", player.casts==0 && runtime.Status()=="claimed" && runtime.Said().find("not in the bags")!=std::string::npos);
+    }
+    {
+        Runtime runtime; Player player; player.items.at(42)->kept=true;
+        runtime.AddNamed(player,"craft","guid:42 count:1"); runtime.Ticks(7);
+        Check("a named kept item ends the row as error", player.casts==0 && runtime.Status()=="error" && runtime.Said().find("kept")!=std::string::npos && player.GetItemByGuid(ObjectGuid(42)));
+    }
+    {
+        Runtime runtime; Player player; player.skill=1; player.items.at(42)->proto.RequiredDisenchantSkill=25;
+        runtime.AddNamed(player,"craft","guid:42 count:1"); runtime.Ticks(7);
+        Check("a named item above the skill stays standing as skill too low", player.casts==0 && runtime.Status()=="claimed" && runtime.Said().find("skill too low")!=std::string::npos);
+    }
+    {
+        Runtime runtime; Player player; player.items.at(42)->proto.Class=ITEM_CLASS_TRADE_GOODS;
+        runtime.AddNamed(player,"craft","guid:42 count:1"); runtime.Ticks(7);
+        Check("a named trade good ends the row as not disenchantable", player.casts==0 && runtime.Status()=="error" && runtime.Said().find("not disenchantable")!=std::string::npos);
+    }
+    {
+        Runtime runtime; Player player; runtime.AddNamed(player,"craft","guid:abc"); runtime.Ticks(7);
+        Check("a malformed named row ends as error, never guessed at", player.casts==0 && runtime.Status()=="error" && runtime.Said().find("not guid:")!=std::string::npos);
+    }
+    {
+        Runtime runtime; Player player; runtime.AddNamed(player,"town run",""); runtime.Ticks(6);
+        Check("an unnamed row on a campaign job between runs keeps today's rule and runs", runtime.Status()=="delivered" && player.casts==1);
+    }
+    {
+        Runtime runtime; Player player; player.items.at(42)->bound=false; player.items.at(42)->proto.usable=true;
+        runtime.AddNamed(player,"dungeon:shadowfang","guid:42 count:1"); runtime.Ticks(6);
+        Check("a named row on a dungeon job between runs runs", runtime.Status()=="delivered" && player.casts==1);
+    }
+    {
+        Runtime runtime; Player player; player.dungeon=true;
+        runtime.AddNamed(player,"dungeon:shadowfang","guid:42 count:1"); runtime.Ticks(7);
+        Check("never inside a run", player.casts==0 && runtime.Status()=="claimed");
+        player.dungeon=false; runtime.Ticks(5);
+        Check("and the same row runs once the run is over", runtime.Status()=="delivered" && player.casts==1);
+    }
+    {
+        Runtime runtime; Player player; runtime.AddNamed(player,"quest","guid:42 count:1"); runtime.Ticks(7);
+        Check("a questing member does not disenchant", player.casts==0 && runtime.Status()=="claimed");
+    }
+    {
+        // The writer moves the item with kind='give' and names it at once.
+        Runtime runtime; Player player;
+        auto moved=std::move(player.items.at(42)); player.items.erase(42);
+        moved->bound=false; moved->proto.usable=true;
+        runtime.AddNamed(player,"craft","guid:42 count:1"); runtime.Ticks(7);
+        Check("a named item still on its way holds the row", player.casts==0 && runtime.Status()=="claimed" && runtime.Said()=="named item not owned yet");
+        GameTime::now+=300; runtime.Ticks(2);
+        player.items.emplace(42,std::move(moved)); runtime.Ticks(6);
+        Check("and is disenchanted once the give lands", runtime.Status()=="delivered" && player.casts==1 && player.GetItemCount(10940)==9 && !player.GetItemByGuid(ObjectGuid(42)));
+    }
+    {
+        Runtime runtime; Player player; player.items.erase(42);
+        runtime.AddNamed(player,"craft","guid:42 count:1"); runtime.Ticks(5);
+        runtime.AddLater();
+        auto spare=std::make_unique<Item>(); spare->guid=84; player.items.emplace(84,std::move(spare));
+        runtime.Ticks(5);
+        Check("a young missing item holds the row and defers the member's next row", runtime.Status()=="claimed" && runtime.LaterStatus()=="pending" && player.casts==0);
+        GameTime::now+=OverseerDecisions::NAMED_DISENCHANT_ARRIVAL_SECONDS; runtime.Ticks(5);
+        Check("a named item that never arrives ends the row as error after fifteen minutes", runtime.Status()=="error" && runtime.Said()=="named item never reached the enchanter");
+        runtime.Ticks(10);
+        Check("and the member's other row is no longer blocked", runtime.LaterStatus()=="delivered" && player.casts==1 && !player.GetItemByGuid(ObjectGuid(84)));
     }
     return failures?1:0;
 }
