@@ -21869,6 +21869,78 @@ char const* SpawnWalkFirstLegRefusal(bool creatureSpawn, bool probeFoundStep, bo
 bool MayCraftNow(std::string const& job, bool inDungeonRun, bool alive, bool inCombat,
                  bool moving);
 
+// THE ITEM AN ENCHANTING RUNG IS CAST ON (#1523). Every Enchanting skill-up
+// rung past the rods is SPELL_EFFECT_ENCHANT_ITEM: the core refuses it with
+// SPELL_FAILED_ITEM_NOT_FOUND unless the cast names an item, and the cast
+// overwrites that item's permanent enchant slot. So the target is chosen
+// here, from facts the adapter reads about each item the crafter holds.
+struct EnchantTargetCandidate
+{
+    bool fitsSpell{false};      // Item::IsFitToSpellRequirements
+    bool levelOk{false};        // the core's item-level gate (Spell::CheckItems)
+    bool equipped{false};       // worn, not in the bags
+    bool kept{false};           // a keep reservation protects it
+    uint32_t quality{0};        // ItemTemplate::Quality
+    bool questItem{false};      // a quest item, or one that starts a quest
+    uint32_t permEnchant{0};    // PERM_ENCHANTMENT_SLOT's enchant id, 0 = empty
+};
+
+struct EnchantSpellFacts
+{
+    uint32_t ownEnchant{0};     // the spell's own enchant (Effects[i].MiscValue)
+    uint32_t ownRank{0};        // its MinSkillLineRank in Enchanting, 0 = unknown
+};
+
+// enchant id -> the MinSkillLineRank of the Enchanting spell that applies it.
+// An enchant absent here has no Enchanting source (an armor kit, a libram, a
+// rogue's poison, something unknown) and is never written over.
+using EnchantRanks = std::map<uint32_t, uint32_t>;
+
+// The index of the candidate to enchant, or -1 for none (the errand waits).
+// a. Only a candidate that fits the spell and passes the level gate.
+// b. First choice: a bag item, not kept, quality at most uncommon, not a quest
+//    item. The lowest quality wins; ties keep the given order.
+// c. Else a worn item, only when its permanent slot is empty, already holds
+//    this spell's own enchant, or holds an Enchanting enchant whose rank is
+//    known and at or below this spell's own (known and non-zero). Empty or
+//    the same enchant is taken before an overwrite. A ladder rung never
+//    replaces a better enchant on worn gear.
+int PickEnchantTarget(EnchantSpellFacts const& spell,
+                      std::vector<EnchantTargetCandidate> const& candidates,
+                      EnchantRanks const& ranks);
+
+// THE ITEM A kind='disenchant' ROW NAMES (#1523). `guid:<item_instance.guid>`,
+// optionally followed by ` count:1`, the same token form the sell rows use.
+// A row with no `guid:` token at all is the unnamed form and keeps the
+// module's own candidate rule. A row with a `guid:` token that does not parse
+// (no digits, zero, overflow, or a count other than 1) is malformed and is
+// held, never guessed at.
+struct DisenchantTarget
+{
+    bool named{false};
+    bool malformed{false};
+    uint32_t guid{0};
+};
+DisenchantTarget ParseDisenchantTarget(std::string const& command);
+
+// What the adapter knows about the item a disenchant row named.
+struct NamedDisenchantFacts
+{
+    bool found{false};          // the player owns an item with that guid
+    bool inBags{false};         // in the backpack or a bag, not worn or banked
+    bool kept{false};
+    uint32_t quality{0};
+    bool weaponOrArmor{false};
+    uint32_t disenchantId{0};
+    int32_t requiredSkill{-1};  // ItemTemplate::RequiredDisenchantSkill
+    uint32_t skill{0};          // the player's Enchanting skill
+};
+
+// "" when the named item may be disenchanted, otherwise the reason the row
+// stays standing. Soulbound and usability are NOT asked: the writer of a
+// named row already applied the guild's keep rules.
+char const* NamedDisenchantRefusal(NamedDisenchantFacts const& facts);
+
 // A LONE CRAFTER IN A ZONE THAT KEEPS KILLING IT (#1208). A character on job
 // 'craft' is away from its family and nothing walks it anywhere: on wow-dev,
 // in the 24 hours to 2026-10-27 23:52 UTC, Og (43) died 13 times alone in

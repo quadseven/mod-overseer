@@ -40,8 +40,8 @@ class DisenchantReplay(unittest.TestCase):
             built = subprocess.run([
                 compiler, "-std=c++17", "-Wall", "-Wextra",
                 "-I" + str(ROOT / "tests/fixtures/disenchant"),
-                "-I" + str(ROOT / "src"), str(cpp), "-lsqlite3", "-o", str(binary),
-            ], capture_output=True, text=True, timeout=90)
+                "-I" + str(ROOT / "src"), str(cpp), str(ROOT / "src/overseer_decisions.cpp"), "-lsqlite3", "-o", str(binary),
+            ], capture_output=True, text=True, timeout=300)
             self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
             ran = subprocess.run([str(binary)], capture_output=True, text=True, timeout=20)
             self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
