@@ -8861,15 +8861,16 @@ bool CutOffFollowerRoams(std::string const& job, std::string const& target);
 
 // ---------- a follower walks its own errand in individual mode (#1517) -----
 //
-// quadseven/wow-overseer#2395: outside a dungeon or a raid, each family member
+// wow-overseer#2395: outside a dungeon or a raid, each family member
 // may walk to its own trainer, vendor or banker. Before this a follower's own
 // aim answered AimedMover::RefuseInFormation and moved nobody, so only the
 // leader ever ran an errand.
 //
 // WHAT LINKS A FAMILY. A dungeon job (`dungeon`, `dungeon:<keyword>`) or a raid
-// job (`raid:<keyword>`) on any enabled member. `town run` and `raid prep` do
-// not: the operator links a family only for a dungeon or a raid. The bridge's
-// individual.links holds the same three shapes.
+// job (`raid:<keyword>`) on any enabled member, read without regard to case or
+// surrounding spaces. `town run` and `raid prep` do not: the operator links a
+// family only for a dungeon or a raid. The bridge's individual.links holds the
+// same three shapes and normalises the same way.
 bool IsLinkingJob(std::string const& job);
 bool FamilyLinked(std::vector<std::string> const& memberJobs);
 
@@ -8894,10 +8895,41 @@ struct IndividualErrandFacts
     // A catch-up walk, a walk home, an escort or a run's claim holds the
     // column: the aim is somebody else's, not the member's own errand.
     bool claimedByAnotherOwner{false};
+    // The map the leader stands on. An `at:` aim names its map, and one on any
+    // other map is not walked alone. An areatrigger and a flight master lead
+    // off the ground the family stands on, so neither is walked alone either.
+    uint32_t leaderMapId{0};
+    // THE ERRAND HAS LANDED. The member arrived at this very aim and the
+    // travel book let it go, but the pass that wrote it has not cleared it
+    // (a foreign `at:` aim is never cleared by this module). Without this the
+    // member would keep `new rpg`, never be caught up or waited for, and walk
+    // the same aim again when the landing ceiling lapses. It follows again.
+    bool landedOnIt{false};
 };
 
 // May this follower steer itself to its own errand this poll?
 bool IndividualErrandSteers(IndividualErrandFacts const& facts);
+
+// The whole set for one travel poll: empty while the switch is off,
+// whatever the facts say.
+std::set<std::string> IndividualErrandSet(
+    bool enabled, std::vector<std::pair<std::string, IndividualErrandFacts>> const& members);
+
+// Who started and who stopped walking an errand of its own between two
+// polls, each in name order, so the adapter logs each change once.
+struct IndividualErrandChange
+{
+    std::vector<std::string> started;
+    std::vector<std::string> stopped;
+};
+IndividualErrandChange IndividualErrandChanges(std::set<std::string> const& before,
+                                               std::set<std::string> const& after);
+
+// THE DEATH BREAKER, PER WALKER. A member on its own errand answers for its
+// own deaths only, and it is left out of every other walker's party toll: the
+// rest of its family is somewhere else, and their deaths are not this walk's.
+uint32_t ErrandPartyDeaths(bool onItsOwnErrand, uint32_t ownDeaths, uint32_t partyDeaths);
+bool PartyTollCounts(bool memberOnItsOwnErrand);
 
 // -------------- the family waits for the member it left behind (#404) -------
 //
@@ -9284,10 +9316,10 @@ struct FetchCandidate
     // It was fetched, or given up on, within the fetch stand-down.
     bool stoodDown{false};
     // How far from the leader, when `seen` and `sameMap`.
+    float yards{-1.f};
     // IT WALKS AN ERRAND OF ITS OWN (#1517). Never fetched, and not a member
     // still walking back: it is walking away on purpose.
     bool onItsOwnErrand{false};
-    float yards{-1.f};
 };
 
 struct FetchLimits

@@ -12,7 +12,12 @@
  *  - DriveCatchUp returns for a member on its own errand before any walk back.
  *  - The regroup wait and the fetch both read it, so the leader is never held
  *    for, or sent back for, a member on its own errand.
- *  - The errand death breaker counts only that member's own deaths.
+ *  - The errand death breaker counts only that member's own deaths, through
+ *    the pure ErrandPartyDeaths, and a member on its own errand is left out of
+ *    every other walker's party toll through PartyTollCounts.
+ *  - A failed job read fails closed; a landed aim ends the errand; a flight
+ *    or a Mage's portal is never taken on one; and a released column ends it
+ *    at once (WalksItsOwnErrand asks the column too).
  */
 
 #include <cstdlib>
@@ -73,8 +78,22 @@ int main()
     Check(refresh.find("GetOption<bool>(\"Overseer.Individual.Enable\", false, false)") !=
               std::string::npos,
           "the switch is read with a default of false");
-    Check(refresh.find("OverseerDecisions::IndividualErrandSteers(facts)") != std::string::npos,
-          "the set is decided by the pure rule");
+    Check(refresh.find("OverseerDecisions::IndividualErrandSet(enabled, rows)") !=
+              std::string::npos,
+          "the set is decided by the pure rule, gated by the switch");
+    Check(refresh.find("OverseerDecisions::IndividualErrandChanges(_individualErrands, next)") !=
+              std::string::npos,
+          "each start and stop is logged from the pure swap");
+    Check(refresh.find("LoadAllJobs(jobsRead)") != std::string::npos &&
+              refresh.find("facts.familyLinked = !jobsRead ||") != std::string::npos,
+          "a failed job read fails closed");
+    Check(refresh.find("_travelAims.HoldsLanding(name, aim)") != std::string::npos &&
+              refresh.find("facts.landedOnIt = _individualLanded.count(name) != 0;") !=
+                  std::string::npos,
+          "a landed aim ends the errand");
+    Check(refresh.find("facts.leaderMapId = leader ? leader->GetMapId() : 0;") !=
+              std::string::npos,
+          "the aim's map is asked against the leader's");
     Check(refresh.find("OverseerDecisions::FamilyLinked(") != std::string::npos,
           "a family on a dungeon or raid job is linked");
     Check(refresh.find("family.empty() ||") != std::string::npos,
@@ -85,7 +104,7 @@ int main()
           "a catch-up or run claim is not the member's own errand");
 
     std::string const travel = Body(text, "    void DriveTravel()");
-    Check(Before(travel, "RefreshIndividualErrands(aims, jobs);", "if (aims.empty())"),
+    Check(Before(travel, "RefreshIndividualErrands(aims);", "if (aims.empty())"),
           "the travel poll refreshes the set before it returns on an empty column");
 
     std::string const steer = Body(text, "    bool MaySteerItself(std::string const& name) const");
@@ -106,9 +125,26 @@ int main()
               std::string::npos,
           "the fetch reads it");
 
+    // The guard and the assignment are one statement, so deleting the guard
+    // cannot leave the assignment behind; and it follows the party read.
     Check(Before(text, "toll.partyDeaths = RecentPartyDeathCount(bot, window);",
-                 "toll.partyDeaths = toll.deaths;"),
-          "the death breaker counts only its own deaths");
+                 "toll.partyDeaths = OverseerDecisions::ErrandPartyDeaths(\n"
+                 "                    WalksItsOwnErrand(name), toll.deaths, toll.partyDeaths);"),
+          "the walker's own toll goes through ErrandPartyDeaths with its own errand");
+    std::string const party = Body(text, "    uint32 RecentPartyDeathCount(");
+    Check(party.find("OverseerDecisions::PartyTollCounts(WalksItsOwnErrand(member->GetName()))") !=
+              std::string::npos,
+          "a member on its own errand is left out of another walker's party toll");
+
+    std::string const walks = Body(text, "    bool WalksItsOwnErrand(std::string const& name) const");
+    Check(walks.find("!_travelAims.TargetFor(name).empty()") != std::string::npos,
+          "a released column ends the errand at once");
+    std::string const flight = Body(text, "    bool ConsiderFlight(");
+    Check(flight.find("if (WalksItsOwnErrand(name))") != std::string::npos,
+          "no flight is taken on an errand of its own");
+    Check(travel.find("!WalksItsOwnErrand(name) &&\n                MageTravelHolds(") !=
+              std::string::npos,
+          "no Mage portal is taken on an errand of its own");
 
     std::string const conf = Read("conf/mod_overseer.conf.dist");
     Check(conf.find("#Overseer.Individual.Enable = 0") != std::string::npos,

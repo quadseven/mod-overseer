@@ -1,6 +1,6 @@
 /*
  * A follower walks its own errand while its family is not linked (#1517,
- * part of quadseven/wow-overseer#2395).
+ * part of wow-overseer#2395).
  *
  * Outside a dungeon or a raid, a family member may walk to its own trainer,
  * vendor or banker. Before this, a follower's own aim answered
@@ -18,6 +18,8 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <set>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -170,6 +172,56 @@ int main()
     walking.onItsOwnErrand = true;
     Check(PickFetchTarget({walking, other}, fetch, false) == "Grog",
           "a member on its own errand is not one still walking back");
+
+    // --- jobs are read the way the bridge reads them ---------------------------
+    Check(IsLinkingJob(" Dungeon:Wailing "), "case and spaces do not hide a dungeon job");
+    Check(IsLinkingJob("RAID:moltencore"), "case does not hide a raid job");
+
+    // --- the destination must be on the leader's map, and walked on foot -----
+    {
+        auto f = Walking();
+        f.leaderMapId = 0;
+        f.ownAim = "at:0:-8815.2,652.9,94.9";
+        Check(IndividualErrandSteers(f), "an at: aim on the leader's map is walked");
+        f.ownAim = "at:1:1782.0,-1627.8,61.5";
+        Check(!IndividualErrandSteers(f), "an at: aim on another map is not");
+        f.ownAim = "at:garbage";
+        Check(!IndividualErrandSteers(f), "an unreadable at: aim is not");
+        f.ownAim = "trigger:324";
+        Check(!IndividualErrandSteers(f), "an areatrigger leads off the map and is not walked alone");
+        f.ownAim = "flight master";
+        Check(!IndividualErrandSteers(f), "a flight is not an errand walked alone");
+    }
+
+    // --- an errand ends when it lands ------------------------------------------
+    {
+        auto f = Walking();
+        f.landedOnIt = true;
+        Check(!IndividualErrandSteers(f),
+              "a member that landed on its aim follows again, whoever wrote the aim");
+    }
+
+    // --- the switch gates the whole set ----------------------------------------
+    std::vector<std::pair<std::string, IndividualErrandFacts>> rows{{"Og", Walking()},
+                                                                    {"Bork", Walking()}};
+    rows[1].second.familyLinked = true;
+    Check(IndividualErrandSet(false, rows).empty(), "the switch off leaves the set empty");
+    Check(IndividualErrandSet(true, rows) == std::set<std::string>{"Og"},
+          "the switch on picks only the members the rule picks");
+
+    // --- the swap says who started and who stopped -----------------------------
+    IndividualErrandChange const change =
+        IndividualErrandChanges({"Og", "Ugga"}, {"Og", "Bork"});
+    Check(change.started == std::vector<std::string>{"Bork"}, "Bork started");
+    Check(change.stopped == std::vector<std::string>{"Ugga"}, "Ugga stopped");
+
+    // --- deaths: each walker answers for its own ------------------------------
+    Check(ErrandPartyDeaths(true, 1, 9) == 1,
+          "a member on its own errand counts only its own deaths");
+    Check(ErrandPartyDeaths(false, 1, 9) == 9, "anyone else counts its party's");
+    Check(!PartyTollCounts(true),
+          "a member away on its own errand is not in another walker's party toll");
+    Check(PartyTollCounts(false), "a member with the family is");
 
     if (failures)
         return EXIT_FAILURE;

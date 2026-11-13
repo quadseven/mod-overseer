@@ -12,6 +12,7 @@
 #include "overseer_decisions.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
@@ -7897,8 +7898,15 @@ UnissuedFlightStep TownLeaderUnissuedFlight(bool mayCarryNewRpg, bool statusIsTr
 
 bool IsLinkingJob(std::string const& job)
 {
-    return job == "dungeon" || job.rfind("dungeon:", 0) == 0 ||
-           job.rfind(RAID_JOB_PREFIX, 0) == 0;
+    std::size_t const first = job.find_first_not_of(" \t");
+    if (first == std::string::npos)
+        return false;
+    std::size_t const last = job.find_last_not_of(" \t");
+    std::string value = job.substr(first, last - first + 1);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value == "dungeon" || value.rfind("dungeon:", 0) == 0 ||
+           value.rfind(RAID_JOB_PREFIX, 0) == 0;
 }
 
 bool FamilyLinked(std::vector<std::string> const& memberJobs)
@@ -7913,9 +7921,61 @@ bool IndividualErrandSteers(IndividualErrandFacts const& facts)
 {
     if (!facts.enabled || facts.leadsItsParty || facts.familyLinked || facts.inARun)
         return false;
-    if (!facts.sameMapAsLeader || facts.claimedByAnotherOwner)
+    if (!facts.sameMapAsLeader || facts.claimedByAnotherOwner || facts.landedOnIt)
         return false;
-    return !facts.ownAim.empty() && !IsTravelGuardAim(facts.ownAim);
+    std::string const& aim = facts.ownAim;
+    if (aim.empty() || IsTravelGuardAim(aim))
+        return false;
+    // Off the family's ground: a portal or a flight is not walked alone.
+    if (aim.rfind("trigger:", 0) == 0 || aim == "flight master")
+        return false;
+    if (aim.rfind("at:", 0) == 0)
+    {
+        std::istringstream in(aim.substr(3));
+        uint32_t map = 0;
+        char colon = 0;
+        if (!(in >> map >> colon) || colon != ':')
+            return false;
+        return map == facts.leaderMapId;
+    }
+    return true;
+}
+
+std::set<std::string> IndividualErrandSet(
+    bool enabled, std::vector<std::pair<std::string, IndividualErrandFacts>> const& members)
+{
+    std::set<std::string> out;
+    if (!enabled)
+        return out;
+    for (auto const& [name, facts] : members)
+    {
+        IndividualErrandFacts asked = facts;
+        asked.enabled = true;
+        if (IndividualErrandSteers(asked))
+            out.insert(name);
+    }
+    return out;
+}
+
+IndividualErrandChange IndividualErrandChanges(std::set<std::string> const& before,
+                                               std::set<std::string> const& after)
+{
+    IndividualErrandChange change;
+    std::set_difference(after.begin(), after.end(), before.begin(), before.end(),
+                        std::back_inserter(change.started));
+    std::set_difference(before.begin(), before.end(), after.begin(), after.end(),
+                        std::back_inserter(change.stopped));
+    return change;
+}
+
+uint32_t ErrandPartyDeaths(bool onItsOwnErrand, uint32_t ownDeaths, uint32_t partyDeaths)
+{
+    return onItsOwnErrand ? ownDeaths : partyDeaths;
+}
+
+bool PartyTollCounts(bool memberOnItsOwnErrand)
+{
+    return !memberOnItsOwnErrand;
 }
 
 bool CutOffFollowerRoams(std::string const& job, std::string const& target)
