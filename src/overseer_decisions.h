@@ -8803,7 +8803,22 @@ bool HoldsInTown(std::string const& job);
 // not, and a family half moved onto the wait must not send the other half off
 // on the questing rules. The party poll reads every row and asks this once, and
 // the two answers below are given the family's answer rather than each row's.
+//
+// A FARMING FAMILY IS HELD THE SAME WAY (#1521). The bridge's farm drive walks
+// the leader from one surveyed node spawn to the next, one ground aim per hop,
+// and each aim ends on arrival. Between two hops the leader has no aim, and on
+// any job but this wait an idle leader keeps `new rpg` and upstream rolls its
+// own status: a wander, a far grind spot or a flight. So a family with any
+// farm row stays where its aims put it, exactly as a family waiting in town
+// does, and every answer that reads this family's hold (the leader's grant,
+// the cut-off follower, the arrival strip, the unissued flight) treats it so.
 bool FamilyHoldsInTown(std::vector<std::string> const& jobs);
+
+// Whether `job` is a farm order (#1521): `farm`, `farm:<item entry>` for a
+// named material, or `farm:mining` / `farm:herbalism` for skill. The entry is
+// 1 to 9 digits and not zero. Exact and lowercase, like every job comparison
+// here: DoJob lowercases the mode before it is checked or stored.
+bool IsFarmJob(std::string const& job);
 
 // May the party leader carry `new rpg` on this poll? Always for a questing
 // family, whose leader is its one traveller. In town only while it has an aim or
