@@ -16191,6 +16191,40 @@ private:
         return bought;
     }
 
+    // WHAT THE VISIT SAW, RECORDED FOR THE BRIDGE (wow-overseer issue 2432).
+    // The bridge sends a crafter here when a ladder recipe looks unbought, and
+    // the only book it can read is character_spell, which lags a purchase by
+    // the save interval and never holds a recipe a playerbot was granted at
+    // creation. So each visit records every recipe of the trade the member
+    // holds by HasSpell ('recipe-known', the spell) and the visit itself
+    // ('trainer-visit', the trade's skill). A held recipe then stops reading
+    // as due after one visit, and one the trainer will not sell is not walked
+    // to again until the bridge's retry window has passed.
+    static void NoteTrainerVisit(Trainer::Trainer* trainer, Player* bot, uint32 skill)
+    {
+        std::vector<OverseerDecisions::TrainerRecipeOffer> offers;
+        for (Trainer::Spell const& spell : trainer->GetSpells())
+        {
+            if (spell.ReqSkillLine != skill)
+                continue;
+            OverseerDecisions::TrainerRecipeOffer offer;
+            offer.spellId = spell.SpellId;
+            offer.skillLine = spell.ReqSkillLine;
+            offer.known = bot->HasSpell(spell.SpellId);
+            offer.startsSkill = SkillStartedBySpell(spell.SpellId, true) != 0;
+            offers.push_back(offer);
+        }
+        for (uint32 spellId : OverseerDecisions::HeldTradeRecipes(offers, skill))
+        {
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+            RecordEvent(bot, "recipe-known", spellId,
+                        info ? std::string(info->SpellName[LOCALE_enUS]) : std::string(),
+                        "holds this recipe, read at its trade's trainer");
+        }
+        RecordEvent(bot, "trainer-visit", skill, SkillName(skill),
+                    "stood at its trade's trainer on a learn errand");
+    }
+
     // Every enabled character the roster has an OPINION about, name -> plan.
     //
     // READ ON ITS OWN, like LoadQuestAims and TravelAimBook::Load and for the same
@@ -16666,7 +16700,9 @@ private:
             // NO RANK FOR SALE IS NOT NO ERRAND: a character at its ceiling can
             // still lack the recipes the trainer teaches (Heavy Linen Bandage).
             // Only when neither is on offer does the errand drop.
-            if (uint32 const recipes = BuyRecipes(trainer, npc, bot, skill))
+            uint32 const recipes = BuyRecipes(trainer, npc, bot, skill);
+            NoteTrainerVisit(trainer, bot, skill);
+            if (recipes)
             {
                 LOG_INFO("module.overseer",
                          "overseer: '{}' bought {} recipe(s) of {} ({}) from '{}' (creature {}); "
@@ -16747,6 +16783,7 @@ private:
         if (uint32 const recipes = BuyRecipes(trainer, npc, bot, skill))
             RecordEvent(bot, "learn", skill, skillName,
                         "bought the recipes this trainer teaches, at the trainer's price");
+        NoteTrainerVisit(trainer, bot, skill);
         ClearLearnAim(name);
         return true;
     }

@@ -21580,6 +21580,29 @@ std::vector<uint32_t> PlanClassLearns(std::vector<ClassLearnCandidate> candidate
     return plan;
 }
 
+uint64_t RecipePurseFloor(uint32_t level)
+{
+    uint64_t const reserve =
+        RECIPE_REPAIR_RESERVE_PER_LEVEL_SQ * static_cast<uint64_t>(level) * level;
+    return reserve > RECIPE_PURSE_FLOOR_COPPER ? reserve : RECIPE_PURSE_FLOOR_COPPER;
+}
+
+std::vector<uint32_t> HeldTradeRecipes(std::vector<TrainerRecipeOffer> const& offers,
+                                       uint32_t skill)
+{
+    std::vector<uint32_t> held;
+    if (skill == 0)
+        return held;
+    for (TrainerRecipeOffer const& offer : offers)
+    {
+        if (offer.skillLine != skill || !offer.known || offer.startsSkill)
+            continue;
+        if (std::find(held.begin(), held.end(), offer.spellId) == held.end())
+            held.push_back(offer.spellId);
+    }
+    return held;
+}
+
 std::vector<uint32_t> PlanRecipePurchases(std::vector<TrainerRecipeOffer> offers, uint32_t skill,
                                           bool hasSkill, uint32_t skillValue, uint32_t level,
                                           uint64_t purse)
@@ -21588,6 +21611,7 @@ std::vector<uint32_t> PlanRecipePurchases(std::vector<TrainerRecipeOffer> offers
     // Never a recipe for a trade the character does not hold.
     if (!hasSkill || skill == 0)
         return plan;
+    uint64_t const floor = RecipePurseFloor(level);
     std::vector<TrainerRecipeOffer> useful;
     for (TrainerRecipeOffer const& offer : offers)
     {
@@ -21611,8 +21635,7 @@ std::vector<uint32_t> PlanRecipePurchases(std::vector<TrainerRecipeOffer> offers
     {
         // Ascending cost: the first one the purse cannot carry above the floor
         // is followed only by dearer ones.
-        if (purse < RECIPE_PURSE_FLOOR_COPPER ||
-            offer.cost > purse - RECIPE_PURSE_FLOOR_COPPER)
+        if (purse < floor || offer.cost > purse - floor)
             break;
         purse -= offer.cost;
         plan.push_back(offer.spellId);

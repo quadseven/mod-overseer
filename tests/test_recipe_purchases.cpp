@@ -22,8 +22,10 @@
 #include <string>
 #include <vector>
 
+using OverseerDecisions::HeldTradeRecipes;
 using OverseerDecisions::PlanRecipePurchases;
 using OverseerDecisions::RECIPE_PURSE_FLOOR_COPPER;
+using OverseerDecisions::RecipePurseFloor;
 using OverseerDecisions::TrainerRecipeOffer;
 
 namespace
@@ -78,7 +80,7 @@ int main()
     // 60 for 100 copper, a purse that covers it.
     {
         auto const plan = PlanRecipePurchases({Offer(3276, FIRST_AID, 60, 100)}, FIRST_AID, true,
-                                              60, 10, 1000);
+                                              60, 10, 10000);
         Check("heavy linen bandage is bought", plan == std::vector<uint32_t>{3276});
     }
     // Row 2: no profession, no recipe. The same list for a character without it.
@@ -134,29 +136,64 @@ int main()
             TAILORING, true, 150, 30, 100000);
         Check("cheapest, then rank, then id", Join(plan) == "20 21 10 30 ");
     }
-    // Row 9: the purse floor. 1000 copper, floor 100: 900 may be spent.
+    // Row 9: the purse floor at level 1. 1000 copper, floor 100: 900 may be
+    // spent.
     {
         std::vector<TrainerRecipeOffer> offers{Offer(1, TAILORING, 1, 400),
                                                Offer(2, TAILORING, 1, 500),
                                                Offer(3, TAILORING, 1, 600)};
         Check("spending stops at the floor",
-              Join(PlanRecipePurchases(offers, TAILORING, true, 50, 20, 1000)) == "1 2 ");
+              Join(PlanRecipePurchases(offers, TAILORING, true, 50, 1, 1000)) == "1 2 ");
         Check("exactly down to the floor is allowed",
-              Join(PlanRecipePurchases({Offer(1, TAILORING, 1, 900)}, TAILORING, true, 50, 20,
+              Join(PlanRecipePurchases({Offer(1, TAILORING, 1, 900)}, TAILORING, true, 50, 1,
                                        1000)) == "1 ");
         Check("one copper under the floor is refused",
-              PlanRecipePurchases({Offer(1, TAILORING, 1, 901)}, TAILORING, true, 50, 20,
+              PlanRecipePurchases({Offer(1, TAILORING, 1, 901)}, TAILORING, true, 50, 1,
                                   1000).empty());
     }
     // Row 10: a purse at or under the floor buys nothing, even a free recipe
     // (nothing left to be a floor for), and a free recipe above it is bought.
     {
         Check("a purse under the floor buys nothing",
-              PlanRecipePurchases({Offer(1, TAILORING, 1, 0)}, TAILORING, true, 50, 20,
+              PlanRecipePurchases({Offer(1, TAILORING, 1, 0)}, TAILORING, true, 50, 1,
                                   RECIPE_PURSE_FLOOR_COPPER - 1).empty());
         Check("a free recipe is bought above the floor",
-              PlanRecipePurchases({Offer(1, TAILORING, 1, 0)}, TAILORING, true, 50, 20,
+              PlanRecipePurchases({Offer(1, TAILORING, 1, 0)}, TAILORING, true, 50, 1,
                                   RECIPE_PURSE_FLOOR_COPPER) == std::vector<uint32_t>{1});
+    }
+    // Row 12: the repair reserve grows with level (wow-overseer issue 2432).
+    // A level 60 member keeps 3g 60s for its repair, not 1 silver.
+    {
+        Check("level 1 keeps the silver", RecipePurseFloor(1) == RECIPE_PURSE_FLOOR_COPPER);
+        Check("level 0 keeps the silver", RecipePurseFloor(0) == RECIPE_PURSE_FLOOR_COPPER);
+        Check("level 60 keeps 3g 60s", RecipePurseFloor(60) == 36000);
+        Check("the reserve grows", RecipePurseFloor(20) < RecipePurseFloor(40));
+        // 40,000 copper at 60: 4,000 may be spent.
+        std::vector<TrainerRecipeOffer> offers{Offer(1, TAILORING, 1, 3000),
+                                               Offer(2, TAILORING, 1, 1500)};
+        Check("a level 60 visit stops at the reserve",
+              Join(PlanRecipePurchases(offers, TAILORING, true, 150, 60, 40000)) == "2 ");
+        Check("a purse inside the reserve buys nothing at 60",
+              PlanRecipePurchases({Offer(1, TAILORING, 1, 1)}, TAILORING, true, 150, 60,
+                                  36000).empty());
+    }
+    // Row 13: what a visit records as held. Only the trade's own known
+    // recipes, never a rank, another trade's spell or an unknown one.
+    {
+        TrainerRecipeOffer held = Offer(3276, FIRST_AID, 40, 100);
+        held.known = true;
+        TrainerRecipeOffer rank = Offer(3280, FIRST_AID, 50, 500);
+        rank.known = true;
+        rank.startsSkill = true;
+        TrainerRecipeOffer other = Offer(2387, TAILORING, 1, 10);
+        other.known = true;
+        TrainerRecipeOffer unknown = Offer(3277, FIRST_AID, 80, 250);
+        Check("held recipes of the trade",
+              HeldTradeRecipes({held, rank, other, unknown}, FIRST_AID) ==
+                  std::vector<uint32_t>{3276});
+        Check("a repeated spell is recorded once",
+              HeldTradeRecipes({held, held}, FIRST_AID) == std::vector<uint32_t>{3276});
+        Check("no trade, nothing held", HeldTradeRecipes({held}, 0).empty());
     }
     // Row 11: nothing offered.
     Check("an empty list buys nothing",
@@ -185,6 +222,25 @@ int main()
               body.find("bought recipe '{}' ({}) of {} ({})") != std::string::npos);
         Check("each recipe is its own learn event",
               body.find("RecordEvent(bot, \"learn\", spellId, recipe,") != std::string::npos);
+        // Each arrival records what it saw for the bridge: the held recipes
+        // and the visit, on the recipe-only path and after a rank.
+        Check("a visit records held recipes",
+              body.find("RecordEvent(bot, \"recipe-known\", spellId,") != std::string::npos);
+        Check("a visit records itself",
+              body.find("RecordEvent(bot, \"trainer-visit\", skill,") != std::string::npos);
+        Check("the held read asks the decision",
+              body.find("OverseerDecisions::HeldTradeRecipes(offers, skill)") != std::string::npos);
+        std::size_t const arrive = src.find("bool TrainRankOnArrival(");
+        std::size_t const named = src.find("bool BuyNamedRecipe(");
+        std::string const arrival = arrive == std::string::npos || named == std::string::npos
+                                        ? std::string()
+                                        : src.substr(arrive, named - arrive);
+        std::size_t notes = 0;
+        for (std::size_t at = arrival.find("NoteTrainerVisit(trainer, bot, skill);");
+             at != std::string::npos;
+             at = arrival.find("NoteTrainerVisit(trainer, bot, skill);", at + 1))
+            ++notes;
+        Check("both arrival outcomes note the visit", notes == 2);
     }
 
     if (failures)
