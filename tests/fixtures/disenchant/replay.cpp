@@ -74,11 +74,14 @@ public:
     {
         ObjectAccessor::players[player.name]=&player;
         std::string sql="INSERT INTO overseer_roster VALUES('Smith',1,'";
-        sql+=job; sql+="');INSERT INTO overseer_command(id,target_name,kind,status,command) VALUES(1,'Smith','disenchant','pending','";
-        sql+=command; sql+="');";
+        sql+=job; sql+="');INSERT INTO overseer_command(id,target_name,kind,status,command,created_at) VALUES(1,'Smith','disenchant','pending','";
+        sql+=command; sql+="',"+std::to_string(GameTime::now)+");";
         _disenchantStore.Exec(sql.c_str());
     }
     std::string Said() { return _disenchantStore.ResultText(1); }
+    // A second pending row for the same member, unnamed, to see it unblocked.
+    void AddLater() { _disenchantStore.Exec("INSERT INTO overseer_command(id,target_name,kind,status) VALUES(3,'Smith','disenchant','pending');"); }
+    std::string LaterStatus() { return _disenchantStore.Status(3); }
     std::string SecondStatus() { return _disenchantStore.Status(100); }
     std::size_t Queued() { return _disenchantStore.Queued(); }
 };
@@ -243,31 +246,31 @@ int main()
     }
     {
         Runtime runtime; Player player; runtime.AddNamed(player,"craft","guid:99 count:1"); runtime.Ticks(7);
-        Check("a named item not owned stays standing with that reason", player.casts==0 && runtime.Status()=="claimed" && runtime.Said().find("not owned")!=std::string::npos);
+        Check("a named item not owned yet stays standing with that reason", player.casts==0 && runtime.Status()=="claimed" && runtime.Said()=="named item not owned yet");
     }
     {
         Runtime runtime; Player player; player.items.at(42)->equipped=true;
         runtime.AddNamed(player,"craft","guid:42 count:1"); runtime.Ticks(7);
-        Check("a named worn item is refused as not in the bags", player.casts==0 && runtime.Status()=="claimed" && runtime.Said().find("not in the bags")!=std::string::npos);
+        Check("a named worn item is held as not in the bags", player.casts==0 && runtime.Status()=="claimed" && runtime.Said().find("not in the bags")!=std::string::npos);
     }
     {
         Runtime runtime; Player player; player.items.at(42)->kept=true;
         runtime.AddNamed(player,"craft","guid:42 count:1"); runtime.Ticks(7);
-        Check("a named kept item is refused as kept", player.casts==0 && runtime.Said().find("kept")!=std::string::npos);
+        Check("a named kept item ends the row as error", player.casts==0 && runtime.Status()=="error" && runtime.Said().find("kept")!=std::string::npos && player.GetItemByGuid(ObjectGuid(42)));
     }
     {
         Runtime runtime; Player player; player.skill=1; player.items.at(42)->proto.RequiredDisenchantSkill=25;
         runtime.AddNamed(player,"craft","guid:42 count:1"); runtime.Ticks(7);
-        Check("a named item above the skill is refused as skill too low", player.casts==0 && runtime.Said().find("skill too low")!=std::string::npos);
+        Check("a named item above the skill stays standing as skill too low", player.casts==0 && runtime.Status()=="claimed" && runtime.Said().find("skill too low")!=std::string::npos);
     }
     {
         Runtime runtime; Player player; player.items.at(42)->proto.Class=ITEM_CLASS_TRADE_GOODS;
         runtime.AddNamed(player,"craft","guid:42 count:1"); runtime.Ticks(7);
-        Check("a named trade good is refused as not disenchantable", player.casts==0 && runtime.Said().find("not disenchantable")!=std::string::npos);
+        Check("a named trade good ends the row as not disenchantable", player.casts==0 && runtime.Status()=="error" && runtime.Said().find("not disenchantable")!=std::string::npos);
     }
     {
         Runtime runtime; Player player; runtime.AddNamed(player,"craft","guid:abc"); runtime.Ticks(7);
-        Check("a malformed named row is held, never guessed at", player.casts==0 && runtime.Status()=="claimed" && runtime.Said().find("not guid:")!=std::string::npos);
+        Check("a malformed named row ends as error, never guessed at", player.casts==0 && runtime.Status()=="error" && runtime.Said().find("not guid:")!=std::string::npos);
     }
     {
         Runtime runtime; Player player; runtime.AddNamed(player,"town run",""); runtime.Ticks(6);
@@ -288,6 +291,29 @@ int main()
     {
         Runtime runtime; Player player; runtime.AddNamed(player,"quest","guid:42 count:1"); runtime.Ticks(7);
         Check("a questing member does not disenchant", player.casts==0 && runtime.Status()=="claimed");
+    }
+    {
+        // The writer moves the item with kind='give' and names it at once.
+        Runtime runtime; Player player;
+        auto moved=std::move(player.items.at(42)); player.items.erase(42);
+        moved->bound=false; moved->proto.usable=true;
+        runtime.AddNamed(player,"craft","guid:42 count:1"); runtime.Ticks(7);
+        Check("a named item still on its way holds the row", player.casts==0 && runtime.Status()=="claimed" && runtime.Said()=="named item not owned yet");
+        GameTime::now+=300; runtime.Ticks(2);
+        player.items.emplace(42,std::move(moved)); runtime.Ticks(6);
+        Check("and is disenchanted once the give lands", runtime.Status()=="delivered" && player.casts==1 && player.GetItemCount(10940)==9 && !player.GetItemByGuid(ObjectGuid(42)));
+    }
+    {
+        Runtime runtime; Player player; player.items.erase(42);
+        runtime.AddNamed(player,"craft","guid:42 count:1"); runtime.Ticks(5);
+        runtime.AddLater();
+        auto spare=std::make_unique<Item>(); spare->guid=84; player.items.emplace(84,std::move(spare));
+        runtime.Ticks(5);
+        Check("a young missing item holds the row and defers the member's next row", runtime.Status()=="claimed" && runtime.LaterStatus()=="pending" && player.casts==0);
+        GameTime::now+=OverseerDecisions::NAMED_DISENCHANT_ARRIVAL_SECONDS; runtime.Ticks(5);
+        Check("a named item that never arrives ends the row as error after fifteen minutes", runtime.Status()=="error" && runtime.Said()=="named item never reached the enchanter");
+        runtime.Ticks(10);
+        Check("and the member's other row is no longer blocked", runtime.LaterStatus()=="delivered" && player.casts==1 && !player.GetItemByGuid(ObjectGuid(84)));
     }
     return failures?1:0;
 }

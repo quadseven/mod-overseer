@@ -16840,6 +16840,8 @@ private:
         std::string name;
         std::string job;
         std::string command;  // `guid:<n>[ count:1]` names the item (#1523)
+        int64 ageSeconds = 0; // since the row's created_at, database clock
+        time_t endedAt = 0;   // when an End was last written, 0 = never
         bool enabled = false;
         bool completing = false;
         std::string refusal;
@@ -17049,6 +17051,25 @@ private:
                  id, task.name, reason);
     }
 
+    // End a named row as status 'error' (#1523). The owned read then drops it
+    // and the enchanter's other rows stop being deferred behind it. Written
+    // again at most every 30 seconds until that read has seen it end.
+    void EndDisenchant(uint32 id, DisenchantTask& task, char const* reason)
+    {
+        time_t const now = GameTime::GetGameTime().count();
+        if (task.endedAt && now - task.endedAt < 30)
+            return;
+        task.endedAt = now;
+        task.refusal = reason;
+        auto* statement = _disenchantStore.Bound(OverseerDisenchant::Fail);
+        statement->SetData(0, std::string(reason));
+        statement->SetData(1, id);
+        statement->SetData(2, g_runToken);
+        _disenchantStore.Execute(statement);
+        LOG_INFO("module.overseer", "overseer: disenchant {} for '{}' ended as error: {}",
+                 id, task.name, reason);
+    }
+
     void ReadDisenchantCommands()
     {
         if (!_disenchantStore.Ready())
@@ -17086,6 +17107,7 @@ private:
                             task.job = fields[2].Get<std::string>();
                             task.enabled = fields[3].Get<uint8>() != 0;
                             task.command = fields[4].Get<std::string>();
+                            task.ageSeconds = fields[5].Get<int64>();
                             _disenchantClaiming.erase(task.name);
                         } while (result->NextRow());
                         // AI-REVIEW 2026-11-01 [claude-haiku-5-5] DE-STALE (Elder, PR #1303):
@@ -17274,7 +17296,7 @@ private:
                 OverseerDecisions::ParseDisenchantTarget(task.command);
             if (named.malformed)
             {
-                HoldDisenchant(id, task, "the command names an item but is not guid:<n> [count:1]");
+                EndDisenchant(id, task, "the command names an item but is not guid:<n> [count:1]");
                 continue;
             }
             SpellInfo const* info = sSpellMgr->GetSpellInfo(13262);
@@ -17283,10 +17305,16 @@ private:
             {
                 OverseerDecisions::NamedDisenchantFacts facts;
                 item = NamedDisenchantItem(player, named.guid, facts);
-                char const* const refusal = OverseerDecisions::NamedDisenchantRefusal(facts);
-                if (*refusal || !info)
+                OverseerDecisions::NamedDisenchantVerdict const verdict =
+                    OverseerDecisions::JudgeNamedDisenchant(facts, task.ageSeconds);
+                if (verdict.step == OverseerDecisions::NamedDisenchantStep::End)
                 {
-                    HoldDisenchant(id, task, *refusal ? refusal : "disenchant spell is not known");
+                    EndDisenchant(id, task, verdict.reason);
+                    continue;
+                }
+                if (verdict.step == OverseerDecisions::NamedDisenchantStep::Hold || !info)
+                {
+                    HoldDisenchant(id, task, info ? verdict.reason : "disenchant spell is not known");
                     continue;
                 }
             }
@@ -18190,10 +18218,14 @@ private:
             {
                 SpellCastTargets targets;
                 targets.SetItemTarget(enchantTarget);
+                // natural-only: a known recipe on the crafter's own item, untriggered.
                 result = bot->CastSpell(targets, info, nullptr, TRIGGERED_NONE);
             }
             else
+            {
+                // natural-only: a known recipe, untriggered, with its own reagents.
                 result = bot->CastSpell(bot, spellId, false);
+            }
             if (result == SPELL_CAST_OK)
             {
                 LOG_INFO("module.overseer",

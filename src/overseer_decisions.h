@@ -21936,10 +21936,25 @@ struct NamedDisenchantFacts
     uint32_t skill{0};          // the player's Enchanting skill
 };
 
-// "" when the named item may be disenchanted, otherwise the reason the row
-// stays standing. Soulbound and usability are NOT asked: the writer of a
-// named row already applied the guild's keep rules.
-char const* NamedDisenchantRefusal(NamedDisenchantFacts const& facts);
+// What a named row does this poll. Soulbound and usability are NOT asked:
+// the writer of a named row already applied the guild's keep rules.
+//   Cast  the item may be disenchanted now.
+//   Hold  the row stays standing with `reason`: the item is not in the bags
+//         yet (the writer moves it with a kind='give' row written at the same
+//         moment), or the skill is too low (skill rises).
+//   End   the row ends as status 'error' with `reason`, so it stops holding
+//         the enchanter's other rows: the item is kept or not disenchantable
+//         (neither changes by waiting), or it never reached the bags within
+//         NAMED_DISENCHANT_ARRIVAL_SECONDS of the row's created_at.
+enum class NamedDisenchantStep { Cast, Hold, End };
+struct NamedDisenchantVerdict
+{
+    NamedDisenchantStep step{NamedDisenchantStep::Hold};
+    char const* reason{""};
+};
+constexpr int64_t NAMED_DISENCHANT_ARRIVAL_SECONDS = 15 * 60;
+NamedDisenchantVerdict JudgeNamedDisenchant(NamedDisenchantFacts const& facts,
+                                            int64_t ageSeconds);
 
 // A LONE CRAFTER IN A ZONE THAT KEEPS KILLING IT (#1208). A character on job
 // 'craft' is away from its family and nothing walks it anywhere: on wow-dev,

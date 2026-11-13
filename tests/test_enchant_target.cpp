@@ -25,7 +25,6 @@ using OverseerDecisions::EnchantRanks;
 using OverseerDecisions::EnchantSpellFacts;
 using OverseerDecisions::EnchantTargetCandidate;
 using OverseerDecisions::NamedDisenchantFacts;
-using OverseerDecisions::NamedDisenchantRefusal;
 using OverseerDecisions::ParseDisenchantTarget;
 using OverseerDecisions::PickEnchantTarget;
 
@@ -170,52 +169,63 @@ NamedDisenchantFacts Disenchantable()
     return f;
 }
 
+using OverseerDecisions::JudgeNamedDisenchant;
+using OverseerDecisions::NAMED_DISENCHANT_ARRIVAL_SECONDS;
+using OverseerDecisions::NamedDisenchantStep;
+
+bool Is(NamedDisenchantFacts const& f, int64_t age, NamedDisenchantStep step, char const* words)
+{
+    OverseerDecisions::NamedDisenchantVerdict const v = JudgeNamedDisenchant(f, age);
+    return v.step == step && std::string(v.reason).find(words) != std::string::npos;
+}
+
 void TheNamedItem()
 {
+    int64_t const young = 60;
+    int64_t const late = NAMED_DISENCHANT_ARRIVAL_SECONDS;
     Check("an owned, bagged, disenchantable green may go",
-          std::string(NamedDisenchantRefusal(Disenchantable())).empty());
+          Is(Disenchantable(), young, NamedDisenchantStep::Cast, ""));
     NamedDisenchantFacts f = Disenchantable();
     f.quality = 4;
-    Check("an epic the writer named may go",
-          std::string(NamedDisenchantRefusal(f)).empty());
+    Check("an epic the writer named may go", Is(f, young, NamedDisenchantStep::Cast, ""));
     f = Disenchantable();
     f.found = false;
-    Check("an item not owned is refused as not owned",
-          std::string(NamedDisenchantRefusal(f)).find("not owned") != std::string::npos);
+    Check("an item not owned yet is held while the give is young",
+          Is(f, young, NamedDisenchantStep::Hold, "named item not owned yet"));
+    Check("and ends once the arrival window is spent",
+          Is(f, late, NamedDisenchantStep::End, "named item never reached the enchanter"));
+    Check("the window is fifteen minutes", NAMED_DISENCHANT_ARRIVAL_SECONDS == 900 &&
+          Is(f, late - 1, NamedDisenchantStep::Hold, "not owned yet"));
     f = Disenchantable();
     f.inBags = false;
-    Check("worn gear is refused as not in the bags",
-          std::string(NamedDisenchantRefusal(f)).find("not in the bags") != std::string::npos);
+    Check("worn gear is held as not in the bags",
+          Is(f, young, NamedDisenchantStep::Hold, "not in the bags"));
+    Check("and ends once the window is spent",
+          Is(f, late, NamedDisenchantStep::End, "never reached the enchanter's bags"));
     f = Disenchantable();
     f.kept = true;
-    Check("a kept item is refused as kept",
-          std::string(NamedDisenchantRefusal(f)).find("kept") != std::string::npos);
+    Check("a kept item ends the row at once", Is(f, young, NamedDisenchantStep::End, "kept"));
     f = Disenchantable();
     f.requiredSkill = 25;
     f.skill = 1;
-    Check("too little Enchanting is refused as skill too low",
-          std::string(NamedDisenchantRefusal(f)).find("skill too low") != std::string::npos);
+    Check("too little Enchanting holds, since skill rises",
+          Is(f, late * 10, NamedDisenchantStep::Hold, "skill too low"));
     char const* const notDe = "not disenchantable";
     f = Disenchantable();
     f.quality = 1;
-    Check("a white item is not disenchantable",
-          std::string(NamedDisenchantRefusal(f)).find(notDe) != std::string::npos);
+    Check("a white item ends the row", Is(f, young, NamedDisenchantStep::End, notDe));
     f = Disenchantable();
     f.quality = 5;
-    Check("a legendary is not disenchantable",
-          std::string(NamedDisenchantRefusal(f)).find(notDe) != std::string::npos);
+    Check("a legendary ends the row", Is(f, young, NamedDisenchantStep::End, notDe));
     f = Disenchantable();
     f.weaponOrArmor = false;
-    Check("a trade good is not disenchantable",
-          std::string(NamedDisenchantRefusal(f)).find(notDe) != std::string::npos);
+    Check("a trade good ends the row", Is(f, young, NamedDisenchantStep::End, notDe));
     f = Disenchantable();
     f.disenchantId = 0;
-    Check("no DisenchantID is not disenchantable",
-          std::string(NamedDisenchantRefusal(f)).find(notDe) != std::string::npos);
+    Check("no DisenchantID ends the row", Is(f, young, NamedDisenchantStep::End, notDe));
     f = Disenchantable();
     f.requiredSkill = -1;
-    Check("a negative required skill is not disenchantable",
-          std::string(NamedDisenchantRefusal(f)).find(notDe) != std::string::npos);
+    Check("a negative required skill ends the row", Is(f, young, NamedDisenchantStep::End, notDe));
 }
 
 std::string Body(std::string const& source, char const* head)
@@ -269,8 +279,12 @@ void TheAdapterIsWired()
           de.find("task.job != \"craft\"") == std::string::npos);
     Check("a named row is parsed from the command text",
           source.find("OverseerDecisions::ParseDisenchantTarget(") != std::string::npos);
-    Check("a named item is judged by the pure refusal",
-          de.find("OverseerDecisions::NamedDisenchantRefusal(") != std::string::npos);
+    Check("a named item is judged by the pure verdict, on the row's age",
+          de.find("OverseerDecisions::JudgeNamedDisenchant(facts, task.ageSeconds)") !=
+              std::string::npos);
+    Check("an ended named row is written as error",
+          source.find("void EndDisenchant(") != std::string::npos &&
+              de.find("EndDisenchant(id, task,") != std::string::npos);
 
     std::ifstream storeIn("src/overseer_disenchant_store.h");
     std::stringstream storeText;
@@ -278,8 +292,11 @@ void TheAdapterIsWired()
     std::string const store = storeText.str();
     Check("Pending no longer requires job craft",
           store.find("r.job = 'craft'") == std::string::npos);
-    Check("Owned carries the command text",
-          store.find("COALESCE(c.command, '')") != std::string::npos);
+    Check("Owned carries the command text and the row's age",
+          store.find("COALESCE(c.command, '')") != std::string::npos &&
+              store.find("UNIX_TIMESTAMP(c.created_at)") != std::string::npos);
+    Check("an ended row is status error",
+          store.find("SET status = 'error', result = ?") != std::string::npos);
 }
 
 }  // namespace

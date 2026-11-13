@@ -19356,20 +19356,29 @@ DisenchantTarget ParseDisenchantTarget(std::string const& command)
     return target;
 }
 
-char const* NamedDisenchantRefusal(NamedDisenchantFacts const& facts)
+NamedDisenchantVerdict JudgeNamedDisenchant(NamedDisenchantFacts const& facts,
+                                            int64_t ageSeconds)
 {
+    bool const late = ageSeconds >= NAMED_DISENCHANT_ARRIVAL_SECONDS;
     if (!facts.found)
-        return "the named item is not owned by this character";
+        return late ? NamedDisenchantVerdict{NamedDisenchantStep::End,
+                                             "named item never reached the enchanter"}
+                    : NamedDisenchantVerdict{NamedDisenchantStep::Hold,
+                                             "named item not owned yet"};
     if (!facts.inBags)
-        return "the named item is not in the bags (worn or banked)";
+        return late ? NamedDisenchantVerdict{NamedDisenchantStep::End,
+                                             "named item never reached the enchanter's bags "
+                                             "(worn or banked)"}
+                    : NamedDisenchantVerdict{NamedDisenchantStep::Hold,
+                                             "named item is not in the bags yet (worn or banked)"};
     if (facts.kept)
-        return "the named item is kept by a keep reservation";
+        return {NamedDisenchantStep::End, "named item is kept by a keep reservation"};
     if (facts.quality < 2 || facts.quality > 4 || !facts.weaponOrArmor || !facts.disenchantId ||
         facts.requiredSkill < 0)
-        return "the named item is not disenchantable";
+        return {NamedDisenchantStep::End, "named item is not disenchantable"};
     if (facts.skill < static_cast<uint32_t>(facts.requiredSkill))
-        return "Enchanting skill too low for the named item";
-    return "";
+        return {NamedDisenchantStep::Hold, "Enchanting skill too low for the named item"};
+    return {NamedDisenchantStep::Cast, ""};
 }
 
 unsigned CraftLoneDeathsInZone(std::vector<CraftLoneDeath> const& deaths, uint32_t mapId,

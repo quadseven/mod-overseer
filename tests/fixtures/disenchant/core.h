@@ -20,6 +20,7 @@
 using uint8 = uint8_t;
 using uint32 = uint32_t;
 using uint64 = uint64_t;
+using int64 = int64_t;
 using Cell = std::variant<int64_t, std::string>;
 inline int64_t sqlClock=1000;
 struct Field
@@ -111,6 +112,9 @@ public:
         if (sqlite3_open(":memory:", &db) != SQLITE_OK) throw std::runtime_error("SQLite unavailable");
         sqlite3_create_function(db, "NOW", 0, SQLITE_UTF8, nullptr,
             [](sqlite3_context* c, int, sqlite3_value**) { sqlite3_result_int64(c, sqlClock); }, nullptr, nullptr);
+        // Timestamps here are already seconds, so UNIX_TIMESTAMP is the identity.
+        sqlite3_create_function(db, "UNIX_TIMESTAMP", 1, SQLITE_UTF8, nullptr,
+            [](sqlite3_context* c, int, sqlite3_value** v) { sqlite3_result_int64(c, sqlite3_value_int64(v[0])); }, nullptr, nullptr);
         // The store names MySQL's utf8mb4_unicode_ci to join columns of two
         // collations; stand it in as a case-insensitive ASCII compare.
         sqlite3_create_collation(db, "utf8mb4_unicode_ci", SQLITE_UTF8, nullptr,
@@ -124,7 +128,7 @@ public:
                 return la - lb;
             });
         Exec("CREATE TABLE overseer_roster(name TEXT PRIMARY KEY, enabled INTEGER, job TEXT);"
-             "CREATE TABLE overseer_command(id INTEGER PRIMARY KEY,target_name TEXT,kind TEXT,status TEXT,claimed_by TEXT DEFAULT '',result TEXT DEFAULT '',updated_at INTEGER DEFAULT 0,command TEXT);");
+             "CREATE TABLE overseer_command(id INTEGER PRIMARY KEY,target_name TEXT,kind TEXT,status TEXT,claimed_by TEXT DEFAULT '',result TEXT DEFAULT '',updated_at INTEGER DEFAULT 0,command TEXT,created_at INTEGER DEFAULT 0);");
         return 0;
     }
     bool PrepareStatements()

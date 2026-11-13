@@ -279,8 +279,11 @@ class WholeDirectoryMigrationTest(unittest.TestCase):
         owned = self.run_sql(
             reads["Owned"].replace("?", "'CrafterA'") + ";", "Owned read"
         )
-        # The command text rides along so a named row (`guid:<n>`) reaches the drive.
-        self.assertEqual(["CrafterA\tcraft\t1\titem 2"], [r.split("\t", 1)[1] for r in owned.splitlines()])
+        # The command text rides along so a named row (`guid:<n>`) reaches the
+        # drive, and so does the row's age in seconds, a whole number.
+        rows = [r.split("\t") for r in owned.splitlines()]
+        self.assertEqual([["CrafterA", "craft", "1", "item 2"]], [r[1:5] for r in rows])
+        self.assertRegex(rows[0][5], r"^-?\d+$")
 
 
 def store_selects(path):

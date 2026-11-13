@@ -17,6 +17,7 @@ enum Statement : uint32
     Acknowledge,
     Defer,
     SayHeld,
+    Fail,
     StatementCount
 };
 
@@ -45,7 +46,10 @@ public:
         PrepareStatement(Owned,
             // A valid empty snapshot returns id 0; a failed query still returns no result.
             "SELECT COALESCE(c.id, 0), COALESCE(r.name, c.target_name COLLATE utf8mb4_unicode_ci, ''), "
-            "COALESCE(r.job, ''), COALESCE(r.enabled, 0), COALESCE(c.command, '') "
+            "COALESCE(r.job, ''), COALESCE(r.enabled, 0), COALESCE(c.command, ''), "
+            // The row's age in the database's own clock (#1523): a named item
+            // has a window to arrive by kind='give' before the row ends.
+            "CAST(COALESCE(UNIX_TIMESTAMP(NOW()) - UNIX_TIMESTAMP(c.created_at), 0) AS SIGNED) "
             "FROM (SELECT 1) AS owned_snapshot LEFT JOIN overseer_command c "
             "ON c.kind = 'disenchant' AND c.status = 'claimed' AND c.claimed_by = ? "
             "LEFT JOIN overseer_roster r ON r.name = c.target_name COLLATE utf8mb4_unicode_ci "
@@ -64,6 +68,12 @@ public:
             CONNECTION_ASYNC);
         PrepareStatement(SayHeld,
             "UPDATE overseer_command SET result = ? WHERE id = ? "
+            "AND claimed_by = ? AND kind = 'disenchant' AND status = 'claimed'",
+            CONNECTION_ASYNC);
+        // A named row that can never be served ends, so it stops deferring
+        // the same enchanter's other rows (#1523).
+        PrepareStatement(Fail,
+            "UPDATE overseer_command SET status = 'error', result = ? WHERE id = ? "
             "AND claimed_by = ? AND kind = 'disenchant' AND status = 'claimed'",
             CONNECTION_ASYNC);
     }
