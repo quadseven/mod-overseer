@@ -699,6 +699,60 @@ void SeatRoles()
            "a council award reads as one in the loot record");
 }
 
+void TheSteerSaysWhichGateTurnedARollAway()
+{
+    LootSteerFacts family;
+    family.itemClass = 2;  // a weapon
+    family.inGroup = true;
+    family.onRoster = true;
+    Expect(LootSteerGateFor(family) == LootSteerGate::Steered,
+           "a roster character's weapon roll in a party is the council's");
+    Expect(!LootSteerGateSaid(family, LootSteerGateFor(family)),
+           "a steered roll needs no line");
+
+    LootSteerFacts armour = family;
+    armour.itemClass = 4;
+    Expect(LootSteerGateFor(armour) == LootSteerGate::Steered, "armour is the council's too");
+
+    LootSteerFacts gem = family;
+    gem.itemClass = 3;
+    Expect(LootSteerGateFor(gem) == LootSteerGate::NotGear, "a gem is upstream's");
+    Expect(!LootSteerGateSaid(gem, LootSteerGate::NotGear), "a gem roll says nothing");
+
+    LootSteerFacts alone = family;
+    alone.inGroup = false;
+    Expect(LootSteerGateFor(alone) == LootSteerGate::NoGroup, "no group, no council");
+
+    LootSteerFacts raid = family;
+    raid.raid = true;
+    Expect(LootSteerGateFor(raid) == LootSteerGate::Raid, "a raid is master loot's");
+    Expect(LootSteerGateSaid(raid, LootSteerGate::Raid),
+           "a roster character's roll turned away in a raid is said");
+
+    LootSteerFacts finder = family;
+    finder.finder = true;
+    Expect(LootSteerGateFor(finder) == LootSteerGate::CoreGroup, "a finder group is the core's");
+    LootSteerFacts battleground = family;
+    battleground.battleground = true;
+    Expect(LootSteerGateFor(battleground) == LootSteerGate::CoreGroup,
+           "a battleground group is the core's");
+    Expect(LootSteerGateSaid(finder, LootSteerGate::CoreGroup),
+           "a roster character's roll turned away by a core group is said");
+
+    LootSteerFacts stranger = family;
+    stranger.onRoster = false;
+    Expect(LootSteerGateFor(stranger) == LootSteerGate::NotOnRoster,
+           "a bot off the roster keeps its own vote");
+    Expect(!LootSteerGateSaid(stranger, LootSteerGate::NotOnRoster),
+           "the realm's other bots are turned away silently");
+
+    Expect(std::string(LootSteerGateWhy(LootSteerGate::Raid)).find("raid") != std::string::npos,
+           "the raid gate says raid");
+    Expect(std::string(LootSteerGateWhy(LootSteerGate::CoreGroup)).find("dungeon-finder") !=
+               std::string::npos,
+           "the core-group gate names the dungeon finder");
+}
+
 void KeysAndJson()
 {
     Expect(LootCouncilRollKey(4242) == "roll:4242", "a roll's key");
@@ -783,6 +837,13 @@ void TheAdapterSeams()
                    std::string::npos,
            "a seat's duty is read where the realm has the column, and its role where not");
 
+    Expect(module.find("OverseerDecisions::LootSteerGateFor(facts)") != std::string::npos,
+           "the steer's gates are the decision's");
+    Expect(module.find("overseer: loot council did not take") != std::string::npos,
+           "a roster character's roll the steer turned away is said, with the gate");
+    Expect(module.find("overseer: loot council never saw") != std::string::npos,
+           "a roster character's gear roll won with no council note is said");
+
     std::string const duty =
         Read("data/sql/characters/base/2026_09_24_03_overseer_raid_seat_duty.sql");
     Expect(duty.find("ADD COLUMN `duty` VARCHAR(16) NOT NULL DEFAULT ''") != std::string::npos &&
@@ -827,6 +888,7 @@ int main()
     MandatedBindOnPickupRollsAreExclusive();
     AMandateEndsOnlyInTheNamedHands();
     SeatRoles();
+    TheSteerSaysWhichGateTurnedARollAway();
     KeysAndJson();
     TheAdapterSeams();
     if (failures)

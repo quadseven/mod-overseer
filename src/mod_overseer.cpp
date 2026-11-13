@@ -4530,6 +4530,9 @@ std::map<uint64, CouncilRoll> g_councilRolls;  // by the roll's item guid
 std::map<uint64, std::string> g_councilVerdicts;  // roll item guid -> recipient ("" = nobody)
 std::vector<CouncilKill> g_councilKills;
 std::vector<CouncilRollWon> g_councilWon;
+// (roll item guid, voter guid) pairs the steer has already said it turned
+// away (#1516), so the line is written once per roll and voter.
+std::set<std::pair<uint64, uint64>> g_councilTurnedAway;
 
 // How long a roll's note is kept after it was first seen: longer than the
 // sixty seconds a roll is open, so its winner can still be matched to it.
@@ -4652,19 +4655,48 @@ bool CouncilSteerRoll(Player* bot, Roll const* roll, RollVote& vote)
     if (!bot || !roll)
         return false;
     ItemTemplate const* proto = sObjectMgr->GetItemTemplate(roll->itemid);
-    if (!proto || !OverseerDecisions::LootCouncilJudges(static_cast<int>(proto->Class)))
+    if (!proto)
         return false;
     Group* group = bot->GetGroup();
-    if (!group || group->isRaidGroup() || group->isBGGroup() || group->isBFGroup() ||
-        group->isLFGGroup())
-        return false;
-
     uint64 const key = roll->itemGUID.GetRawValue();
+
+    OverseerDecisions::LootSteerFacts facts;
+    facts.itemClass = static_cast<int>(proto->Class);
+    facts.inGroup = group != nullptr;
+    facts.raid = group && group->isRaidGroup();
+    facts.battleground = group && group->isBGGroup();
+    facts.battlefield = group && group->isBFGroup();
+    facts.finder = group && group->isLFGGroup();
+    {
+        std::lock_guard<std::mutex> guard(g_councilMutex);
+        facts.onRoster = g_councilRoster.count(bot->GetGUID().GetRawValue()) != 0;
+    }
+    OverseerDecisions::LootSteerGate const gate = OverseerDecisions::LootSteerGateFor(facts);
+    if (gate != OverseerDecisions::LootSteerGate::Steered)
+    {
+        // Said once per roll and voter, bounded: the realm's other bots are
+        // turned away silently (LootSteerGateSaid).
+        if (OverseerDecisions::LootSteerGateSaid(facts, gate))
+        {
+            bool first = false;
+            {
+                std::lock_guard<std::mutex> guard(g_councilMutex);
+                if (g_councilTurnedAway.size() >= 512)
+                    g_councilTurnedAway.clear();
+                first = g_councilTurnedAway.insert({key, bot->GetGUID().GetRawValue()}).second;
+            }
+            if (first)
+                LOG_INFO("module.overseer",
+                         "overseer: loot council did not take {} (roll {}) for '{}' - {}",
+                         proto->Name1, key, bot->GetName(),
+                         OverseerDecisions::LootSteerGateWhy(gate));
+        }
+        return false;
+    }
+
     time_t const now = std::time(nullptr);
     OverseerDecisions::LootDisenchantFacts const disenchant = DisenchantFactsFor(bot, roll, proto);
     std::lock_guard<std::mutex> guard(g_councilMutex);
-    if (g_councilRoster.find(bot->GetGUID().GetRawValue()) == g_councilRoster.end())
-        return false;
 
     auto noted = g_councilRolls.find(key);
     if (noted == g_councilRolls.end())
@@ -8059,6 +8091,17 @@ public:
             if (g_councilRolls.count(key) && g_councilWon.size() < 256)
                 g_councilWon.push_back(CouncilRollWon{
                     key, player->GetName(), live ? live->GetGUID().GetCounter() : 0});
+            // A roster character's gear roll the steer never noted (#1516):
+            // the playerbots' own rule decided it, and the council never saw it.
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(roll->itemid);
+            if (!g_councilRolls.count(key) &&
+                g_councilRoster.count(player->GetGUID().GetRawValue()) && proto &&
+                OverseerDecisions::LootCouncilJudges(static_cast<int>(proto->Class)))
+                LOG_WARN("module.overseer",
+                         "overseer: loot council never saw {} (roll {}) - '{}' won it on {} "
+                         "by the playerbots' own rule",
+                         proto->Name1, key, player->GetName(),
+                         voteType == NEED ? "need" : "greed");
         }
         if (!live)
             return;

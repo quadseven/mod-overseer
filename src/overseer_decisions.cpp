@@ -6061,6 +6061,42 @@ bool LootCouncilJudges(int itemClass)
     return itemClass == 2 || itemClass == 4;  // ITEM_CLASS_WEAPON, ITEM_CLASS_ARMOR
 }
 
+LootSteerGate LootSteerGateFor(LootSteerFacts const& facts)
+{
+    if (!LootCouncilJudges(facts.itemClass))
+        return LootSteerGate::NotGear;
+    if (!facts.inGroup)
+        return LootSteerGate::NoGroup;
+    if (facts.raid)
+        return LootSteerGate::Raid;
+    if (facts.battleground || facts.battlefield || facts.finder)
+        return LootSteerGate::CoreGroup;
+    if (!facts.onRoster)
+        return LootSteerGate::NotOnRoster;
+    return LootSteerGate::Steered;
+}
+
+char const* LootSteerGateWhy(LootSteerGate gate)
+{
+    switch (gate)
+    {
+        case LootSteerGate::Steered: return "the council takes it";
+        case LootSteerGate::NotGear: return "it is not a weapon or a piece of armour";
+        case LootSteerGate::NoGroup: return "the voter is in no group";
+        case LootSteerGate::Raid: return "the voter's group is a raid, which runs master loot";
+        case LootSteerGate::CoreGroup:
+            return "the voter's group is a battleground, battlefield or dungeon-finder group";
+        case LootSteerGate::NotOnRoster: return "the voter is not on the roster";
+    }
+    return "unknown";
+}
+
+bool LootSteerGateSaid(LootSteerFacts const& facts, LootSteerGate gate)
+{
+    return facts.onRoster && gate != LootSteerGate::Steered &&
+           gate != LootSteerGate::NotGear;
+}
+
 int UpgradePercent(LootCandidate const& candidate)
 {
     if (candidate.gain <= 0.f || candidate.score <= 0.f)

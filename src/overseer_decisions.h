@@ -6904,6 +6904,44 @@ constexpr long LOOT_COUNCIL_ROLL_LAST_SECONDS = 45;
 // a bag, cloth) keeps the upstream roll rule.
 bool LootCouncilJudges(int itemClass);
 
+// WHY THE STEER DID OR DID NOT TAKE A ROLL (#1516). Most of a family party's
+// dungeon rolls opened no council row while every open-world roll did, and
+// nothing said which of the steer's gates had turned them away. The steer
+// now asks this one function, and says the answer once per roll for a
+// roster character, so the next run names the gate instead of leaving it
+// to be guessed.
+enum class LootSteerGate
+{
+    Steered,      // the council takes the roll
+    NotGear,      // not a weapon or a piece of armour: upstream votes
+    NoGroup,      // the voter is in no group
+    Raid,         // a raid runs master loot, not rolls
+    CoreGroup,    // a battleground, battlefield or dungeon-finder group
+    NotOnRoster,  // the voter is not a roster character
+};
+
+struct LootSteerFacts
+{
+    int itemClass{0};
+    bool inGroup{false};
+    bool raid{false};
+    bool battleground{false};
+    bool battlefield{false};
+    bool finder{false};
+    bool onRoster{false};
+};
+
+// The first gate that turns a roll away, in the steer's own order, or
+// Steered when none does.
+LootSteerGate LootSteerGateFor(LootSteerFacts const& facts);
+
+// The gate in words, for the log line.
+char const* LootSteerGateWhy(LootSteerGate gate);
+
+// Is a turned-away roll worth a log line: only a roster character's gear
+// roll, since every other bot on the realm is turned away by design.
+bool LootSteerGateSaid(LootSteerFacts const& facts, LootSteerGate gate);
+
 // One member who could receive a drop, scored by the gear drive's own rule.
 struct LootCandidate
 {
