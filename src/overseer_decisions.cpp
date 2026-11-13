@@ -7870,9 +7870,27 @@ bool HoldsInTown(std::string const& job)
 bool FamilyHoldsInTown(std::vector<std::string> const& jobs)
 {
     for (std::string const& job : jobs)
-        if (HoldsInTown(job))
+        if (HoldsInTown(job) || IsFarmJob(job))
             return true;
     return false;
+}
+
+bool IsFarmJob(std::string const& job)
+{
+    static std::string const prefix = "farm:";
+    if (job == "farm")
+        return true;
+    if (job.compare(0, prefix.size(), prefix) != 0)
+        return false;
+    std::string const what = job.substr(prefix.size());
+    if (what == "mining" || what == "herbalism")
+        return true;
+    if (what.empty() || what.size() > 9 || what[0] == '0')
+        return false;
+    for (char const c : what)
+        if (c < '0' || c > '9')
+            return false;
+    return true;
 }
 
 bool LeaderCarriesNewRpg(std::string const& job, bool onAnErrand)
