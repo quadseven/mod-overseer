@@ -64,6 +64,22 @@ void CheckWord(char const* what, char const* got, char const* want)
     ++failures;
 }
 
+void ModuleAllClearedNeedsTheMaskToAgree()
+{
+    using OverseerDecisions::DungeonModuleStopProvesComplete;
+    std::string const cleared = "Dungeon clear stopped: All bosses cleared!";
+    // #1514: run 1903593, mask 495 of the map's wider list, the Emperor alive.
+    CheckBool("module says cleared, mask says not yet",
+              DungeonModuleStopProvesComplete(cleared, DungeonCompletion::NotYet), false);
+    CheckBool("module says cleared, mask agrees",
+              DungeonModuleStopProvesComplete(cleared, DungeonCompletion::Complete), true);
+    CheckBool("module says cleared, map credits nothing",
+              DungeonModuleStopProvesComplete(cleared, DungeonCompletion::Unknowable), true);
+    CheckBool("another stop never proves it",
+              DungeonModuleStopProvesComplete("Dungeon clear stopped: wiped",
+                                              DungeonCompletion::Complete), false);
+}
+
 void AMapThatCreditsNothingIsNeverFinished()
 {
     // THE TRAP THIS ENUM EXISTS FOR. Zero bits are all set, so a bool-returning
@@ -272,6 +288,7 @@ int main()
     // from either door can clear every encounter the map credits.
     CheckBool("Maraudon is not a split-wing map",
           DungeonMapHasIndependentWings(349), false);
+    ModuleAllClearedNeedsTheMaskToAgree();
     AMapThatCreditsNothingIsNeverFinished();
     EveryCreditedEncounterMeansComplete();
     OneEncounterShortIsNotFinished();

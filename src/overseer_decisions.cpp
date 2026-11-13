@@ -2695,6 +2695,11 @@ bool DungeonModuleStopIsCleared(std::string const& stopReason)
     return text.substr(first, text.find_last_not_of(blanks) - first + 1) == cleared;
 }
 
+bool DungeonModuleStopProvesComplete(std::string const& stopReason, DungeonCompletion completion)
+{
+    return DungeonModuleStopIsCleared(stopReason) && completion != DungeonCompletion::NotYet;
+}
+
 bool DungeonClearBusyStillHolds(bool anyBusy, time_t advancedAt, time_t now,
                                 time_t ceilingSeconds)
 {

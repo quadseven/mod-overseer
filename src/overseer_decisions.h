@@ -4359,6 +4359,15 @@ DungeonRunAdoptPhase DungeonRunAdoptAt(bool allThrough, DungeonCompletion comple
 // nothing and must never spend a campaign slot.
 bool AdoptedExitProvesComplete(DungeonCompletion completion, bool provedBeforeTheExit = false);
 
+// Whether the dungeon module's "All bosses cleared!" stop may end a run
+// 'complete' (#1514). The module counts its own boss list, which can be shorter
+// than the map's encounter list (Blackrock Depths: eight bosses and no Emperor),
+// so its word is only taken when the instance mask does not contradict it: a mask
+// that says NotYet outranks the module, and the run ends stalled with the
+// module's reason instead. Unknowable (a map that credits nothing) has no mask to
+// contradict it, so the module's count stands.
+bool DungeonModuleStopProvesComplete(std::string const& stopReason, DungeonCompletion completion);
+
 // Select the encounters this run must credit. Independent-wing maps require a
 // non-empty, verified wing mask; otherwise completion remains unknowable.
 // The encounter bits a run cannot be expected to credit, because the boss
