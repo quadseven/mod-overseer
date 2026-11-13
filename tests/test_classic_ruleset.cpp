@@ -96,6 +96,13 @@ void TheStartingLandsAreInside()
     Check("the sea zone is named as a starting land",
           C::IsStartingLand(530, 3479), true);
     Check("the starting lands are named", C::IsStartingLand(530, 3524), true);
+    // The North Sea (AreaTable 3455, map 530, no parent area) is the coast
+    // north of Eversong Woods. A level 24 blood elf standing in its shallows
+    // was refused 667 walks in a day as standing in Outland.
+    Check("The North Sea off Eversong", C::IsOutsideClassic(530, 3455), false);
+    Check("the north sea is named as a starting land",
+          C::IsStartingLand(530, 3455), true);
+    Check("the north sea id is AreaTable's", C::NORTH_SEA_ZONE_ID == 3455u, true);
 
     Check("Hellfire Peninsula is Outland", C::IsOutsideClassic(530, 3483), true);
     Check("Shattrath is Outland", C::IsOutsideClassic(530, 3703), true);
