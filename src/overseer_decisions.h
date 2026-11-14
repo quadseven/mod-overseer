@@ -29495,9 +29495,10 @@ bool CountsInFamilyParty(FamilyPartyFacts const& facts);
 // member left standing in another guild's run (lent as its healer, the run
 // stalled, the group since rejoined to its family) is not: the rest of the
 // family is elsewhere and the run is not the family's. A run row the family
-// itself opened keeps a thinned party's run, because that row is the proof the
-// family walked in. Nobody inside owns nothing.
-bool FamilyOwnsInstance(uint32_t insideCount, uint32_t onlinePartyCount, bool openRunRow);
+// proved ownership earlier (a majority was seen inside) keeps a thinned party's
+// run. A run row is not that proof: the arming drive opens one for a lone member
+// too. Nobody inside owns nothing.
+bool FamilyOwnsInstance(uint32_t insideCount, uint32_t onlinePartyCount, bool provenEarlier);
 
 // ============================================ the dungeon run record (#971) ==
 //

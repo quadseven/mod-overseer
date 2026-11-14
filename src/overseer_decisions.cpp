@@ -26841,11 +26841,11 @@ bool CountsInFamilyParty(FamilyPartyFacts const& facts)
            !facts.heldByGuildRun;
 }
 
-bool FamilyOwnsInstance(uint32_t insideCount, uint32_t onlinePartyCount, bool openRunRow)
+bool FamilyOwnsInstance(uint32_t insideCount, uint32_t onlinePartyCount, bool provenEarlier)
 {
     if (insideCount == 0)
         return false;
-    return openRunRow || insideCount * 2 >= onlinePartyCount;
+    return provenEarlier || insideCount * 2 >= onlinePartyCount;
 }
 
 // ------------------------------------------- the dungeon run record (#971) --

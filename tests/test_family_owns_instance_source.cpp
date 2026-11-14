@@ -14,6 +14,14 @@ namespace
 {
 int failures = 0;
 
+void Forbid(std::string const& text, char const* needle, char const* what)
+{
+    if (text.find(needle) == std::string::npos)
+        return;
+    std::cerr << "FAIL " << what << ": found '" << needle << "'" << std::endl;
+    ++failures;
+}
+
 void Require(std::string const& text, char const* needle, char const* what)
 {
     if (text.find(needle) != std::string::npos)
@@ -58,6 +66,16 @@ int main()
     Require(running, "OverseerDecisions::FamilyOwnsInstance(",
             "a running phase asks whether the instance is the family's");
     Require(running, "the instance is not the family's: the rest of the family \"", "the run ends with a reason");
+
+    // A run row is NOT proof the family walked in: the arming drive opens one
+    // for any member it finds inside, so a phantom already has its row. Only a
+    // majority seen inside proves it.
+    Forbid(adopt, "family) != 0))", "adoption does not take a run row as proof");
+    Forbid(running, "coord.runId ||", "a running phase does not take a run row as proof");
+    Forbid(running, "family) != 0)))", "a running phase does not take a run row as proof");
+    Require(running, "coord.familyProvenInside",
+            "a running phase keeps a thinned run only once a majority was seen inside");
+    Require(text, "bool familyProvenInside{false}", "the coordinator remembers the proof");
 
     if (failures)
         return EXIT_FAILURE;

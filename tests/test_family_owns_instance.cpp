@@ -36,8 +36,8 @@ int main()
     Check("half inside is the family's instance", FamilyOwnsInstance(2, 4, false));
     Check("the whole party inside is the family's instance", FamilyOwnsInstance(5, 5, false));
 
-    // A run the family opened keeps its row, and a thinned party keeps it.
-    Check("an open run row for the family keeps a thinned party's run",
+    // A run the family proved its own earlier keeps a thinned party.
+    Check("an earlier proof keeps a thinned party's run",
           FamilyOwnsInstance(1, 5, true));
 
     // A family of one that is online alone is its own party.

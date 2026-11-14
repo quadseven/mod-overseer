@@ -38972,6 +38972,10 @@ private:
         // progress (#620). Cleared when nobody is in another copy.
         bool loggedOtherCopy{false};
         bool loggedForeignInstance{false};
+        // A majority of the family's online party was seen in this instance, so it
+        // is the family's run. A run row is not that proof: the arming drive opens
+        // one for any member it finds inside, a lone phantom included.
+        bool familyProvenInside{false};
         // Said once per stretch rather than once per poll, the log-once
         // discipline the rest of this struct follows. It is the line that tells
         // an operator WHY the watchdog started counting against a party that
@@ -59185,8 +59189,7 @@ private:
                 // online party is in it or the family itself has a run open on
                 // the map.
                 if (!OverseerDecisions::FamilyOwnsInstance(
-                        adoptedInside, static_cast<uint32>(familyParty.size()),
-                        ActiveRunIdOnMap(inside->insideMapId, family) != 0))
+                        adoptedInside, static_cast<uint32>(familyParty.size()), false))
                 {
                     if (!coord.loggedForeignInstance)
                     {
@@ -59200,6 +59203,7 @@ private:
                     }
                     return;
                 }
+                coord.familyProvenInside = true;
 
                 // AND THIS COORDINATOR DELIBERATELY HAS NO STAGING POINT (#220).
                 // An adopted run is already inside; there is no gather left to
@@ -61598,9 +61602,12 @@ private:
             // occupant is a member left in another guild's instance, the family
             // is elsewhere and there is nothing here to drive: the same test
             // adoption takes, so a run adopted before it existed ends too.
-            if (inside && !OverseerDecisions::FamilyOwnsInstance(
-                              inside, static_cast<uint32>(FamilyPartyMembers(members, family).size()),
-                              (coord.runId || ActiveRunIdOnMap(portal->insideMapId, family) != 0)))
+            uint32 const onlineParty =
+                static_cast<uint32>(FamilyPartyMembers(members, family).size());
+            if (inside && OverseerDecisions::FamilyOwnsInstance(inside, onlineParty, false))
+                coord.familyProvenInside = true;
+            if (inside && !OverseerDecisions::FamilyOwnsInstance(inside, onlineParty,
+                                                                 coord.familyProvenInside))
             {
                 LOG_INFO("module.overseer",
                          "overseer: the dungeon run on map {} holds {} online party member(s) "
