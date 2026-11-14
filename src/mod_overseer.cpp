@@ -3142,6 +3142,10 @@ constexpr OverseerDecisions::RatchetLimits DUNGEON_CLEAR_RATCHET{
 constexpr unsigned DUNGEON_CLEAR_SKIPS = 3;
 // How many times one stretch of a run may arm a stopped brain again (#1308).
 constexpr unsigned DUNGEON_CLEAR_WAIT_REARMS = 3;
+// How long the module may stand stopped on a party wait before it is armed again
+// (#1483). Short, because a stopped run cannot make progress and the busy hold
+// protects nothing there; long enough that one flickering read is not a stop.
+constexpr time_t DUNGEON_CLEAR_STOPPED_REARM_SECONDS = 30;
 
 // HOW LONG A PARTY MAY LOOK BUSY BEFORE THE WATCHDOG STOPS BELIEVING IT (#382).
 //
@@ -38942,6 +38946,10 @@ private:
         // `dc on`s sent again for a party-wait stop since the last boss credit
         // (#1308). Yards do not clear it: a tank drifts with its brain off.
         unsigned clearRearms{0};
+        // When the clearing watchdog first saw the module stopped on a party wait
+        // (#1483); 0 = not stopped. A stopped run is armed again once this is
+        // DUNGEON_CLEAR_STOPPED_REARM_SECONDS old, whatever a member reports.
+        time_t clearStopSeenAt{0};
         // When the reassembly phase last sent `dc on` again for a party-wait stop
         // (#1500); 0 = never. Spaces the re-arms so one stop is not answered with
         // the whole bound before the first command has gone out.
@@ -41118,6 +41126,7 @@ private:
             coord.clearMarked = false;
             coord.clearSkips = 0;
             coord.clearRearms = 0;
+            coord.clearStopSeenAt = 0;
             // AND THE RUN DEMONSTRABLY ADVANCED (#382). A boss died, so whatever
             // the party has been busy with for the last however-long, it was
             // busy doing THAT. The ceiling below exists to catch a hold that
@@ -41169,6 +41178,39 @@ private:
             break;
         }
         bool const anyBusy = !busyName.empty();
+
+        // A PARTY-WAIT STOP IS ARMED AGAIN BEFORE ANY SKIP, AND BEFORE THE BUSY
+        // HOLD (#1308, #1483). A run the module has switched off cannot make
+        // progress, so a member still reporting "looting" protects nothing: the
+        // stop stamps its own clock here and is answered once that clock is
+        // DUNGEON_CLEAR_STOPPED_REARM_SECONDS old, instead of after the busy
+        // ceiling and the stall window. Forgetting the `dc on` record is what
+        // makes the arming drive issue it next poll.
+        std::string const stopReason = DungeonBrainStopReason(leader);
+        if (!OverseerDecisions::DungeonClearWaitStopRearms(stopReason, coord.clearRearms,
+                                                           DUNGEON_CLEAR_WAIT_REARMS))
+            coord.clearStopSeenAt = 0;
+        else if (coord.clearStopSeenAt == 0)
+            coord.clearStopSeenAt = now;
+        if (OverseerDecisions::DungeonClearStoppedRunRearmsNow(
+                stopReason, coord.clearRearms, DUNGEON_CLEAR_WAIT_REARMS, coord.clearStopSeenAt,
+                now, DUNGEON_CLEAR_STOPPED_REARM_SECONDS))
+        {
+            ++coord.clearRearms;
+            coord.clearStopSeenAt = 0;
+            coord.clearProgress.since = now;
+            for (OverseerDecisions::DungeonRunEntryState const& state : states)
+                _dcOnIssued.erase(state.name);
+            LOG_WARN("module.overseer",
+                     "overseer: dungeon run {} of campaign {} stopped on a party wait, so "
+                     "the dungeon module is armed again ({} of {}): {}. Member still "
+                     "reporting busy: {}",
+                     coord.runNumber, coord.campaignId, coord.clearRearms,
+                     static_cast<uint32>(DUNGEON_CLEAR_WAIT_REARMS),
+                     OverseerDecisions::DungeonModuleStopWords(stopReason),
+                     anyBusy ? "'" + busyName + "' " + busyReason : std::string("nobody"));
+            return false;
+        }
 
         // MOVEMENT IS MEASURED BEFORE THE BUSY HOLD NOW, NOT BEHIND IT (#382).
         //
@@ -41285,25 +41327,6 @@ private:
         // STALLED. The clock restarts on every rung, so whatever is tried here
         // gets a whole patience window to work in before the next thing is.
         coord.clearProgress.since = now;
-
-        // A PARTY-WAIT STOP IS ARMED AGAIN BEFORE ANY SKIP (#1308). Forgetting
-        // the `dc on` record is what makes the arming drive issue it next poll.
-        std::string const stopReason = DungeonBrainStopReason(leader);
-        if (!anyBusy &&
-            OverseerDecisions::DungeonClearWaitStopRearms(stopReason, coord.clearRearms,
-                                                          DUNGEON_CLEAR_WAIT_REARMS))
-        {
-            ++coord.clearRearms;
-            for (OverseerDecisions::DungeonRunEntryState const& state : states)
-                _dcOnIssued.erase(state.name);
-            LOG_WARN("module.overseer",
-                     "overseer: dungeon run {} of campaign {} stopped on a party wait, so "
-                     "the dungeon module is armed again ({} of {}): {}",
-                     coord.runNumber, coord.campaignId, coord.clearRearms,
-                     static_cast<uint32>(DUNGEON_CLEAR_WAIT_REARMS),
-                     OverseerDecisions::DungeonModuleStopWords(stopReason));
-            return false;
-        }
 
         if (action == OverseerDecisions::DungeonClearStallAction::Skip &&
             OverseerDecisions::StallSkipWouldSpendLastBoss(

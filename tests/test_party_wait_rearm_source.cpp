@@ -5,8 +5,8 @@
  * test_guild_run_stall.cpp. What only the adapter can get wrong, and what this
  * file pins:
  *
- *  - The watchdog asks DungeonClearWaitStopRearms only of a party nobody holds,
- *    before the skip ladder, and forgets every member's `dc on` record, which
+ *  - The watchdog asks DungeonClearStoppedRunRearmsNow before the busy hold and
+ *    the skip ladder, busy member or not (#1483), and forgets every member's `dc on` record, which
  *    is what makes the arming drive issue it again.
  *  - The stall step keeps its split clock through GuildRunSplitClock and ends a
  *    split as its own step, naming the split.
@@ -45,14 +45,18 @@ int main()
                            std::istreambuf_iterator<char>());
 
     std::string const watchdog = Body(text, "    bool RunClearingWatchdog(");
-    std::size_t const rearm = watchdog.find("DungeonClearWaitStopRearms");
+    std::size_t const rearm = watchdog.find("DungeonClearStoppedRunRearmsNow");
+    std::size_t const busyHold = watchdog.find("DungeonClearBusyStillHolds");
     std::size_t const skip = watchdog.find("DungeonClearStallAction::Skip)");
     if (rearm == std::string::npos || skip == std::string::npos || rearm > skip)
         return Fail("the re-arm is asked before the skip ladder");
-    if (watchdog.substr(rearm - 60, 60).find("!anyBusy") == std::string::npos)
-        return Fail("a busy party is not re-armed");
-    if (watchdog.find("_dcOnIssued.erase(state.name)", rearm) > skip)
+    if (busyHold == std::string::npos || rearm > busyHold)
+        return Fail("a stopped run is re-armed before the busy hold is read (#1483)");
+    if (watchdog.find("_dcOnIssued.erase(state.name)", rearm) > busyHold)
         return Fail("the re-arm forgets every member's dc on record");
+
+    if (watchdog.find("coord.clearStopSeenAt = 0;") > rearm)
+        return Fail("a boss credit forgets the stop stamp");
 
     std::string const stall = Body(text, "    bool StepGuildRunStall(");
     if (stall.find("GuildRunSplitClock(") == std::string::npos)

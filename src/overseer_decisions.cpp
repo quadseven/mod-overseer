@@ -2642,6 +2642,16 @@ bool DungeonClearWaitStopRearms(std::string const& stopReason, unsigned rearms,
            stopReason.find("the party never became ready") != std::string::npos;
 }
 
+bool DungeonClearStoppedRunRearmsNow(std::string const& stopReason, unsigned rearms,
+                                     unsigned maximumRearms, time_t stopSeenAt, time_t now,
+                                     time_t graceSeconds)
+{
+    if (stopSeenAt == 0 || now < stopSeenAt)
+        return false;
+    return now - stopSeenAt >= graceSeconds &&
+           DungeonClearWaitStopRearms(stopReason, rearms, maximumRearms);
+}
+
 bool StagedInsideBrainRearms(std::string const& stopReason, unsigned rearms,
                              unsigned maximumRearms, unsigned aliveInside,
                              time_t secondsSinceLastRearm)
