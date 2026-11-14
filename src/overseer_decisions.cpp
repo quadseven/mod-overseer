@@ -24759,14 +24759,27 @@ LeaderIntentVerdict AskLeaderIntent(LeaderIntentState& state,
         int const asked = LeaderIntentRank(request.kind, request.target, preference, now);
         std::time_t const ran = now - state.since;
         bool const dwellOver = state.dwellWaived || ran >= limits.dwellSeconds;
-        if (asked <= held)
-            return defer(state.owner, 0,
-                         std::string("'") + LeaderIntentKindWord(state.kind) +
-                             "' holds the leader and ranks at or above this request");
-        if (!urgent && !dwellOver)
-            return defer(state.owner, limits.dwellSeconds - ran,
-                         std::string("'") + LeaderIntentKindWord(state.kind) +
-                             "' is inside its minimum dwell");
+        bool const regroupYields = state.kind == LeaderIntentKind::Regroup &&
+                                   (request.kind == LeaderIntentKind::EconomyErrand ||
+                                    request.kind == LeaderIntentKind::TownErrand) &&
+                                   limits.regroupYieldSeconds > 0 &&
+                                   ran >= limits.regroupYieldSeconds;
+        if (regroupYields)
+        {
+            state.cooldownUntil[static_cast<std::uint8_t>(LeaderIntentKind::Regroup)] =
+                now + limits.regroupYieldCooldownSeconds;
+        }
+        else
+        {
+            if (asked <= held)
+                return defer(state.owner, 0,
+                             std::string("'") + LeaderIntentKindWord(state.kind) +
+                                 "' holds the leader and ranks at or above this request");
+            if (!urgent && !dwellOver)
+                return defer(state.owner, limits.dwellSeconds - ran,
+                             std::string("'") + LeaderIntentKindWord(state.kind) +
+                                 "' is inside its minimum dwell");
+        }
         verdict.replaced = state.kind;
         verdict.replacedOwner = state.owner;
     }
