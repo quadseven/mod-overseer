@@ -481,11 +481,24 @@ void ARegroupYieldsToAnErrandThatKeepsAsking()
             Check("nor on any poll while the errand walks",
                   v.answer == LeaderIntentAnswer::Deferred);
         }
+        // The errand is still walking well past the first cooldown: every poll
+        // it asks renews the cooldown, so the regroup cannot cut the walk off.
         for (int t = 870; t <= 1000; t += 30)
+        {
             AskLeaderIntent(state, Req(errand, "travel column", "vendor"), t, LIMITS);
-        v = AskLeaderIntent(state, Req(LeaderIntentKind::Regroup, "regroup", "Oz"), 1001,
+            v = AskLeaderIntent(state, Req(LeaderIntentKind::Regroup, "regroup", "Oz"), t + 1,
+                                LIMITS);
+            Check("a walking errand is not cut off when the first cooldown runs out",
+                  v.answer == LeaderIntentAnswer::Deferred);
+        }
+        // It stops asking at 1000; the cooldown then runs its full length.
+        v = AskLeaderIntent(state, Req(LeaderIntentKind::Regroup, "regroup", "Oz"), 1500,
                             LIMITS);
-        Check("once the cooldown has run a regroup may ask again",
+        Check("a regroup is still deferred inside the renewed cooldown",
+              v.answer == LeaderIntentAnswer::Deferred);
+        v = AskLeaderIntent(state, Req(LeaderIntentKind::Regroup, "regroup", "Oz"), 1601,
+                            LIMITS);
+        Check("once the errand has been gone a full cooldown a regroup may ask again",
               v.answer == LeaderIntentAnswer::Granted);
     }
 }

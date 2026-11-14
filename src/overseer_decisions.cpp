@@ -24732,6 +24732,13 @@ LeaderIntentVerdict AskLeaderIntent(LeaderIntentState& state,
     }
     if (live && state.kind == request.kind && state.owner == request.owner)
     {
+        // AN ERRAND THAT TOOK THE LEADER FROM A REGROUP KEEPS HIM WHILE IT WALKS:
+        // each poll it asks renews the regroup's cooldown, so the regroup cannot
+        // take him back mid-walk the moment the first cooldown runs out.
+        auto const yielded =
+            state.cooldownUntil.find(static_cast<std::uint8_t>(LeaderIntentKind::Regroup));
+        if (yielded != state.cooldownUntil.end() && now < yielded->second)
+            yielded->second = std::max(yielded->second, now + limits.regroupYieldCooldownSeconds);
         state.lastAsked = now;
         state.deferralSaid.erase(request.owner);
         if (state.target == request.target)
