@@ -9489,6 +9489,89 @@ CrossingPrice PriceCrossings(std::vector<CrossingOffer> const& offers,
     return price;
 }
 
+SameMapRideSelection SelectSameMapRideStops(std::vector<SameMapRideStop> const& stops,
+                                            std::uint32_t mapId, float fromX, float fromY,
+                                            float goalX, float goalY)
+{
+    SameMapRideSelection selection;
+    float boardingDistance = 0.f;
+    float landingDistance = 0.f;
+
+    for (std::size_t i = 0; i < stops.size(); ++i)
+    {
+        SameMapRideStop const& stop = stops[i];
+        if (stop.mapId != mapId)
+            continue;
+
+        float const toBoarding = std::hypot(stop.mooringX - fromX, stop.mooringY - fromY);
+        if (selection.boardingStop < 0 || toBoarding < boardingDistance)
+        {
+            selection.boardingStop = static_cast<int>(i);
+            boardingDistance = toBoarding;
+        }
+
+        float const toLanding = std::hypot(stop.mooringX - goalX, stop.mooringY - goalY);
+        if (selection.landingStop < 0 || toLanding < landingDistance)
+        {
+            selection.landingStop = static_cast<int>(i);
+            landingDistance = toLanding;
+        }
+    }
+
+    if (selection.boardingStop < 0 || selection.landingStop < 0)
+    {
+        selection.route = SameMapRideRoute::NoStops;
+        return selection;
+    }
+
+    if (selection.boardingStop == selection.landingStop)
+    {
+        selection.route = SameMapRideRoute::SameStop;
+        return selection;
+    }
+
+    if (!stops[static_cast<std::size_t>(selection.boardingStop)].berthKnown)
+    {
+        selection.route = SameMapRideRoute::NoBoardingBerth;
+        return selection;
+    }
+
+    if (!stops[static_cast<std::size_t>(selection.landingStop)].berthKnown)
+    {
+        selection.route = SameMapRideRoute::NoLandingBerth;
+        return selection;
+    }
+
+    selection.route = SameMapRideRoute::Ready;
+    return selection;
+}
+
+std::string SameMapRideReason(SameMapRideSelection const& selection, std::uint32_t mapId)
+{
+    auto stopName = [mapId](int stop, char const* role)
+    {
+        if (stop < 0)
+            return std::string("no ") + role + " on map " + std::to_string(mapId);
+        return std::string(role) + " " + std::to_string(stop + 1) + " on map " +
+               std::to_string(mapId);
+    };
+
+    switch (selection.route)
+    {
+        case SameMapRideRoute::Ready:
+            return "";
+        case SameMapRideRoute::NoStops:
+            return "the transport has no stop on map " + std::to_string(mapId);
+        case SameMapRideRoute::SameStop:
+            return "boarding and landing both select " + stopName(selection.boardingStop, "stop");
+        case SameMapRideRoute::NoBoardingBerth:
+            return "no berth at " + stopName(selection.boardingStop, "boarding stop");
+        case SameMapRideRoute::NoLandingBerth:
+            return "no berth at " + stopName(selection.landingStop, "landing stop");
+    }
+    return "same-map ride route is unreadable";
+}
+
 char const* StrandedWayName(StrandedWay way)
 {
     switch (way)
