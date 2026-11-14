@@ -51040,7 +51040,8 @@ private:
                                 float goalX, float goalY, uint32 incumbent,
                                 std::vector<CrossingTransportInfo const*>& serving,
                                 std::vector<std::pair<int, int>>& stops, std::string& said,
-                                bool sameMap = false, float fromX = 0.f, float fromY = 0.f)
+                                bool sameMap = false, float fromX = 0.f, float fromY = 0.f,
+                                float* routeYards = nullptr)
     {
         serving.clear();
         stops.clear();
@@ -51097,6 +51098,9 @@ private:
         limits.incumbentEntry = incumbent;
         OverseerDecisions::CrossingPrice const price =
             OverseerDecisions::PriceCrossings(offers, limits);
+        if (routeYards)
+            *routeYards = price.pick >= 0 ? price.yards[static_cast<std::size_t>(price.pick)]
+                                         : -1.f;
 
         std::ostringstream line;
         for (std::size_t i = 0; i < offers.size(); ++i)
@@ -52355,6 +52359,15 @@ private:
     // they do for a family. World thread only, lost on a restart: a restart
     // costs one re-priced route, and a member aboard at that moment is read as
     // a passenger again by the transport it is standing on.
+    struct ClassTrainerCrossingTarget
+    {
+        uint32 mapId{0};
+        uint32 spawnId{0};
+        float x{0.f};
+        float y{0.f};
+        std::string command;
+    };
+
     struct LoneCrossing
     {
         std::string leaderName;
@@ -52387,6 +52400,14 @@ private:
         uint32 jobWalks{0};
         uint32 jobFineSteps{0};
         bool jobSaidForeignWalk{false};
+        // A class trainer walk crosses to the priced trainer map, then resumes
+        // the original walk row so its local road checks and trainer visit run.
+        bool classTrainerWalk{false};
+        uint32 classTrainerMap{0};
+        uint32 classTrainerSpawn{0};
+        float classTrainerX{0.f};
+        float classTrainerY{0.f};
+        std::string classTrainerCommand;
         // THE MAP A TELDRASSIL CROSSING IS REALLY FOR (wow-overseer#1401): while
         // the island's boat leg is under way this crossing is a ride to Auberdine
         // on map 1, and this is the map the row asked for, crossed next.
@@ -52981,8 +53002,54 @@ private:
         uint32 const row = found->second.jobRow;
         uint32 const destination = found->second.crossingDestinationMap;
         uint32 const steps = found->second.jobSteps;
+        bool const resumeClassTrainerWalk = found->second.classTrainerWalk;
+        uint32 const classTrainerSpawn = found->second.classTrainerSpawn;
+        std::string const classTrainerCommand = found->second.classTrainerCommand;
         Player* const p = ObjectAccessor::FindPlayerByName(name);
         CancelCrossBerthWalk(name, p, "the crossing is over");
+
+        if (end == OverseerDecisions::CrossEnd::Arrived && resumeClassTrainerWalk)
+        {
+            // The bridge may have ended a long-running row while the member
+            // crossed. Only resume its trainer walk while this run still owns
+            // the verifying row.
+            QueryResult owned = CharacterDatabase.Query(
+                "SELECT status, claimed_by FROM overseer_command WHERE id = {}", row);
+            bool rowStillOurs = false;
+            if (owned)
+            {
+                Field* const fields = owned->Fetch();
+                rowStillOurs = fields[0].Get<std::string>() == "verifying" &&
+                               fields[1].Get<std::string>() == g_runToken;
+            }
+            if (!rowStillOurs)
+            {
+                EndLoneCrossing(name, "its class trainer crossing ended after the row was released");
+                return;
+            }
+
+            EndLoneCrossing(name, "it is ashore and resumes its class trainer walk");
+            char const* walkStatus = "error";
+            std::string walkDetail;
+            std::string walkResult;
+            if (p && p->IsInWorld())
+                walkDetail = DoWalk(p, classTrainerCommand,
+                                    OverseerDecisions::WalkGoal::Trainer, walkStatus,
+                                    walkResult, _pendingMailWalks, row, classTrainerSpawn);
+            else
+            {
+                walkDetail = "character is not in the world after crossing";
+                walkResult = "{\"outcome\":\"refused\",\"reason\":" +
+                             J(walkDetail) + ",\"retryable\":true}";
+            }
+            WriteCommandRow(row, walkStatus, walkDetail, walkResult, "verifying", true);
+            LOG_INFO("module.overseer",
+                     "overseer: class trainer walk {} for '{}' resumes after crossing to map {}: {}",
+                     row, name, destination,
+                     std::string(walkStatus) == "verifying" ? "continues asynchronously"
+                                                             : walkDetail);
+            return;
+        }
 
         std::string shown = reason.size() > 190 ? reason.substr(0, 190) : reason;
         char const* const status =
@@ -53219,7 +53286,8 @@ private:
     // to the stranded member's crossing as a job; the row stays 'verifying' and
     // is written when the crossing ends (FinishCrossJob).
     char const* DoCrossToMap(Player* who, std::string const& command, char const*& status,
-                             std::string& out, uint32 id)
+                             std::string& out, uint32 id,
+                             ClassTrainerCrossingTarget const* classTrainer = nullptr)
     {
         namespace D = OverseerDecisions;
         std::string const name = who->GetName();
@@ -53279,8 +53347,9 @@ private:
             facts.routeKnown =
                 (!leg.ride || who->GetMapId() == leg.map) &&
                 PriceCrossingTransports(who, who->GetMapId(), leg.map,
-                                        leg.ride ? leg.x : 0.f,
-                                        leg.ride ? leg.y : 0.f, 0, serving, stops, priced,
+                                        leg.ride ? leg.x : (classTrainer ? classTrainer->x : 0.f),
+                                        leg.ride ? leg.y : (classTrainer ? classTrainer->y : 0.f),
+                                        0, serving, stops, priced,
                                         leg.ride, who->GetPositionX(),
                                         who->GetPositionY()) >= 0;
             if (!facts.routeKnown)
@@ -53303,6 +53372,15 @@ private:
         started.rideY = leg.y;
         started.rideFromX = who->GetPositionX();
         started.rideFromY = who->GetPositionY();
+        if (classTrainer)
+        {
+            started.classTrainerWalk = true;
+            started.classTrainerMap = classTrainer->mapId;
+            started.classTrainerSpawn = classTrainer->spawnId;
+            started.classTrainerX = classTrainer->x;
+            started.classTrainerY = classTrainer->y;
+            started.classTrainerCommand = classTrainer->command;
+        }
         _loneCrossings[name] = started;
         LOG_INFO("module.overseer",
                  "overseer: cross-to-map {} - '{}' sets out from map {} for {}{}; up to {}s{}",
@@ -53376,14 +53454,22 @@ private:
         Player* const leader = ObjectAccessor::FindPlayerByName(memo.leaderName);
         float goalX = 0.f;
         float goalY = 0.f;
-        bool const leaderThere = leader && leader->IsInWorld() &&
+        bool const classTrainerThere = memo.classTrainerWalk &&
+                                       memo.classTrainerMap == memo.crossingDestinationMap;
+        bool const leaderThere = !classTrainerThere && leader && leader->IsInWorld() &&
                                  StrandedGoalOf(leader, goalX, goalY).map ==
                                      memo.crossingDestinationMap;
+        if (classTrainerThere)
+        {
+            goalX = memo.classTrainerX;
+            goalY = memo.classTrainerY;
+        }
         CrossingRoute route = ReadCrossingFromWorld(
             memo, std::vector<std::string>{name}, name, p, memo.crossingOriginMap,
             memo.crossingDestinationMap,
-            memo.rideSameMap ? memo.rideX : (leaderThere ? goalX : 0.f),
-            memo.rideSameMap ? memo.rideY : (leaderThere ? goalY : 0.f), memo.rideSameMap,
+            memo.rideSameMap ? memo.rideX : ((leaderThere || classTrainerThere) ? goalX : 0.f),
+            memo.rideSameMap ? memo.rideY : ((leaderThere || classTrainerThere) ? goalY : 0.f),
+            memo.rideSameMap,
             memo.rideFromX, memo.rideFromY);
         if (memo.crossingSince &&
             std::time(nullptr) - memo.crossingSince > time_t(CROSSING_BACKSTOP_SECONDS))
@@ -85560,9 +85646,10 @@ private:
     }
 
     // One walk row of any of the three kinds: parse, gate, choose, hold, walk.
-    static char const* DoWalk(Player* who, std::string const& command,
-                              OverseerDecisions::WalkGoal goal, char const*& status,
-                              std::string& out, std::vector<MailWalkCheck>& walking, uint32 id)
+    char const* DoWalk(Player* who, std::string const& command,
+                       OverseerDecisions::WalkGoal goal, char const*& status,
+                       std::string& out, std::vector<MailWalkCheck>& walking, uint32 id,
+                       uint32 preferredTrainerSpawn = 0)
     {
         namespace D = OverseerDecisions;
         namespace R = OverseerDecisions::MailWalkRefusal;
@@ -85835,6 +85922,107 @@ private:
                 spawns.push_back(Spawn{uint32(data->spawnId), data->id, data->posX, data->posY,
                                        data->posZ});
         }
+
+        // After a remote crossing, prefer the trainer whose route was priced.
+        // If it left the world while the member travelled, the ordinary local
+        // chooser may use another eligible trainer on that map.
+        if (goal == D::WalkGoal::Trainer && ev.classSpells && preferredTrainerSpawn)
+        {
+            auto const selected = std::find_if(
+                spawns.begin(), spawns.end(), [preferredTrainerSpawn](Spawn const& spawn)
+                {
+                    return spawn.spawnId == preferredTrainerSpawn;
+                });
+            if (selected != spawns.end())
+            {
+                Spawn const trainer = *selected;
+                spawns.assign(1, trainer);
+            }
+        }
+
+        // A CLASS WALK WITH NO LOCAL TRAINER MAY TAKE A PRICED, SAFE CROSSING
+        // TO THE NEAREST TRAINER ON ANOTHER CLASSIC MAP. The crossing uses the
+        // existing transport state machine; after landing, this same row runs
+        // the normal local walk, including its road, ground, and arrival checks.
+        if (goal == D::WalkGoal::Trainer && ev.classSpells && spawns.empty() &&
+            !D::Classic::IsExpansionContinent(ev.mapId))
+        {
+            if (!CrossEnabled())
+                return refuse(D::ErrandWalkRefusal::NoReachableClassSpellTrainer);
+
+            std::vector<D::ClassTrainerWalkOption> options;
+            std::vector<Spawn> remoteSpawns;
+            std::unordered_map<uint32, bool> remoteServes;
+            uint32 const phase = who->GetPhaseMask();
+            for (auto const& itr : sObjectMgr->GetAllCreatureData())
+            {
+                CreatureData const& data = itr.second;
+                if (data.mapid == ev.mapId || D::Classic::IsExpansionContinent(data.mapid) ||
+                    !(data.phaseMask & phase) ||
+                    !SpawnInWorldNow(GameEventOfSpawn(itr.first)))
+                    continue;
+
+                auto const serves = remoteServes.find(data.id);
+                if (serves == remoteServes.end())
+                    remoteServes.emplace(data.id, CreatureServesWalk(who, ev, data.id));
+                if (!remoteServes[data.id])
+                    continue;
+
+                std::vector<CrossingTransportInfo const*> serving;
+                std::vector<std::pair<int, int>> stops;
+                std::string priced;
+                float routeYards = -1.f;
+                int const route = PriceCrossingTransports(
+                    who, ev.mapId, data.mapid, data.posX, data.posY, 0, serving, stops,
+                    priced, false, who->GetPositionX(), who->GetPositionY(), &routeYards);
+                bool reachable = route >= 0 && routeYards >= 0.f;
+                if (reachable)
+                {
+                    CrossingStopInfo const& from =
+                        serving[static_cast<std::size_t>(route)]->stops[
+                            stops[static_cast<std::size_t>(route)].first];
+                    LoneCrossing safetyRead;
+                    uint32 guardLevel = 0;
+                    reachable = from.berthKnown &&
+                                !BerthIsGuarded(safetyRead, who, ev.mapId, from.berthX,
+                                                from.berthY, guardLevel);
+                }
+                options.push_back(D::ClassTrainerWalkOption{
+                    data.mapid, static_cast<uint32>(data.spawnId), routeYards, reachable});
+                remoteSpawns.push_back(Spawn{static_cast<uint32>(data.spawnId), data.id,
+                                             data.posX, data.posY, data.posZ});
+            }
+
+            int const pick = D::PickReachableClassTrainer(options);
+            if (pick < 0)
+                return refuse(D::ErrandWalkRefusal::NoReachableClassSpellTrainer);
+
+            Spawn const& chosen = remoteSpawns[static_cast<std::size_t>(pick)];
+            D::ClassTrainerWalkOption const& option = options[static_cast<std::size_t>(pick)];
+            ClassTrainerCrossingTarget target;
+            target.mapId = option.mapId;
+            target.spawnId = chosen.spawnId;
+            target.x = chosen.x;
+            target.y = chosen.y;
+            target.command = command;
+            char const* crossingStatus = "error";
+            std::string crossingResult;
+            std::string const crossingCommand =
+                "cross-to-map " + std::to_string(option.mapId);
+            (void)DoCrossToMap(who, crossingCommand, crossingStatus, crossingResult, id,
+                               &target);
+            if (std::string(crossingStatus) != "verifying")
+                return refuse(D::ErrandWalkRefusal::NoReachableClassSpellTrainer);
+
+            status = "verifying";
+            out = MailWalkJson(ev, "crossing", "");
+            LOG_INFO("module.overseer",
+                     "overseer: class trainer walk {} - '{}' crosses toward trainer spawn {} "
+                     "on map {} ({:.0f} priced yards), then resumes its local walk",
+                     id, ev.character, chosen.spawnId, option.mapId, option.routeYards);
+            return "";
+        }
+
         // THE STARTING LANDS ARE AN ISLAND OF THE CLASSIC WORLD ON AN OUTLAND
         // MAP (#765). A walker there is walked only to a mailbox, trainer,
         // vendor or spawn inside them; one in Hellfire Peninsula is not a

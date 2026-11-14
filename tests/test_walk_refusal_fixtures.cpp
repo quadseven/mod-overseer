@@ -94,6 +94,7 @@ int main(int argc, char** argv)
     // `retryable` says true.
     char const* const permanent[] = {
         E::TrainerTooFar, E::TrainerGround, E::NoTrainerOnMap, E::TrainerOtherSide,
+        E::NoReachableClassSpellTrainer,
         E::VendorTooFar, E::VendorGround, E::NoVendorOnMap,
         M::MailboxTooFar, M::GroundRefused, M::ExpansionContinent, M::Follower, M::Dead,
         M::InInstance, M::OnRoster, M::Malformed, S::SpawnTooFar, S::SpawnGround,
