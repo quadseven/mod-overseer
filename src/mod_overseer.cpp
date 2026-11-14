@@ -520,6 +520,21 @@ constexpr uint32 ENGAGEMENT_POLL_MS = 8000;
 // enough to act while the bad position is still a position, not a death.
 constexpr uint32 TERRAIN_RECOVERY_POLL_MS = 1000;
 
+// A raw terrain mismatch is a diagnostic only, and needs a stable sample at
+// one spot before it is useful. Five seconds spans several recovery polls;
+// the location bound prevents a walk across a hillside from becoming one
+// incident.
+constexpr float TERRAIN_MISMATCH_TOLERANCE_YARDS = 3.0f;
+constexpr time_t TERRAIN_MISMATCH_SUSTAINED_SECONDS = 5;
+constexpr time_t TERRAIN_MISMATCH_MAX_SAMPLE_GAP_SECONDS = 3;
+constexpr float TERRAIN_MISMATCH_EPISODE_RADIUS_YARDS = 5.0f;
+constexpr OverseerDecisions::BelowTerrainObservationLimits
+    TERRAIN_MISMATCH_OBSERVATION_LIMITS{
+        TERRAIN_MISMATCH_TOLERANCE_YARDS,
+        TERRAIN_MISMATCH_SUSTAINED_SECONDS,
+        TERRAIN_MISMATCH_MAX_SAMPLE_GAP_SECONDS,
+        TERRAIN_MISMATCH_EPISODE_RADIUS_YARDS};
+
 // HOW FAR ABOVE A CHARACTER ANOTHER SURFACE MUST BE before it can mean the
 // character is underneath the world rather than walking an ordinary slope.
 // The first live Stormwind reading was a 34-36 yard gap, but the trapped party
@@ -5286,6 +5301,49 @@ void RememberAim(std::string const& name, std::string const& job, uint32 questAi
         a.y = bot->GetPositionY();
         a.z = bot->GetPositionZ();
     }
+}
+
+// The movement generator is the core's actual step, while the aim snapshot
+// names the job or quest step that asked for it. Retain this only while the
+// character is moving; the observation state keeps the last such sample when
+// it stops before the terrain mismatch has lasted long enough to report.
+std::string CurrentTerrainMovementStep(std::string const& name, Player* bot)
+{
+    if (!bot || !bot->isMoving())
+        return {};
+
+    MotionMaster const* const motion = bot->GetMotionMaster();
+    if (!motion)
+        return {};
+
+    char const* const generator = OverseerDecisions::MoveGeneratorName(
+        FoldMovementGenerator(motion->GetCurrentMovementGeneratorType()));
+    if (!generator || !*generator || std::strcmp(generator, "idle") == 0)
+        return {};
+
+    std::string job;
+    std::string travelTarget;
+    uint32 questAim = 0;
+    {
+        std::lock_guard<std::mutex> guard(g_aimMutex);
+        auto const it = g_aimSnapshot.find(LowerName(name));
+        if (it != g_aimSnapshot.end() && it->second.mapId == bot->GetMapId())
+        {
+            job = it->second.job;
+            questAim = it->second.questAim;
+            travelTarget = it->second.travelTarget;
+        }
+    }
+
+    std::ostringstream step;
+    step << "generator=" << generator;
+    if (!job.empty())
+        step << " job='" << job << "'";
+    if (questAim)
+        step << " quest=" << questAim;
+    if (!travelTarget.empty())
+        step << " travel='" << travelTarget << "'";
+    return step.str();
 }
 
 // Called from the two kill hooks below, whatever thread Unit::Kill happens to
@@ -33212,6 +33270,18 @@ private:
 
             OverseerDecisions::TerrainRecoveryState& memory =
                 _terrainRecovery[LowerName(name)];
+            time_t const now = std::time(nullptr);
+            float const terrainGap = reading.terrainZ - reading.z;
+            std::string movementStep;
+            if (reading.onOpenMap && reading.terrainValid && !onTheGround &&
+                terrainGap >= TERRAIN_MISMATCH_TOLERANCE_YARDS)
+                movementStep = CurrentTerrainMovementStep(name, bot);
+            OverseerDecisions::BelowTerrainObservationState& mismatchMemory =
+                _terrainMismatchObservation[LowerName(name)];
+            OverseerDecisions::BelowTerrainObservationVerdict const mismatch =
+                OverseerDecisions::ObserveTerrainMismatch(
+                    mismatchMemory, reading, onTheGround, movementStep,
+                    TERRAIN_MISMATCH_OBSERVATION_LIMITS, now);
             // PROVEN, NOT INFERRED FROM A MISSING POLYGON (#725). This set
             // tells the other drives that terrain recovery owns the character;
             // a character under a roof that is not falling is owned by nothing
@@ -33226,7 +33296,41 @@ private:
             uint8 const rungBefore = static_cast<uint8>(memory.attempts);
             OverseerDecisions::TerrainRecoveryVerdict const verdict =
                 OverseerDecisions::TerrainRecoveryStep(
-                    memory, reading, TERRAIN_RECOVERY_LIMITS, std::time(nullptr));
+                    memory, reading, TERRAIN_RECOVERY_LIMITS, now);
+            if (mismatch.report)
+            {
+                char const* reason =
+                    "existing recovery proof did not authorize an action";
+                switch (verdict.remedy)
+                {
+                    case OverseerDecisions::TerrainRemedy::Nothing:
+                        break;
+                    case OverseerDecisions::TerrainRemedy::LiftToSurface:
+                        reason = "existing fall or void proof authorized a lift attempt";
+                        break;
+                    case OverseerDecisions::TerrainRemedy::GiveUp:
+                        reason = "the bounded recovery has no safe next remedy";
+                        break;
+                    case OverseerDecisions::TerrainRemedy::NotFalling:
+                        reason = "the character is not falling, so a lift was declined";
+                        break;
+                    case OverseerDecisions::TerrainRemedy::ReturnToLastGround:
+                        reason = "a same-map return to measured ground was authorized";
+                        break;
+                    case OverseerDecisions::TerrainRemedy::SetDown:
+                        reason = "a measured transport floor authorized a set-down";
+                        break;
+                }
+                std::string const lastMovementStep = mismatchMemory.lastMovementStep.empty()
+                    ? "no moving step was sampled"
+                    : mismatchMemory.lastMovementStep;
+                LOG_ERROR("module.overseer",
+                          "overseer: '{}' remained below raw terrain for {} seconds at map {} "
+                          "position ({:.1f}, {:.1f}, {:.1f}); terrain z {:.1f}, gap {:.1f}. "
+                          "last movement step: {}. recovery reason: {} (#1482)",
+                          name, mismatch.seconds, reading.mapId, reading.x, reading.y,
+                          reading.z, reading.terrainZ, terrainGap, lastMovementStep, reason);
+            }
             bool const groundOnRecord = memory.plane.ground.valid &&
                                         memory.plane.ground.mapId == bot->GetMapId();
             if (verdict.remedy == OverseerDecisions::TerrainRemedy::Nothing)
@@ -87391,6 +87495,10 @@ private:
     // OverseerDecisions::TerrainRecoveryStep, where it is tested without a
     // world.
     std::map<std::string, OverseerDecisions::TerrainRecoveryState> _terrainRecovery;
+    // A raw-terrain mismatch is only reported after it persists at one place;
+    // this state never grants permission to move a character.
+    std::map<std::string, OverseerDecisions::BelowTerrainObservationState>
+        _terrainMismatchObservation;
     // Places a "nothing is being moved" terrain note was already said about (#775).
     std::unordered_set<uint64_t> _terrainNoted;
 

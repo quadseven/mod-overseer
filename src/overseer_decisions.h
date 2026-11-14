@@ -1181,6 +1181,41 @@ struct TerrainRecoveryState
     float y{0.f};
 };
 
+// DIAGNOSTIC MEMORY FOR A CHARACTER BELOW THE RAW TERRAIN HEIGHT. This is not
+// proof that a lift is safe: a cave floor can sit below the terrain above it.
+// It holds the mismatch long enough to distinguish a bad step from one noisy
+// sample, then gives the adapter one report with the last sampled movement step.
+struct BelowTerrainObservationLimits
+{
+    float toleranceYards{0.f};
+    time_t sustainedSeconds{0};
+    time_t maxSampleGapSeconds{0};
+    float episodeRadiusYards{0.f};
+};
+
+struct BelowTerrainObservationState
+{
+    time_t since{0};
+    time_t lastSeen{0};
+    uint32_t mapId{0};
+    float x{0.f};
+    float y{0.f};
+    std::string lastMovementStep;
+    bool reported{false};
+};
+
+struct BelowTerrainObservationVerdict
+{
+    bool observing{false};
+    bool report{false};
+    time_t seconds{0};
+};
+
+BelowTerrainObservationVerdict ObserveTerrainMismatch(
+    BelowTerrainObservationState& state, TerrainReading const& reading,
+    bool standingOnGround, std::string const& movementStep,
+    BelowTerrainObservationLimits const& limits, time_t now);
+
 // IS THIS CHARACTER STANDING ON THE GROUND, or only near some ground?
 //
 // `hasLocalNavmesh` is what Detour answers when it is asked for a path a

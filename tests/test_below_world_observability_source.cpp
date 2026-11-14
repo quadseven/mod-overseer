@@ -28,6 +28,33 @@ int main()
     std::string const text((std::istreambuf_iterator<char>(source)),
                            std::istreambuf_iterator<char>());
 
+    std::size_t const observation =
+        text.find("OverseerDecisions::ObserveTerrainMismatch(");
+    if (observation == std::string::npos)
+        return Fail("terrain recovery must observe sustained raw-terrain mismatches");
+    std::size_t const mismatchLog = text.find("remained below raw terrain", observation);
+    if (mismatchLog == std::string::npos ||
+        !Has(text, "last movement step", mismatchLog) ||
+        !Has(text, "recovery reason", mismatchLog))
+        return Fail("the sustained mismatch log must name its movement step and recovery reason");
+    std::size_t const reasonSwitch = text.find("switch (verdict.remedy)", observation);
+    std::size_t const reasonEnd = text.find("std::string const lastMovementStep", reasonSwitch);
+    if (reasonSwitch == std::string::npos || reasonEnd == std::string::npos)
+        return Fail("the sustained mismatch log must explain each recovery outcome");
+    std::string const reasons = text.substr(reasonSwitch, reasonEnd - reasonSwitch);
+    if (!Has(reasons, "TerrainRemedy::Nothing") ||
+        !Has(reasons, "TerrainRemedy::LiftToSurface") ||
+        !Has(reasons, "TerrainRemedy::GiveUp") ||
+        !Has(reasons, "TerrainRemedy::NotFalling") ||
+        !Has(reasons, "TerrainRemedy::ReturnToLastGround") ||
+        !Has(reasons, "TerrainRemedy::SetDown"))
+        return Fail("the sustained mismatch log must explain each recovery outcome");
+    if (!Has(text, "std::string CurrentTerrainMovementStep(") ||
+        !Has(text, "FoldMovementGenerator(motion->GetCurrentMovementGeneratorType())") ||
+        !Has(text, "g_aimSnapshot.find(LowerName(name))") ||
+        !Has(text, "mismatchMemory.lastMovementStep"))
+        return Fail("the mismatch log must retain the sampled movement generator and aim step");
+
     std::size_t const catchUp = text.find("bool CatchUpToward(");
     std::size_t const catchUpEnd = text.find("    // WHAT STANDS ON THE LINE", catchUp);
     if (catchUp == std::string::npos || catchUpEnd == std::string::npos)
