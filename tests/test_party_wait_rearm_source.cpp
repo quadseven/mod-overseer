@@ -55,6 +55,9 @@ int main()
     if (watchdog.find("_dcOnIssued.erase(state.name)", rearm) > busyHold)
         return Fail("the re-arm forgets every member's dc on record");
 
+    if (watchdog.find("coord.clearStopSeenAt = 0;") > rearm)
+        return Fail("a boss credit forgets the stop stamp");
+
     std::string const stall = Body(text, "    bool StepGuildRunStall(");
     if (stall.find("GuildRunSplitClock(") == std::string::npos)
         return Fail("the split clock goes through GuildRunSplitClock");

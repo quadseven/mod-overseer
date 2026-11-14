@@ -41126,6 +41126,7 @@ private:
             coord.clearMarked = false;
             coord.clearSkips = 0;
             coord.clearRearms = 0;
+            coord.clearStopSeenAt = 0;
             // AND THE RUN DEMONSTRABLY ADVANCED (#382). A boss died, so whatever
             // the party has been busy with for the last however-long, it was
             // busy doing THAT. The ceiling below exists to catch a hold that
