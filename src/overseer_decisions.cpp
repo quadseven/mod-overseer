@@ -848,13 +848,47 @@ BelowTerrainObservationVerdict ObserveTerrainMismatch(
     bool standingOnGround, std::string const& movementStep,
     BelowTerrainObservationLimits const& limits, time_t now)
 {
-    if (!reading.onOpenMap || !reading.terrainValid || standingOnGround ||
-        limits.toleranceYards <= 0.f || !std::isfinite(reading.z) ||
-        !std::isfinite(reading.terrainZ) || !std::isfinite(reading.x) ||
-        !std::isfinite(reading.y) ||
-        reading.terrainZ - reading.z < limits.toleranceYards)
+    bool const validReading = reading.onOpenMap && reading.terrainValid &&
+                              !standingOnGround &&
+                              std::isfinite(reading.z) &&
+                              std::isfinite(reading.terrainZ) &&
+                              std::isfinite(reading.x) &&
+                              std::isfinite(reading.y);
+    if (!validReading || limits.toleranceYards <= 0.f)
     {
         state = BelowTerrainObservationState{};
+        return {};
+    }
+
+    if (!movementStep.empty())
+    {
+        state.lastMovementStep = movementStep;
+        state.lastMovementAt = now;
+        state.lastMovementMapId = reading.mapId;
+    }
+    bool const movementIsRecent = !state.lastMovementStep.empty() &&
+                                  state.lastMovementAt > 0 &&
+                                  now >= state.lastMovementAt &&
+                                  limits.maxSampleGapSeconds > 0 &&
+                                  now - state.lastMovementAt <=
+                                      limits.maxSampleGapSeconds &&
+                                  state.lastMovementMapId == reading.mapId;
+    if (state.since == 0 && !movementIsRecent)
+    {
+        state.lastMovementStep.clear();
+        state.lastMovementAt = 0;
+        state.lastMovementMapId = 0;
+    }
+
+    if (reading.terrainZ - reading.z < limits.toleranceYards)
+    {
+        std::string const recentStep = state.lastMovementStep;
+        time_t const recentStepAt = state.lastMovementAt;
+        uint32_t const recentStepMap = state.lastMovementMapId;
+        state = BelowTerrainObservationState{};
+        state.lastMovementStep = recentStep;
+        state.lastMovementAt = recentStepAt;
+        state.lastMovementMapId = recentStepMap;
         return {};
     }
 
@@ -870,7 +904,13 @@ BelowTerrainObservationVerdict ObserveTerrainMismatch(
                                    limits.episodeRadiusYards;
     if (!recent || state.mapId != reading.mapId || !samePlace)
     {
+        std::string const recentStep = movementIsRecent ? state.lastMovementStep : "";
+        time_t const recentStepAt = movementIsRecent ? state.lastMovementAt : 0;
+        uint32_t const recentStepMap = movementIsRecent ? state.lastMovementMapId : 0;
         state = BelowTerrainObservationState{};
+        state.lastMovementStep = recentStep;
+        state.lastMovementAt = recentStepAt;
+        state.lastMovementMapId = recentStepMap;
         state.since = now;
         state.mapId = reading.mapId;
         state.x = reading.x;
@@ -878,8 +918,6 @@ BelowTerrainObservationVerdict ObserveTerrainMismatch(
     }
 
     state.lastSeen = now;
-    if (!movementStep.empty())
-        state.lastMovementStep = movementStep;
 
     time_t const seconds = now >= state.since ? now - state.since : 0;
     bool const report = !state.reported && limits.sustainedSeconds > 0 &&

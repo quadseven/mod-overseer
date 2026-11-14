@@ -1184,7 +1184,9 @@ struct TerrainRecoveryState
 // DIAGNOSTIC MEMORY FOR A CHARACTER BELOW THE RAW TERRAIN HEIGHT. This is not
 // proof that a lift is safe: a cave floor can sit below the terrain above it.
 // It holds the mismatch long enough to distinguish a bad step from one noisy
-// sample, then gives the adapter one report with the last sampled movement step.
+// sample, then gives the adapter one report with a fresh movement step. Recent
+// movement is retained across the tolerance crossing, but expires with the
+// same bound as an observation sample so old steps cannot be misattributed.
 struct BelowTerrainObservationLimits
 {
     float toleranceYards{0.f};
@@ -1201,6 +1203,8 @@ struct BelowTerrainObservationState
     float x{0.f};
     float y{0.f};
     std::string lastMovementStep;
+    time_t lastMovementAt{0};
+    uint32_t lastMovementMapId{0};
     bool reported{false};
 };
 
