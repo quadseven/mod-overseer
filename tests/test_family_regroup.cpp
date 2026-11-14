@@ -394,7 +394,8 @@ void EveryClaimHasItsOwnName()
         RegroupClaim::InFormation, RegroupClaim::Rejoining,
         RegroupClaim::NotInTheWorld, RegroupClaim::AnotherMap,
         RegroupClaim::Dead, RegroupClaim::OnARun, RegroupClaim::StoodDown,
-        RegroupClaim::AimRefused};
+        RegroupClaim::AimRefused, RegroupClaim::Fetched, RegroupClaim::TooFarToWaitFor,
+        RegroupClaim::OwnErrand};
     for (RegroupClaim a : all)
     {
         Check("a name is never empty", RegroupClaimName(a)[0] != '\0', true);

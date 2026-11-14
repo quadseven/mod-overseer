@@ -7059,6 +7059,14 @@ public:
     // remembers. See OverseerDecisions::LandedErrandStep. Says once per landing
     // that it is standing down, so the log shows why a standing aim is not
     // being walked.
+    // Has `name` landed on exactly `columnAim` and been let go of it? A peek
+    // with no side effect, for readers that are not the travel loop (#1517).
+    bool HoldsLanding(std::string const& name, std::string const& columnAim) const
+    {
+        auto const it = _landed.find(name);
+        return it != _landed.end() && it->second.aim == columnAim;
+    }
+
     OverseerDecisions::LandedErrand LandedStep(std::string const& name,
                                                std::string const& columnAim,
                                                bool counterHoldActive)
@@ -16320,7 +16328,8 @@ private:
             for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
             {
                 Player* const member = ref->GetSource();
-                if (member && member != who && plain(member->GetName()))
+                if (member && member != who && plain(member->GetName()) &&
+                    OverseerDecisions::PartyTollCounts(WalksItsOwnErrand(member->GetName())))
                     names += ",'" + Esc(member->GetName()) + "'";
             }
         }
@@ -19703,6 +19712,10 @@ private:
         if (walkYards < TRAVEL_FLIGHT_MIN_YARDS)
             return false;
         if (state.flights >= TRAVEL_FLIGHT_MAX_PER_ERRAND)
+            return false;
+        // A member on its own errand walks: a flight carries it off the
+        // family's ground (#1517).
+        if (WalksItsOwnErrand(name))
             return false;
         // Only `new rpg` runs NewRpgTravelFlightAction, the same way only
         // `new rpg` runs NewRpgWanderNpcAction - asked through the same shared
@@ -25909,9 +25922,30 @@ private:
                OverseerDecisions::GuardWalkSteers(it->second.walk);
     }
 
+    // AN ERRAND OF ITS OWN, IN INDIVIDUAL MODE (#1517). The followers this
+    // travel poll found walking an errand of their own while their family is
+    // on no dungeon or raid job (OverseerDecisions::IndividualErrandSteers).
+    // Refreshed once per travel poll by RefreshIndividualErrands and read by
+    // every gate that asks MaySteerItself, by DriveCatchUp, by the regroup
+    // wait, by the fetch and by the errand death breaker, so none of them can
+    // disagree about it. The errand ends, the column clears, the next poll
+    // drops the name, and the follow sweep takes `new rpg` back.
+    std::set<std::string> _individualErrands;
+    // AND ONLY WHILE ITS COLUMN STILL HOLDS AN AIM: a Release between two
+    // travel polls empties the column, and the member follows again from that
+    // moment rather than one poll later with `new rpg` left on it.
+    bool WalksItsOwnErrand(std::string const& name) const
+    {
+        return _individualErrands.count(name) != 0 && !_travelAims.TargetFor(name).empty();
+    }
+    // The aim each member landed on while walking alone, kept until the
+    // column changes, so a landed aim that its writer never clears is not
+    // walked again when the landing ceiling lapses.
+    std::map<std::string, std::string> _individualLanded;
+
     bool MaySteerItself(std::string const& name) const
     {
-        return IsEscorted(name) || WalksItsGuard(name) ||
+        return IsEscorted(name) || WalksItsGuard(name) || WalksItsOwnErrand(name) ||
                (SplitFromLeader(name) &&
                 OverseerDecisions::CutOffFollowerRoams(TownJobFor(name),
                                                        _travelAims.TargetFor(name)));
@@ -26533,6 +26567,9 @@ private:
         // in the same poll, and a refusal recorded below is never a stale one.
         // All of it runs on the world thread.
         _catchUpRefused.erase(name);
+        // ITS OWN ERRAND (#1517): not walked back to its leader while it runs.
+        if (WalksItsOwnErrand(name))
+            return;
 
         // GetMapId  Position.h:281; GetDistance2d  Object.h:537-538. Read
         // BEFORE the escorted early-return below, so that a split is forgotten
@@ -27293,6 +27330,8 @@ private:
             // THE LEADER IS GOING BACK FOR IT (2026-09-23). DriveFetch ran
             // earlier in this poll, so this is this poll's answer.
             member.beingFetched = member.name == FetchTargetOf(leaderName);
+            // ITS OWN ERRAND (#1517): the leader is never held for it.
+            member.onItsOwnErrand = WalksItsOwnErrand(member.name);
             members.push_back(member);
         }
 
@@ -27742,6 +27781,8 @@ private:
             member.heldTooFar = HeldWaitingForLeader(member.name);
             member.heldOffLethalLeg = HeldOffLethalLeg(member.name);
             member.stoodDown = WithinFetchStandDown(member.name);
+            // ITS OWN ERRAND (#1517): the leader never goes back for it.
+            member.onItsOwnErrand = WalksItsOwnErrand(member.name);
             if (member.sameMap)
                 member.yards = p->GetDistance2d(leader);
             candidates.push_back(member);
@@ -28799,6 +28840,103 @@ private:
         return true;
     }
 
+    // Every enabled row's job, and whether the read itself succeeded. LoadJobs
+    // leaves out `quest` and answers a failed read with an empty map, which is
+    // also "everybody questing"; individual mode must tell those apart and
+    // fail closed on the first.
+    static std::map<std::string, std::string> LoadAllJobs(bool& readSucceeded)
+    {
+        std::map<std::string, std::string> jobs;
+        readSucceeded = false;
+        QueryResult result =
+            CharacterDatabase.Query("SELECT name, job FROM overseer_roster WHERE enabled = 1");
+        if (!result)
+            return jobs;
+        readSucceeded = true;
+        do
+        {
+            Field* fields = result->Fetch();
+            jobs[fields[0].Get<std::string>()] = fields[1].Get<std::string>();
+        } while (result->NextRow());
+        return jobs;
+    }
+
+    // WHO WALKS AN ERRAND OF ITS OWN THIS POLL (#1517). Behind
+    // Overseer.Individual.Enable, off by default: the bridge already writes
+    // aims on followers, and with the switch on each of them walks. Fails
+    // closed: a failed job read, a member whose family the roster does not
+    // name, or a family holding a dungeon or raid job leaves every member
+    // following as before.
+    void RefreshIndividualErrands(std::map<std::string, std::string> const& aims)
+    {
+        bool const enabled =
+            sConfigMgr->GetOption<bool>("Overseer.Individual.Enable", false, false);
+        std::vector<std::pair<std::string, OverseerDecisions::IndividualErrandFacts>> rows;
+        if (enabled && !aims.empty())
+        {
+            bool jobsRead = false;
+            std::map<std::string, std::string> const jobs = LoadAllJobs(jobsRead);
+            std::map<std::string, std::string> const families =
+                jobsRead ? LoadRosterFamilies() : std::map<std::string, std::string>();
+            std::map<std::string, std::vector<std::string>> jobsByFamily;
+            for (auto const& [member, job] : jobs)
+            {
+                auto const f = families.find(member);
+                if (f != families.end())
+                    jobsByFamily[f->second].push_back(job);
+            }
+            for (auto const& [name, aim] : aims)
+            {
+                Player* const bot = ObjectAccessor::FindPlayerByName(name);
+                if (!SteerableAI(bot))
+                    continue;
+                auto const f = families.find(name);
+                std::string const family = f == families.end() ? std::string() : f->second;
+                Group* const group = bot->GetGroup();
+                Player* const leader =
+                    group ? ObjectAccessor::FindPlayer(group->GetLeaderGUID()) : nullptr;
+                // THE LANDING ENDS THE ERRAND, whoever wrote the aim: kept
+                // until the column holds something else.
+                auto const landed = _individualLanded.find(name);
+                if (landed != _individualLanded.end() && landed->second != aim)
+                    _individualLanded.erase(landed);
+                if (_travelAims.HoldsLanding(name, aim))
+                    _individualLanded[name] = aim;
+                OverseerDecisions::IndividualErrandFacts facts;
+                facts.leadsItsParty = LeadsItsParty(bot);
+                facts.familyLinked = !jobsRead || family.empty() ||
+                                     OverseerDecisions::FamilyLinked(jobsByFamily[family]);
+                facts.inARun = InAnyDungeonRun(bot);
+                facts.sameMapAsLeader = leader && leader != bot && leader->IsInWorld() &&
+                                        leader->GetMapId() == bot->GetMapId();
+                facts.leaderMapId = leader ? leader->GetMapId() : 0;
+                facts.ownAim = aim;
+                facts.claimedByAnotherOwner = IsEscorted(name) || IsCatchingUp(name) ||
+                                              IsWalkingHome(name) ||
+                                              _travelAims.RunOwns(name, aim);
+                facts.landedOnIt = _individualLanded.count(name) != 0;
+                rows.emplace_back(name, facts);
+            }
+        }
+        for (auto it = _individualLanded.begin(); it != _individualLanded.end();)
+            it = aims.count(it->first) ? std::next(it) : _individualLanded.erase(it);
+        std::set<std::string> next = OverseerDecisions::IndividualErrandSet(enabled, rows);
+        OverseerDecisions::IndividualErrandChange const change =
+            OverseerDecisions::IndividualErrandChanges(_individualErrands, next);
+        for (std::string const& name : change.started)
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' walks its own errand '{}' - its family is on no "
+                     "dungeon or raid job, so it steers itself and its leader does not "
+                     "wait for it (individual mode, #1517)",
+                     name, aims.at(name));
+        for (std::string const& name : change.stopped)
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' no longer walks an errand of its own - it follows "
+                     "its leader again (#1517)",
+                     name);
+        _individualErrands.swap(next);
+    }
+
     void DriveTravel()
     {
         // Before anything else, so a death is read against the route the walker
@@ -28857,6 +28995,7 @@ private:
         // rule that would otherwise starve it, rather than the generic rule
         // being weakened for everybody.
         std::map<std::string, std::string> const jobs = LoadJobs();
+        RefreshIndividualErrands(aims);
         if (aims.empty())
         {
             // No errands anywhere, so nothing this loop remembers is still
@@ -29001,7 +29140,8 @@ private:
 
             // ONE CAST INSTEAD OF THE WALK, asked ahead of the resolve because the
             // resolve refuses a point on another map (#1161).
-            if (!guarded && MageTravelHolds(bot, name, target, state, aims))
+            if (!guarded && !WalksItsOwnErrand(name) &&
+                MageTravelHolds(bot, name, target, state, aims))
                 continue;
 
             // AN AIM ON A CHARACTER THAT CANNOT ACT ON IT IS NOT AN AIM, and
@@ -29218,6 +29358,10 @@ private:
                 // never reaches the database; RecentDeathCount owns that too.
                 toll.deaths = RecentDeathCount(name, window);
                 toll.partyDeaths = RecentPartyDeathCount(bot, window);
+                // A member on its own errand answers for its own deaths only
+                // (#1517): the rest of its family is somewhere else.
+                toll.partyDeaths = OverseerDecisions::ErrandPartyDeaths(
+                    WalksItsOwnErrand(name), toll.deaths, toll.partyDeaths);
                 toll.strikes = _travelAims.LethalStrikes(name, target);
 
                 OverseerDecisions::ErrandDeathVerdict const verdict =
