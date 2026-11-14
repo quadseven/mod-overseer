@@ -66823,21 +66823,29 @@ private:
             facts.tankHasVictim = tankVictim != nullptr;
 
             std::vector<Unit*> hostiles;
+            auto const consider = [&](Unit* attacker)
+            {
+                if (!attacker || !attacker->CanHaveThreatList() ||
+                    std::find(hostiles.begin(), hostiles.end(), attacker) != hostiles.end())
+                    return;
+                unsigned onList = 0;
+                for (Player* seat : party)
+                    if (attacker->GetThreatMgr().GetThreat(seat) > 0.0f)
+                        ++onList;
+                hostiles.push_back(attacker);
+                facts.hostilePartyCounts.push_back(onList);
+            };
             for (Player* member : party)
             {
                 // getAttackers  Unit.h  AttackerSet const& getAttackers() const
                 for (Unit* attacker : member->getAttackers())
-                {
-                    if (!attacker || !attacker->CanHaveThreatList() ||
-                        std::find(hostiles.begin(), hostiles.end(), attacker) != hostiles.end())
-                        continue;
-                    unsigned onList = 0;
-                    for (Player* seat : party)
-                        if (attacker->GetThreatMgr().GetThreat(seat) > 0.0f)
-                            ++onList;
-                    hostiles.push_back(attacker);
-                    facts.hostilePartyCounts.push_back(onList);
-                }
+                    consider(attacker);
+                // A hostile can hold a member on its threat list while it attacks
+                // someone outside the party, so getAttackers never lists it.
+                // GetThreatenedByMeList  ThreatManager.h  auto const& GetThreatenedByMeList() const
+                // ThreatReference::GetOwner  ThreatManager.h  Unit* GetOwner() const
+                for (auto const& entry : member->GetThreatMgr().GetThreatenedByMeList())
+                    consider(entry.second->GetOwner());
             }
 
             OverseerDecisions::MeterTargetChoice const choice =

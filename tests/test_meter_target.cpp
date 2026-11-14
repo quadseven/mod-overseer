@@ -113,6 +113,12 @@ void TheProbeAsksTheDecision()
     std::size_t const json = source.find("OverseerDecisions::MeterProbeJson(", probe);
     Check("ProbeMeter picks its target through MeterPickTarget before it writes the json",
           pick != std::string::npos && json != std::string::npos && pick < json);
+    // A hostile can hold party members on its threat list while it attacks
+    // someone outside the party, so getAttackers alone never lists it: the
+    // candidates also come from the units that have a member on their list.
+    std::size_t const threatened = source.find("GetThreatenedByMeList()", probe);
+    Check("ProbeMeter also reads the units that have a party member on their threat list",
+          threatened != std::string::npos && threatened < pick);
 }
 }  // namespace
 
