@@ -14571,6 +14571,31 @@ char const* HearthStayedDetail(bool castWasSeen, bool castWasQueued)
     return HEARTH_STAYED_NO_CAST;
 }
 
+bool CastProductHasRoom(CastMakesFacts const& facts)
+{
+    if (!facts.makesItem)
+        return true;
+    // Spell::CheckItems asks this first, for any pick, before the item itself.
+    if (facts.randomPool && facts.freeSlots == 0)
+        return false;
+    if (facts.fits)
+        return true;
+    // The core's ItemLimitCategory branch (the mage conjures) is the core's.
+    return facts.limitCategory;
+}
+
+std::string CastNothingDetail(bool castWasSeen, bool castWasQueued, char const* wall,
+                              std::string const& coreAnswer, char const* postCondition)
+{
+    if (castWasSeen || castWasQueued)
+        return postCondition;
+    if (!coreAnswer.empty())
+        return "the cast did not start: the core answered " + coreAnswer;
+    if (wall && *wall)
+        return wall;
+    return postCondition;
+}
+
 
 char const* PartyFlightBlockWord(PartyFlightBlock block)
 {
@@ -15308,7 +15333,8 @@ TownRetry CastRefusalRetry(std::string const& detail)
     // that does is a trip to a vendor, which is exactly what this class means
     // everywhere else in this file.
     if (detail == CastRefusal::TargetOutOfRange || detail == CastRefusal::TargetOtherMap
-        || detail == CastRefusal::MissingReagent || detail == CastRefusal::NoSpellFocus)
+        || detail == CastRefusal::MissingReagent || detail == CastRefusal::NoSpellFocus
+        || detail == CastRefusal::NoBagRoom || detail == CastRefusal::MissingTool)
         return TownRetry::Elsewhere;
 
     // LATER, and everything this table has never heard of. The character's own
