@@ -94,7 +94,7 @@ int main()
     Check(refresh.find("facts.leaderMapId = leader ? leader->GetMapId() : 0;") !=
               std::string::npos,
           "the aim's map is asked against the leader's");
-    Check(refresh.find("OverseerDecisions::FamilyLinked(") != std::string::npos,
+    Check(refresh.find("OverseerDecisions::FamilyReLinks(relink)") != std::string::npos,
           "a family on a dungeon or raid job is linked");
     Check(refresh.find("family.empty() ||") != std::string::npos,
           "a member whose family the roster does not name fails closed");
@@ -102,6 +102,13 @@ int main()
     Check(refresh.find("IsCatchingUp(name)") != std::string::npos &&
               refresh.find("_travelAims.RunOwns(name, aim)") != std::string::npos,
           "a catch-up or run claim is not the member's own errand");
+
+    Check(refresh.find("OverseerDecisions::FamilyReLinks(") != std::string::npos &&
+              refresh.find("OverseerDecisions::ReleasesItsOwnErrand(") != std::string::npos &&
+              refresh.find("_travelAims.Release(name,") != std::string::npos,
+          "a re-link releases the member's own errand through the travel book (#1519)");
+    Check(refresh.find("SummonAskedFor(") != std::string::npos,
+          "a summon asked for is a re-link fact (#1519)");
 
     std::string const travel = Body(text, "    void DriveTravel()");
     Check(Before(travel, "RefreshIndividualErrands(aims);", "if (aims.empty())"),

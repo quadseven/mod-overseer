@@ -8927,6 +8927,25 @@ bool CutOffFollowerRoams(std::string const& job, std::string const& target);
 bool IsLinkingJob(std::string const& job);
 bool FamilyLinked(std::vector<std::string> const& memberJobs);
 
+// WHAT RE-LINKS AN INDIVIDUAL FAMILY (#1519). Three facts, any one enough: a
+// dungeon or raid job on any member's row, a run any member is in, or a
+// meeting stone summon asked for one of its members. The answer is for the
+// whole family, so a run that has taken one member takes them all.
+struct FamilyReLinkFacts
+{
+    std::vector<std::string> memberJobs;
+    bool anyMemberInRun{false};
+    bool summonAsked{false};
+};
+bool FamilyReLinks(FamilyReLinkFacts const& facts);
+
+// Does a re-link give this member's own errand back? Only an errand the
+// member was walking on its own: a catch-up, an escort, a walk home or a run's
+// claim is another owner's and is left alone. Releasing the column is what lets
+// the existing catch-up walk the member to its leader.
+bool ReleasesItsOwnErrand(bool wasWalkingOwnErrand, bool familyReLinks,
+                          bool claimedByAnotherOwner);
+
 // Everything the answer turns on. The defaults are the safe reading of
 // "nothing is known": switched off, linked, and no aim, which moves nobody.
 struct IndividualErrandFacts
