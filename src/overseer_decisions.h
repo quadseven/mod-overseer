@@ -3447,6 +3447,17 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
 bool DungeonClearWaitStopRearms(std::string const& stopReason, unsigned rearms,
                                 unsigned maximumRearms);
 
+// A STOPPED RUN IS ARMED AGAIN WITHIN THE GRACE, WHATEVER A MEMBER REPORTS
+// (#1483). The busy hold protects a run that is fighting; a run the module has
+// switched off cannot fight, so a member still reporting "looting" must not keep
+// the re-arm waiting for the busy ceiling plus the stall window. True when the
+// stop is the re-armable party-wait stop, `rearms` is under `maximumRearms`, the
+// caller first saw the stop at `stopSeenAt` (0 = not stamped yet, never old), and
+// `graceSeconds` have passed since. A clock behind the stamp is not old.
+bool DungeonClearStoppedRunRearmsNow(std::string const& stopReason, unsigned rearms,
+                                     unsigned maximumRearms, time_t stopSeenAt, time_t now,
+                                     time_t graceSeconds);
+
 // THE SAME RE-ARM WHILE THE RUN REASSEMBLES (#1500). The clearing watchdog above
 // only runs in CLEARING and only once its stall clock runs, and a dead member
 // holds that clock out. Dev realm 2026-11-11: the module stopped on a party wait,
