@@ -46203,6 +46203,50 @@ private:
         return "";
     }
 
+    // LEAVING SOMEBODY ELSE'S GROUP (`leave-group`, see LeaveGroupGate). The
+    // member alone leaves, as a player's /leave does; the core disbands a
+    // group of two on its own, as it would for that player. The member's bot
+    // AI stops treating the old leader as its master, so its own errands are
+    // not held as a follower's.
+    char const* DoLeaveGroup(Player* who, char const*& status, std::string& out)
+    {
+        namespace D = OverseerDecisions;
+        Group* const group = who->GetGroup();
+        PlayerbotAI* const ai = GET_PLAYERBOT_AI(who);
+        D::LeaveGroupFacts facts;
+        facts.isBot = ai != nullptr;
+        facts.inGroup = group != nullptr;
+        facts.leadsGroup = group && group->IsLeader(who->GetGUID());
+        facts.battleground =
+            group && (group->isBGGroup() || group->isBFGroup() || group->isLFGGroup());
+        facts.inInstance = who->GetMap() && who->GetMap()->Instanceable();
+        facts.inCombat = who->IsInCombat();
+        std::string const leaderName = group ? std::string(group->GetLeaderName()) : "";
+        if (char const* wall = D::LeaveGroupGate(facts); *wall)
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":\"refused\",\"reason\":" << J(wall)
+              << ",\"leader\":" << J(leaderName) << '}';
+            out = o.str();
+            status = std::string(wall) == D::LeaveGroupRefusal::NotInGroup ? "unchanged" : "error";
+            LOG_INFO("module.overseer", "overseer: leave-group for '{}' refused - {}",
+                     who->GetName(), wall);
+            return wall;
+        }
+        Player* const master = ai->GetMaster();
+        who->RemoveFromGroup(GROUP_REMOVEMETHOD_LEAVE);
+        if (master && master != who)
+            ai->SetMaster(nullptr);
+        std::ostringstream o;
+        o << "{\"outcome\":\"left\",\"reason\":\"\",\"leader\":" << J(leaderName)
+          << ",\"in_group_after\":" << (who->GetGroup() ? "true" : "false") << '}';
+        out = o.str();
+        status = who->GetGroup() ? "error" : "applied";
+        LOG_INFO("module.overseer", "overseer: '{}' left the group of '{}'", who->GetName(),
+                 leaderName);
+        return who->GetGroup() ? "the character is still in a group after leaving" : "";
+    }
+
     char const* DoPartyWalk(Player* leader, std::string const& command, char const*& status,
                             std::string& out, uint32 id)
     {
@@ -65677,6 +65721,10 @@ private:
                 detail = DoPartyUp(player, command, status, rowResult, id);
             else if (kind == "guild" && OverseerDecisions::IsPartyDisbandRow(command))
                 detail = DoPartyDisband(player, status, rowResult);
+            else if (kind == "guild" && OverseerDecisions::IsLeaveGroupRow(command))
+                // A GUILD BOT LEAVES A STRANGER'S GROUP (DoLeaveGroup), on
+                // kind='guild' and routed on the first word, no ENUM migration.
+                detail = DoLeaveGroup(player, status, rowResult);
             else if (kind == "guild" && OverseerDecisions::IsGuildFinderRow(command))
                 // THE GUILD COORDINATOR'S FIVE-MAN, on kind='guild' and routed
                 // on the first word as the walks ride `mail` and `cast`, so no
