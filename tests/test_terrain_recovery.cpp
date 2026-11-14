@@ -31,6 +31,9 @@ using OverseerDecisions::TerrainRecoveryStep;
 using OverseerDecisions::TerrainRecoveryVerdict;
 using OverseerDecisions::LiftDestinationIsValid;
 using OverseerDecisions::TerrainRemedy;
+using OverseerDecisions::BelowTerrainObservationLimits;
+using OverseerDecisions::BelowTerrainObservationState;
+using OverseerDecisions::ObserveTerrainMismatch;
 
 namespace
 {
@@ -244,6 +247,61 @@ TerrainReading Here(float z, float surfaceAboveZ, bool hasLocalNavmesh,
     r.surfaceValid = true;
     r.hasLocalNavmesh = hasLocalNavmesh;
     return r;
+}
+
+void ANonFlatOpenTerrainMismatchIsReportedOnceAfterItPersists()
+{
+    TerrainReading reading = Here(10.f, 0.f, false);
+    reading.surfaceValid = false;
+    reading.onOpenMap = true;
+    reading.terrainValid = true;
+    reading.terrainZ = 20.f;
+    reading.planeFlat = false;
+    reading.movementMeasured = true;
+    reading.falling = false;
+
+    BelowTerrainObservationLimits const limits{3.f, 5, 3, 5.f};
+    BelowTerrainObservationState state;
+    auto verdict = ObserveTerrainMismatch(
+        state, reading, false, "generator=point job='class walk'", limits, 1000);
+    Check("raw terrain gap is observed", verdict.observing, true);
+    Check("first poll does not warn", verdict.report, false);
+
+    verdict = ObserveTerrainMismatch(state, reading, false, "", limits, 1003);
+    Check("three seconds is still inside the observation window", verdict.report,
+          false);
+    Check("the last moving step survives idle samples",
+          state.lastMovementStep == "generator=point job='class walk'", true);
+
+    verdict = ObserveTerrainMismatch(state, reading, false, "", limits, 1005);
+    Check("the sustained mismatch reports at its bound", verdict.report, true);
+    Check("reported duration is five seconds", verdict.seconds == 5, true);
+    verdict = ObserveTerrainMismatch(state, reading, false, "", limits, 1006);
+    Check("the same episode reports only once", verdict.report, false);
+}
+
+void ANewPlaceOrGroundedReadingStartsAFreshObservation()
+{
+    TerrainReading reading = Here(10.f, 0.f, false, 1, 100.f, 100.f);
+    reading.surfaceValid = false;
+    reading.onOpenMap = true;
+    reading.terrainValid = true;
+    reading.terrainZ = 20.f;
+    BelowTerrainObservationLimits const limits{3.f, 5, 3, 5.f};
+    BelowTerrainObservationState state;
+
+    ObserveTerrainMismatch(state, reading, false, "generator=point", limits, 1000);
+    reading.x += 10.f;
+    auto verdict = ObserveTerrainMismatch(
+        state, reading, false, "generator=point", limits, 1006);
+    Check("moving to another spot starts a fresh episode", verdict.seconds == 0,
+          true);
+    Check("a new spot does not report immediately", verdict.report, false);
+
+    verdict = ObserveTerrainMismatch(state, reading, true, "", limits, 1007);
+    Check("ground beneath the character ends the diagnostic episode",
+          verdict.observing, false);
+    Check("ground clears the episode timer", state.since == 0, true);
 }
 
 char const* Name(TerrainRemedy r)
@@ -1362,6 +1420,8 @@ void ACatchIsStillOnlyAChangeOfHeight()
 
 int main()
 {
+    ANonFlatOpenTerrainMismatchIsReportedOnceAfterItPersists();
+    ANewPlaceOrGroundedReadingStartsAFreshObservation();
     TheMeasuredGapIsRecovered();
     DeliberatelyAirborneStatesAreLeftAlone();
     TheBoundaryIsARecovery();

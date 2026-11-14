@@ -843,6 +843,52 @@ bool ProvenBelowTheWorld(TerrainReading const& reading,
     return !reading.movementMeasured || reading.falling;
 }
 
+BelowTerrainObservationVerdict ObserveTerrainMismatch(
+    BelowTerrainObservationState& state, TerrainReading const& reading,
+    bool standingOnGround, std::string const& movementStep,
+    BelowTerrainObservationLimits const& limits, time_t now)
+{
+    if (!reading.onOpenMap || !reading.terrainValid || standingOnGround ||
+        limits.toleranceYards <= 0.f || !std::isfinite(reading.z) ||
+        !std::isfinite(reading.terrainZ) || !std::isfinite(reading.x) ||
+        !std::isfinite(reading.y) ||
+        reading.terrainZ - reading.z < limits.toleranceYards)
+    {
+        state = BelowTerrainObservationState{};
+        return {};
+    }
+
+    float const dx = reading.x - state.x;
+    float const dy = reading.y - state.y;
+    bool const recent = state.since > 0 && state.lastSeen > 0 &&
+                        now >= state.lastSeen &&
+                        limits.maxSampleGapSeconds > 0 &&
+                        now - state.lastSeen <= limits.maxSampleGapSeconds;
+    bool const samePlace = limits.episodeRadiusYards > 0.f &&
+                           dx * dx + dy * dy <=
+                               limits.episodeRadiusYards *
+                                   limits.episodeRadiusYards;
+    if (!recent || state.mapId != reading.mapId || !samePlace)
+    {
+        state = BelowTerrainObservationState{};
+        state.since = now;
+        state.mapId = reading.mapId;
+        state.x = reading.x;
+        state.y = reading.y;
+    }
+
+    state.lastSeen = now;
+    if (!movementStep.empty())
+        state.lastMovementStep = movementStep;
+
+    time_t const seconds = now >= state.since ? now - state.since : 0;
+    bool const report = !state.reported && limits.sustainedSeconds > 0 &&
+                        seconds >= limits.sustainedSeconds;
+    if (report)
+        state.reported = true;
+    return {true, report, seconds};
+}
+
 UnmeasuredLeaderGround ClassifyUnmeasuredLeaderGround(bool leaderFalling,
                                                       bool polygonAtItsFeet)
 {
