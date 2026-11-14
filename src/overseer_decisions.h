@@ -23295,13 +23295,18 @@ constexpr uint32_t NORTHREND_MAP_ID = 571;
  // The sea zones next to the starting isles on map 530. Members who cross to
  // or from Azuremyst by boat stand on that shore and berth (#1157).
  constexpr uint32_t VEILED_SEA_ZONE_ID = 3479;
+ // The North Sea (AreaTable 3455, a zone of its own on map 530) is the coast
+ // north of Eversong Woods. A blood elf that wades into its shallows stands in
+ // it, and was refused every walk as standing in Outland: 667 refusals in one
+ // day for one level 24 member.
+ constexpr uint32_t NORTH_SEA_ZONE_ID = 3455;
 
 // Outland or Northrend, by the map alone. True for the starting lands too, so a
 // question that has a zone asks IsOutsideClassic instead.
 bool IsExpansionContinent(uint32_t mapId);
 
-// One of the six zones above, on map 530. The Isle of Quel'Danas is not one:
-// it is level-70 content.
+// One of the zones above, on map 530: the six lands and the two seas beside
+// them. The Isle of Quel'Danas is not one: it is level-70 content.
 bool IsStartingLand(uint32_t mapId, uint32_t zoneId);
 
 // The question a walk or a travel aim asks of where a character stands, and of
