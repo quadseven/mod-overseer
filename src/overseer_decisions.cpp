@@ -2652,6 +2652,16 @@ bool DungeonClearStoppedRunRearmsNow(std::string const& stopReason, unsigned rea
            DungeonClearWaitStopRearms(stopReason, rearms, maximumRearms);
 }
 
+bool DungeonClearStopIsInGrace(std::string const& stopReason, unsigned rearms,
+                               unsigned maximumRearms, time_t stopSeenAt, time_t now,
+                               time_t graceSeconds)
+{
+    if (stopSeenAt == 0 || now < stopSeenAt)
+        return false;
+    return now - stopSeenAt < graceSeconds &&
+           DungeonClearWaitStopRearms(stopReason, rearms, maximumRearms);
+}
+
 bool StagedInsideBrainRearms(std::string const& stopReason, unsigned rearms,
                              unsigned maximumRearms, unsigned aliveInside,
                              time_t secondsSinceLastRearm)

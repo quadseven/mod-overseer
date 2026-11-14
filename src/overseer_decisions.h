@@ -3458,6 +3458,15 @@ bool DungeonClearStoppedRunRearmsNow(std::string const& stopReason, unsigned rea
                                      unsigned maximumRearms, time_t stopSeenAt, time_t now,
                                      time_t graceSeconds);
 
+// THE SKIP LADDER WAITS OUT THE GRACE (#1483). True while a re-armable stop has
+// been seen for less than `graceSeconds`: the re-arm is not due yet, and the
+// stall ladder must not skip or end the run first. False once the stop is old
+// (the re-arm answers it), unstamped, spent or another stop, and for a clock
+// behind the stamp.
+bool DungeonClearStopIsInGrace(std::string const& stopReason, unsigned rearms,
+                               unsigned maximumRearms, time_t stopSeenAt, time_t now,
+                               time_t graceSeconds);
+
 // THE SAME RE-ARM WHILE THE RUN REASSEMBLES (#1500). The clearing watchdog above
 // only runs in CLEARING and only once its stall clock runs, and a dead member
 // holds that clock out. Dev realm 2026-11-11: the module stopped on a party wait,

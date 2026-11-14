@@ -41211,6 +41211,12 @@ private:
                      anyBusy ? "'" + busyName + "' " + busyReason : std::string("nobody"));
             return false;
         }
+        // THE LADDER WAITS OUT THE GRACE (#1483). An expired stall clock would
+        // skip or end the run in this same poll, before the re-arm is due.
+        if (OverseerDecisions::DungeonClearStopIsInGrace(
+                stopReason, coord.clearRearms, DUNGEON_CLEAR_WAIT_REARMS, coord.clearStopSeenAt,
+                now, DUNGEON_CLEAR_STOPPED_REARM_SECONDS))
+            return false;
 
         // MOVEMENT IS MEASURED BEFORE THE BUSY HOLD NOW, NOT BEHIND IT (#382).
         //

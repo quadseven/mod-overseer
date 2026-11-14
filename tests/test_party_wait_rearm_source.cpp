@@ -55,6 +55,10 @@ int main()
     if (watchdog.find("_dcOnIssued.erase(state.name)", rearm) > busyHold)
         return Fail("the re-arm forgets every member's dc on record");
 
+    std::size_t const grace = watchdog.find("DungeonClearStopIsInGrace");
+    if (grace == std::string::npos || grace < rearm || grace > busyHold)
+        return Fail("the grace holds the ladder right after the re-arm, before the busy hold");
+
     if (watchdog.find("coord.clearStopSeenAt = 0;") > rearm)
         return Fail("a boss credit forgets the stop stamp");
 

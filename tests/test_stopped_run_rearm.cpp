@@ -13,6 +13,7 @@
 #include <string>
 
 using OverseerDecisions::DungeonClearStoppedRunRearmsNow;
+using OverseerDecisions::DungeonClearStopIsInGrace;
 
 namespace
 {
@@ -67,6 +68,26 @@ void AClockSteppedBackwardsIsNotOld()
     Check("clock behind stamp", DungeonClearStoppedRunRearmsNow(WAIT, 0, 3, T0 + 100, T0, GRACE),
           false);
 }
+
+void TheLadderWaitsOutTheGrace()
+{
+    // A stall clock already expired must not skip or exit a stopped run before
+    // the re-arm's grace is over: the previous code armed it again first.
+    Check("stop just seen holds the ladder", DungeonClearStopIsInGrace(WAIT, 0, 3, T0, T0, GRACE), true);
+    Check("stop seen for 29s holds the ladder",
+          DungeonClearStopIsInGrace(WAIT, 0, 3, T0, T0 + GRACE - 1, GRACE), true);
+    Check("grace over, the re-arm is due instead",
+          DungeonClearStopIsInGrace(WAIT, 0, 3, T0, T0 + GRACE, GRACE), false);
+    Check("no stamp, nothing to wait for", DungeonClearStopIsInGrace(WAIT, 0, 3, 0, T0, GRACE), false);
+    Check("bound spent, the ladder runs",
+          DungeonClearStopIsInGrace(WAIT, 3, 3, T0, T0 + 1, GRACE), false);
+    Check("other stop, the ladder runs",
+          DungeonClearStopIsInGrace("Dungeon clear stopped: All bosses cleared!", 0, 3, T0, T0 + 1,
+                                    GRACE),
+          false);
+    Check("clock behind stamp is not a wait", DungeonClearStopIsInGrace(WAIT, 0, 3, T0 + 100, T0, GRACE),
+          false);
+}
 }  // namespace
 
 int main()
@@ -76,5 +97,6 @@ int main()
     TheBoundOfRearmsStillHolds();
     OtherStopsKeepTheLadder();
     AClockSteppedBackwardsIsNotOld();
+    TheLadderWaitsOutTheGrace();
     return failures ? 1 : 0;
 }
