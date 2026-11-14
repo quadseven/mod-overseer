@@ -276,8 +276,57 @@ void ANonFlatOpenTerrainMismatchIsReportedOnceAfterItPersists()
     verdict = ObserveTerrainMismatch(state, reading, false, "", limits, 1005);
     Check("the sustained mismatch reports at its bound", verdict.report, true);
     Check("reported duration is five seconds", verdict.seconds == 5, true);
+    Check("the reported episode retains its last moving step",
+          state.lastMovementStep == "generator=point job='class walk'", true);
     verdict = ObserveTerrainMismatch(state, reading, false, "", limits, 1006);
     Check("the same episode reports only once", verdict.report, false);
+}
+
+void ARecentMovementStepBeforeTheMismatchIsRetained()
+{
+    TerrainReading reading = Here(10.f, 0.f, false);
+    reading.surfaceValid = false;
+    reading.onOpenMap = true;
+    reading.terrainValid = true;
+    reading.terrainZ = 12.5f;
+    BelowTerrainObservationLimits const limits{3.f, 5, 3, 5.f};
+    BelowTerrainObservationState state;
+
+    auto verdict = ObserveTerrainMismatch(
+        state, reading, false, "generator=point job='class walk'", limits, 1000);
+    Check("a sub-tolerance gap does not start the observation", verdict.observing,
+          false);
+
+    reading.terrainZ = 13.5f;
+    verdict = ObserveTerrainMismatch(state, reading, false, "", limits, 1001);
+    Check("the gap starts observing after crossing the tolerance",
+          verdict.observing, true);
+    Check("the recent movement step survives the tolerance crossing",
+          state.lastMovementStep == "generator=point job='class walk'", true);
+}
+
+void ASampleGapResetsTheObservationAndDiscardsStaleMovement()
+{
+    TerrainReading reading = Here(10.f, 0.f, false);
+    reading.surfaceValid = false;
+    reading.onOpenMap = true;
+    reading.terrainValid = true;
+    reading.terrainZ = 20.f;
+    BelowTerrainObservationLimits const limits{3.f, 5, 3, 5.f};
+    BelowTerrainObservationState state;
+
+    ObserveTerrainMismatch(state, reading, false, "generator=point", limits, 1000);
+    auto verdict = ObserveTerrainMismatch(state, reading, false, "", limits, 1004);
+    Check("a sample gap longer than its limit starts a fresh observation",
+          verdict.seconds, 0);
+    Check("a stale movement step is discarded after a long sample gap",
+          state.lastMovementStep.empty(), true);
+    verdict = ObserveTerrainMismatch(state, reading, false, "", limits, 1006);
+    Check("a fresh sample continues the reset observation", verdict.seconds, 2);
+    Check("the reset observation does not report early", verdict.report, false);
+    verdict = ObserveTerrainMismatch(state, reading, false, "", limits, 1009);
+    Check("a reset observation reports only after its own sustained bound",
+          verdict.report, true);
 }
 
 void ANewPlaceOrGroundedReadingStartsAFreshObservation()
@@ -1421,6 +1470,8 @@ void ACatchIsStillOnlyAChangeOfHeight()
 int main()
 {
     ANonFlatOpenTerrainMismatchIsReportedOnceAfterItPersists();
+    ARecentMovementStepBeforeTheMismatchIsRetained();
+    ASampleGapResetsTheObservationAndDiscardsStaleMovement();
     ANewPlaceOrGroundedReadingStartsAFreshObservation();
     TheMeasuredGapIsRecovered();
     DeliberatelyAirborneStatesAreLeftAlone();
