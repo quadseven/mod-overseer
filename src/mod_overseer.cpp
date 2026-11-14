@@ -5304,9 +5304,9 @@ void RememberAim(std::string const& name, std::string const& job, uint32 questAi
 }
 
 // The movement generator is the core's actual step, while the aim snapshot
-// names the job or quest step that asked for it. Retain this only while the
-// character is moving; the observation state keeps the last such sample when
-// it stops before the terrain mismatch has lasted long enough to report.
+// names the job or quest step that asked for it. Retain fresh samples across
+// the raw-terrain tolerance crossing so a character that stops just before
+// becoming a mismatch can still be traced without attributing an old step.
 std::string CurrentTerrainMovementStep(std::string const& name, Player* bot)
 {
     if (!bot || !bot->isMoving())
@@ -33273,8 +33273,7 @@ private:
             time_t const now = std::time(nullptr);
             float const terrainGap = reading.terrainZ - reading.z;
             std::string movementStep;
-            if (reading.onOpenMap && reading.terrainValid && !onTheGround &&
-                terrainGap >= TERRAIN_MISMATCH_TOLERANCE_YARDS)
+            if (reading.onOpenMap && reading.terrainValid && !onTheGround)
                 movementStep = CurrentTerrainMovementStep(name, bot);
             OverseerDecisions::BelowTerrainObservationState& mismatchMemory =
                 _terrainMismatchObservation[LowerName(name)];
