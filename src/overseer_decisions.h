@@ -28034,6 +28034,31 @@ struct MeterLine
     float threat{-1.0f};
 };
 
+// WHICH MOB THE PROBE READS THREAT ON (#1484). The family leader's current
+// victim, else the tank's, else the hostile unit whose threat list holds the
+// most party members: the leader is often between targets at the sample instant
+// and a card with no target shows no threat at all. `hostilePartyCounts` has one
+// entry per hostile unit attacking the party, each the number of party members
+// on its threat list; a hostile holding none is not a candidate. A tie keeps the
+// earliest. `hostile` indexes `hostilePartyCounts` and only means something for
+// MeterTargetSource::ThreatList.
+enum class MeterTargetSource { None, Leader, Tank, ThreatList };
+
+struct MeterTargetFacts
+{
+    bool leaderHasVictim{false};
+    bool tankHasVictim{false};
+    std::vector<unsigned> hostilePartyCounts;
+};
+
+struct MeterTargetChoice
+{
+    MeterTargetSource source{MeterTargetSource::None};
+    std::size_t hostile{0};
+};
+
+MeterTargetChoice MeterPickTarget(MeterTargetFacts const& facts);
+
 // {"live":B,"seconds":N,"target":S,"top_threat":F,"members":[{"name":S,
 //  "damage":N,"dps":N,"healing":N,"hps":N,"taken":N,"threat":F,
 //  "threat_pct":N}]}
