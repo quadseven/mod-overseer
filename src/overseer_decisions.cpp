@@ -24732,6 +24732,13 @@ LeaderIntentVerdict AskLeaderIntent(LeaderIntentState& state,
     }
     if (live && state.kind == request.kind && state.owner == request.owner)
     {
+        // AN ERRAND THAT TOOK THE LEADER FROM A REGROUP KEEPS HIM WHILE IT WALKS:
+        // each poll it asks renews the regroup's cooldown, so the regroup cannot
+        // take him back mid-walk the moment the first cooldown runs out.
+        auto const yielded =
+            state.cooldownUntil.find(static_cast<std::uint8_t>(LeaderIntentKind::Regroup));
+        if (yielded != state.cooldownUntil.end() && now < yielded->second)
+            yielded->second = std::max(yielded->second, now + limits.regroupYieldCooldownSeconds);
         state.lastAsked = now;
         state.deferralSaid.erase(request.owner);
         if (state.target == request.target)
@@ -24759,14 +24766,27 @@ LeaderIntentVerdict AskLeaderIntent(LeaderIntentState& state,
         int const asked = LeaderIntentRank(request.kind, request.target, preference, now);
         std::time_t const ran = now - state.since;
         bool const dwellOver = state.dwellWaived || ran >= limits.dwellSeconds;
-        if (asked <= held)
-            return defer(state.owner, 0,
-                         std::string("'") + LeaderIntentKindWord(state.kind) +
-                             "' holds the leader and ranks at or above this request");
-        if (!urgent && !dwellOver)
-            return defer(state.owner, limits.dwellSeconds - ran,
-                         std::string("'") + LeaderIntentKindWord(state.kind) +
-                             "' is inside its minimum dwell");
+        bool const regroupYields = state.kind == LeaderIntentKind::Regroup &&
+                                   (request.kind == LeaderIntentKind::EconomyErrand ||
+                                    request.kind == LeaderIntentKind::TownErrand) &&
+                                   limits.regroupYieldSeconds > 0 &&
+                                   ran >= limits.regroupYieldSeconds;
+        if (regroupYields)
+        {
+            state.cooldownUntil[static_cast<std::uint8_t>(LeaderIntentKind::Regroup)] =
+                now + limits.regroupYieldCooldownSeconds;
+        }
+        else
+        {
+            if (asked <= held)
+                return defer(state.owner, 0,
+                             std::string("'") + LeaderIntentKindWord(state.kind) +
+                                 "' holds the leader and ranks at or above this request");
+            if (!urgent && !dwellOver)
+                return defer(state.owner, limits.dwellSeconds - ran,
+                             std::string("'") + LeaderIntentKindWord(state.kind) +
+                                 "' is inside its minimum dwell");
+        }
         verdict.replaced = state.kind;
         verdict.replacedOwner = state.owner;
     }

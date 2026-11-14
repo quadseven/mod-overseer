@@ -27657,6 +27657,15 @@ struct LeaderIntentLimits
     // enough that an order given in passing does not keep the campaign's own
     // run waiting behind it for long.
     std::time_t operatorSeconds{300};
+    // A REGROUP IS A WAIT, AND A WAIT IS BOUNDED. It outranks every errand, so
+    // a straggler that never closed the gap kept the leader still against the
+    // vendor and town walks for as long as the hold lasted (dev realm
+    // 2026-11-14: a sale trip refused the traveller for hours, behind a
+    // regroup for a member 997 yards back). Held this long against an errand
+    // that is asking, a regroup gives the leader to the errand, and may not
+    // ask for him again for the cooldown. Zero turns the yield off.
+    std::time_t regroupYieldSeconds{300};
+    std::time_t regroupYieldCooldownSeconds{600};
 };
 
 // Jev's pick for the family, read from the bridge's column. Requests of this
