@@ -223,6 +223,31 @@ int main()
           "a member away on its own errand is not in another walker's party toll");
     Check(PartyTollCounts(false), "a member with the family is");
 
+    // --- a dungeon job, a run or a summon re-links the family (#1519) ----------
+    {
+        FamilyReLinkFacts facts;
+        facts.memberJobs = {"town run", "town run"};
+        Check(!FamilyReLinks(facts), "town run, no run, no summon: stays individual");
+        facts.memberJobs = {"town run", "dungeon:wailing"};
+        Check(FamilyReLinks(facts), "a dungeon job on any member re-links");
+        facts.memberJobs = {"quest", " RAID:moltencore "};
+        Check(FamilyReLinks(facts), "a raid job on any member re-links");
+        facts.memberJobs = {"quest", "craft"};
+        facts.anyMemberInRun = true;
+        Check(FamilyReLinks(facts), "a run started by any member re-links the family");
+        facts.anyMemberInRun = false;
+        facts.summonAsked = true;
+        Check(FamilyReLinks(facts), "a meeting stone summon asked for re-links");
+    }
+    Check(ReleasesItsOwnErrand(true, true, false),
+          "a re-linked member's own errand is released");
+    Check(!ReleasesItsOwnErrand(true, true, true),
+          "a catch-up, escort or run claim is not its own errand and is never released here");
+    Check(!ReleasesItsOwnErrand(false, true, false),
+          "a member that walked no errand of its own has nothing to release");
+    Check(!ReleasesItsOwnErrand(true, false, false),
+          "an individual family keeps its errands");
+
     if (failures)
         return EXIT_FAILURE;
     std::cout << "individual errand: ok\n";

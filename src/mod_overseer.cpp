@@ -29040,6 +29040,25 @@ private:
         return jobs;
     }
 
+    // Families with a meeting stone summon asked for and not yet finished
+    // (#1519): a kind='summon' row still pending, claimed or verifying, read
+    // by the member it summons. An unreadable table answers nothing, and the
+    // other two re-link facts still apply.
+    static std::set<std::string> SummonAskedFor()
+    {
+        std::set<std::string> targets;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT target_name FROM overseer_command WHERE kind = 'summon' "
+            "AND status IN ('pending', 'claimed', 'verifying')");
+        if (!result)
+            return targets;
+        do
+        {
+            targets.insert(result->Fetch()[0].Get<std::string>());
+        } while (result->NextRow());
+        return targets;
+    }
+
     // WHO WALKS AN ERRAND OF ITS OWN THIS POLL (#1517). Behind
     // Overseer.Individual.Enable, off by default: the bridge already writes
     // aims on followers, and with the switch on each of them walks. Fails
@@ -29064,6 +29083,22 @@ private:
                 if (f != families.end())
                     jobsByFamily[f->second].push_back(job);
             }
+            // THE RE-LINK FACTS ARE READ FOR THE WHOLE FAMILY (#1519): a run
+            // that has taken one member, or a summon asked for one, takes all.
+            std::set<std::string> familiesInARun;
+            std::set<std::string> familiesSummoning;
+            for (auto const& [member, family] : families)
+            {
+                if (Player* const m = ObjectAccessor::FindPlayerByName(member))
+                    if (InAnyDungeonRun(m))
+                        familiesInARun.insert(family);
+            }
+            for (std::string const& target : SummonAskedFor())
+            {
+                auto const f = families.find(target);
+                if (f != families.end())
+                    familiesSummoning.insert(f->second);
+            }
             for (auto const& [name, aim] : aims)
             {
                 Player* const bot = ObjectAccessor::FindPlayerByName(name);
@@ -29083,8 +29118,12 @@ private:
                     _individualLanded[name] = aim;
                 OverseerDecisions::IndividualErrandFacts facts;
                 facts.leadsItsParty = LeadsItsParty(bot);
-                facts.familyLinked = !jobsRead || family.empty() ||
-                                     OverseerDecisions::FamilyLinked(jobsByFamily[family]);
+                OverseerDecisions::FamilyReLinkFacts relink;
+                relink.memberJobs = jobsByFamily[family];
+                relink.anyMemberInRun = familiesInARun.count(family) != 0;
+                relink.summonAsked = familiesSummoning.count(family) != 0;
+                bool const reLinks = OverseerDecisions::FamilyReLinks(relink);
+                facts.familyLinked = !jobsRead || family.empty() || reLinks;
                 facts.inARun = InAnyDungeonRun(bot);
                 facts.sameMapAsLeader = leader && leader != bot && leader->IsInWorld() &&
                                         leader->GetMapId() == bot->GetMapId();
@@ -29094,6 +29133,16 @@ private:
                                               IsWalkingHome(name) ||
                                               _travelAims.RunOwns(name, aim);
                 facts.landedOnIt = _individualLanded.count(name) != 0;
+                // A RE-LINK GIVES THE MEMBER'S OWN ERRAND BACK (#1519), through
+                // the travel book, so the existing catch-up walks it to its
+                // leader. Only one it was walking on its own; the release is
+                // the book's own gate, which leaves a foreign aim standing.
+                if (jobsRead && !family.empty() &&
+                    OverseerDecisions::ReleasesItsOwnErrand(
+                        _individualErrands.count(name) != 0, reLinks,
+                        facts.claimedByAnotherOwner))
+                    _travelAims.Release(name, "its family was re-linked by a dungeon or "
+                                              "raid job, a run or a summon (#1519)");
                 rows.emplace_back(name, facts);
             }
         }

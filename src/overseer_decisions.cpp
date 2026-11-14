@@ -7971,6 +7971,17 @@ bool FamilyLinked(std::vector<std::string> const& memberJobs)
     return false;
 }
 
+bool FamilyReLinks(FamilyReLinkFacts const& facts)
+{
+    return facts.anyMemberInRun || facts.summonAsked || FamilyLinked(facts.memberJobs);
+}
+
+bool ReleasesItsOwnErrand(bool wasWalkingOwnErrand, bool familyReLinks,
+                          bool claimedByAnotherOwner)
+{
+    return wasWalkingOwnErrand && familyReLinks && !claimedByAnotherOwner;
+}
+
 bool IndividualErrandSteers(IndividualErrandFacts const& facts)
 {
     if (!facts.enabled || facts.leadsItsParty || facts.familyLinked || facts.inARun)
