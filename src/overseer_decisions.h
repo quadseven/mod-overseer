@@ -24759,9 +24759,21 @@ std::vector<uint32_t> PlanClassLearns(std::vector<ClassLearnCandidate> candidate
 // list, the character's book and purse, and buys what comes back through the
 // core's own Trainer::TeachSpell at the trainer's real price.
 
-// The purse a recipe purchase never spends below, in copper: 1 silver, so a
-// visit never leaves a character unable to pay for its next repair.
+// The purse a recipe purchase never spends below, in copper, at level 1: 1
+// silver. RecipePurseFloor grows it with level.
 constexpr uint64_t RECIPE_PURSE_FLOOR_COPPER = 100;
+
+// THE REPAIR RESERVE, in copper per level squared: 36 silver at 20 and 3g 60s
+// at 60. A repair bill grows with the item level of what is worn, and one
+// silver does not pay a level 60 member's repair after a death, so a visit
+// that spent down to it left the member unable to repair. The bridge mirrors
+// this (guildjobs.RECIPE_REPAIR_RESERVE_PER_LEVEL_SQ) so the errand it writes
+// is one the visit can complete.
+constexpr uint64_t RECIPE_REPAIR_RESERVE_PER_LEVEL_SQ = 10;
+
+// The copper a recipe purchase leaves in the purse at `level`: the larger of
+// RECIPE_PURSE_FLOOR_COPPER and the repair reserve.
+uint64_t RecipePurseFloor(uint32_t level);
 
 // Passes over the trainer's list in one visit: a recipe is offered only once the
 // one before it is known, so one read holds the first links of each chain.
@@ -24783,12 +24795,24 @@ struct TrainerRecipeOffer
 // trade `skill` the character HOLDS (`hasSkill`), that is not already known, is
 // not a rank, is within the classic 300 cap, needs no more skill than
 // `skillValue` and no more level than `level`, and whose price leaves at least
-// RECIPE_PURSE_FLOOR_COPPER in `purse` after the ones before it. Cheapest
+// RecipePurseFloor(level) in `purse` after the ones before it. Cheapest
 // first, then lowest skill requirement, then spell id; the purse is spent down
 // as the list is walked, so the answer is the whole visit's shopping list.
 std::vector<uint32_t> PlanRecipePurchases(std::vector<TrainerRecipeOffer> offers, uint32_t skill,
                                           bool hasSkill, uint32_t skillValue, uint32_t level,
                                           uint64_t purse);
+
+// THE RECIPES OF ONE TRADE A MEMBER HOLDS, read at its trainer (wow-overseer
+// issue 2432). The bridge decides whether a crafter is due a trainer trip from
+// the recipes it can show the member holds, and character_spell is not that:
+// a bought recipe lags there by the save interval, and a recipe a playerbot
+// was granted at creation is never written there. At a trainer visit the
+// adapter asks HasSpell of every spell on the list and records the ones held,
+// so a held recipe stops reading as due after one visit instead of sending the
+// member back for it every cycle. Only `skill`'s recipes, never a rank (the
+// rank path owns those), in the trainer's list order.
+std::vector<uint32_t> HeldTradeRecipes(std::vector<TrainerRecipeOffer> const& offers,
+                                       uint32_t skill);
 
 // THE ONE RECIPE THE ROSTER NAMES (`craft_spell`), asked at the trainer it was
 // sent to. Held already is done; a spell this trainer does not list is the wrong
