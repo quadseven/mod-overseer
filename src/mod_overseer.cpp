@@ -66800,8 +66800,53 @@ private:
         std::time_t const now = GameTime::GetGameTime().count();
 
         Player* leader = leaderName.empty() ? nullptr : ObjectAccessor::FindPlayerByName(leaderName);
+        // WHICH MOB (#1484): the leader's victim, else the tank's, else the hostile
+        // unit whose threat list holds the most party members. The leader is often
+        // between targets at the sample instant.
         // GetVictim  Unit.h  Unit* GetVictim() const
         Unit* target = leader ? leader->GetVictim() : nullptr;
+        if (!target)
+        {
+            std::vector<Player*> party;
+            for (std::string const& name : members)
+                if (Player* member = ObjectAccessor::FindPlayerByName(name))
+                    party.push_back(member);
+
+            OverseerDecisions::MeterTargetFacts facts;
+            Unit* tankVictim = nullptr;
+            for (Player* member : party)
+            {
+                // IsTank  PlayerbotAI.h  static bool IsTank(Player* player, bool bySpec = false)
+                if (!tankVictim && member->IsAlive() && PlayerbotAI::IsTank(member))
+                    tankVictim = member->GetVictim();
+            }
+            facts.tankHasVictim = tankVictim != nullptr;
+
+            std::vector<Unit*> hostiles;
+            for (Player* member : party)
+            {
+                // getAttackers  Unit.h  AttackerSet const& getAttackers() const
+                for (Unit* attacker : member->getAttackers())
+                {
+                    if (!attacker || !attacker->CanHaveThreatList() ||
+                        std::find(hostiles.begin(), hostiles.end(), attacker) != hostiles.end())
+                        continue;
+                    unsigned onList = 0;
+                    for (Player* seat : party)
+                        if (attacker->GetThreatMgr().GetThreat(seat) > 0.0f)
+                            ++onList;
+                    hostiles.push_back(attacker);
+                    facts.hostilePartyCounts.push_back(onList);
+                }
+            }
+
+            OverseerDecisions::MeterTargetChoice const choice =
+                OverseerDecisions::MeterPickTarget(facts);
+            if (choice.source == OverseerDecisions::MeterTargetSource::Tank)
+                target = tankVictim;
+            else if (choice.source == OverseerDecisions::MeterTargetSource::ThreatList)
+                target = hostiles[choice.hostile];
+        }
         // CanHaveThreatList  Unit.h  bool CanHaveThreatList() const
         bool const threatened = target && target->CanHaveThreatList();
         float top = 0.0f;

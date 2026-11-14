@@ -25159,6 +25159,32 @@ std::time_t MeterSeconds(MeterBook const& book, std::time_t now)
     return std::max<std::time_t>(1, end - fight.started);
 }
 
+MeterTargetChoice MeterPickTarget(MeterTargetFacts const& facts)
+{
+    MeterTargetChoice choice;
+    if (facts.leaderHasVictim)
+    {
+        choice.source = MeterTargetSource::Leader;
+        return choice;
+    }
+    if (facts.tankHasVictim)
+    {
+        choice.source = MeterTargetSource::Tank;
+        return choice;
+    }
+    unsigned best = 0;
+    for (std::size_t i = 0; i < facts.hostilePartyCounts.size(); ++i)
+    {
+        if (facts.hostilePartyCounts[i] > best)
+        {
+            best = facts.hostilePartyCounts[i];
+            choice.source = MeterTargetSource::ThreatList;
+            choice.hostile = i;
+        }
+    }
+    return choice;
+}
+
 std::string MeterProbeJson(std::vector<MeterLine> const& lines, bool live,
                            std::time_t seconds, std::string const& target,
                            float topThreat)
