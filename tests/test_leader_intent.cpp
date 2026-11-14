@@ -109,22 +109,23 @@ void ALowerRuleWaitsForTheCurrentOne()
 {
     LeaderIntentState state;
     // Asked every party poll, well past the dwell: a lower rank still waits,
-    // because it waits for the current intent to END, not for its dwell.
-    for (int t = 0; t <= 480; t += 30)
+    // because it waits for the current intent to END, not for its dwell (up to
+    // regroupYieldSeconds, after which a regroup gives way to an errand).
+    for (int t = 0; t <= 240; t += 30)
         AskLeaderIntent(state, Req(LeaderIntentKind::Regroup, "regroup", "Ugga"), t, LIMITS);
     LeaderIntentVerdict v =
-        AskLeaderIntent(state, Req(LeaderIntentKind::TownErrand, "travel column", "banker"), 500,
+        AskLeaderIntent(state, Req(LeaderIntentKind::TownErrand, "travel column", "banker"), 260,
                         LIMITS);
     Check("a lower rank is deferred", v.answer == LeaderIntentAnswer::Deferred);
     Check("the holder is named", v.holder == "regroup");
     Check("the deferral is said the first time", v.sayIt);
-    AskLeaderIntent(state, Req(LeaderIntentKind::Regroup, "regroup", "Ugga"), 510, LIMITS);
-    v = AskLeaderIntent(state, Req(LeaderIntentKind::TownErrand, "travel column", "banker"), 515,
+    AskLeaderIntent(state, Req(LeaderIntentKind::Regroup, "regroup", "Ugga"), 270, LIMITS);
+    v = AskLeaderIntent(state, Req(LeaderIntentKind::TownErrand, "travel column", "banker"), 275,
                         LIMITS);
     Check("still deferred", v.answer == LeaderIntentAnswer::Deferred);
     Check("the same deferral is not said twice", !v.sayIt);
     Check("the regroup still holds him",
-          LeaderIntentHeldBy(state, LeaderIntentKind::Regroup, "regroup", 515, LIMITS));
+          LeaderIntentHeldBy(state, LeaderIntentKind::Regroup, "regroup", 275, LIMITS));
 }
 
 void AHigherRuleWaitsForTheDwell()
@@ -436,6 +437,95 @@ void TheMeasuredWindowSettles()
 
 }  // namespace
 
+// THE ZUG FAMILY'S SALE TRIP NEVER LANDED (dev realm 2026-11-14). The regroup
+// hold outranks every errand, so a family with a straggler 997 yards back held
+// its leader still and every vendor or town walk was deferred on each poll;
+// the bridge's errand "did not land in 1200s" and was asked for again. A
+// regroup is a wait, and a wait is bounded: past regroupYieldSeconds against
+// an errand that is asking, it gives the leader to the errand and does not take
+// him back for regroupYieldCooldownSeconds.
+void ARegroupYieldsToAnErrandThatKeepsAsking()
+{
+    for (LeaderIntentKind errand :
+         {LeaderIntentKind::EconomyErrand, LeaderIntentKind::TownErrand})
+    {
+        LeaderIntentState state;
+        for (int t = 0; t <= 270; t += 30)
+        {
+            AskLeaderIntent(state, Req(LeaderIntentKind::Regroup, "regroup", "Oz"), t, LIMITS);
+            LeaderIntentVerdict const early =
+                AskLeaderIntent(state, Req(errand, "travel column", "vendor"), t + 1, LIMITS);
+            Check("inside the yield time the regroup still holds",
+                  early.answer == LeaderIntentAnswer::Deferred);
+        }
+        LeaderIntentVerdict v =
+            AskLeaderIntent(state, Req(errand, "travel column", "vendor"), 301, LIMITS);
+        Check("past the yield time the errand is granted the leader",
+              v.answer == LeaderIntentAnswer::Granted);
+        Check("and the regroup is named as the intent that lost him",
+              v.replaced == LeaderIntentKind::Regroup && v.replacedOwner == "regroup");
+        Check("the errand now holds him",
+              LeaderIntentHeldBy(state, errand, "travel column", 302, LIMITS));
+
+        // The regroup asks again on its next poll and is not let back in over
+        // the errand, whatever its rank, until its cooldown has run.
+        AskLeaderIntent(state, Req(errand, "travel column", "vendor"), 330, LIMITS);
+        v = AskLeaderIntent(state, Req(LeaderIntentKind::Regroup, "regroup", "Oz"), 331, LIMITS);
+        Check("the regroup does not take him back inside its cooldown",
+              v.answer == LeaderIntentAnswer::Deferred);
+        for (int t = 360; t <= 840; t += 30)
+        {
+            AskLeaderIntent(state, Req(errand, "travel column", "vendor"), t, LIMITS);
+            v = AskLeaderIntent(state, Req(LeaderIntentKind::Regroup, "regroup", "Oz"), t + 1,
+                                LIMITS);
+            Check("nor on any poll while the errand walks",
+                  v.answer == LeaderIntentAnswer::Deferred);
+        }
+        // The errand is still walking well past the first cooldown: every poll
+        // it asks renews the cooldown, so the regroup cannot cut the walk off.
+        for (int t = 870; t <= 1000; t += 30)
+        {
+            AskLeaderIntent(state, Req(errand, "travel column", "vendor"), t, LIMITS);
+            v = AskLeaderIntent(state, Req(LeaderIntentKind::Regroup, "regroup", "Oz"), t + 1,
+                                LIMITS);
+            Check("a walking errand is not cut off when the first cooldown runs out",
+                  v.answer == LeaderIntentAnswer::Deferred);
+        }
+        // It stops asking at 1000; the cooldown then runs its full length.
+        v = AskLeaderIntent(state, Req(LeaderIntentKind::Regroup, "regroup", "Oz"), 1500,
+                            LIMITS);
+        Check("a regroup is still deferred inside the renewed cooldown",
+              v.answer == LeaderIntentAnswer::Deferred);
+        v = AskLeaderIntent(state, Req(LeaderIntentKind::Regroup, "regroup", "Oz"), 1601,
+                            LIMITS);
+        Check("once the errand has been gone a full cooldown a regroup may ask again",
+              v.answer == LeaderIntentAnswer::Granted);
+    }
+}
+
+void ARegroupWithNoErrandWaitingKeepsHisLeaderForGood()
+{
+    LeaderIntentState state;
+    for (int t = 0; t <= 1200; t += 30)
+    {
+        LeaderIntentVerdict const v =
+            AskLeaderIntent(state, Req(LeaderIntentKind::Regroup, "regroup", "Oz"), t, LIMITS);
+        Check("a regroup nobody wants the leader from is never cut",
+              v.answer == LeaderIntentAnswer::Granted || v.answer == LeaderIntentAnswer::Renewed);
+    }
+}
+
+void ARegroupDoesNotYieldToARankAboveIt()
+{
+    LeaderIntentState state;
+    for (int t = 0; t <= 600; t += 30)
+        AskLeaderIntent(state, Req(LeaderIntentKind::Regroup, "regroup", "Oz"), t, LIMITS);
+    LeaderIntentVerdict const v =
+        AskLeaderIntent(state, Req(LeaderIntentKind::QuestDrive, "quest", ""), 601, LIMITS);
+    Check("the quest drive ranks below a regroup and gets no special yield",
+          v.answer == LeaderIntentAnswer::Deferred);
+}
+
 int main()
 {
     AFailedDungeonRepairGrantIsNotReissuedDuringTheFlapCooldown();
@@ -453,6 +543,9 @@ int main()
     TheMeasuredWindowSettles();
     TheSameRuleChangingKindIsARetarget();
     OperatorVerbsPinAndRelease();
+    ARegroupYieldsToAnErrandThatKeepsAsking();
+    ARegroupWithNoErrandWaitingKeepsHisLeaderForGood();
+    ARegroupDoesNotYieldToARankAboveIt();
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);
