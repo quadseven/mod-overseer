@@ -38971,6 +38971,7 @@ private:
         // Whether the split-across-copies ERROR has been said for the split in
         // progress (#620). Cleared when nobody is in another copy.
         bool loggedOtherCopy{false};
+        bool loggedForeignInstance{false};
         // Said once per stretch rather than once per poll, the log-once
         // discipline the rest of this struct follows. It is the line that tells
         // an operator WHY the watchdog started counting against a party that
@@ -59175,6 +59176,31 @@ private:
                     DungeonRunCensus(familyParty, entryDoor, inside->insideMapId, adoptedInside,
                                      leaderName);
 
+                // A LONE MEMBER IN SOMEBODY ELSE'S RUN IS NOT THE FAMILY'S RUN.
+                // A member lent to another guild's run that stalled can be left
+                // standing in that instance, back in its family's group, while
+                // the rest of the family is on another map. Adopting that made
+                // a campaign out of a run the family never entered. The
+                // instance is adopted only when a majority of the family's
+                // online party is in it or the family itself has a run open on
+                // the map.
+                if (!OverseerDecisions::FamilyOwnsInstance(
+                        adoptedInside, static_cast<uint32>(familyParty.size()),
+                        ActiveRunIdOnMap(inside->insideMapId, family) != 0))
+                {
+                    if (!coord.loggedForeignInstance)
+                    {
+                        coord.loggedForeignInstance = true;
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' has {} of {} online party members in the "
+                                 "instance on map {}, which is not the family's - not "
+                                 "adopting it",
+                                 leaderName, adoptedInside,
+                                 static_cast<uint32>(familyParty.size()), inside->insideMapId);
+                    }
+                    return;
+                }
+
                 // AND THIS COORDINATOR DELIBERATELY HAS NO STAGING POINT (#220).
                 // An adopted run is already inside; there is no gather left to
                 // own, and asking the world where the party WOULD have waited
@@ -61566,6 +61592,26 @@ private:
                 if (coord.runId)
                     StampRunIntoCampaign(coord.runId, coord.campaignId, coord.runNumber,
                                          JoinNames(members));
+            }
+
+            // A MINORITY WITH NO RUN ROW IS NOT THE FAMILY'S RUN. If the only
+            // occupant is a member left in another guild's instance, the family
+            // is elsewhere and there is nothing here to drive: the same test
+            // adoption takes, so a run adopted before it existed ends too.
+            if (inside && !OverseerDecisions::FamilyOwnsInstance(
+                              inside, static_cast<uint32>(FamilyPartyMembers(members, family).size()),
+                              (coord.runId || ActiveRunIdOnMap(portal->insideMapId, family) != 0)))
+            {
+                LOG_INFO("module.overseer",
+                         "overseer: the dungeon run on map {} holds {} online party member(s) "
+                         "and the family has no run open there, so it is not the family's "
+                         "run and ends",
+                         portal->insideMapId, inside);
+                EndRunAndDecide(coord, leaderName, *portal, 0, "emptied",
+                                "the instance is not the family's: the rest of the family "
+                                "is on another map and no run is open there",
+                                IsDungeonJob(leaderJob));
+                return;
             }
 
             // NOBODY LEFT INSIDE MEANS THE RUN IS OVER, however it ended - a

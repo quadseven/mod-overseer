@@ -29490,6 +29490,15 @@ struct FamilyPartyFacts
 };
 bool CountsInFamilyParty(FamilyPartyFacts const& facts);
 
+// Whether an instance with `insideCount` of the family's `onlinePartyCount`
+// online party members in it is the family's own run to adopt or keep. A lone
+// member left standing in another guild's run (lent as its healer, the run
+// stalled, the group since rejoined to its family) is not: the rest of the
+// family is elsewhere and the run is not the family's. A run row the family
+// itself opened keeps a thinned party's run, because that row is the proof the
+// family walked in. Nobody inside owns nothing.
+bool FamilyOwnsInstance(uint32_t insideCount, uint32_t onlinePartyCount, bool openRunRow);
+
 // ============================================ the dungeon run record (#971) ==
 //
 // A RUN ALREADY HAS A ROW; THIS IS WHAT IT LEAVES FOR ITS SUMMARY.
