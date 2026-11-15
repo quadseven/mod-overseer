@@ -39,8 +39,9 @@ std::string Between(std::string const& text, char const* start, char const* end)
 int main()
 {
     std::string const source = Read("src/mod_overseer.cpp");
-    if (source.empty())
-        return Fail("cannot read src/mod_overseer.cpp from the repository root");
+    std::string const readme = Read("README.md");
+    if (source.empty() || readme.empty())
+        return Fail("cannot read module source and README from the repository root");
 
     if (source.find("kind == \"cast\" && OverseerDecisions::IsUnlearnSkillRow(command)") ==
             std::string::npos ||
@@ -70,6 +71,9 @@ int main()
     std::size_t const readback = handler.find("who->HasSkill(request.skill)", set);
     if (set == std::string::npos || readback == std::string::npos || readback < set)
         return Fail("SetSkill must be followed by a HasSkill read-back");
+
+    if (readme.find("unlearn-skill skill:<id> max:<ceiling>") == std::string::npos)
+        return Fail("README must list the new command grammar");
 
     std::cout << "test_unlearn_skill_source: all cases passed\n";
     return EXIT_SUCCESS;
