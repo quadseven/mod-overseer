@@ -79840,7 +79840,7 @@ private:
                          who->GetName(), outcome, request.skill, skillName, liveValue, request.max);
             // RecordEvent excludes non-roster characters. This command is
             // specifically for guild seats, so queue its outcome directly.
-            QueueEvent(who, eventKind, request.skill, skillName, eventDetail);
+            QueueEvent(who, eventKind, request.skill, skillName, eventDetail, EventExtra());
             return reason && reason[0] ? reason : "";
         };
 

@@ -58,7 +58,8 @@ int main()
         return Fail("the handler must enforce natural-guild and non-roster eligibility");
     if (handler.find("eventKind = refused ? \"unlearn_refused\" : \"unlearn\"") ==
             std::string::npos ||
-        handler.find("QueueEvent(who, eventKind") == std::string::npos ||
+        handler.find("QueueEvent(who, eventKind, request.skill, skillName, eventDetail, EventExtra())") ==
+            std::string::npos ||
         handler.find("RecordEvent(") != std::string::npos ||
         handler.find("LOG_WARN(") == std::string::npos ||
         handler.find("LOG_INFO(") == std::string::npos)
