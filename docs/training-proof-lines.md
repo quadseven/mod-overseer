@@ -21,7 +21,10 @@ overseer: trainer_purchase member='<name>' kind=<rank|recipe> skill=<trade> (<id
   when the read-back finds the character did not learn it.
 
 The shape is pinned by `tests/test_trainer_purchase_line.cpp`. A recipe
-purchase also writes an `overseer_event` row of kind `learn`, as before.
+purchase also writes an `overseer_event` row of kind `learn`, as before. A
+rank purchase writes one too, keyed by the RANK spell id (subject_id), with the
+detail "trained the next tier of this skill ..."; the recipes bought with it
+are keyed by the trade, so the two rows never fold into one.
 
 ## Refusal: beside it
 

@@ -17000,18 +17000,24 @@ private:
                  name, alreadyHasSkill ? "RAISED THE CAP ON" : "LEARNED", skillName, skill,
                  static_cast<uint32>(bot->GetPureSkillValue(skill)),
                  static_cast<uint32>(bot->GetPureMaxSkillValue(skill)), npc->GetName());
-        {
-            // The proof line: success path only, after the read-back above.
-            uint64 const purseAfter = bot->GetMoney();
-            SpellInfo const* rankInfo = sSpellMgr->GetSpellInfo(spellId);
-            LOG_INFO("module.overseer", "{}",
-                     OverseerDecisions::TrainerPurchaseLine(
-                         name, "rank", skillName, skill, spellId,
-                         rankInfo ? std::string(rankInfo->SpellName[LOCALE_enUS]) : std::string(),
-                         static_cast<uint32>(bot->GetPureMaxSkillValue(skill)),
-                         purseBefore > purseAfter ? purseBefore - purseAfter : 0));
-        }
-        RecordEvent(bot, "learn", skill, skillName,
+        // The proof line: success path only, after the read-back above.
+        uint64 const purseAfter = bot->GetMoney();
+        SpellInfo const* rankInfo = sSpellMgr->GetSpellInfo(spellId);
+        std::string const rankName =
+            rankInfo ? std::string(rankInfo->SpellName[LOCALE_enUS]) : std::string();
+        LOG_INFO("module.overseer", "{}",
+                 OverseerDecisions::TrainerPurchaseLine(
+                     name, "rank", skillName, skill, spellId, rankName,
+                     static_cast<uint32>(bot->GetPureMaxSkillValue(skill)),
+                     purseBefore > purseAfter ? purseBefore - purseAfter : 0));
+        // KEYED BY THE RANK SPELL, NOT THE TRADE. overseer_event folds rows that
+        // share (character, kind, subject, time bucket) and the later detail
+        // wins. The recipes this rank opens are recorded below against the
+        // trade, in the same bucket, so a rank keyed by the trade was folded
+        // into that row (occurrences 2) and read as a recipe visit: four
+        // Journeyman First Aid purchases were on the realm for a day with no
+        // row that said so. A rank spell id is its own key.
+        RecordEvent(bot, "learn", spellId, rankName.empty() ? skillName : rankName,
                     alreadyHasSkill
                         ? "trained the next tier of this skill from a trainer it was sent to"
                         : "learned this profession from a trainer it was sent to");
