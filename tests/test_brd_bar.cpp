@@ -185,7 +185,7 @@ void TheAdapterWiresIt()
            "it only speaks on map 230 during a LeaveInstance escort");
     Expect(inHook("getAttackers()") && inHook("OverseerDecisions::BarAttackerLine("),
            "it logs every attacker through the shared line");
-    Expect(src.find("PLAYERHOOK_ON_PLAYER_SPELL_CAST") != std::string::npos &&
+    Expect(src.find("PLAYERHOOK_ON_SPELL_CAST") != std::string::npos &&
                src.find("PLAYERHOOK_ON_PLAYER_LEAVE_COMBAT") != std::string::npos,
            "spell casts are counted for the fight, and the fight ends on leaving combat");
     Expect(src.find("SetLeaveInstanceWalkers(") != std::string::npos,
