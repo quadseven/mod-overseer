@@ -55061,7 +55061,7 @@ private:
                           std::map<std::string, unsigned> const& seats, unsigned gateKey)
     {
         uint32 const floorSlots = sConfigMgr->GetOption<uint32>(
-            "Overseer.Raid.FreeSlotFloor", OverseerDecisions::RAID_FREE_SLOT_FLOOR_DEFAULT);
+            "Overseer.Raid.FreeSlotFloor", OverseerDecisions::RAID_FREE_SLOT_FLOOR_DEFAULT, false);
         if (run.bagGateKey != gateKey)
         {
             run.bagGateKey = gateKey;
@@ -56228,7 +56228,7 @@ private:
             Player* head = ObjectAccessor::FindPlayerByName(roster.leader);
             facts.headStreaming = OverseerDecisions::RaidHeadMayLead(
                 head && head->IsInWorld(), head && ClientAttached(head),
-                sConfigMgr->GetOption<bool>("Overseer.Raid.RequireHeadClient", true));
+                sConfigMgr->GetOption<bool>("Overseer.Raid.RequireHeadClient", true, false));
             facts.headAlive = head && head->IsInWorld() && head->IsAlive();
             Group* group = head ? head->GetGroup() : nullptr;
             facts.raidFormed = group && group->isRaidGroup();
@@ -56242,11 +56242,11 @@ private:
             facts.seatsTotal = unsigned(seats.size());
             facts.quorumEnded = run.quorumEnded;
             facts.quorumSeats = sConfigMgr->GetOption<uint32>(
-                "Overseer.Raid.QuorumSeats", OverseerDecisions::RAID_QUORUM_SEATS);
+                "Overseer.Raid.QuorumSeats", OverseerDecisions::RAID_QUORUM_SEATS, false);
             facts.quorumTanks = sConfigMgr->GetOption<uint32>(
-                "Overseer.Raid.QuorumTanks", OverseerDecisions::RAID_QUORUM_TANKS);
+                "Overseer.Raid.QuorumTanks", OverseerDecisions::RAID_QUORUM_TANKS, false);
             facts.quorumHealers = sConfigMgr->GetOption<uint32>(
-                "Overseer.Raid.QuorumHealers", OverseerDecisions::RAID_QUORUM_HEALERS);
+                "Overseer.Raid.QuorumHealers", OverseerDecisions::RAID_QUORUM_HEALERS, false);
             std::map<std::string, uint8> quorumSpecs;
             if (facts.ordered && run.phase == RaidRunPhase::Assemble)
                 quorumSpecs = LoadGearSpecs();
@@ -56256,7 +56256,7 @@ private:
             // The existing repair executor uses the character's own purse and
             // reads durability back after the core handler returns.
             uint32 const repairFloor = std::min<uint32>(
-                100, sConfigMgr->GetOption<uint32>("Overseer.Raid.RepairFloorPct", 70));
+                100, sConfigMgr->GetOption<uint32>("Overseer.Raid.RepairFloorPct", 70, false));
             bool repairPending = false;
             if (facts.ordered && run.phase == RaidRunPhase::Idle && repairFloor <= 100)
             {
@@ -71539,9 +71539,9 @@ private:
     {
         OverseerDecisions::RaidShape shape;
         shape.tanks = sConfigMgr->GetOption<uint32>(
-            "Overseer.Raid.Tanks", OverseerDecisions::RAID_TANKS_DEFAULT);
+            "Overseer.Raid.Tanks", OverseerDecisions::RAID_TANKS_DEFAULT, false);
         shape.healers = sConfigMgr->GetOption<uint32>(
-            "Overseer.Raid.Healers", OverseerDecisions::RAID_HEALERS_DEFAULT);
+            "Overseer.Raid.Healers", OverseerDecisions::RAID_HEALERS_DEFAULT, false);
         return shape;
     }
 
@@ -71577,7 +71577,7 @@ private:
     // roster character in it converts with no flag at all.
     static bool RaidMayConvertTheRosterParty()
     {
-        return sConfigMgr->GetOption<bool>("Overseer.Raid.ConvertRosterParty", false);
+        return sConfigMgr->GetOption<bool>("Overseer.Raid.ConvertRosterParty", false, false);
     }
 
     // Must a roster character have a game client attached to stay in the world?
