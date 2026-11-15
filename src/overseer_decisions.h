@@ -20012,13 +20012,15 @@ constexpr unsigned RAID_FREE_SLOT_FLOOR_DEFAULT = 6;
 // Under the floor needs room. A floor of 0 disables the gate.
 bool RaidSeatNeedsRoom(unsigned freeSlots, unsigned floorSlots);
 
-enum class RaidBagStep { Ready, TimedOut, Walk, Stand };
+enum class RaidBagStep { Ready, TimedOut, Walk, Stand, Unmovable };
 
 // Ready: at or above the floor. TimedOut: still under it when the hold wait
 // ended (the seat could not free room). Stand: under it with a vendor in
-// reach. Walk: under it with none.
+// reach. Walk: under it with none. Unmovable: under it, and this module does
+// not steer the seat (`seatMovable` false), so no errand it claims is carried
+// out; the gate neither walks nor waits for it (#1547).
 RaidBagStep RaidSeatBagStep(unsigned freeSlots, unsigned floorSlots, long heldSeconds,
-                            bool vendorInReach);
+                            bool vendorInReach, bool seatMovable = true);
 
 // Whether the pull is held: some readable seat is under the floor and the hold
 // wait has not run out.
