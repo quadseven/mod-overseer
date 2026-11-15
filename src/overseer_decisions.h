@@ -13970,7 +13970,43 @@ struct RoutePlanLimits
     bool fromZKnown{false};
     float fromZ{0.f};
     float maxEntryRiseYards{40.f};
+    // A WAY ROUND MAY NOT HAND THE WALK TO THE STEPPER ON ANOTHER FLOOR THAN
+    // THE AIM (#1557). The round rule above trades a way that arrives for one
+    // that stops short because the leftover is "not farther", and it measures
+    // the leftover in the plane. The ordered Molten Core raid's head took that
+    // trade at the door of the mountain: the leg to the door node ("Molten Core
+    // entrance", 5 yards from the aim) crosses guarded ground, so the guard-free
+    // search stopped on the node "Blackrock Spire exit", 189 yards from the aim
+    // and 105 above it, where no bearing is walkable and the errand was
+    // released as unreachable every five minutes. A handover node is passed
+    // over when it stands more than `maxHandoverRiseYards` above or below the
+    // aim AND the rise is steeper than `maxHandoverGradient` of the plane
+    // distance still to cover. The second test is what leaves a long hillside
+    // alone: 105 yards over 189 is a cliff face, the same rise over 480 is a
+    // slope the stepper walks. Unknown, nothing changes: a caller that does not
+    // set `aimZKnown` gets the plan this planner has always made.
+    bool aimZKnown{false};
+    float aimZ{0.f};
+    float maxHandoverRiseYards{40.f};
+    float maxHandoverGradient{0.25f};
+    // THE GUARDED-GROUND ROUND RULE IS OFF FOR THIS PLAN (#1557). Set by a
+    // caller whose last attempt at this errand ended on another level than the
+    // aim after taking a way round, so the next attempt is not the same walk
+    // again. The plan is then the search that may cross guarded legs.
+    bool allowRound{true};
 };
+
+// A walk that ends an attempt more than this far ABOVE its aim stands on a
+// level the aim cannot be walked to from (#1557: the Blackrock Spire ledge, 105
+// yards over the Molten Core door). The same walk repeated ends there again.
+constexpr float WRONG_LEVEL_YARDS = 50.f;
+
+// True when the character stands more than WRONG_LEVEL_YARDS above the aim.
+bool EndedAboveTheAim(float stoodZ, float aimZ);
+
+// The planned node ids as one line fragment, "3380 1485", at most `cap` of
+// them, with "... and N more" after a cut list. Empty for an empty plan.
+std::string RouteNodeList(std::vector<std::uint32_t> const& nodes, std::size_t cap);
 
 // THE SENTENCE THE ROUTE LINE ENDS WITH (#925): the entry node, how far it
 // stands above or below the character, and how many surveyed nodes in reach
