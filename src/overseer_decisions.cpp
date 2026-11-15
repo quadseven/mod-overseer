@@ -2948,6 +2948,62 @@ bool FinderGroupStillServes(FinderState state, bool anyMemberInAnInstance)
            state == FinderState::Proposal;
 }
 
+RaidSeatBlock RaidSeatBlockOf(RaidSeatJoinFacts const& facts)
+{
+    if (!facts.inWorld)
+        return RaidSeatBlock::NotInWorld;
+    if (facts.inThisRaid)
+        return RaidSeatBlock::Seated;
+    if (facts.raidFull)
+        return RaidSeatBlock::RaidFull;
+    if (facts.inBattleground)
+        return RaidSeatBlock::Battleground;
+    if (facts.inBattlefield)
+        return RaidSeatBlock::Battlefield;
+    if (facts.inFinderGroup &&
+        FinderGroupStillServes(facts.finderState, facts.finderMemberInInstance))
+        return RaidSeatBlock::FinderGroup;
+    return RaidSeatBlock::None;
+}
+
+bool RaidSeatNeedsFinderClear(RaidSeatJoinFacts const& facts)
+{
+    return facts.inFinderGroup && RaidSeatBlockOf(facts) == RaidSeatBlock::None;
+}
+
+char const* RaidSeatBlockWord(RaidSeatBlock block)
+{
+    switch (block)
+    {
+        case RaidSeatBlock::None:         return "free to join";
+        case RaidSeatBlock::NotInWorld:   return "not in the world";
+        case RaidSeatBlock::Seated:       return "already in the raid";
+        case RaidSeatBlock::RaidFull:     return "the raid is full";
+        case RaidSeatBlock::Battleground: return "in a battleground group";
+        case RaidSeatBlock::Battlefield:  return "in a battlefield group";
+        case RaidSeatBlock::FinderGroup:
+            return "in a dungeon-finder group the finder still serves";
+    }
+    return "unknown";
+}
+
+std::string RaidSeatSkipLine(std::vector<RaidSeatSkip> const& skips, unsigned tableSeats,
+                             unsigned seated)
+{
+    if (skips.empty())
+        return std::string();
+    std::string out = std::to_string(skips.size()) + " seat(s) not seated: ";
+    for (std::size_t i = 0; i < skips.size(); ++i)
+    {
+        if (i)
+            out += ", ";
+        out += skips[i].name + " (" + RaidSeatBlockWord(skips[i].block) + ")";
+    }
+    out += "; " + std::to_string(seated) + " of " + std::to_string(tableSeats) +
+           " seats in the raid";
+    return out;
+}
+
 bool LeftoverFinderGroupKept(FinderState state, bool anyMemberInAnInstance, bool headInIt,
                              bool familyRunOpen)
 {

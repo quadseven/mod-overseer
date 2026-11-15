@@ -55254,13 +55254,44 @@ private:
     // formation would never take.
     static bool RaidSeatCanJoin(Player* p, Group* group)
     {
-        if (!p || !p->IsInWorld())
-            return false;
-        Group* mine = p->GetGroup();
-        if (group && (mine == group || group->IsFull()))
-            return false;
-        return !(mine && (mine->isBGGroup() || mine->isBFGroup() || mine->isLFGGroup()));
+        return OverseerDecisions::RaidSeatBlockOf(RaidSeatFactsOf(p, group)) ==
+               OverseerDecisions::RaidSeatBlock::None;
     }
+
+    // The facts RaidSeatBlockOf decides on (#1555). A finder group is read the
+    // way DisbandLeftoverFinderGroups reads it: its state, and whether any
+    // member is on a dungeon map or between maps.
+    static OverseerDecisions::RaidSeatJoinFacts RaidSeatFactsOf(Player* p, Group* group)
+    {
+        OverseerDecisions::RaidSeatJoinFacts facts;
+        facts.inWorld = p && p->IsInWorld();
+        if (!facts.inWorld)
+            return facts;
+        Group* mine = p->GetGroup();
+        facts.inThisRaid = group && mine == group;
+        facts.raidFull = group && group->IsFull();
+        if (!mine)
+            return facts;
+        facts.inBattleground = mine->isBGGroup();
+        facts.inBattlefield = mine->isBFGroup();
+        if (mine->isLFGGroup())
+        {
+            facts.inFinderGroup = true;
+            facts.finderState = FinderStateOf(sLFGMgr->GetState(mine->GetGUID()));
+            for (GroupReference* ref = mine->GetFirstMember(); ref; ref = ref->next())
+            {
+                Player* member = ref->GetSource();
+                if (member && (!member->IsInWorld() || member->IsBeingTeleported() ||
+                               (member->GetMap() && member->GetMap()->IsDungeon())))
+                    facts.finderMemberInInstance = true;
+            }
+        }
+        return facts;
+    }
+
+    // Who FORM last named as not seated, per family, so the line is said when
+    // the answer changes and not every poll.
+    std::map<std::string, std::string> _raidSeatSkipSaid;
 
     // A database without the seat table (2026_09_23_01_overseer_raid_seat.sql
     // not applied) forms no raid and says so once. Asked of the schema first
@@ -55363,13 +55394,41 @@ private:
         unsigned added = 0;
         unsigned leftOther = 0;
         unsigned stillAddable = 0;
+        std::vector<OverseerDecisions::RaidSeatSkip> skips;
         for (auto const& [name, subgroup] : seats)
         {
             Player* p = ObjectAccessor::FindPlayerByName(name);
             // Not in the world, already seated, or in a group the core owns
-            // (left alone, as KeepFamilyGrouped leaves it).
-            if (!RaidSeatCanJoin(p, group))
+            // (left alone, as KeepFamilyGrouped leaves it). Each refusal is
+            // named in the log below (#1555).
+            OverseerDecisions::RaidSeatJoinFacts const facts = RaidSeatFactsOf(p, group);
+            OverseerDecisions::RaidSeatBlock const block = OverseerDecisions::RaidSeatBlockOf(facts);
+            if (block != OverseerDecisions::RaidSeatBlock::None)
+            {
+                if (block != OverseerDecisions::RaidSeatBlock::Seated)
+                    skips.push_back({name, block});
                 continue;
+            }
+            if (OverseerDecisions::RaidSeatNeedsFinderClear(facts))
+            {
+                // A LEFTOVER FINDER GROUP: not matching, nobody inside. Let go
+                // the way DisbandLeftoverFinderGroups lets one go, so the seat
+                // joins on this pass or the next. Nothing is granted: the
+                // character is put in no map and given nothing.
+                Group* stale = p->GetGroup();
+                LOG_WARN("module.overseer",
+                         "overseer: raid run for family '{}' - seat '{}' is in a dungeon "
+                         "finder group led by '{}' that nobody is inside and the finder is "
+                         "not matching (state {}); it is disbanded so the seat can join",
+                         family, name, stale->GetLeaderName(),
+                         static_cast<unsigned>(facts.finderState));
+                stale->Disband();
+                if (p->GetGroup())
+                {
+                    ++stillAddable;
+                    continue;
+                }
+            }
             if (Group* other = p->GetGroup())
             {
                 // THE PLAYER'S OWN /leave (RemoveFromGroup, the path
@@ -55425,6 +55484,19 @@ private:
                      "the raid of {} seats",
                      family, added, leftOther, moved, group->GetMembersCount(),
                      uint32(seats.size()));
+        }
+
+        // EVERY SEAT NOT SEATED, BY NAME AND REASON (#1555), when the answer
+        // changes. The raid used to form 31 of 40 with no line about the nine.
+        std::string const skipLine =
+            OverseerDecisions::RaidSeatSkipLine(skips, uint32(seats.size()), group->GetMembersCount());
+        std::string& said = _raidSeatSkipSaid[family];
+        if (skipLine != said)
+        {
+            said = skipLine;
+            if (!skipLine.empty())
+                LOG_WARN("module.overseer", "overseer: raid run for family '{}' - {}", family,
+                         skipLine);
         }
 
         return stillAddable;
