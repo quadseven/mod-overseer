@@ -25735,6 +25735,59 @@ enum class FinderState : std::uint8_t
 // both families split four and one for hours).
 bool FinderGroupStillServes(FinderState state, bool anyMemberInAnInstance);
 
+// ------------------------------------------ why a seated character is not seated --
+//
+// An ordered raid formed 31 of 40 seats and logged nothing about the other
+// nine, which sat in dungeon-finder groups left over in the data. FORM asks
+// this for every seat, joins the ones that answer None, and names the rest in
+// the log with the reason below.
+enum class RaidSeatBlock : std::uint8_t
+{
+    None,          // can be put in the raid now
+    NotInWorld,    // offline, or between maps
+    Seated,        // already a member of this raid (not a gap)
+    RaidFull,      // the raid has no room
+    Battleground,  // the core's group
+    Battlefield,   // the core's group
+    FinderGroup,   // a dungeon-finder group the finder still serves
+};
+
+struct RaidSeatJoinFacts
+{
+    bool inWorld{false};
+    bool inThisRaid{false};
+    bool raidFull{false};
+    bool inBattleground{false};
+    bool inBattlefield{false};
+    bool inFinderGroup{false};
+    FinderState finderState{FinderState::None};
+    // Any member of that finder group is on a dungeon map or between maps.
+    bool finderMemberInInstance{false};
+};
+
+// A finder group the finder no longer serves (FinderGroupStillServes) is a
+// leftover and does not hold its members: the seat is joinable once the
+// module has cleared that group, which it already does for a family's own
+// party. It grants nothing the finder would not have lost anyway.
+RaidSeatBlock RaidSeatBlockOf(RaidSeatJoinFacts const& facts);
+
+// Joinable, but only after the leftover finder group is cleared.
+bool RaidSeatNeedsFinderClear(RaidSeatJoinFacts const& facts);
+
+// "not in the world", "in a dungeon-finder group the finder still serves", ...
+char const* RaidSeatBlockWord(RaidSeatBlock block);
+
+struct RaidSeatSkip
+{
+    std::string name;
+    RaidSeatBlock block{RaidSeatBlock::None};
+};
+
+// One line for a FORM pass: every seat not seated and why, and how many of the
+// table are in the raid. Empty when nobody was skipped.
+std::string RaidSeatSkipLine(std::vector<RaidSeatSkip> const& skips, unsigned tableSeats,
+                             unsigned seated);
+
 // AND A FINISHED RUN'S GROUP WITH THE HEAD STILL IN IT. The head's own finder
 // group was left alone as LeaveTheFinderGroup's to disband, but that only
 // happens at the right moment of a run. On wow-dev 2026-10-05 Grug's whole
