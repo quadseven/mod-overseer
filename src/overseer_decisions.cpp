@@ -16965,10 +16965,12 @@ bool RaidSeatNeedsRoom(unsigned freeSlots, unsigned floorSlots)
 }
 
 RaidBagStep RaidSeatBagStep(unsigned freeSlots, unsigned floorSlots, long heldSeconds,
-                            bool vendorInReach)
+                            bool vendorInReach, bool seatMovable)
 {
     if (!RaidSeatNeedsRoom(freeSlots, floorSlots))
         return RaidBagStep::Ready;
+    if (!seatMovable)
+        return RaidBagStep::Unmovable;
     if (heldSeconds >= RAID_HOLD_WAIT_SECONDS)
         return RaidBagStep::TimedOut;
     return vendorInReach ? RaidBagStep::Stand : RaidBagStep::Walk;

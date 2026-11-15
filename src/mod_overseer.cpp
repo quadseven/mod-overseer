@@ -55046,6 +55046,8 @@ private:
         std::set<std::string> bagSlotsSaid;
         std::set<std::string> bagWalkSaid;
         std::set<std::string> bagTimedOutSaid;
+        std::set<std::string> bagUnmovableSaid;
+        size_t bagUnmovableCounted{0};
         // Consumable item entries already used for this pull, per seat, and the
         // seats already logged as having nothing to use (#1460).
         std::map<std::string, std::set<uint32>> consumableTried;
@@ -55069,6 +55071,8 @@ private:
             run.bagSlotsSaid.clear();
             run.bagWalkSaid.clear();
             run.bagTimedOutSaid.clear();
+            run.bagUnmovableSaid.clear();
+            run.bagUnmovableCounted = 0;
         }
         long const heldNow = long(std::time(nullptr) - run.bagGateSince);
         std::vector<unsigned> seatFree;
@@ -55079,7 +55083,12 @@ private:
             if (!member || !member->IsInWorld())
                 continue;
             unsigned const freeSlots = member->GetFreeInventorySpace();
-            seatFree.push_back(freeSlots);
+            // A seat this module does not steer cannot be walked to a vendor:
+            // the aim would be claimed and never carried out (#1547). It is
+            // left out of the hold, so the pull does not wait on it.
+            bool const movable = Steerable(member);
+            if (movable)
+                seatFree.push_back(freeSlots);
             if (run.bagSlotsSaid.insert(name).second)
                 LOG_INFO("module.overseer",
                          "overseer: raid run for family '{}': free slots {} {}", family, name,
@@ -55092,9 +55101,17 @@ private:
                                  CounterInReach(member, OverseerDecisions::CounterRole::Vendor,
                                                 oneIsNearby, nearestYards);
             auto const step = OverseerDecisions::RaidSeatBagStep(freeSlots, floorSlots, heldNow,
-                                                                 inReach);
+                                                                 inReach, movable);
             switch (step)
             {
+                case OverseerDecisions::RaidBagStep::Unmovable:
+                    if (run.bagUnmovableSaid.insert(name).second)
+                        LOG_INFO("module.overseer",
+                                 "overseer: raid run for family '{}' cannot move '{}' to a "
+                                 "vendor ({} free, floor {}): this module does not steer it, so "
+                                 "the pull does not wait for it",
+                                 family, name, freeSlots, floorSlots);
+                    break;
                 case OverseerDecisions::RaidBagStep::Ready:
                     if (HasCounterHold(name))
                         ReleaseCounterHold(name, "raid bag room freed");
@@ -55122,6 +55139,14 @@ private:
                     HoldAtTheCounter(member, name);
                     break;
             }
+        }
+        if (run.bagUnmovableSaid.size() != run.bagUnmovableCounted)
+        {
+            run.bagUnmovableCounted = run.bagUnmovableSaid.size();
+            LOG_INFO("module.overseer",
+                     "overseer: raid run for family '{}': {} of {} seats under the free-slot "
+                     "floor cannot move to a vendor and are not waited for",
+                     family, run.bagUnmovableCounted, seats.size());
         }
         bool const hold = OverseerDecisions::RaidBagHold(seatFree, floorSlots, heldNow);
         if (!hold)
