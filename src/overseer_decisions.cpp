@@ -25915,6 +25915,9 @@ char const* LeaveGroupGate(LeaveGroupFacts const& facts)
         return R::LeadsGroup;
     if (facts.battleground)
         return R::Battleground;
+    if (facts.finderGroup &&
+        FinderGroupStillServes(facts.finderState, facts.finderMemberInInstance))
+        return R::Battleground;
     if (facts.inInstance)
         return R::InInstance;
     if (facts.inCombat)

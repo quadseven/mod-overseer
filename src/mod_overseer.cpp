@@ -46572,8 +46572,26 @@ private:
         facts.isBot = ai != nullptr;
         facts.inGroup = group != nullptr;
         facts.leadsGroup = group && group->IsLeader(who->GetGUID());
-        facts.battleground =
-            group && (group->isBGGroup() || group->isBFGroup() || group->isLFGGroup());
+        facts.battleground = group && (group->isBGGroup() || group->isBFGroup());
+        if (group && group->isLFGGroup())
+        {
+            // A finder group the finder no longer serves is a leftover of a
+            // finished run and does not hold its members (the same reading
+            // DisbandLeftoverFinderGroups takes). A member between maps counts
+            // as inside: the finder's teleport in has every member out of the
+            // world at once, in state Dungeon.
+            facts.finderGroup = true;
+            facts.finderState = FinderStateOf(sLFGMgr->GetState(group->GetGUID()));
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+            {
+                Player* member = ref->GetSource();
+                if (!member)
+                    continue;
+                if (!member->IsInWorld() || member->IsBeingTeleported() ||
+                    (member->GetMap() && member->GetMap()->IsDungeon()))
+                    facts.finderMemberInInstance = true;
+            }
+        }
         facts.inInstance = who->GetMap() && who->GetMap()->Instanceable();
         facts.inCombat = who->IsInCombat();
         std::string const leaderName = group ? std::string(group->GetLeaderName()) : "";
