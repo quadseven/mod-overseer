@@ -55061,7 +55061,7 @@ private:
                           std::map<std::string, unsigned> const& seats, unsigned gateKey)
     {
         uint32 const floorSlots = sConfigMgr->GetOption<uint32>(
-            "Overseer.Raid.FreeSlotFloor", OverseerDecisions::RAID_FREE_SLOT_FLOOR_DEFAULT, false);
+            "Overseer.Raid.FreeSlotFloor", OverseerDecisions::RAID_FREE_SLOT_FLOOR_DEFAULT);
         if (run.bagGateKey != gateKey)
         {
             run.bagGateKey = gateKey;
@@ -56242,11 +56242,11 @@ private:
             facts.seatsTotal = unsigned(seats.size());
             facts.quorumEnded = run.quorumEnded;
             facts.quorumSeats = sConfigMgr->GetOption<uint32>(
-                "Overseer.Raid.QuorumSeats", OverseerDecisions::RAID_QUORUM_SEATS, false);
+                "Overseer.Raid.QuorumSeats", OverseerDecisions::RAID_QUORUM_SEATS);
             facts.quorumTanks = sConfigMgr->GetOption<uint32>(
-                "Overseer.Raid.QuorumTanks", OverseerDecisions::RAID_QUORUM_TANKS, false);
+                "Overseer.Raid.QuorumTanks", OverseerDecisions::RAID_QUORUM_TANKS);
             facts.quorumHealers = sConfigMgr->GetOption<uint32>(
-                "Overseer.Raid.QuorumHealers", OverseerDecisions::RAID_QUORUM_HEALERS, false);
+                "Overseer.Raid.QuorumHealers", OverseerDecisions::RAID_QUORUM_HEALERS);
             std::map<std::string, uint8> quorumSpecs;
             if (facts.ordered && run.phase == RaidRunPhase::Assemble)
                 quorumSpecs = LoadGearSpecs();
@@ -56256,7 +56256,7 @@ private:
             // The existing repair executor uses the character's own purse and
             // reads durability back after the core handler returns.
             uint32 const repairFloor = std::min<uint32>(
-                100, sConfigMgr->GetOption<uint32>("Overseer.Raid.RepairFloorPct", 70, false));
+                100, sConfigMgr->GetOption<uint32>("Overseer.Raid.RepairFloorPct", 70));
             bool repairPending = false;
             if (facts.ordered && run.phase == RaidRunPhase::Idle && repairFloor <= 100)
             {
@@ -71539,9 +71539,9 @@ private:
     {
         OverseerDecisions::RaidShape shape;
         shape.tanks = sConfigMgr->GetOption<uint32>(
-            "Overseer.Raid.Tanks", OverseerDecisions::RAID_TANKS_DEFAULT, false);
+            "Overseer.Raid.Tanks", OverseerDecisions::RAID_TANKS_DEFAULT);
         shape.healers = sConfigMgr->GetOption<uint32>(
-            "Overseer.Raid.Healers", OverseerDecisions::RAID_HEALERS_DEFAULT, false);
+            "Overseer.Raid.Healers", OverseerDecisions::RAID_HEALERS_DEFAULT);
         return shape;
     }
 
@@ -71577,7 +71577,7 @@ private:
     // roster character in it converts with no flag at all.
     static bool RaidMayConvertTheRosterParty()
     {
-        return sConfigMgr->GetOption<bool>("Overseer.Raid.ConvertRosterParty", false, false);
+        return sConfigMgr->GetOption<bool>("Overseer.Raid.ConvertRosterParty", false);
     }
 
     // Must a roster character have a game client attached to stay in the world?
