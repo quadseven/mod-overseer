@@ -22752,18 +22752,43 @@ private:
     // rather than a fifteen-yard drop to its bed. Asked of the map rather than
     // of PathGenerator on purpose: this question is only ever reached because
     // the navmesh has already failed to answer it.
-    static bool SurfaceAt(Player* bot, float x, float y, float from, float& out)
+    //
+    // `lethal`, when asked for, comes back true where lava stands over the
+    // ground at (x, y) (#1569), because this lookup reads the liquid's surface
+    // as a floor and a lava pool would otherwise pass as one. It rides on the
+    // same query (the ground is the out-parameter the call already computes),
+    // and the liquid TYPE is asked of the core only when the surface stands
+    // above the ground, so a dry stride costs nothing extra. An unmeasurable
+    // point is not called lethal: the caller's no-ground rules handle it.
+    static bool SurfaceAt(Player* bot, float x, float y, float from, float& out,
+                          bool* lethal = nullptr)
     {
+        if (lethal)
+            *lethal = false;
         Map* map = bot->GetMap();
         if (!map)
             return false;
+        float ground = INVALID_HEIGHT;
         float const surface = map->GetWaterOrGroundLevel(
-            bot->GetPhaseMask(), x, y, from, nullptr, true, bot->GetCollisionHeight());
+            bot->GetPhaseMask(), x, y, from, lethal ? &ground : nullptr, true,
+            bot->GetCollisionHeight());
         // GridTerrainData.h:27. Both INVALID_HEIGHT and the vmap's own
         // "nothing here" value are far below any floor in the world, so one
         // comparison catches both.
         if (surface <= INVALID_HEIGHT)
             return false;
+        if (lethal && ground > INVALID_HEIGHT)
+        {
+            float const depth = surface - ground;
+            if (depth > 0.f)
+            {
+                LiquidData const liquid = map->GetLiquidData(
+                    bot->GetPhaseMask(), x, y, ground + depth * 0.5f,
+                    bot->GetCollisionHeight(), MAP_ALL_LIQUIDS);
+                if (liquid.Status != LIQUID_MAP_NO_WATER)
+                    *lethal = OverseerDecisions::StepLiquidIsLethal(depth, liquid.Flags);
+            }
+        }
         out = surface;
         return true;
     }
@@ -23024,34 +23049,6 @@ private:
         return false;
     }
 
-    // IS THE LIQUID AT (x, y) LAVA OR SLIME, STANDING OVER THE GROUND (#1569)?
-    // SurfaceAt answers with the liquid's surface, so without this a lava pool
-    // reads as a floor and the straight step walks into it. The depth is the
-    // core's own two halves (GetWaterOrGroundLevel's surface and its ground
-    // out-parameter); the liquid TYPE is read from the core at a point inside
-    // the liquid, never inferred from a height. An unmeasurable point is not
-    // called lethal here: the caller's own no-ground rules handle it.
-    static bool LethalLiquidAt(Player* bot, float x, float y, float from)
-    {
-        Map* map = bot->GetMap();
-        if (!map)
-            return false;
-        float ground = 0.f;
-        float const surface = map->GetWaterOrGroundLevel(
-            bot->GetPhaseMask(), x, y, from, &ground, true, bot->GetCollisionHeight());
-        if (surface <= INVALID_HEIGHT || ground <= INVALID_HEIGHT)
-            return false;
-        float const depth = surface - ground;
-        if (depth <= 0.f)
-            return false;
-        LiquidData const liquid = map->GetLiquidData(
-            bot->GetPhaseMask(), x, y, ground + depth * 0.5f, bot->GetCollisionHeight(),
-            MAP_ALL_LIQUIDS);
-        if (liquid.Status == LIQUID_MAP_NO_WATER)
-            return false;
-        return OverseerDecisions::StepLiquidIsLethal(depth, liquid.Flags);
-    }
-
     // Does the ground hold, walking in a straight line from where `bot` stands
     // to (toX, toY)? `footing` comes back as the surface at the far end, which
     // is the Z the step should be aimed at: an aim's own Z is what put a
@@ -23075,6 +23072,16 @@ private:
         footing = bot->GetPositionZ();
         if (provedYards)
             *provedYards = 0.f;
+        // A BOT ALREADY STANDING IN LAVA MAY WADE OUT (#1569). Refusing every
+        // stride into lava would hold it in the pool: each bearing's first
+        // stride is lava too, the proved prefix is 0, the travel fan never
+        // offers the way back, and AnyDirectionHolds would call it sealed in a
+        // pocket and trigger the terrain-recovery lift. So the liquid refusal
+        // is skipped for the whole call when the feet are already in it.
+        bool feetLethal = false;
+        float feetSurface = 0.f;
+        SurfaceAt(bot, fromX, fromY, footing + TRAVEL_GROUND_DROP_YARDS,
+                  feetSurface, &feetLethal);
         if (span < TRAVEL_GROUND_SAMPLE_YARDS)
         {
             if (provedYards)
@@ -23088,6 +23095,7 @@ private:
         {
             float const t = static_cast<float>(i) / static_cast<float>(samples);
             float next = 0.f;
+            bool strideLethal = false;
             float const sampleX = fromX + dx * t;
             float const sampleY = fromY + dy * t;
             // Looked for from TRAVEL_GROUND_DROP_YARDS ABOVE the last footing
@@ -23095,7 +23103,7 @@ private:
             // slope it is climbing rather than the valley floor beyond it. The
             // asymmetry is the point: this check is about falling.
             if (!SurfaceAt(bot, sampleX, sampleY,
-                           footing + TRAVEL_GROUND_DROP_YARDS, next))
+                           footing + TRAVEL_GROUND_DROP_YARDS, next, &strideLethal))
             {
                 // NOT FINDING THE GROUND IS NOT THE SAME AS STANDING OVER A
                 // CLIFF, and answering both with `false` is what held
@@ -23113,19 +23121,19 @@ private:
                 // the same minute, every one of them on ground a character can
                 // simply walk up.
                 if (!SurfaceAt(bot, sampleX, sampleY,
-                               footing + TRAVEL_GROUND_UPHILL_YARDS, next))
+                               footing + TRAVEL_GROUND_UPHILL_YARDS, next, &strideLethal))
                     return false;
                 // Nothing is forgiven on the way down. Any surface BELOW the
                 // first origin was already within that search's reach, so a
                 // second answer lower than the footing is not a hill, and the
                 // drop test immediately below still has to pass on it.
             }
-            // LAVA AND SLIME ARE NOT GROUND (#1569). SurfaceAt reads their
-            // surface as a floor, so the drop and rise tests below pass over a
-            // pool; the head walked into magma this way at the Molten Core
-            // door. The sample is refused, which also ends the proved prefix
-            // before the pool.
-            if (LethalLiquidAt(bot, sampleX, sampleY, footing + TRAVEL_GROUND_DROP_YARDS))
+            // LAVA IS NOT GROUND (#1569). SurfaceAt reads its surface as a
+            // floor, so the drop and rise tests below pass over a pool; the
+            // head walked into magma this way at the Molten Core door. The
+            // sample is refused, which also ends the proved prefix before the
+            // pool, unless the feet are already in it (see feetLethal above).
+            if (OverseerDecisions::StrideLiquidRefused(feetLethal, strideLethal))
                 return false;
             // A STRIDE IS WALKABLE EXACTLY WHEN THE STRIDE BACK IS (#262).
             // These used to be two separate tests with two different bounds,

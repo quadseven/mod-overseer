@@ -46,6 +46,7 @@ using OverseerDecisions::DEATH_LIQUID_OCEAN;
 using OverseerDecisions::DEATH_LIQUID_SLIME;
 using OverseerDecisions::DEATH_LIQUID_WATER;
 using OverseerDecisions::StepLiquidIsLethal;
+using OverseerDecisions::StrideLiquidRefused;
 
 namespace
 {
@@ -73,7 +74,11 @@ int main()
     // The two live deaths: magma standing over the ground at the sample.
     Check("lava over the ground is lethal", StepLiquidIsLethal(4.0f, DEATH_LIQUID_MAGMA), true);
     Check("a thin film of lava is lethal", StepLiquidIsLethal(0.3f, DEATH_LIQUID_MAGMA), true);
-    Check("slime over the ground is lethal", StepLiquidIsLethal(2.0f, DEATH_LIQUID_SLIME), true);
+    // Slime is NOT refused: the core's slime damage is disabled, and refusing
+    // it would newly hold bots at canals and pools that have never hurt them.
+    Check("slime is not refused", StepLiquidIsLethal(2.0f, DEATH_LIQUID_SLIME), false);
+    Check("magma mixed with slime is still lethal",
+          StepLiquidIsLethal(2.0f, DEATH_LIQUID_SLIME | DEATH_LIQUID_MAGMA), true);
     Check("a mixed mask with magma in it is lethal",
           StepLiquidIsLethal(2.0f, DEATH_LIQUID_WATER | DEATH_LIQUID_MAGMA), true);
 
@@ -88,6 +93,16 @@ int main()
     Check("lava below the floor is a floor", StepLiquidIsLethal(0.0f, DEATH_LIQUID_MAGMA), false);
     Check("negative depth is a floor", StepLiquidIsLethal(-5.0f, DEATH_LIQUID_MAGMA), false);
     Check("no liquid bits is a floor", StepLiquidIsLethal(3.0f, 0), false);
+
+    // THE FEET EXEMPTION. A bot already standing in magma must be able to wade
+    // out: every bearing's first stride is magma too, so refusing them all
+    // leaves a proved prefix of 0, no way back from the +-60 degree travel
+    // fan, and AnyDirectionHolds reading "sealed in a pocket".
+    Check("a stride into magma from dry ground is refused", StrideLiquidRefused(false, true), true);
+    Check("a dry stride from dry ground is not refused", StrideLiquidRefused(false, false), false);
+    Check("a bot in magma may take a stride that stays in magma",
+          StrideLiquidRefused(true, true), false);
+    Check("a bot in magma may take a dry stride", StrideLiquidRefused(true, false), false);
 
     // The adapter has to ask the rule, from the one footing check.
     std::ifstream source("src/mod_overseer.cpp");
@@ -107,16 +122,34 @@ int main()
         return EXIT_FAILURE;
     }
     std::string const body = text.substr(holds, holdsEnd - holds);
-    Check("GroundHolds refuses a stride that lands in lethal liquid",
-          Has(body, "LethalLiquidAt(bot,"), true);
+    Check("GroundHolds reads the lethal liquid through SurfaceAt, in the same lookup",
+          Has(body, "&strideLethal"), true);
+    Check("GroundHolds refuses through the pure feet-exemption rule",
+          Has(body, "StrideLiquidRefused("), true);
+    Check("GroundHolds measures the bot's own feet once, before the loop",
+          Has(body, "&feetLethal"), true);
+    std::size_t const loopAt = body.find("for (uint32 i = 1;");
+    std::size_t const feetAt = body.find("&feetLethal");
+    Check("the feet are measured before the first stride",
+          loopAt != std::string::npos && feetAt != std::string::npos && feetAt < loopAt, true);
 
-    std::size_t const helper = text.find("static bool LethalLiquidAt(");
+    // AnyDirectionHolds goes through GroundHolds, so the exemption reaches it
+    // and a bot standing in magma is not reported sealed in.
+    std::size_t const any = text.find("static bool AnyDirectionHolds(");
+    Check("AnyDirectionHolds asks GroundHolds",
+          any != std::string::npos &&
+              Has(text.substr(any, 1800), "GroundHolds(bot, x, y, footing)"),
+          true);
+
+    std::size_t const helper = text.find("static bool SurfaceAt(");
     if (helper == std::string::npos)
     {
-        std::printf("FAIL the adapter has no LethalLiquidAt\n");
+        std::printf("FAIL the adapter has no SurfaceAt\n");
         return EXIT_FAILURE;
     }
     std::string const helperBody = text.substr(helper, 2600);
+    Check("the liquid type is asked for only when liquid stands over the ground",
+          Has(helperBody, "depth > 0.f"), true);
     Check("the liquid is measured with the core's own depth query",
           Has(helperBody, "GetWaterOrGroundLevel("), true);
     Check("the liquid TYPE is read from the core, not guessed from a height",
