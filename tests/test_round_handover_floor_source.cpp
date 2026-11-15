@@ -1,6 +1,6 @@
 /*
  * The planner is given the aim's height, an attempt that ends above the aim is
- * said and not repeated unchanged, and the planned nodes are named once
+ * said, and the planned nodes are named once
  * (mod-overseer#1557).
  *
  * Reads src/mod_overseer.cpp as text: the wiring lives in the adapter, which
@@ -46,12 +46,8 @@ int main()
 
     Check("the planner is told the aim's height",
           Has(src, "limits.aimZKnown = true;\n        limits.aimZ = aimZ;"));
-    Check("a wrong-level ending turns the way round off for the next plan",
-          Has(src, "if (WrongLevelEnds().erase(bot->GetName()) > 0)") &&
-              Has(src, "limits.allowRound = false;"));
     Check("the unreachable release asks whether it ended above the aim",
           Has(src, "OverseerDecisions::EndedAboveTheAim(bot->GetPositionZ(),"));
-    Check("and remembers the walker", Has(src, "WrongLevelEnds().insert(name);"));
     Check("the planned nodes are logged",
           Has(src, "OverseerDecisions::RouteNodeList(plan.nodes, 64)"));
 

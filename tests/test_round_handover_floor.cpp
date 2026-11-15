@@ -140,16 +140,6 @@ int main()
     CheckUInt("a long gentle rise is still a handover",
               slope.nodes.empty() ? 0 : slope.nodes.back(), LEDGE);
 
-    if (failures)
-        return 1;    // A head that ended an attempt on the ledge does not take the same way round
-    // again: the next plan is made with the round rule off and ends at the door.
-    RoutePlanLimits again = Limits(false);
-    again.allowRound = false;
-    RoutePlan const retried = PlanFootRoute(Nodes(), Links(), EASTERN_KINGDOMS, -8203.f, -922.f,
-                                            AIM_X, AIM_Y, again);
-    CheckUInt("a retry with the round rule off ends at the door",
-              retried.nodes.empty() ? 0 : retried.nodes.back(), DOOR);
-
     // More than 50 yards above the aim is a wrong-level ending.
     Check("the ledge is above the door", OverseerDecisions::EndedAboveTheAim(285.7f, AIM_Z), true);
     Check("a few yards above is not", OverseerDecisions::EndedAboveTheAim(200.f, AIM_Z), false);

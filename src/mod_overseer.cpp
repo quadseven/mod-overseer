@@ -23458,15 +23458,6 @@ private:
         return it == DiedOnLegBook().end() ? 0 : it->second.deathsOnLegs;
     }
 
-    // Walkers whose last attempt at an errand ended more than
-    // WRONG_LEVEL_YARDS above its aim (#1557). The next plan for each is made
-    // with the way round off, once, so the same walk is not repeated.
-    static std::set<std::string>& WrongLevelEnds()
-    {
-        static std::set<std::string> ends;
-        return ends;
-    }
-
     static std::map<std::string, DiedOnLegMemory>& DiedOnLegBook()
     {
         static std::map<std::string, DiedOnLegMemory> book;
@@ -24639,17 +24630,6 @@ private:
         // head stopped on the Spire ledge 105 yards above it.
         limits.aimZKnown = true;
         limits.aimZ = aimZ;
-        // AND AN ATTEMPT THAT ENDED ON THE WRONG LEVEL IS NOT MADE AGAIN
-        // UNCHANGED: the way round is off for this one plan (#1557).
-        if (WrongLevelEnds().erase(bot->GetName()) > 0)
-        {
-            limits.allowRound = false;
-            LOG_INFO("module.overseer",
-                     "overseer: '{}' is sent to '{}' again after an attempt that ended more "
-                     "than {:.0f} yards above the aim, so this plan does not go round "
-                     "guarded ground (#1557)",
-                     name, target, OverseerDecisions::WRONG_LEVEL_YARDS);
-        }
         OverseerDecisions::RoutePlan plan;
         unsigned refusedEntries = 0;
         uint32 walkableEntry = 0;
@@ -31311,17 +31291,14 @@ private:
                              name, target, refusal.consecutive);
                     // AND SAID PLAINLY WHEN IT STANDS ON ANOTHER LEVEL THAN THE AIM
                     // (#1557): the planned walk ended on a ledge the aim cannot be
-                    // reached from, and the same plan would end there again.
+                    // reached from.
                     if (OverseerDecisions::EndedAboveTheAim(bot->GetPositionZ(),
                                                             pos.GetPositionZ()))
                     {
-                        WrongLevelEnds().insert(name);
                         LOG_WARN("module.overseer",
                                  "overseer: '{}' ended its attempt at '{}' {:.0f} yards ABOVE "
                                  "the aim (z {:.0f} against {:.0f}), {} yards across, on a "
-                                 "level the aim cannot be walked to from. The next plan for "
-                                 "this errand does not go round guarded ground, so it is "
-                                 "not the same walk (#1557)",
+                                 "level the aim cannot be walked to from (#1557)",
                                  name, target, bot->GetPositionZ() - pos.GetPositionZ(),
                                  bot->GetPositionZ(), pos.GetPositionZ(),
                                  static_cast<uint32>(distance));
