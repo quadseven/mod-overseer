@@ -13027,6 +13027,26 @@ std::size_t ChooseRoadJoin(std::vector<RoadJoinOption> const& options,
     return best;
 }
 
+bool EndedAboveTheAim(float stoodZ, float aimZ)
+{
+    return std::isfinite(stoodZ) && std::isfinite(aimZ) && stoodZ - aimZ > WRONG_LEVEL_YARDS;
+}
+
+std::string RouteNodeList(std::vector<std::uint32_t> const& nodes, std::size_t cap)
+{
+    std::string out;
+    std::size_t const shown = nodes.size() < cap ? nodes.size() : cap;
+    for (std::size_t i = 0; i < shown; ++i)
+    {
+        if (i)
+            out += ' ';
+        out += std::to_string(nodes[i]);
+    }
+    if (nodes.size() > shown)
+        out += " ... and " + std::to_string(nodes.size() - shown) + " more";
+    return out;
+}
+
 std::string RouteEntryNote(std::uint32_t entryNode, float entryHeightGapYards,
                            std::uint32_t sameFloorNodesInReach)
 {
@@ -13203,7 +13223,7 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
     // segfaulted on another, which is what a dangling pointer is entitled to do.
     FootReach round;
     std::uint32_t guardedOnPlan = GuardedLegsOn(straight, edgeGuarded, entry, goal);
-    if (anyGuarded && guardedOnPlan > 0)
+    if (limits.allowRound && anyGuarded && guardedOnPlan > 0)
     {
         // AND THE ONE RULE #400 CHANGES: THE GUARDS COST SOMETHING NOW.
         //
@@ -13247,6 +13267,14 @@ RoutePlan PlanFootRoute(std::vector<RouteNode> const& nodes,
             // thousand of them to a cone that cannot walk them.
             if (d > limits.roundHandoverYards)
                 continue;
+            // AND NOT ONTO ANOTHER FLOOR THAN THE AIM'S (#1557). See
+            // RoutePlanLimits::aimZKnown.
+            if (limits.aimZKnown)
+            {
+                float const rise = std::fabs(here[i].z - limits.aimZ);
+                if (rise > limits.maxHandoverRiseYards && rise > limits.maxHandoverGradient * d)
+                    continue;
+            }
             // NOT FARTHER, written as a refusal of the ones that ARE, so a way
             // round that is exactly as far as today's plan is kept rather than
             // dropped by the rounding of a sum.

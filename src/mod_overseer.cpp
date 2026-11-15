@@ -24625,6 +24625,11 @@ private:
         // Tower roof 119 yards above him because only x and y were asked.
         limits.fromZKnown = true;
         limits.fromZ = bot->GetPositionZ();
+        // AND A WAY ROUND DOES NOT HAND THE WALK OVER ON ANOTHER FLOOR THAN THE
+        // AIM'S (#1557): see RoutePlanLimits::aimZKnown. The Molten Core door's
+        // head stopped on the Spire ledge 105 yards above it.
+        limits.aimZKnown = true;
+        limits.aimZ = aimZ;
         OverseerDecisions::RoutePlan plan;
         unsigned refusedEntries = 0;
         uint32 walkableEntry = 0;
@@ -24852,6 +24857,14 @@ private:
                  static_cast<uint32>(route.size()), plan.endsFromAimYards,
                  OverseerDecisions::RouteEntryNote(plan.nodes.front(), plan.entryHeightGapYards,
                                                    plan.sameFloorNodesInReach));
+        // THE PLANNED NODES, NAMED ONCE PER PLAN (#1557), so a walk that ends
+        // short of its aim can be read against the survey: the last id is where
+        // the route hands over, and the log said only how far from the aim.
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is sent to '{}' and its planned survey nodes are {} "
+                 "(the last is {:.0f} yards from the aim{})",
+                 name, target, OverseerDecisions::RouteNodeList(plan.nodes, 64),
+                 plan.endsFromAimYards, plan.wentRound ? ", chosen as a way round" : "");
         // AND SAID SEPARATELY WHEN THAT ROUTE IS ONLY THE FIRST HALF (#356), for
         // the same reason the guarded note below is separate: the line above has
         // meant one thing since #316 and an operator reading it for a death must
@@ -31276,6 +31289,20 @@ private:
                              "overseer: '{}' was sent to '{}' and has been refused every "
                              "bearing for {} polls running without getting any nearer - releasing the errand as unreachable",
                              name, target, refusal.consecutive);
+                    // AND SAID PLAINLY WHEN IT STANDS ON ANOTHER LEVEL THAN THE AIM
+                    // (#1557): the planned walk ended on a ledge the aim cannot be
+                    // reached from.
+                    if (OverseerDecisions::EndedAboveTheAim(bot->GetPositionZ(),
+                                                            pos.GetPositionZ()))
+                    {
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' ended its attempt at '{}' {:.0f} yards ABOVE "
+                                 "the aim (z {:.0f} against {:.0f}), {} yards across, on a "
+                                 "level the aim cannot be walked to from (#1557)",
+                                 name, target, bot->GetPositionZ() - pos.GetPositionZ(),
+                                 bot->GetPositionZ(), pos.GetPositionZ(),
+                                 static_cast<uint32>(distance));
+                    }
                     _travelAims.Release(name, OverseerDecisions::TravelGroundGiveUpReleaseReason);
                     // A stranded member whose walk to its berth gives up here
                     // may hearth out of it instead (DecideStrandedWay, rule 6b).
