@@ -1570,6 +1570,10 @@ std::vector<BuildFact> BuildReport(std::string const& coreVersion,
     // refuses a door on the other continent while nothing can cross to it and
     // has no other way to learn that something now can.
     facts.push_back(BuildFact{"crossing", CROSSING_CAPABILITY, SOURCE_COMPILED});
+    // THE TRADE-WINDOW ENCHANT (kind='trade', `enchant-for`): the bridge writes
+    // those rows only while this fact reads "trade", so a world without the
+    // verb is never sent a row it would answer as a malformed trade.
+    facts.push_back(BuildFact{"enchant_for", ENCHANT_FOR_CAPABILITY, SOURCE_COMPILED});
     return facts;
 }
 
@@ -28018,6 +28022,163 @@ std::size_t DropBogusDoorLinks(std::vector<RouteLink>& links, std::uint32_t mapI
                                }),
                 links.end());
     return before - links.size();
+}
+
+
+// ------------------------------------------------ enchant-for (trade window) --
+
+bool IsEnchantForRow(std::string const& command)
+{
+    std::istringstream in(command);
+    std::string first;
+    in >> first;
+    return first == "enchant-for";
+}
+
+EnchantForSpec ParseEnchantForSpec(std::string const& command)
+{
+    EnchantForSpec spec;
+    std::istringstream in(command);
+    std::string word;
+    in >> word;
+    if (word != "enchant-for")
+        return spec;
+    bool seenTarget = false, seenSlot = false, seenSpell = false;
+    while (in >> word)
+    {
+        uint32_t value = 0;
+        if (!seenTarget && KeyedNumber(word, "target", value))
+        {
+            spec.target = value;
+            seenTarget = true;
+        }
+        else if (!seenSlot && KeyedNumber(word, "slot", value))
+        {
+            spec.slot = value;
+            seenSlot = true;
+        }
+        else if (!seenSpell && KeyedNumber(word, "spell", value))
+        {
+            spec.spell = value;
+            seenSpell = true;
+        }
+        else
+            return EnchantForSpec();
+    }
+    // The equipment slots are 0 to 18; a bag slot is a different question.
+    if (!(seenTarget && seenSlot && seenSpell) || spec.target == 0 || spec.spell == 0 ||
+        spec.slot > 18)
+        return EnchantForSpec();
+    spec.valid = true;
+    return spec;
+}
+
+namespace
+{
+EnchantForVerdict Wall(char const* reason, char const* retry)
+{
+    EnchantForVerdict v;
+    v.go = false;
+    v.reason = reason;
+    v.retry = retry;
+    return v;
+}
+}  // namespace
+
+EnchantForVerdict JudgeEnchantFor(EnchantForFacts const& f)
+{
+    if (f.sameCharacter)
+        return Wall("enchanter and member are the same character", "never");
+    if (!f.spellEnchantsItem)
+        return Wall("the spell is not an item enchant", "never");
+    if (!f.knowsSpell)
+        return Wall("the enchanter does not know the recipe", "never");
+    if (!f.hasEnchantingSkill)
+        return Wall("the enchanter has no Enchanting skill", "never");
+    if (!f.targetOnline)
+        return Wall("the member is not online", "later");
+    if (!f.sameGuild)
+        return Wall("the member is not in the enchanter's guild", "never");
+    if (!f.enchanterAlive)
+        return Wall("the enchanter is dead", "later");
+    if (!f.targetAlive)
+        return Wall("the member is dead", "later");
+    if (f.anyInFlight)
+        return Wall("one of the characters is on a flight path", "later");
+    if (f.anyStunned)
+        return Wall("one of the characters is stunned", "later");
+    if (f.anyLoggingOut)
+        return Wall("one of the characters is logging out", "later");
+    if (f.anyAlreadyTrading)
+        return Wall("one of the characters is already in a trade", "later");
+    if (f.anyInCombat)
+        return Wall("one of the characters is in combat", "later");
+    if (f.enchanterMoving)
+        return Wall("the enchanter is moving and a cast would be interrupted", "later");
+    if (!f.withinTradeRange)
+        return Wall("the characters are too far apart to trade", "later");
+    if (!f.reagentsInBags)
+        return Wall("the enchanter's bags do not hold the reagents", "later");
+    if (!f.itemFound)
+        return Wall("nothing is worn in that slot", "later");
+    if (!f.itemFits)
+        return Wall("the item does not fit the recipe", "never");
+    if (!f.levelOk)
+        return Wall("the item level is too low for the recipe", "never");
+    if (f.currentEnchant != 0)
+    {
+        if (f.ownEnchant != 0 && f.currentEnchant == f.ownEnchant)
+            return Wall("the item already has this enchant", "never");
+        if (!f.currentRankKnown)
+            return Wall("the item holds an enchant not made by Enchanting", "never");
+        if (f.ownRank == 0)
+            return Wall("the recipe's rank is unknown, so it replaces nothing", "never");
+        if (f.currentRank > f.ownRank)
+            return Wall("the item holds a better enchant", "never");
+    }
+    EnchantForVerdict go;
+    go.go = true;
+    return go;
+}
+
+EnchantForStepVerdict NextEnchantForStep(EnchantForProgress const& p)
+{
+    auto step = [](EnchantForStep s, char const* reason)
+    {
+        EnchantForStepVerdict v;
+        v.step = s;
+        v.reason = reason;
+        return v;
+    };
+    if (p.enchantApplied)
+        return step(EnchantForStep::Applied, "");
+    if (!p.enchanterHere || !p.targetHere)
+        return step(EnchantForStep::Failed,
+                    "a character left the world before the enchant landed");
+    if (!p.tradeOpen)
+        return step(EnchantForStep::Failed,
+                    p.acceptSent ? "the trade closed and the item carries no new enchant"
+                                 : "the trade window closed before the cast landed");
+    if (p.spellStored && !p.acceptSent)
+        return step(EnchantForStep::Accept, "");
+    if (p.pollsSpent >= p.pollLimit)
+        return step(EnchantForStep::Failed,
+                    p.acceptSent ? "the accept did not complete the trade in time"
+                                 : "the cast never reached the trade window in time");
+    return step(EnchantForStep::Wait, "");
+}
+
+std::string EnchantForProofLine(EnchantForProof const& proof)
+{
+    std::ostringstream out;
+    out << "overseer: enchant-for proof: enchanter='" << proof.enchanter << "' target='"
+        << proof.target << "' item=" << proof.itemEntry << " slot=" << proof.slot
+        << " enchant=" << proof.enchantId << " spell=" << proof.spell << " reagents=";
+    if (proof.reagents.empty())
+        out << "none";
+    for (std::size_t i = 0; i < proof.reagents.size(); ++i)
+        out << (i ? "," : "") << proof.reagents[i].first << "x" << proof.reagents[i].second;
+    return out.str();
 }
 
 }  // namespace OverseerDecisions

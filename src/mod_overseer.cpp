@@ -86,6 +86,15 @@
  *                     `verifying` until ResolveHearthChecks reads back where
  *                     the character actually is. See
  *                     2026_09_07_01_overseer_hearth.sql.
+ *       kind='trade' with a command beginning `enchant-for` - an enchanter puts an
+ *                     Enchanting recipe it already knows on a guild member's WORN
+ *                     item through the core's own trade window: the member's item
+ *                     goes in the will-not-be-traded slot, the enchanter casts the
+ *                     recipe at it, both accept, and the core takes the reagents from
+ *                     the enchanter's bags. The item never changes owner. Parks in
+ *                     `verifying` and ends `applied` only when the item's permanent
+ *                     enchant is read back, with a proof line in the log. Needs no
+ *                     migration; the build fact `enchant_for` says a world has it.
  *       kind='summon' - summon one absent party member to a dungeon's
  *                     summoning stone, across continents, through the game's
  *                     own mechanic: select, click the stone, click the portal
@@ -66132,6 +66141,9 @@ private:
         // single call can wait that out (#147).
         ResolveConjureChecks(sincePollMs);
 
+        // ...and the trade-window enchants, which wait on a cast and an accept.
+        ResolveEnchantForChecks(sincePollMs);
+
         // ...and the casts, which wait out one cast time each and then read
         // the world for the thing the spell was supposed to do (#408). After
         // the conjures for no deeper reason than that a poll should end the
@@ -66404,6 +66416,11 @@ private:
                 detail = DoProbe(player, command, status, rowResult);
             else if (kind == "give")
                 detail = DoGive(player, targetArg, command, status, rowResult);
+            else if (kind == "trade" && OverseerDecisions::IsEnchantForRow(command))
+                // AN ENCHANTER ENCHANTS A MEMBER'S WORN ITEM in a trade window.
+                // Routed on the first word of kind='trade', so no ENUM migration.
+                detail = DoEnchantFor(player, command, status, rowResult,
+                                      _pendingEnchantFors, id);
             else if (kind == "trade")
                 detail = DoTrade(player, targetArg, command, status, rowResult);
             else if (kind == "share")
@@ -77255,6 +77272,312 @@ private:
         }
 
         _pendingConjures.swap(stillRunning);
+    }
+
+    // ------------------------------------------------------- enchant-for --
+    //
+    // AN ENCHANTER ENCHANTS A GUILD MEMBER'S WORN ITEM through the core's own
+    // trade window (kind='trade', command `enchant-for target:<character guid>
+    // slot:<0-18> spell:<recipe id>`, target_name the enchanter).
+    //
+    // WHY THIS EXISTS. EnchantTargetFor only ever names the crafter's OWN
+    // items, so a guild's enchanters could spend their disenchanted dust on
+    // nobody else. The core already has the mechanism, and this drives it the
+    // way DoTrade drives the exchange: the member's item is put in the
+    // "will not be traded" slot (TradeData::SetItem, TRADE_SLOT_NONTRADED), the
+    // enchanter casts the recipe at that slot (SpellCastTargets::
+    // SetTradeItemTarget, Spell.cpp:376), the core stores the spell on the
+    // trade (Spell.cpp:3984) and runs it when the second side accepts
+    // (TradeHandler.cpp:623), taking the reagents from the enchanter's own bags
+    // (Spell.cpp:4055: an item not owned by the caster still costs its
+    // reagents). The slot is never moved by moveItems, so the item never
+    // changes owner.
+    //
+    // NOTHING IS GRANTED. The recipe must already be known (HasSpell), the
+    // reagents come out of the enchanter's bags through the core's own cast,
+    // and the enchant is the recipe's. A member of another guild, an offline
+    // one, one out of range, a dead one, an item the recipe does not fit, and
+    // an enchant that would replace a better one are all refused, each with a
+    // reason the row carries (OverseerDecisions::JudgeEnchantFor).
+    //
+    // THE CAST IS NOT INSTANT, so the row parks in `verifying` and
+    // ResolveEnchantForChecks reads the world: the cast reaching the trade
+    // (TradeData::GetSpell), both sides accepting, and then the item's
+    // permanent enchant read back. That read-back, not a call returning, is
+    // the only success, and the proof line is logged only then.
+    struct EnchantForCheck
+    {
+        uint32 id{0};
+        std::string enchanterName;
+        std::string targetName;
+        uint32 spell{0};
+        uint32 slot{0};
+        uint32 enchantId{0};
+        uint32 itemEntry{0};
+        ObjectGuid itemGuid;
+        uint32 pollsSpent{0};
+        bool acceptSent{false};
+        // reagent item entry -> what the enchanter held before the cast.
+        std::vector<std::pair<uint32, uint32>> reagentsBefore;
+    };
+
+    // World thread only, like the other parked checks; one per enchanter.
+    std::vector<EnchantForCheck> _pendingEnchantFors;
+
+    static std::string EnchantForJson(char const* outcome, char const* reason, char const* retry,
+                                      std::string const& enchanter, std::string const& member,
+                                      uint32 spell, uint32 slot, uint32 itemEntry,
+                                      uint32 enchantId, std::string const& request)
+    {
+        std::ostringstream o;
+        o << "{\"outcome\":" << J(outcome) << ",\"reason\":" << J(reason)
+          << ",\"retry\":" << J(retry) << ",\"enchanter\":" << J(enchanter)
+          << ",\"member\":" << J(member) << ",\"spell\":" << spell << ",\"slot\":" << slot
+          << ",\"item_entry\":" << itemEntry << ",\"enchant\":" << enchantId
+          << ",\"method\":\"trade-window\",\"request\":" << J(request) << "}";
+        return o.str();
+    }
+
+    static char const* DoEnchantFor(Player* enchanter, std::string const& command,
+                                    char const*& status, std::string& out,
+                                    std::vector<EnchantForCheck>& parked, uint32 id)
+    {
+        OverseerDecisions::EnchantForSpec const spec =
+            OverseerDecisions::ParseEnchantForSpec(command);
+        auto refuse = [&](char const* reason, char const* retry, std::string const& member,
+                          uint32 itemEntry, uint32 enchantId) -> char const*
+        {
+            out = EnchantForJson("refused", reason, retry, enchanter->GetName(), member,
+                                 spec.spell, spec.slot, itemEntry, enchantId, command);
+            LOG_INFO("module.overseer",
+                     "overseer: enchant-for refused for '{}' (member '{}', slot {}, spell {}): {} "
+                     "[retry {}]",
+                     enchanter->GetName(), member, spec.slot, spec.spell, reason, retry);
+            return reason;
+        };
+        if (!spec.valid)
+            return refuse("malformed enchant-for: want target:<guid> slot:<0-18> spell:<id>",
+                          "never", "", 0, 0);
+        for (EnchantForCheck const& running : parked)
+            if (running.enchanterName == enchanter->GetName())
+                return refuse("this enchanter already has an enchant-for running", "later", "",
+                              0, 0);
+
+        Player* member = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(spec.target));
+        std::string const memberName = member ? member->GetName() : std::string();
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(spec.spell);
+
+        OverseerDecisions::EnchantForFacts f;
+        f.sameCharacter = member == enchanter;
+        f.spellEnchantsItem = info && CraftEnchantsItem(info);
+        f.knowsSpell = info && enchanter->HasSpell(spec.spell);
+        f.hasEnchantingSkill = enchanter->HasSkill(SKILL_ENCHANTING);
+        f.targetOnline = member && member->IsInWorld() && member->GetSession();
+        Item* item = nullptr;
+        if (f.targetOnline && info)
+        {
+            f.sameGuild = enchanter->GetGuildId() != 0 &&
+                          enchanter->GetGuildId() == member->GetGuildId();
+            f.enchanterAlive = enchanter->IsAlive();
+            f.targetAlive = member->IsAlive();
+            f.anyInFlight = enchanter->IsInFlight() || member->IsInFlight();
+            f.anyStunned = enchanter->HasUnitState(UNIT_STATE_STUNNED) ||
+                           member->HasUnitState(UNIT_STATE_STUNNED);
+            f.anyLoggingOut = SessionIsLoggingOut(enchanter->GetSession()) ||
+                              SessionIsLoggingOut(member->GetSession());
+            f.anyAlreadyTrading = enchanter->GetTradeData() || member->GetTradeData();
+            f.anyInCombat = enchanter->IsInCombat() || member->IsInCombat();
+            f.enchanterMoving = enchanter->isMoving();
+            f.withinTradeRange = enchanter->IsWithinDistInMap(member, TRADE_DISTANCE, false);
+
+            f.reagentsInBags = true;
+            for (uint32 x = 0; x < MAX_SPELL_REAGENTS; ++x)
+                if (info->Reagent[x] > 0 &&
+                    !enchanter->HasItemCount(static_cast<uint32>(info->Reagent[x]),
+                                             static_cast<uint32>(info->ReagentCount[x])))
+                    f.reagentsInBags = false;
+
+            item = member->GetItemByPos(INVENTORY_SLOT_BAG_0, static_cast<uint8>(spec.slot));
+            f.itemFound = item != nullptr;
+            f.ownEnchant = EnchantOfSpell(info);
+            OverseerDecisions::EnchantRanks const& ranks = EnchantRankMap();
+            auto const own = ranks.find(f.ownEnchant);
+            f.ownRank = own != ranks.end() ? own->second : 0;
+            SkillLineAbilityMapBounds const bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spec.spell);
+            for (auto it = bounds.first; it != bounds.second; ++it)
+                if (it->second->SkillLine == SKILL_ENCHANTING)
+                    f.ownRank = it->second->MinSkillLineRank;
+            if (item)
+            {
+                ItemTemplate const* proto = item->GetTemplate();
+                f.itemFits = item->IsFitToSpellRequirements(info);
+                uint32 const requiredLevel =
+                    proto->RequiredLevel ? proto->RequiredLevel : proto->ItemLevel;
+                f.levelOk = info->HasAttribute(SPELL_ATTR2_ALLOW_LOW_LEVEL_BUFF) ||
+                            requiredLevel >= info->BaseLevel;
+                f.currentEnchant = item->GetEnchantmentId(PERM_ENCHANTMENT_SLOT);
+                auto const current = ranks.find(f.currentEnchant);
+                f.currentRankKnown = f.currentEnchant && current != ranks.end() && current->second;
+                f.currentRank = f.currentRankKnown ? current->second : 0;
+            }
+        }
+        OverseerDecisions::EnchantForVerdict const verdict = OverseerDecisions::JudgeEnchantFor(f);
+        uint32 const itemEntry = item ? item->GetEntry() : 0;
+        if (!verdict.go)
+            return refuse(verdict.reason, verdict.retry, memberName, itemEntry, f.ownEnchant);
+
+        // ---- open the window, place the item, cast at it ------------------
+        WorldSession* enchanterSession = enchanter->GetSession();
+        WorldSession* memberSession = member->GetSession();
+        WorldPacket initiate(CMSG_INITIATE_TRADE, 8);
+        initiate << member->GetGUID();
+        enchanterSession->HandleInitiateTradeOpcode(initiate);
+        if (!enchanter->GetTradeData() || !member->GetTradeData())
+        {
+            enchanter->TradeCancel(false);
+            return refuse("the core refused to open the trade window", "later", memberName,
+                          itemEntry, f.ownEnchant);
+        }
+        WorldPacket begin(CMSG_BEGIN_TRADE, 0);
+        memberSession->HandleBeginTradeOpcode(begin);
+
+        // The member's own item, in the slot the core never moves: the cast
+        // below reads it through the trade, and it stays the member's.
+        member->GetTradeData()->SetItem(TRADE_SLOT_NONTRADED, item);
+
+        SpellCastTargets targets;
+        targets.SetTradeItemTarget(enchanter);
+        // natural-only: a recipe the enchanter knows (HasSpell, checked above),
+        // cast untriggered so the core runs its own checks and takes the
+        // enchanter's own reagents when the trade completes; the item stays
+        // the member's and nothing is created or granted.
+        SpellCastResult const cast = enchanter->CastSpell(targets, info, nullptr, TRIGGERED_NONE);
+        if (cast != SPELL_CAST_OK)
+        {
+            enchanter->TradeCancel(true);
+            std::string const why =
+                "the core refused the cast (SpellCastResult " +
+                std::to_string(static_cast<uint32>(cast)) + ")";
+            out = EnchantForJson("refused", why.c_str(), "later", enchanter->GetName(),
+                                 memberName, spec.spell, spec.slot, itemEntry, f.ownEnchant,
+                                 command);
+            LOG_INFO("module.overseer",
+                     "overseer: enchant-for refused for '{}' (member '{}', slot {}, spell {}): {}",
+                     enchanter->GetName(), memberName, spec.slot, spec.spell, why);
+            return "the core refused the cast";
+        }
+
+        EnchantForCheck check;
+        check.id = id;
+        check.enchanterName = enchanter->GetName();
+        check.targetName = memberName;
+        check.spell = spec.spell;
+        check.slot = spec.slot;
+        check.enchantId = f.ownEnchant;
+        check.itemEntry = itemEntry;
+        check.itemGuid = item->GetGUID();
+        for (uint32 x = 0; x < MAX_SPELL_REAGENTS; ++x)
+            if (info->Reagent[x] > 0)
+                check.reagentsBefore.emplace_back(
+                    static_cast<uint32>(info->Reagent[x]),
+                    enchanter->GetItemCount(static_cast<uint32>(info->Reagent[x]), false));
+        parked.push_back(check);
+
+        LOG_INFO("module.overseer",
+                 "overseer: enchant-for '{}' casts spell {} (enchant {}) at '{}' slot {} (item {}); "
+                 "judging in {} polls",
+                 check.enchanterName, spec.spell, f.ownEnchant, memberName, spec.slot, itemEntry,
+                 OverseerDecisions::ENCHANT_FOR_POLLS);
+        status = "verifying";
+        out = EnchantForJson("casting", "", "", check.enchanterName, memberName, spec.spell,
+                             spec.slot, itemEntry, f.ownEnchant, command);
+        return "";
+    }
+
+    void ResolveEnchantForChecks(uint32 elapsedMs)
+    {
+        (void)elapsedMs;
+        std::vector<EnchantForCheck> stillRunning;
+        for (EnchantForCheck& check : _pendingEnchantFors)
+        {
+            ++check.pollsSpent;
+            Player* enchanter = ObjectAccessor::FindPlayerByName(check.enchanterName);
+            Player* member = ObjectAccessor::FindPlayerByName(check.targetName);
+            OverseerDecisions::EnchantForStepVerdict verdict;
+            bool finished = false;
+            for (int pass = 0; pass < 2 && !finished; ++pass)
+            {
+                Item* item = member ? member->GetItemByGuid(check.itemGuid) : nullptr;
+                TradeData* trade = enchanter ? enchanter->GetTradeData() : nullptr;
+                OverseerDecisions::EnchantForProgress p;
+                p.enchanterHere = enchanter != nullptr;
+                p.targetHere = member != nullptr;
+                p.tradeOpen = trade != nullptr;
+                p.spellStored = trade && trade->GetSpell() == check.spell;
+                p.acceptSent = check.acceptSent;
+                p.enchantApplied =
+                    item && item->GetEnchantmentId(PERM_ENCHANTMENT_SLOT) == check.enchantId;
+                p.pollsSpent = check.pollsSpent;
+                verdict = OverseerDecisions::NextEnchantForStep(p);
+                if (verdict.step == OverseerDecisions::EnchantForStep::Accept)
+                {
+                    // Enchanter first, then the member: the second accept is the
+                    // one the core completes the trade on.
+                    WorldPacket accept(CMSG_ACCEPT_TRADE, 0);
+                    enchanter->GetSession()->HandleAcceptTradeOpcode(accept);
+                    if (member->GetTradeData())
+                        member->GetSession()->HandleAcceptTradeOpcode(accept);
+                    check.acceptSent = true;
+                    continue;
+                }
+                finished = true;
+            }
+
+            if (verdict.step == OverseerDecisions::EnchantForStep::Wait ||
+                verdict.step == OverseerDecisions::EnchantForStep::Accept)
+            {
+                stillRunning.push_back(check);
+                continue;
+            }
+
+            if (verdict.step == OverseerDecisions::EnchantForStep::Applied)
+            {
+                OverseerDecisions::EnchantForProof proof;
+                proof.enchanter = check.enchanterName;
+                proof.target = check.targetName;
+                proof.itemEntry = check.itemEntry;
+                proof.slot = check.slot;
+                proof.enchantId = check.enchantId;
+                proof.spell = check.spell;
+                for (auto const& before : check.reagentsBefore)
+                {
+                    uint32 const now = enchanter ? enchanter->GetItemCount(before.first, false) : 0;
+                    proof.reagents.emplace_back(before.first,
+                                                before.second > now ? before.second - now : 0);
+                }
+                LOG_INFO("module.overseer", "{}", OverseerDecisions::EnchantForProofLine(proof));
+                if (enchanter && enchanter->GetTradeData())
+                    enchanter->TradeCancel(true);
+                WriteCommandRow(check.id, "applied", "",
+                                EnchantForJson("applied", "", "", check.enchanterName,
+                                               check.targetName, check.spell, check.slot,
+                                               check.itemEntry, check.enchantId, ""),
+                                "verifying", false);
+                continue;
+            }
+
+            if (enchanter && enchanter->GetTradeData())
+                enchanter->TradeCancel(true);
+            LOG_WARN("module.overseer",
+                     "overseer: enchant-for {} for '{}' on '{}' slot {} failed: {}", check.id,
+                     check.enchanterName, check.targetName, check.slot, verdict.reason);
+            WriteCommandRow(check.id, "error", verdict.reason,
+                            EnchantForJson("failed", verdict.reason, "later", check.enchanterName,
+                                           check.targetName, check.spell, check.slot,
+                                           check.itemEntry, check.enchantId, ""),
+                            "verifying", false);
+        }
+        _pendingEnchantFors.swap(stillRunning);
     }
 
     // -------------------------------------------------------------- hearth --
