@@ -66,6 +66,7 @@ run_decisions() {
   python3 -B tests/replay_buy_bag.py
   python3 -B tests/replay_run_family.py
   python3 -B tests/replay_life_tap_floor.py
+  python3 -B tests/replay_zone_fallback.py
   python3 -B tests/test_corridor_survey.py
 
   # CI and the lane contract both run this function, so the workflow's single

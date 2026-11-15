@@ -13970,7 +13970,43 @@ struct RoutePlanLimits
     bool fromZKnown{false};
     float fromZ{0.f};
     float maxEntryRiseYards{40.f};
+    // A WAY ROUND MAY NOT HAND THE WALK TO THE STEPPER ON ANOTHER FLOOR THAN
+    // THE AIM (#1557). The round rule above trades a way that arrives for one
+    // that stops short because the leftover is "not farther", and it measures
+    // the leftover in the plane. The ordered Molten Core raid's head took that
+    // trade at the door of the mountain: the leg to the door node ("Molten Core
+    // entrance", 5 yards from the aim) crosses guarded ground, so the guard-free
+    // search stopped on the node "Blackrock Spire exit", 189 yards from the aim
+    // and 105 above it, where no bearing is walkable and the errand was
+    // released as unreachable every five minutes. A handover node is passed
+    // over when it stands more than `maxHandoverRiseYards` above or below the
+    // aim AND the rise is steeper than `maxHandoverGradient` of the plane
+    // distance still to cover. The second test is what leaves a long hillside
+    // alone: 105 yards over 189 is a cliff face, the same rise over 480 is a
+    // slope the stepper walks. Unknown, nothing changes: a caller that does not
+    // set `aimZKnown` gets the plan this planner has always made.
+    bool aimZKnown{false};
+    float aimZ{0.f};
+    float maxHandoverRiseYards{40.f};
+    float maxHandoverGradient{0.25f};
+    // THE GUARDED-GROUND ROUND RULE IS OFF FOR THIS PLAN (#1557). Set by a
+    // caller whose last attempt at this errand ended on another level than the
+    // aim after taking a way round, so the next attempt is not the same walk
+    // again. The plan is then the search that may cross guarded legs.
+    bool allowRound{true};
 };
+
+// A walk that ends an attempt more than this far ABOVE its aim stands on a
+// level the aim cannot be walked to from (#1557: the Blackrock Spire ledge, 105
+// yards over the Molten Core door). The same walk repeated ends there again.
+constexpr float WRONG_LEVEL_YARDS = 50.f;
+
+// True when the character stands more than WRONG_LEVEL_YARDS above the aim.
+bool EndedAboveTheAim(float stoodZ, float aimZ);
+
+// The planned node ids as one line fragment, "3380 1485", at most `cap` of
+// them, with "... and N more" after a cut list. Empty for an empty plan.
+std::string RouteNodeList(std::vector<std::uint32_t> const& nodes, std::size_t cap);
 
 // THE SENTENCE THE ROUTE LINE ENDS WITH (#925): the entry node, how far it
 // stands above or below the character, and how many surveyed nodes in reach
@@ -18410,6 +18446,51 @@ constexpr char const* Dead         = "character is dead";
 // yet, money, death). Malformed, not a weapon and already held never will.
 bool WeaponTrainRefusalRetryable(std::string const& reason);
 
+// A guild seat gives up one of the three slot-consuming gathering trades so
+// the bridge can send its next craft-training command. This remains a verb of
+// kind='cast'; it does not add an overseer_command kind or schema migration.
+//
+//   unlearn-skill skill:<id> max:<ceiling>
+//
+// The ceiling is explicit and bounded because the bridge only authorizes low
+// skill values. Only Herbalism (182), Mining (186) and Skinning (393) qualify.
+constexpr char const* UNLEARN_SKILL_VERB = "unlearn-skill";
+constexpr uint32_t UNLEARN_SKILL_MAX_CEILING = 75;
+
+struct UnlearnSkillRequest
+{
+    uint32_t skill{0};
+    uint32_t max{0};
+    char const* error{""};
+};
+
+namespace UnlearnSkillRefusal
+{
+constexpr char const* Malformed =
+    "malformed unlearn-skill command: want unlearn-skill skill:<id> max:<ceiling>";
+constexpr char const* NotNaturalGuild = "character is not in a configured natural guild";
+constexpr char const* RosterCharacter = "roster characters cannot use command unlearn";
+constexpr char const* NotGathering = "only Herbalism, Mining and Skinning may be unlearned";
+constexpr char const* AboveCeiling = "live skill value exceeds the command max ceiling";
+constexpr char const* StillHeld = "character still has the skill after SetSkill";
+}  // namespace UnlearnSkillRefusal
+
+bool IsUnlearnSkillRow(std::string const& command);
+UnlearnSkillRequest ParseUnlearnSkillRequest(std::string const& command);
+
+enum class UnlearnSkillAction
+{
+    NotNaturalGuild,
+    RosterCharacter,
+    NotGathering,
+    AlreadyAbsent,
+    AboveCeiling,
+    ReadyToUnlearn
+};
+
+UnlearnSkillAction DecideUnlearnSkill(bool inNaturalGuild, bool onRoster, uint32_t skill,
+                                      bool hasSkill, uint32_t liveValue, uint32_t max);
+
 // THE FOUR THINGS A LEARN ROW CAN HONESTLY CLAIM. Shorter than CastOutcome's
 // list because the post-condition here is exact: Player::HasSpell is the
 // worldserver's own answer to the only question that matters, and it is
@@ -20374,6 +20455,17 @@ enum class GuildVerb : std::uint8_t
     // verb that could do that as a side effect of being asked a question is a
     // verb somebody will one day ask a question with.
     RaidForm,
+    // `promote rank:<id>` - set the rank of the member named in the row's
+    // `target_arg` to rank id `<id>`, the way an officer's promote does and
+    // through the core's own Guild::ChangeMemberRank. Only UP: never to or
+    // from rank 0 (the guild master), never a demotion, never a rank the
+    // guild does not have. See GuildPromoteVerdictFor for the gates.
+    Promote,
+    // `motd <text>` - set the guild's message of the day through the core's
+    // own Guild::HandleSetMOTD, so the rank right is the core's to enforce.
+    // The text is cleaned by GuildMotdClean (control characters stripped, cut
+    // to the client's 128 bytes). `target_arg` is not read.
+    Motd,
 };
 
 struct GuildRequest
@@ -20390,6 +20482,12 @@ struct GuildRequest
     std::uint32_t depositCopper{0};
     // BankGrantDeposit only: the rank receiving deposit rights.
     std::uint8_t bankRankId{0};
+    // Promote only: the rank id to set. Zero is parsed, and then refused by
+    // GuildPromoteVerdictFor, so that the refusal is the verdict's and not a
+    // second copy of the rule in the grammar.
+    unsigned promoteRank{0};
+    // Motd only: the text, already cleaned by GuildMotdClean and never empty.
+    std::string motd;
     // BankDepositItem and BankWithdrawItem: which item. For a withdraw it is
     // always a guid (`itemByGuid` true), the stack in the tab. For a deposit,
     // which carried item, in the same `guid:`/`entry:`
@@ -20469,7 +20567,9 @@ constexpr unsigned GUILD_NAME_MAX = 24;
 // quote character - the rule every executor in this file keeps.
 namespace GuildRefusal
 {
-constexpr char const* NoVerb = "a guild row must begin with form, view, shortlist, invite, remove, tabard, bank or raid";
+constexpr char const* NoVerb = "a guild row must begin with form, view, shortlist, invite, remove, promote, motd, tabard, bank or raid";
+constexpr char const* PromoteInvalid = "promote takes rank:N and nothing else, with the member in target_arg";
+constexpr char const* MotdInvalid = "motd takes the message text, which is empty once control characters are removed";
 constexpr char const* RaidTakesFormOrNothing = "raid takes nothing, or the single word form";
 constexpr char const* BankNeedsDeposit = "bank takes `deposit <copper>`, `withdraw <copper>`, `deposit-item <guid:N|entry:N> [tab:N]`, `withdraw-item guid:N [tab:N]`, `buy-tab [tab:N]`, `name-tab tab:N icon:<icon> <name>` or `grant-deposit rank:N`";
 constexpr char const* BankBuyTabTrailing = "bank buy-tab takes tab:N or nothing";
@@ -20492,6 +20592,78 @@ constexpr char const* CountIsZero = "a shortlist of nothing is not a question";
 }  // namespace GuildRefusal
 
 GuildRequest ParseGuildRequest(std::string const& command);
+
+// The most a guild's message of the day may be: the 3.3.5 client's own edit
+// box stops at 128 characters, and a longer one is cut by it on display.
+constexpr std::size_t GUILD_MOTD_MAX = 128;
+
+// A MOTD as the core should be handed it: every control character (below
+// 0x20 and 0x7f) removed, the ends trimmed of spaces, and the whole cut to
+// GUILD_MOTD_MAX bytes without splitting a UTF-8 sequence. Idempotent, so a
+// comparison against the guild's current MOTD is a comparison of two cleaned
+// strings.
+std::string GuildMotdClean(std::string const& text);
+
+// What the acting character's guild is, and who is being moved, as the
+// promote executor reads them before it asks the core. Rank ids: 0 is the
+// guild master and a larger id is a lower rung.
+struct GuildPromoteFacts
+{
+    // The acting character's guild is one this module manages
+    // (Overseer.Natural.Guilds or Overseer.Retire.KeepGuilds).
+    bool managedGuild{false};
+    bool named{false};        // target_arg was not empty
+    bool exists{false};       // a character of that name exists
+    bool inThisGuild{false};  // and is in the acting character's guild
+    // The acting character's rank carries GR_RIGHT_PROMOTE.
+    bool actorMayPromote{false};
+    unsigned actorRank{0};
+    unsigned targetRank{0};
+    unsigned requestedRank{0};
+    unsigned rankCount{0};    // how many ranks the guild has
+};
+
+enum class GuildPromoteVerdict : std::uint8_t
+{
+    Apply,
+    // Already on the requested rung: the row has nothing left to do, and is
+    // reported as applied without a change.
+    AlreadyThere,
+    NotManaged,
+    NoTarget,
+    NoSuchCharacter,
+    NotInThisGuild,
+    RankIsMaster,
+    NoSuchRank,
+    TargetIsMaster,
+    WouldDemote,
+    NoRight,
+    NotBelowActor,
+};
+
+char const* GuildPromoteVerdictSaid(GuildPromoteVerdict verdict);
+
+// Apply means the core should be asked, and the adapter reads the member's
+// rank back afterwards. The gates are asked in the order of the enum above.
+GuildPromoteVerdict GuildPromoteVerdictFor(GuildPromoteFacts const& facts);
+
+struct GuildMotdFacts
+{
+    bool managedGuild{false};
+    bool actorMayEdit{false};  // GR_RIGHT_SETMOTD
+    bool unchanged{false};     // the cleaned text equals the guild's MOTD
+};
+
+enum class GuildMotdVerdict : std::uint8_t
+{
+    Apply,
+    AlreadySet,
+    NotManaged,
+    NoRight,
+};
+
+char const* GuildMotdVerdictSaid(GuildMotdVerdict verdict);
+GuildMotdVerdict GuildMotdVerdictFor(GuildMotdFacts const& facts);
 
 // -- taking a stack out of a guild bank tab ---------------------------------
 //
@@ -28699,7 +28871,14 @@ struct LeaveGroupFacts
     bool isBot{false};         // the character has a bot AI; a person is never moved
     bool inGroup{false};
     bool leadsGroup{false};
-    bool battleground{false};  // a battleground, battlefield or dungeon finder group
+    bool battleground{false};  // a battleground or battlefield group
+    // A dungeon finder group. Only one the finder still serves is a wall
+    // (FinderGroupStillServes); a leftover of a finished run is left like any
+    // other group. Seen live: three guild raid seats held as followers of
+    // leftover finder groups for days, every leave refused.
+    bool finderGroup{false};
+    FinderState finderState{FinderState::None};
+    bool finderMemberInInstance{false};
     bool inInstance{false};
     bool inCombat{false};
 };

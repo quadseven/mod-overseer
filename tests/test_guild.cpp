@@ -41,6 +41,12 @@ using OverseerDecisions::GuildNeeds;
 using OverseerDecisions::GuildNeedsFrom;
 using OverseerDecisions::GuildProfessionGaps;
 using OverseerDecisions::GuildProfessionView;
+using OverseerDecisions::GUILD_MOTD_MAX;
+using OverseerDecisions::GuildMotdClean;
+using OverseerDecisions::GuildMotdFacts;
+using OverseerDecisions::GuildMotdVerdictFor;
+using OverseerDecisions::GuildPromoteFacts;
+using OverseerDecisions::GuildPromoteVerdictFor;
 using OverseerDecisions::GuildRemoveFacts;
 using OverseerDecisions::GuildRemoveRefusal;
 using OverseerDecisions::GuildRemoveRefusalSaid;
@@ -1511,12 +1517,168 @@ void ABadRowIsRefusedByNameAndNeverSilently()
                                     TabardNeedsFive,
                                     TabardNotANumber,
                                     TabardValueTooBig,
-                                    RaidTakesFormOrNothing};
+                                    RaidTakesFormOrNothing,
+                                    PromoteInvalid,
+                                    MotdInvalid};
     bool clean = true;
     for (std::size_t i = 0; i < sizeof(literals) / sizeof(literals[0]); ++i)
         for (char const* c = literals[i]; *c; ++c)
             clean = clean && *c != 0x27 && *c != 0x22 && *c != 0x5c;
     Check("no refusal literal carries a quote", clean);
+}
+
+GuildPromoteFacts Promotable()
+{
+    GuildPromoteFacts facts;
+    facts.managedGuild = true;
+    facts.named = true;
+    facts.exists = true;
+    facts.inThisGuild = true;
+    facts.actorMayPromote = true;
+    facts.actorRank = GUILD_RANK_MASTER;
+    facts.targetRank = OverseerDecisions::GUILD_RANK_INITIATE;
+    facts.requestedRank = OverseerDecisions::GUILD_RANK_MEMBER;
+    facts.rankCount = 5;
+    return facts;
+}
+
+void PromoteAndMotdParse()
+{
+    using namespace OverseerDecisions::GuildRefusal;
+
+    GuildRequest const promote = ParseGuildRequest("promote rank:3");
+    Check("promote parses", promote.verb == GuildVerb::Promote);
+    CheckUnsigned("promote carries the rank", promote.promoteRank, 3);
+    CheckString("promote is accepted", promote.error, "");
+    Check("promote is case-blind on the verb", ParseGuildRequest("PROMOTE rank:2").verb == GuildVerb::Promote);
+    Check("rank 0 still parses (the verdict refuses it)", ParseGuildRequest("promote rank:0").verb == GuildVerb::Promote);
+    CheckString("promote needs the rank word", ParseGuildRequest("promote").error, PromoteInvalid);
+    CheckString("promote needs rank: syntax", ParseGuildRequest("promote 3").error, PromoteInvalid);
+    CheckString("promote refuses a name for a rank", ParseGuildRequest("promote rank:officer").error, PromoteInvalid);
+    CheckString("promote refuses a second word", ParseGuildRequest("promote rank:3 rank:2").error, PromoteInvalid);
+    CheckString("promote refuses an empty number", ParseGuildRequest("promote rank:").error, PromoteInvalid);
+    CheckString("promote refuses a number that would wrap",
+                ParseGuildRequest("promote rank:99999999999999999999").error, PromoteInvalid);
+
+    GuildRequest const motd = ParseGuildRequest("motd Cave goal: clear Deadmines (3x)");
+    Check("motd parses", motd.verb == GuildVerb::Motd);
+    CheckString("motd carries the text", motd.motd, "Cave goal: clear Deadmines (3x)");
+    CheckString("motd with nothing is refused", ParseGuildRequest("motd").error, MotdInvalid);
+    CheckString("motd of only control characters is refused",
+                ParseGuildRequest(std::string("motd \x01\x02\x1b")).error, MotdInvalid);
+}
+
+void AMotdIsCleanedAndCapped()
+{
+    CheckString("control characters are stripped",
+                GuildMotdClean(std::string("a\tb\nc\x01") + "d\x7f" + "e"), "abcde");
+    CheckString("the ends are trimmed", GuildMotdClean("  hello  "), "hello");
+    CheckString("a short text is untouched", GuildMotdClean("Raid Friday"), "Raid Friday");
+
+    std::string const exact(GUILD_MOTD_MAX, 'x');
+    CheckString("exactly the client limit is kept whole", GuildMotdClean(exact), exact);
+    CheckUnsigned("one over is cut to the limit", unsigned(GuildMotdClean(exact + "y").size()),
+                  unsigned(GUILD_MOTD_MAX));
+
+    // A two byte character straddling the cut is dropped whole.
+    std::string const straddle = std::string(GUILD_MOTD_MAX - 1, 'x') + "\xC3\xA9" + "tail";
+    std::string const cut = GuildMotdClean(straddle);
+    CheckString("a multi-byte character is not split", cut, std::string(GUILD_MOTD_MAX - 1, 'x'));
+
+    CheckString("cleaning is idempotent", GuildMotdClean(GuildMotdClean(exact + "y")),
+                GuildMotdClean(exact + "y"));
+    CheckUnsigned("a long parsed row is capped too",
+                  unsigned(ParseGuildRequest("motd " + exact + exact).motd.size()),
+                  unsigned(GUILD_MOTD_MAX));
+}
+
+void APromoteGoesToTheCoreOnlyWhenEveryGatePasses()
+{
+    using V = OverseerDecisions::GuildPromoteVerdict;
+    Check("a member is promoted", GuildPromoteVerdictFor(Promotable()) == V::Apply);
+
+    GuildPromoteFacts unmanaged = Promotable();
+    unmanaged.managedGuild = false;
+    Check("a guild the module does not manage is refused",
+          GuildPromoteVerdictFor(unmanaged) == V::NotManaged);
+
+    GuildPromoteFacts unnamed = Promotable();
+    unnamed.named = false;
+    Check("no name is refused", GuildPromoteVerdictFor(unnamed) == V::NoTarget);
+
+    GuildPromoteFacts ghost = Promotable();
+    ghost.exists = false;
+    Check("an unknown name is refused", GuildPromoteVerdictFor(ghost) == V::NoSuchCharacter);
+
+    GuildPromoteFacts elsewhere = Promotable();
+    elsewhere.inThisGuild = false;
+    Check("a member of another guild is refused", GuildPromoteVerdictFor(elsewhere) == V::NotInThisGuild);
+
+    GuildPromoteFacts toMaster = Promotable();
+    toMaster.requestedRank = GUILD_RANK_MASTER;
+    Check("rank 0 is never given", GuildPromoteVerdictFor(toMaster) == V::RankIsMaster);
+
+    GuildPromoteFacts missing = Promotable();
+    missing.requestedRank = 5;
+    Check("a rank the guild does not have is refused", GuildPromoteVerdictFor(missing) == V::NoSuchRank);
+    missing.requestedRank = 200;
+    Check("and one far beyond it", GuildPromoteVerdictFor(missing) == V::NoSuchRank);
+
+    GuildPromoteFacts master = Promotable();
+    master.targetRank = GUILD_RANK_MASTER;
+    master.requestedRank = OverseerDecisions::GUILD_RANK_OFFICER;
+    Check("the guild master is never moved", GuildPromoteVerdictFor(master) == V::TargetIsMaster);
+
+    GuildPromoteFacts demote = Promotable();
+    demote.targetRank = OverseerDecisions::GUILD_RANK_VETERAN;
+    demote.requestedRank = OverseerDecisions::GUILD_RANK_MEMBER;
+    Check("a demotion is refused", GuildPromoteVerdictFor(demote) == V::WouldDemote);
+
+    GuildPromoteFacts same = Promotable();
+    same.targetRank = OverseerDecisions::GUILD_RANK_MEMBER;
+    same.requestedRank = OverseerDecisions::GUILD_RANK_MEMBER;
+    Check("already on that rank is the idempotent answer", GuildPromoteVerdictFor(same) == V::AlreadyThere);
+    same.actorMayPromote = false;
+    Check("and is said even to an actor without the right", GuildPromoteVerdictFor(same) == V::AlreadyThere);
+
+    GuildPromoteFacts noRight = Promotable();
+    noRight.actorMayPromote = false;
+    Check("an actor without the promote right is refused", GuildPromoteVerdictFor(noRight) == V::NoRight);
+
+    GuildPromoteFacts officer = Promotable();
+    officer.actorRank = OverseerDecisions::GUILD_RANK_OFFICER;
+    officer.requestedRank = OverseerDecisions::GUILD_RANK_OFFICER;
+    officer.targetRank = OverseerDecisions::GUILD_RANK_MEMBER;
+    Check("an officer cannot promote to their own rung", GuildPromoteVerdictFor(officer) == V::NotBelowActor);
+    officer.requestedRank = OverseerDecisions::GUILD_RANK_VETERAN;
+    Check("but can promote below it", GuildPromoteVerdictFor(officer) == V::Apply);
+
+    bool clean = true;
+    for (unsigned i = 0; i <= unsigned(V::NotBelowActor); ++i)
+        for (char const* c = OverseerDecisions::GuildPromoteVerdictSaid(V(i)); *c; ++c)
+            clean = clean && *c != 0x27 && *c != 0x22 && *c != 0x5c;
+    Check("no promote refusal carries a quote", clean);
+    Check("every refusal says something",
+          std::string(OverseerDecisions::GuildPromoteVerdictSaid(V::WouldDemote)) != "");
+}
+
+void AMotdGoesToTheCoreOnlyWhenEveryGatePasses()
+{
+    using V = OverseerDecisions::GuildMotdVerdict;
+    GuildMotdFacts facts;
+    facts.managedGuild = true;
+    facts.actorMayEdit = true;
+    Check("a changed MOTD is applied", GuildMotdVerdictFor(facts) == V::Apply);
+    facts.unchanged = true;
+    Check("the same MOTD is already set", GuildMotdVerdictFor(facts) == V::AlreadySet);
+    facts.actorMayEdit = false;
+    Check("and is said without needing the right", GuildMotdVerdictFor(facts) == V::AlreadySet);
+    facts.unchanged = false;
+    Check("an actor without the right is refused", GuildMotdVerdictFor(facts) == V::NoRight);
+    facts.managedGuild = false;
+    Check("an unmanaged guild is refused first", GuildMotdVerdictFor(facts) == V::NotManaged);
+    Check("a refusal has words",
+          std::string(OverseerDecisions::GuildMotdVerdictSaid(V::NoRight)) != "");
 }
 
 }  // namespace
@@ -1556,6 +1718,10 @@ int main()
     ABadRowIsRefusedByNameAndNeverSilently();
     ARemoveGoesToTheCoreOnlyWhenEveryGatePasses();
     TheRemoveGatesAreAskedInOrder();
+    PromoteAndMotdParse();
+    AMotdIsCleanedAndCapped();
+    APromoteGoesToTheCoreOnlyWhenEveryGatePasses();
+    AMotdGoesToTheCoreOnlyWhenEveryGatePasses();
 
     if (failures)
     {

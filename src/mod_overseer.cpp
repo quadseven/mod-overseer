@@ -24625,6 +24625,11 @@ private:
         // Tower roof 119 yards above him because only x and y were asked.
         limits.fromZKnown = true;
         limits.fromZ = bot->GetPositionZ();
+        // AND A WAY ROUND DOES NOT HAND THE WALK OVER ON ANOTHER FLOOR THAN THE
+        // AIM'S (#1557): see RoutePlanLimits::aimZKnown. The Molten Core door's
+        // head stopped on the Spire ledge 105 yards above it.
+        limits.aimZKnown = true;
+        limits.aimZ = aimZ;
         OverseerDecisions::RoutePlan plan;
         unsigned refusedEntries = 0;
         uint32 walkableEntry = 0;
@@ -24852,6 +24857,14 @@ private:
                  static_cast<uint32>(route.size()), plan.endsFromAimYards,
                  OverseerDecisions::RouteEntryNote(plan.nodes.front(), plan.entryHeightGapYards,
                                                    plan.sameFloorNodesInReach));
+        // THE PLANNED NODES, NAMED ONCE PER PLAN (#1557), so a walk that ends
+        // short of its aim can be read against the survey: the last id is where
+        // the route hands over, and the log said only how far from the aim.
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is sent to '{}' and its planned survey nodes are {} "
+                 "(the last is {:.0f} yards from the aim{})",
+                 name, target, OverseerDecisions::RouteNodeList(plan.nodes, 64),
+                 plan.endsFromAimYards, plan.wentRound ? ", chosen as a way round" : "");
         // AND SAID SEPARATELY WHEN THAT ROUTE IS ONLY THE FIRST HALF (#356), for
         // the same reason the guarded note below is separate: the line above has
         // meant one thing since #316 and an operator reading it for a death must
@@ -31276,6 +31289,20 @@ private:
                              "overseer: '{}' was sent to '{}' and has been refused every "
                              "bearing for {} polls running without getting any nearer - releasing the errand as unreachable",
                              name, target, refusal.consecutive);
+                    // AND SAID PLAINLY WHEN IT STANDS ON ANOTHER LEVEL THAN THE AIM
+                    // (#1557): the planned walk ended on a ledge the aim cannot be
+                    // reached from.
+                    if (OverseerDecisions::EndedAboveTheAim(bot->GetPositionZ(),
+                                                            pos.GetPositionZ()))
+                    {
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' ended its attempt at '{}' {:.0f} yards ABOVE "
+                                 "the aim (z {:.0f} against {:.0f}), {} yards across, on a "
+                                 "level the aim cannot be walked to from (#1557)",
+                                 name, target, bot->GetPositionZ() - pos.GetPositionZ(),
+                                 bot->GetPositionZ(), pos.GetPositionZ(),
+                                 static_cast<uint32>(distance));
+                    }
                     _travelAims.Release(name, OverseerDecisions::TravelGroundGiveUpReleaseReason);
                     // A stranded member whose walk to its berth gives up here
                     // may hearth out of it instead (DecideStrandedWay, rule 6b).
@@ -46545,8 +46572,26 @@ private:
         facts.isBot = ai != nullptr;
         facts.inGroup = group != nullptr;
         facts.leadsGroup = group && group->IsLeader(who->GetGUID());
-        facts.battleground =
-            group && (group->isBGGroup() || group->isBFGroup() || group->isLFGGroup());
+        facts.battleground = group && (group->isBGGroup() || group->isBFGroup());
+        if (group && group->isLFGGroup())
+        {
+            // A finder group the finder no longer serves is a leftover of a
+            // finished run and does not hold its members (the same reading
+            // DisbandLeftoverFinderGroups takes). A member between maps counts
+            // as inside: the finder's teleport in has every member out of the
+            // world at once, in state Dungeon.
+            facts.finderGroup = true;
+            facts.finderState = FinderStateOf(sLFGMgr->GetState(group->GetGUID()));
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+            {
+                Player* member = ref->GetSource();
+                if (!member)
+                    continue;
+                if (!member->IsInWorld() || member->IsBeingTeleported() ||
+                    (member->GetMap() && member->GetMap()->IsDungeon()))
+                    facts.finderMemberInInstance = true;
+            }
+        }
         facts.inInstance = who->GetMap() && who->GetMap()->Instanceable();
         facts.inCombat = who->IsInCombat();
         std::string const leaderName = group ? std::string(group->GetLeaderName()) : "";
@@ -66175,6 +66220,10 @@ private:
                 // grammars cannot collide.
                 detail = DoWalk(player, command, OverseerDecisions::WalkGoal::Trainer, status,
                                 rowResult, _pendingMailWalks, id);
+            else if (kind == "cast" && OverseerDecisions::IsUnlearnSkillRow(command))
+                // A guild seat gives up one gathering trade before the bridge
+                // sends its walk to the trainer for the replacement craft.
+                detail = DoUnlearnSkill(player, command, status, rowResult);
             else if (kind == "cast" && OverseerDecisions::IsWeaponTrainRow(command))
                 // A WEAPON SKILL BOUGHT AT A WEAPON MASTER (wow-overseer#399), on
                 // kind='cast' and routed on the first word like `use`.
@@ -74151,6 +74200,143 @@ private:
             return "";
         }
 
+        // THE TWO VERBS BELOW ARE A GUILD OFFICER'S PROMOTE AND MOTD (#2616), and
+        // they act only on a guild this module manages: one named in
+        // Overseer.Natural.Guilds or Overseer.Retire.KeepGuilds. A row aimed at
+        // any other guild is refused whoever sent it, because the acting
+        // character's rank in somebody else's guild is not this module's to use.
+        if (request.verb == GuildVerb::Promote || request.verb == GuildVerb::Motd)
+        {
+            bool managed = false;
+            for (std::vector<std::string> const& names : {NaturalGuilds(), RetireKeepGuilds()})
+                managed = managed || std::find(names.begin(), names.end(), guild->GetName()) != names.end();
+
+            if (request.verb == GuildVerb::Promote)
+            {
+                // ChangeMemberRank, not HandleUpdateMemberRank: the core's own
+                // promote moves ONE rung per call and answers a refusal with a
+                // packet a bot cannot read, while ChangeMemberRank sets the rung
+                // and returns a bool. It checks nothing about the actor, so
+                // every rule a promoter obeys is asked here first (the verdict
+                // is pinned in tests/test_guild.cpp) and the rank is read back.
+                using OverseerDecisions::GuildPromoteFacts;
+                using OverseerDecisions::GuildPromoteVerdict;
+
+                GuildPromoteFacts facts;
+                facts.managedGuild = managed;
+                facts.named = !targetArg.empty();
+                ObjectGuid const targetGuid =
+                    facts.named ? sCharacterCache->GetCharacterGuidByName(targetArg) : ObjectGuid::Empty;
+                facts.exists = !targetGuid.IsEmpty();
+                Guild::Member const* target = facts.exists ? guild->GetMember(targetGuid) : nullptr;
+                facts.inThisGuild = target != nullptr;
+                facts.actorMayPromote = guild->HasRankRight(who, GR_RIGHT_PROMOTE);
+                if (Guild::Member const* me = guild->GetMember(who->GetGUID()))
+                    facts.actorRank = me->GetRankId();
+                if (target)
+                    facts.targetRank = target->GetRankId();
+                facts.requestedRank = request.promoteRank;
+                facts.rankCount = static_cast<unsigned>((guild->*GuildBankMemory::Ranks()).size());
+
+                std::string const targetName = target ? target->GetName() : targetArg;
+                {
+                    std::ostringstream o;
+                    o << "\"guild\":" << J(guild->GetName())
+                      << ",\"guild_id\":" << guild->GetId()
+                      << ",\"target\":" << J(targetName)
+                      << ",\"rank_before\":" << facts.targetRank
+                      << ",\"rank_wanted\":" << facts.requestedRank;
+                    note = o.str();
+                }
+
+                GuildPromoteVerdict const verdict = OverseerDecisions::GuildPromoteVerdictFor(facts);
+                if (verdict == GuildPromoteVerdict::AlreadyThere)
+                {
+                    LOG_INFO("module.overseer", "overseer: '{}' is already rank {} in guild '{}'",
+                             targetName, facts.requestedRank, guild->GetName());
+                    describe("already", "");
+                    status = "applied";
+                    return "";
+                }
+                if (verdict != GuildPromoteVerdict::Apply)
+                {
+                    char const* const said = OverseerDecisions::GuildPromoteVerdictSaid(verdict);
+                    LOG_INFO("module.overseer", "overseer: promote of '{}' in guild '{}' refused - {}",
+                             targetName, guild->GetName(), said);
+                    describe("refused", said);
+                    status = "unchanged";
+                    return said;
+                }
+
+                uint32 const guildId = guild->GetId();
+                if (!guild->ChangeMemberRank(targetGuid, uint8(facts.requestedRank)))
+                    return refuse("the core refused to change that rank");
+                Guild* after = sGuildMgr->GetGuildById(guildId);
+                Guild::Member const* moved = after ? after->GetMember(targetGuid) : nullptr;
+                if (!moved || moved->GetRankId() != facts.requestedRank)
+                    return refuse("the rank was not changed when it was read back");
+
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' moved '{}' from rank {} to rank {} in guild '{}' ({})",
+                         who->GetName(), targetName, facts.targetRank, facts.requestedRank,
+                         after->GetName(), guildId);
+                describe("promoted", "");
+                status = "applied";
+                return "";
+            }
+
+            // GuildVerb::Motd. HandleSetMOTD checks the right itself and
+            // returns without a word on a refusal, so the verdict asks first
+            // and the guild's own text, read back, is the witness.
+            using OverseerDecisions::GuildMotdFacts;
+            using OverseerDecisions::GuildMotdVerdict;
+
+            WorldSession* session = who->GetSession();
+            if (!session)
+                return refuse("that character has no session to set a guild message through");
+
+            GuildMotdFacts facts;
+            facts.managedGuild = managed;
+            facts.actorMayEdit = guild->HasRankRight(who, GR_RIGHT_SETMOTD);
+            facts.unchanged = guild->GetMOTD() == request.motd;
+            {
+                std::ostringstream o;
+                o << "\"guild\":" << J(guild->GetName())
+                  << ",\"guild_id\":" << guild->GetId()
+                  << ",\"motd\":" << J(request.motd);
+                note = o.str();
+            }
+
+            GuildMotdVerdict const verdict = OverseerDecisions::GuildMotdVerdictFor(facts);
+            if (verdict == GuildMotdVerdict::AlreadySet)
+            {
+                LOG_INFO("module.overseer", "overseer: guild '{}' already has that message of the day",
+                         guild->GetName());
+                describe("already", "");
+                status = "applied";
+                return "";
+            }
+            if (verdict != GuildMotdVerdict::Apply)
+            {
+                char const* const said = OverseerDecisions::GuildMotdVerdictSaid(verdict);
+                LOG_INFO("module.overseer", "overseer: message of the day for guild '{}' refused - {}",
+                         guild->GetName(), said);
+                describe("refused", said);
+                status = "unchanged";
+                return said;
+            }
+
+            guild->HandleSetMOTD(session, request.motd);
+            if (guild->GetMOTD() != request.motd)
+                return refuse("the core did not set the message of the day");
+
+            LOG_INFO("module.overseer", "overseer: {} set the message of the day of guild '{}'",
+                     who->GetName(), guild->GetName());
+            describe("set", "");
+            status = "applied";
+            return "";
+        }
+
         if (request.verb == GuildVerb::Tabard)
         {
             // BEFORE THE ROSTER READ, on purpose: a tabard is five numbers and
@@ -79762,6 +79948,98 @@ private:
             }
         }
         return refuse(R::NoTrainer);
+    }
+
+    static char const* DoUnlearnSkill(Player* who, std::string const& command,
+                                      char const*& status, std::string& out)
+    {
+        using OverseerDecisions::UnlearnSkillAction;
+        using OverseerDecisions::UnlearnSkillRequest;
+        using OverseerDecisions::DecideUnlearnSkill;
+        using OverseerDecisions::ParseUnlearnSkillRequest;
+        namespace R = OverseerDecisions::UnlearnSkillRefusal;
+
+        if (!who)
+            return "no character";
+
+        UnlearnSkillRequest const request = ParseUnlearnSkillRequest(command);
+        uint32 const liveValue = request.skill ? who->GetPureSkillValue(request.skill) : 0;
+        char const* const skillName = request.skill ? SkillName(request.skill) : "unlearn-skill";
+        auto finish = [&](char const* outcome, char const* reason) -> char const*
+        {
+            std::ostringstream result;
+            result << "{\"outcome\":" << J(outcome)
+                   << ",\"reason\":" << J(reason ? reason : "")
+                   << ",\"who\":" << J(who->GetName())
+                   << ",\"skill\":" << request.skill
+                   << ",\"skill_name\":" << J(skillName)
+                   << ",\"live_value\":" << liveValue
+                   << ",\"max\":" << request.max
+                   << ",\"request\":" << J(command) << "}";
+            out = result.str();
+
+            std::ostringstream event;
+            event << outcome << "; skill value " << liveValue << ", max " << request.max;
+            if (reason && reason[0])
+                event << ": " << reason;
+            std::string const eventDetail = event.str();
+            bool const refused = std::string(outcome) == "refused";
+            char const* const eventKind = refused ? "unlearn_refused" : "unlearn";
+            if (refused)
+                LOG_WARN("module.overseer",
+                         "overseer: unlearn-skill row for '{}' refused - {} (skill {}, live {}, max {})",
+                         who->GetName(), reason, request.skill, liveValue, request.max);
+            else
+                LOG_INFO("module.overseer",
+                         "overseer: unlearn-skill row for '{}' ended {} (skill {} {}, live {}, max {})",
+                         who->GetName(), outcome, request.skill, skillName, liveValue, request.max);
+            // RecordEvent excludes non-roster characters. This command is
+            // specifically for guild seats, so queue its outcome directly.
+            QueueEvent(who, eventKind, request.skill, skillName, eventDetail, EventExtra());
+            return reason && reason[0] ? reason : "";
+        };
+
+        if (request.error[0])
+            return finish("refused", request.error);
+
+        bool const inNaturalGuild = InNaturalGuild(who);
+        bool const onRoster = OnRoster(who->GetName());
+        bool const hasSkill = who->HasSkill(request.skill);
+        UnlearnSkillAction const action = DecideUnlearnSkill(
+            inNaturalGuild, onRoster, request.skill, hasSkill, liveValue, request.max);
+        switch (action)
+        {
+            case UnlearnSkillAction::NotNaturalGuild:
+                return finish("refused", R::NotNaturalGuild);
+            case UnlearnSkillAction::RosterCharacter:
+                return finish("refused", R::RosterCharacter);
+            case UnlearnSkillAction::NotGathering:
+                return finish("refused", R::NotGathering);
+            case UnlearnSkillAction::AlreadyAbsent:
+                status = "applied";
+                return finish("already-unlearned", "");
+            case UnlearnSkillAction::AboveCeiling:
+                return finish("refused", R::AboveCeiling);
+            case UnlearnSkillAction::ReadyToUnlearn:
+                break;
+        }
+
+        LOG_WARN("module.overseer",
+                 "overseer: unlearn-skill is giving up {} ({}) for '{}' at {}/{}",
+                 skillName, request.skill, who->GetName(), liveValue, request.max);
+        // natural-only: drops a guild seat's existing gathering skill after
+        // the guild, roster, skill and ceiling checks above.
+        who->SetSkill(static_cast<uint16>(request.skill), 0, 0, 0);
+        if (who->HasSkill(request.skill))
+        {
+            LOG_ERROR("module.overseer",
+                      "overseer: '{}' still has {} ({}) after SetSkill cleared it",
+                      who->GetName(), skillName, request.skill);
+            return finish("refused", R::StillHeld);
+        }
+
+        status = "applied";
+        return finish("unlearned", "");
     }
 
     static char const* DoLearnRecipe(Player* who, std::string const& command,
