@@ -23024,6 +23024,34 @@ private:
         return false;
     }
 
+    // IS THE LIQUID AT (x, y) LAVA OR SLIME, STANDING OVER THE GROUND (#1569)?
+    // SurfaceAt answers with the liquid's surface, so without this a lava pool
+    // reads as a floor and the straight step walks into it. The depth is the
+    // core's own two halves (GetWaterOrGroundLevel's surface and its ground
+    // out-parameter); the liquid TYPE is read from the core at a point inside
+    // the liquid, never inferred from a height. An unmeasurable point is not
+    // called lethal here: the caller's own no-ground rules handle it.
+    static bool LethalLiquidAt(Player* bot, float x, float y, float from)
+    {
+        Map* map = bot->GetMap();
+        if (!map)
+            return false;
+        float ground = 0.f;
+        float const surface = map->GetWaterOrGroundLevel(
+            bot->GetPhaseMask(), x, y, from, &ground, true, bot->GetCollisionHeight());
+        if (surface <= INVALID_HEIGHT || ground <= INVALID_HEIGHT)
+            return false;
+        float const depth = surface - ground;
+        if (depth <= 0.f)
+            return false;
+        LiquidData const liquid = map->GetLiquidData(
+            bot->GetPhaseMask(), x, y, ground + depth * 0.5f, bot->GetCollisionHeight(),
+            MAP_ALL_LIQUIDS);
+        if (liquid.Status == LIQUID_MAP_NO_WATER)
+            return false;
+        return OverseerDecisions::StepLiquidIsLethal(depth, liquid.Flags);
+    }
+
     // Does the ground hold, walking in a straight line from where `bot` stands
     // to (toX, toY)? `footing` comes back as the surface at the far end, which
     // is the Z the step should be aimed at: an aim's own Z is what put a
@@ -23092,6 +23120,13 @@ private:
                 // second answer lower than the footing is not a hill, and the
                 // drop test immediately below still has to pass on it.
             }
+            // LAVA AND SLIME ARE NOT GROUND (#1569). SurfaceAt reads their
+            // surface as a floor, so the drop and rise tests below pass over a
+            // pool; the head walked into magma this way at the Molten Core
+            // door. The sample is refused, which also ends the proved prefix
+            // before the pool.
+            if (LethalLiquidAt(bot, sampleX, sampleY, footing + TRAVEL_GROUND_DROP_YARDS))
+                return false;
             // A STRIDE IS WALKABLE EXACTLY WHEN THE STRIDE BACK IS (#262).
             // These used to be two separate tests with two different bounds,
             // ten down and eight up, so a nine yard descent was approved and

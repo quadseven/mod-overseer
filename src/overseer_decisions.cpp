@@ -1364,6 +1364,13 @@ bool FootingSampleHolds(float fromZ, float toZ, float maxDrop, float maxRise)
     return (change < 0.f ? -change : change) <= bound;
 }
 
+bool StepLiquidIsLethal(float depthYards, uint32_t liquidTypeMask)
+{
+    if (depthYards <= 0.f)
+        return false;
+    return (liquidTypeMask & (DEATH_LIQUID_MAGMA | DEATH_LIQUID_SLIME)) != 0;
+}
+
 bool ProvenStepIsWorthTaking(bool wholeBearingHeld, float provedYards,
                              float minYards)
 {
