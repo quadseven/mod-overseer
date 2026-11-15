@@ -1610,6 +1610,24 @@ bool StepMayBridgeGap(float span, float verticalGap, float stepYards,
 // are.
 bool FootingSampleHolds(float fromZ, float toZ, float maxDrop, float maxRise);
 
+// A STRIDE THAT STANDS IN LAVA IS NOT GROUND (#1569).
+//
+// The footing check reads each stride with Map::GetWaterOrGroundLevel, which
+// answers with the liquid's SURFACE wherever there is liquid, so a lava pool
+// reads as a level floor and the straight step walked into it. `depthYards` is
+// the liquid surface minus the ground under it at the sampled point, and
+// `liquidTypeMask` is the core's LiquidData::Flags there (the DEATH_LIQUID_*
+// bits). Lethal is magma with liquid actually standing over the ground; water
+// is not refused here (the drowning rule owns it) and neither is slime (the
+// core's slime damage is disabled).
+bool StepLiquidIsLethal(float depthYards, uint32_t liquidTypeMask);
+
+// IS THIS STRIDE REFUSED FOR LANDING IN LETHAL LIQUID, GIVEN WHERE THE
+// CHARACTER ALREADY STANDS (#1569)? A character whose own feet are in lethal
+// liquid is exempt, so it can wade out instead of being held in the pool and
+// read as sealed in a pocket.
+bool StrideLiquidRefused(bool feetInLethalLiquid, bool strideLethal);
+
 // WHAT A REFUSED BEARING STILL PROVED (#312).
 //
 // THE FOOTING CHECK WALKS A BEARING IN STRIDES AND THREW AWAY EVERY STRIDE

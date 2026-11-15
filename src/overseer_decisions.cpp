@@ -1364,6 +1364,23 @@ bool FootingSampleHolds(float fromZ, float toZ, float maxDrop, float maxRise)
     return (change < 0.f ? -change : change) <= bound;
 }
 
+bool StepLiquidIsLethal(float depthYards, uint32_t liquidTypeMask)
+{
+    if (depthYards <= 0.f)
+        return false;
+    // Magma only. The core's slime damage is disabled, so refusing slime would
+    // newly hold characters at canals and pools that have never hurt them.
+    return (liquidTypeMask & DEATH_LIQUID_MAGMA) != 0;
+}
+
+bool StrideLiquidRefused(bool feetInLethalLiquid, bool strideLethal)
+{
+    // A character already in the pool must be able to wade out: every bearing's
+    // first stride is lethal liquid too, so refusing them all would leave a
+    // proved prefix of nothing and no way back.
+    return strideLethal && !feetInLethalLiquid;
+}
+
 bool ProvenStepIsWorthTaking(bool wholeBearingHeld, float provedYards,
                              float minYards)
 {
