@@ -1,0 +1,145 @@
+Subject: [PATCH] playerbots: a bot standing in a zone with no grind spot or hub picks one from a neighbouring zone
+
+WHY THIS PATCH EXISTS
+
+NewRpgBaseAction::SelectRandomGrindPos and ::SelectRandomCampPos
+(src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp, at the pin) keep a cached
+destination only when the zone at that destination equals the bot's own zone
+(unless the bot stands in a capital). A bot whose own zone caches nothing then
+has no grind spot and no camp: the strategy's other statuses are unavailable
+too (quest points are zone-filtered the same way), RandomChangeStatus finds no
+available status, and it takes the "all unavailable" branch, which sets the bot
+to REST and sits it down. Nothing later changes that, because the bot's zone
+does not change while it sits.
+
+Measured on the dev realm on 2026-11-15, from Playerbots.log and the
+characters table: of 197 bots online on map 530, 31 of the 32 standing in zone
+3455 (The North Sea) logged only empty grind picks ("Map:4294967295 ... 0+0
+available") in the 400000 most recent pick lines, none a valid one. They stand
+at the sea surface (z -1.2) west of the Sunstrider Isle, level 1 to 12, up to
+609 hours played, and the other 33 characters of that zone are offline there.
+The same empty picks are logged by 15 bots in Eversong Woods at level 14 to 16
+and by a few in Ghostlands and Azuremyst: a zone with no cached spot at the
+bot's level (Eversong's creatures stop around level 10) strands them the same
+way. Ghostlands, one zone away, has spots for them.
+
+This adds a second pass to both functions. Only when the first pass (same zone
+only, exactly as before) finds nothing does the second pass accept a cached
+spot or hub from any zone of the bot's own map, inside the same distance
+limits as before (the level 1 to 4 limits are unchanged). A bot that has a
+spot in its own zone behaves exactly as before; a bot in a capital is not
+affected. No bot is teleported: it walks or swims to the spot like any other.
+
+HOW A BOT GOT INTO THE SEA WAS NOT FOUND. This patch does not stop a bot
+entering open water; it makes a bot that is already there able to leave. The
+quest-point and wander code were not changed.
+
+WHAT WOULD LET THIS PATCH BE DELETED
+
+An upstream change that falls back to a neighbouring zone, or to the nearest
+spot on the map, when the bot's own zone has none.
+
+APPLIES TO
+
+  repo: https://github.com/quadseven/mod-playerbots.git
+  SHA:  40884e9c135c1daf27ffd894a6047502a5701130 (the pin), and it also
+        applies after every local patch in the infra copy of this directory
+        (checked with git apply --check, with offsets). It touches only
+        NewRpgBaseAction::SelectRandomGrindPos and ::SelectRandomCampPos.
+
+diff --git a/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp b/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
+index ba23668..1b5341b 100644
+--- a/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
++++ b/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
+@@ -991,26 +991,34 @@ WorldPosition NewRpgBaseAction::SelectRandomGrindPos(Player* bot)
+             inCity = true;
+     }
+ 
+-    for (auto& loc : locs)
++    // A bot standing in a zone that caches no grind spot (open sea, a strait)
++    // has nothing to pick if it may only pick from its own zone, and the
++    // caller then sits it down for good. The second pass lets it pick the
++    // nearest spot in any zone of its map so it can swim to shore.
++    for (int pass = 0; pass < 2 && lo_prepared_locs.empty(); ++pass)
+     {
+-        if (bot->GetMapId() != loc.GetMapId())
+-            continue;
++        bool const sameZoneOnly = !inCity && pass == 0;
++        for (auto& loc : locs)
++        {
++            if (bot->GetMapId() != loc.GetMapId())
++                continue;
+ 
+-        if (bot->GetExactDist(loc) > 2500.0f)
+-            continue;
++            if (bot->GetExactDist(loc) > 2500.0f)
++                continue;
+ 
+-        if (!inCity && bot->GetMap()->GetZoneId(bot->GetPhaseMask(), loc.GetPositionX(), loc.GetPositionY(),
+-                                                loc.GetPositionZ()) != bot->GetZoneId())
+-            continue;
++            if (sameZoneOnly && bot->GetMap()->GetZoneId(bot->GetPhaseMask(), loc.GetPositionX(),
++                                                         loc.GetPositionY(), loc.GetPositionZ()) != bot->GetZoneId())
++                continue;
+ 
+-        if (bot->GetExactDist(loc) < hiRange)
+-        {
+-            hi_prepared_locs.push_back(loc);
+-        }
++            if (bot->GetExactDist(loc) < hiRange)
++            {
++                hi_prepared_locs.push_back(loc);
++            }
+ 
+-        if (bot->GetExactDist(loc) < loRange)
+-        {
+-            lo_prepared_locs.push_back(loc);
++            if (bot->GetExactDist(loc) < loRange)
++            {
++                lo_prepared_locs.push_back(loc);
++            }
+         }
+     }
+     WorldPosition dest{};
+@@ -1043,23 +1051,29 @@ WorldPosition NewRpgBaseAction::SelectRandomCampPos(Player* bot)
+     }
+ 
+     std::vector<WorldLocation> prepared_locs;
+-    for (auto& loc : locs)
++    // Same two passes as SelectRandomGrindPos: a bot in a zone with no hub of
++    // its own may pick one in any zone of its map.
++    for (int pass = 0; pass < 2 && prepared_locs.empty(); ++pass)
+     {
+-        if (bot->GetMapId() != loc.GetMapId())
+-            continue;
++        bool const sameZoneOnly = !inCity && pass == 0;
++        for (auto& loc : locs)
++        {
++            if (bot->GetMapId() != loc.GetMapId())
++                continue;
+ 
+-        float range = bot->GetLevel() <= 5 ? 500.0f : 2500.0f;
+-        if (bot->GetExactDist(loc) > range)
+-            continue;
++            float range = bot->GetLevel() <= 5 ? 500.0f : 2500.0f;
++            if (bot->GetExactDist(loc) > range)
++                continue;
+ 
+-        if (bot->GetExactDist(loc) < 50.0f)
+-            continue;
++            if (bot->GetExactDist(loc) < 50.0f)
++                continue;
+ 
+-        if (!inCity && bot->GetMap()->GetZoneId(bot->GetPhaseMask(), loc.GetPositionX(), loc.GetPositionY(),
+-                                                loc.GetPositionZ()) != bot->GetZoneId())
+-            continue;
++            if (sameZoneOnly && bot->GetMap()->GetZoneId(bot->GetPhaseMask(), loc.GetPositionX(),
++                                                         loc.GetPositionY(), loc.GetPositionZ()) != bot->GetZoneId())
++                continue;
+ 
+-        prepared_locs.push_back(loc);
++            prepared_locs.push_back(loc);
++        }
+     }
+     WorldPosition dest{};
+     if (!prepared_locs.empty())
