@@ -17745,6 +17745,127 @@ GuildRemoveRefusal GuildRemoveVerdictFor(GuildRemoveFacts const& facts)
     return GuildRemoveRefusal::None;
 }
 
+std::string GuildMotdClean(std::string const& text)
+{
+    std::string kept;
+    kept.reserve(text.size());
+    for (char const ch : text)
+    {
+        unsigned char const u = static_cast<unsigned char>(ch);
+        if (u < 0x20 || u == 0x7f)
+            continue;
+        kept.push_back(ch);
+    }
+    std::size_t begin = 0;
+    while (begin < kept.size() && kept[begin] == ' ')
+        ++begin;
+    kept.erase(0, begin);
+    if (kept.size() > GUILD_MOTD_MAX)
+    {
+        std::size_t cut = GUILD_MOTD_MAX;
+        // Back off a UTF-8 continuation byte (10xxxxxx) so a multi-byte
+        // character is dropped whole rather than left as a stray half.
+        while (cut > 0 && (static_cast<unsigned char>(kept[cut]) & 0xC0) == 0x80)
+            --cut;
+        kept.erase(cut);
+    }
+    while (!kept.empty() && kept.back() == ' ')
+        kept.pop_back();
+    return kept;
+}
+
+char const* GuildPromoteVerdictSaid(GuildPromoteVerdict verdict)
+{
+    switch (verdict)
+    {
+        case GuildPromoteVerdict::Apply:
+        case GuildPromoteVerdict::AlreadyThere:
+            return "";
+        case GuildPromoteVerdict::NotManaged:
+            return "that guild is not one this module manages";
+        case GuildPromoteVerdict::NoTarget:
+            return "no character to promote (put the name in target_arg)";
+        case GuildPromoteVerdict::NoSuchCharacter:
+            return "no character of that name exists";
+        case GuildPromoteVerdict::NotInThisGuild:
+            return "that character is not in this guild";
+        case GuildPromoteVerdict::RankIsMaster:
+            return "rank 0 is the guild master and is never given by a row";
+        case GuildPromoteVerdict::NoSuchRank:
+            return "the guild has no rank with that id";
+        case GuildPromoteVerdict::TargetIsMaster:
+            return "the guild master is never moved by a row";
+        case GuildPromoteVerdict::WouldDemote:
+            return "that rank is below the one the member holds, and a row never demotes";
+        case GuildPromoteVerdict::NoRight:
+            return "the acting character has no right to promote members";
+        case GuildPromoteVerdict::NotBelowActor:
+            return "that rank is not below the rank of the acting character";
+    }
+    return "";
+}
+
+GuildPromoteVerdict GuildPromoteVerdictFor(GuildPromoteFacts const& facts)
+{
+    if (!facts.managedGuild)
+        return GuildPromoteVerdict::NotManaged;
+    if (!facts.named)
+        return GuildPromoteVerdict::NoTarget;
+    if (!facts.exists)
+        return GuildPromoteVerdict::NoSuchCharacter;
+    if (!facts.inThisGuild)
+        return GuildPromoteVerdict::NotInThisGuild;
+    // Rank 0 first among the rank gates: it exists in every guild, so it would
+    // otherwise be answered as a demotion or a missing right, and the reason
+    // that matters is that this verb never touches the master's rung.
+    if (facts.requestedRank == GUILD_RANK_MASTER)
+        return GuildPromoteVerdict::RankIsMaster;
+    if (facts.requestedRank >= facts.rankCount)
+        return GuildPromoteVerdict::NoSuchRank;
+    if (facts.targetRank == GUILD_RANK_MASTER)
+        return GuildPromoteVerdict::TargetIsMaster;
+    // A larger id is a lower rung. Same rung is the idempotent answer, checked
+    // before the actor's right so that a repeat of a row that already worked
+    // reads as done and not as a permission problem.
+    if (facts.requestedRank == facts.targetRank)
+        return GuildPromoteVerdict::AlreadyThere;
+    if (facts.requestedRank > facts.targetRank)
+        return GuildPromoteVerdict::WouldDemote;
+    if (!facts.actorMayPromote)
+        return GuildPromoteVerdict::NoRight;
+    // The core's own rule for a promote: the new rung must be strictly below
+    // the promoter's. The master (rank 0) therefore may set any rung but 0.
+    if (facts.requestedRank <= facts.actorRank)
+        return GuildPromoteVerdict::NotBelowActor;
+    return GuildPromoteVerdict::Apply;
+}
+
+char const* GuildMotdVerdictSaid(GuildMotdVerdict verdict)
+{
+    switch (verdict)
+    {
+        case GuildMotdVerdict::Apply:
+        case GuildMotdVerdict::AlreadySet:
+            return "";
+        case GuildMotdVerdict::NotManaged:
+            return "that guild is not one this module manages";
+        case GuildMotdVerdict::NoRight:
+            return "the acting character has no right to set the message of the day";
+    }
+    return "";
+}
+
+GuildMotdVerdict GuildMotdVerdictFor(GuildMotdFacts const& facts)
+{
+    if (!facts.managedGuild)
+        return GuildMotdVerdict::NotManaged;
+    if (facts.unchanged)
+        return GuildMotdVerdict::AlreadySet;
+    if (!facts.actorMayEdit)
+        return GuildMotdVerdict::NoRight;
+    return GuildMotdVerdict::Apply;
+}
+
 GuildRequest ParseGuildRequest(std::string const& command)
 {
     GuildRequest request;
@@ -17790,6 +17911,52 @@ GuildRequest ParseGuildRequest(std::string const& command)
         // Same shape as `invite`: the character is in `target_arg`, and a name
         // repeated here is saying it twice rather than saying it wrong.
         request.verb = GuildVerb::Remove;
+        return request;
+    }
+
+    if (verb == "promote")
+    {
+        // `promote rank:<id>`, the member in `target_arg`. Exactly one word
+        // after the verb: a stray word is refused rather than ignored, because
+        // `promote rank:2 rank:4` that took the first would be a row that
+        // lied about which rung it asked for.
+        if (rest.size() < 6 || rest.compare(0, 5, "rank:") != 0
+            || rest.find(' ') != std::string::npos)
+        {
+            request.error = GuildRefusal::PromoteInvalid;
+            return request;
+        }
+        unsigned rank = 0;
+        for (std::size_t i = 5; i < rest.size(); ++i)
+        {
+            char const ch = rest[i];
+            if (ch < '0' || ch > '9' || rank > 25)
+            {
+                request.error = GuildRefusal::PromoteInvalid;
+                return request;
+            }
+            rank = rank * 10 + static_cast<unsigned>(ch - '0');
+        }
+        if (rank > 25)
+        {
+            request.error = GuildRefusal::PromoteInvalid;
+            return request;
+        }
+        request.verb = GuildVerb::Promote;
+        request.promoteRank = rank;
+        return request;
+    }
+
+    if (verb == "motd")
+    {
+        std::string const cleaned = GuildMotdClean(rest);
+        if (cleaned.empty())
+        {
+            request.error = GuildRefusal::MotdInvalid;
+            return request;
+        }
+        request.verb = GuildVerb::Motd;
+        request.motd = cleaned;
         return request;
     }
 

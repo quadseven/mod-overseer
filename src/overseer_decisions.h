@@ -20410,6 +20410,17 @@ enum class GuildVerb : std::uint8_t
     // verb that could do that as a side effect of being asked a question is a
     // verb somebody will one day ask a question with.
     RaidForm,
+    // `promote rank:<id>` - set the rank of the member named in the row's
+    // `target_arg` to rank id `<id>`, the way an officer's promote does and
+    // through the core's own Guild::ChangeMemberRank. Only UP: never to or
+    // from rank 0 (the guild master), never a demotion, never a rank the
+    // guild does not have. See GuildPromoteVerdictFor for the gates.
+    Promote,
+    // `motd <text>` - set the guild's message of the day through the core's
+    // own Guild::HandleSetMOTD, so the rank right is the core's to enforce.
+    // The text is cleaned by GuildMotdClean (control characters stripped, cut
+    // to the client's 128 bytes). `target_arg` is not read.
+    Motd,
 };
 
 struct GuildRequest
@@ -20426,6 +20437,12 @@ struct GuildRequest
     std::uint32_t depositCopper{0};
     // BankGrantDeposit only: the rank receiving deposit rights.
     std::uint8_t bankRankId{0};
+    // Promote only: the rank id to set. Zero is parsed, and then refused by
+    // GuildPromoteVerdictFor, so that the refusal is the verdict's and not a
+    // second copy of the rule in the grammar.
+    unsigned promoteRank{0};
+    // Motd only: the text, already cleaned by GuildMotdClean and never empty.
+    std::string motd;
     // BankDepositItem and BankWithdrawItem: which item. For a withdraw it is
     // always a guid (`itemByGuid` true), the stack in the tab. For a deposit,
     // which carried item, in the same `guid:`/`entry:`
@@ -20505,7 +20522,9 @@ constexpr unsigned GUILD_NAME_MAX = 24;
 // quote character - the rule every executor in this file keeps.
 namespace GuildRefusal
 {
-constexpr char const* NoVerb = "a guild row must begin with form, view, shortlist, invite, remove, tabard, bank or raid";
+constexpr char const* NoVerb = "a guild row must begin with form, view, shortlist, invite, remove, promote, motd, tabard, bank or raid";
+constexpr char const* PromoteInvalid = "promote takes rank:N and nothing else, with the member in target_arg";
+constexpr char const* MotdInvalid = "motd takes the message text, which is empty once control characters are removed";
 constexpr char const* RaidTakesFormOrNothing = "raid takes nothing, or the single word form";
 constexpr char const* BankNeedsDeposit = "bank takes `deposit <copper>`, `withdraw <copper>`, `deposit-item <guid:N|entry:N> [tab:N]`, `withdraw-item guid:N [tab:N]`, `buy-tab [tab:N]`, `name-tab tab:N icon:<icon> <name>` or `grant-deposit rank:N`";
 constexpr char const* BankBuyTabTrailing = "bank buy-tab takes tab:N or nothing";
@@ -20528,6 +20547,78 @@ constexpr char const* CountIsZero = "a shortlist of nothing is not a question";
 }  // namespace GuildRefusal
 
 GuildRequest ParseGuildRequest(std::string const& command);
+
+// The most a guild's message of the day may be: the 3.3.5 client's own edit
+// box stops at 128 characters, and a longer one is cut by it on display.
+constexpr std::size_t GUILD_MOTD_MAX = 128;
+
+// A MOTD as the core should be handed it: every control character (below
+// 0x20 and 0x7f) removed, the ends trimmed of spaces, and the whole cut to
+// GUILD_MOTD_MAX bytes without splitting a UTF-8 sequence. Idempotent, so a
+// comparison against the guild's current MOTD is a comparison of two cleaned
+// strings.
+std::string GuildMotdClean(std::string const& text);
+
+// What the acting character's guild is, and who is being moved, as the
+// promote executor reads them before it asks the core. Rank ids: 0 is the
+// guild master and a larger id is a lower rung.
+struct GuildPromoteFacts
+{
+    // The acting character's guild is one this module manages
+    // (Overseer.Natural.Guilds or Overseer.Retire.KeepGuilds).
+    bool managedGuild{false};
+    bool named{false};        // target_arg was not empty
+    bool exists{false};       // a character of that name exists
+    bool inThisGuild{false};  // and is in the acting character's guild
+    // The acting character's rank carries GR_RIGHT_PROMOTE.
+    bool actorMayPromote{false};
+    unsigned actorRank{0};
+    unsigned targetRank{0};
+    unsigned requestedRank{0};
+    unsigned rankCount{0};    // how many ranks the guild has
+};
+
+enum class GuildPromoteVerdict : std::uint8_t
+{
+    Apply,
+    // Already on the requested rung: the row has nothing left to do, and is
+    // reported as applied without a change.
+    AlreadyThere,
+    NotManaged,
+    NoTarget,
+    NoSuchCharacter,
+    NotInThisGuild,
+    RankIsMaster,
+    NoSuchRank,
+    TargetIsMaster,
+    WouldDemote,
+    NoRight,
+    NotBelowActor,
+};
+
+char const* GuildPromoteVerdictSaid(GuildPromoteVerdict verdict);
+
+// Apply means the core should be asked, and the adapter reads the member's
+// rank back afterwards. The gates are asked in the order of the enum above.
+GuildPromoteVerdict GuildPromoteVerdictFor(GuildPromoteFacts const& facts);
+
+struct GuildMotdFacts
+{
+    bool managedGuild{false};
+    bool actorMayEdit{false};  // GR_RIGHT_SETMOTD
+    bool unchanged{false};     // the cleaned text equals the guild's MOTD
+};
+
+enum class GuildMotdVerdict : std::uint8_t
+{
+    Apply,
+    AlreadySet,
+    NotManaged,
+    NoRight,
+};
+
+char const* GuildMotdVerdictSaid(GuildMotdVerdict verdict);
+GuildMotdVerdict GuildMotdVerdictFor(GuildMotdFacts const& facts);
 
 // -- taking a stack out of a guild bank tab ---------------------------------
 //
