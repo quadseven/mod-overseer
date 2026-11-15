@@ -258,6 +258,17 @@
 #Overseer.Raid.QuorumTanks = 3
 #Overseer.Raid.QuorumHealers = 8
 #
+#    Overseer.Raid.RequireHeadClient
+#        Description: Whether the raid's head must have a game client attached
+#                     before an ordered raid forms. ON is the rule for a realm
+#                     that plays on camera: the raid holds, and the log says so,
+#                     until the head is streaming. OFF lets a head that is in the
+#                     world as a headless bot lead the run, for a realm no
+#                     client can reach (a disposable test copy).
+#        Default:     1
+#
+#Overseer.Raid.RequireHeadClient = 1
+#
 ########################################
 #
 #    THE ROSTER AND ITS CLIENTS

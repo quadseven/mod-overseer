@@ -16872,6 +16872,11 @@ std::string RaidKeywordForJob(std::string const& job)
     return RaidDoorFor(keyword) ? keyword : std::string();
 }
 
+bool RaidHeadMayLead(bool inWorld, bool clientAttached, bool requireHeadClient)
+{
+    return inWorld && (clientAttached || !requireHeadClient);
+}
+
 char const* RaidRunPhaseName(RaidRunPhase phase)
 {
     switch (phase)

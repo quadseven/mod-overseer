@@ -56226,7 +56226,9 @@ private:
             OverseerDecisions::RaidRunFacts facts;
             facts.ordered = !keyword.empty();
             Player* head = ObjectAccessor::FindPlayerByName(roster.leader);
-            facts.headStreaming = head && head->IsInWorld() && ClientAttached(head);
+            facts.headStreaming = OverseerDecisions::RaidHeadMayLead(
+                head && head->IsInWorld(), head && ClientAttached(head),
+                sConfigMgr->GetOption<bool>("Overseer.Raid.RequireHeadClient", true));
             facts.headAlive = head && head->IsInWorld() && head->IsAlive();
             Group* group = head ? head->GetGroup() : nullptr;
             facts.raidFormed = group && group->isRaidGroup();
@@ -56822,6 +56824,13 @@ private:
             }
             if (step.phase == RaidRunPhase::Idle)
             {
+                // An order that stands and is not forming says why, once per change
+                // (mod-overseer#1544): this hold used to be stored and never logged.
+                if (facts.ordered && run.lastWhy != step.why)
+                    LOG_INFO("module.overseer",
+                             "overseer: raid run for family '{}' holds {} - {}",
+                             roster.family, OverseerDecisions::RaidRunPhaseName(step.phase),
+                             step.why);
                 run.lastWhy = step.why;
                 continue;
             }

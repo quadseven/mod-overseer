@@ -19708,6 +19708,11 @@ RaidDoor const* RaidDoorFor(std::string const& keyword);
 // for anything else, including a raid keyword this module has no door for.
 std::string RaidKeywordForJob(std::string const& job);
 
+// Whether the raid's head may lead the run: in the world, and with a game
+// client attached when the realm asks for one (Overseer.Raid.RequireHeadClient,
+// default on). A realm no client can reach turns the requirement off.
+bool RaidHeadMayLead(bool inWorld, bool clientAttached, bool requireHeadClient);
+
 // How near the staging point counts as assembled, and how near a member has to
 // be to the head to have walked with him. Forty characters following one make
 // a crowd, not a point: the follow strategy spreads a raid over tens of yards.
