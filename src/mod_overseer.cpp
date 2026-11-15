@@ -26539,6 +26539,10 @@ private:
     bool CatchUpToward(std::string const& name, Player* leader,
                        std::string const& rosterLeaderName)
     {
+        // While the member's raid run is in ASSEMBLE the run is the only writer
+        // of its travel aim (see RaidAssembleHolds).
+        if (RaidAssembleHolds(name))
+            return false;
         if (!rosterLeaderName.empty() &&
             OverseerDecisions::DecideCatchUpAimSource(
                 leader && leader->IsInWorld(),
@@ -27001,6 +27005,17 @@ private:
                       : "it never took off, so it follows its leader again on foot");
     }
 
+    // IS THIS MEMBER'S RAID IN ASSEMBLE? The run walks every seat to the door
+    // through the travel column during that phase, so the follow drive's
+    // catch-up (a second writer of the same column, aimed at the leader) must
+    // not claim. Read off the per-member phase DriveRaidRun marks each poll.
+    bool RaidAssembleHolds(std::string const& name) const
+    {
+        auto const phase = _raidRunPhaseByMember.find(name);
+        return phase != _raidRunPhaseByMember.end() &&
+               phase->second == OverseerDecisions::RaidRunPhase::Assemble;
+    }
+
     void DriveCatchUp(Player* p, Player* leader, std::string const& rosterLeaderName)
     {
         std::string const name = p->GetName();
@@ -27167,6 +27182,11 @@ private:
             // survey's own resolution before that. The whole argument is on its
             // declaration; FOLLOW_CATCH_UP_AIM_LIMITS is where the three numbers
             // it reads come from, and none of them is new.
+            // THE RUN OWNS THIS AIM WHILE THE RAID ASSEMBLES: two writers
+            // flipping a seat's aim between the leader and the door is what
+            // walked seats the wrong way. The member keeps following.
+            if (RaidAssembleHolds(name))
+                return;
             OverseerDecisions::CatchUpAimFacts aim;
             aim.leaderOnTheGround = OnTheGround(leader);
             aim.leaderDriftFromAim =
@@ -55293,6 +55313,10 @@ private:
         // Raiders given a walk to the staging point in ASSEMBLE (#765), so the
         // walk is released when the phase ends and said once per seat.
         std::set<std::string> seatsWalking;
+        // Seats this run gave `+stay` because the module cannot steer them, so
+        // upstream's follow cannot drag them along while the head walks; only
+        // these are released.
+        std::set<std::string> seatsStayed;
         bool enterAwaySaid{false};
         unsigned durabilityBossesDone{std::numeric_limits<unsigned>::max()};
         unsigned repairHoldBossesDone{std::numeric_limits<unsigned>::max()};
@@ -55752,6 +55776,7 @@ private:
         for (std::string const& name : run.seatsWalking)
             _travelAims.Release(name, "the raid order ended");
         run.seatsWalking.clear();
+        ReleaseStayedSeats(run);
         run.stoneRowSource.clear();
         run.stoneRowTarget.clear();
         run.stoneRowClicker.clear();
@@ -56476,6 +56501,22 @@ private:
     // drive makes any crossing and far walk on its own legs and with its own
     // purse). Released when ASSEMBLE ends, so nobody is walked to a door the
     // raid has already gone through. Nothing here teleports or summons.
+    void ReleaseStayedSeat(RaidRunState& run, std::string const& name)
+    {
+        if (!run.seatsStayed.erase(name))
+            return;
+        Player* const member = ObjectAccessor::FindPlayerByName(name);
+        if (PlayerbotAI* const seatAI = member ? GET_PLAYERBOT_AI(member) : nullptr)
+            seatAI->ChangeStrategy("-stay", BOT_STATE_NON_COMBAT);
+    }
+
+    void ReleaseStayedSeats(RaidRunState& run)
+    {
+        std::set<std::string> const names = run.seatsStayed;
+        for (std::string const& name : names)
+            ReleaseStayedSeat(run, name);
+    }
+
     void DriveRaidSeatWalks(OverseerDecisions::FamilyRoster const& roster, RaidRunState& run,
                             Group* group, Player* head,
                             OverseerDecisions::RaidDoor const* door, bool walk)
@@ -56505,6 +56546,7 @@ private:
                          roster.family, stillAway, door->name, away);
             run.enterAwaySaid = true;
             run.seatsWalking.clear();
+            ReleaseStayedSeats(run);
             return;
         }
         run.enterAwaySaid = false;
@@ -56527,9 +56569,23 @@ private:
             {
                 if (run.seatsWalking.erase(name))
                     _travelAims.Release(name, "the raider reached the staging point");
+                ReleaseStayedSeat(run, name);
                 continue;
             }
             _travelAims.Claim(name, aim, OverseerDecisions::TravelOwner::Run);
+            // A SEAT THE MODULE CANNOT STEER IS HELD, NOT WALKED: no drive here
+            // moves it, so upstream's own follow would drag it after the head
+            // wherever the head goes. `+stay` until the head is at the door.
+            if (!SteerableAI(member))
+                if (PlayerbotAI* const seatAI = GET_PLAYERBOT_AI(member))
+                    if (run.seatsStayed.insert(name).second)
+                    {
+                        seatAI->ChangeStrategy("+stay", BOT_STATE_NON_COMBAT);
+                        LOG_INFO("module.overseer",
+                                 "overseer: raid run for family '{}' holds '{}' with `+stay` "
+                                 "while ASSEMBLE walks the head: the module cannot steer it",
+                                 roster.family, name);
+                    }
             if (run.seatsWalking.insert(name).second)
                 LOG_INFO("module.overseer",
                          "overseer: raid run for family '{}' is walking '{}' to the {} door "
