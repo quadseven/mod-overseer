@@ -29303,6 +29303,24 @@ private:
         _individualErrands.swap(next);
     }
 
+    // Stop a character whose next step the ground gate refused: clear the
+    // MotionMaster and the unit's movement, idle the rpg status and take
+    // `new rpg` off, so neither the walk in flight nor upstream's own status
+    // update moves it on. The errand's own re-issue grants `new rpg` again once
+    // a step is found.
+    static void StopRefusedWalk(Player* bot, PlayerbotAI* botAI)
+    {
+        if (!bot)
+            return;
+        bot->GetMotionMaster()->Clear();
+        bot->StopMoving();
+        if (!botAI)
+            return;
+        botAI->rpgInfo.ChangeToIdle();  // NewRpgInfo.h:110
+        if (botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+            botAI->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+    }
+
     void DriveTravel()
     {
         // Before anything else, so a death is read against the route the walker
@@ -31335,9 +31353,9 @@ private:
                              "AIM and not every direction out of here: a character at the "
                              "foot of a hill reads exactly like one sealed in a pocket "
                              "from this line alone, so measure the ground before believing "
-                             "either. Nothing is holding it, either - its walk and its "
-                             "`new rpg` are untouched - so if it moves, something else "
-                             "moved it. Giving the errand up if {} consecutive polls are "
+                             "either. Its walk is stopped and its "
+                             "`new rpg` taken off on every refused poll, so if it moves, "
+                             "something else moved it. Giving the errand up if {} consecutive polls are "
                              "refused without it getting nearer (#312)",
                              name, target, static_cast<uint32>(distance),
                              static_cast<uint32>(TRAVEL_STEP_MIN_YARDS),
@@ -31371,6 +31389,12 @@ private:
                     // may hearth out of it instead (DecideStrandedWay, rule 6b).
                     _strandedGroundGiveUp[name] = std::time(nullptr);
                 }
+                // A REFUSED STEP STOPS THE WALK. The comment above used to say
+                // nothing held the character, and that was the defect: a walk
+                // already in flight and a granted `new rpg` carried it on across
+                // ground the gate had just refused. Every refused poll, not only
+                // the one that gives up.
+                StopRefusedWalk(bot, botAI);
                 continue;
             }
             // A poll that found a step ends any refusal episode this character
