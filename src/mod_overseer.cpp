@@ -34233,12 +34233,22 @@ private:
                          "SELECT time, mapId, posX, posY, posZ FROM corpse WHERE guid = {}",
                          bot->GetGUID().GetCounter()))
             {
+                // A ROW IS READ ONLY IF IT IS THIS DEATH'S. A body still on the
+                // release prompt has no corpse, and a row left from an earlier
+                // death (a revive does not always delete it) once timed a
+                // character three seconds into a new death as dead for 31153s,
+                // which skipped the grace wait and the release on its behalf.
                 Field* f = row->Fetch();
-                ghostTime = int64(f[0].Get<uint32>());
-                corpseMap = f[1].Get<uint16>();
-                corpseX = f[2].Get<float>();
-                corpseY = f[3].Get<float>();
-                corpseZ = f[4].Get<float>();
+                int64 const rowTime = int64(f[0].Get<uint32>());
+                if (OverseerDecisions::CorpseRowBelongsToThisDeath(
+                        bot->HasPlayerFlag(PLAYER_FLAGS_GHOST), rowTime, LastDeathAt(name)))
+                {
+                    ghostTime = rowTime;
+                    corpseMap = f[1].Get<uint16>();
+                    corpseX = f[2].Get<float>();
+                    corpseY = f[3].Get<float>();
+                    corpseZ = f[4].Get<float>();
+                }
             }
 
             // NOBODY IS THERE TO CLICK RELEASE.

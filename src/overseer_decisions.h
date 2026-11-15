@@ -29621,6 +29621,20 @@ ReleasePromptReading ReleasePromptObserve(ReleasePromptClock& clock, std::int64_
                                           std::int64_t lastDeathAt,
                                           std::int64_t maxGapSeconds);
 
+// WHETHER A ROW IN THE `corpse` TABLE IS THE CLOCK OF THE DEATH BEING DRIVEN.
+// The stuck-revival drive falls back to that table when the map-scoped corpse
+// lookup finds nothing. A row survives a revive that did not delete it, so
+// read without this check a character three seconds into a new death was
+// timed from its previous one (31153s dead, in the live case): the grace wait
+// was skipped and the release-on-its-behalf block never ran.
+//
+// A body that has not been released has no corpse at all, so only a ghost owns
+// a row. A ghost's row is made at the release, after the death was booked, so a
+// row older than the booked death is a leftover. `lastDeathAt` is 0 when the
+// module has booked none since it started; the ghost flag alone decides then.
+// A row time of 0 is no clock.
+bool CorpseRowBelongsToThisDeath(bool ghost, std::int64_t rowTime, std::int64_t lastDeathAt);
+
 // --------------------------------------- dungeon run lockouts (#963) ---------
 
 // ONE CHARACTER'S SAVED STATE FOR ONE INSTANCE, as the instance-lockout window
