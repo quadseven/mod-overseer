@@ -24063,10 +24063,10 @@ private:
         // the next unmeasured leg.
         OverseerDecisions::GuardedGroundRule groundRule;
         groundRule.neutralElites =
-            sConfigMgr->GetOption<bool>("Overseer.Route.NeutralElites", true);
+            sConfigMgr->GetOption<bool>("Overseer.Route.NeutralElites", true, false);
         OverseerDecisions::LoneGreyDensityRule densityRule;
         densityRule.threshold =
-            sConfigMgr->GetOption<uint32>("Overseer.Route.LoneGreyDensity", 0);
+            sConfigMgr->GetOption<uint32>("Overseer.Route.LoneGreyDensity", 0, false);
         // A LONE WALKER IS ONE WITH NO GROUP, which is what a catch-up walk is
         // by construction. The A rule is never asked of a party. Like the level
         // floor and the party's levels before it, the answer is kept on the
@@ -56240,11 +56240,11 @@ private:
             facts.seatsTotal = unsigned(seats.size());
             facts.quorumEnded = run.quorumEnded;
             facts.quorumSeats = sConfigMgr->GetOption<uint32>(
-                "Overseer.Raid.QuorumSeats", OverseerDecisions::RAID_QUORUM_SEATS);
+                "Overseer.Raid.QuorumSeats", OverseerDecisions::RAID_QUORUM_SEATS, false);
             facts.quorumTanks = sConfigMgr->GetOption<uint32>(
-                "Overseer.Raid.QuorumTanks", OverseerDecisions::RAID_QUORUM_TANKS);
+                "Overseer.Raid.QuorumTanks", OverseerDecisions::RAID_QUORUM_TANKS, false);
             facts.quorumHealers = sConfigMgr->GetOption<uint32>(
-                "Overseer.Raid.QuorumHealers", OverseerDecisions::RAID_QUORUM_HEALERS);
+                "Overseer.Raid.QuorumHealers", OverseerDecisions::RAID_QUORUM_HEALERS, false);
             std::map<std::string, uint8> quorumSpecs;
             if (facts.ordered && run.phase == RaidRunPhase::Assemble)
                 quorumSpecs = LoadGearSpecs();
@@ -56254,7 +56254,7 @@ private:
             // The existing repair executor uses the character's own purse and
             // reads durability back after the core handler returns.
             uint32 const repairFloor = std::min<uint32>(
-                100, sConfigMgr->GetOption<uint32>("Overseer.Raid.RepairFloorPct", 70));
+                100, sConfigMgr->GetOption<uint32>("Overseer.Raid.RepairFloorPct", 70, false));
             bool repairPending = false;
             if (facts.ordered && run.phase == RaidRunPhase::Idle && repairFloor <= 100)
             {
