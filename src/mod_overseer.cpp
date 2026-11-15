@@ -23339,6 +23339,126 @@ private:
         return true;
     }
 
+    // ------------------------------- THE WALKWAY TO LOTHOS RIFTWAKER (#1573) --
+    //
+    // See OverseerDecisions::MoltenCoreWalkway for the finding. The navmesh holds
+    // the walkway as ground except for two slivers tagged SLIME, which a headless
+    // bot's filter excludes, so every stock path to Lothos stops 40 yards short.
+    //
+    // This paths with a filter that also admits SLIME, then asks PolyAdmitted of
+    // every polygon of the corridor: MAGMA and STEEP never, SLIME only on the two
+    // slivers. A corridor that uses any other polygon, or that does not end on
+    // the aim's own polygon, is not a route. Nothing is written down but the two
+    // seams; the corners come from the navmesh as it is loaded.
+    //
+    // THE STEP IS SHORT (STEP_YARDS). The mover is handed one point and builds
+    // its own path to it with the stock filter, which cannot cross a sliver: it
+    // walks to the sliver's edge and, standing there, draws the last yards
+    // straight (PointMovementGenerator.cpp:66-92 takes the straight branch for a
+    // path of two points or fewer). A short step keeps that straight line on the
+    // walkway. NOT YET SEEN LIVE: the next rehearsal has to show a character
+    // cross both slivers.
+    static bool MoltenCoreWalkwayLeg(Player* bot, WorldPosition const& want,
+                                      WorldPosition& step)
+    {
+        namespace W = OverseerDecisions::MoltenCoreWalkway;
+        float const ax = want.GetPositionX();
+        float const ay = want.GetPositionY();
+        float const az = want.GetPositionZ();
+        if (want.GetMapId() != bot->GetMapId() ||
+            !OverseerDecisions::AimOnMoltenCoreWalkway(bot->GetMapId(), ax, ay, az))
+            return false;
+        Map* const map = bot->GetMap();
+        if (!map)
+            return false;
+        dtNavMeshQuery const* const query =
+            map->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
+        dtNavMesh const* const mesh = map->GetMapCollisionData().GetMMapData().GetNavMesh();
+        if (!query || !mesh)
+            return false;
+
+        dtQueryFilter filter;
+        filter.setIncludeFlags(W::INCLUDE_FLAGS);
+        filter.setExcludeFlags(W::EXCLUDE_FLAGS);
+
+        // Detour's axes are (y, z, x) of the world's.
+        float const extents[3] = {4.f, 6.f, 4.f};
+        float const from[3] = {bot->GetPositionY(), bot->GetPositionZ(), bot->GetPositionX()};
+        float const to[3] = {ay, az, ax};
+        dtPolyRef startRef = 0;
+        dtPolyRef endRef = 0;
+        float startAt[3] = {};
+        float endAt[3] = {};
+        if (dtStatusFailed(query->findNearestPoly(from, extents, &filter, &startRef, startAt)) ||
+            !startRef ||
+            dtStatusFailed(query->findNearestPoly(to, extents, &filter, &endRef, endAt)) ||
+            !endRef)
+            return false;
+
+        static constexpr int MAX_POLYS = 256;
+        dtPolyRef corridor[MAX_POLYS];
+        int corridorSize = 0;
+        if (dtStatusFailed(query->findPath(startRef, endRef, startAt, endAt, &filter, corridor,
+                                           &corridorSize, MAX_POLYS)) ||
+            corridorSize <= 0 || corridor[corridorSize - 1] != endRef)
+            return false;
+
+        for (int i = 0; i < corridorSize; ++i)
+        {
+            dtMeshTile const* tile = nullptr;
+            dtPoly const* poly = nullptr;
+            if (dtStatusFailed(mesh->getTileAndPolyByRef(corridor[i], &tile, &poly)) || !tile ||
+                !poly)
+                return false;
+            std::vector<OverseerDecisions::RoutePoint> corners;
+            for (unsigned v = 0; v < poly->vertCount; ++v)
+            {
+                float const* p = &tile->verts[poly->verts[v] * 3];
+                OverseerDecisions::RoutePoint corner;
+                corner.x = p[2];
+                corner.y = p[0];
+                corner.z = p[1];
+                corners.push_back(corner);
+            }
+            if (!OverseerDecisions::PolyAdmitted(static_cast<uint16>(poly->flags), corners))
+                return false;
+        }
+
+        if (!OverseerDecisions::WalkwayRouteArrives(endAt[2], endAt[0], endAt[1], ax, ay, az))
+            return false;
+
+        static constexpr int MAX_CORNERS = 64;
+        float cornerAt[MAX_CORNERS * 3];
+        int cornerCount = 0;
+        if (dtStatusFailed(query->findStraightPath(startAt, endAt, corridor, corridorSize,
+                                                    cornerAt, nullptr, nullptr, &cornerCount,
+                                                    MAX_CORNERS)) ||
+            cornerCount < 2)
+            return false;
+        std::vector<OverseerDecisions::MailWalkPoint> points;
+        for (int i = 0; i < cornerCount; ++i)
+            points.push_back({cornerAt[i * 3 + 2], cornerAt[i * 3], cornerAt[i * 3 + 1]});
+        OverseerDecisions::FirstLegPick const pick = OverseerDecisions::PickFirstLegWaypoint(
+            points, W::STEP_YARDS, TRAVEL_FIRST_LEG_STRIDE_YARDS, TRAVEL_GROUND_DROP_YARDS);
+        if (!pick.found)
+            return false;
+        step = WorldPosition(want.GetMapId(), pick.point.x, pick.point.y, pick.point.z);
+
+        static std::map<std::string, std::time_t> said;
+        std::time_t const now = std::time(nullptr);
+        std::time_t& last = said[bot->GetName()];
+        if (now - last >= 60)
+        {
+            last = now;
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is walking the Molten Core walkway: {} navmesh polygons, "
+                     "{} corners, next step to ({:.1f}, {:.1f}, {:.1f}) (#1573)",
+                     bot->GetName(), corridorSize, cornerCount, pick.point.x, pick.point.y,
+                     pick.point.z);
+        }
+        return true;
+    }
+
     // ------------------------------------ THE WAY ROUND AN OBSTACLE (#316) --
     //
     // Everything above this line is about ONE step. GroundedStep asks whether
@@ -24699,13 +24819,22 @@ private:
         if (!dangerZones.empty())
             ReadNodeZones(bot, survey);
         std::vector<OverseerDecisions::RouteLink> pricedLinks;
+        // THE SURVEY LINKS INTO THE MOLTEN CORE ENTRANCE CLIMB THE OUTSIDE OF
+        // THE MOUNTAIN (#1573): see OverseerDecisions::MoltenCoreWalkway. For an
+        // aim on that walkway they are not offered, so the plan ends where the
+        // navmesh can finish it.
+        bool const bogusDoorLinks = OverseerDecisions::AimOnMoltenCoreWalkway(
+            bot->GetMapId(), aimX, aimY, aimZ);
         auto const linksForThisWalker =
             [&]() -> std::vector<OverseerDecisions::RouteLink> const&
         {
             diedOnHeld = 0;
-            if (diedOn.died.empty() && dangerZones.empty())
+            if (diedOn.died.empty() && dangerZones.empty() && !bogusDoorLinks)
                 return survey.links;
             pricedLinks = survey.links;
+            OverseerDecisions::DropBogusDoorLinks(pricedLinks, bot->GetMapId(), aimX, aimY, aimZ);
+            if (diedOn.died.empty() && dangerZones.empty())
+                return pricedLinks;
             diedOnHeld = OverseerDecisions::PriceDiedOnLegs(pricedLinks, diedOn.died,
                                                             plannedAt, DIED_ON_LEG_LIMITS);
             OverseerDecisions::PriceDangerZones(pricedLinks, survey.nodeZones, dangerZones,
@@ -25490,6 +25619,11 @@ private:
                 wz = surface;
         }
 
+        // 0. THE WALKWAY TO LOTHOS RIFTWAKER (#1573), first because the stock
+        // filter's answer there is a path that stops 40 yards short.
+        if (MoltenCoreWalkwayLeg(bot, WorldPosition(want.GetMapId(), wx, wy, wz), step))
+            return true;
+
         // 1. THE NAVMESH FIRST, AND USUALLY THE NAVMESH IS ENOUGH.
         if (NavmeshRoutes(bot, wx, wy, wz))
         {
@@ -25509,6 +25643,15 @@ private:
             step = WorldPosition(want.GetMapId(), wx, wy, wz);
             return true;
         }
+
+        // NO ROUTE AND NOTHING DRAWN AT LOTHOS (#1573). The five-bearing fan below
+        // probes the heightmap, and the lava lake beside his walkway is a model's
+        // floor to it, so a straight finish from the walkway walked into the lake.
+        // Refused like any other step with no ground; the walk is not re-aimed.
+        if (OverseerDecisions::StraightFinishIsLethal(
+                bot->GetMapId(), wx, wy, wz, bot->GetPositionX(), bot->GetPositionY(),
+                bot->GetPositionZ()))
+            return false;
 
         // 2. AND OTHERWISE A SHORT STEP, OVER GROUND THAT HOLDS.
         //
