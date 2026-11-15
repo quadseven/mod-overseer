@@ -79872,6 +79872,8 @@ private:
         LOG_WARN("module.overseer",
                  "overseer: unlearn-skill is giving up {} ({}) for '{}' at {}/{}",
                  skillName, request.skill, who->GetName(), liveValue, request.max);
+        // natural-only: drops a guild seat's existing gathering skill after
+        // the guild, roster, skill and ceiling checks above.
         who->SetSkill(static_cast<uint16>(request.skill), 0, 0, 0);
         if (who->HasSkill(request.skill))
         {
