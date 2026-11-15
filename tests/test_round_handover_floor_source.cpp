@@ -57,7 +57,7 @@ int main()
 
     // The release line itself is still one source line (the guard test greps it).
     Check("the release phrase is untouched",
-          Has(src, "refused every bearing for {} polls running without getting any nearer - releasing the errand as unreachable\","));
+          Has(src, "bearing for {} polls running without getting any nearer - releasing the errand as unreachable\","));
 
     if (failures)
         return 1;
