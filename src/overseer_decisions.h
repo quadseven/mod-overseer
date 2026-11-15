@@ -18446,6 +18446,51 @@ constexpr char const* Dead         = "character is dead";
 // yet, money, death). Malformed, not a weapon and already held never will.
 bool WeaponTrainRefusalRetryable(std::string const& reason);
 
+// A guild seat gives up one of the three slot-consuming gathering trades so
+// the bridge can send its next craft-training command. This remains a verb of
+// kind='cast'; it does not add an overseer_command kind or schema migration.
+//
+//   unlearn-skill skill:<id> max:<ceiling>
+//
+// The ceiling is explicit and bounded because the bridge only authorizes low
+// skill values. Only Herbalism (182), Mining (186) and Skinning (393) qualify.
+constexpr char const* UNLEARN_SKILL_VERB = "unlearn-skill";
+constexpr uint32_t UNLEARN_SKILL_MAX_CEILING = 75;
+
+struct UnlearnSkillRequest
+{
+    uint32_t skill{0};
+    uint32_t max{0};
+    char const* error{""};
+};
+
+namespace UnlearnSkillRefusal
+{
+constexpr char const* Malformed =
+    "malformed unlearn-skill command: want unlearn-skill skill:<id> max:<ceiling>";
+constexpr char const* NotNaturalGuild = "character is not in a configured natural guild";
+constexpr char const* RosterCharacter = "roster characters cannot use command unlearn";
+constexpr char const* NotGathering = "only Herbalism, Mining and Skinning may be unlearned";
+constexpr char const* AboveCeiling = "live skill value exceeds the command max ceiling";
+constexpr char const* StillHeld = "character still has the skill after SetSkill";
+}  // namespace UnlearnSkillRefusal
+
+bool IsUnlearnSkillRow(std::string const& command);
+UnlearnSkillRequest ParseUnlearnSkillRequest(std::string const& command);
+
+enum class UnlearnSkillAction
+{
+    NotNaturalGuild,
+    RosterCharacter,
+    NotGathering,
+    AlreadyAbsent,
+    AboveCeiling,
+    ReadyToUnlearn
+};
+
+UnlearnSkillAction DecideUnlearnSkill(bool inNaturalGuild, bool onRoster, uint32_t skill,
+                                      bool hasSkill, uint32_t liveValue, uint32_t max);
+
 // THE FOUR THINGS A LEARN ROW CAN HONESTLY CLAIM. Shorter than CastOutcome's
 // list because the post-condition here is exact: Player::HasSpell is the
 // worldserver's own answer to the only question that matters, and it is

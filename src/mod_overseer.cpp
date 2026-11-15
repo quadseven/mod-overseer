@@ -66220,6 +66220,10 @@ private:
                 // grammars cannot collide.
                 detail = DoWalk(player, command, OverseerDecisions::WalkGoal::Trainer, status,
                                 rowResult, _pendingMailWalks, id);
+            else if (kind == "cast" && OverseerDecisions::IsUnlearnSkillRow(command))
+                // A guild seat gives up one gathering trade before the bridge
+                // sends its walk to the trainer for the replacement craft.
+                detail = DoUnlearnSkill(player, command, status, rowResult);
             else if (kind == "cast" && OverseerDecisions::IsWeaponTrainRow(command))
                 // A WEAPON SKILL BOUGHT AT A WEAPON MASTER (wow-overseer#399), on
                 // kind='cast' and routed on the first word like `use`.
@@ -79807,6 +79811,98 @@ private:
             }
         }
         return refuse(R::NoTrainer);
+    }
+
+    static char const* DoUnlearnSkill(Player* who, std::string const& command,
+                                      char const*& status, std::string& out)
+    {
+        using OverseerDecisions::UnlearnSkillAction;
+        using OverseerDecisions::UnlearnSkillRequest;
+        using OverseerDecisions::DecideUnlearnSkill;
+        using OverseerDecisions::ParseUnlearnSkillRequest;
+        namespace R = OverseerDecisions::UnlearnSkillRefusal;
+
+        if (!who)
+            return "no character";
+
+        UnlearnSkillRequest const request = ParseUnlearnSkillRequest(command);
+        uint32 const liveValue = request.skill ? who->GetPureSkillValue(request.skill) : 0;
+        char const* const skillName = request.skill ? SkillName(request.skill) : "unlearn-skill";
+        auto finish = [&](char const* outcome, char const* reason) -> char const*
+        {
+            std::ostringstream result;
+            result << "{\"outcome\":" << J(outcome)
+                   << ",\"reason\":" << J(reason ? reason : "")
+                   << ",\"who\":" << J(who->GetName())
+                   << ",\"skill\":" << request.skill
+                   << ",\"skill_name\":" << J(skillName)
+                   << ",\"live_value\":" << liveValue
+                   << ",\"max\":" << request.max
+                   << ",\"request\":" << J(command) << "}";
+            out = result.str();
+
+            std::ostringstream event;
+            event << outcome << "; skill value " << liveValue << ", max " << request.max;
+            if (reason && reason[0])
+                event << ": " << reason;
+            std::string const eventDetail = event.str();
+            bool const refused = std::string(outcome) == "refused";
+            char const* const eventKind = refused ? "unlearn_refused" : "unlearn";
+            if (refused)
+                LOG_WARN("module.overseer",
+                         "overseer: unlearn-skill row for '{}' refused - {} (skill {}, live {}, max {})",
+                         who->GetName(), reason, request.skill, liveValue, request.max);
+            else
+                LOG_INFO("module.overseer",
+                         "overseer: unlearn-skill row for '{}' ended {} (skill {} {}, live {}, max {})",
+                         who->GetName(), outcome, request.skill, skillName, liveValue, request.max);
+            // RecordEvent excludes non-roster characters. This command is
+            // specifically for guild seats, so queue its outcome directly.
+            QueueEvent(who, eventKind, request.skill, skillName, eventDetail, EventExtra());
+            return reason && reason[0] ? reason : "";
+        };
+
+        if (request.error[0])
+            return finish("refused", request.error);
+
+        bool const inNaturalGuild = InNaturalGuild(who);
+        bool const onRoster = OnRoster(who->GetName());
+        bool const hasSkill = who->HasSkill(request.skill);
+        UnlearnSkillAction const action = DecideUnlearnSkill(
+            inNaturalGuild, onRoster, request.skill, hasSkill, liveValue, request.max);
+        switch (action)
+        {
+            case UnlearnSkillAction::NotNaturalGuild:
+                return finish("refused", R::NotNaturalGuild);
+            case UnlearnSkillAction::RosterCharacter:
+                return finish("refused", R::RosterCharacter);
+            case UnlearnSkillAction::NotGathering:
+                return finish("refused", R::NotGathering);
+            case UnlearnSkillAction::AlreadyAbsent:
+                status = "applied";
+                return finish("already-unlearned", "");
+            case UnlearnSkillAction::AboveCeiling:
+                return finish("refused", R::AboveCeiling);
+            case UnlearnSkillAction::ReadyToUnlearn:
+                break;
+        }
+
+        LOG_WARN("module.overseer",
+                 "overseer: unlearn-skill is giving up {} ({}) for '{}' at {}/{}",
+                 skillName, request.skill, who->GetName(), liveValue, request.max);
+        // natural-only: drops a guild seat's existing gathering skill after
+        // the guild, roster, skill and ceiling checks above.
+        who->SetSkill(static_cast<uint16>(request.skill), 0, 0, 0);
+        if (who->HasSkill(request.skill))
+        {
+            LOG_ERROR("module.overseer",
+                      "overseer: '{}' still has {} ({}) after SetSkill cleared it",
+                      who->GetName(), skillName, request.skill);
+            return finish("refused", R::StillHeld);
+        }
+
+        status = "applied";
+        return finish("unlearned", "");
     }
 
     static char const* DoLearnRecipe(Player* who, std::string const& command,
