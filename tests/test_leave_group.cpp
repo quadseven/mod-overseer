@@ -89,6 +89,70 @@ void TheGateRefusesWhatLeavingWouldBreak()
     Check("not in a fight", Is(D::LeaveGroupGate(f), D::LeaveGroupRefusal::InCombat));
 }
 
+void ALeftoverFinderGroupMayBeLeft()
+{
+    // Seen live: two finder groups of finished runs held three guild raid
+    // seats as followers for days, 81 refusals in a day, because every finder
+    // group was refused whether or not the finder still served it. A group
+    // nobody stands inside and the finder is not matching is a leftover, the
+    // same word FinderGroupStillServes gives the family's own cleanup.
+    D::LeaveGroupFacts f = Follower();
+    f.finderGroup = true;
+    f.finderState = D::FinderState::None;
+    f.finderMemberInInstance = false;
+    Check("a leftover finder group may be left", Is(D::LeaveGroupGate(f), ""));
+
+    f.finderState = D::FinderState::Other;
+    Check("a finished finder run may be left", Is(D::LeaveGroupGate(f), ""));
+
+    f.finderState = D::FinderState::Dungeon;
+    Check("a finder group in its dungeon with nobody inside is a leftover",
+          Is(D::LeaveGroupGate(f), ""));
+}
+
+void AFinderGroupTheFinderStillServesIsLeftAlone()
+{
+    D::LeaveGroupFacts f = Follower();
+    f.finderGroup = true;
+    f.finderState = D::FinderState::Queued;
+    Check("a queued finder group is left alone",
+          Is(D::LeaveGroupGate(f), D::LeaveGroupRefusal::Battleground));
+
+    f.finderState = D::FinderState::RoleCheck;
+    Check("a role check is left alone",
+          Is(D::LeaveGroupGate(f), D::LeaveGroupRefusal::Battleground));
+
+    f.finderState = D::FinderState::Proposal;
+    Check("a proposal is left alone",
+          Is(D::LeaveGroupGate(f), D::LeaveGroupRefusal::Battleground));
+
+    f.finderState = D::FinderState::None;
+    f.finderMemberInInstance = true;
+    Check("a finder group with a member inside is left alone",
+          Is(D::LeaveGroupGate(f), D::LeaveGroupRefusal::Battleground));
+}
+
+void ALeftoverFinderGroupStillHasTheOtherWalls()
+{
+    D::LeaveGroupFacts f = Follower();
+    f.finderGroup = true;
+    f.leadsGroup = true;
+    Check("the leader of a leftover finder group does not leave",
+          Is(D::LeaveGroupGate(f), D::LeaveGroupRefusal::LeadsGroup));
+
+    f = Follower();
+    f.finderGroup = true;
+    f.inCombat = true;
+    Check("a leftover finder group is not left in a fight",
+          Is(D::LeaveGroupGate(f), D::LeaveGroupRefusal::InCombat));
+
+    f = Follower();
+    f.finderGroup = true;
+    f.battleground = true;
+    Check("a battleground is a wall whatever the finder says",
+          Is(D::LeaveGroupGate(f), D::LeaveGroupRefusal::Battleground));
+}
+
 void APlayerIsAskedFirst()
 {
     // Every wall is up: the player wall is named before the rest, so a row
@@ -109,6 +173,9 @@ int main()
     TheRowIsItsFirstWord();
     AFollowerMayLeave();
     TheGateRefusesWhatLeavingWouldBreak();
+    ALeftoverFinderGroupMayBeLeft();
+    AFinderGroupTheFinderStillServesIsLeftAlone();
+    ALeftoverFinderGroupStillHasTheOtherWalls();
     APlayerIsAskedFirst();
     if (failures)
         return 1;
