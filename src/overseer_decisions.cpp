@@ -15749,6 +15749,58 @@ bool WeaponTrainRefusalRetryable(std::string const& reason)
            reason == WeaponTrainRefusal::Dead;
 }
 
+bool IsUnlearnSkillRow(std::string const& command)
+{
+    std::vector<std::string> const words = LearnWords(command);
+    return !words.empty() && words[0] == UNLEARN_SKILL_VERB;
+}
+
+UnlearnSkillRequest ParseUnlearnSkillRequest(std::string const& command)
+{
+    UnlearnSkillRequest request;
+    std::vector<std::string> const words = LearnWords(command);
+    auto malformed = []() -> UnlearnSkillRequest
+    {
+        UnlearnSkillRequest bad;
+        bad.error = UnlearnSkillRefusal::Malformed;
+        return bad;
+    };
+    if (words.size() != 3 || words[0] != UNLEARN_SKILL_VERB)
+        return malformed();
+
+    bool sawSkill = false;
+    bool sawMax = false;
+    for (std::size_t i = 1; i < words.size(); ++i)
+    {
+        if (!sawSkill && LearnKeyed(words[i], "skill", request.skill) && request.skill != 0)
+            sawSkill = true;
+        else if (!sawMax && LearnKeyed(words[i], "max", request.max) && request.max != 0 &&
+                 request.max <= UNLEARN_SKILL_MAX_CEILING)
+            sawMax = true;
+        else
+            return malformed();
+    }
+    if (!sawSkill || !sawMax)
+        return malformed();
+    return request;
+}
+
+UnlearnSkillAction DecideUnlearnSkill(bool inNaturalGuild, bool onRoster, uint32_t skill,
+                                      bool hasSkill, uint32_t liveValue, uint32_t max)
+{
+    if (onRoster)
+        return UnlearnSkillAction::RosterCharacter;
+    if (!inNaturalGuild)
+        return UnlearnSkillAction::NotNaturalGuild;
+    if (skill != 182 && skill != 186 && skill != 393)
+        return UnlearnSkillAction::NotGathering;
+    if (!hasSkill)
+        return UnlearnSkillAction::AlreadyAbsent;
+    if (liveValue > max)
+        return UnlearnSkillAction::AboveCeiling;
+    return UnlearnSkillAction::ReadyToUnlearn;
+}
+
 LearnRequest ParseLearnRequest(std::string const& command)
 {
     LearnRequest request;

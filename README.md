@@ -100,6 +100,15 @@ summons are dismissed rather than recreated. The command row retains the carry
 name when a run is adopted after a restart. Only passive strategies added by
 the run are removed on exit; disconnected members are restored on reconnect.
 
+### Unlearning a gathering profession
+
+The `kind='cast'` verb `unlearn-skill skill:<id> max:<ceiling>` can release
+Herbalism (182), Mining (186) or Skinning (393) from a non-roster character in
+a configured natural guild. The ceiling must be from 1 through 75, and the
+module refuses a live skill value above it. An absent skill is already done;
+otherwise the module calls `SetSkill`, reads `HasSkill` back, and records the
+outcome in the command row and event stream.
+
 ### Disenchanting a carried item
 
 A `disenchant` command names one enabled roster character on `job='craft'`.
