@@ -20230,8 +20230,10 @@ std::vector<std::string> RaidKnockOrder(std::vector<std::string> const& inDoor,
 // member of the caster's own raid. The Blackrock Mountain meeting stones need
 // neither: GameObject::Use's MEETINGSTONE case lets any raid member standing at
 // the stone summon any other raid member, and refuses only when either of the
-// two is below the stone's minimum level (179587 reads 55 and 179586 reads 48
-// on the dev realm; the adapter reads the template, not these numbers). The
+// two is below the stone's minimum level (the adapter reads the template, not a number
+// kept here). The stones are 179584 and 179585, the two the world spawns by the
+// mountain; 179586 and 179587 have templates but no spawn, so naming them left
+// the door with no stone at all (#1570). The
 // seats are already one raid (FormRaidFromSeats) and kind='summon' already
 // drives the whole chain: the walk of both clickers onto the stone, the
 // portal, the settle, the accept and the read-back.
