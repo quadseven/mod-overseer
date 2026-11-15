@@ -27936,4 +27936,88 @@ std::string ShareRetentionDeleteSql(std::vector<uint32_t> const& ids)
            ") AND kind = 'share' AND status IN ('delivered', 'error')";
 }
 
+// ------------------------------ the Molten Core entrance walkway (#1573) --
+
+bool AimOnMoltenCoreWalkway(std::uint32_t mapId, float x, float y, float z)
+{
+    namespace W = MoltenCoreWalkway;
+    if (mapId != W::MAP_ID || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+        return false;
+    float const dx = x - W::LOTHOS_X;
+    float const dy = y - W::LOTHOS_Y;
+    return dx * dx + dy * dy <= W::AIM_RADIUS_YARDS * W::AIM_RADIUS_YARDS &&
+           std::fabs(z - W::LOTHOS_Z) <= W::AIM_HEIGHT_YARDS;
+}
+
+bool StraightFinishIsLethal(std::uint32_t mapId, float aimX, float aimY, float aimZ, float fromX,
+                            float fromY, float fromZ, bool feetInLethalLiquid)
+{
+    namespace W = MoltenCoreWalkway;
+    if (feetInLethalLiquid || !AimOnMoltenCoreWalkway(mapId, aimX, aimY, aimZ) ||
+        !std::isfinite(fromX) ||
+        !std::isfinite(fromY) || !std::isfinite(fromZ))
+        return false;
+    float const dx = fromX - W::LOTHOS_X;
+    float const dy = fromY - W::LOTHOS_Y;
+    return dx * dx + dy * dy <= W::NEAR_YARDS * W::NEAR_YARDS &&
+           std::fabs(fromZ - W::LOTHOS_Z) <= W::NEAR_HEIGHT_YARDS;
+}
+
+bool PolyAdmitted(std::uint16_t flags, std::vector<RoutePoint> const& corners)
+{
+    namespace W = MoltenCoreWalkway;
+    if ((flags & (W::NAV_MAGMA | W::NAV_GROUND_STEEP)) != 0)
+        return false;
+    if ((flags & W::NAV_SLIME) == 0)
+        return (flags & (W::NAV_GROUND | W::NAV_WATER)) != 0;
+    // A SLIME polygon is admitted only when it is one of the two slivers.
+    if (corners.empty())
+        return false;
+    for (RoutePoint const& corner : corners)
+    {
+        bool onASeam = false;
+        for (unsigned i = 0; i < W::SEAM_COUNT && !onASeam; ++i)
+        {
+            float const dx = corner.x - W::SEAM_X[i];
+            float const dy = corner.y - W::SEAM_Y[i];
+            onASeam = dx * dx + dy * dy <= W::SEAM_RADIUS_YARDS * W::SEAM_RADIUS_YARDS &&
+                      std::fabs(corner.z - W::SEAM_Z[i]) <= W::SEAM_HEIGHT_YARDS;
+        }
+        if (!onASeam)
+            return false;
+    }
+    return true;
+}
+
+bool WalkwayRouteArrives(float endX, float endY, float endZ, float aimX, float aimY, float aimZ)
+{
+    namespace W = MoltenCoreWalkway;
+    if (!std::isfinite(endX) || !std::isfinite(endY) || !std::isfinite(endZ))
+        return false;
+    float const dx = endX - aimX;
+    float const dy = endY - aimY;
+    return dx * dx + dy * dy <= W::ARRIVE_YARDS * W::ARRIVE_YARDS &&
+           std::fabs(endZ - aimZ) <= W::ARRIVE_YARDS;
+}
+
+std::size_t DropBogusDoorLinks(std::vector<RouteLink>& links, std::uint32_t mapId, float aimX,
+                               float aimY, float aimZ)
+{
+    namespace W = MoltenCoreWalkway;
+    if (!AimOnMoltenCoreWalkway(mapId, aimX, aimY, aimZ))
+        return 0;
+    std::size_t const before = links.size();
+    links.erase(std::remove_if(links.begin(), links.end(),
+                               [](RouteLink const& link)
+                               {
+                                   for (unsigned i = 0; i < W::BOGUS_LINK_COUNT; ++i)
+                                       if (link.from == W::BOGUS_LINK_FROM[i] &&
+                                           link.to == W::BOGUS_LINK_TO[i])
+                                           return true;
+                                   return false;
+                               }),
+                links.end());
+    return before - links.size();
+}
+
 }  // namespace OverseerDecisions

@@ -30378,6 +30378,109 @@ std::string ShareRetentionCountSql();
 // every row it reads, and this read covers every answered share row.
 std::string ShareRetentionDeleteSql(std::vector<uint32_t> const& ids);
 
+// ------------------------------ the Molten Core entrance walkway (#1573) --
+//
+// WHY THIS EXISTS. Lothos Riftwaker stands on a walkway on the outside of
+// Blackrock Mountain, 12 yards above a lake of lava. The navmesh there is
+// ground all the way, EXCEPT for two slivers about half a yard wide that the
+// mesh generator tagged SLIME where the walkway's two stretches meet, at
+// (-7533.7, -1071.4) and (-7523.5, -1052.4), z 181.1 to 181.3. PathGenerator's
+// filter for a headless bot excludes MAGMA, SLIME and STEEP, so every path
+// toward Lothos ends 40 yards short, at (-7534.6, -1072.5, 182), and the
+// straight finish that followed walked off the walkway into the lake.
+//
+// Read off the pinned core's tiles (MMAP_VERSION 20), area flags are GROUND 1,
+// MAGMA 2, SLIME 4, WATER 8, STEEP 0x10. The route is 1031 yards from the
+// Blackrock Spire ring and its last 40 yards cross both slivers.
+//
+// WHAT IS DONE. For an aim on this walkway the adapter paths with a filter
+// that also admits SLIME, and then asks PolyAdmitted of EVERY polygon the path
+// uses: MAGMA and STEEP are never admitted, and a SLIME polygon only when it
+// is one of the two slivers (every corner within SEAM_RADIUS_YARDS of a seam
+// centre, and at the walkway's height, not the lake's). So the wider filter
+// cannot carry a path across the lake: the lake's own SLIME polygons, 12 yards
+// down, fail the height test. The waypoints are whatever the navmesh says at
+// run time; none is written down here.
+//
+// AND THE SURVEY LINK THAT CLIMBS THE OUTSIDE OF THE MOUNTAIN IS DROPPED FOR
+// THIS AIM. The shipped travel survey joins node 3380 ("Burning Steppes
+// Dracodar") to nodes 1485 and 1486 ("Molten Core entrance"); the recorded path
+// climbs the outside of the mountain, about thirty of its waypoints are on no
+// navmesh polygon at all, and its last point drops 83 yards through the roof.
+namespace MoltenCoreWalkway
+{
+constexpr std::uint32_t MAP_ID = 0;   // Eastern Kingdoms: Blackrock Mountain's own map
+constexpr float LOTHOS_X = -7508.63f;
+constexpr float LOTHOS_Y = -1039.84f;
+constexpr float LOTHOS_Z = 180.995f;
+// An aim this near Lothos in the plane, and within AIM_HEIGHT_YARDS of his
+// floor, is an aim on the walkway. It covers the door's staging point, which
+// is 0.4 yards from him.
+constexpr float AIM_RADIUS_YARDS = 25.f;
+constexpr float AIM_HEIGHT_YARDS = 8.f;
+// A character this close in the plane and this near his height is where the
+// straight finish is lethal, so nothing is drawn at the aim from there.
+constexpr float NEAR_YARDS = 100.f;
+constexpr float NEAR_HEIGHT_YARDS = 25.f;
+// How far along the route one step reaches. Short on purpose: a step that
+// crosses a sliver is drawn straight by the mover, and eight yards of walkway
+// is as far as a straight line can be trusted to stay on it.
+constexpr float STEP_YARDS = 8.f;
+// The route has to end this near him to be a route to him.
+constexpr float ARRIVE_YARDS = 5.f;
+
+// The navmesh's own area flags (MoveMapSharedDefines.h NavTerrain).
+constexpr std::uint16_t NAV_GROUND = 0x01;
+constexpr std::uint16_t NAV_MAGMA = 0x02;
+constexpr std::uint16_t NAV_SLIME = 0x04;
+constexpr std::uint16_t NAV_WATER = 0x08;
+constexpr std::uint16_t NAV_GROUND_STEEP = 0x10;
+
+// What the filter includes and excludes. SLIME is included here and then
+// policed polygon by polygon by PolyAdmitted; MAGMA and STEEP stay excluded.
+constexpr std::uint16_t INCLUDE_FLAGS = NAV_GROUND | NAV_WATER | NAV_SLIME;
+constexpr std::uint16_t EXCLUDE_FLAGS = NAV_MAGMA | NAV_GROUND_STEEP;
+
+// The two slivers: centre and the radius every corner of one must fall in.
+constexpr float SEAM_RADIUS_YARDS = 4.f;
+constexpr float SEAM_HEIGHT_YARDS = 2.f;
+constexpr unsigned SEAM_COUNT = 2;
+constexpr float SEAM_X[SEAM_COUNT] = {-7533.7f, -7523.5f};
+constexpr float SEAM_Y[SEAM_COUNT] = {-1071.4f, -1052.4f};
+constexpr float SEAM_Z[SEAM_COUNT] = {181.3f, 181.1f};
+
+// The survey links that are not a way to the door. Node ids, from -> to.
+constexpr unsigned BOGUS_LINK_COUNT = 2;
+constexpr std::uint32_t BOGUS_LINK_FROM[BOGUS_LINK_COUNT] = {3380, 3380};
+constexpr std::uint32_t BOGUS_LINK_TO[BOGUS_LINK_COUNT] = {1485, 1486};
+}  // namespace MoltenCoreWalkway
+
+// Is this aim on the walkway Lothos stands on? False on any other map.
+bool AimOnMoltenCoreWalkway(std::uint32_t mapId, float x, float y, float z);
+
+// Would a straight finish from here be lethal: the aim is on the walkway and
+// the character is within NEAR_YARDS of it, close to its height. The adapter
+// refuses to draw a line at the aim from here when no route was found.
+// A character whose feet are already in lethal liquid is NOT refused: it is in
+// the lake, and the wade-out (#1569) must be free to run (#1576).
+bool StraightFinishIsLethal(std::uint32_t mapId, float aimX, float aimY, float aimZ,
+                            float fromX, float fromY, float fromZ, bool feetInLethalLiquid);
+
+// May a path use this polygon? `flags` are the polygon's navmesh flags and
+// `corners` its corners in world coordinates. GROUND and WATER yes; MAGMA and
+// STEEP never; SLIME only when it is one of the two slivers on the walkway.
+bool PolyAdmitted(std::uint16_t flags, std::vector<RoutePoint> const& corners);
+
+// Does a route that ends at (endX, endY, endZ) reach the aim within
+// ARRIVE_YARDS, in the plane and in height?
+bool WalkwayRouteArrives(float endX, float endY, float endZ, float aimX, float aimY, float aimZ);
+
+// Drop from `links` the survey links that are not a way to the door, when the
+// aim is on the walkway. Returns how many were dropped. Nothing changes for any
+// other aim.
+std::size_t DropBogusDoorLinks(std::vector<RouteLink>& links, std::uint32_t mapId, float aimX,
+                               float aimY, float aimZ);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

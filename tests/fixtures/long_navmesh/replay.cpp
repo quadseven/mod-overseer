@@ -113,9 +113,11 @@ constexpr float TRAVEL_STEP_YARDS = 60, TRAVEL_GROUND_SNAP_YARDS = 3,
                 TRAVEL_ROUTE_ENDPOINT_YARDS = 5,
                 TRAVEL_FIRST_LEG_STRIDE_YARDS = 5, TRAVEL_GROUND_DROP_YARDS = 5,
                 TRAVEL_STEP_MIN_YARDS = 8;
-bool SurfaceAt(Player *, float, float, float, float &) { return false; }
+bool SurfaceAt(Player *, float, float, float, float &, bool * = nullptr) { return false; }
 bool GroundHolds(Player *, float, float, float &, float *) { return false; }
 bool NothingInTheWay(Player *, float, float, float) { return false; }
+// The Lothos walkway reads the loaded navmesh, which this replay has none of (#1573).
+bool MoltenCoreWalkwayLeg(Player *, WorldPosition const &, WorldPosition &) { return false; }
 // RUNTIME_BODIES
 // This is the session/transport boundary. It models the core refusing any
 // crossing outside the unchanged trigger; the production knock is injected.
