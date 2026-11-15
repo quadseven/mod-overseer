@@ -25648,9 +25648,15 @@ private:
         // probes the heightmap, and the lava lake beside his walkway is a model's
         // floor to it, so a straight finish from the walkway walked into the lake.
         // Refused like any other step with no ground; the walk is not re-aimed.
+        // A character already standing in lava or slime is exempt, so the wade-out
+        // (#1569) still runs from the lake.
+        bool feetInLiquid = false;
+        float feetSurface = 0.f;
+        SurfaceAt(bot, bot->GetPositionX(), bot->GetPositionY(),
+                  bot->GetPositionZ() + TRAVEL_GROUND_DROP_YARDS, feetSurface, &feetInLiquid);
         if (OverseerDecisions::StraightFinishIsLethal(
                 bot->GetMapId(), wx, wy, wz, bot->GetPositionX(), bot->GetPositionY(),
-                bot->GetPositionZ()))
+                bot->GetPositionZ(), feetInLiquid))
             return false;
 
         // 2. AND OTHERWISE A SHORT STEP, OVER GROUND THAT HOLDS.

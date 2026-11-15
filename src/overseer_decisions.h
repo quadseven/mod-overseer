@@ -30461,8 +30461,10 @@ bool AimOnMoltenCoreWalkway(std::uint32_t mapId, float x, float y, float z);
 // Would a straight finish from here be lethal: the aim is on the walkway and
 // the character is within NEAR_YARDS of it, close to its height. The adapter
 // refuses to draw a line at the aim from here when no route was found.
+// A character whose feet are already in lethal liquid is NOT refused: it is in
+// the lake, and the wade-out (#1569) must be free to run (#1576).
 bool StraightFinishIsLethal(std::uint32_t mapId, float aimX, float aimY, float aimZ,
-                            float fromX, float fromY, float fromZ);
+                            float fromX, float fromY, float fromZ, bool feetInLethalLiquid);
 
 // May a path use this polygon? `flags` are the polygon's navmesh flags and
 // `corners` its corners in world coordinates. GROUND and WATER yes; MAGMA and

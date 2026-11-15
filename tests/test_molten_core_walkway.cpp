@@ -300,14 +300,22 @@ void TheAimIsThePocket()
 
     Check("from the walkway's start the straight finish is lethal",
           StraightFinishIsLethal(0, W::LOTHOS_X, W::LOTHOS_Y, W::LOTHOS_Z, START_X, START_Y,
-                                 START_Z),
+                                 START_Z, false),
           true);
     Check("from the Spire ring it is not asked",
           StraightFinishIsLethal(0, W::LOTHOS_X, W::LOTHOS_Y, W::LOTHOS_Z, -7532.f, -1222.f,
-                                 286.f),
+                                 286.f, false),
           false);
+    Check("a character standing in the lake is not refused",
+          StraightFinishIsLethal(0, W::LOTHOS_X, W::LOTHOS_Y, W::LOTHOS_Z, -7499.f, -1019.f,
+                                 169.f, true),
+          false);
+    Check("the same spot with dry feet is refused",
+          StraightFinishIsLethal(0, W::LOTHOS_X, W::LOTHOS_Y, W::LOTHOS_Z, -7499.f, -1019.f,
+                                 169.f, false),
+          true);
     Check("for another aim it is not asked",
-          StraightFinishIsLethal(0, -7176.63f, -937.667f, 170.206f, START_X, START_Y, START_Z),
+          StraightFinishIsLethal(0, -7176.63f, -937.667f, 170.206f, START_X, START_Y, START_Z, false),
           false);
 }
 

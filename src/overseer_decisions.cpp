@@ -27950,10 +27950,11 @@ bool AimOnMoltenCoreWalkway(std::uint32_t mapId, float x, float y, float z)
 }
 
 bool StraightFinishIsLethal(std::uint32_t mapId, float aimX, float aimY, float aimZ, float fromX,
-                            float fromY, float fromZ)
+                            float fromY, float fromZ, bool feetInLethalLiquid)
 {
     namespace W = MoltenCoreWalkway;
-    if (!AimOnMoltenCoreWalkway(mapId, aimX, aimY, aimZ) || !std::isfinite(fromX) ||
+    if (feetInLethalLiquid || !AimOnMoltenCoreWalkway(mapId, aimX, aimY, aimZ) ||
+        !std::isfinite(fromX) ||
         !std::isfinite(fromY) || !std::isfinite(fromZ))
         return false;
     float const dx = fromX - W::LOTHOS_X;
