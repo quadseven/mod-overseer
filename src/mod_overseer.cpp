@@ -74200,6 +74200,143 @@ private:
             return "";
         }
 
+        // THE TWO VERBS BELOW ARE A GUILD OFFICER'S PROMOTE AND MOTD (#2616), and
+        // they act only on a guild this module manages: one named in
+        // Overseer.Natural.Guilds or Overseer.Retire.KeepGuilds. A row aimed at
+        // any other guild is refused whoever sent it, because the acting
+        // character's rank in somebody else's guild is not this module's to use.
+        if (request.verb == GuildVerb::Promote || request.verb == GuildVerb::Motd)
+        {
+            bool managed = false;
+            for (std::vector<std::string> const& names : {NaturalGuilds(), RetireKeepGuilds()})
+                managed = managed || std::find(names.begin(), names.end(), guild->GetName()) != names.end();
+
+            if (request.verb == GuildVerb::Promote)
+            {
+                // ChangeMemberRank, not HandleUpdateMemberRank: the core's own
+                // promote moves ONE rung per call and answers a refusal with a
+                // packet a bot cannot read, while ChangeMemberRank sets the rung
+                // and returns a bool. It checks nothing about the actor, so
+                // every rule a promoter obeys is asked here first (the verdict
+                // is pinned in tests/test_guild.cpp) and the rank is read back.
+                using OverseerDecisions::GuildPromoteFacts;
+                using OverseerDecisions::GuildPromoteVerdict;
+
+                GuildPromoteFacts facts;
+                facts.managedGuild = managed;
+                facts.named = !targetArg.empty();
+                ObjectGuid const targetGuid =
+                    facts.named ? sCharacterCache->GetCharacterGuidByName(targetArg) : ObjectGuid::Empty;
+                facts.exists = !targetGuid.IsEmpty();
+                Guild::Member const* target = facts.exists ? guild->GetMember(targetGuid) : nullptr;
+                facts.inThisGuild = target != nullptr;
+                facts.actorMayPromote = guild->HasRankRight(who, GR_RIGHT_PROMOTE);
+                if (Guild::Member const* me = guild->GetMember(who->GetGUID()))
+                    facts.actorRank = me->GetRankId();
+                if (target)
+                    facts.targetRank = target->GetRankId();
+                facts.requestedRank = request.promoteRank;
+                facts.rankCount = static_cast<unsigned>((guild->*GuildBankMemory::Ranks()).size());
+
+                std::string const targetName = target ? target->GetName() : targetArg;
+                {
+                    std::ostringstream o;
+                    o << "\"guild\":" << J(guild->GetName())
+                      << ",\"guild_id\":" << guild->GetId()
+                      << ",\"target\":" << J(targetName)
+                      << ",\"rank_before\":" << facts.targetRank
+                      << ",\"rank_wanted\":" << facts.requestedRank;
+                    note = o.str();
+                }
+
+                GuildPromoteVerdict const verdict = OverseerDecisions::GuildPromoteVerdictFor(facts);
+                if (verdict == GuildPromoteVerdict::AlreadyThere)
+                {
+                    LOG_INFO("module.overseer", "overseer: '{}' is already rank {} in guild '{}'",
+                             targetName, facts.requestedRank, guild->GetName());
+                    describe("already", "");
+                    status = "applied";
+                    return "";
+                }
+                if (verdict != GuildPromoteVerdict::Apply)
+                {
+                    char const* const said = OverseerDecisions::GuildPromoteVerdictSaid(verdict);
+                    LOG_INFO("module.overseer", "overseer: promote of '{}' in guild '{}' refused - {}",
+                             targetName, guild->GetName(), said);
+                    describe("refused", said);
+                    status = "unchanged";
+                    return said;
+                }
+
+                uint32 const guildId = guild->GetId();
+                if (!guild->ChangeMemberRank(targetGuid, uint8(facts.requestedRank)))
+                    return refuse("the core refused to change that rank");
+                Guild* after = sGuildMgr->GetGuildById(guildId);
+                Guild::Member const* moved = after ? after->GetMember(targetGuid) : nullptr;
+                if (!moved || moved->GetRankId() != facts.requestedRank)
+                    return refuse("the rank was not changed when it was read back");
+
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' moved '{}' from rank {} to rank {} in guild '{}' ({})",
+                         who->GetName(), targetName, facts.targetRank, facts.requestedRank,
+                         after->GetName(), guildId);
+                describe("promoted", "");
+                status = "applied";
+                return "";
+            }
+
+            // GuildVerb::Motd. HandleSetMOTD checks the right itself and
+            // returns without a word on a refusal, so the verdict asks first
+            // and the guild's own text, read back, is the witness.
+            using OverseerDecisions::GuildMotdFacts;
+            using OverseerDecisions::GuildMotdVerdict;
+
+            WorldSession* session = who->GetSession();
+            if (!session)
+                return refuse("that character has no session to set a guild message through");
+
+            GuildMotdFacts facts;
+            facts.managedGuild = managed;
+            facts.actorMayEdit = guild->HasRankRight(who, GR_RIGHT_SETMOTD);
+            facts.unchanged = guild->GetMOTD() == request.motd;
+            {
+                std::ostringstream o;
+                o << "\"guild\":" << J(guild->GetName())
+                  << ",\"guild_id\":" << guild->GetId()
+                  << ",\"motd\":" << J(request.motd);
+                note = o.str();
+            }
+
+            GuildMotdVerdict const verdict = OverseerDecisions::GuildMotdVerdictFor(facts);
+            if (verdict == GuildMotdVerdict::AlreadySet)
+            {
+                LOG_INFO("module.overseer", "overseer: guild '{}' already has that message of the day",
+                         guild->GetName());
+                describe("already", "");
+                status = "applied";
+                return "";
+            }
+            if (verdict != GuildMotdVerdict::Apply)
+            {
+                char const* const said = OverseerDecisions::GuildMotdVerdictSaid(verdict);
+                LOG_INFO("module.overseer", "overseer: message of the day for guild '{}' refused - {}",
+                         guild->GetName(), said);
+                describe("refused", said);
+                status = "unchanged";
+                return said;
+            }
+
+            guild->HandleSetMOTD(session, request.motd);
+            if (guild->GetMOTD() != request.motd)
+                return refuse("the core did not set the message of the day");
+
+            LOG_INFO("module.overseer", "overseer: {} set the message of the day of guild '{}'",
+                     who->GetName(), guild->GetName());
+            describe("set", "");
+            status = "applied";
+            return "";
+        }
+
         if (request.verb == GuildVerb::Tabard)
         {
             // BEFORE THE ROSTER READ, on purpose: a tabard is five numbers and
