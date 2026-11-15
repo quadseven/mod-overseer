@@ -28735,7 +28735,14 @@ struct LeaveGroupFacts
     bool isBot{false};         // the character has a bot AI; a person is never moved
     bool inGroup{false};
     bool leadsGroup{false};
-    bool battleground{false};  // a battleground, battlefield or dungeon finder group
+    bool battleground{false};  // a battleground or battlefield group
+    // A dungeon finder group. Only one the finder still serves is a wall
+    // (FinderGroupStillServes); a leftover of a finished run is left like any
+    // other group. Seen live: three guild raid seats held as followers of
+    // leftover finder groups for days, every leave refused.
+    bool finderGroup{false};
+    FinderState finderState{FinderState::None};
+    bool finderMemberInInstance{false};
     bool inInstance{false};
     bool inCombat{false};
 };
