@@ -178,6 +178,26 @@ The Overseer module: a C++ AzerothCore module that runs the bot families' decisi
 - **Public repo:** the rule below binds every file, commit, PR and comment.
 
 
+## Read this before changing bot behaviour
+
+The realm's worldserver compiles a core and six upstream modules, each pinned to a commit. The playerbots module already ships raid strategies (Molten Core included), class AI, gathering, travel and questing. The long list is `docs/DEPENDENCIES.md`.
+
+| Module | Already provides |
+|---|---|
+| `quadseven/mod-playerbots` (fork of `mod-playerbots/mod-playerbots`) | Strategy engine, class AI, 19 raid and 21 dungeon strategies, RPG, gathering, travel, quests |
+| `mod-playerbots/azerothcore-wotlk` | The core and its boss scripts |
+| `quadseven/mod-dungeon-clear` | A tank bot clears a dungeon on its own |
+| `DustinHendrickson/mod-ollama-chat` | LLM chat for bots |
+| `quadseven/mod-overseer` | This module, the control plane |
+| `noisiver/mod-junk-to-gold` | Grey loot sold on pickup |
+| `NathanHandley/mod-ah-bot-plus` | An auction bot; installed, its seller is intentionally not used |
+
+1. Before you write or file a bot behaviour, search the pinned module's source for an existing mechanism.
+2. Never copy a commit from memory. The realm's build pins each module to a commit; ask the operator or read the build's pins file.
+3. Read the source at the pinned commit, not the default branch.
+4. A mechanism that exists but is off is a config key, not a feature.
+5. Where you did not read the code, say "not read".
+
 ## Working on this module: things learned the expensive way
 
 None of this is policy. It is the set of mistakes that have actually been
