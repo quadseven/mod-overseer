@@ -16913,10 +16913,10 @@ RaidDoor const* RaidDoorFor(std::string const& keyword)
     // See RaidDoor for where every number comes from.
     static RaidDoor const doors[] = {
         {"moltencore", "Molten Core", 0, 3529, 409, 2890,
-         -7508.32f, -1039.74f, 180.912f, 50, "moltencore", {179587, 179586},
+         -7508.32f, -1039.74f, 180.912f, 50, "moltencore", {179584, 179585},
          "Blackrock Mountain", "", {0, 0, 0, 0}},
         {"ubrs", "Upper Blackrock Spire", 0, 1468, 229, 1470,
-         -7524.7f, -1228.41f, 287.204f, 45, "", {179587, 179586},
+         -7524.7f, -1228.41f, 287.204f, 45, "", {179585, 179584},
          "Blackrock Mountain", "ubrs", {9, 10, 12, 13}},
     };
     for (RaidDoor const& door : doors)

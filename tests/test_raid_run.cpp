@@ -633,7 +633,8 @@ RaidStoneSeat AtStone(char const* name, unsigned level, int stone)
     return seat;
 }
 
-// The two Blackrock Mountain stones as the dev realm's templates read them.
+// Two stones with different minimum levels: the choice logic is level-driven,
+// so the fixture keeps a high and a low floor whatever the real stones read.
 std::vector<RaidStone> Stones()
 {
     RaidStone high;
@@ -650,8 +651,14 @@ void TheDoorNamesTheMountainsTwoStones()
     RaidDoor const* door = RaidDoorFor("moltencore");
     if (!door)
         return;
-    Check("the level 55 stone", door->meetingStones[0] == 179587);
-    Check("the level 48 stone", door->meetingStones[1] == 179586);
+    // 179586 and 179587 have templates but no spawn in the world's data; the
+    // spawned pair is 179584 (Blackrock Depths) and 179585 (Blackrock Spire).
+    Check("the spawned depths stone", door->meetingStones[0] == 179584);
+    Check("the spawned spire stone", door->meetingStones[1] == 179585);
+    Check("never the unspawned level 55 stone",
+          door->meetingStones[0] != 179587 && door->meetingStones[1] != 179587);
+    Check("never the unspawned level 48 stone",
+          door->meetingStones[0] != 179586 && door->meetingStones[1] != 179586);
     CheckString("named for the log", door->stonesName, "Blackrock Mountain");
 }
 
@@ -874,7 +881,7 @@ void TheUpperSpireDoorIsTheLowerSpiresTriggerWithAWing()
     CheckString("the brain is armed on the upper wing", door->clearWing, "ubrs");
     Check("no bot strategy exists for the map", *door->fightStrategy == '\0');
     Check("the mountain's stones serve this door too",
-          door->meetingStones[0] == 179587 && door->meetingStones[1] == 179586);
+          door->meetingStones[0] == 179585 && door->meetingStones[1] == 179584);
     Check("the job names it", RaidKeywordForJob("raid:ubrs") == "ubrs");
 }
 
