@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-PATCH = HERE.parent / "patches/mod-playerbots/0026-a-bot-in-a-zone-with-no-spot-picks-one-from-a-neighbouring-zone.patch"
+PATCH = HERE.parent / "patches/mod-playerbots/0027-a-bot-in-a-zone-with-no-spot-picks-one-from-a-neighbouring-zone.patch"
 FIXTURES = HERE / "fixtures/zone_fallback"
 TARGET = "src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp"
 
