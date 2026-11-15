@@ -164,6 +164,13 @@ run_adapter() {
   echo "== adapter: applying mod-playerbots patches"
   (cd "$work/acore/modules/mod-overseer" && bash apply-patches.sh "$work/acore")
 
+  echo "== adapter: testing grind resource hold decision"
+  g++ -std=c++17 -Wall -Wextra -Werror \
+    -I "$work/acore/modules/mod-playerbots/src" \
+    "$repo_root/tests/adapter_grind_resource_hold.cpp" \
+    -o "$work/grind-resource-hold-decision"
+  "$work/grind-resource-hold-decision"
+
   echo "== adapter: configuring"
   mkdir -p "$work/acore/build"
   (
@@ -187,6 +194,26 @@ run_adapter() {
   local src="$work/acore/modules/mod-overseer/src/mod_overseer.cpp"
   local db="$work/acore/build/compile_commands.json"
   test -f "$db" || { echo "no compile_commands.json - configure did not produce one" >&2; return 1; }
+
+  echo "== adapter: compiling patched mod-playerbots decision sources"
+  local relative bot_src bot_cmd bot_syntax
+  local -a bot_args
+  for relative in \
+      Ai/Base/Actions/NonCombatActions.cpp \
+      Ai/Base/Strategy/GrindingStrategy.cpp \
+      Ai/Base/Trigger/GenericTriggers.cpp \
+      Ai/Base/Value/GrindTargetValue.cpp; do
+    bot_src="$work/acore/modules/mod-playerbots/src/$relative"
+    bot_cmd="$(jq -r --arg f "$bot_src" '[.[] | select(.file == $f)][0].command // empty' "$db")"
+    test -n "$bot_cmd" || {
+      echo "compile_commands.json has no entry for $bot_src" >&2
+      return 1
+    }
+    bot_syntax="$(printf '%s' "$bot_cmd" \
+      | sed -E 's@ -o [^ ]+@@g; s@ -c [^ ]+@@g; s@ -MD@@g; s@ -MT [^ ]+@@g; s@ -MF [^ ]+@@g')"
+    mapfile -t bot_args < <(xargs -n1 <<< "$bot_syntax")
+    "${bot_args[@]}" -fsyntax-only "$bot_src"
+  done
 
   local count
   count="$(jq --arg f "$src" '[.[] | select(.file == $f)] | length' "$db")"

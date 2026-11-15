@@ -1,0 +1,251 @@
+Subject: [PATCH] hold a solo grind before an unsafe pull
+
+WHY THIS PATCH EXISTS
+
+GrindTargetValue returns the first living attacker before it checks possible
+candidates, while GrindingStrategy turns an empty target into "attack anything".
+Neither decision reads a bot's health, mana or carried water and food. A solo
+bot without the needed consumable can therefore start another pull while too
+weak to survive it. This patch shares one pure decision between the target gate
+and a high-priority rest action. It uses carried inventory counts and never
+creates food or drink.
+
+WHAT WOULD LET THIS PATCH BE DELETED
+
+Delete this patch after an equivalent resource hold is merged into the pinned
+quadseven/mod-playerbots source and the realm pin advances past that change.
+
+APPLIES TO
+
+quadseven/mod-playerbots @ 40884e9c135c1daf27ffd894a6047502a5701130:
+GrindTargetValue, GrindingStrategy and their trigger/action registration.
+diff --git a/src/Ai/Base/ActionContext.h b/src/Ai/Base/ActionContext.h
+index 99d6159d..e40e8bea 100644
+--- a/src/Ai/Base/ActionContext.h
++++ b/src/Ai/Base/ActionContext.h
+@@ -120,6 +120,7 @@ public:
+         creators["mana potion"] = &ActionContext::mana_potion;
+         creators["food"] = &ActionContext::food;
+         creators["drink"] = &ActionContext::drink;
++        creators["rest before grinding"] = &ActionContext::rest_before_grinding;
+         creators["tank assist"] = &ActionContext::tank_assist;
+         creators["dps assist"] = &ActionContext::dps_assist;
+         creators["dps aoe"] = &ActionContext::dps_aoe;
+@@ -344,6 +345,7 @@ private:
+     static Action* attack_enemy_player(PlayerbotAI* botAI) { return new AttackEnemyPlayerAction(botAI); }
+     static Action* stay(PlayerbotAI* botAI) { return new StayAction(botAI); }
+     static Action* sit(PlayerbotAI* botAI) { return new SitAction(botAI); }
++    static Action* rest_before_grinding(PlayerbotAI* botAI) { return new RestBeforeGrindingAction(botAI); }
+     static Action* runaway(PlayerbotAI* botAI) { return new RunAwayAction(botAI); }
+     static Action* follow(PlayerbotAI* botAI) { return new FollowAction(botAI); }
+     static Action* move_from_group(PlayerbotAI* botAI) { return new MoveFromGroupAction(botAI); }
+diff --git a/src/Ai/Base/Actions/NonCombatActions.cpp b/src/Ai/Base/Actions/NonCombatActions.cpp
+index c537d9cd..b13ad219 100644
+--- a/src/Ai/Base/Actions/NonCombatActions.cpp
++++ b/src/Ai/Base/Actions/NonCombatActions.cpp
+@@ -150,3 +150,15 @@ bool EatAction::isPossible()
+ 
+     return botAI->HasCheat(BotCheatMask::food) || UseItemAction::isPossible();
+ }
++
++bool RestBeforeGrindingAction::Execute(Event /*event*/)
++{
++    if (!bot->IsAlive() || bot->IsInCombat())
++        return false;
++
++    if (bot->isMoving())
++        bot->StopMoving();
++
++    bot->SetStandState(UNIT_STAND_STATE_SIT);
++    return true;
++}
+diff --git a/src/Ai/Base/Actions/NonCombatActions.h b/src/Ai/Base/Actions/NonCombatActions.h
+index 31197408..1257ea9f 100644
+--- a/src/Ai/Base/Actions/NonCombatActions.h
++++ b/src/Ai/Base/Actions/NonCombatActions.h
+@@ -31,4 +31,12 @@ public:
+     bool isPossible() override;
+ };
+ 
++class RestBeforeGrindingAction : public Action
++{
++public:
++    RestBeforeGrindingAction(PlayerbotAI* botAI) : Action(botAI, "rest before grinding") {}
++
++    bool Execute(Event event) override;
++};
++
+ #endif
+diff --git a/src/Ai/Base/Strategy/GrindResourceHold.h b/src/Ai/Base/Strategy/GrindResourceHold.h
+new file mode 100644
+index 00000000..79f5657a
+--- /dev/null
++++ b/src/Ai/Base/Strategy/GrindResourceHold.h
+@@ -0,0 +1,36 @@
++/*
++ * This file is part of the mod-playerbots module for AzerothCore. See AUTHORS file for Copyright
++ * information; released under GNU GPL v2 license, redistribute/modify under version 2 of the License,
++ * or (at your option) any later version.
++ */
++
++#ifndef PLAYERBOTS_GRINDRESOURCEHOLD_H
++#define PLAYERBOTS_GRINDRESOURCEHOLD_H
++
++namespace GrindResourceHold
++{
++struct GrindResourceState
++{
++    bool alive;
++    bool inCombat;
++    unsigned int groupMemberCount;
++    bool hasMana;
++    unsigned int manaPercent;
++    unsigned int manaFloor;
++    bool hasDrink;
++    unsigned int healthPercent;
++    unsigned int healthFloor;
++    bool hasFood;
++};
++
++inline bool ShouldHoldGrindPull(GrindResourceState const& state)
++{
++    if (!state.alive || state.inCombat || state.groupMemberCount > 1)
++        return false;
++
++    return (state.hasMana && !state.hasDrink && state.manaPercent < state.manaFloor) ||
++           (!state.hasFood && state.healthPercent < state.healthFloor);
++}
++}  // namespace GrindResourceHold
++
++#endif
+diff --git a/src/Ai/Base/Strategy/GrindingStrategy.cpp b/src/Ai/Base/Strategy/GrindingStrategy.cpp
+index a5526f87..56fd42a4 100644
+--- a/src/Ai/Base/Strategy/GrindingStrategy.cpp
++++ b/src/Ai/Base/Strategy/GrindingStrategy.cpp
+@@ -17,6 +17,15 @@ std::vector<NextAction> GrindingStrategy::getDefaultActions()
+ 
+ void GrindingStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
+ {
++    triggers.push_back(
++        new TriggerNode(
++            "grind resource hold",
++            {
++                NextAction("rest before grinding", 100.0f)
++            }
++        )
++    );
++
+     // reduce lower than loot
+     triggers.push_back(
+         new TriggerNode(
+diff --git a/src/Ai/Base/Trigger/GenericTriggers.cpp b/src/Ai/Base/Trigger/GenericTriggers.cpp
+index d144882d..5796399f 100644
+--- a/src/Ai/Base/Trigger/GenericTriggers.cpp
++++ b/src/Ai/Base/Trigger/GenericTriggers.cpp
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include "GenericTriggers.h"
++#include "../Strategy/GrindResourceHold.h"
+ #include "Corpse.h"
+ #include "CreatureAI.h"
+ #include "GenericBuffUtils.h"
+@@ -218,6 +219,25 @@ bool NoDrinkTrigger::IsActive()
+     return AI_VALUE2(std::vector<Item*>, "inventory items", "conjured water").empty();
+ }
+ 
++bool GrindResourceHoldTrigger::IsActive()
++{
++    Group* group = bot->GetGroup();
++    GrindResourceHold::GrindResourceState const state = {
++        bot->IsAlive(),
++        bot->IsInCombat(),
++        group ? group->GetMembersCount() : 1,
++        AI_VALUE2(bool, "has mana", "self target"),
++        AI_VALUE2(uint8, "mana", "self target"),
++        sPlayerbotAIConfig.LowMana,
++        AI_VALUE2(uint32, "item count", "water") > 0,
++        AI_VALUE2(uint8, "health", "self target"),
++        sPlayerbotAIConfig.LowHealth,
++        AI_VALUE2(uint32, "item count", "food") > 0,
++    };
++
++    return GrindResourceHold::ShouldHoldGrindPull(state);
++}
++
+ bool TargetInSightTrigger::IsActive() { return AI_VALUE(Unit*, "grind target"); }
+ 
+ bool DebuffTrigger::IsActive()
+diff --git a/src/Ai/Base/Trigger/GenericTriggers.h b/src/Ai/Base/Trigger/GenericTriggers.h
+index 37dbc379..3070aef9 100644
+--- a/src/Ai/Base/Trigger/GenericTriggers.h
++++ b/src/Ai/Base/Trigger/GenericTriggers.h
+@@ -289,6 +289,14 @@ public:
+     bool IsActive() override;
+ };
+ 
++class GrindResourceHoldTrigger : public Trigger
++{
++public:
++    GrindResourceHoldTrigger(PlayerbotAI* botAI) : Trigger(botAI, "grind resource hold") {}
++
++    bool IsActive() override;
++};
++
+ class LightAoeTrigger : public AoeTrigger
+ {
+ public:
+diff --git a/src/Ai/Base/TriggerContext.h b/src/Ai/Base/TriggerContext.h
+index 0894b944..e20ccf37 100644
+--- a/src/Ai/Base/TriggerContext.h
++++ b/src/Ai/Base/TriggerContext.h
+@@ -147,6 +147,7 @@ public:
+ 
+         creators["no drink"] = &TriggerContext::no_drink;
+         creators["no food"] = &TriggerContext::no_food;
++        creators["grind resource hold"] = &TriggerContext::grind_resource_hold;
+ 
+         creators["behind target"] = &TriggerContext::behind_target;
+         creators["not behind target"] = &TriggerContext::not_behind_target;
+@@ -304,6 +305,7 @@ private:
+     static Trigger* not_facing_target(PlayerbotAI* botAI) { return new IsNotFacingTargetTrigger(botAI); }
+     static Trigger* no_drink(PlayerbotAI* botAI) { return new NoDrinkTrigger(botAI); }
+     static Trigger* no_food(PlayerbotAI* botAI) { return new NoFoodTrigger(botAI); }
++    static Trigger* grind_resource_hold(PlayerbotAI* botAI) { return new GrindResourceHoldTrigger(botAI); }
+     static Trigger* LightAoe(PlayerbotAI* botAI) { return new LightAoeTrigger(botAI); }
+     static Trigger* MediumAoe(PlayerbotAI* botAI) { return new MediumAoeTrigger(botAI); }
+     static Trigger* HighAoe(PlayerbotAI* botAI) { return new HighAoeTrigger(botAI); }
+diff --git a/src/Ai/Base/Value/GrindTargetValue.cpp b/src/Ai/Base/Value/GrindTargetValue.cpp
+index c93e7eea..63862bd8 100644
+--- a/src/Ai/Base/Value/GrindTargetValue.cpp
++++ b/src/Ai/Base/Value/GrindTargetValue.cpp
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include "GrindTargetValue.h"
++#include "../Strategy/GrindResourceHold.h"
+ #include "NewRpgInfo.h"
+ #include "Playerbots.h"
+ #include "ReputationMgr.h"
+@@ -31,6 +32,21 @@ Unit* GrindTargetValue::Calculate()
+ Unit* GrindTargetValue::FindTargetForGrinding(uint32 assistCount)
+ {
+     Group* group = bot->GetGroup();
++    GrindResourceHold::GrindResourceState const resourceState = {
++        bot->IsAlive(),
++        bot->IsInCombat(),
++        group ? group->GetMembersCount() : 1,
++        AI_VALUE2(bool, "has mana", "self target"),
++        AI_VALUE2(uint8, "mana", "self target"),
++        sPlayerbotAIConfig.LowMana,
++        AI_VALUE2(uint32, "item count", "water") > 0,
++        AI_VALUE2(uint8, "health", "self target"),
++        sPlayerbotAIConfig.LowHealth,
++        AI_VALUE2(uint32, "item count", "food") > 0,
++    };
++    if (GrindResourceHold::ShouldHoldGrindPull(resourceState))
++        return nullptr;
++
+     Player* master = GetMaster();
+ 
+     if (master && (master == bot || master->GetMapId() != bot->GetMapId() || master->IsBeingTeleported() ||
