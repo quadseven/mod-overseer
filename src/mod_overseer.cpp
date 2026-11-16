@@ -23038,16 +23038,26 @@ private:
         // comparison catches both.
         if (surface <= INVALID_HEIGHT)
             return false;
-        if (lethal && ground > INVALID_HEIGHT)
+        if (lethal)
         {
-            float const depth = surface - ground;
-            if (depth > 0.f)
+            // THE BED MAY BE OUT OF THE CORE'S REACH (#1573). GetHeight looks
+            // down 50 yards; a cavern lake deeper than that leaves `ground` at
+            // INVALID_HEIGHT while the liquid surface still comes back, and
+            // the world-model magma at the Molten Core door read as a floor.
+            // An unmeasured bed is the deepest liquid there is, so it is
+            // asked about (see OverseerDecisions::LethalLiquidProbe).
+            bool const groundKnown = ground > INVALID_HEIGHT;
+            OverseerDecisions::LiquidProbePlan const plan =
+                OverseerDecisions::LethalLiquidProbe(surface, ground, groundKnown);
+            if (plan.ask)
             {
+                // MAP_ALL_LIQUIDS reaches world-model liquid as well as the
+                // terrain's (Map.cpp:1336-1365 at the pinned revision).
                 LiquidData const liquid = map->GetLiquidData(
-                    bot->GetPhaseMask(), x, y, ground + depth * 0.5f,
+                    bot->GetPhaseMask(), x, y, plan.z,
                     bot->GetCollisionHeight(), MAP_ALL_LIQUIDS);
                 if (liquid.Status != LIQUID_MAP_NO_WATER)
-                    *lethal = OverseerDecisions::StepLiquidIsLethal(depth, liquid.Flags);
+                    *lethal = OverseerDecisions::StepLiquidIsLethal(plan.depthYards, liquid.Flags);
             }
         }
         out = surface;
@@ -23325,95 +23335,21 @@ private:
     static bool GroundHolds(Player* bot, float toX, float toY, float& footing,
                             float* provedYards = nullptr)
     {
-        float const fromX = bot->GetPositionX();
-        float const fromY = bot->GetPositionY();
-        float const dx = toX - fromX;
-        float const dy = toY - fromY;
-        float const span = std::sqrt(dx * dx + dy * dy);
-        footing = bot->GetPositionZ();
+        // The walk itself is OverseerDecisions::WalkFooting, so that the stride,
+        // the follow step and the catch-up walk (all of which come through
+        // here) can be driven in a test. What follows in the comments there
+        // applies unchanged: the feet exemption (#1569), the uphill second
+        // look (#312) and the symmetric drop and rise bound (#262).
+        OverseerDecisions::FootingWalkResult const walked = OverseerDecisions::WalkFooting(
+            bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), toX, toY,
+            {TRAVEL_GROUND_SAMPLE_YARDS, TRAVEL_GROUND_DROP_YARDS, TRAVEL_GROUND_UPHILL_YARDS,
+             TRAVEL_GROUND_RISE_YARDS},
+            [bot](float x, float y, float from, float& out, bool& lethal)
+            { return SurfaceAt(bot, x, y, from, out, &lethal); });
+        footing = walked.footing;
         if (provedYards)
-            *provedYards = 0.f;
-        // A BOT ALREADY STANDING IN LAVA MAY WADE OUT (#1569). Refusing every
-        // stride into lava would hold it in the pool: each bearing's first
-        // stride is lava too, the proved prefix is 0, the travel fan never
-        // offers the way back, and AnyDirectionHolds would call it sealed in a
-        // pocket and trigger the terrain-recovery lift. So the liquid refusal
-        // is skipped for the whole call when the feet are already in it.
-        bool feetLethal = false;
-        float feetSurface = 0.f;
-        SurfaceAt(bot, fromX, fromY, footing + TRAVEL_GROUND_DROP_YARDS,
-                  feetSurface, &feetLethal);
-        if (span < TRAVEL_GROUND_SAMPLE_YARDS)
-        {
-            if (provedYards)
-                *provedYards = span;
-            return true;   // one stride, with nothing between to fall into
-        }
-
-        uint32 const samples =
-            static_cast<uint32>(span / TRAVEL_GROUND_SAMPLE_YARDS) + 1;
-        for (uint32 i = 1; i <= samples; ++i)
-        {
-            float const t = static_cast<float>(i) / static_cast<float>(samples);
-            float next = 0.f;
-            bool strideLethal = false;
-            float const sampleX = fromX + dx * t;
-            float const sampleY = fromY + dy * t;
-            // Looked for from TRAVEL_GROUND_DROP_YARDS ABOVE the last footing
-            // rather than from the footing itself, so a step UPHILL finds the
-            // slope it is climbing rather than the valley floor beyond it. The
-            // asymmetry is the point: this check is about falling.
-            if (!SurfaceAt(bot, sampleX, sampleY,
-                           footing + TRAVEL_GROUND_DROP_YARDS, next, &strideLethal))
-            {
-                // NOT FINDING THE GROUND IS NOT THE SAME AS STANDING OVER A
-                // CLIFF, and answering both with `false` is what held
-                // characters still on open hillside. The search above starts
-                // TRAVEL_GROUND_DROP_YARDS over the last footing and looks
-                // DOWN, so a slope gaining more than that within one sample
-                // puts its own surface ABOVE the origin: the search passes
-                // under the hill and reports nothing. Read literally that says
-                // "no ground here", when what happened is "the ground went up",
-                // and nothing falls up. Ask again from over any single-sample
-                // rise before believing the first answer.
-                //
-                // Measured: 'Bork' refused an aim SEVEN yards away in open
-                // Duskwood, and two others were held on Westfall hillside in
-                // the same minute, every one of them on ground a character can
-                // simply walk up.
-                if (!SurfaceAt(bot, sampleX, sampleY,
-                               footing + TRAVEL_GROUND_UPHILL_YARDS, next, &strideLethal))
-                    return false;
-                // Nothing is forgiven on the way down. Any surface BELOW the
-                // first origin was already within that search's reach, so a
-                // second answer lower than the footing is not a hill, and the
-                // drop test immediately below still has to pass on it.
-            }
-            // LAVA IS NOT GROUND (#1569). SurfaceAt reads its surface as a
-            // floor, so the drop and rise tests below pass over a pool; the
-            // head walked into magma this way at the Molten Core door. The
-            // sample is refused, which also ends the proved prefix before the
-            // pool, unless the feet are already in it (see feetLethal above).
-            if (OverseerDecisions::StrideLiquidRefused(feetLethal, strideLethal))
-                return false;
-            // A STRIDE IS WALKABLE EXACTLY WHEN THE STRIDE BACK IS (#262).
-            // These used to be two separate tests with two different bounds,
-            // ten down and eight up, so a nine yard descent was approved and
-            // the climb out of it never could be. See
-            // OverseerDecisions::FootingSampleHolds for the four characters
-            // that cost.
-            if (!OverseerDecisions::FootingSampleHolds(
-                    footing, next, TRAVEL_GROUND_DROP_YARDS,
-                    TRAVEL_GROUND_RISE_YARDS))
-                return false;
-            footing = next;
-            // Recorded only AFTER the sample held, so the proved prefix always
-            // ends on a stride that passed and never on the one that did not.
-            if (provedYards)
-                *provedYards =
-                    span * static_cast<float>(i) / static_cast<float>(samples);
-        }
-        return true;
+            *provedYards = walked.provedYards;
+        return walked.holds;
     }
 
     // Is anything STANDING between where `p` is and the point it is about to be

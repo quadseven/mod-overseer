@@ -1628,6 +1628,107 @@ bool StepLiquidIsLethal(float depthYards, uint32_t liquidTypeMask);
 // read as sealed in a pocket.
 bool StrideLiquidRefused(bool feetInLethalLiquid, bool strideLethal);
 
+// WHERE TO ASK THE CORE WHAT KIND OF LIQUID STANDS AT A STRIDE (#1573, #1557).
+//
+// The footing check learns the liquid TYPE with a second query, Map::
+// GetLiquidData, and it needs a height to ask at. The first query gives it a
+// liquid surface and, when the core can find one, the ground under it. The
+// core finds that ground with a bounded look downward (Map::GetHeight, 50
+// yards), so over a cavern lake whose bed lies further down the ground comes
+// back unmeasured while the liquid surface still comes back. An unmeasured bed
+// used to mean "no question asked", and the world-model magma at the Molten
+// Core door passed as a floor. It is the deepest liquid there is, not a dry
+// one: ask just under its surface, and call its depth bottomless.
+struct LiquidProbePlan
+{
+    // False where no liquid stands over the ground: there is nothing to ask.
+    bool ask = false;
+    // The height to ask the core at, inside the liquid.
+    float z = 0.f;
+    // The depth to hand StepLiquidIsLethal.
+    float depthYards = 0.f;
+};
+LiquidProbePlan LethalLiquidProbe(float surfaceZ, float groundZ, bool groundKnown);
+
+// THE FOOTING WALK ITSELF, LIFTED OUT OF THE ADAPTER SO IT CAN BE DRIVEN (#1573).
+//
+// Every straight step this module takes, or vets for `follow` to take, is
+// proved by walking it in strides and asking one question of each: where is
+// the surface, and is it lethal liquid. The travel stride, the follow step and
+// the catch-up walk all reach it (GroundHolds in the adapter is a thin call to
+// this), so a test that puts a character in magma here puts all three there.
+// `surface(x, y, from, out, lethal)` is the adapter's SurfaceAt: false where
+// there is no ground in reach, `out` the surface, `lethal` true over magma.
+struct FootingWalkLimits
+{
+    float sampleYards;
+    float dropYards;
+    float uphillYards;
+    float riseYards;
+};
+struct FootingWalkResult
+{
+    bool holds = false;
+    float footing = 0.f;
+    float provedYards = 0.f;
+};
+template <class SurfaceFn>
+FootingWalkResult WalkFooting(float fromX, float fromY, float fromZ, float toX, float toY,
+                              FootingWalkLimits const& limit, SurfaceFn&& surface)
+{
+    FootingWalkResult r;
+    float const dx = toX - fromX;
+    float const dy = toY - fromY;
+    float const span = std::sqrt(dx * dx + dy * dy);
+    r.footing = fromZ;
+    // A character already standing in lethal liquid may wade out (#1569).
+    bool feetLethal = false;
+    float feetSurface = 0.f;
+    surface(fromX, fromY, r.footing + limit.dropYards, feetSurface, feetLethal);
+    if (span < limit.sampleYards)
+    {
+        // One stride, with nothing between to fall into, but it can still LAND
+        // in magma: the destination and the midpoint are asked about liquid
+        // (a span under the sample interval used to sample nothing, so a dry
+        // bot a few yards from the shore stepped in). Where there is no
+        // surface to read, nothing is refused here, as before.
+        for (float const t : {0.5f, 1.f})
+        {
+            float shortNext = 0.f;
+            bool shortLethal = false;
+            if (surface(fromX + dx * t, fromY + dy * t, r.footing + limit.dropYards, shortNext,
+                        shortLethal) &&
+                StrideLiquidRefused(feetLethal, shortLethal))
+                return r;
+        }
+        r.provedYards = span;
+        r.holds = true;
+        return r;
+    }
+    unsigned const samples = static_cast<unsigned>(span / limit.sampleYards) + 1;
+    for (unsigned i = 1; i <= samples; ++i)
+    {
+        float const t = static_cast<float>(i) / static_cast<float>(samples);
+        float next = 0.f;
+        bool strideLethal = false;
+        float const sampleX = fromX + dx * t;
+        float const sampleY = fromY + dy * t;
+        if (!surface(sampleX, sampleY, r.footing + limit.dropYards, next, strideLethal))
+        {
+            if (!surface(sampleX, sampleY, r.footing + limit.uphillYards, next, strideLethal))
+                return r;
+        }
+        if (StrideLiquidRefused(feetLethal, strideLethal))
+            return r;
+        if (!FootingSampleHolds(r.footing, next, limit.dropYards, limit.riseYards))
+            return r;
+        r.footing = next;
+        r.provedYards = span * static_cast<float>(i) / static_cast<float>(samples);
+    }
+    r.holds = true;
+    return r;
+}
+
 // WHAT A REFUSED BEARING STILL PROVED (#312).
 //
 // THE FOOTING CHECK WALKS A BEARING IN STRIDES AND THREW AWAY EVERY STRIDE

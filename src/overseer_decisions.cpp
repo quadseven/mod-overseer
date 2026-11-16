@@ -1381,6 +1381,26 @@ bool StrideLiquidRefused(bool feetInLethalLiquid, bool strideLethal)
     return strideLethal && !feetInLethalLiquid;
 }
 
+LiquidProbePlan LethalLiquidProbe(float surfaceZ, float groundZ, bool groundKnown)
+{
+    LiquidProbePlan plan;
+    if (!groundKnown)
+    {
+        // A liquid surface with no measurable bed: deeper than the core looks.
+        plan.ask = true;
+        plan.z = surfaceZ - 0.5f;
+        plan.depthYards = 1000.f;
+        return plan;
+    }
+    float const depth = surfaceZ - groundZ;
+    if (depth <= 0.f)
+        return plan;
+    plan.ask = true;
+    plan.z = groundZ + depth * 0.5f;
+    plan.depthYards = depth;
+    return plan;
+}
+
 bool ProvenStepIsWorthTaking(bool wholeBearingHeld, float provedYards,
                              float minYards)
 {
