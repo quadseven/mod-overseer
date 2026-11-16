@@ -98,6 +98,22 @@ void TheHold()
            "Plugger himself is never held");
 }
 
+void TheKillArmsTheHoldAtOnce()
+{
+    Expect(BarHoldOnKill(BRD_PLUGGER_ENTRY), "Plugger's death arms the hold");
+    Expect(!BarHoldOnKill(BRD_GRIM_PATRON_ENTRY) && !BarHoldOnKill(0) && !BarHoldOnKill(9500),
+           "nothing else's death does");
+    // The boundary the review named: the tick Plugger dies the patrons are hostile
+    // but nobody is fighting yet, so every one is held; one that is already
+    // engaged is not, which is exactly why the hold cannot wait for a poll.
+    Expect(BarArmed(true, 0) && BarPatronAction(true, Patron()) == BarAction::Hold,
+           "in the tick of the kill an idle patron is held");
+    BarPatronFacts engaged = Patron();
+    engaged.engaged = true;
+    Expect(BarPatronAction(true, engaged) == BarAction::None,
+           "a patron that has already engaged is skipped, which is the window to close");
+}
+
 void TheRelease()
 {
     BarPatronFacts f = Patron();
@@ -140,6 +156,31 @@ void TheAdapterWiresIt()
     Expect(src.find("#include \"overseer_brd_bar.h\"") != std::string::npos,
            "the header is included");
 
+    // THE PASS, shared by the sweep and the kill hook.
+    std::size_t const pass = src.find("\nBrdBarPass ApplyBrdBar(Map* map, bool pluggerKnownDead)\n{");
+    Expect(pass != std::string::npos, "the adapter has the shared ApplyBrdBar pass");
+    std::size_t const passEnd = src.find("\n}\n", pass);
+    auto inPass = [&](char const* needle)
+    {
+        std::size_t const at = src.find(needle, pass);
+        return pass != std::string::npos && at != std::string::npos && at < passEnd;
+    };
+    Expect(inPass("OverseerDecisions::BarArmed(") && inPass("BRD_PLUGGER_ENTRY"),
+           "it asks whether the bar is armed, from Plugger and the patrons' factions");
+    Expect(inPass("GetCreatureTemplate()->faction") && inPass("GetFaction()"),
+           "it compares the current faction with the template's");
+    Expect(inPass("OnRoster(") && inPass("IsAlive()"), "it looks for a live family member");
+    Expect(inPass("OverseerDecisions::BarPatronAction("), "the rules decide each creature");
+    Expect(inPass("SetReactState(REACT_DEFENSIVE)") && inPass("SetReactState(REACT_AGGRESSIVE)"),
+           "it holds with REACT_DEFENSIVE and releases to REACT_AGGRESSIVE");
+    Expect(inPass("g_brdBarHeld"), "what it held is remembered by guid");
+    Expect(inPass("pluggerKnownDead"),
+           "the kill hook's own knowledge arms it, without waiting for the corpse to read dead");
+    Expect(!inPass("SetFaction(") && !inPass("DespawnOrUnsummon(") && !inPass("KillSelf(") &&
+               !inPass("setDeathState("),
+           "it never kills, despawns or re-factions a patron");
+
+    // THE SWEEP is the backstop and the release.
     std::size_t const drive = src.find("    void DriveBrdBar()");
     Expect(drive != std::string::npos, "the adapter has DriveBrdBar");
     std::size_t const end = src.find("\n    }\n", drive);
@@ -149,19 +190,35 @@ void TheAdapterWiresIt()
         return drive != std::string::npos && at != std::string::npos && at < end;
     };
     Expect(within("sMapMgr->DoForAllMapsWithMapId(OverseerDecisions::BRD_WING_MAP_ID"),
-           "it walks every instance of map 230");
-    Expect(within("OverseerDecisions::BarArmed(") && within("BRD_PLUGGER_ENTRY"),
-           "it asks whether the bar is armed, from Plugger and the patrons' factions");
-    Expect(within("GetCreatureTemplate()->faction") && within("GetFaction()"),
-           "it compares the current faction with the template's");
-    Expect(within("OnRoster(") && within("IsAlive()"), "it looks for a live family member");
-    Expect(within("OverseerDecisions::BarPatronAction("), "the rules decide each creature");
-    Expect(within("SetReactState(REACT_DEFENSIVE)") && within("SetReactState(REACT_AGGRESSIVE)"),
-           "it holds with REACT_DEFENSIVE and releases to REACT_AGGRESSIVE");
-    Expect(within("_brdBarHeld"), "what it held is remembered by guid");
-    Expect(!within("SetFaction(") && !within("DespawnOrUnsummon(") && !within("KillSelf(") &&
-               !within("setDeathState("),
-           "it never kills, despawns or re-factions a patron");
+           "the sweep walks every instance of map 230");
+    Expect(within("ApplyBrdBar(map, false)"), "the sweep runs the shared pass");
+
+    // THE TIMING BOUNDARY: the hold is armed in the tick Plugger dies.
+    std::size_t const hold = src.find("\nvoid HoldBrdBarOnKill(Creature* killed)\n{");
+    Expect(hold != std::string::npos, "the adapter has HoldBrdBarOnKill");
+    std::size_t const holdEnd = src.find("\n}\n", hold);
+    auto inHold = [&](char const* needle)
+    {
+        std::size_t const at = src.find(needle, hold);
+        return hold != std::string::npos && at != std::string::npos && at < holdEnd;
+    };
+    Expect(inHold("OverseerDecisions::BarHoldOnKill(killed->GetEntry())") &&
+               inHold("ApplyBrdBar(killed->GetMap(), true)"),
+           "a Plugger kill runs the pass at once, knowing he is dead");
+    for (char const* signature :
+         {"void OnPlayerCreatureKill(Player* killer, Creature* killed) override\n    {\n",
+          "void OnPlayerCreatureKilledByPet(Player* owner, Creature* killed) override\n    {\n"})
+    {
+        std::size_t const at = src.find(signature);
+        Expect(at != std::string::npos &&
+                   src.compare(at + std::string(signature).size(), 40,
+                               "        HoldBrdBarOnKill(killed);\n        Note", 0, 40) == 0,
+               "each creature-kill hook arms the hold as its FIRST statement, ahead of the "
+               "loot and hunt bookkeeping");
+    }
+    Expect(src.find("PLAYERHOOK_ON_CREATURE_KILL,") != std::string::npos &&
+               src.find("PLAYERHOOK_ON_CREATURE_KILLED_BY_PET,") != std::string::npos,
+           "the event script is subscribed to both kill hooks");
 
     // The drive runs on the engagement poll, with the other per-poll drives.
     std::size_t const poll = src.find("DriveStaleCombat();");
@@ -199,6 +256,7 @@ int main()
     TheEntries();
     WhenTheBarIsArmed();
     TheHold();
+    TheKillArmsTheHoldAtOnce();
     TheRelease();
     TheLogLine();
     TheAdapterWiresIt();

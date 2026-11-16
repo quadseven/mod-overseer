@@ -62,6 +62,14 @@ inline bool BarArmed(bool pluggerDead, unsigned patronsOffTemplateFaction)
     return pluggerDead || patronsOffTemplateFaction > 0;
 }
 
+// A KILL THAT ARMS THE HOLD AT ONCE. Plugger's death makes every patron hostile
+// in the same breath, so the hold cannot wait for a poll: the kill hook asks this
+// and runs the pass in the same tick, before any walker can reach a formation.
+inline bool BarHoldOnKill(std::uint32_t killedEntry)
+{
+    return killedEntry == BRD_PLUGGER_ENTRY;
+}
+
 enum class BarAction
 {
     None,

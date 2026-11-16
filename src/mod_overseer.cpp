@@ -7932,6 +7932,116 @@ void EndExitFight(Player* player, char const* how)
              player->GetName(), how, casts);
 }
 
+// ------------------------------------ the Grim Guzzler's patrons (BRD) ---
+//
+// The creatures this module put at REACT_DEFENSIVE, by guid. Shared by the world
+// thread's sweep and by the kill hook, which runs on the instance's map thread,
+// hence the lock.
+std::mutex g_brdBarMutex;
+std::set<ObjectGuid> g_brdBarHeld;
+
+std::size_t BrdBarHeldCount()
+{
+    std::lock_guard<std::mutex> guard(g_brdBarMutex);
+    return g_brdBarHeld.size();
+}
+
+struct BrdBarPass
+{
+    bool pluggerDead{false};
+    unsigned offTemplate{0};
+    bool hold{false};
+};
+
+// ONE PASS OVER AN INSTANCE OF THE BLACKROCK DEPTHS: decide whether the bar is
+// hostile and a family member is in it, then hold or release each creature by
+// the rules in overseer_brd_bar.h. `pluggerKnownDead` is the kill hook's own
+// knowledge, so the pass does not depend on the corpse already reading dead.
+BrdBarPass ApplyBrdBar(Map* map, bool pluggerKnownDead)
+{
+    BrdBarPass pass;
+    if (!map)
+        return pass;
+    bool memberHere = false;
+    for (MapReference const& ref : map->GetPlayers())
+    {
+        Player* member = ref.GetSource();
+        if (member && member->IsAlive() && OnRoster(member->GetName()))
+        {
+            memberHere = true;
+            break;
+        }
+    }
+    if (!memberHere && BrdBarHeldCount() == 0)
+        return pass;
+
+    pass.pluggerDead = pluggerKnownDead;
+    for (auto const& kv : map->GetCreatureBySpawnIdStore())
+    {
+        Creature* c = kv.second;
+        if (!c)
+            continue;
+        uint32 const entry = c->GetEntry();
+        if (entry == OverseerDecisions::BRD_PLUGGER_ENTRY)
+            pass.pluggerDead = pass.pluggerDead || !c->IsAlive();
+        else if (OverseerDecisions::IsBarPatron(entry) && c->GetCreatureTemplate() &&
+                 c->GetFaction() != c->GetCreatureTemplate()->faction)
+            ++pass.offTemplate;
+    }
+    pass.hold = memberHere && OverseerDecisions::BarArmed(pass.pluggerDead, pass.offTemplate);
+
+    for (auto const& kv : map->GetCreatureBySpawnIdStore())
+    {
+        Creature* c = kv.second;
+        if (!c)
+            continue;
+        OverseerDecisions::BarPatronFacts facts;
+        facts.entry = c->GetEntry();
+        facts.alive = c->IsAlive();
+        facts.summon = c->IsSummon() || c->IsPet();
+        facts.engaged = c->IsInCombat();
+        facts.reactState = static_cast<int>(c->GetReactState());
+        {
+            std::lock_guard<std::mutex> guard(g_brdBarMutex);
+            facts.held = g_brdBarHeld.count(c->GetGUID()) != 0;
+        }
+        switch (OverseerDecisions::BarPatronAction(pass.hold, facts))
+        {
+            case OverseerDecisions::BarAction::Hold:
+                c->SetReactState(REACT_DEFENSIVE);
+                {
+                    std::lock_guard<std::mutex> guard(g_brdBarMutex);
+                    g_brdBarHeld.insert(c->GetGUID());
+                }
+                break;
+            case OverseerDecisions::BarAction::Release:
+                if (OverseerDecisions::BarReleaseWrites(facts.reactState))
+                    c->SetReactState(REACT_AGGRESSIVE);
+                {
+                    std::lock_guard<std::mutex> guard(g_brdBarMutex);
+                    g_brdBarHeld.erase(c->GetGUID());
+                }
+                break;
+            case OverseerDecisions::BarAction::None:
+                break;
+        }
+    }
+    return pass;
+}
+
+// PLUGGER SPAZZRING JUST DIED: HOLD THE BAR IN THE SAME TICK. Called from the
+// creature-kill hooks, which Unit::Kill runs before the next map update, so the
+// patrons are defensive before any walker can come within their aggro range.
+// The 8-second sweep alone left a window in which a walker reached a formation
+// and the fight was already engaged, and an engaged patron is never touched.
+void HoldBrdBarOnKill(Creature* killed)
+{
+    if (!killed || !OverseerDecisions::BarHoldOnKill(killed->GetEntry()) ||
+        killed->GetMapId() != OverseerDecisions::BRD_WING_MAP_ID)
+        return;
+    ApplyBrdBar(killed->GetMap(), true);
+}
+
 class OverseerEventScript : public PlayerScript
 {
 public:
@@ -8303,6 +8413,7 @@ public:
     // calls both after the corpse's loot is filled).
     void OnPlayerCreatureKill(Player* killer, Creature* killed) override
     {
+        HoldBrdBarOnKill(killed);
         NoteHuntKill(killer, killed);
         NoteCouncilKill(killer, killed);
         RecordBossKill(killer, killed);
@@ -8310,6 +8421,7 @@ public:
 
     void OnPlayerCreatureKilledByPet(Player* owner, Creature* killed) override
     {
+        HoldBrdBarOnKill(killed);
         NoteHuntKill(owner, killed);
         NoteCouncilKill(owner, killed);
         RecordBossKill(owner, killed);
@@ -26103,14 +26215,15 @@ private:
     std::map<std::string, DungeonEscort> _dungeonEscorts;
 
     // THE GRIM GUZZLER'S PATRONS WHILE A FAMILY MEMBER IS IN THE INSTANCE
-    // (overseer_brd_bar.h). The creatures the module held, by guid: a patron is
-    // only put back if it is one of these and nothing has moved it since.
-    std::set<ObjectGuid> _brdBarHeld;
+    // (overseer_brd_bar.h). This is the BACKSTOP and the RELEASE: the hold itself
+    // is armed in the same tick as Plugger Spazzring's death by HoldBrdBarOnKill,
+    // and this sweep re-asserts it (a patron that respawned or left combat) and
+    // lets go once nobody is in the instance. The pass is ApplyBrdBar, shared
+    // with that hook.
     bool _brdBarLogged{false};
 
-    // Tells the combat hook who is being walked out, then holds or releases the
-    // patrons of every instance of map 230. World thread, between map updates,
-    // like every other drive here.
+    // Tells the combat hook who is being walked out, then sweeps every instance
+    // of map 230. World thread, between map updates, like every other drive here.
     void DriveBrdBar()
     {
         std::set<std::string> walkers;
@@ -26123,78 +26236,23 @@ private:
         {
             if (!map)
                 return;
-            bool memberHere = false;
-            for (MapReference const& ref : map->GetPlayers())
-            {
-                Player* member = ref.GetSource();
-                if (member && member->IsAlive() && OnRoster(member->GetName()))
-                {
-                    memberHere = true;
-                    break;
-                }
-            }
-            if (!memberHere && _brdBarHeld.empty())
-                return;
-
-            bool pluggerDead = false;
-            unsigned offTemplate = 0;
-            for (auto const& kv : map->GetCreatureBySpawnIdStore())
-            {
-                Creature* c = kv.second;
-                if (!c)
-                    continue;
-                uint32 const entry = c->GetEntry();
-                if (entry == OverseerDecisions::BRD_PLUGGER_ENTRY)
-                    pluggerDead = pluggerDead || !c->IsAlive();
-                else if (OverseerDecisions::IsBarPatron(entry) && c->GetCreatureTemplate() &&
-                         c->GetFaction() != c->GetCreatureTemplate()->faction)
-                    ++offTemplate;
-            }
-            bool const hold = memberHere && OverseerDecisions::BarArmed(pluggerDead, offTemplate);
-
-            for (auto const& kv : map->GetCreatureBySpawnIdStore())
-            {
-                Creature* c = kv.second;
-                if (!c)
-                    continue;
-                OverseerDecisions::BarPatronFacts facts;
-                facts.entry = c->GetEntry();
-                facts.alive = c->IsAlive();
-                facts.summon = c->IsSummon() || c->IsPet();
-                facts.engaged = c->IsInCombat();
-                facts.reactState = static_cast<int>(c->GetReactState());
-                facts.held = _brdBarHeld.count(c->GetGUID()) != 0;
-                switch (OverseerDecisions::BarPatronAction(hold, facts))
-                {
-                    case OverseerDecisions::BarAction::Hold:
-                        c->SetReactState(REACT_DEFENSIVE);
-                        _brdBarHeld.insert(c->GetGUID());
-                        break;
-                    case OverseerDecisions::BarAction::Release:
-                        if (OverseerDecisions::BarReleaseWrites(facts.reactState))
-                            c->SetReactState(REACT_AGGRESSIVE);
-                        _brdBarHeld.erase(c->GetGUID());
-                        break;
-                    case OverseerDecisions::BarAction::None:
-                        break;
-                }
-            }
-            if (hold && !_brdBarLogged)
+            BrdBarPass const pass = ApplyBrdBar(map, false);
+            if (pass.hold && !_brdBarLogged)
             {
                 _brdBarLogged = true;
                 LOG_INFO("module.overseer",
                          "overseer: the Grim Guzzler's patrons are held at defensive while a "
                          "family member is in the instance (Plugger dead: {}, patrons off "
                          "their template faction: {})",
-                         pluggerDead, offTemplate);
+                         pass.pluggerDead, pass.offTemplate);
             }
-            else if (!hold && _brdBarLogged)
+            else if (!pass.hold && _brdBarLogged)
             {
                 _brdBarLogged = false;
                 LOG_INFO("module.overseer",
                          "overseer: the Grim Guzzler's patrons are released ({} still held "
                          "by this module)",
-                         _brdBarHeld.size());
+                         BrdBarHeldCount());
             }
         });
     }
