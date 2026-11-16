@@ -1687,6 +1687,20 @@ FootingWalkResult WalkFooting(float fromX, float fromY, float fromZ, float toX, 
     surface(fromX, fromY, r.footing + limit.dropYards, feetSurface, feetLethal);
     if (span < limit.sampleYards)
     {
+        // One stride, with nothing between to fall into, but it can still LAND
+        // in magma: the destination and the midpoint are asked about liquid
+        // (a span under the sample interval used to sample nothing, so a dry
+        // bot a few yards from the shore stepped in). Where there is no
+        // surface to read, nothing is refused here, as before.
+        for (float const t : {0.5f, 1.f})
+        {
+            float shortNext = 0.f;
+            bool shortLethal = false;
+            if (surface(fromX + dx * t, fromY + dy * t, r.footing + limit.dropYards, shortNext,
+                        shortLethal) &&
+                StrideLiquidRefused(feetLethal, shortLethal))
+                return r;
+        }
         r.provedYards = span;
         r.holds = true;
         return r;

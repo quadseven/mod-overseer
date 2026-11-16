@@ -157,6 +157,32 @@ int main()
     Check("catch-up: the hand-back is refused while the leader is over magma",
           FollowStepHoldsAt(true, 0.f, -3.f, 10.f, 12.f), false);
 
+    // SHORT SPANS (1 to 3.9 yards, under the 4 yard sample interval). The walk
+    // used to take a fast path for these that sampled nothing, so a dry bot a
+    // few yards from the shore stepped straight in. The destination and the
+    // midpoint are sampled for liquid now, for every path.
+    static constexpr float SHORT[][2] = {{0.5f, 1.f}, {1.f, 2.f}, {2.f, 3.5f}, {0.1f, 3.9f}};
+    for (auto const& pair : SHORT)
+    {
+        // Standing `over` yards short of the shore, aimed `reach` yards on, so
+        // the whole step is shorter than a sample and ends in magma.
+        float const over = pair[0];
+        float const reach = pair[1];
+        FootingWalkResult const r = Walk(true, 0.f, -over, 0.f, -over + reach);
+        char what[96];
+        std::snprintf(what, sizeof what, "short stride (%.1f yd) into magma is refused", reach);
+        Check(what, r.holds, false);
+        std::snprintf(what, sizeof what, "short stride (%.1f yd) takes no step", reach);
+        Check(what, ProvenStepIsWorthTaking(r.holds, r.provedYards, MIN_STEP), false);
+        std::snprintf(what, sizeof what, "short follow step (%.1f yd) into magma is refused", reach);
+        Check(what, FollowStepHoldsAt(true, 0.f, -over, 0.f, -over + reach), false);
+        std::snprintf(what, sizeof what, "short catch-up hand-back (%.1f yd) over magma is refused", reach);
+        Check(what, FollowStepHoldsAt(true, 0.f, -over, 0.f, -over + reach), false);
+    }
+    Check("a short step along dry ground still holds", Walk(true, 0.f, -20.f, 0.f, -17.f).holds, true);
+    Check("a bot already in magma may take a short step",
+          Walk(true, 0.f, 5.f, 0.f, 7.f).holds, true);
+
     // The adapter has to route all three through the one walk.
     std::ifstream source("src/mod_overseer.cpp");
     if (!source)
