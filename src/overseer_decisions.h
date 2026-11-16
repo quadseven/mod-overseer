@@ -30495,6 +30495,114 @@ bool WalkwayRouteArrives(float endX, float endY, float endZ, float aimX, float a
 std::size_t DropBogusDoorLinks(std::vector<RouteLink>& links, std::uint32_t mapId, float aimX,
                                float aimY, float aimZ);
 
+
+// ------------------------------------------------ enchant-for (trade window) --
+//
+// An enchanter puts an Enchanting recipe it knows on a guild member's WORN item
+// through the core's own trade window. The member's item goes in the "will not
+// be traded" slot, the enchanter casts the recipe at that slot, and both
+// accept: the core stores the spell on the trade and runs it at the second
+// accept, taking the reagents from the enchanter's bags. The item never
+// changes owner, and nothing here grants anything.
+//
+//     kind='trade', command `enchant-for target:<character guid> slot:<n> spell:<id>`
+//
+// target_name is the enchanter. The keys may come in any order, each exactly
+// once. `slot` is an equipment slot (0 to 18), never an item entry or a guid:
+// the item is whatever the member wears there when the row runs.
+constexpr char ENCHANT_FOR_CAPABILITY[] = "trade";
+
+// Polls (two seconds each) the cast has to reach the trade window and the
+// accept has to finish. An Enchanting cast is a few seconds.
+constexpr uint32_t ENCHANT_FOR_POLLS = 8;
+
+struct EnchantForSpec
+{
+    bool valid{false};
+    uint32_t target{0};
+    uint32_t slot{0};
+    uint32_t spell{0};
+};
+
+// True when the row's first word is `enchant-for` (routed before DoTrade's own
+// grammar, so a malformed row still reaches its own parser and is said so).
+bool IsEnchantForRow(std::string const& command);
+EnchantForSpec ParseEnchantForSpec(std::string const& command);
+
+// What the adapter read. Every field defaults to the refusing answer.
+struct EnchantForFacts
+{
+    bool sameCharacter{false};
+    bool spellEnchantsItem{false};     // the spell is SPELL_EFFECT_ENCHANT_ITEM
+    bool knowsSpell{false};            // HasSpell: a recipe it earned
+    bool hasEnchantingSkill{false};
+    bool targetOnline{false};
+    bool sameGuild{false};
+    bool enchanterAlive{false};
+    bool targetAlive{false};
+    bool anyInFlight{false};
+    bool anyStunned{false};
+    bool anyLoggingOut{false};
+    bool anyAlreadyTrading{false};
+    bool anyInCombat{false};
+    bool enchanterMoving{false};
+    bool withinTradeRange{false};
+    bool reagentsInBags{false};        // the enchanter's own bags pay
+    bool itemFound{false};             // something is worn in the named slot
+    bool itemFits{false};              // Item::IsFitToSpellRequirements
+    bool levelOk{false};               // the core's item-level gate
+    uint32_t currentEnchant{0};        // the item's permanent enchant, 0 = none
+    uint32_t ownEnchant{0};            // the enchant the recipe writes
+    uint32_t ownRank{0};               // the recipe's Enchanting rank, 0 = unknown
+    uint32_t currentRank{0};
+    bool currentRankKnown{false};      // the current enchant has an Enchanting source
+};
+
+struct EnchantForVerdict
+{
+    bool go{false};
+    char const* reason{""};
+    char const* retry{"never"};        // never | later
+};
+
+// The first wall in the order said, or go. `retry` is "never" for a fact that
+// waiting cannot change and "later" for one that can.
+EnchantForVerdict JudgeEnchantFor(EnchantForFacts const& facts);
+
+// The parked row's next step. Applied is the only success and it is read from
+// the item, never from a call returning.
+enum class EnchantForStep { Wait, Accept, Applied, Failed };
+struct EnchantForProgress
+{
+    bool enchanterHere{false};
+    bool targetHere{false};
+    bool tradeOpen{false};
+    bool spellStored{false};     // the cast reached the trade (TradeData::GetSpell)
+    bool acceptSent{false};
+    bool enchantApplied{false};  // the item's permanent enchant is the expected one
+    uint32_t pollsSpent{0};
+    uint32_t pollLimit{ENCHANT_FOR_POLLS};
+};
+struct EnchantForStepVerdict
+{
+    EnchantForStep step{EnchantForStep::Wait};
+    char const* reason{""};
+};
+EnchantForStepVerdict NextEnchantForStep(EnchantForProgress const& progress);
+
+struct EnchantForProof
+{
+    std::string enchanter;
+    std::string target;
+    uint32_t itemEntry{0};
+    uint32_t slot{0};
+    uint32_t enchantId{0};
+    uint32_t spell{0};
+    std::vector<std::pair<uint32_t, uint32_t>> reagents;  // item entry, count paid
+};
+// The one log line that proves an enchant happened.
+std::string EnchantForProofLine(EnchantForProof const& proof);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
