@@ -7940,6 +7940,16 @@ void EndExitFight(Player* player, char const* how)
 std::mutex g_brdBarMutex;
 std::set<ObjectGuid> g_brdBarHeld;
 
+// THE WHOLE PASS, NOT ONLY THE SET (the review's race-condition finding). The
+// kill hook runs a pass on the instance's map thread and the sweep runs one on
+// the world thread. They cannot overlap in the core as pinned: World::Update runs
+// sMapMgr->Update, which waits for every map update to finish (MapMgr::Update
+// calls m_updater.wait()), before sScriptMgr->OnWorldUpdate. This lock makes
+// that a property of this code instead of an assumption about the core: a pass
+// scans and writes react states under it from first creature to last, so two
+// passes can never interleave. Taken before the held-set lock, never after.
+std::mutex g_brdBarPassMutex;
+
 std::size_t BrdBarHeldCount()
 {
     std::lock_guard<std::mutex> guard(g_brdBarMutex);
@@ -7962,6 +7972,7 @@ BrdBarPass ApplyBrdBar(Map* map, bool pluggerKnownDead)
     BrdBarPass pass;
     if (!map)
         return pass;
+    std::lock_guard<std::mutex> wholePass(g_brdBarPassMutex);
     bool memberHere = false;
     for (MapReference const& ref : map->GetPlayers())
     {
@@ -8031,7 +8042,10 @@ BrdBarPass ApplyBrdBar(Map* map, bool pluggerKnownDead)
 
 // PLUGGER SPAZZRING JUST DIED: HOLD THE BAR IN THE SAME TICK. Called from the
 // creature-kill hooks, which Unit::Kill runs before the next map update, so the
-// patrons are defensive before any walker can come within their aggro range.
+// patrons are defensive before any walker can come within their aggro range. It touches
+// only the map the dying creature stands on, which is the map whose thread is
+// running it; the sweep is the only caller that visits other instances, and it
+// runs on the world thread between map updates.
 // The 8-second sweep alone left a window in which a walker reached a formation
 // and the fight was already engaged, and an engaged patron is never touched.
 void HoldBrdBarOnKill(Creature* killed)

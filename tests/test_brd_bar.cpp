@@ -174,6 +174,25 @@ void TheAdapterWiresIt()
     Expect(inPass("SetReactState(REACT_DEFENSIVE)") && inPass("SetReactState(REACT_AGGRESSIVE)"),
            "it holds with REACT_DEFENSIVE and releases to REACT_AGGRESSIVE");
     Expect(inPass("g_brdBarHeld"), "what it held is remembered by guid");
+    // THE RACE FINDING: two passes (kill hook on the map thread, sweep on the world
+    // thread) must never interleave, so the whole pass runs under one lock that is
+    // taken before the creature store is touched and before the held-set lock.
+    std::size_t const lockAt = src.find("std::lock_guard<std::mutex> wholePass(g_brdBarPassMutex);", pass);
+    std::size_t const firstScan = src.find("GetPlayers()", pass);
+    std::size_t const firstSet = src.find("g_brdBarMutex", pass);
+    Expect(lockAt != std::string::npos && lockAt < passEnd && lockAt < firstScan &&
+               lockAt < firstSet,
+           "the whole pass holds its own lock from before the first read of the map");
+    Expect(src.find("std::mutex g_brdBarPassMutex;") != std::string::npos,
+           "the pass lock exists");
+    std::size_t const holdFn = src.find("\nvoid HoldBrdBarOnKill(Creature* killed)\n{");
+    std::size_t const holdFnEnd = src.find("\n}\n", holdFn);
+    std::string const holdBody = src.substr(holdFn, holdFnEnd - holdFn);
+    Expect(holdBody.find("killed->GetMap()") != std::string::npos &&
+               holdBody.find("DoForAllMaps") == std::string::npos &&
+               holdBody.find("FindMap") == std::string::npos &&
+               holdBody.find("FindBaseMap") == std::string::npos,
+           "the kill hook touches only the map the dying creature is on, never another map");
     Expect(inPass("pluggerKnownDead"),
            "the kill hook's own knowledge arms it, without waiting for the corpse to read dead");
     Expect(!inPass("SetFaction(") && !inPass("DespawnOrUnsummon(") && !inPass("KillSelf(") &&
