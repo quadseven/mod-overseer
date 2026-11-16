@@ -1650,6 +1650,71 @@ struct LiquidProbePlan
 };
 LiquidProbePlan LethalLiquidProbe(float surfaceZ, float groundZ, bool groundKnown);
 
+// THE FOOTING WALK ITSELF, LIFTED OUT OF THE ADAPTER SO IT CAN BE DRIVEN (#1573).
+//
+// Every straight step this module takes, or vets for `follow` to take, is
+// proved by walking it in strides and asking one question of each: where is
+// the surface, and is it lethal liquid. The travel stride, the follow step and
+// the catch-up walk all reach it (GroundHolds in the adapter is a thin call to
+// this), so a test that puts a character in magma here puts all three there.
+// `surface(x, y, from, out, lethal)` is the adapter's SurfaceAt: false where
+// there is no ground in reach, `out` the surface, `lethal` true over magma.
+struct FootingWalkLimits
+{
+    float sampleYards;
+    float dropYards;
+    float uphillYards;
+    float riseYards;
+};
+struct FootingWalkResult
+{
+    bool holds = false;
+    float footing = 0.f;
+    float provedYards = 0.f;
+};
+template <class SurfaceFn>
+FootingWalkResult WalkFooting(float fromX, float fromY, float fromZ, float toX, float toY,
+                              FootingWalkLimits const& limit, SurfaceFn&& surface)
+{
+    FootingWalkResult r;
+    float const dx = toX - fromX;
+    float const dy = toY - fromY;
+    float const span = std::sqrt(dx * dx + dy * dy);
+    r.footing = fromZ;
+    // A character already standing in lethal liquid may wade out (#1569).
+    bool feetLethal = false;
+    float feetSurface = 0.f;
+    surface(fromX, fromY, r.footing + limit.dropYards, feetSurface, feetLethal);
+    if (span < limit.sampleYards)
+    {
+        r.provedYards = span;
+        r.holds = true;
+        return r;
+    }
+    unsigned const samples = static_cast<unsigned>(span / limit.sampleYards) + 1;
+    for (unsigned i = 1; i <= samples; ++i)
+    {
+        float const t = static_cast<float>(i) / static_cast<float>(samples);
+        float next = 0.f;
+        bool strideLethal = false;
+        float const sampleX = fromX + dx * t;
+        float const sampleY = fromY + dy * t;
+        if (!surface(sampleX, sampleY, r.footing + limit.dropYards, next, strideLethal))
+        {
+            if (!surface(sampleX, sampleY, r.footing + limit.uphillYards, next, strideLethal))
+                return r;
+        }
+        if (StrideLiquidRefused(feetLethal, strideLethal))
+            return r;
+        if (!FootingSampleHolds(r.footing, next, limit.dropYards, limit.riseYards))
+            return r;
+        r.footing = next;
+        r.provedYards = span * static_cast<float>(i) / static_cast<float>(samples);
+    }
+    r.holds = true;
+    return r;
+}
+
 // WHAT A REFUSED BEARING STILL PROVED (#312).
 //
 // THE FOOTING CHECK WALKS A BEARING IN STRIDES AND THREW AWAY EVERY STRIDE

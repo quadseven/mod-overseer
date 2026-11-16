@@ -123,13 +123,27 @@ int main()
     }
     std::string const body = text.substr(holds, holdsEnd - holds);
     Check("GroundHolds reads the lethal liquid through SurfaceAt, in the same lookup",
-          Has(body, "&strideLethal"), true);
-    Check("GroundHolds refuses through the pure feet-exemption rule",
-          Has(body, "StrideLiquidRefused("), true);
-    Check("GroundHolds measures the bot's own feet once, before the loop",
-          Has(body, "&feetLethal"), true);
-    std::size_t const loopAt = body.find("for (uint32 i = 1;");
-    std::size_t const feetAt = body.find("&feetLethal");
+          Has(body, "SurfaceAt(bot, x, y, from, out, &lethal)"), true);
+    Check("GroundHolds walks through the shared footing walk",
+          Has(body, "OverseerDecisions::WalkFooting("), true);
+
+    // The walk itself lives in the decisions header (so it can be driven).
+    std::ifstream header("src/overseer_decisions.h");
+    if (!header)
+    {
+        std::printf("FAIL cannot read src/overseer_decisions.h\n");
+        return EXIT_FAILURE;
+    }
+    std::string const htext((std::istreambuf_iterator<char>(header)),
+                            std::istreambuf_iterator<char>());
+    std::size_t const walk = htext.find("FootingWalkResult WalkFooting(");
+    std::string const walkBody = walk == std::string::npos ? "" : htext.substr(walk, 2400);
+    Check("the walk refuses through the pure feet-exemption rule",
+          Has(walkBody, "StrideLiquidRefused("), true);
+    Check("the walk measures the bot's own feet once, before the loop",
+          Has(walkBody, "feetLethal"), true);
+    std::size_t const loopAt = walkBody.find("for (unsigned i = 1;");
+    std::size_t const feetAt = walkBody.find("feetLethal");
     Check("the feet are measured before the first stride",
           loopAt != std::string::npos && feetAt != std::string::npos && feetAt < loopAt, true);
 
