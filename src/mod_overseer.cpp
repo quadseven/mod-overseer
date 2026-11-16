@@ -51045,19 +51045,46 @@ private:
         serving.clear();
         stops.clear();
         std::vector<OverseerDecisions::CrossingOffer> offers;
+        std::vector<OverseerDecisions::SameMapRideSelection> rideSelections;
+        std::vector<std::string> skipped;
         bool const leaderOnOrigin = leader->GetMapId() == originMap;
 
         for (CrossingTransportInfo const& info : ReadCrossingCatalogue())
         {
             if (!info.mapsUsed.count(originMap) || !info.mapsUsed.count(destinationMap))
                 continue;
+            int from = -1;
+            int to = -1;
+            OverseerDecisions::SameMapRideSelection rideSelection;
             // A RIDE ON ONE MAP BOARDS AT THE STOP NEAREST WHERE IT STARTED, not
             // where the passenger is now: aboard, it is carried past the others.
-            int const from = StopOnMap(info, originMap, sameMap ? fromX : leader->GetPositionX(),
-                                       sameMap ? fromY : leader->GetPositionY());
-            int const to = StopOnMap(info, destinationMap, goalX, goalY);
-            if (from < 0 || to < 0 || (sameMap && from == to))
-                continue;
+            if (sameMap)
+            {
+                std::vector<OverseerDecisions::SameMapRideStop> rideStops;
+                rideStops.reserve(info.stops.size());
+                for (CrossingStopInfo const& stop : info.stops)
+                    rideStops.push_back({stop.mapId, stop.mooringX, stop.mooringY,
+                                         stop.berthKnown});
+                rideSelection = OverseerDecisions::SelectSameMapRideStops(
+                    rideStops, originMap, fromX, fromY, goalX, goalY);
+                if (rideSelection.route == OverseerDecisions::SameMapRideRoute::NoStops ||
+                    rideSelection.route == OverseerDecisions::SameMapRideRoute::SameStop)
+                {
+                    skipped.push_back("'" + info.name + "' " +
+                                      OverseerDecisions::SameMapRideReason(rideSelection,
+                                                                           originMap));
+                    continue;
+                }
+                from = rideSelection.boardingStop;
+                to = rideSelection.landingStop;
+            }
+            else
+            {
+                from = StopOnMap(info, originMap, leader->GetPositionX(), leader->GetPositionY());
+                to = StopOnMap(info, destinationMap, goalX, goalY);
+                if (from < 0 || to < 0)
+                    continue;
+            }
             CrossingStopInfo const& a = info.stops[from];
             CrossingStopInfo const& b = info.stops[to];
 
@@ -51088,6 +51115,7 @@ private:
                        : -1.f;
             offer.periodSeconds = float(period) / 1000.f;
             offers.push_back(offer);
+            rideSelections.push_back(rideSelection);
             serving.push_back(&info);
             stops.emplace_back(from, to);
         }
@@ -51106,11 +51134,28 @@ private:
             line << '\'' << serving[i]->name << "' ";
             if (price.verdicts[i] == OverseerDecisions::OfferVerdict::Priced)
                 line << std::fixed << std::setprecision(0) << price.yards[i] << " yards";
+            else if (sameMap &&
+                     (rideSelections[i].route ==
+                          OverseerDecisions::SameMapRideRoute::NoBoardingBerth ||
+                      rideSelections[i].route ==
+                          OverseerDecisions::SameMapRideRoute::NoLandingBerth))
+                line << OverseerDecisions::SameMapRideReason(rideSelections[i], originMap);
             else
                 line << OverseerDecisions::OfferVerdictName(price.verdicts[i]);
         }
-        if (offers.empty())
-            line << "no transport's path names both maps";
+        for (std::string const& reason : skipped)
+        {
+            if (line.tellp() > 0)
+                line << "; ";
+            line << reason;
+        }
+        if (offers.empty() && skipped.empty())
+        {
+            if (sameMap)
+                line << "no same-map transport in the crossing catalogue on map " << originMap;
+            else
+                line << "no transport's path names both maps";
+        }
         said = line.str();
         return price.pick;
     }
@@ -53224,15 +53269,17 @@ private:
         namespace D = OverseerDecisions;
         std::string const name = who->GetName();
         D::CrossRequest const request = D::ParseCrossRequest(command);
-        auto refuse = [&](char const* why) -> char const*
+        auto refuseWith = [&](char const* why, std::string const& detail) -> char const*
         {
-            out = D::CrossResultJson(D::CrossEnd::Refused, why, D::CrossRefusalRetryable(why),
-                                     request.map, 0);
+            std::string const& reason = detail.empty() ? std::string(why) : detail;
+            out = D::CrossResultJson(D::CrossEnd::Refused, reason,
+                                     D::CrossRefusalRetryable(why), request.map, 0);
             status = "error";
             LOG_INFO("module.overseer", "overseer: cross-to-map {} for '{}' refused - {}", id,
-                     name, why);
+                     name, reason);
             return why;
         };
+        auto refuse = [&](char const* why) -> char const* { return refuseWith(why, ""); };
         if (*request.error)
             return refuse(request.error);
 
@@ -53269,6 +53316,7 @@ private:
         facts.crossingsUnderWay = CrossJobsUnderWay();
         facts.atOnce = CrossAtOnce();
         facts.routeKnown = true;
+        std::string routeDetails;
         if (facts.inWorld && !facts.onTargetMap && facts.isBot)
         {
             std::vector<CrossingTransportInfo const*> serving;
@@ -53284,12 +53332,18 @@ private:
                                         leg.ride, who->GetPositionX(),
                                         who->GetPositionY()) >= 0;
             if (!facts.routeKnown)
+                routeDetails = priced;
+            if (!facts.routeKnown)
                 LOG_INFO("module.overseer",
                          "overseer: cross-to-map {} for '{}' from map {} to map {} - priced: {}",
                          id, name, who->GetMapId(), leg.map, priced);
         }
         if (char const* wall = D::CrossGate(facts); *wall)
+        {
+            if (std::string(wall) == D::CrossRefusal::NoRoute && !routeDetails.empty())
+                return refuseWith(wall, routeDetails);
             return refuse(wall);
+        }
 
         LoneCrossing started;
         started.crossingOriginMap = who->GetMapId();

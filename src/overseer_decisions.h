@@ -10834,6 +10834,38 @@ struct CrossingPrice
 CrossingPrice PriceCrossings(std::vector<CrossingOffer> const& offers,
                              CrossingPriceLimits const& limits);
 
+// Same-map rides choose each endpoint by the stop's mooring, then check that
+// the selected stops have surveyed walking berths. A berth at the destination
+// must not make the boarding selector choose that same stop for both ends.
+struct SameMapRideStop
+{
+    std::uint32_t mapId{0};
+    float mooringX{0.f};
+    float mooringY{0.f};
+    bool berthKnown{false};
+};
+
+enum class SameMapRideRoute : std::uint8_t
+{
+    Ready,
+    NoStops,
+    SameStop,
+    NoBoardingBerth,
+    NoLandingBerth,
+};
+
+struct SameMapRideSelection
+{
+    SameMapRideRoute route{SameMapRideRoute::NoStops};
+    int boardingStop{-1};
+    int landingStop{-1};
+};
+
+SameMapRideSelection SelectSameMapRideStops(std::vector<SameMapRideStop> const& stops,
+                                            std::uint32_t mapId, float fromX, float fromY,
+                                            float goalX, float goalY);
+std::string SameMapRideReason(SameMapRideSelection const& selection, std::uint32_t mapId);
+
 // ------------------------ a member stranded on another continent (#274) --
 //
 // THE CROSSING ABOVE ONLY EVER MOVED A DUNGEON RUN'S LEADER, so a follower on
