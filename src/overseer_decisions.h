@@ -1628,6 +1628,28 @@ bool StepLiquidIsLethal(float depthYards, uint32_t liquidTypeMask);
 // read as sealed in a pocket.
 bool StrideLiquidRefused(bool feetInLethalLiquid, bool strideLethal);
 
+// WHERE TO ASK THE CORE WHAT KIND OF LIQUID STANDS AT A STRIDE (#1573, #1557).
+//
+// The footing check learns the liquid TYPE with a second query, Map::
+// GetLiquidData, and it needs a height to ask at. The first query gives it a
+// liquid surface and, when the core can find one, the ground under it. The
+// core finds that ground with a bounded look downward (Map::GetHeight, 50
+// yards), so over a cavern lake whose bed lies further down the ground comes
+// back unmeasured while the liquid surface still comes back. An unmeasured bed
+// used to mean "no question asked", and the world-model magma at the Molten
+// Core door passed as a floor. It is the deepest liquid there is, not a dry
+// one: ask just under its surface, and call its depth bottomless.
+struct LiquidProbePlan
+{
+    // False where no liquid stands over the ground: there is nothing to ask.
+    bool ask = false;
+    // The height to ask the core at, inside the liquid.
+    float z = 0.f;
+    // The depth to hand StepLiquidIsLethal.
+    float depthYards = 0.f;
+};
+LiquidProbePlan LethalLiquidProbe(float surfaceZ, float groundZ, bool groundKnown);
+
 // WHAT A REFUSED BEARING STILL PROVED (#312).
 //
 // THE FOOTING CHECK WALKS A BEARING IN STRIDES AND THREW AWAY EVERY STRIDE

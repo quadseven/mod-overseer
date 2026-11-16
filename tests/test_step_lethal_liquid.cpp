@@ -147,9 +147,9 @@ int main()
         std::printf("FAIL the adapter has no SurfaceAt\n");
         return EXIT_FAILURE;
     }
-    std::string const helperBody = text.substr(helper, 2600);
+    std::string const helperBody = text.substr(helper, 3600);
     Check("the liquid type is asked for only when liquid stands over the ground",
-          Has(helperBody, "depth > 0.f"), true);
+          Has(helperBody, "plan.ask"), true);
     Check("the liquid is measured with the core's own depth query",
           Has(helperBody, "GetWaterOrGroundLevel("), true);
     Check("the liquid TYPE is read from the core, not guessed from a height",

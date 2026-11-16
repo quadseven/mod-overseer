@@ -23038,16 +23038,26 @@ private:
         // comparison catches both.
         if (surface <= INVALID_HEIGHT)
             return false;
-        if (lethal && ground > INVALID_HEIGHT)
+        if (lethal)
         {
-            float const depth = surface - ground;
-            if (depth > 0.f)
+            // THE BED MAY BE OUT OF THE CORE'S REACH (#1573). GetHeight looks
+            // down 50 yards; a cavern lake deeper than that leaves `ground` at
+            // INVALID_HEIGHT while the liquid surface still comes back, and
+            // the world-model magma at the Molten Core door read as a floor.
+            // An unmeasured bed is the deepest liquid there is, so it is
+            // asked about (see OverseerDecisions::LethalLiquidProbe).
+            bool const groundKnown = ground > INVALID_HEIGHT;
+            OverseerDecisions::LiquidProbePlan const plan =
+                OverseerDecisions::LethalLiquidProbe(surface, ground, groundKnown);
+            if (plan.ask)
             {
+                // MAP_ALL_LIQUIDS reaches world-model liquid as well as the
+                // terrain's (Map.cpp:1336-1365 at the pinned revision).
                 LiquidData const liquid = map->GetLiquidData(
-                    bot->GetPhaseMask(), x, y, ground + depth * 0.5f,
+                    bot->GetPhaseMask(), x, y, plan.z,
                     bot->GetCollisionHeight(), MAP_ALL_LIQUIDS);
                 if (liquid.Status != LIQUID_MAP_NO_WATER)
-                    *lethal = OverseerDecisions::StepLiquidIsLethal(depth, liquid.Flags);
+                    *lethal = OverseerDecisions::StepLiquidIsLethal(plan.depthYards, liquid.Flags);
             }
         }
         out = surface;
