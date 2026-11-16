@@ -27112,6 +27112,13 @@ ReleasePromptReading ReleasePromptObserve(ReleasePromptClock& clock, std::int64_
     return reading;
 }
 
+bool CorpseRowBelongsToThisDeath(bool ghost, std::int64_t rowTime, std::int64_t lastDeathAt)
+{
+    if (!ghost || rowTime <= 0)
+        return false;
+    return lastDeathAt == 0 || rowTime >= lastDeathAt;
+}
+
 // --------------------------------------- dungeon run lockouts (#963) ---------
 
 bool InstanceLockoutIsLive(SavedInstance const& save, std::time_t now)
