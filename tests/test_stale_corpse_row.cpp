@@ -93,9 +93,24 @@ void TheDriveIsWired()
     if (at == std::string::npos)
         return;
     std::string const around = source.substr(at, 900);
-    Check("the fallback row is judged by CorpseRowBelongsToThisDeath before it is used",
+    Check("the fallback row is judged by CorpseRowBelongsToThisDeath with the ghost flag and the booked death",
           Has(around, "CorpseRowBelongsToThisDeath(") && Has(around, "LastDeathAt(name)") &&
               Has(around, "PLAYER_FLAGS_GHOST"));
+
+    // ORDER, not presence: no corpse field may be taken from the row before the
+    // helper has judged it, or the drive could regress and this stay green.
+    auto const judged = around.find("CorpseRowBelongsToThisDeath(");
+    auto const firstUse = around.find("= f[");
+    auto const firstRead = around.find("f[0]");
+    Check("the row's time is read only to be judged, then fields are taken inside the guard",
+          judged != std::string::npos && firstRead != std::string::npos &&
+              firstUse != std::string::npos && judged < firstUse);
+    auto const ghostAssigned = around.find("ghostTime = ");
+    Check("ghostTime is never assigned from the row before the helper has judged it",
+          ghostAssigned != std::string::npos && judged < ghostAssigned);
+    auto const mapAssigned = around.find("corpseMap = ");
+    Check("the corpse map is never assigned from the row before the helper has judged it",
+          mapAssigned != std::string::npos && judged < mapAssigned);
 }
 
 }  // namespace
