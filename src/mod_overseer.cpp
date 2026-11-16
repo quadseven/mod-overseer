@@ -7936,9 +7936,11 @@ void EndExitFight(Player* player, char const* how)
 //
 // The creatures this module put at REACT_DEFENSIVE, by guid. Shared by the world
 // thread's sweep and by the kill hook, which runs on the instance's map thread,
-// hence the lock.
+// hence the lock. KEYED BY (INSTANCE ID, GUID): a static spawn's guid is its entry
+// and spawn id, with no instance id, so the same patron in two instances of the
+// map shares a guid and must not share a key.
 std::mutex g_brdBarMutex;
-std::set<ObjectGuid> g_brdBarHeld;
+std::set<std::pair<uint32, ObjectGuid>> g_brdBarHeld;
 
 // THE WHOLE PASS, NOT ONLY THE SET (the review's race-condition finding). The
 // kill hook runs a pass on the instance's map thread and the sweep runs one on
@@ -8014,7 +8016,7 @@ BrdBarPass ApplyBrdBar(Map* map, bool pluggerKnownDead)
         facts.reactState = static_cast<int>(c->GetReactState());
         {
             std::lock_guard<std::mutex> guard(g_brdBarMutex);
-            facts.held = g_brdBarHeld.count(c->GetGUID()) != 0;
+            facts.held = g_brdBarHeld.count({map->GetInstanceId(), c->GetGUID()}) != 0;
         }
         switch (OverseerDecisions::BarPatronAction(pass.hold, facts))
         {
@@ -8022,7 +8024,7 @@ BrdBarPass ApplyBrdBar(Map* map, bool pluggerKnownDead)
                 c->SetReactState(REACT_DEFENSIVE);
                 {
                     std::lock_guard<std::mutex> guard(g_brdBarMutex);
-                    g_brdBarHeld.insert(c->GetGUID());
+                    g_brdBarHeld.insert({map->GetInstanceId(), c->GetGUID()});
                 }
                 break;
             case OverseerDecisions::BarAction::Release:
@@ -8030,7 +8032,7 @@ BrdBarPass ApplyBrdBar(Map* map, bool pluggerKnownDead)
                     c->SetReactState(REACT_AGGRESSIVE);
                 {
                     std::lock_guard<std::mutex> guard(g_brdBarMutex);
-                    g_brdBarHeld.erase(c->GetGUID());
+                    g_brdBarHeld.erase({map->GetInstanceId(), c->GetGUID()});
                 }
                 break;
             case OverseerDecisions::BarAction::None:

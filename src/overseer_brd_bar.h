@@ -93,8 +93,11 @@ inline BarAction BarPatronAction(bool hold, BarPatronFacts const& f)
 {
     if (f.held && !hold)
         return BarAction::Release;
-    if (!hold || f.held)
+    if (!hold)
         return BarAction::None;
+    // A HELD PATRON FALLS THROUGH, NOT OUT: a patron that respawns while the bar
+    // is armed has its react state reset to aggressive by the core, and that is
+    // read here like any aggressive patron, so the hold is reasserted.
     if (!IsBarPatron(f.entry) || !f.alive || f.summon)
         return BarAction::None;
     // Who joins a fight is the concern, not who is in one.

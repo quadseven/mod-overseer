@@ -121,6 +121,23 @@ void TheRelease()
     f.reactState = BAR_REACT_DEFENSIVE;
     Expect(BarPatronAction(true, f) == BarAction::None,
            "a held patron stays held while a member walks");
+    // A held patron that respawns while the bar is armed has its react state reset
+    // to aggressive by the core; the hold is reasserted, not skipped as "held".
+    BarPatronFacts respawned = Patron();
+    respawned.held = true;
+    respawned.reactState = BAR_REACT_AGGRESSIVE;
+    Expect(BarPatronAction(true, respawned) == BarAction::Hold,
+           "a held patron that reads aggressive again is held again");
+    respawned.engaged = true;
+    Expect(BarPatronAction(true, respawned) == BarAction::None,
+           "...unless it is already fighting");
+    respawned.engaged = false;
+    respawned.alive = false;
+    Expect(BarPatronAction(true, respawned) == BarAction::None, "...or dead");
+    respawned.alive = true;
+    respawned.reactState = BAR_REACT_PASSIVE;
+    Expect(BarPatronAction(true, respawned) == BarAction::None,
+           "...or moved by a script to something that is not ours");
     Expect(BarPatronAction(false, f) == BarAction::Release,
            "it is released when no member is in the instance");
     f.engaged = true;
@@ -183,6 +200,14 @@ void TheAdapterWiresIt()
     Expect(lockAt != std::string::npos && lockAt < passEnd && lockAt < firstScan &&
                lockAt < firstSet,
            "the whole pass holds its own lock from before the first read of the map");
+    // TWO INSTANCES SHARE SPAWN GUIDS: a static spawn's guid is its entry and spawn
+    // id, with no instance id, so the held set is keyed by (instance id, guid).
+    Expect(src.find("std::set<std::pair<uint32, ObjectGuid>> g_brdBarHeld;") != std::string::npos,
+           "the held set is keyed by instance id and guid");
+    Expect(inPass("map->GetInstanceId()") && !inPass("g_brdBarHeld.count(c->GetGUID())") &&
+               !inPass("g_brdBarHeld.insert(c->GetGUID())") &&
+               !inPass("g_brdBarHeld.erase(c->GetGUID())"),
+           "the pass reads, writes and erases the held set by the (instance, guid) key only");
     Expect(src.find("std::mutex g_brdBarPassMutex;") != std::string::npos,
            "the pass lock exists");
     std::size_t const holdFn = src.find("\nvoid HoldBrdBarOnKill(Creature* killed)\n{");
