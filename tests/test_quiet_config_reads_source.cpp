@@ -3,13 +3,13 @@
  *
  * The core's GetOption warns "Config: Missing property <key> ..." on every
  * call when the key is absent from the config file and showLogs, the third
- * argument, is left at its default of true. The six keys below are read on
+ * argument, is left at its default of true. The keys below are read on
  * every raid pass and every route plan, and the realm leaves them at their
  * defaults on purpose. Read without `false`, one line of the worldserver log
  * in every two was that warning (5,690 of 9,812 lines in 30 minutes on the
  * dev realm), which buried the lines that matter.
  *
- * What this file pins: each read of these six keys passes `false` as the third
+ * What this file pins: each read of these keys passes `false` as the third
  * argument, and keeps the default it had. The conf template must still
  * document each key, so turning one on later stays a one-line change.
  */
@@ -81,6 +81,10 @@ int main()
         {"Overseer.Raid.QuorumTanks", "OverseerDecisions::RAID_QUORUM_TANKS"},
         {"Overseer.Raid.QuorumHealers", "OverseerDecisions::RAID_QUORUM_HEALERS"},
         {"Overseer.Raid.RepairFloorPct", "70"},
+        {"Overseer.Raid.FreeSlotFloor", "OverseerDecisions::RAID_FREE_SLOT_FLOOR_DEFAULT"},
+        {"Overseer.Raid.Tanks", "OverseerDecisions::RAID_TANKS_DEFAULT"},
+        {"Overseer.Raid.Healers", "OverseerDecisions::RAID_HEALERS_DEFAULT"},
+        {"Overseer.Raid.ConvertRosterParty", "false"},
         {"Overseer.Route.NeutralElites", "true"},
         {"Overseer.Route.LoneGreyDensity", "0"},
     };
