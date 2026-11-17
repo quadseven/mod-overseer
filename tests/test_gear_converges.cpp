@@ -659,6 +659,26 @@ void AWornFloorIsBeatenByAClearlyBetterPiece()
                      GearComparison::Undecided);
 }
 
+// A TRINKET IS WORN ONCE (wow-overseer#2358). A live read found a level 60
+// warrior wearing the Heart of Noxxion in BOTH trinket slots. A trinket's worth
+// is mostly an effect the stat sum cannot price, and two copies of one effect
+// share a cooldown, so the second slot is wasted on the same piece while a
+// distinct trinket sits in the bags. Rings carry no such effect and a pair of
+// the same ring is legitimate.
+void ATrinketIsNotWornTwice()
+{
+    constexpr unsigned HEART = 17744;
+    constexpr unsigned OTHER = 11302;
+    Expect("the same trinket is refused for the second slot",
+           OverseerDecisions::GearIsSecondCopyOfTrinket(true, HEART, HEART));
+    Expect("a different trinket is not",
+           !OverseerDecisions::GearIsSecondCopyOfTrinket(true, OTHER, HEART));
+    Expect("an empty other slot is not",
+           !OverseerDecisions::GearIsSecondCopyOfTrinket(true, HEART, 0));
+    Expect("a pair of the same ring is legitimate",
+           !OverseerDecisions::GearIsSecondCopyOfTrinket(false, HEART, HEART));
+}
+
 int main()
 {
     TheSameTwoGlovesGiveTheSameAnswerWhicheverIsOn();
@@ -675,6 +695,7 @@ int main()
     GivingUpOnOnePairDoesNotFreezeTheSlot();
     WithNobodyFightingBackTheGuardIsInert();
     AnEmptySlotIsNeverSomethingToGiveUpOn();
+    ATrinketIsNotWornTwice();
 
     if (failures)
     {

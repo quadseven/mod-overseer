@@ -21754,6 +21754,27 @@ private:
                 }
             }
 
+            // A TRINKET IS WORN ONCE (wow-overseer#2358). The slot this piece
+            // is NOT going into is the other trinket home; if it already holds
+            // this very entry the piece is a second copy, and the next-best
+            // distinct trinket takes the second slot instead.
+            if (found == EQUIPMENT_SLOT_TRINKET1)
+            {
+                uint8 const otherHome = static_cast<uint8>(
+                    target == EQUIPMENT_SLOT_TRINKET1 ? EQUIPMENT_SLOT_TRINKET2
+                                                      : EQUIPMENT_SLOT_TRINKET1);
+                if (OverseerDecisions::GearIsSecondCopyOfTrinket(
+                        true, item->GetEntry(), GearWornEntry(bot, otherHome)))
+                {
+                    if (SayGearOnce(who.name, item->GetEntry()))
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' already wears {} in its other trinket slot, "
+                                 "so a second copy stays in the bags",
+                                 who.name, proto->Name1);
+                    continue;
+                }
+            }
+
             // What every line below prints as "against", said so the off hand
             // is visible in it rather than folded silently into a total (#411).
             std::string const incumbentSaid = OverseerDecisions::GearIncumbentSaid(

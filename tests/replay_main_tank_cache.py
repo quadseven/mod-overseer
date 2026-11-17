@@ -270,6 +270,23 @@ class MainTankCachePatchTest(unittest.TestCase):
         if built.returncode:
             raise RuntimeError(built.stderr)
 
+    def test_every_patch_line_in_a_hunk_carries_its_marker(self):
+        # A blank context line must be a single space. An empty line inside a
+        # hunk is accepted by some git builds and refused by others, which
+        # stopped the decisions gate in git apply before any decision test ran.
+        lines = PATCH.read_text().splitlines()
+        in_hunk = False
+        for number, line in enumerate(lines, start=1):
+            if line.startswith("diff --git "):
+                in_hunk = False
+            elif line.startswith("@@ "):
+                in_hunk = True
+            elif in_hunk:
+                self.assertTrue(
+                    line[:1] in (" ", "+", "-", "\\"),
+                    "line %d is inside a hunk and has no marker" % number,
+                )
+
     def test_main_tank_identity_is_resolved_at_each_use(self):
         for scenario in (
             "departed",
