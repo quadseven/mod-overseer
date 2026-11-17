@@ -60,8 +60,9 @@ REPLACE INTO overseer_zone_danger(name,result) VALUES ('LeaderA','{"zones":[{"zo
             "SELECT CONCAT(name, CHAR(9), family) FROM overseer_roster "
             "ORDER BY name;"
         )
+        # mysql --batch escapes tab bytes inside fields as the two characters \t.
         self.assertEqual(
-            ["ExistingA\tFamilyA", "ExistingB\tFamilyB", "NewMember\t"],
+            ["ExistingA\\tFamilyA", "ExistingB\\tFamilyB", "NewMember\\t"],
             rows.splitlines(),
         )
         default_is_neutral = self.mysql(
