@@ -48,3 +48,18 @@ For each continent and player side, the report gives:
 2, non-grey hostile rule. `a_n2` and `a_n3` add lone-walker density at the
 given count, using each spawn's detection range plus 5 yards around either leg
 endpoint. They include the B rule as well.
+
+## Live replay percentages (open)
+
+| Result | Status |
+|---|---|
+| Real replay percentages by continent and player side | **OPEN - NOT MEASURED** |
+
+To fill this box, take one consistent, sanitized snapshot for the measured maps:
+all relevant rows from `playerbots_travelnode`, every directed link and ordered
+path point from `playerbots_travelnode_link` and `playerbots_travelnode_path`,
+all corresponding `creature` spawn rows and their `creature_template` values,
+the pinned core's faction-template data, and the Alliance and Horde player
+template faction IDs. Derive `can_be_fought`, `trigger`, `civilian`, and `active`
+with the pinned core's rules. Do not report percentages until that complete
+snapshot has been replayed.
