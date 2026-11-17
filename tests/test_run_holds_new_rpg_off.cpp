@@ -91,7 +91,7 @@ int main()
           keep.rfind("HasStrategy(\"new rpg\"") > keep.find("ChangeStrategy(\"-new rpg\""));
 
     // The leader's grant: the hold is asked before the grant and turns it off.
-    std::string const leader = Slice(source, "KeepLeaderStayHonest(leader, leaderName, leaderAI, held);",
+    std::string const leader = Slice(source, "std::string const leaderName = leader->GetName();",
                                      "leads but did not carry `new rpg` - granting it");
     std::string::size_type const asked = leader.find("KeepNewRpgOffInsideTheRun(leader, leaderAI)");
     std::string::size_type const grant = leader.find("if (mayCarry && !leaderAI->HasStrategy(\"new rpg\"");
