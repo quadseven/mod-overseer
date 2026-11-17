@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <string>
 
@@ -50,16 +51,12 @@ struct Rig
 {
     InMemoryAimColumn column;
     MovementOwnership wheel{column, GRACE};
-    unsigned leaderAsks{0};
-    bool leaderFree{true};
 
     OverseerMovement::ClaimResult Claim(std::string const& name, std::string const& aim,
-                                        TravelOwner owner, bool cached = false)
+                                        TravelOwner owner, bool cached = false,
+                                        time_t now = T0)
     {
-        return wheel.Claim(name, aim, owner, cached, [this] {
-            ++leaderAsks;
-            return leaderFree;
-        });
+        return wheel.Claim(name, aim, owner, cached, now);
     }
 };
 
@@ -118,7 +115,6 @@ void AForeignAimIsLeftAlone()
               got.answer == ClaimAnswer::Fenced &&
                   got.verdict == OverseerDecisions::TravelClaim::RefusedForeign);
         Check("and writes nothing", r.column.writes == before && r.column.columns["Ann"] == foreign);
-        Check("the leader is not asked about a fenced claim", r.leaderAsks == 0);
         Check("the forecast agrees",
               r.wheel.FenceRefuses("Ann", "at:0:1,2,3", TravelOwner::CatchUp, false));
         ReleaseResult const rel = r.wheel.Release("Ann", T0);
@@ -278,11 +274,9 @@ void ACachedDriveIsTrustedOnlyWhileTheColumnAgrees()
 {
     Rig r;
     r.column.columns["Ann"] = "vendor";
-    r.leaderFree = false;
     auto const same = r.Claim("Ann", "vendor", TravelOwner::TownTrip, true);
-    Check("an unchanged cached drive holds without a write or a leader ask",
-          same.answer == ClaimAnswer::AlreadyDriving && same.Holds() && r.column.writes == 0 &&
-              r.leaderAsks == 0);
+    Check("an unchanged cached drive holds without a write",
+          same.answer == ClaimAnswer::AlreadyDriving && same.Holds() && r.column.writes == 0);
     Check("the forecast agrees", !r.wheel.FenceRefuses("Ann", "vendor", TravelOwner::TownTrip, true));
     for (char const* changed : {"banker", "at:0:1,2,3", "guard:0:1,2,3"})
     {
@@ -297,14 +291,127 @@ void ACachedDriveIsTrustedOnlyWhileTheColumnAgrees()
 void ABusyLeaderIsNotWritten()
 {
     Rig r;
-    r.leaderFree = false;
-    auto const got = r.Claim("Lead", "vendor", TravelOwner::TownTrip);
+    r.wheel.ConfigureLeaderIntents(true, OverseerDecisions::LeaderIntentLimits{});
+    r.wheel.SetLeaders({"Lead"});
+    r.wheel.AskForLeader("Lead", OverseerDecisions::LeaderIntentKind::OperatorOrder,
+                         "operator", "stay", "operator pin", T0);
+    r.column.columns["Lead"] = "vendor";
+    auto const fenced = r.Claim("Lead", "at:0:1,2,3", TravelOwner::CatchUp, false, T0 + 1);
+    Check("a foreign column is fenced before the module asks for a leader hold",
+          fenced.answer == ClaimAnswer::Fenced && !fenced.leaderAsk.asked);
+    r.column.columns["Lead"].clear();
+    auto const got = r.Claim("Lead", "vendor", TravelOwner::TownTrip, false, T0 + 1);
     Check("a busy leader refuses the claim",
-          got.answer == ClaimAnswer::LeaderBusy && !got.Holds() && r.leaderAsks == 1);
+          got.answer == ClaimAnswer::LeaderBusy && !got.Holds() && got.leaderAsk.asked &&
+              got.leaderAsk.verdict.answer == OverseerDecisions::LeaderIntentAnswer::Deferred);
     Check("and leaves column and claim untouched",
           r.column.writes == 0 && !r.wheel.HoldsClaim("Lead", "vendor"));
     Check("the forecast does not ask whose turn it is",
           !r.wheel.FenceRefuses("Lead", "vendor", TravelOwner::TownTrip, false));
+}
+
+// The movement interface owns named leader holds, their dwell, and release.
+void LeaderIntentsLiveBehindTheMovementInterface()
+{
+    Rig r;
+    r.wheel.ConfigureLeaderIntents(true, OverseerDecisions::LeaderIntentLimits{});
+    r.wheel.SetLeaders({"Lead"});
+    auto const granted = r.wheel.AskForLeader(
+        "Lead", OverseerDecisions::LeaderIntentKind::TownErrand, "travel column", "banker",
+        "claims the travel column", T0);
+    Check("a free leader grants the named hold",
+          granted.answer == OverseerDecisions::LeaderIntentAnswer::Granted);
+    Check("the module reports its current hold",
+          r.wheel.CurrentLeaderIntent("Lead", T0 + 1) ==
+              OverseerDecisions::LeaderIntentKind::TownErrand);
+
+    auto const deferred = r.wheel.AskForLeader(
+        "Lead", OverseerDecisions::LeaderIntentKind::FetchMember, "fetch", "Og",
+        "catches up", T0 + 30);
+    Check("a higher-ranked owner waits inside the dwell",
+          deferred.answer == OverseerDecisions::LeaderIntentAnswer::Deferred &&
+              deferred.waitSeconds == 60);
+    r.wheel.WaiveLeaderDwell("Lead");
+    auto const taken = r.wheel.AskForLeader(
+        "Lead", OverseerDecisions::LeaderIntentKind::FetchMember, "fetch", "Og",
+        "catches up after combat", T0 + 31);
+    Check("waiving dwell hands the hold to the named owner",
+          taken.answer == OverseerDecisions::LeaderIntentAnswer::Granted &&
+              r.wheel.CurrentLeaderIntent("Lead", T0 + 31) ==
+                  OverseerDecisions::LeaderIntentKind::FetchMember);
+    Check("the previous owner cannot release the new hold",
+          !r.wheel.EndForLeader("Lead", OverseerDecisions::LeaderIntentKind::FetchMember,
+                                "travel column", OverseerDecisions::LeaderIntentEnd::Completed,
+                                T0 + 32));
+    Check("the current owner can release its hold",
+          r.wheel.EndForLeader("Lead", OverseerDecisions::LeaderIntentKind::FetchMember,
+                               "fetch", OverseerDecisions::LeaderIntentEnd::Completed,
+                               T0 + 32) &&
+              r.wheel.CurrentLeaderIntent("Lead", T0 + 32) ==
+                  OverseerDecisions::LeaderIntentKind::None);
+}
+
+void TheMovementInterfaceOwnsLeaderRosterPreferencesAndColumnEnds()
+{
+    Rig r;
+    r.wheel.ConfigureLeaderIntents(true, OverseerDecisions::LeaderIntentLimits{});
+    r.wheel.SetLeaders({"Lead"});
+    auto const nonLeader = r.wheel.AskForLeader(
+        "Other", OverseerDecisions::LeaderIntentKind::Regroup, "regroup", "Og", "test", T0);
+    Check("a name outside the leader set does not acquire a hold",
+          nonLeader.answer == OverseerDecisions::LeaderIntentAnswer::Granted &&
+              r.wheel.CurrentLeaderIntent("Other", T0) ==
+                  OverseerDecisions::LeaderIntentKind::None);
+
+    OverseerDecisions::LeaderIntentPreference preference;
+    preference.kind = OverseerDecisions::LeaderIntentKind::TownErrand;
+    preference.target = "banker";
+    preference.until = T0 + 1000;
+    r.wheel.SetLeaderPreference("Lead", preference);
+    for (time_t now = T0; now <= T0 + 195; now += 15)
+        r.wheel.AskForLeader("Lead", OverseerDecisions::LeaderIntentKind::TownErrand,
+                             "travel column", "banker", "keeps the picked errand", now);
+    auto const regroup = r.wheel.AskForLeader(
+        "Lead", OverseerDecisions::LeaderIntentKind::Regroup, "regroup", "Og",
+        "would change the leader's work", T0 + 200);
+    Check("the module applies its configured preference",
+          regroup.answer == OverseerDecisions::LeaderIntentAnswer::Deferred);
+    Check("the leader's asked work is visible through the module",
+          !r.wheel.LeaderIntentsOnTheTable("Lead", T0 + 200).empty());
+    Check("walks are derived from the held intent",
+          r.wheel.LeaderWalksUnderNewRpg("Lead", T0 + 200));
+
+    OverseerMovement::LeaderColumnEnd const ended =
+        r.wheel.EndColumnLeaderIntent("Lead", "the errand arrived at the banker", T0 + 201);
+    Check("a column end completes the module-owned errand intent",
+          ended.ended && ended.how == OverseerDecisions::LeaderIntentEnd::Completed &&
+              r.wheel.CurrentLeaderIntent("Lead", T0 + 201) ==
+                  OverseerDecisions::LeaderIntentKind::None);
+
+    r.wheel.AskForLeader("Lead", OverseerDecisions::LeaderIntentKind::Regroup, "regroup", "Og",
+                         "hold for the member", T0 + 202);
+    Check("a non-column hold stays with its owner",
+          !r.wheel.EndColumnLeaderIntent("Lead", "arrived", T0 + 203).ended &&
+              r.wheel.CurrentLeaderIntent("Lead", T0 + 203) ==
+                  OverseerDecisions::LeaderIntentKind::Regroup);
+    Check("stay leak notices are said once and reset when cleared",
+          r.wheel.NoteLeaderStayLeak("Lead") && !r.wheel.NoteLeaderStayLeak("Lead"));
+    r.wheel.ForgetLeaderStayLeak("Lead");
+    Check("a cleared stay leak may be said again", r.wheel.NoteLeaderStayLeak("Lead"));
+
+    r.wheel.SetLeaders({"Other"});
+    Check("a former leader loses its held intent and preference",
+          r.wheel.CurrentLeaderIntent("Lead", T0 + 204) ==
+                  OverseerDecisions::LeaderIntentKind::None &&
+              r.wheel.LeaderPreferenceFor("Lead").kind ==
+                  OverseerDecisions::LeaderIntentKind::None);
+    r.wheel.ConfigureLeaderIntents(false, OverseerDecisions::LeaderIntentLimits{});
+    Check("disabling leader arbitration lets other drives proceed",
+          r.wheel.AskForLeader("Other", OverseerDecisions::LeaderIntentKind::Regroup,
+                               "regroup", "Og", "disabled", T0 + 205).answer ==
+                  OverseerDecisions::LeaderIntentAnswer::Granted &&
+              r.wheel.CurrentLeaderIntent("Other", T0 + 205) ==
+                  OverseerDecisions::LeaderIntentKind::None);
 }
 
 // An aim wider than the column is refused before anything is read (#1139).
@@ -351,8 +458,8 @@ void AVanishedAimIsAReleaseToo()
 
 
 // THE ONE DOOR. Every UPDATE of `travel_npc` in the adapter lives inside
-// RosterAimColumn, the module's production adapter, and the travel book holds
-// the module rather than claim or hand-back maps of its own.
+// RosterAimColumn, and the shared movement module owns the column and leader
+// intent state rather than leaving either book beside its callers.
 void OnlyTheRosterAdapterWritesTheColumn()
 {
     std::ifstream file("src/mod_overseer.cpp");
@@ -387,13 +494,18 @@ void OnlyTheRosterAdapterWritesTheColumn()
     if (book == std::string::npos || bookEnd == std::string::npos)
         return;
     std::string const body = source.substr(book, bookEnd - book);
-    Check("the travel book holds the module",
-          body.find("OverseerMovement::MovementOwnership _wheel{_roster, "
-                    "TRAVEL_HANDBACK_SECONDS};") != std::string::npos);
-    Check("and no claim or hand-back map of its own",
+    Check("the shared movement module owns the roster adapter",
+          source.find("MovementOwnership& MovementOwner()") != std::string::npos &&
+              source.find("MovementOwnership movement{column, TRAVEL_HANDBACK_SECONDS};") !=
+                  std::string::npos);
+    Check("the travel book holds no duplicate claim or hand-back state",
           body.find("std::map<std::string, std::string> _claimed;") == std::string::npos &&
               body.find("_claimOwner") == std::string::npos &&
-              body.find("std::map<std::string, time_t> _handback;") == std::string::npos);
+              body.find("std::map<std::string, time_t> _handback;") == std::string::npos &&
+              body.find("MovementOwnership _wheel") == std::string::npos);
+    Check("leader intent state is owned by the movement module",
+          source.find("struct LeaderIntentBookState") == std::string::npos &&
+              source.find("OverseerDecisions::AskLeaderIntent(") == std::string::npos);
 }
 
 }  // namespace
@@ -412,6 +524,8 @@ int main()
     ARunWhoseClaimARestartLostRetiresItsExactLeg();
     ACachedDriveIsTrustedOnlyWhileTheColumnAgrees();
     ABusyLeaderIsNotWritten();
+    LeaderIntentsLiveBehindTheMovementInterface();
+    TheMovementInterfaceOwnsLeaderRosterPreferencesAndColumnEnds();
     AnAimTooWideIsRefusedFirst();
     LeftoverAndPoisonedAimsUseTheExactClear();
     AVanishedAimIsAReleaseToo();
