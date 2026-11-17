@@ -22111,6 +22111,11 @@ int NearestTrainerSpot(std::vector<TrainerSpot> const& spots, uint32_t mapId, fl
     return best;
 }
 
+bool GuildTrainerSpotUsable(bool spawnStandsNow, unsigned otherSideGuards)
+{
+    return spawnStandsNow && otherSideGuards == 0;
+}
+
 GuildTrainingStep DecideGuildTraining(unsigned affordable, bool trainerFound, float yards,
                                       float reach)
 {

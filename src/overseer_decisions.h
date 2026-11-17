@@ -25064,6 +25064,16 @@ struct TrainerSpot
 int NearestTrainerSpot(std::vector<TrainerSpot> const& spots, uint32_t mapId, float x, float y,
                        float maxYards);
 
+// Whether a class trainer spawn is somewhere a natural member may be sent. A
+// trainer being friendly is not enough: an event trainer carries faction 35,
+// friendly to both sides, and stands inside the other side's town beside its
+// guards (Arena Tournament Warlock Trainers in Ironforge). So a spawn tied to
+// a game event that is not running is nobody to walk to, and one with a hostile
+// town guard standing beside it ends the walk in a death, over and over.
+// `otherSideGuards` is how many of the other side's spawns that are hostile to
+// the member stand within the guard radius of it.
+bool GuildTrainerSpotUsable(bool spawnStandsNow, unsigned otherSideGuards);
+
 enum class GuildTrainingStep
 {
     Nothing,  // nothing it can afford to learn, or no trainer to learn it from

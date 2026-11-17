@@ -17,6 +17,7 @@
 #include <vector>
 
 using OverseerDecisions::DecideGuildTraining;
+using OverseerDecisions::GuildTrainerSpotUsable;
 using OverseerDecisions::GuildTrainingStep;
 using OverseerDecisions::NearestTrainerSpot;
 using OverseerDecisions::TrainerSpot;
@@ -60,6 +61,18 @@ int main()
           "affordable spells and a trainer away: it walks");
     Check(DecideGuildTraining(3, true, 4.f, 5.f) == GuildTrainingStep::Learn,
           "at the trainer: it learns");
+
+    // A friendly-faction trainer is not a usable trainer by that alone. An
+    // event trainer (faction 35, friendly to both sides) stands beside the
+    // other side's town guards, and a level 37 Horde warlock walked to one in
+    // Dun Morogh and died to a city guard 14 times, 15 minutes apart.
+    Check(GuildTrainerSpotUsable(true, 0), "an in-world spawn with no hostile guard near is usable");
+    Check(!GuildTrainerSpotUsable(false, 0),
+          "a spawn tied to a game event that is not running is nobody to walk to");
+    Check(!GuildTrainerSpotUsable(true, 1),
+          "a spawn the other side's guard stands beside is not usable, however friendly it is");
+    Check(!GuildTrainerSpotUsable(true, 6), "several guards: not usable");
+    Check(!GuildTrainerSpotUsable(false, 3), "out of season and guarded: not usable");
 
     if (failures)
     {
