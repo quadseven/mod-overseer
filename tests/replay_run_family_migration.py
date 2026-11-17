@@ -40,6 +40,37 @@ REPLACE INTO overseer_zone_danger(name,result) VALUES ('LeaderA','{"zones":[{"zo
         )
         self.assertEqual("utf8mb4_unicode_ci", collation.strip())
 
+    def test_neutral_roster_family_default_is_guarded_and_preserves_rows(self):
+        bootstrap = "DROP TABLE IF EXISTS overseer_roster;\n"
+        bootstrap += (SQL / "2026_08_23_00_overseer_roster.sql").read_text()
+        bootstrap += (SQL / "2026_09_19_00_overseer_roster_family.sql").read_text()
+        self.mysql(bootstrap)
+        self.mysql(
+            "INSERT INTO overseer_roster(name,family) VALUES "
+            "('ExistingA','FamilyA'),('ExistingB','FamilyB');"
+        )
+
+        migration = SQL / "2026_11_16_00_overseer_roster_family_default.sql"
+        self.assertTrue(migration.is_file(), "guarded family-default migration is missing")
+        sql = migration.read_text()
+        self.mysql(sql + sql)
+        self.mysql("INSERT INTO overseer_roster(name) VALUES ('NewMember');")
+
+        rows = self.mysql(
+            "SELECT CONCAT(name, '\\t', family) FROM overseer_roster "
+            "ORDER BY name;"
+        )
+        self.assertEqual(
+            ["ExistingA\tFamilyA", "ExistingB\tFamilyB", "NewMember\t"],
+            rows.splitlines(),
+        )
+        default_is_neutral = self.mysql(
+            "SELECT COLUMN_DEFAULT = '' FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='overseer_roster' "
+            "AND COLUMN_NAME='family';"
+        )
+        self.assertEqual("1", default_is_neutral.strip())
+
     def mysql(self, sql):
         command = json.loads(
             os.environ.get(
