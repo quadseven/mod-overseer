@@ -32,10 +32,13 @@
 //
 // THE UKORZ WALK is the run's step once the End Door is done and Ukorz lives
 // uncredited. Its clock is the tank's distance to Ukorz: a walk that comes no
-// ZF_UKORZ_NEARER_YARDS nearer than its best for ZF_UKORZ_WALK_SECONDS gives
-// up. Inside ZF_UKORZ_REACHED_YARDS the party is at Ukorz, his fight is the
-// boss's own, and the walk is not judged. Cleared runs took 2 to 9 minutes from
-// their first path to Ukorz to the end of the run.
+// ZF_UKORZ_NEARER_YARDS nearer than its best for ZF_UKORZ_WALK_SECONDS first
+// sends a grounded movement recovery toward him, re-issued every
+// ZF_UKORZ_RECOVERY_RETRY_SECONDS. If that walk also comes no nearer for
+// ZF_UKORZ_WALK_SECONDS, the run gives up. In combat or while the group's
+// brain is held, the tank is not re-aimed. Inside ZF_UKORZ_REACHED_YARDS the
+// party has reached Ukorz; his fight is the boss's own, and the walk is not
+// judged. Cleared runs took 2 to 9 minutes from their first path to Ukorz to the end of the run.
 //
 // Both clocks run on through wipes and corpse runs: a run that dies on the way
 // over and over is the failure measured, not a reason to wait. While nothing
@@ -66,6 +69,7 @@ constexpr std::uint32_t ZF_PYRAMID_NOT_STARTED = 0;
 
 constexpr std::time_t ZF_PYRAMID_STALL_SECONDS = 25 * 60;
 constexpr std::time_t ZF_UKORZ_WALK_SECONDS = 15 * 60;
+constexpr std::time_t ZF_UKORZ_RECOVERY_RETRY_SECONDS = 60;
 constexpr float ZF_UKORZ_NEARER_YARDS = 10.f;
 constexpr float ZF_UKORZ_REACHED_YARDS = 40.f;
 
@@ -77,6 +81,7 @@ enum class ZulFarrakStepVerdict : std::uint8_t
     Idle,      // not this step: the clock is cleared
     Carry,     // nothing readable this poll: the clock is kept as it is
     Watching,  // this step, inside its bound
+    Recover,   // re-aim the tank toward Ukorz, once per retry interval
     GiveUp,    // this step, past its bound: end the run with the reason
 };
 
@@ -152,6 +157,9 @@ struct ZulFarrakUkorzFacts
     bool read{false};
     std::uint32_t creditedMask{0};
     std::uint32_t endDoorState{ZF_END_DOOR_NOT_STARTED};
+    // Recovery moves the tank only while the group is not fighting, regrouping
+    // or held for a rest.
+    bool pauseMovement{false};
     // A living Ukorz was found in the instance, and the tank's distance to him.
     bool ukorzFound{false};
     float yards{0.f};
@@ -165,6 +173,10 @@ struct ZulFarrakUkorzClock
     // step's start, and on every ZF_UKORZ_NEARER_YARDS gain since.
     float best{0.f};
     std::time_t since{0};
+    // One bounded direct-walk recovery is in progress. Movement of at least
+    // ZF_UKORZ_NEARER_YARDS resets this bit and permits another recovery later.
+    bool recoveryIssued{false};
+    std::time_t recoveryAt{0};
 };
 
 struct ZulFarrakUkorzStep
@@ -198,10 +210,27 @@ inline ZulFarrakUkorzStep ZulFarrakUkorzNext(ZulFarrakUkorzFacts const& f,
     // The best only moves on a ZF_UKORZ_NEARER_YARDS gain, so a slow walk
     // that keeps closing in still resets the clock every ten yards.
     step.clock = clock;
+    if (f.pauseMovement)
+        return step;
     if (f.now - clock.since >= ZF_UKORZ_WALK_SECONDS)
     {
-        step.verdict = ZulFarrakStepVerdict::GiveUp;
         step.seconds = f.now - clock.since;
+        if (!clock.recoveryIssued)
+        {
+            step.verdict = ZulFarrakStepVerdict::Recover;
+            step.clock.recoveryIssued = true;
+            step.clock.since = f.now;
+            step.clock.recoveryAt = f.now;
+            return step;
+        }
+        step.verdict = ZulFarrakStepVerdict::GiveUp;
+        return step;
+    }
+    if (clock.recoveryIssued &&
+        f.now - clock.recoveryAt >= ZF_UKORZ_RECOVERY_RETRY_SECONDS)
+    {
+        step.verdict = ZulFarrakStepVerdict::Recover;
+        step.clock.recoveryAt = f.now;
     }
     return step;
 }
