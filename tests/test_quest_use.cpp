@@ -319,6 +319,27 @@ void TheOpenerTakesItsChestLootQuestItemsFirst()
     Expect(ChestLootSlots(chest, chest, 300, 0).size() == 255, "a loot slot is one byte");
 }
 
+void TheChestWindowIsDescribedForTheLog()
+{
+    std::uint64_t const chest = 0xF110000000009052ull;
+    ExpectText("no use parked: no line", ChestWindowLine(0, chest, 1, 1, 0, 5, 1, 1), "");
+    std::string const taken = ChestWindowLine(chest, chest, 0, 1, 0, 3, 1, 1);
+    Expect(taken.find("window on the chest its use opened") != std::string::npos,
+           "the window on the opened chest is named");
+    Expect(taken.find("plain items 0, quest items 1, gold 0") != std::string::npos,
+           "the counts the window held are logged");
+    Expect(taken.find("free bag slots 3") != std::string::npos, "the bag room is logged");
+    Expect(taken.find("slots asked 1, items that reached the bags 1") != std::string::npos,
+           "the slots asked and the items stored are logged");
+    std::string const empty = ChestWindowLine(chest, chest, 0, 0, 0, 3, 0, 0);
+    Expect(empty.find("empty") != std::string::npos, "a window that opened empty says so");
+    std::string const other = ChestWindowLine(chest, chest + 1, 2, 0, 5, 3, 0, 0);
+    Expect(other.find("another object") != std::string::npos, "a window on another object says so");
+    std::string const full = ChestWindowLine(chest, chest, 0, 1, 0, 0, 1, 0);
+    Expect(full.find("no free bag slot") != std::string::npos,
+           "a full bag that stored nothing is named as the likely cause");
+}
+
 void TheRetryTable()
 {
     Expect(QuestUseRefusalRetry(R::MalformedItem) == TownRetry::Never, "malformed item: never");
@@ -366,6 +387,7 @@ int main()
     AGameObjectUseAsksNothingOfAnItemOrALife();
     AChestIsOpenedWithTheSpellItsLockNames();
     TheOpenerTakesItsChestLootQuestItemsFirst();
+    TheChestWindowIsDescribedForTheLog();
     TheRetryTable();
     TheJudge();
     if (failures)

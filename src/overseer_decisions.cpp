@@ -27124,6 +27124,28 @@ std::vector<std::uint8_t> ChestLootSlots(std::uint64_t opened, std::uint64_t loo
     return slots;
 }
 
+std::string ChestWindowLine(std::uint64_t opened, std::uint64_t looting, std::size_t plain,
+                            std::size_t quest, std::uint32_t gold, std::uint32_t freeSlots,
+                            std::size_t asked, std::size_t reached)
+{
+    if (!opened)
+        return "";
+    std::string line = "chest loot window: ";
+    if (opened != looting)
+        line += "a window on another object than the chest its use opened";
+    else if (!plain && !quest && !gold)
+        line += "the window on the chest its use opened was empty";
+    else
+        line += "the window on the chest its use opened";
+    line += ": plain items " + std::to_string(plain) + ", quest items " + std::to_string(quest) +
+            ", gold " + std::to_string(gold) + ", free bag slots " + std::to_string(freeSlots) +
+            ", slots asked " + std::to_string(asked) + ", items that reached the bags " +
+            std::to_string(reached);
+    if (asked && !reached && !freeSlots)
+        line += " (no free bag slot: the core's store of the item fails when the bags are full)";
+    return line;
+}
+
 QuestUseOutcome JudgeQuestUse(QuestUseReadBack const& read)
 {
     if (!read.readable)
