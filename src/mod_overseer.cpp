@@ -36091,6 +36091,54 @@ private:
     static constexpr float GUILD_TRAINER_WALK_YARDS = 3000.0f;
     static constexpr float GUILD_TRAINER_REACH_YARDS = 5.0f;
 
+    // HOW MANY OF THE OTHER SIDE'S SPAWNS, HOSTILE TO THIS MEMBER, STAND BESIDE
+    // EACH CLASS TRAINER SPAWN IN `spawnIds` (2026-11-17). The faction gate on a
+    // trainer reads the trainer's own template, and a seasonal trainer (entry
+    // 26331, faction 35) is friendly to everyone while standing in the other
+    // side's capital among its guards: a level 37 Horde warlock was walked to
+    // one in Dun Morogh and killed by an Ironforge Mountaineer 14 times, 15
+    // minutes apart. The same sweep the travel resolver and the graveyard use
+    // (HostileSpawnsNearEach), at level 0 so a guard below the member's level
+    // counts, since a city guard kills a member however its level compares, and
+    // on the other side's ground only, so wildlife near a trainer does not
+    // refuse it. One pass over the spawn table for all the spots that are not
+    // already cached.
+    static constexpr std::time_t GUILD_TRAINER_GUARD_CACHE_SECONDS = 3600;
+    std::vector<unsigned> GuildTrainerGuardsNear(Player* bot, uint32 mapId,
+                                                 std::vector<ObjectGuid::LowType> const& spawnIds,
+                                                 std::vector<std::pair<float, float>> const& at)
+    {
+        std::vector<unsigned> counts(spawnIds.size(), 0);
+        FactionTemplateEntry const* mine = bot ? bot->GetFactionTemplateEntry() : nullptr;
+        if (!mine)
+            return counts;
+        std::time_t const now = std::time(nullptr);
+        std::vector<std::size_t> missing;
+        std::vector<std::pair<float, float>> points;
+        for (std::size_t i = 0; i < spawnIds.size(); ++i)
+        {
+            auto const found = _guildTrainerGuards.find({spawnIds[i], mine->ID});
+            if (found != _guildTrainerGuards.end() &&
+                now - found->second.second < GUILD_TRAINER_GUARD_CACHE_SECONDS)
+            {
+                counts[i] = found->second.first;
+                continue;
+            }
+            missing.push_back(i);
+            points.push_back(at[i]);
+        }
+        if (missing.empty())
+            return counts;
+        std::vector<NearbyThreat> threats;
+        HostileSpawnsNearEach(bot, mapId, points, TRAVEL_THREAT_RADIUS, 0, true, threats);
+        for (std::size_t k = 0; k < missing.size(); ++k)
+        {
+            counts[missing[k]] = threats[k].count;
+            _guildTrainerGuards[{spawnIds[missing[k]], mine->ID}] = {threats[k].count, now};
+        }
+        return counts;
+    }
+
     void LoadClassTrainerSpots()
     {
         _classTrainersLoaded = true;
@@ -36103,6 +36151,7 @@ private:
             uint8 const cls = static_cast<uint8>(trainer->GetTrainerRequirement());
             _classTrainerSpots[cls].push_back({data.mapid, data.posX, data.posY});
             _classTrainerEntries[cls].push_back({data.id, data.posZ});
+            _classTrainerSpawnIds[cls].push_back(spawn.first);
         }
     }
 
@@ -36255,9 +36304,16 @@ private:
             std::vector<std::pair<uint32, float>> entries;
             auto const& allSpots = _classTrainerSpots[bot->getClass()];
             auto const& allEntries = _classTrainerEntries[bot->getClass()];
+            auto const& allSpawnIds = _classTrainerSpawnIds[bot->getClass()];
+            std::vector<std::size_t> kept;
+            std::vector<ObjectGuid::LowType> keptSpawnIds;
+            std::vector<std::pair<float, float>> keptAt;
             for (std::size_t i = 0; i < allSpots.size(); ++i)
             {
                 if (allSpots[i].mapId != bot->GetMapId())
+                    continue;
+                // A seasonal trainer out of season is nobody to walk to.
+                if (!CreatureSpawnStandsNow(allSpawnIds[i]))
                     continue;
                 uint32 const entry = allEntries[i].first;
                 Trainer::Trainer* trainer = sObjectMgr->GetTrainer(entry);
@@ -36268,8 +36324,21 @@ private:
                     sFactionTemplateStore.LookupEntry(tmpl->faction);
                 if (!mine || !theirs || theirs->IsHostileTo(*mine))
                     continue;
-                spots.push_back(allSpots[i]);
-                entries.push_back(allEntries[i]);
+                kept.push_back(i);
+                keptSpawnIds.push_back(allSpawnIds[i]);
+                keptAt.emplace_back(allSpots[i].x, allSpots[i].y);
+            }
+            // Friendly is not safe: the other side's guards beside it end the
+            // walk in a death (GuildTrainerGuardsNear).
+            std::vector<unsigned> const guards =
+                GuildTrainerGuardsNear(bot, bot->GetMapId(), keptSpawnIds, keptAt);
+            for (std::size_t k = 0; k < kept.size(); ++k)
+            {
+                if (!OverseerDecisions::GuildTrainerSpotUsable(
+                        CreatureSpawnStandsNow(keptSpawnIds[k]), guards[k]))
+                    continue;
+                spots.push_back(allSpots[kept[k]]);
+                entries.push_back(allEntries[kept[k]]);
             }
             int const pick = OverseerDecisions::NearestTrainerSpot(
                 spots, bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(),
@@ -89254,6 +89323,15 @@ private:
     // the drive last ran.
     std::map<uint8, std::vector<OverseerDecisions::TrainerSpot>> _classTrainerSpots;
     std::map<uint8, std::vector<std::pair<uint32, float>>> _classTrainerEntries;
+    // The spawn id of each entry in _classTrainerEntries, index for index, so a
+    // trainer's game event can be read (CreatureSpawnStandsNow).
+    std::map<uint8, std::vector<ObjectGuid::LowType>> _classTrainerSpawnIds;
+    // How many of the other side's spawns hostile to a faction template stand
+    // beside a trainer spawn, by (spawn id, faction template id), and when that
+    // was read. The spawn table is a quarter of a million rows, so it is swept
+    // once an hour per pair rather than once a minute per member.
+    std::map<std::pair<ObjectGuid::LowType, uint32>, std::pair<unsigned, std::time_t>>
+        _guildTrainerGuards;
     bool _classTrainersLoaded{false};
     std::map<std::string, uint32> _guildTrainingSentTo;
     // DriveGuildWeaponFor: every vendor spawn that sells a weapon, every
