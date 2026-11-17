@@ -26895,7 +26895,8 @@ TownRetry QuestUseRefusalRetry(std::string const& detail)
 {
     namespace R = QuestUseRefusal;
     if (detail == R::MalformedItem || detail == R::MalformedObject || detail == R::MalformedHere ||
-        detail == R::MalformedSpell || detail == R::NoBotAI || detail == R::NoHereSpell ||
+        detail == R::MalformedSpell || detail == R::MalformedMainHandSpell ||
+        detail == R::NoBotAI || detail == R::NoHereSpell ||
         detail == R::NoOpener || detail == R::WrongTarget || detail == R::ItemMissing ||
         detail == R::ItemUnusable || detail == R::SpellUnknown || detail == R::NoCreatureSpell)
         return TownRetry::Never;
