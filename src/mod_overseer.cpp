@@ -5733,6 +5733,20 @@ struct PendingLevel
 std::vector<PendingLevel> g_levelQueue;  // under g_deathMutex, bounded below
 uint64 g_droppedLevels = 0;
 
+// THE WHOLE REALM'S DEATHS AND LEVEL-UPS, AS COUNTERS (#1552). Memory only, like
+// the queues above, under the same g_deathMutex: the hooks add to it on a map
+// thread and FlushRealmTally writes the finished hours from the world thread.
+// There is no per-character row here by construction: the key is band, zone,
+// killer and cohort, so a guildless bot's death adds one to a counter and
+// writes nothing of its own.
+OverseerDecisions::RealmTally g_realmTally;
+// The creature that landed the last blow on a victim, by the victim's guid, for
+// every player and not only the managed ones (g_pendingKill is kept for those).
+// Taken by the death hook that follows, so it holds only deaths in flight; the
+// cap is a guard, not a limit anything reaches.
+std::map<uint32, uint32> g_realmKiller;
+constexpr std::size_t MAX_REALM_KILLERS = 4096;
+
 // The one place a death's full context is captured. Runs on whatever thread
 // OnPlayerJustDied fires on - a map-update thread, per the file header - so
 // it does NO database work: it reads three in-memory caches and the
@@ -5803,10 +5817,47 @@ static void LogGuildDeath(Player* killed, char const* kind, std::string const& k
 
 // The level-up record (#533): the family and the managed guilds, decided by
 // OverseerDecisions::RecordsLevel. Memory only, like RecordDeath.
+// Count one level change in the realm tally (#1552), whoever the character is.
+static void NoteRealmLevel(Player* player)
+{
+    bool const onRoster = OnRoster(player->GetName());
+    bool const managed = onRoster || InNaturalGuild(player);
+    std::lock_guard<std::mutex> guard(g_deathMutex);
+    g_realmTally.NoteLevelUp(player->GetLevel(), player->GetZoneId(), managed,
+                             static_cast<std::int64_t>(std::time(nullptr)));
+}
+
+// Count one death in the realm tally (#1552), whoever the character is. The
+// killer is the creature remembered by NoteRealmKiller, or 0.
+static void NoteRealmDeath(Player* player)
+{
+    bool const onRoster = OnRoster(player->GetName());
+    bool const managed = onRoster || InNaturalGuild(player);
+    std::lock_guard<std::mutex> guard(g_deathMutex);
+    uint32 killer = 0;
+    auto const it = g_realmKiller.find(player->GetGUID().GetCounter());
+    if (it != g_realmKiller.end())
+    {
+        killer = it->second;
+        g_realmKiller.erase(it);
+    }
+    g_realmTally.NoteDeath(player->GetLevel(), player->GetZoneId(), killer, managed,
+                           static_cast<std::int64_t>(std::time(nullptr)));
+}
+
+static void NoteRealmKiller(Player* killed, Creature* killer)
+{
+    std::lock_guard<std::mutex> guard(g_deathMutex);
+    if (g_realmKiller.size() >= MAX_REALM_KILLERS)
+        g_realmKiller.clear();
+    g_realmKiller[killed->GetGUID().GetCounter()] = killer->GetEntry();
+}
+
 static void RecordLevel(Player* player, uint8 oldLevel)
 {
     if (!player)
         return;
+    NoteRealmLevel(player);
     bool const onRoster = OnRoster(player->GetName());
     if (!OverseerDecisions::RecordsLevel(onRoster, !onRoster && InNaturalGuild(player)))
         return;
@@ -5831,6 +5882,7 @@ void RecordDeath(Player* player)
 {
     if (!player)
         return;
+    NoteRealmDeath(player);
 
     std::string const lower = LowerName(player->GetName());
     std::time_t const now = std::time(nullptr);
@@ -8479,6 +8531,7 @@ public:
     {
         if (!killer || !killed)
             return;
+        NoteRealmKiller(killed, killer);
         RememberKiller(killed, "creature", killer->GetName(), killer->GetEntry());
         LogGuildDeath(killed, "creature", killer->GetName(), killer->GetEntry(),
                       killer->GetLevel(),
@@ -8961,6 +9014,7 @@ public:
         FlushRunDamage();
         FlushDeaths();
         FlushLevels();
+        FlushRealmTally(true);
         LOG_INFO("module.overseer",
                  "overseer: the chat, event, death and level queues are flushed at shutdown");
     }
@@ -9372,6 +9426,7 @@ public:
             _deathTimer = 0;
             FlushDeaths();
             FlushLevels();
+            FlushRealmTally();
             SweepDeathHits();
         }
         if (_sweepTimer >= CHAT_SWEEP_MS)
@@ -9396,6 +9451,9 @@ public:
                 DEATH_RETENTION_DAYS);
             CharacterDatabase.Execute(
                 "DELETE FROM overseer_level WHERE created_at < NOW() - INTERVAL {} DAY",
+                DEATH_RETENTION_DAYS);
+            CharacterDatabase.Execute(
+                "DELETE FROM overseer_realm_hour WHERE hour_start < NOW() - INTERVAL {} DAY",
                 DEATH_RETENTION_DAYS);
             // Answered probes past a day, a batch at a time (see
             // PROBE_RETENTION_HOURS). On updated_at, which is when the answer
@@ -65699,6 +65757,40 @@ private:
                << ',' << l.zoneId
                << ',' << l.guildId << ')';
         }
+        CharacterDatabase.Execute(ss.str().c_str());
+    }
+
+    // The finished hours of the realm tally (#1552), one multi-row upsert that adds
+    // to a row already written for the hour. `final` closes the open hour too, so
+    // a shutdown does not lose it. Same rule as FlushLevels: only this
+    // world-thread call touches the database, and a missing table costs counts,
+    // not the death.
+    void FlushRealmTally(bool final = false)
+    {
+        std::vector<OverseerDecisions::RealmTallyRow> rows;
+        {
+            std::lock_guard<std::mutex> guard(g_deathMutex);
+            std::int64_t const now = static_cast<std::int64_t>(std::time(nullptr));
+            rows = g_realmTally.Roll(final ? now + 3600 : now);
+        }
+        if (rows.empty())
+            return;
+        std::ostringstream ss;
+        ss << "INSERT INTO overseer_realm_hour (hour_start, level_band, zone, killer_entry, "
+              "managed, deaths, level_ups) VALUES ";
+        bool first = true;
+        for (OverseerDecisions::RealmTallyRow const& row : rows)
+        {
+            if (!first)
+                ss << ',';
+            first = false;
+            ss << "(FROM_UNIXTIME(" << row.hourStart << ")," << row.key.band << ','
+               << row.key.zone << ',' << row.key.killerEntry << ','
+               << (row.key.managed ? 1 : 0) << ',' << row.counts.deaths << ','
+               << row.counts.levelUps << ')';
+        }
+        ss << " ON DUPLICATE KEY UPDATE deaths = deaths + VALUES(deaths), "
+              "level_ups = level_ups + VALUES(level_ups)";
         CharacterDatabase.Execute(ss.str().c_str());
     }
 
