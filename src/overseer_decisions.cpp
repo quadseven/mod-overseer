@@ -23508,6 +23508,7 @@ GuildRunRearmStep GuildRunRearmNext(GuildRunRearmFacts const& facts)
 
 GuildRunModuleStopStep GuildRunArmAfterModuleStop(std::string const& stopReason,
                                                   unsigned waitRearmsUsed,
+                                                  DungeonCompletion completion,
                                                   unsigned maximumWaitRearms)
 {
     if (stopReason.empty())
@@ -23517,8 +23518,16 @@ GuildRunModuleStopStep GuildRunArmAfterModuleStop(std::string const& stopReason,
     // stop was not listed here, so the run ended with the module's reason and
     // was booked stalled, the guild run's version of the family defect #1328
     // fixed. It ends complete instead.
+    //
+    // UNLESS THE INSTANCE MASK SAYS A BOSS IS LEFT (#1587). The module counts
+    // its own boss list, which can be shorter than what the run expects, so a
+    // mask that says NotYet outranks it, as it does for a family run (#1514):
+    // the run is not armed back into a module that believes it is done, and
+    // ends with the module's reason, stalled, not cleared.
     if (DungeonModuleStopIsCleared(stopReason))
-        return GuildRunModuleStopStep::EndComplete;
+        return DungeonModuleStopProvesComplete(stopReason, completion)
+                   ? GuildRunModuleStopStep::EndComplete
+                   : GuildRunModuleStopStep::EndWithReason;
     if (stopReason.find("the party never became ready") != std::string::npos)
         return DungeonClearWaitStopRearms(stopReason, waitRearmsUsed, maximumWaitRearms)
                    ? GuildRunModuleStopStep::Rearm

@@ -49467,9 +49467,15 @@ private:
                                    tank && tank->IsInWorld() && run.moduleStop.empty() && carryReady;
                 std::string const stopReason =
                     issue && rearm.tankAlive ? DungeonBrainStopReason(tank) : std::string();
+                // THE MODULE'S "ALL BOSSES CLEARED!" NEEDS THE MASK TO AGREE
+                // (#1587): this poll's own expected and credited masks, read
+                // off the tank above. The module's boss list can be shorter
+                // than what the run expects, as #1514 found for family runs.
+                OverseerDecisions::DungeonCompletion const maskSays =
+                    OverseerDecisions::DungeonRunCompletion(poll.expectedMask, poll.creditedMask);
                 OverseerDecisions::GuildRunModuleStopStep const stopStep =
                     issue ? OverseerDecisions::GuildRunArmAfterModuleStop(stopReason,
-                                                                          run.waitRearms)
+                                                                          run.waitRearms, maskSays)
                           : OverseerDecisions::GuildRunModuleStopStep::Rearm;
                 if (issue && stopStep == OverseerDecisions::GuildRunModuleStopStep::EndWithReason)
                 {

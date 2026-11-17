@@ -20,6 +20,11 @@
  * booked stalled (#1331) - the guild version of the family defect #1328
  * fixed. It gives EndComplete, and the run ends cleared.
  *
+ * But only when the instance mask does not contradict it (#1587): the module
+ * counts its own boss list, which can be shorter than what the run expects, so
+ * a mask that says NotYet outranks the module and the run ends with the
+ * module's reason instead, as a family run does (#1514).
+ *
  * Also pins the adapter: the re-arm asks GuildRunArmAfterModuleStop before it
  * sends the verb, and the run ends on that answer only after the verdict.
  *
@@ -48,43 +53,75 @@ void Check(char const* what, bool ok)
 
 char const* const kCannon =
     "Dungeon event 'Iron Clad Door (Defias Cannon)' failed at step 1; ending dungeon clear.";
+// A map that credits nothing: no mask to contradict the module's word.
+DungeonCompletion const kNoMask = DungeonCompletion::Unknowable;
 char const* const kWait =
     "Dungeon clear stopped: the party never became ready after 180s (Waiting on Bo (low mana))";
 
 void AFailedEventEndsTheRun()
 {
     Check("a failed dungeon event gives EndWithReason",
-          GuildRunArmAfterModuleStop(kCannon, 0) == GuildRunModuleStopStep::EndWithReason);
+          GuildRunArmAfterModuleStop(kCannon, 0, kNoMask) ==
+              GuildRunModuleStopStep::EndWithReason);
     Check("nothing left to reach gives EndWithReason",
-          GuildRunArmAfterModuleStop("No bosses left - disabling", 0) ==
+          GuildRunArmAfterModuleStop("No bosses left - disabling", 0, kNoMask) ==
               GuildRunModuleStopStep::EndWithReason);
     Check("a failed portal event gives EndWithReason",
-          GuildRunArmAfterModuleStop("Medivh's shield hit 0 - the Dark Portal event failed", 0) ==
+          GuildRunArmAfterModuleStop("Medivh's shield hit 0 - the Dark Portal event failed", 0,
+                                     kNoMask) ==
               GuildRunModuleStopStep::EndWithReason);
 }
 
 void AClearedStopEndsTheRunComplete()
 {
     Check("a cleared stop gives EndComplete",
-          GuildRunArmAfterModuleStop("All bosses cleared!", 0) ==
+          GuildRunArmAfterModuleStop("All bosses cleared!", 0, kNoMask) ==
               GuildRunModuleStopStep::EndComplete);
     Check("a cleared stop with the module's prefix gives EndComplete",
-          GuildRunArmAfterModuleStop("Dungeon clear stopped: All bosses cleared!", 0) ==
+          GuildRunArmAfterModuleStop("Dungeon clear stopped: All bosses cleared!", 0, kNoMask) ==
               GuildRunModuleStopStep::EndComplete);
     Check("a sentence that only contains the words is not a clear",
-          GuildRunArmAfterModuleStop("Not All bosses cleared! before the timer", 0) ==
+          GuildRunArmAfterModuleStop("Not All bosses cleared! before the timer", 0, kNoMask) ==
+              GuildRunModuleStopStep::EndWithReason);
+}
+
+void AClearedStopNeedsTheMaskToAgree()
+{
+    // The module counts its own boss list, which can be shorter than what the
+    // run expects (#1587, the guild run's version of #1514).
+    Check("a cleared stop the mask contradicts gives EndWithReason, not EndComplete",
+          GuildRunArmAfterModuleStop("All bosses cleared!", 0, DungeonCompletion::NotYet) ==
+              GuildRunModuleStopStep::EndWithReason);
+    Check("a prefixed cleared stop the mask contradicts gives EndWithReason",
+          GuildRunArmAfterModuleStop("Dungeon clear stopped: All bosses cleared!", 0,
+                                     DungeonCompletion::NotYet) ==
+              GuildRunModuleStopStep::EndWithReason);
+    Check("a contradicted cleared stop is never armed back into",
+          GuildRunArmAfterModuleStop("All bosses cleared!", 0, DungeonCompletion::NotYet) !=
+              GuildRunModuleStopStep::Rearm);
+    Check("a cleared stop the mask agrees with gives EndComplete",
+          GuildRunArmAfterModuleStop("All bosses cleared!", 0, DungeonCompletion::Complete) ==
+              GuildRunModuleStopStep::EndComplete);
+    Check("a cleared stop on a map that credits nothing gives EndComplete",
+          GuildRunArmAfterModuleStop("All bosses cleared!", 0, DungeonCompletion::Unknowable) ==
+              GuildRunModuleStopStep::EndComplete);
+    Check("the mask does not turn a resumable stop into an ending",
+          GuildRunArmAfterModuleStop("Dungeon clear disabled.", 0, DungeonCompletion::NotYet) ==
+              GuildRunModuleStopStep::Rearm);
+    Check("the mask does not turn a failed event into a clear",
+          GuildRunArmAfterModuleStop(kCannon, 0, DungeonCompletion::Complete) ==
               GuildRunModuleStopStep::EndWithReason);
 }
 
 void APartyWaitIsArmedWithinItsBudget()
 {
     Check("a first party-wait stop gives Rearm",
-          GuildRunArmAfterModuleStop(kWait, 0) == GuildRunModuleStopStep::Rearm);
+          GuildRunArmAfterModuleStop(kWait, 0, kNoMask) == GuildRunModuleStopStep::Rearm);
     Check("the last party-wait re-arm in budget gives Rearm",
-          GuildRunArmAfterModuleStop(kWait, GUILD_RUN_WAIT_REARMS - 1) ==
+          GuildRunArmAfterModuleStop(kWait, GUILD_RUN_WAIT_REARMS - 1, kNoMask) ==
               GuildRunModuleStopStep::Rearm);
     Check("a party-wait stop past the budget gives EndWithReason",
-          GuildRunArmAfterModuleStop(kWait, GUILD_RUN_WAIT_REARMS) ==
+          GuildRunArmAfterModuleStop(kWait, GUILD_RUN_WAIT_REARMS, kNoMask) ==
               GuildRunModuleStopStep::EndWithReason);
     Check("the budget is the family coordinator's three", GUILD_RUN_WAIT_REARMS == 3);
 }
@@ -92,23 +129,24 @@ void APartyWaitIsArmedWithinItsBudget()
 void AResumableStopIsArmedAsBefore()
 {
     Check("no stop reason gives Rearm",
-          GuildRunArmAfterModuleStop("", 0) == GuildRunModuleStopStep::Rearm);
+          GuildRunArmAfterModuleStop("", 0, kNoMask) == GuildRunModuleStopStep::Rearm);
     Check("a wipe gives Rearm",
           GuildRunArmAfterModuleStop("The party wiped - dungeon clear disabled. Type 'dc on' "
                                      "when ready to resume.",
-                                     0) == GuildRunModuleStopStep::Rearm);
+                                     0, kNoMask) == GuildRunModuleStopStep::Rearm);
     Check("a death gives Rearm",
           GuildRunArmAfterModuleStop("Bo died - dungeon clear disabled. Type 'dc on' when "
                                      "ready to resume.",
-                                     5) == GuildRunModuleStopStep::Rearm);
+                                     5, kNoMask) == GuildRunModuleStopStep::Rearm);
     Check("a corpse run outside gives Rearm",
-          GuildRunArmAfterModuleStop("Corpse run ended outside its dungeon instance.", 0) ==
+          GuildRunArmAfterModuleStop("Corpse run ended outside its dungeon instance.", 0,
+                                     kNoMask) ==
               GuildRunModuleStopStep::Rearm);
     Check("leaving the dungeon gives Rearm",
-          GuildRunArmAfterModuleStop("Left the dungeon - dungeon clear disabled.", 0) ==
+          GuildRunArmAfterModuleStop("Left the dungeon - dungeon clear disabled.", 0, kNoMask) ==
               GuildRunModuleStopStep::Rearm);
     Check("a plain 'dc off' gives Rearm",
-          GuildRunArmAfterModuleStop("Dungeon clear disabled.", 0) ==
+          GuildRunArmAfterModuleStop("Dungeon clear disabled.", 0, kNoMask) ==
               GuildRunModuleStopStep::Rearm);
 }
 
@@ -156,6 +194,14 @@ void TheAdapterAsksBeforeItArms()
     Check("the run ends on the module's stop after the verdict and before the ladder",
           verdict != std::string::npos && ends != std::string::npos &&
               ladder != std::string::npos && verdict < ends && ends < ladder);
+    // The run's own masks are what may contradict the module's count (#1587).
+    std::size_t const masks = drive.find(
+        "maskSays =\n                    "
+        "OverseerDecisions::DungeonRunCompletion(poll.expectedMask, poll.creditedMask);");
+    std::size_t const handed = drive.find("run.waitRearms, maskSays)", ask);
+    Check("the re-arm hands the decision the run's expected and credited masks",
+          masks != std::string::npos && handed != std::string::npos && masks < handed &&
+              handed < send);
     std::size_t const complete = drive.find("GuildRunModuleStopStep::EndComplete");
     std::size_t const flag = drive.find("run.moduleCleared = true");
     Check("a cleared stop marks the run cleared where the re-arm asks",
@@ -173,6 +219,7 @@ int main()
 {
     AFailedEventEndsTheRun();
     AClearedStopEndsTheRunComplete();
+    AClearedStopNeedsTheMaskToAgree();
     APartyWaitIsArmedWithinItsBudget();
     AResumableStopIsArmedAsBefore();
     TheWhyCarriesTheModuleWords();
