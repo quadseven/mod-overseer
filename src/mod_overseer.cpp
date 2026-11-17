@@ -9426,8 +9426,8 @@ public:
             _deathTimer = 0;
             FlushDeaths();
             FlushLevels();
-            FlushRealmTally();
             SweepDeathHits();
+            FlushRealmTally();
         }
         if (_sweepTimer >= CHAT_SWEEP_MS)
         {
