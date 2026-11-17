@@ -27732,9 +27732,14 @@ private:
                         return;
                     }
                 }
+                // A LEG REFUSED FOR ITS GROUND ALONE IS ASKED AGAIN SOONER (#1609):
+                // see OverseerDecisions::LONE_LEG_GROUND_HOLD_SECONDS.
+                time_t const holdFor = lethal != _lethalLegHeld.end()
+                    ? static_cast<time_t>(OverseerDecisions::LoneLegHoldSeconds(
+                          lethal->second.why, CATCH_UP_FAR_HOLD_SECONDS))
+                    : CATCH_UP_FAR_HOLD_SECONDS;
                 if (OverseerDecisions::FarCatchUpStaysHeld(
-                        gap, holdLifts, std::time(nullptr) - heldFar->second,
-                        CATCH_UP_FAR_HOLD_SECONDS))
+                        gap, holdLifts, std::time(nullptr) - heldFar->second, holdFor))
                 {
                     HoldFarFromLeader(p, name);
                     if (walkToSafety && WalkHeldToSafeGround(p, name, *safeGrave))
@@ -31514,7 +31519,8 @@ private:
                                  "It is not walked down that leg: its walk ends and it is "
                                  "held where it stands ({}), and its leader goes back for it "
                                  "with the family once the rest are gathered. The hold "
-                                 "lifts when the leader is within {} yards (#697)",
+                                 "lifts when the leader is within {} yards, or the leg is "
+                                 "judged again after {}s (#697, #1609)",
                                  name, static_cast<uint32>(distance), target,
                                  OverseerDecisions::LoneLegReasonWord(lone.why),
                                  FamilyLegDeaths(name),
@@ -31522,7 +31528,9 @@ private:
                                  static_cast<uint32>(ground.longestLethalRunYards),
                                  bot->GetLevel() + LONE_LEG_LIMITS.levelGap, ground.worstLevel,
                                  OverseerDecisions::LoneLegStepWord(lone.step),
-                                 static_cast<uint32>(FOLLOW_CATCH_UP_DONE_YARDS));
+                                 static_cast<uint32>(FOLLOW_CATCH_UP_DONE_YARDS),
+                                 static_cast<uint32>(OverseerDecisions::LoneLegHoldSeconds(
+                                     lone.why, CATCH_UP_FAR_HOLD_SECONDS)));
                         _catchUpHeldFar[name] = std::time(nullptr);
                         LethalLegHold& held = _lethalLegHeld[name];
                         held = LethalLegHold{};

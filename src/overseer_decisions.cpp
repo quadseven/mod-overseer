@@ -10089,6 +10089,14 @@ LoneLegVerdict DecideLoneLeg(LoneLegFacts const& facts, LoneLegLimits const& lim
     return verdict;
 }
 
+int64_t LoneLegHoldSeconds(LoneLegReason why, int64_t farHoldSeconds)
+{
+    if (why != LoneLegReason::Ground)
+        return farHoldSeconds;
+    return farHoldSeconds < LONE_LEG_GROUND_HOLD_SECONDS ? farHoldSeconds
+                                                         : LONE_LEG_GROUND_HOLD_SECONDS;
+}
+
 char const* LoneLegStepWord(LoneLegStep step)
 {
     switch (step)

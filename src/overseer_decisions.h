@@ -11547,6 +11547,18 @@ char const* LoneLegStepWord(LoneLegStep step);
 // The reason in words, for the log line and the regroup's refusal.
 char const* LoneLegReasonWord(LoneLegReason why);
 
+// HOW LONG A LONE-LEG HOLD LASTS BEFORE THE LEG IS ASKED AGAIN (#1609). A leg
+// refused for its deaths is a measurement and holds for the far-catch-up ceiling.
+// A leg refused for its ground alone is a prediction about a straight line, so it
+// is asked again after five minutes: the leader may have moved, a flight or a
+// stone may be ready, and a member stood still for fifteen minutes on a guess
+// stays split from its family for all of them.
+constexpr int64_t LONE_LEG_GROUND_HOLD_SECONDS = 300;
+
+// The ceiling to hold a member for, given why the leg was refused and the
+// far-catch-up ceiling. Never longer than `farHoldSeconds`.
+int64_t LoneLegHoldSeconds(LoneLegReason why, int64_t farHoldSeconds);
+
 // A member already held for a far catch-up must not wait on ground that the
 // #697 lone-walker rule calls lethal.
 struct HeldGroundFacts
