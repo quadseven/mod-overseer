@@ -47550,8 +47550,10 @@ private:
     // the bound off): how long a guild run may keep a lent family member.
     static uint32 GuildRunLendBoundSeconds()
     {
+        // Silent: the key is unset on a realm that keeps the default, and this
+        // is read on every poll of a run with a lent member.
         return sConfigMgr->GetOption<uint32>("Overseer.GuildRun.LendBoundSeconds",
-                                             OverseerDecisions::LEND_BOUND_SECONDS);
+                                             OverseerDecisions::LEND_BOUND_SECONDS, false);
     }
 
     // THE LEND BOUND: a lent member past the bound leaves the run's group the

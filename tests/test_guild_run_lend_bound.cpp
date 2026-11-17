@@ -79,6 +79,8 @@ void TheGuildRunTickAsksIt()
     Check("the tick asks LendBoundDue", src.find("OverseerDecisions::LendBoundDue(") != std::string::npos);
     Check("the bound is a conf option",
           src.find("Overseer.GuildRun.LendBoundSeconds") != std::string::npos);
+    Check("the option is read silently, so an unset key logs nothing each poll",
+          src.find("OverseerDecisions::LEND_BOUND_SECONDS, false)") != std::string::npos);
     Check("the release logs the bound",
           src.find("lent member '{}' released after {}s (bound)") != std::string::npos);
     std::string const conf = Slurp("conf/mod_overseer.conf.dist");
