@@ -55658,7 +55658,7 @@ private:
                           std::map<std::string, unsigned> const& seats, unsigned gateKey)
     {
         uint32 const floorSlots = sConfigMgr->GetOption<uint32>(
-            "Overseer.Raid.FreeSlotFloor", OverseerDecisions::RAID_FREE_SLOT_FLOOR_DEFAULT);
+            "Overseer.Raid.FreeSlotFloor", OverseerDecisions::RAID_FREE_SLOT_FLOOR_DEFAULT, false);
         if (run.bagGateKey != gateKey)
         {
             run.bagGateKey = gateKey;
@@ -72275,9 +72275,9 @@ private:
     {
         OverseerDecisions::RaidShape shape;
         shape.tanks = sConfigMgr->GetOption<uint32>(
-            "Overseer.Raid.Tanks", OverseerDecisions::RAID_TANKS_DEFAULT);
+            "Overseer.Raid.Tanks", OverseerDecisions::RAID_TANKS_DEFAULT, false);
         shape.healers = sConfigMgr->GetOption<uint32>(
-            "Overseer.Raid.Healers", OverseerDecisions::RAID_HEALERS_DEFAULT);
+            "Overseer.Raid.Healers", OverseerDecisions::RAID_HEALERS_DEFAULT, false);
         return shape;
     }
 
@@ -72313,7 +72313,7 @@ private:
     // roster character in it converts with no flag at all.
     static bool RaidMayConvertTheRosterParty()
     {
-        return sConfigMgr->GetOption<bool>("Overseer.Raid.ConvertRosterParty", false);
+        return sConfigMgr->GetOption<bool>("Overseer.Raid.ConvertRosterParty", false, false);
     }
 
     // Must a roster character have a game client attached to stay in the world?
