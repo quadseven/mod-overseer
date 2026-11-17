@@ -13093,6 +13093,29 @@ std::string ZoneNoWayRoundLine(std::string const& name, std::string const& targe
            " or more levels above this party. It walks the fewest legs there it can (#1243)";
 }
 
+ZoneWalkVerdict DecideZoneWalk(std::vector<DangerZone> const& stillWalked,
+                               std::uint32_t walkerZone, std::uint32_t aimZone, bool onFoot,
+                               ZoneDangerLimits const& limits)
+{
+    ZoneWalkVerdict verdict;
+    if (!onFoot)
+        return verdict;
+    for (DangerZone const& zone : stillWalked)
+    {
+        if (walkerZone != 0 && zone.zoneId == walkerZone)
+            continue;
+        if (aimZone != 0 && zone.zoneId == aimZone)
+            continue;
+        verdict.crossed.push_back(zone);
+    }
+    if (verdict.crossed.empty())
+        return verdict;
+    verdict.refuse = true;
+    verdict.reason = "its only route crosses " + ZoneNames(verdict.crossed, limits) +
+                     ", where this party has been dying";
+    return verdict;
+}
+
 std::uint32_t DiedOnLegsOnRoute(std::vector<RouteLegSpan> const& legs,
                                 std::vector<DiedOnLeg> const& died, std::time_t now)
 {
