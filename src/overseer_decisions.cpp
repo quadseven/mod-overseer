@@ -6062,6 +6062,12 @@ GearComparison GearCompare(GearVerdict const& candidate, GearIncumbentScore cons
     return clears ? GearComparison::Better : GearComparison::Undecided;
 }
 
+bool GearIsSecondCopyOfTrinket(bool isTrinket, unsigned candidateEntry,
+                               unsigned otherSlotEntry)
+{
+    return isTrinket && candidateEntry != 0 && candidateEntry == otherSlotEntry;
+}
+
 GearSwapIntent GearIntend(GearSlotMemory const& memory, unsigned candidateEntry,
                           unsigned wornEntry, bool wanted)
 {

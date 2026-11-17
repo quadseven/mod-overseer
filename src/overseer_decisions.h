@@ -6832,6 +6832,16 @@ std::string GearIncumbentSaid(GearIncumbentScore const& incumbent,
 // the line cannot be located.
 GearComparison GearCompare(GearVerdict const& candidate, GearIncumbentScore const& worn);
 
+// A TRINKET IS WORN ONCE. A trinket's worth is mostly an effect the stat sum
+// cannot price, and two copies of one effect share a cooldown, so a second copy
+// in the other trinket slot adds nothing while a distinct piece waits in the
+// bags (wow-overseer#2358: a level 60 warrior wore the same Heart of Noxxion
+// in both). True when the candidate is a trinket and the trinket slot it is NOT
+// going into already holds this very entry. Rings are exempt: a pair of the
+// same ring is two real rings.
+bool GearIsSecondCopyOfTrinket(bool isTrinket, unsigned candidateEntry,
+                               unsigned otherSlotEntry);
+
 // ---------------------------------------------- and the drive stands down --
 //
 // The comparison above converges on its own: it is antisymmetric, so under
