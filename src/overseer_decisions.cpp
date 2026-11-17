@@ -28533,4 +28533,174 @@ std::string EnchantForProofLine(EnchantForProof const& proof)
     return out.str();
 }
 
+
+// ------------------------------------------------ create a named character --
+
+static std::string CreateLower(std::string text)
+{
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return text;
+}
+
+bool IsCreateCharacterRow(std::string const& command)
+{
+    std::vector<std::string> const words = RenameWords(command);
+    return !words.empty() && CreateLower(words[0]) == "create-character";
+}
+
+bool RaceIsAlliance(std::uint8_t race)
+{
+    // The core's race ids: 1 human, 3 dwarf, 4 night elf, 7 gnome, 11 draenei.
+    return race == 1 || race == 3 || race == 4 || race == 7 || race == 11;
+}
+
+static std::uint8_t CreateRaceId(std::string const& word)
+{
+    if (word == "human") return 1;
+    if (word == "orc") return 2;
+    if (word == "dwarf") return 3;
+    if (word == "nightelf") return 4;
+    if (word == "undead") return 5;
+    if (word == "tauren") return 6;
+    if (word == "gnome") return 7;
+    if (word == "troll") return 8;
+    if (word == "bloodelf") return 10;
+    if (word == "draenei") return 11;
+    return 0;
+}
+
+static std::uint8_t CreateClassId(std::string const& word)
+{
+    if (word == "warrior") return 1;
+    if (word == "paladin") return 2;
+    if (word == "hunter") return 3;
+    if (word == "rogue") return 4;
+    if (word == "priest") return 5;
+    if (word == "shaman") return 7;
+    if (word == "mage") return 8;
+    if (word == "warlock") return 9;
+    if (word == "druid") return 11;
+    return 0;
+}
+
+CreateCharacterRequest ParseCreateCharacterRequest(std::string const& command)
+{
+    CreateCharacterRequest request;
+    std::vector<std::string> words = RenameWords(command);
+    for (std::string& word : words)
+        word = CreateLower(word);
+    if (words.empty() || words[0] != "create-character")
+    {
+        request.error = "malformed create-character: want create-character <race> <class> <male|female> <alliance|horde> [level <N>]";
+        return request;
+    }
+    if (words.size() != 5 && words.size() != 7)
+    {
+        request.error = "malformed create-character: want race, class, gender, faction and an optional level N";
+        return request;
+    }
+    request.race = CreateRaceId(words[1]);
+    if (!request.race)
+    {
+        request.error = "unknown race";
+        return request;
+    }
+    if (words[2] == "deathknight")
+    {
+        request.error = "a death knight starts at level 55, which is a grant";
+        return request;
+    }
+    request.cls = CreateClassId(words[2]);
+    if (!request.cls)
+    {
+        request.error = "unknown class";
+        return request;
+    }
+    if (words[3] == "male")
+        request.gender = 0;
+    else if (words[3] == "female")
+        request.gender = 1;
+    else
+    {
+        request.error = "unknown gender (want male or female)";
+        return request;
+    }
+    if (words[4] == "alliance")
+        request.alliance = true;
+    else if (words[4] == "horde")
+        request.alliance = false;
+    else
+    {
+        request.error = "unknown faction (want alliance or horde)";
+        return request;
+    }
+    if (words.size() == 7)
+    {
+        if (words[5] != "level" || words[6].empty() || words[6].size() > 2 ||
+            words[6].find_first_not_of("0123456789") != std::string::npos)
+        {
+            request.error = "malformed level: want level <1 to 60>";
+            return request;
+        }
+        unsigned const level = static_cast<unsigned>(std::atoi(words[6].c_str()));
+        if (level < 1 || level > CREATE_CHARACTER_LEVEL_MAX)
+        {
+            request.error = "level is outside 1 to 60";
+            return request;
+        }
+        request.level = level;
+    }
+    request.ok = true;
+    return request;
+}
+
+CreateCharacterVerdict CreateCharacterVerdictFor(CreateCharacterRequest const& request,
+                                                 CreateCharacterFacts const& facts)
+{
+    auto refuse = [](char const* reason) { return CreateCharacterVerdict{CreateRoute::Refuse, reason}; };
+    if (!facts.switchOn)
+        return refuse("character creation is off (Overseer.CreateCharacter.Enable)");
+    if (!request.ok)
+        return refuse(request.error.c_str());
+    if (!facts.nameValid)
+        return refuse("the core refuses that name");
+    if (facts.rowInFlight)
+        return refuse("a creation for that name is already running; retry in a minute");
+    // An existing character of the same shape is the idempotent answer, and it
+    // is given before the faction and level gates so that re-running a row
+    // that already did its work reads `exists` and not a new refusal.
+    if (facts.nameTaken)
+        return facts.takenIsSame ? CreateCharacterVerdict{CreateRoute::AlreadyExists, ""}
+                                 : refuse("the name is taken by a different character");
+    if (RaceIsAlliance(request.race) != request.alliance)
+        return refuse("the race is not of the guild's faction");
+    if (!facts.raceEnabled)
+        return refuse("the realm has that race disabled for creation");
+    if (!facts.raceClassLegal)
+        return refuse("that race and class cannot be combined");
+    if (request.level > 1 && request.level > facts.maxLevel)
+        return refuse("level above Overseer.CreateCharacter.MaxLevel");
+    if (!facts.freeAccount)
+        return refuse("no listed bot account has a free character slot");
+    return CreateCharacterVerdict{CreateRoute::Create, ""};
+}
+
+unsigned PickCreationAccount(std::vector<CreationAccount> const& accounts, unsigned cap)
+{
+    unsigned best = 0;
+    unsigned bestCount = 0;
+    for (CreationAccount const& account : accounts)
+    {
+        if (!account.id || account.characters >= cap)
+            continue;
+        if (!best || account.characters < bestCount || (account.characters == bestCount && account.id < best))
+        {
+            best = account.id;
+            bestCount = account.characters;
+        }
+    }
+    return best;
+}
+
 }  // namespace OverseerDecisions
