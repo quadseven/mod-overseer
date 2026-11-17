@@ -10990,6 +10990,22 @@ struct StrandedFacts
 
 StrandedWay DecideStrandedWay(StrandedFacts const& facts);
 
+// WHEN A REFUSED CROSSING MAY BE PRICED AGAIN. Measured on the dev realm
+// 2026-11-15: two family stand-in guests stayed on map 1 while their leader was
+// on map 0 for 207 and 79 minutes, and the way across flipped between `sail`
+// and `refuse` every 15 minutes. The crossing was refused at a leg, stood down
+// for 15 minutes, priced again as servable, started, refused again at the same
+// leg, and so on with no boarding and no hearth. A refusal is a fact about the
+// berth and the transport, and neither changes in 15 minutes.
+//
+// So a refused crossing stays refused for that member for 60 minutes, or until
+// the leader changes map, whichever comes first. A leader on another map is a
+// different crossing, so the old refusal says nothing about it.
+constexpr std::int64_t LONE_CROSSING_REFUSAL_SECONDS = 60 * 60;
+
+bool RefusedCrossingStands(std::int64_t now, std::int64_t refusedAt,
+                           std::uint32_t refusedForLeaderMap, std::uint32_t leaderMap);
+
 // WHO ELSE DECIDES WHERE A STRANDED MEMBER GOES (#1143), the fact behind
 // `familyOwnsTheWay`. Measured on the dev realm 2026-10-20: a member hearthed
 // to map 1 by a failed EXIT while its leader stood on map 0 stayed there 11 h

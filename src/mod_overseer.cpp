@@ -1750,6 +1750,8 @@ constexpr uint32 CROSSING_FETCH_WAIT_SECONDS = 5 * 60;
 // crossing past its backstop), and re-opening it on the next party poll would
 // walk the member back toward the same refusal every thirty seconds. A quarter
 // of an hour is several boat periods and short of the backstop itself.
+// This quarter hour now only times the berth-walk give-up; a refused crossing
+// itself stands for OverseerDecisions::LONE_CROSSING_REFUSAL_SECONDS (#1143).
 constexpr uint32 LONE_CROSSING_STANDDOWN_SECONDS = 15 * 60;
 
 // The same question for an aimed POSITION, and it needs a different answer.
@@ -52692,6 +52694,8 @@ private:
     }
     // A member whose boat home was refused, and when (LONE_CROSSING_STANDDOWN_SECONDS).
     std::map<std::string, std::pair<time_t, std::string>> _loneCrossingRefused;
+    // The leader's map each refusal above was made for (RefusedCrossingStands).
+    std::map<std::string, uint32> _loneCrossingRefusedFor;
     // Hearth casts asked of a stranded member this split (EXIT_HEARTH_ATTEMPTS).
     std::map<std::string, unsigned> _strandedHearthTries;
     // When a member's travel walk last gave up on the ground (rule 6b).
@@ -53024,11 +53028,19 @@ private:
 
         // PRICED ONLY WHEN IT CAN MATTER, and never while a refusal stands.
         auto const refused = _loneCrossingRefused.find(name);
+        // A REFUSED CROSSING STAYS REFUSED for LONE_CROSSING_REFUSAL_SECONDS or
+        // until the leader changes map (#1143), so the way does not flip
+        // between sail and refuse every quarter hour.
         bool const standingDown =
             refused != _loneCrossingRefused.end() &&
-            std::time(nullptr) - refused->second.first < time_t(LONE_CROSSING_STANDDOWN_SECONDS);
+            OverseerDecisions::RefusedCrossingStands(
+                std::time(nullptr), refused->second.first, _loneCrossingRefusedFor[name],
+                facts.leaderMap);
         if (refused != _loneCrossingRefused.end() && !standingDown)
+        {
             _loneCrossingRefused.erase(refused);
+            _loneCrossingRefusedFor.erase(name);
+        }
         std::string priced;
         if (split && !facts.aboard && !standingDown && facts.memberMap != facts.leaderMap)
         {
@@ -53044,7 +53056,8 @@ private:
         if (standingDown && way != OverseerDecisions::StrandedWay::Sail)
             why += "; its last boat home was refused (" + refused->second.second +
                    ") and is priced again within " +
-                   std::to_string(LONE_CROSSING_STANDDOWN_SECONDS / 60) + " minutes";
+                   std::to_string(OverseerDecisions::LONE_CROSSING_REFUSAL_SECONDS / 60) +
+                   " minutes, or sooner if its leader changes map";
         else if (!priced.empty() && way == OverseerDecisions::StrandedWay::Refuse)
             why += " (priced: " + priced + ")";
         // WHICH OWNER, not the list of three it might be (#1143).
@@ -53964,10 +53977,23 @@ private:
                 }
                 LOG_WARN("module.overseer",
                          "overseer: '{}' cannot sail from map {} to map {} - refused at '{}': "
-                         "{}. Its boat home is priced again in {} minutes",
+                         "{}. Its boat home is priced again in {} minutes, or sooner if its leader "
+                         "changes map",
                          name, origin, destination, OverseerDecisions::CrossingLegName(step.leg),
-                         why, LONE_CROSSING_STANDDOWN_SECONDS / 60);
+                         why, OverseerDecisions::LONE_CROSSING_REFUSAL_SECONDS / 60);
                 _loneCrossingRefused[name] = {std::time(nullptr), why};
+                {
+                    // THE LEADER'S MAP, read the way the poll reads it
+                    // (StrandedGoalOf), not the crossing's destination: the
+                    // poll compares this with facts.leaderMap, so the map
+                    // compared is the map written (#1143).
+                    float refusedGoalX = 0.f;
+                    float refusedGoalY = 0.f;
+                    _loneCrossingRefusedFor[name] =
+                        leader && leader->IsInWorld()
+                            ? StrandedGoalOf(leader, refusedGoalX, refusedGoalY).map
+                            : destination;
+                }
                 EndLoneCrossing(name, "its crossing is refused");
                 break;
 

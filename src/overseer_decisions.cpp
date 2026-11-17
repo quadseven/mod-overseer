@@ -9707,6 +9707,15 @@ StrandedWay DecideStrandedWay(StrandedFacts const& f)
     return StrandedWay::Refuse;
 }
 
+bool RefusedCrossingStands(std::int64_t now, std::int64_t refusedAt,
+                           std::uint32_t refusedForLeaderMap, std::uint32_t leaderMap)
+{
+    if (refusedForLeaderMap != leaderMap)
+        return false;
+    // A clock that ran backwards does not keep a refusal alive for ever.
+    return now >= refusedAt && now - refusedAt < LONE_CROSSING_REFUSAL_SECONDS;
+}
+
 StrandedOwner WhoOwnsStrandedWay(StrandedOwners const& o)
 {
     // A crossing with somebody aboard is supervised whatever else is true; one
