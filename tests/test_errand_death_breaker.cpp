@@ -367,6 +367,67 @@ void ACatchUpWithoutTheClaimIsReleasedLikeAnythingElse()
                 ErrandDeathBreaker(refused, limits).remedy, ErrandDeathRemedy::RefuseReissue);
 }
 
+// A DEATH IN LAVA ON AN ERRAND ENDS IT AT THE FIRST BODY
+// (wow-overseer#2886). Three bodies in five minutes is the rule for a
+// destination that might be a patrol, a camp or a bad road, and one cannot tell
+// which from one body. Lava is not like that: the burn is the ground itself and
+// the next walk takes the same road. On the dev realm on 2026-11-17 a level 60
+// tank on a vendor errand died at (-7922, -1305) in Burning Steppes at 22:17:57,
+// 22:18:27 and 22:19:20, within two yards of one point each time, and the
+// errand was released only at the third, 143 seconds after the first.
+void ALavaDeathOnAnErrandEndsItAtTheFirstBody()
+{
+    ErrandDeathLimits const limits;
+
+    ErrandDeathToll toll;
+    toll.deaths = 1;
+    toll.lavaDeaths = 1;
+    CheckRemedy("one death in lava releases the errand", ErrandDeathBreaker(toll, limits).remedy,
+                ErrandDeathRemedy::Release);
+
+    toll.deaths = 1;
+    toll.lavaDeaths = 0;
+    CheckRemedy("one death on dry ground is still not enough",
+                ErrandDeathBreaker(toll, limits).remedy, ErrandDeathRemedy::Continue);
+
+    // A run's own claim is declined, not released into a wall, exactly as for
+    // three ordinary bodies.
+    toll = ErrandDeathToll{};
+    toll.deaths = 1;
+    toll.lavaDeaths = 1;
+    toll.runOwned = true;
+    CheckRemedy("a run-owned errand with a lava death is declined",
+                ErrandDeathBreaker(toll, limits).remedy, ErrandDeathRemedy::DeclineRunOwned);
+
+    toll.catchUp = true;
+    CheckRemedy("a catch-up walk with a lava death is ended",
+                ErrandDeathBreaker(toll, limits).remedy, ErrandDeathRemedy::EndCatchUp);
+
+    // An operator's guard is never called off.
+    toll = ErrandDeathToll{};
+    toll.deaths = 1;
+    toll.lavaDeaths = 1;
+    toll.guard = true;
+    CheckRemedy("an operator's guard is left alone", ErrandDeathBreaker(toll, limits).remedy,
+                ErrandDeathRemedy::Continue);
+
+    // The limit is the caller's: zero turns the rule off.
+    ErrandDeathLimits off;
+    off.lavaDeaths = 0;
+    toll = ErrandDeathToll{};
+    toll.deaths = 1;
+    toll.lavaDeaths = 1;
+    CheckRemedy("zero liquid deaths allowed turns the rule off",
+                ErrandDeathBreaker(toll, off).remedy, ErrandDeathRemedy::Continue);
+
+    // A released target stays refused for the cool-off whatever the toll.
+    toll = ErrandDeathToll{};
+    toll.strikes = 1;
+    toll.sinceRefused = 60;
+    CheckRemedy("a refused target is still refused", ErrandDeathBreaker(toll, limits).remedy,
+                ErrandDeathRemedy::RefuseReissue);
+}
+
 void TheFiveRemediesDoNotReadAlike()
 {
     ErrandDeathLimits const limits;
@@ -417,6 +478,7 @@ int main()
     ACatchUpThatIsNotKillingAnybodyIsLeftAlone();
     ARestartedCatchUpAtARefusedTargetIsEndedAgain();
     ACatchUpWithoutTheClaimIsReleasedLikeAnythingElse();
+    ALavaDeathOnAnErrandEndsItAtTheFirstBody();
     TheFiveRemediesDoNotReadAlike();
 
     if (failures)
