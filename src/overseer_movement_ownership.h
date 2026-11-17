@@ -25,10 +25,11 @@
 
 #include <cstdint>
 #include <ctime>
-#include <functional>
+#include <iterator>
 #include <map>
 #include <set>
 #include <string>
+#include <vector>
 
 namespace OverseerMovement
 {
@@ -107,6 +108,15 @@ enum class ClaimAnswer : uint8_t
     LeaderBusy,      // a family leader held by another intent; nothing written
 };
 
+struct LeaderIntentSnapshot
+{
+    OverseerDecisions::LeaderIntentKind kind{OverseerDecisions::LeaderIntentKind::None};
+    std::string owner;
+    std::string target;
+    time_t since{0};
+    std::uint32_t changes{0};
+};
+
 struct ClaimResult
 {
     ClaimAnswer answer{ClaimAnswer::TooLong};
@@ -115,6 +125,16 @@ struct ClaimResult
     OverseerDecisions::TravelClaim verdict{OverseerDecisions::TravelClaim::Write};
     std::string column;    // the column as read, before any write
     uint32_t learnSkill{0};
+    struct LeaderAsk
+    {
+        bool asked{false};
+        OverseerDecisions::LeaderIntentKind kind{OverseerDecisions::LeaderIntentKind::None};
+        std::string owner;
+        std::string target;
+        std::string why;
+        LeaderIntentSnapshot before;
+        OverseerDecisions::LeaderIntentVerdict verdict;
+    } leaderAsk;
     // True when the aim is in the column after the call.
     bool Holds() const
     {
@@ -151,12 +171,187 @@ struct RunAimRetireResult
     std::string after;  // the column read back after the attempt
 };
 
+struct LeaderColumnEnd
+{
+    bool ended{false};
+    OverseerDecisions::LeaderIntentKind kind{OverseerDecisions::LeaderIntentKind::None};
+    std::string owner;
+    OverseerDecisions::LeaderIntentEnd how{OverseerDecisions::LeaderIntentEnd::Abandoned};
+    time_t since{0};
+};
+
 class MovementOwnership
 {
 public:
+    struct TravelOwnerIntent
+    {
+        OverseerDecisions::LeaderIntentKind kind{OverseerDecisions::LeaderIntentKind::None};
+        std::string owner;
+    };
+
+    static TravelOwnerIntent ForTravelOwner(OverseerDecisions::TravelOwner owner)
+    {
+        return IntentForTravelOwner(owner);
+    }
+
     MovementOwnership(AimColumn& column, time_t handbackSeconds)
         : _column(column), _handbackSeconds(handbackSeconds)
     {
+    }
+
+    // The leader book is part of the same movement owner as the travel column.
+    // The world script supplies its roster and live configuration; this module
+    // owns the dwell, arbitration state, preferences, and end rules.
+    void ConfigureLeaderIntents(bool enabled, OverseerDecisions::LeaderIntentLimits limits)
+    {
+        _leaderIntentsEnabled = enabled;
+        _leaderLimits = limits;
+    }
+
+    bool LeaderIntentsEnabled() const { return _leaderIntentsEnabled; }
+
+    void SetLeaders(std::set<std::string> leaders)
+    {
+        for (auto it = _leaderStates.begin(); it != _leaderStates.end();)
+            it = leaders.count(it->first) ? std::next(it) : _leaderStates.erase(it);
+        for (auto it = _leaderPreferences.begin(); it != _leaderPreferences.end();)
+            it = leaders.count(it->first) ? std::next(it) : _leaderPreferences.erase(it);
+        _leaders.swap(leaders);
+    }
+
+    bool LeaderIntentApplies(std::string const& name) const
+    {
+        return _leaderIntentsEnabled && _leaders.count(name) != 0;
+    }
+
+    void ClearLeaderPreferences() { _leaderPreferences.clear(); }
+
+    void SetLeaderPreference(std::string const& name,
+                             OverseerDecisions::LeaderIntentPreference preference)
+    {
+        if (_leaders.count(name))
+            _leaderPreferences[name] = preference;
+    }
+
+    OverseerDecisions::LeaderIntentPreference LeaderPreferenceFor(std::string const& name) const
+    {
+        auto const it = _leaderPreferences.find(name);
+        return it == _leaderPreferences.end() ? OverseerDecisions::LeaderIntentPreference{}
+                                              : it->second;
+    }
+
+    LeaderIntentSnapshot LeaderIntentStateFor(std::string const& name) const
+    {
+        auto const it = _leaderStates.find(name);
+        if (it == _leaderStates.end())
+            return {};
+        OverseerDecisions::LeaderIntentState const& state = it->second;
+        return {state.kind, state.owner, state.target, state.since, state.changes};
+    }
+
+    OverseerDecisions::LeaderIntentVerdict AskForLeader(
+        std::string const& name, OverseerDecisions::LeaderIntentKind kind,
+        std::string const& owner, std::string const& target, std::string const& why, time_t now)
+    {
+        OverseerDecisions::LeaderIntentVerdict verdict;
+        if (!LeaderIntentApplies(name))
+        {
+            verdict.answer = OverseerDecisions::LeaderIntentAnswer::Granted;
+            return verdict;
+        }
+        OverseerDecisions::LeaderIntentRequest request;
+        request.kind = kind;
+        request.owner = owner;
+        request.target = target;
+        request.why = why;
+        return OverseerDecisions::AskLeaderIntent(_leaderStates[name], request, now, _leaderLimits,
+                                                   LeaderPreferenceFor(name));
+    }
+
+    bool EndForLeader(std::string const& name, OverseerDecisions::LeaderIntentKind kind,
+                      std::string const& owner, OverseerDecisions::LeaderIntentEnd how, time_t now)
+    {
+        if (!LeaderIntentApplies(name))
+            return false;
+        auto const it = _leaderStates.find(name);
+        return it != _leaderStates.end() &&
+               OverseerDecisions::EndLeaderIntent(it->second, kind, owner, how, now, _leaderLimits);
+    }
+
+    OverseerDecisions::LeaderIntentKind CurrentLeaderIntent(std::string const& name,
+                                                            time_t now) const
+    {
+        if (!LeaderIntentApplies(name))
+            return OverseerDecisions::LeaderIntentKind::None;
+        auto const it = _leaderStates.find(name);
+        if (it == _leaderStates.end() ||
+            OverseerDecisions::LeaderIntentFree(it->second, now, _leaderLimits))
+            return OverseerDecisions::LeaderIntentKind::None;
+        return it->second.kind;
+    }
+
+    void WaiveLeaderDwell(std::string const& name)
+    {
+        if (!LeaderIntentApplies(name))
+            return;
+        auto const it = _leaderStates.find(name);
+        if (it != _leaderStates.end())
+            OverseerDecisions::WaiveLeaderIntentDwell(it->second);
+    }
+
+    bool LeaderWalksUnderNewRpg(std::string const& name, time_t now) const
+    {
+        return OverseerDecisions::LeaderIntentWalksUnderNewRpg(CurrentLeaderIntent(name, now));
+    }
+
+    std::vector<OverseerDecisions::LeaderIntentRequest> LeaderIntentsOnTheTable(
+        std::string const& name, time_t now) const
+    {
+        if (!LeaderIntentApplies(name))
+            return {};
+        auto const it = _leaderStates.find(name);
+        if (it == _leaderStates.end())
+            return {};
+        return OverseerDecisions::LeaderIntentsOnTheTable(it->second, now, _leaderLimits,
+                                                           LeaderPreferenceFor(name));
+    }
+
+    bool NoteLeaderStayLeak(std::string const& name)
+    {
+        return _leaders.count(name) && _stayLeakSaid.insert(name).second;
+    }
+
+    void ForgetLeaderStayLeak(std::string const& name) { _stayLeakSaid.erase(name); }
+
+    LeaderColumnEnd EndColumnLeaderIntent(std::string const& name, std::string const& why,
+                                          time_t now)
+    {
+        LeaderColumnEnd result;
+        result.kind = CurrentLeaderIntent(name, now);
+        switch (result.kind)
+        {
+            case OverseerDecisions::LeaderIntentKind::EconomyErrand:
+            case OverseerDecisions::LeaderIntentKind::TownErrand:
+            case OverseerDecisions::LeaderIntentKind::Respec:
+            case OverseerDecisions::LeaderIntentKind::TrainingStop:
+            case OverseerDecisions::LeaderIntentKind::Hearth:
+            case OverseerDecisions::LeaderIntentKind::DungeonRun:
+                break;
+            default:
+                result.kind = OverseerDecisions::LeaderIntentKind::None;
+                return result;
+        }
+        LeaderIntentSnapshot const state = LeaderIntentStateFor(name);
+        result.owner = state.owner;
+        result.since = state.since;
+        bool const done = why.find("arrived") != std::string::npos ||
+                          why.find("reached") != std::string::npos ||
+                          why.find("done") != std::string::npos ||
+                          why.find("stepped through") != std::string::npos;
+        result.how = done ? OverseerDecisions::LeaderIntentEnd::Completed
+                          : OverseerDecisions::LeaderIntentEnd::Failed;
+        result.ended = EndForLeader(name, result.kind, result.owner, result.how, now);
+        return result;
     }
 
     // TAKE THE WHEEL for `owner`. `cachedDrive` is the caller's word that its
@@ -166,8 +361,7 @@ public:
     // whether a family leader's intent book lets this owner act now; empty
     // means no leader rule applies.
     ClaimResult Claim(std::string const& name, std::string const& target,
-                      OverseerDecisions::TravelOwner owner, bool cachedDrive,
-                      std::function<bool()> const& leaderTurn)
+                      OverseerDecisions::TravelOwner owner, bool cachedDrive, time_t now)
     {
         ClaimResult result;
         if (!OverseerDecisions::TravelAimFitsColumn(target))
@@ -189,10 +383,29 @@ public:
             result.answer = ClaimAnswer::Fenced;
             return result;
         }
-        if (leaderTurn && !leaderTurn())
+        if (LeaderIntentApplies(name))
         {
-            result.answer = ClaimAnswer::LeaderBusy;
-            return result;
+            TravelOwnerIntent const intent = IntentForTravelOwner(owner);
+            bool const fetchAlreadyHoldsLeader =
+                intent.kind == OverseerDecisions::LeaderIntentKind::FetchMember &&
+                CurrentLeaderIntent(name, now) == OverseerDecisions::LeaderIntentKind::FetchMember;
+            if (!fetchAlreadyHoldsLeader)
+            {
+                result.leaderAsk.asked = true;
+                result.leaderAsk.kind = intent.kind;
+                result.leaderAsk.owner = intent.owner;
+                result.leaderAsk.target = target;
+                result.leaderAsk.why = "claims the travel column";
+                result.leaderAsk.before = LeaderIntentStateFor(name);
+                result.leaderAsk.verdict = AskForLeader(
+                    name, intent.kind, intent.owner, target, result.leaderAsk.why, now);
+                if (result.leaderAsk.verdict.answer ==
+                    OverseerDecisions::LeaderIntentAnswer::Deferred)
+                {
+                    result.answer = ClaimAnswer::LeaderBusy;
+                    return result;
+                }
+            }
         }
         _column.Write(name, target);
         _claims[name] = Held{target, owner};
@@ -327,6 +540,43 @@ private:
                verdict == OverseerDecisions::TravelClaim::Preempt;
     }
 
+    static TravelOwnerIntent IntentForTravelOwner(OverseerDecisions::TravelOwner owner)
+    {
+        TravelOwnerIntent intent;
+        switch (owner)
+        {
+            case OverseerDecisions::TravelOwner::HomeErrand:
+                intent.kind = OverseerDecisions::LeaderIntentKind::Hearth;
+                intent.owner = "home errand";
+                return intent;
+            case OverseerDecisions::TravelOwner::CatchUp:
+                intent.kind = OverseerDecisions::LeaderIntentKind::FetchMember;
+                intent.owner = "fetch";
+                return intent;
+            case OverseerDecisions::TravelOwner::Run:
+            case OverseerDecisions::TravelOwner::WalkBackIn:
+            case OverseerDecisions::TravelOwner::Exit:
+                intent.kind = OverseerDecisions::LeaderIntentKind::DungeonRun;
+                intent.owner = "dungeon run";
+                return intent;
+            case OverseerDecisions::TravelOwner::Respec:
+                intent.kind = OverseerDecisions::LeaderIntentKind::Respec;
+                intent.owner = "respec";
+                return intent;
+            case OverseerDecisions::TravelOwner::TrainingStop:
+                intent.kind = OverseerDecisions::LeaderIntentKind::TrainingStop;
+                intent.owner = "training stop";
+                return intent;
+            case OverseerDecisions::TravelOwner::TownTrip:
+                intent.kind = OverseerDecisions::LeaderIntentKind::TownErrand;
+                intent.owner = "town trip";
+                return intent;
+        }
+        intent.kind = OverseerDecisions::LeaderIntentKind::TownErrand;
+        intent.owner = "travel column";
+        return intent;
+    }
+
     OverseerDecisions::TravelClaimFacts FactsFor(std::string const& name,
                                                  std::string const& target,
                                                  OverseerDecisions::TravelOwner owner,
@@ -381,6 +631,12 @@ private:
     time_t _handbackSeconds;
     std::map<std::string, Held> _claims;
     std::map<std::string, time_t> _handback;
+    bool _leaderIntentsEnabled{true};
+    OverseerDecisions::LeaderIntentLimits _leaderLimits{};
+    std::set<std::string> _leaders;
+    std::map<std::string, OverseerDecisions::LeaderIntentState> _leaderStates;
+    std::map<std::string, OverseerDecisions::LeaderIntentPreference> _leaderPreferences;
+    std::set<std::string> _stayLeakSaid;
 };
 
 }  // namespace OverseerMovement

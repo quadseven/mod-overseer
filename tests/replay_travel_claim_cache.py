@@ -27,9 +27,9 @@ try:
     fence_cached = CACHED.search(source, fence, fence_end).group(1)
 except (ValueError, AttributeError) as exc:
     raise SystemExit("Travel cache branch not found; update the replay anchors") from exc
-if "_wheel.Claim(name, target, owner, cachedDrive," not in source[claim:claim_end]:
+if "MovementOwner().Claim(name, target, owner, cachedDrive," not in source[claim:claim_end]:
     raise SystemExit("Claim must hand its cached drive to the movement ownership module")
-if "_wheel.FenceRefuses(name, target, owner, cachedDrive)" not in source[fence:fence_end]:
+if "MovementOwner().FenceRefuses(name, target, owner, cachedDrive)" not in source[fence:fence_end]:
     raise SystemExit("FenceRefuses must hand its cached drive to the movement ownership module")
 
 harness = r'''
@@ -48,7 +48,7 @@ struct Book
     {
         TravelOwner const owner = TravelOwner::TownTrip;
 CLAIM_CACHED
-        return _wheel.Claim(name, target, owner, cachedDrive, {}).answer ==
+        return _wheel.Claim(name, target, owner, cachedDrive, 1000).answer ==
                OverseerMovement::ClaimAnswer::AlreadyDriving;
     }
     bool CachedFence(std::string const& name, std::string const& target)
