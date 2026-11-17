@@ -86,9 +86,11 @@ int main()
     if (body.find("StrategyItem{\"tank\", true}") != std::string::npos)
         return Fail("DriveEngagementSafety asks the combat engine for the literal 'tank'; a "
                     "warrior lists it as 'prot' - ask TankStrategyListedName (#1212)");
-    std::size_t const tanksFed = before.find("pursuit.tanks =");
-    if (tanksFed == std::string::npos ||
-        before.find("TankStrategyListedName(", tanksFed) == std::string::npos)
+    std::size_t const tanksFed = before.find("pursuit.tanks ="),
+                      listedName = before.find("TankStrategyListedName("),
+                      tankStrategy = before.find("tankStrategy", tanksFed);
+    if (tanksFed == std::string::npos || listedName == std::string::npos ||
+        listedName > tanksFed || tankStrategy == std::string::npos)
         return Fail("pursuit.tanks must be read by TankStrategyListedName (#1212)");
     if (before.find("pursuit.hasVictim =") == std::string::npos)
         return Fail("TankMayPursue is not fed hasVictim (#1212)");
@@ -103,6 +105,10 @@ int main()
         return Fail("a withheld pursuit must be said once per fight from TankPursuitWithheld "
                     "(#1212)");
 
+    std::size_t const suppress = body.find("std::string const change = \"-\" + tankStrategy;"),
+                      restore = body.find("std::string const change = \"+\" + tankStrategy;");
+    if (!(suppress < chase && restore < withheld))
+        return Fail("a chasing tank must suspend its tank strategy and restore it when pursuit ends");
     std::size_t const keepStart = text.find("    void KeepTankStrategies()\n");
     if (keepStart == std::string::npos)
         return Fail("cannot find KeepTankStrategies");
@@ -112,6 +118,8 @@ int main()
         keep.find("TankStrategyListedName(") == std::string::npos)
         return Fail("KeepTankStrategies must read the tank strategy by "
                     "TankStrategyListedName, not the literal 'tank' (#1212)");
+    if (keep.find("_tankPursuitSuppressed.count(name)") == std::string::npos)
+        return Fail("KeepTankStrategies must not regrant the tank strategy during pursuit");
 
     std::cout << "tank pursuit gate source: all checks passed\n";
     return EXIT_SUCCESS;

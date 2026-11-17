@@ -32172,9 +32172,11 @@ private:
             {
                 OverseerDecisions::TankPursuitFacts pursuit;
                 pursuit.classId = bot->getClass();
-                pursuit.tanks = StrategyPresent(
-                    botAI,
-                    StrategyItem{OverseerDecisions::TankStrategyListedName(pursuit.classId), true});
+                std::string const tankStrategy =
+                    OverseerDecisions::TankStrategyListedName(pursuit.classId);
+                bool const suppressed = _tankPursuitSuppressed.count(name) != 0;
+                pursuit.tanks =
+                    suppressed || StrategyPresent(botAI, StrategyItem{tankStrategy, true});
                 pursuit.inCombat = bot->IsInCombat();
                 pursuit.hasVictim = combatVictim != nullptr;
                 pursuit.inMeleeRange = combatVictim && bot->IsWithinMeleeRange(combatVictim);
@@ -32185,6 +32187,13 @@ private:
                 pursuit.alive = bot->IsAlive();
                 if (OverseerDecisions::TankMayPursue(pursuit))
                 {
+                    if (!suppressed)
+                    {
+                        std::string const change = "-" + tankStrategy;
+                        botAI->ChangeStrategy(change.c_str(), BOT_STATE_COMBAT);
+                        if (!StrategyPresent(botAI, StrategyItem{tankStrategy, true}))
+                            _tankPursuitSuppressed.insert(name);
+                    }
                     // Once per fight, not once per poll: the set is cleared
                     // above on the first poll that finds it out of combat.
                     if (_tankPursuitSaid.insert(name).second)
@@ -32198,6 +32207,13 @@ private:
                 }
                 else
                 {
+                    if (suppressed)
+                    {
+                        std::string const change = "+" + tankStrategy;
+                        botAI->ChangeStrategy(change.c_str(), BOT_STATE_COMBAT);
+                        if (StrategyPresent(botAI, StrategyItem{tankStrategy, true}))
+                            _tankPursuitSuppressed.erase(name);
+                    }
                     std::string const withheld =
                         OverseerDecisions::TankPursuitWithheld(pursuit);
                     if (!withheld.empty() && _tankPursuitWithheldSaid.insert(name).second)
@@ -64791,6 +64807,8 @@ private:
             PlayerbotAI* botAI = SteerableAI(bot);
             if (!botAI)
                 continue;
+            if (_tankPursuitSuppressed.count(name))
+                continue;
 
             uint32 points[3] = {0, 0, 0};
             TalentPointsByTree(bot, points);
@@ -89024,6 +89042,7 @@ private:
     // Tanks whose withheld pursuit has been said this fight (#1212), cleared
     // with the set above.
     std::set<std::string> _tankPursuitWithheldSaid;
+    std::set<std::string> _tankPursuitSuppressed;
     // The stale combat drive (#1390): when each character's empty combat
     // began, when its combat began as this drive saw it, and when its held
     // line was last said. Keyed by GUID counter; pruned every poll to the
