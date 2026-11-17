@@ -8972,8 +8972,13 @@ std::string CrossingExplanation(CrossingStep const& step, CrossingWorld const& w
         }
 
         case CrossingAction::Fetch:
-            return "the leader has waited at the berth long enough and a follower past the foot limit "
-                   "has no flight, so the leader goes back for that follower before the crossing";
+            // The step ends the attempt; it does not walk the leader back, and
+            // it asks nothing about a foot limit or a flight (#1598).
+            return "the leader has waited " + std::to_string(world.leaderWaitSeconds) +
+                   "s at the berth on map " + origin + " and " +
+                   std::to_string(step.waiting - 1 - step.gathered) +
+                   " member(s) are still not gathered with him, so this attempt ends "
+                   "for a split family, which regroups before the next crossing";
 
         case CrossingAction::Walk:
             return "the leader is on map " + origin + " with " +
