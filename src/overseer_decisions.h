@@ -15233,6 +15233,32 @@ std::string ZoneNoWayRoundLine(std::string const& name, std::string const& targe
                                std::vector<DangerZone> const& stillWalked,
                                ZoneDangerLimits const& limits);
 
+// WHETHER AN ERRAND'S FOOT WALK IS STARTED AT ALL (#1498). ReadZoneRoute says which
+// flagged zones the planned route still walks because no way round exists. Before
+// this the planner only logged that and walked the leg, and the leader died on it
+// before the death breaker called the errand off. A walk whose only route crosses
+// a flagged zone is refused at planning time instead, with the reason the refusal
+// record carries for the bridge.
+//
+// THE WALKER'S OWN ZONE AND THE AIM'S ARE NOT "CROSSED". A walker standing in a
+// flagged zone must be let out of it, and refusing every errand from a flagged
+// town would strand the family where it is dying; an errand whose aim is in the
+// zone is the death breaker's to judge once it is killing the walker. Zone 0 is
+// "not known" and excludes nothing. A trip that is not walked on foot (a
+// hearthstone) crosses no ground and is never refused by this rule.
+struct ZoneWalkVerdict
+{
+    bool refuse{false};
+    // The flagged zones the route crosses: `stillWalked` less the walker's and the aim's.
+    std::vector<DangerZone> crossed;
+    // The refusal's reason, as the bridge reads it. Empty when not refused.
+    std::string reason;
+};
+
+ZoneWalkVerdict DecideZoneWalk(std::vector<DangerZone> const& stillWalked,
+                               std::uint32_t walkerZone, std::uint32_t aimZone, bool onFoot,
+                               ZoneDangerLimits const& limits);
+
 // ------------------ a staging walk that is measured rather than routed (#342) --
 //
 // THE ROUTE PLANNER ABOVE IS RIGHT ABOUT ITS GRAPH AND WRONG ABOUT THE WORLD,

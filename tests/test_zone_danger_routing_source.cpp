@@ -97,6 +97,26 @@ int main()
             std::string::npos)
         return Fail("a creature walk must be steered round a dangerous zone");
 
+    // #1498: the walk is refused before the character moves, with the death
+    // breaker's own refusal, and the verdict comes from the pure decision.
+    std::string const say = Between(text, "static void SayDangerZones(",
+                                    "HOW MANY DANGEROUS ZONES THIS CREATURE WALK'S ROUTE GOES ROUND");
+    if (say.find("OverseerDecisions::DecideZoneWalk(") == std::string::npos ||
+        say.find("diedOn.zoneRefusal = walk.reason;") == std::string::npos)
+        return Fail("the plan must keep the zone walk verdict for the drive");
+    std::size_t const planAt = drive.find("PlanRouteOnce(bot, pos, state, name, target);");
+    std::size_t const refuseAt = drive.find("planned.zoneRefusal.empty()");
+    std::size_t const legAt = drive.find("RouteLeg(bot, pos, state, name, target)");
+    if (planAt == std::string::npos || refuseAt == std::string::npos || legAt == std::string::npos)
+        return Fail("the drive must plan, read the zone refusal, then step the route");
+    if (!(planAt < refuseAt && refuseAt < legAt))
+        return Fail("the zone refusal must be read before the route is stepped");
+    std::string const refusal = drive.substr(refuseAt, legAt - refuseAt);
+    if (refusal.find("_travelAims.Refuse(name, target, planned.zoneRefusal);") == std::string::npos ||
+        refusal.find("_travelAims.Release(name,") == std::string::npos ||
+        refusal.find("continue;") == std::string::npos)
+        return Fail("a refused zone walk must be refused and released like the death breaker's");
+
     std::cout << "zone danger routing source: all checks passed\n";
     return EXIT_SUCCESS;
 }

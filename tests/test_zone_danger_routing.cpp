@@ -32,6 +32,8 @@ using OverseerDecisions::RoutePlanVerdict;
 using OverseerDecisions::ZoneAvoidedLine;
 using OverseerDecisions::ZoneDangerLimits;
 using OverseerDecisions::ZoneDangerScore;
+using OverseerDecisions::ZoneWalkVerdict;
+using OverseerDecisions::DecideZoneWalk;
 using OverseerDecisions::ZoneDeath;
 using OverseerDecisions::ZoneNoWayRoundLine;
 using OverseerDecisions::ZoneRouteReading;
@@ -301,6 +303,64 @@ void TheFormerSeedZonesComeFromDeathRows()
           DangerZonesOn({}, MAP, 17, NOW, limits).empty());
 }
 
+// THE ERRAND WALK IS REFUSED AT PLANNING TIME (mod-overseer#1498). When the only
+// route crosses a zone flagged for the party's deaths, the walk is not started:
+// the verdict refuses it with the reason the bridge reads from the refusal record.
+void AWalkWithNoWayRoundADangerousZoneIsRefusedBeforeItStarts()
+{
+    ZoneDangerLimits const limits;
+    std::vector<DangerZone> zones = DangerZonesOn(ThreeDeaths(), MAP, 34, NOW, limits);
+    zones[0].name = "The Hinterlands";
+    std::vector<RouteLink> links = LinksWithNoWayRound();
+    PriceDangerZones(links, Zones(), zones, limits);
+    RoutePlan const plan = Plan(links);
+    ZoneRouteReading const reading = ReadZoneRoute(plan.nodes, plan.nodes, Zones(), zones);
+    ZoneWalkVerdict const verdict = DecideZoneWalk(reading.stillWalked, SAFE, SAFE, true, limits);
+    Check("the walk is refused", verdict.refuse);
+    Check("the verdict names the zone it crosses",
+          verdict.crossed.size() == 1 && verdict.crossed[0].zoneId == DANGER);
+    Check("the refusal reason is the exact text the bridge reads",
+          verdict.reason == "its only route crosses zone 47 (The Hinterlands), 3 death(s) in "
+                            "24 hours to creatures up to level 45, where this party has been "
+                            "dying");
+}
+
+void AWayRoundIsNotRefused()
+{
+    ZoneDangerLimits const limits;
+    std::vector<DangerZone> const zones = DangerZonesOn(ThreeDeaths(), MAP, 34, NOW, limits);
+    std::vector<RouteLink> links = LinksWithWayRound();
+    RoutePlan const wayThrough = Plan(links);
+    PriceDangerZones(links, Zones(), zones, limits);
+    RoutePlan const round = Plan(links);
+    ZoneRouteReading const reading = ReadZoneRoute(round.nodes, wayThrough.nodes, Zones(), zones);
+    Check("nothing is still walked", reading.stillWalked.empty());
+    Check("so the walk is not refused",
+          !DecideZoneWalk(reading.stillWalked, SAFE, SAFE, true, limits).refuse);
+}
+
+void AWalkerInOrBoundForTheZoneItselfIsNotRefused()
+{
+    ZoneDangerLimits const limits;
+    std::vector<DangerZone> zones = DangerZonesOn(ThreeDeaths(), MAP, 34, NOW, limits);
+    Check("a walker standing in the zone is let out of it",
+          !DecideZoneWalk(zones, DANGER, SAFE, true, limits).refuse);
+    Check("an errand whose aim is in the zone is left to the death breaker",
+          !DecideZoneWalk(zones, SAFE, DANGER, true, limits).refuse);
+    Check("a walker with no zone known is judged on the route alone",
+          DecideZoneWalk(zones, 0, 0, true, limits).refuse);
+}
+
+void AHearthstoneTripIsNotRefusedByTheRule()
+{
+    ZoneDangerLimits const limits;
+    std::vector<DangerZone> const zones = DangerZonesOn(ThreeDeaths(), MAP, 34, NOW, limits);
+    Check("a trip that is not walked on foot is not refused",
+          !DecideZoneWalk(zones, SAFE, SAFE, false, limits).refuse);
+    Check("an empty reading refuses nothing",
+          !DecideZoneWalk({}, SAFE, SAFE, true, limits).refuse);
+}
+
 }  // namespace
 
 int main()
@@ -313,6 +373,10 @@ int main()
     TheScoreDecaysAsThePartyLevels();
     TheYoungestMemberIsWhoTheZoneIsJudgedAgainst();
     TheFormerSeedZonesComeFromDeathRows();
+    AWalkWithNoWayRoundADangerousZoneIsRefusedBeforeItStarts();
+    AWayRoundIsNotRefused();
+    AWalkerInOrBoundForTheZoneItselfIsNotRefused();
+    AHearthstoneTripIsNotRefusedByTheRule();
     std::printf("zone danger routing: %d checks, %d failures\n", checks, failures);
     return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

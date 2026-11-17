@@ -23808,6 +23808,12 @@ private:
         std::time_t steppedAt{0};
         // How many dangerous zones the last plan went round (#1243).
         std::uint32_t zonesAvoided{0};
+        // WHY THE LAST PLAN REFUSES ITS WALK, and for which target (#1498): set
+        // when the only route crosses a zone flagged for the party's deaths
+        // (OverseerDecisions::DecideZoneWalk), empty otherwise. The drive reads
+        // it before the character moves and refuses the errand.
+        std::string zoneRefusal;
+        std::string zoneRefusalTarget;
     };
 
     // How many legs this walker died on are still priced at `now` (#1228).
@@ -24869,6 +24875,8 @@ private:
         diedOn.cursorAt = 0;
         diedOn.steppedAt = 0;
         diedOn.zonesAvoided = 0;
+        diedOn.zoneRefusal.clear();
+        diedOn.zoneRefusalTarget.clear();
         StagingCorridorAnswer const corridor =
             StagingCorridorRoute(bot, want, name, target, route);
         if (corridor.walkIt)
@@ -25165,7 +25173,7 @@ private:
             joinsCorridor = corridor.joinFirst && !route.empty();
             SayDiedOnLegs(name, target, diedOn, diedOnHeld, plannedAt);
             SayDangerZones(bot, survey, name, target, diedOn, dangerZones, planFromX, planFromY,
-                           aimX, aimY, limits, plannedAt);
+                           aimX, aimY, aimZ, limits, plannedAt);
             return route;
         }
 
@@ -25309,7 +25317,7 @@ private:
                                     : "still cost more than that, so it was not");
         SayDiedOnLegs(name, target, diedOn, diedOnHeld, plannedAt);
         SayDangerZones(bot, survey, name, target, diedOn, dangerZones, planFromX, planFromY,
-                       aimX, aimY, limits, plannedAt);
+                       aimX, aimY, aimZ, limits, plannedAt);
         return route;
     }
 
@@ -25321,7 +25329,7 @@ private:
                                std::string const& target, DiedOnLegMemory& diedOn,
                                std::vector<OverseerDecisions::DangerZone> const& dangerZones,
                                float planFromX, float planFromY, float aimX, float aimY,
-                               OverseerDecisions::RoutePlanLimits const& limits,
+                               float aimZ, OverseerDecisions::RoutePlanLimits const& limits,
                                std::time_t plannedAt)
     {
         if (dangerZones.empty())
@@ -25347,6 +25355,20 @@ private:
             LOG_WARN("module.overseer", "{}",
                      OverseerDecisions::ZoneNoWayRoundLine(name, target, reading.stillWalked,
                                                            ZONE_DANGER_LIMITS));
+        // AND WHEN THE ONLY ROUTE CROSSES THE ZONE, THE WALK IS REFUSED (#1498).
+        // The line above has always said it and then walked the leg; the leader
+        // died on it and the death breaker called the errand off afterwards. The
+        // verdict is kept for the drive, which reads it before the character
+        // moves. The walker's own zone and the aim's are not crossed.
+        Map* const map = bot->GetMap();
+        uint32 const aimZone = map ? map->GetZoneId(bot->GetPhaseMask(), aimX, aimY, aimZ) : 0;
+        OverseerDecisions::ZoneWalkVerdict const walk = OverseerDecisions::DecideZoneWalk(
+            reading.stillWalked, bot->GetZoneId(), aimZone, true, ZONE_DANGER_LIMITS);
+        if (walk.refuse)
+        {
+            diedOn.zoneRefusal = walk.reason;
+            diedOn.zoneRefusalTarget = target;
+        }
     }
 
     // HOW MANY DANGEROUS ZONES THIS CREATURE WALK'S ROUTE GOES ROUND (#1243). A
@@ -31708,6 +31730,31 @@ private:
             // priced route as a place walk, and the creature is handed over
             // when the route is spent (RouteLeg answers `pos` itself then).
             //
+            // A WALK WHOSE ONLY ROUTE CROSSES A ZONE FLAGGED FOR THE PARTY'S
+            // DEATHS IS REFUSED BEFORE THE CHARACTER MOVES (#1498). A walk to a
+            // place plans its route here, the poll RouteLeg would have, and the
+            // plan says whether it crosses such a zone. The refusal is the one
+            // the death breaker gives (Refuse, then Release) and is recorded for
+            // the bridge in the same row. A hearthstone trip is not a foot walk
+            // and never reaches this.
+            if (!entry)
+            {
+                PlanRouteOnce(bot, pos, state, name, target);
+                DiedOnLegMemory const& planned = DiedOnLegBook()[bot->GetName()];
+                if (!planned.zoneRefusal.empty() && planned.zoneRefusalTarget == target)
+                {
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' is sent to '{}' and {} - releasing the errand "
+                             "before it walks, and refusing it for {} minutes (#1498)",
+                             name, target, planned.zoneRefusal,
+                             static_cast<uint32>(ERRAND_DEATH_LIMITS.cooloffSeconds / 60));
+                    _travelAims.Refuse(name, target, planned.zoneRefusal);
+                    _travelAims.Release(name, "the travel drive (the only route crosses a "
+                                              "zone flagged for the party's deaths)");
+                    continue;
+                }
+            }
+
             // AND WHILE ITS ROUTE GOES ROUND A DANGEROUS ZONE (#1243), for the
             // same reason: upstream's mover would walk straight across it.
             std::uint32_t const zonesRound =
