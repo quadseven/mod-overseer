@@ -19703,6 +19703,19 @@ SpawnWalkArrivalHold SpawnWalkArrivalHoldFor(bool inQuestParty, bool asksStay,
     return SpawnWalkArrivalHold::LetGo;
 }
 
+SpawnWalkGiverStep SpawnWalkGiverStepFor(SpawnWalkGiverFacts const& facts)
+{
+    if (!facts.questHolderCreature || !facts.giverSeen || facts.giverYards < 0.f)
+        return SpawnWalkGiverStep::Place;
+    if (facts.giverYards <= SPAWN_WALK_GIVER_STAND_YARDS)
+        return SpawnWalkGiverStep::AtTheGiver;
+    if (facts.giverYards > SPAWN_WALK_GIVER_SEEN_YARDS)
+        return SpawnWalkGiverStep::Place;
+    if (facts.followedMs >= SPAWN_WALK_GIVER_FOLLOW_SECONDS * 1000u || facts.walkFaltering)
+        return SpawnWalkGiverStep::Place;
+    return SpawnWalkGiverStep::Follow;
+}
+
 bool IsTrainerWalkRow(std::string const& command)
 {
     std::vector<std::string> const words = MailWalkWords(command);

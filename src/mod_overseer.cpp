@@ -84560,6 +84560,11 @@ private:
         // A spawn walk's arrival radius: the row's `near:`, else the place radius.
         float spawnArriveYards{OverseerDecisions::SPAWN_WALK_ARRIVE_YARDS};
         uint32 spawnStaySeconds{0};  // `stay:` (wow-overseer#888), 0: let go on arrival
+        // A quest giver that walked off its spawn point is followed (#1392):
+        // set once the walk turns from the place to the creature, with the
+        // time it has followed since.
+        bool followsGiver{false};
+        uint32 giverFollowedMs{0};
 
         // A FAR WALK (#633): the destination lies past the goal's near cap, so
         // the walk mounts, may fly and follows the travel survey. `travel` is
@@ -85287,7 +85292,9 @@ private:
         // straight leg above is walked then, exactly as a near walk walks it.
         WorldPosition const destination(ev.mapId, ev.boxX, ev.boxY, ev.boxZ);
         bool onRoute = false;
-        bool const surveyed = ev.far && !viaPad;
+        // A walk following a giver that left its spawn point (#1392) is in
+        // its last yards and aims at a creature, not at the surveyed point.
+        bool const surveyed = ev.far && !viaPad && !ev.followsGiver;
         if (surveyed)
         {
             WorldPosition const leg =
@@ -85503,6 +85510,86 @@ private:
             hold->second.until != until || hold->second.walkingUntil != 0)
             return;
         ReleaseHold(name, who, "the quest row at its giver ran", MAIL_WALK_HOLD_VERB);
+    }
+
+    // A QUEST GIVER THAT WALKS IS FOLLOWED (#1392). A spawn walk arrives at
+    // the spawn row's own position, and a giver that patrols is not on it:
+    // a member reached a giver's spawn point at 2.9 yards and the take row
+    // found the living giver 112.5 yards off five seconds later. Asked once
+    // the walker is at the place (or is already following): the spawn's own
+    // living creature is read from the map, and
+    // OverseerDecisions::SpawnWalkGiverStepFor says whether the walk has
+    // arrived, walks on to the creature, or is judged by the place alone.
+    // True when the walk has arrived. A follow moves the walk's aim to where
+    // the creature stands now, and the walk's own legs, hold and clocks carry
+    // it there; it never ends a walk as an error that standing at the place
+    // would have ended as an arrival.
+    static bool SpawnWalkAtTheGiver(Player* bot, MailWalkCheck& check, uint32 elapsedMs)
+    {
+        namespace D = OverseerDecisions;
+        MailWalkEvidence& ev = check.ev;
+        if (ev.goal != D::WalkGoal::Spawn || ev.spawnIsObject)
+            return true;
+        D::SpawnWalkGiverFacts facts;
+        facts.questHolderCreature = SpawnIsQuestHolder(false, ev.mailboxEntry);
+        Creature* giver = nullptr;
+        if (facts.questHolderCreature)
+        {
+            // Alive, in the walker's phase, and not something that would
+            // attack it: a walk never closes on a hostile creature.
+            auto const spawned =
+                bot->GetMap()->GetCreatureBySpawnIdStore().equal_range(ev.spawnId);
+            for (auto it = spawned.first; it != spawned.second && !giver; ++it)
+                if (it->second && it->second->IsInWorld() && it->second->IsAlive() &&
+                    it->second->InSamePhase(bot) && !it->second->IsHostileTo(bot))
+                    giver = it->second;
+        }
+        facts.giverSeen = giver != nullptr;
+        facts.giverYards = giver ? bot->GetExactDist(giver) : -1.f;
+        facts.followedMs = ev.giverFollowedMs;
+        uint32 const stallMs =
+            (ev.far ? D::FAR_WALK_STALL_SECONDS : D::MAIL_WALK_STALL_SECONDS) * 1000u;
+        facts.walkFaltering =
+            ev.waitedMs + 5000u >= ev.timeoutMs ||
+            (ev.followsGiver && (ev.sinceProgressMs + 5000u >= stallMs ||
+                                 ev.groundRefusals + 2u >= D::MAIL_WALK_GROUND_REFUSALS_MAX));
+        D::SpawnWalkGiverStep const step = OverseerDecisions::SpawnWalkGiverStepFor(facts);
+        if (step != D::SpawnWalkGiverStep::Follow)
+        {
+            if (ev.followsGiver)
+                LOG_INFO("module.overseer",
+                         "overseer: spawn walk {} - '{}' followed '{}' (creature spawn {}) for "
+                         "{}s and {} (#1392)",
+                         check.id, check.targetName, ev.mailboxName, ev.spawnId,
+                         ev.giverFollowedMs / 1000u,
+                         step == D::SpawnWalkGiverStep::AtTheGiver
+                             ? "stands beside it"
+                             : "ends the walk where it is: the creature was not caught");
+            ev.reachedName = ev.mailboxName;
+            if (giver)
+                ev.reachedYards = facts.giverYards;
+            return true;
+        }
+        if (!ev.followsGiver)
+        {
+            ev.followsGiver = true;
+            ev.sinceProgressMs = 0;
+            ev.groundRefusals = 0;
+            ev.bestYards = facts.giverYards;
+            LOG_INFO("module.overseer",
+                     "overseer: spawn walk {} - '{}' is at the spawn point of '{}' (creature "
+                     "spawn {}) and the creature stands {:.1f} yards off; the walk follows it "
+                     "for up to {}s so the quest row finds it in reach (#1392)",
+                     check.id, check.targetName, ev.mailboxName, ev.spawnId, facts.giverYards,
+                     D::SPAWN_WALK_GIVER_FOLLOW_SECONDS);
+        }
+        else
+            ev.giverFollowedMs += elapsedMs;
+        ev.boxX = giver->GetPositionX();
+        ev.boxY = giver->GetPositionY();
+        ev.boxZ = giver->GetPositionZ();
+        ev.nowYards = facts.giverYards;
+        return false;
     }
 
     // A GUILD RAIDER'S TALENT RESET, AT THE CLASS TRAINER THE WALK REACHED
@@ -86592,6 +86679,11 @@ private:
                 if (facts.alive && !facts.onFlightLeg)
                     facts.mailboxInReach =
                         DestinationInReach(bot, ev, ev.reachedName, ev.reachedYards);
+                // AT THE PLACE, BUT IS THE GIVER? A quest giver that walked off
+                // its spawn point is followed before the walk is judged (#1392).
+                if (facts.alive && !facts.onFlightLeg && !fighting &&
+                    (facts.mailboxInReach || ev.followsGiver))
+                    facts.mailboxInReach = SpawnWalkAtTheGiver(bot, check, elapsedMs);
             }
             facts.waitedMs = ev.waitedMs;
             facts.timeoutMs = ev.timeoutMs;
