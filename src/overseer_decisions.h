@@ -22323,6 +22323,52 @@ enum class SpawnWalkArrivalHold
 SpawnWalkArrivalHold SpawnWalkArrivalHoldFor(bool inQuestParty, bool asksStay,
                                              bool spawnIsQuestHolder);
 
+// ...AND A QUEST GIVER THAT WALKS IS NOT AT ITS SPAWN POINT (mod-overseer#1392).
+// A spawn is a place, and the walk arrives at the spawn row's own position. A
+// giver that patrols is somewhere else: on the dev realm a member reached a
+// patrolling giver's spawn point at 2.9 yards and the take row, five seconds
+// later, found the living giver 112.5 yards off and refused "no giver of that
+// quest in reach"; all 27 such refusals of 2026-11-11 to 2026-11-15 followed a
+// `reached` line within 10 seconds, with the linger above already in force.
+// So a walk whose spawn is a creature the world names in a quest relation
+// reads where that creature stands once it is at the place, and walks on to
+// it. It stops SPAWN_WALK_GIVER_STAND_YARDS short, well inside the take's
+// SPAWN_WALK_ARRIVE_YARDS, so the steps the giver takes before the quest row
+// runs do not carry it out of reach again. The follow is bounded twice: a
+// creature farther than SPAWN_WALK_GIVER_SEEN_YARDS is not chased, and one not
+// caught within SPAWN_WALK_GIVER_FOLLOW_SECONDS ends the walk at the place, as
+// every such walk ended before. A follow also never costs a walk its arrival:
+// when the walk's own clocks are nearly spent it ends at the place instead of
+// running into a timeout or a stall it would not have met standing still.
+constexpr float SPAWN_WALK_GIVER_SEEN_YARDS = 250.0f;
+constexpr float SPAWN_WALK_GIVER_STAND_YARDS = 5.0f;
+constexpr uint32_t SPAWN_WALK_GIVER_FOLLOW_SECONDS = 60;
+
+struct SpawnWalkGiverFacts
+{
+    // The spawn is a creature the world names as a starter or ender of a quest.
+    bool questHolderCreature{false};
+    // That creature is in the world and alive.
+    bool giverSeen{false};
+    // The walker's distance to it; negative is unread.
+    float giverYards{-1.f};
+    // How long this walk has followed it already.
+    uint32_t followedMs{0};
+    // The walk's own clocks are nearly spent (its timeout, or while following
+    // its stall or ground refusals): one more leg could end it as an error.
+    bool walkFaltering{false};
+};
+
+enum class SpawnWalkGiverStep
+{
+    Place,       // judged by the spawn point alone, as any other spawn is
+    Follow,      // walk on to where the giver stands now
+    AtTheGiver,  // beside the living giver: arrived
+};
+
+// What a spawn walk that has reached its place does about the creature.
+SpawnWalkGiverStep SpawnWalkGiverStepFor(SpawnWalkGiverFacts const& facts);
+
 namespace SpawnWalkRefusal
 {
 constexpr char const* MalformedSpawn = "malformed walk-to-spawn command";
