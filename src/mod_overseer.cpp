@@ -49125,11 +49125,12 @@ private:
     // ZUL'FARRAK'S PYRAMID EVENT AND THE WALK TO UKORZ (overseer_zf_steps.h,
     // #1389), one poll on a run the verdict left running. Reads DATA_PYRAMID
     // and DATA_END_DOOR off the core's instance_zulfarrak and the tank's
-    // distance to a living Ukorz; true when a step gave up, with `why` naming
-    // the step and the reason, and the caller ends the run as stalled.
+    // distance to a living Ukorz; a stuck walk gets a grounded recovery before
+    // a later give-up returns true with `why` naming the step and reason.
     bool StepZulFarrakSteps(GuildRun& run, OverseerDecisions::GuildRunPoll const& poll,
-                            std::time_t now, std::string& why)
+                            bool regrouping, std::time_t now, std::string& why)
     {
+        static constexpr uint32 ZF_UKORZ_RECOVERY_POINT_ID = 0;
         using OverseerDecisions::ZulFarrakStepVerdict;
         if (run.mapId != OverseerDecisions::ZF_MAP_ID)
             return false;
@@ -49144,7 +49145,9 @@ private:
         OverseerDecisions::ZulFarrakUkorzFacts walk;
         walk.read = script != nullptr;
         walk.creditedMask = poll.creditedMask;
+        walk.pauseMovement = poll.bossInCombat || regrouping || run.brainHeld;
         walk.now = now;
+        Creature* ukorz = nullptr;
         if (script)
         {
             summit.pyramidPhase = script->GetData(OverseerDecisions::ZF_DATA_PYRAMID);
@@ -49162,8 +49165,24 @@ private:
                         continue;
                     float const yards = tank->GetExactDist(candidate);
                     if (!walk.ukorzFound || yards < walk.yards)
+                    {
                         walk.yards = yards;
+                        ukorz = candidate;
+                    }
                     walk.ukorzFound = true;
+                }
+            }
+        }
+
+        if (!walk.pauseMovement)
+        {
+            for (std::string const& name : run.names)
+            {
+                Player* const member = ObjectAccessor::FindPlayerByName(name);
+                if (GuildRunAliveInside(run, member) && member->IsInCombat())
+                {
+                    walk.pauseMovement = true;
+                    break;
                 }
             }
         }
@@ -49171,9 +49190,42 @@ private:
         OverseerDecisions::ZulFarrakSummitStep const summitStep =
             OverseerDecisions::ZulFarrakSummitNext(summit, run.zfSummit);
         run.zfSummit = summitStep.clock;
+        bool const alreadyRecovering = run.zfUkorz.recoveryIssued;
         OverseerDecisions::ZulFarrakUkorzStep const walkStep =
             OverseerDecisions::ZulFarrakUkorzNext(walk, run.zfUkorz);
         run.zfUkorz = walkStep.clock;
+
+        if (walkStep.verdict == ZulFarrakStepVerdict::Recover)
+        {
+            if (tank && ukorz)
+            {
+                WorldPosition const destination(run.mapId, ukorz->GetPositionX(),
+                                                ukorz->GetPositionY(), ukorz->GetPositionZ());
+                WorldPosition step;
+                if (GroundedStep(tank, destination, step))
+                {
+                    // The point generator's generic id is intentionally zero:
+                    // PointMovementGenerator only informs Creature AIs, and
+                    // this Player walk has no callback to dispatch.
+                    tank->GetMotionMaster()->MovePoint(ZF_UKORZ_RECOVERY_POINT_ID,
+                                                       step.GetPositionX(), step.GetPositionY(),
+                                                       step.GetPositionZ());
+                    if (!alreadyRecovering)
+                        LOG_WARN("module.overseer",
+                                 "overseer: guild finder run {} - walk recovery toward Ukorz: "
+                                 "re-aiming '{}' from {:.0f}y to the nearest living Chief Ukorz "
+                                 "Sandscalp along grounded movement",
+                                 run.id, run.tank, walk.yards);
+                }
+                else if (!alreadyRecovering)
+                    LOG_WARN("module.overseer",
+                             "overseer: guild finder run {} - walk recovery toward Ukorz has no "
+                             "grounded step from {:.0f}y; retrying while the recovery window "
+                             "remains open",
+                             run.id, walk.yards);
+            }
+            return false;
+        }
 
         if (summitStep.verdict == ZulFarrakStepVerdict::GiveUp)
         {
@@ -49839,7 +49891,7 @@ private:
             // reaches while the party fights, wipes and rests.
             {
                 std::string why;
-                if (StepZulFarrakSteps(run, poll, now, why))
+                if (StepZulFarrakSteps(run, poll, regrouping, now, why))
                 {
                     EndGuildRun(run,
                                 OverseerDecisions::GuildRunVerdictWord(

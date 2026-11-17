@@ -7,8 +7,8 @@
  * bosses, fighting, wiping and resting on the stairs until the two hour
  * ceiling, and 2 timed out after the End Door opened, still heading to Chief
  * Ukorz Sandscalp. The rules in src/overseer_zf_steps.h end a run whose
- * pyramid phase stands 25 minutes unchanged, or whose walk to Ukorz comes no
- * ten yards nearer in 15 minutes.
+ * pyramid phase stands 25 minutes unchanged, and recover a walk to Ukorz that
+ * comes no ten yards nearer in 15 minutes before ending it on another stall.
  *
  * THE NEGATIVE TESTS MATTER MOST: an event that advances, a walk that closes
  * in slowly, a party at Ukorz, a poll with nothing readable, and every state
@@ -37,6 +37,7 @@ char const* Name(ZulFarrakStepVerdict v)
         case ZulFarrakStepVerdict::Idle:     return "idle";
         case ZulFarrakStepVerdict::Carry:    return "carry";
         case ZulFarrakStepVerdict::Watching: return "watching";
+        case ZulFarrakStepVerdict::Recover:  return "recover";
         case ZulFarrakStepVerdict::GiveUp:   return "give up";
     }
     return "unknown";
@@ -73,7 +74,7 @@ ZulFarrakSummitFacts Summit(std::time_t now, std::uint32_t phase)
     return f;
 }
 
-ZulFarrakUkorzFacts Walk(std::time_t now, float yards)
+ZulFarrakUkorzFacts Walk(std::time_t now, float yards, bool pauseMovement = false)
 {
     ZulFarrakUkorzFacts f;
     f.read = true;
@@ -81,6 +82,7 @@ ZulFarrakUkorzFacts Walk(std::time_t now, float yards)
     f.endDoorState = ZF_END_DOOR_DONE;
     f.ukorzFound = true;
     f.yards = yards;
+    f.pauseMovement = pauseMovement;
     f.now = now;
     return f;
 }
@@ -89,6 +91,8 @@ void TheBoundsAreTheLiveOnes()
 {
     Check("pyramid bound is 25 minutes", ZF_PYRAMID_STALL_SECONDS == 25 * 60);
     Check("walk bound is 15 minutes", ZF_UKORZ_WALK_SECONDS == 15 * 60);
+    Check("a stuck recovery is re-aimed once a minute",
+          ZF_UKORZ_RECOVERY_RETRY_SECONDS == 60);
     Check("both are well inside the two hour ceiling",
           ZF_PYRAMID_STALL_SECONDS < GUILD_RUN_CEILING_SECONDS &&
               ZF_UKORZ_WALK_SECONDS < GUILD_RUN_CEILING_SECONDS);
@@ -210,25 +214,63 @@ void AWipeCarriesTheClock()
                  ZulFarrakStepVerdict::Idle);
 }
 
-// Run 1442262's shape: the door opened, the party wiped on the way and the
-// tank never got nearer than its first reading.
-void AWalkThatGetsNoNearerGivesUp()
+// Run 5948's shape: after the door opened, the living boss was still 131 yards
+// away after 15 minutes. The module first walks the tank toward Ukorz; if that
+// measured recovery also makes no progress for 15 minutes, it gives up.
+void AWalkThatGetsNoNearerFirstGetsARecovery()
 {
     ZulFarrakUkorzClock clock;
     ZulFarrakUkorzStep step;
     std::time_t t = T0;
-    float yards = 290.f;
+    float const yards = 131.f;
     for (; t < T0 + ZF_UKORZ_WALK_SECONDS; t += POLL)
     {
-        // Pacing: back and forth without ever gaining ten yards on the start.
-        yards = (t / POLL) % 2 ? 290.f : 282.f;
         step = ZulFarrakUkorzNext(Walk(t, yards), clock);
         CheckVerdict("under the bound is watched", step.verdict, ZulFarrakStepVerdict::Watching);
         clock = step.clock;
     }
-    step = ZulFarrakUkorzNext(Walk(t, yards), clock);
-    CheckVerdict("15 minutes no nearer gives up", step.verdict, ZulFarrakStepVerdict::GiveUp);
+    step = ZulFarrakUkorzNext(Walk(t, 131.f), clock);
+    CheckVerdict("15 minutes no nearer starts a recovery", step.verdict,
+                 ZulFarrakStepVerdict::Recover);
+    Check("recovery is remembered and its clock starts now",
+          step.clock.recoveryIssued && step.clock.since == t && step.clock.best == 131.f);
+
+    ZulFarrakUkorzStep const beforeRetry = ZulFarrakUkorzNext(
+        Walk(t + ZF_UKORZ_RECOVERY_RETRY_SECONDS - 1, 131.f), step.clock);
+    CheckVerdict("the recovery is not re-issued early", beforeRetry.verdict,
+                 ZulFarrakStepVerdict::Watching);
+
+    ZulFarrakUkorzStep const retry = ZulFarrakUkorzNext(
+        Walk(t + ZF_UKORZ_RECOVERY_RETRY_SECONDS, 131.f), beforeRetry.clock);
+    CheckVerdict("a still-distant tank is re-aimed on the retry interval", retry.verdict,
+                 ZulFarrakStepVerdict::Recover);
+
+    step = ZulFarrakUkorzNext(Walk(t + ZF_UKORZ_WALK_SECONDS, 131.f), retry.clock);
+    CheckVerdict("15 minutes without recovery progress gives up", step.verdict,
+                 ZulFarrakStepVerdict::GiveUp);
     Check("and says how long", step.seconds == ZF_UKORZ_WALK_SECONDS);
+}
+
+void RecoveryWaitsForCombatAndResetsAfterProgress()
+{
+    ZulFarrakUkorzClock clock;
+    ZulFarrakUkorzStep step = ZulFarrakUkorzNext(Walk(T0, 131.f), clock);
+    clock = step.clock;
+    step = ZulFarrakUkorzNext(Walk(T0 + ZF_UKORZ_WALK_SECONDS, 131.f, true), clock);
+    CheckVerdict("the recovery does not move the tank while the group is held", step.verdict,
+                 ZulFarrakStepVerdict::Watching);
+    Check("the pending recovery clock is carried", !step.clock.recoveryIssued &&
+                                                       step.clock.since == T0);
+
+    step = ZulFarrakUkorzNext(Walk(T0 + ZF_UKORZ_WALK_SECONDS + POLL, 131.f), step.clock);
+    CheckVerdict("the recovery starts after combat ends", step.verdict,
+                 ZulFarrakStepVerdict::Recover);
+    clock = step.clock;
+    step = ZulFarrakUkorzNext(Walk(T0 + ZF_UKORZ_WALK_SECONDS + 2 * POLL, 120.f), clock);
+    CheckVerdict("ten yards of recovery progress resumes the normal walk", step.verdict,
+                 ZulFarrakStepVerdict::Watching);
+    Check("progress resets the recovery budget", !step.clock.recoveryIssued &&
+                                                     step.clock.best == 120.f);
 }
 
 // A slow walk that keeps closing in, a yard a poll, never gives up, and it
@@ -294,7 +336,8 @@ int main()
     APhaseChangeRestartsTheClock();
     OutsideTheSummitStepIsIdle();
     AWipeCarriesTheClock();
-    AWalkThatGetsNoNearerGivesUp();
+    AWalkThatGetsNoNearerFirstGetsARecovery();
+    RecoveryWaitsForCombatAndResetsAfterProgress();
     ASlowWalkThatClosesInNeverGivesUp();
     AtUkorzTheWalkIsNotJudged();
     OutsideTheWalkIsIdle();
