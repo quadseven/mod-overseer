@@ -4423,7 +4423,20 @@ std::string TravelReleaseGate(TravelReleaseGateFacts const& facts)
     // skipped - reborn every poll.
     if (facts.claimed)
         return std::string();
+    // AN AIM NOTHING WALKS IS NOBODY'S ERRAND TO PROTECT (#1610). The fence
+    // exists so an economy pass's aim is not erased under it; a follower's
+    // counter keyword is refused every poll because only the leader walks, so
+    // the pass it protects is not running on it.
+    if (facts.inertFollowerAim &&
+        InertFollowerAimMayBeCleared(facts.standing, facts.learnSkill, INERT_FOLLOWER_AIM_SECONDS))
+        return std::string();
     return TravelReleaseFence(facts.learnSkill, facts.standing);
+}
+
+bool InertFollowerAimMayBeCleared(std::string const& aim, uint32_t learnSkill,
+                                  int64_t inertSeconds)
+{
+    return learnSkill == 0 && IsMaintenanceErrand(aim) && inertSeconds >= INERT_FOLLOWER_AIM_SECONDS;
 }
 
 bool RunAimMayBeReleased(std::string const& current,
