@@ -28646,6 +28646,80 @@ bool RecordsDeath(bool onRoster, bool inManagedGuild, std::int64_t lastRecordedA
                   std::int64_t now);
 bool RecordsLevel(bool onRoster, bool inManagedGuild);
 
+// THE WHOLE REALM'S DEATHS AND LEVEL-UPS, BY HOUR (mod-overseer#1552). The two
+// tables above cover the family and the managed guilds only, so "is this death
+// rate normal for the realm" could not be answered: the 2,440 bots outside the
+// guilds were not measured at all. This counts every character the module sees
+// die or level, and keeps no row per character: one counter per hour, level
+// band, zone, killer entry and cohort (the family and managed guilds against
+// everyone else), so the managed share can be read off the same table.
+//
+// SIZED BY KEY, NEVER BY CHARACTER. A hundred thousand distinct killers in one
+// hour cannot grow the map past REALM_TALLY_MAX_KEYS: a key that would not fit
+// is counted in its band's catch-all row (zone 0, killer 0) instead, so no death
+// is lost to the cap.
+constexpr std::uint32_t REALM_BAND_WIDTH = 10;
+constexpr std::size_t REALM_TALLY_MAX_KEYS = 4096;
+
+// The first level of the band `level` falls in (1, 11, 21 ...); 0 for level 0.
+std::uint32_t RealmLevelBand(std::uint32_t level);
+
+struct RealmTallyKey
+{
+    std::uint32_t band{0};
+    std::uint32_t zone{0};
+    // 0 for a level-up and for a death with no creature killer.
+    std::uint32_t killerEntry{0};
+    bool managed{false};
+
+    bool operator<(RealmTallyKey const& o) const
+    {
+        if (band != o.band)
+            return band < o.band;
+        if (zone != o.zone)
+            return zone < o.zone;
+        if (killerEntry != o.killerEntry)
+            return killerEntry < o.killerEntry;
+        return managed < o.managed;
+    }
+};
+
+struct RealmTallyCounts
+{
+    std::uint32_t deaths{0};
+    std::uint32_t levelUps{0};
+};
+
+struct RealmTallyRow
+{
+    std::int64_t hourStart{0};
+    RealmTallyKey key;
+    RealmTallyCounts counts;
+};
+
+// In-memory counters for the open hour. NOT thread safe: the caller holds its own
+// lock around every call, as the death queue's does.
+class RealmTally
+{
+public:
+    void NoteDeath(std::uint32_t level, std::uint32_t zone, std::uint32_t killerEntry,
+                   bool managed, std::int64_t now);
+    // `newLevel` is the level reached; a level lost on the way down counts too.
+    void NoteLevelUp(std::uint32_t newLevel, std::uint32_t zone, bool managed, std::int64_t now);
+
+    // The rows of every hour that has ended by `now`, emptied from the tally. The
+    // hour `now` falls in stays open.
+    std::vector<RealmTallyRow> Roll(std::int64_t now);
+
+private:
+    RealmTallyCounts& Slot(RealmTallyKey key, std::int64_t now);
+    void CloseEarlierHours(std::int64_t hour);
+
+    std::int64_t _hour{-1};
+    std::map<RealmTallyKey, RealmTallyCounts> _open;
+    std::vector<RealmTallyRow> _ready;
+};
+
 // ---------------------------------------- the auction history (wow-overseer#536) --
 //
 // An auction that closes is recorded as one row of overseer_auction_history:

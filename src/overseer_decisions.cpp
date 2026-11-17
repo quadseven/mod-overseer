@@ -25939,6 +25939,69 @@ bool RecordsLevel(bool onRoster, bool inManagedGuild)
     return onRoster || inManagedGuild;
 }
 
+std::uint32_t RealmLevelBand(std::uint32_t level)
+{
+    return level == 0 ? 0 : ((level - 1) / REALM_BAND_WIDTH) * REALM_BAND_WIDTH + 1;
+}
+
+void RealmTally::CloseEarlierHours(std::int64_t hour)
+{
+    if (_hour >= 0 && hour > _hour)
+    {
+        for (auto const& entry : _open)
+        {
+            RealmTallyRow row;
+            row.hourStart = _hour;
+            row.key = entry.first;
+            row.counts = entry.second;
+            _ready.push_back(row);
+        }
+        _open.clear();
+    }
+    if (_hour < 0 || hour > _hour)
+        _hour = hour;
+}
+
+RealmTallyCounts& RealmTally::Slot(RealmTallyKey key, std::int64_t now)
+{
+    CloseEarlierHours(now - now % 3600);
+    if (_open.find(key) == _open.end() && _open.size() >= REALM_TALLY_MAX_KEYS)
+    {
+        key.zone = 0;
+        key.killerEntry = 0;
+    }
+    return _open[key];
+}
+
+void RealmTally::NoteDeath(std::uint32_t level, std::uint32_t zone, std::uint32_t killerEntry,
+                           bool managed, std::int64_t now)
+{
+    RealmTallyKey key;
+    key.band = RealmLevelBand(level);
+    key.zone = zone;
+    key.killerEntry = killerEntry;
+    key.managed = managed;
+    ++Slot(key, now).deaths;
+}
+
+void RealmTally::NoteLevelUp(std::uint32_t newLevel, std::uint32_t zone, bool managed,
+                             std::int64_t now)
+{
+    RealmTallyKey key;
+    key.band = RealmLevelBand(newLevel);
+    key.zone = zone;
+    key.managed = managed;
+    ++Slot(key, now).levelUps;
+}
+
+std::vector<RealmTallyRow> RealmTally::Roll(std::int64_t now)
+{
+    CloseEarlierHours(now - now % 3600);
+    std::vector<RealmTallyRow> out;
+    out.swap(_ready);
+    return out;
+}
+
 // ---------------------------------------- the auction history (wow-overseer#536) --
 
 char const* AuctionOutcomeWord(AuctionOutcome outcome)
