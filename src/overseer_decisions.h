@@ -5362,7 +5362,24 @@ struct TravelReleaseGateFacts
     uint32_t learnSkill{0};
     // The travel_npc column as the release read it.
     std::string standing;
+    // The drive has refused this aim as inert for INERT_FOLLOWER_AIM_SECONDS: a
+    // follower's counter keyword, which only the leader's `new rpg` could walk
+    // (#1610). Lets a counter keyword through the gate and nothing else.
+    bool inertFollowerAim{false};
 };
+
+// HOW LONG A FOLLOWER'S COUNTER-KEYWORD AIM MAY STAND REFUSED AS INERT BEFORE IT
+// IS CLEARED (#1610). Long enough that a bridge pass writing a follower's aim and
+// a leader still on its way to the counter are not raced; short enough that the
+// catch-up walk, which refuses a member while an errand stands, is not kept
+// off it for minutes.
+constexpr int64_t INERT_FOLLOWER_AIM_SECONDS = 120;
+
+// Is this standing aim one the release may clear because nothing walks it? A
+// counter keyword only, no pending profession errand, refused as inert for the
+// bound. A positional aim, a guard and an empty column are never cleared here.
+bool InertFollowerAimMayBeCleared(std::string const& aim, uint32_t learnSkill,
+                                  int64_t inertSeconds);
 
 // Empty means the column write goes through. Non-empty is the same whole
 // clause TravelReleaseFence returns, or "the column changed after this book's
@@ -6831,6 +6848,16 @@ std::string GearIncumbentSaid(GearIncumbentScore const& incumbent,
 // the two never disagree about where the line is - only about what to say when
 // the line cannot be located.
 GearComparison GearCompare(GearVerdict const& candidate, GearIncumbentScore const& worn);
+
+// A TRINKET IS WORN ONCE. A trinket's worth is mostly an effect the stat sum
+// cannot price, and two copies of one effect share a cooldown, so a second copy
+// in the other trinket slot adds nothing while a distinct piece waits in the
+// bags (wow-overseer#2358: a level 60 warrior wore the same Heart of Noxxion
+// in both). True when the candidate is a trinket and the trinket slot it is NOT
+// going into already holds this very entry. Rings are exempt: a pair of the
+// same ring is two real rings.
+bool GearIsSecondCopyOfTrinket(bool isTrinket, unsigned candidateEntry,
+                               unsigned otherSlotEntry);
 
 // ---------------------------------------------- and the drive stands down --
 //
@@ -10980,6 +11007,22 @@ struct StrandedFacts
 
 StrandedWay DecideStrandedWay(StrandedFacts const& facts);
 
+// WHEN A REFUSED CROSSING MAY BE PRICED AGAIN. Measured on the dev realm
+// 2026-11-15: two family stand-in guests stayed on map 1 while their leader was
+// on map 0 for 207 and 79 minutes, and the way across flipped between `sail`
+// and `refuse` every 15 minutes. The crossing was refused at a leg, stood down
+// for 15 minutes, priced again as servable, started, refused again at the same
+// leg, and so on with no boarding and no hearth. A refusal is a fact about the
+// berth and the transport, and neither changes in 15 minutes.
+//
+// So a refused crossing stays refused for that member for 60 minutes, or until
+// the leader changes map, whichever comes first. A leader on another map is a
+// different crossing, so the old refusal says nothing about it.
+constexpr std::int64_t LONE_CROSSING_REFUSAL_SECONDS = 60 * 60;
+
+bool RefusedCrossingStands(std::int64_t now, std::int64_t refusedAt,
+                           std::uint32_t refusedForLeaderMap, std::uint32_t leaderMap);
+
 // WHO ELSE DECIDES WHERE A STRANDED MEMBER GOES (#1143), the fact behind
 // `familyOwnsTheWay`. Measured on the dev realm 2026-10-20: a member hearthed
 // to map 1 by a failed EXIT while its leader stood on map 0 stayed there 11 h
@@ -11503,6 +11546,18 @@ char const* LoneLegStepWord(LoneLegStep step);
 
 // The reason in words, for the log line and the regroup's refusal.
 char const* LoneLegReasonWord(LoneLegReason why);
+
+// HOW LONG A LONE-LEG HOLD LASTS BEFORE THE LEG IS ASKED AGAIN (#1609). A leg
+// refused for its deaths is a measurement and holds for the far-catch-up ceiling.
+// A leg refused for its ground alone is a prediction about a straight line, so it
+// is asked again after five minutes: the leader may have moved, a flight or a
+// stone may be ready, and a member stood still for fifteen minutes on a guess
+// stays split from its family for all of them.
+constexpr int64_t LONE_LEG_GROUND_HOLD_SECONDS = 300;
+
+// The ceiling to hold a member for, given why the leg was refused and the
+// far-catch-up ceiling. Never longer than `farHoldSeconds`.
+int64_t LoneLegHoldSeconds(LoneLegReason why, int64_t farHoldSeconds);
 
 // A member already held for a far catch-up must not wait on ground that the
 // #697 lone-walker rule calls lethal.
@@ -15221,6 +15276,32 @@ std::string ZoneAvoidedLine(std::string const& name, std::string const& target,
                             ZoneDangerLimits const& limits);
 std::string ZoneNoWayRoundLine(std::string const& name, std::string const& target,
                                std::vector<DangerZone> const& stillWalked,
+                               ZoneDangerLimits const& limits);
+
+// WHETHER AN ERRAND'S FOOT WALK IS STARTED AT ALL (#1498). ReadZoneRoute says which
+// flagged zones the planned route still walks because no way round exists. Before
+// this the planner only logged that and walked the leg, and the leader died on it
+// before the death breaker called the errand off. A walk whose only route crosses
+// a flagged zone is refused at planning time instead, with the reason the refusal
+// record carries for the bridge.
+//
+// THE WALKER'S OWN ZONE AND THE AIM'S ARE NOT "CROSSED". A walker standing in a
+// flagged zone must be let out of it, and refusing every errand from a flagged
+// town would strand the family where it is dying; an errand whose aim is in the
+// zone is the death breaker's to judge once it is killing the walker. Zone 0 is
+// "not known" and excludes nothing. A trip that is not walked on foot (a
+// hearthstone) crosses no ground and is never refused by this rule.
+struct ZoneWalkVerdict
+{
+    bool refuse{false};
+    // The flagged zones the route crosses: `stillWalked` less the walker's and the aim's.
+    std::vector<DangerZone> crossed;
+    // The refusal's reason, as the bridge reads it. Empty when not refused.
+    std::string reason;
+};
+
+ZoneWalkVerdict DecideZoneWalk(std::vector<DangerZone> const& stillWalked,
+                               std::uint32_t walkerZone, std::uint32_t aimZone, bool onFoot,
                                ZoneDangerLimits const& limits);
 
 // ------------------ a staging walk that is measured rather than routed (#342) --
@@ -28609,6 +28690,80 @@ constexpr std::int64_t GUILD_DEATH_MIN_GAP_SECONDS = 60;
 bool RecordsDeath(bool onRoster, bool inManagedGuild, std::int64_t lastRecordedAt,
                   std::int64_t now);
 bool RecordsLevel(bool onRoster, bool inManagedGuild);
+
+// THE WHOLE REALM'S DEATHS AND LEVEL-UPS, BY HOUR (mod-overseer#1552). The two
+// tables above cover the family and the managed guilds only, so "is this death
+// rate normal for the realm" could not be answered: the 2,440 bots outside the
+// guilds were not measured at all. This counts every character the module sees
+// die or level, and keeps no row per character: one counter per hour, level
+// band, zone, killer entry and cohort (the family and managed guilds against
+// everyone else), so the managed share can be read off the same table.
+//
+// SIZED BY KEY, NEVER BY CHARACTER. A hundred thousand distinct killers in one
+// hour cannot grow the map past REALM_TALLY_MAX_KEYS: a key that would not fit
+// is counted in its band's catch-all row (zone 0, killer 0) instead, so no death
+// is lost to the cap.
+constexpr std::uint32_t REALM_BAND_WIDTH = 10;
+constexpr std::size_t REALM_TALLY_MAX_KEYS = 4096;
+
+// The first level of the band `level` falls in (1, 11, 21 ...); 0 for level 0.
+std::uint32_t RealmLevelBand(std::uint32_t level);
+
+struct RealmTallyKey
+{
+    std::uint32_t band{0};
+    std::uint32_t zone{0};
+    // 0 for a level-up and for a death with no creature killer.
+    std::uint32_t killerEntry{0};
+    bool managed{false};
+
+    bool operator<(RealmTallyKey const& o) const
+    {
+        if (band != o.band)
+            return band < o.band;
+        if (zone != o.zone)
+            return zone < o.zone;
+        if (killerEntry != o.killerEntry)
+            return killerEntry < o.killerEntry;
+        return managed < o.managed;
+    }
+};
+
+struct RealmTallyCounts
+{
+    std::uint32_t deaths{0};
+    std::uint32_t levelUps{0};
+};
+
+struct RealmTallyRow
+{
+    std::int64_t hourStart{0};
+    RealmTallyKey key;
+    RealmTallyCounts counts;
+};
+
+// In-memory counters for the open hour. NOT thread safe: the caller holds its own
+// lock around every call, as the death queue's does.
+class RealmTally
+{
+public:
+    void NoteDeath(std::uint32_t level, std::uint32_t zone, std::uint32_t killerEntry,
+                   bool managed, std::int64_t now);
+    // `newLevel` is the level reached; a level lost on the way down counts too.
+    void NoteLevelUp(std::uint32_t newLevel, std::uint32_t zone, bool managed, std::int64_t now);
+
+    // The rows of every hour that has ended by `now`, emptied from the tally. The
+    // hour `now` falls in stays open.
+    std::vector<RealmTallyRow> Roll(std::int64_t now);
+
+private:
+    RealmTallyCounts& Slot(RealmTallyKey key, std::int64_t now);
+    void CloseEarlierHours(std::int64_t hour);
+
+    std::int64_t _hour{-1};
+    std::map<RealmTallyKey, RealmTallyCounts> _open;
+    std::vector<RealmTallyRow> _ready;
+};
 
 // ---------------------------------------- the auction history (wow-overseer#536) --
 //

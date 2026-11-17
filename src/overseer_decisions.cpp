@@ -4423,7 +4423,20 @@ std::string TravelReleaseGate(TravelReleaseGateFacts const& facts)
     // skipped - reborn every poll.
     if (facts.claimed)
         return std::string();
+    // AN AIM NOTHING WALKS IS NOBODY'S ERRAND TO PROTECT (#1610). The fence
+    // exists so an economy pass's aim is not erased under it; a follower's
+    // counter keyword is refused every poll because only the leader walks, so
+    // the pass it protects is not running on it.
+    if (facts.inertFollowerAim &&
+        InertFollowerAimMayBeCleared(facts.standing, facts.learnSkill, INERT_FOLLOWER_AIM_SECONDS))
+        return std::string();
     return TravelReleaseFence(facts.learnSkill, facts.standing);
+}
+
+bool InertFollowerAimMayBeCleared(std::string const& aim, uint32_t learnSkill,
+                                  int64_t inertSeconds)
+{
+    return learnSkill == 0 && IsMaintenanceErrand(aim) && inertSeconds >= INERT_FOLLOWER_AIM_SECONDS;
 }
 
 bool RunAimMayBeReleased(std::string const& current,
@@ -6060,6 +6073,12 @@ GearComparison GearCompare(GearVerdict const& candidate, GearIncumbentScore cons
     // worn instead of carried. A floor that does NOT clear proves nothing
     // either way, so it is said out loud rather than reported as a refusal.
     return clears ? GearComparison::Better : GearComparison::Undecided;
+}
+
+bool GearIsSecondCopyOfTrinket(bool isTrinket, unsigned candidateEntry,
+                               unsigned otherSlotEntry)
+{
+    return isTrinket && candidateEntry != 0 && candidateEntry == otherSlotEntry;
 }
 
 GearSwapIntent GearIntend(GearSlotMemory const& memory, unsigned candidateEntry,
@@ -9701,6 +9720,15 @@ StrandedWay DecideStrandedWay(StrandedFacts const& f)
     return StrandedWay::Refuse;
 }
 
+bool RefusedCrossingStands(std::int64_t now, std::int64_t refusedAt,
+                           std::uint32_t refusedForLeaderMap, std::uint32_t leaderMap)
+{
+    if (refusedForLeaderMap != leaderMap)
+        return false;
+    // A clock that ran backwards does not keep a refusal alive for ever.
+    return now >= refusedAt && now - refusedAt < LONE_CROSSING_REFUSAL_SECONDS;
+}
+
 StrandedOwner WhoOwnsStrandedWay(StrandedOwners const& o)
 {
     // A crossing with somebody aboard is supervised whatever else is true; one
@@ -10059,6 +10087,14 @@ LoneLegVerdict DecideLoneLeg(LoneLegFacts const& facts, LoneLegLimits const& lim
     else
         verdict.step = LoneLegStep::Wait;
     return verdict;
+}
+
+int64_t LoneLegHoldSeconds(LoneLegReason why, int64_t farHoldSeconds)
+{
+    if (why != LoneLegReason::Ground)
+        return farHoldSeconds;
+    return farHoldSeconds < LONE_LEG_GROUND_HOLD_SECONDS ? farHoldSeconds
+                                                         : LONE_LEG_GROUND_HOLD_SECONDS;
 }
 
 char const* LoneLegStepWord(LoneLegStep step)
@@ -13091,6 +13127,29 @@ std::string ZoneNoWayRoundLine(std::string const& name, std::string const& targe
            "' and no alternative route exists round " + ZoneNames(stillWalked, limits) + ", " +
            std::to_string(limits.levelGap) +
            " or more levels above this party. It walks the fewest legs there it can (#1243)";
+}
+
+ZoneWalkVerdict DecideZoneWalk(std::vector<DangerZone> const& stillWalked,
+                               std::uint32_t walkerZone, std::uint32_t aimZone, bool onFoot,
+                               ZoneDangerLimits const& limits)
+{
+    ZoneWalkVerdict verdict;
+    if (!onFoot)
+        return verdict;
+    for (DangerZone const& zone : stillWalked)
+    {
+        if (walkerZone != 0 && zone.zoneId == walkerZone)
+            continue;
+        if (aimZone != 0 && zone.zoneId == aimZone)
+            continue;
+        verdict.crossed.push_back(zone);
+    }
+    if (verdict.crossed.empty())
+        return verdict;
+    verdict.refuse = true;
+    verdict.reason = "its only route crosses " + ZoneNames(verdict.crossed, limits) +
+                     ", where this party has been dying";
+    return verdict;
 }
 
 std::uint32_t DiedOnLegsOnRoute(std::vector<RouteLegSpan> const& legs,
@@ -25908,6 +25967,69 @@ bool RecordsDeath(bool onRoster, bool inManagedGuild, std::int64_t lastRecordedA
 bool RecordsLevel(bool onRoster, bool inManagedGuild)
 {
     return onRoster || inManagedGuild;
+}
+
+std::uint32_t RealmLevelBand(std::uint32_t level)
+{
+    return level == 0 ? 0 : ((level - 1) / REALM_BAND_WIDTH) * REALM_BAND_WIDTH + 1;
+}
+
+void RealmTally::CloseEarlierHours(std::int64_t hour)
+{
+    if (_hour >= 0 && hour > _hour)
+    {
+        for (auto const& entry : _open)
+        {
+            RealmTallyRow row;
+            row.hourStart = _hour;
+            row.key = entry.first;
+            row.counts = entry.second;
+            _ready.push_back(row);
+        }
+        _open.clear();
+    }
+    if (_hour < 0 || hour > _hour)
+        _hour = hour;
+}
+
+RealmTallyCounts& RealmTally::Slot(RealmTallyKey key, std::int64_t now)
+{
+    CloseEarlierHours(now - now % 3600);
+    if (_open.find(key) == _open.end() && _open.size() >= REALM_TALLY_MAX_KEYS)
+    {
+        key.zone = 0;
+        key.killerEntry = 0;
+    }
+    return _open[key];
+}
+
+void RealmTally::NoteDeath(std::uint32_t level, std::uint32_t zone, std::uint32_t killerEntry,
+                           bool managed, std::int64_t now)
+{
+    RealmTallyKey key;
+    key.band = RealmLevelBand(level);
+    key.zone = zone;
+    key.killerEntry = killerEntry;
+    key.managed = managed;
+    ++Slot(key, now).deaths;
+}
+
+void RealmTally::NoteLevelUp(std::uint32_t newLevel, std::uint32_t zone, bool managed,
+                             std::int64_t now)
+{
+    RealmTallyKey key;
+    key.band = RealmLevelBand(newLevel);
+    key.zone = zone;
+    key.managed = managed;
+    ++Slot(key, now).levelUps;
+}
+
+std::vector<RealmTallyRow> RealmTally::Roll(std::int64_t now)
+{
+    CloseEarlierHours(now - now % 3600);
+    std::vector<RealmTallyRow> out;
+    out.swap(_ready);
+    return out;
 }
 
 // ---------------------------------------- the auction history (wow-overseer#536) --

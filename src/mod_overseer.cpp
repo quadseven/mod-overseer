@@ -1750,6 +1750,8 @@ constexpr uint32 CROSSING_FETCH_WAIT_SECONDS = 5 * 60;
 // crossing past its backstop), and re-opening it on the next party poll would
 // walk the member back toward the same refusal every thirty seconds. A quarter
 // of an hour is several boat periods and short of the backstop itself.
+// This quarter hour now only times the berth-walk give-up; a refused crossing
+// itself stands for OverseerDecisions::LONE_CROSSING_REFUSAL_SECONDS (#1143).
 constexpr uint32 LONE_CROSSING_STANDDOWN_SECONDS = 15 * 60;
 
 // The same question for an aimed POSITION, and it needs a different answer.
@@ -5733,6 +5735,20 @@ struct PendingLevel
 std::vector<PendingLevel> g_levelQueue;  // under g_deathMutex, bounded below
 uint64 g_droppedLevels = 0;
 
+// THE WHOLE REALM'S DEATHS AND LEVEL-UPS, AS COUNTERS (#1552). Memory only, like
+// the queues above, under the same g_deathMutex: the hooks add to it on a map
+// thread and FlushRealmTally writes the finished hours from the world thread.
+// There is no per-character row here by construction: the key is band, zone,
+// killer and cohort, so a guildless bot's death adds one to a counter and
+// writes nothing of its own.
+OverseerDecisions::RealmTally g_realmTally;
+// The creature that landed the last blow on a victim, by the victim's guid, for
+// every player and not only the managed ones (g_pendingKill is kept for those).
+// Taken by the death hook that follows, so it holds only deaths in flight; the
+// cap is a guard, not a limit anything reaches.
+std::map<uint32, uint32> g_realmKiller;
+constexpr std::size_t MAX_REALM_KILLERS = 4096;
+
 // The one place a death's full context is captured. Runs on whatever thread
 // OnPlayerJustDied fires on - a map-update thread, per the file header - so
 // it does NO database work: it reads three in-memory caches and the
@@ -5803,10 +5819,47 @@ static void LogGuildDeath(Player* killed, char const* kind, std::string const& k
 
 // The level-up record (#533): the family and the managed guilds, decided by
 // OverseerDecisions::RecordsLevel. Memory only, like RecordDeath.
+// Count one level change in the realm tally (#1552), whoever the character is.
+static void NoteRealmLevel(Player* player)
+{
+    bool const onRoster = OnRoster(player->GetName());
+    bool const managed = onRoster || InNaturalGuild(player);
+    std::lock_guard<std::mutex> guard(g_deathMutex);
+    g_realmTally.NoteLevelUp(player->GetLevel(), player->GetZoneId(), managed,
+                             static_cast<std::int64_t>(std::time(nullptr)));
+}
+
+// Count one death in the realm tally (#1552), whoever the character is. The
+// killer is the creature remembered by NoteRealmKiller, or 0.
+static void NoteRealmDeath(Player* player)
+{
+    bool const onRoster = OnRoster(player->GetName());
+    bool const managed = onRoster || InNaturalGuild(player);
+    std::lock_guard<std::mutex> guard(g_deathMutex);
+    uint32 killer = 0;
+    auto const it = g_realmKiller.find(player->GetGUID().GetCounter());
+    if (it != g_realmKiller.end())
+    {
+        killer = it->second;
+        g_realmKiller.erase(it);
+    }
+    g_realmTally.NoteDeath(player->GetLevel(), player->GetZoneId(), killer, managed,
+                           static_cast<std::int64_t>(std::time(nullptr)));
+}
+
+static void NoteRealmKiller(Player* killed, Creature* killer)
+{
+    std::lock_guard<std::mutex> guard(g_deathMutex);
+    if (g_realmKiller.size() >= MAX_REALM_KILLERS)
+        g_realmKiller.clear();
+    g_realmKiller[killed->GetGUID().GetCounter()] = killer->GetEntry();
+}
+
 static void RecordLevel(Player* player, uint8 oldLevel)
 {
     if (!player)
         return;
+    NoteRealmLevel(player);
     bool const onRoster = OnRoster(player->GetName());
     if (!OverseerDecisions::RecordsLevel(onRoster, !onRoster && InNaturalGuild(player)))
         return;
@@ -5831,6 +5884,7 @@ void RecordDeath(Player* player)
 {
     if (!player)
         return;
+    NoteRealmDeath(player);
 
     std::string const lower = LowerName(player->GetName());
     std::time_t const now = std::time(nullptr);
@@ -6436,6 +6490,9 @@ public:
         // it: a member carrying an aim nobody walks is still behind its leader,
         // not off on an errand of its own. See MemberFollowsForFlight.
         bool inertFollowerAim{false};
+        // When the aim began to be refused as inert (#1610), or 0. Cleared with
+        // the flag, so a walked aim starts the count again.
+        time_t inertSince{0};
         // Said once per HOLD, not once per errand, which is why it is not
         // `arrived` (#311). The post-revival hold takes `new rpg` off on purpose
         // for a few seconds and gives it back itself, so the line about it is
@@ -6906,9 +6963,14 @@ public:
     // the claim and stamps the hand-back clock that keeps the quest drive off
     // the wheel (see TravelHoldsTheWheel, case 2); this book ends the errand
     // memory around it.
-    void Release(std::string const& name, std::string const& why = std::string())
+    // `inertFollowerAim` is the drive saying the aim in the column is one nothing
+    // walks and has not for INERT_FOLLOWER_AIM_SECONDS (#1610): the gate then lets
+    // a counter keyword be cleared, which it fences when the book never claimed it.
+    void Release(std::string const& name, std::string const& why = std::string(),
+                 bool inertFollowerAim = false)
     {
-        ReleaseImpl(name, why, MovementOwner().Release(name, std::time(nullptr)));
+        ReleaseImpl(name, why,
+                    MovementOwner().Release(name, std::time(nullptr), inertFollowerAim));
     }
 
     // Close a dungeon coordinator's travel state without giving back a newer
@@ -8373,6 +8435,7 @@ public:
     {
         if (!killer || !killed)
             return;
+        NoteRealmKiller(killed, killer);
         RememberKiller(killed, "creature", killer->GetName(), killer->GetEntry());
         LogGuildDeath(killed, "creature", killer->GetName(), killer->GetEntry(),
                       killer->GetLevel(),
@@ -8855,6 +8918,7 @@ public:
         FlushRunDamage();
         FlushDeaths();
         FlushLevels();
+        FlushRealmTally(true);
         LOG_INFO("module.overseer",
                  "overseer: the chat, event, death and level queues are flushed at shutdown");
     }
@@ -9267,6 +9331,7 @@ public:
             FlushDeaths();
             FlushLevels();
             SweepDeathHits();
+            FlushRealmTally();
         }
         if (_sweepTimer >= CHAT_SWEEP_MS)
         {
@@ -9290,6 +9355,9 @@ public:
                 DEATH_RETENTION_DAYS);
             CharacterDatabase.Execute(
                 "DELETE FROM overseer_level WHERE created_at < NOW() - INTERVAL {} DAY",
+                DEATH_RETENTION_DAYS);
+            CharacterDatabase.Execute(
+                "DELETE FROM overseer_realm_hour WHERE hour_start < NOW() - INTERVAL {} DAY",
                 DEATH_RETENTION_DAYS);
             // Answered probes past a day, a batch at a time (see
             // PROBE_RETENTION_HOURS). On updated_at, which is when the answer
@@ -21587,6 +21655,27 @@ private:
                 }
             }
 
+            // A TRINKET IS WORN ONCE (wow-overseer#2358). The slot this piece
+            // is NOT going into is the other trinket home; if it already holds
+            // this very entry the piece is a second copy, and the next-best
+            // distinct trinket takes the second slot instead.
+            if (found == EQUIPMENT_SLOT_TRINKET1)
+            {
+                uint8 const otherHome = static_cast<uint8>(
+                    target == EQUIPMENT_SLOT_TRINKET1 ? EQUIPMENT_SLOT_TRINKET2
+                                                      : EQUIPMENT_SLOT_TRINKET1);
+                if (OverseerDecisions::GearIsSecondCopyOfTrinket(
+                        true, item->GetEntry(), GearWornEntry(bot, otherHome)))
+                {
+                    if (SayGearOnce(who.name, item->GetEntry()))
+                        LOG_INFO("module.overseer",
+                                 "overseer: '{}' already wears {} in its other trinket slot, "
+                                 "so a second copy stays in the bags",
+                                 who.name, proto->Name1);
+                    continue;
+                }
+            }
+
             // What every line below prints as "against", said so the off hand
             // is visible in it rather than folded silently into a total (#411).
             std::string const incumbentSaid = OverseerDecisions::GearIncumbentSaid(
@@ -23678,6 +23767,12 @@ private:
         std::time_t steppedAt{0};
         // How many dangerous zones the last plan went round (#1243).
         std::uint32_t zonesAvoided{0};
+        // WHY THE LAST PLAN REFUSES ITS WALK, and for which target (#1498): set
+        // when the only route crosses a zone flagged for the party's deaths
+        // (OverseerDecisions::DecideZoneWalk), empty otherwise. The drive reads
+        // it before the character moves and refuses the errand.
+        std::string zoneRefusal;
+        std::string zoneRefusalTarget;
     };
 
     // How many legs this walker died on are still priced at `now` (#1228).
@@ -24739,6 +24834,8 @@ private:
         diedOn.cursorAt = 0;
         diedOn.steppedAt = 0;
         diedOn.zonesAvoided = 0;
+        diedOn.zoneRefusal.clear();
+        diedOn.zoneRefusalTarget.clear();
         StagingCorridorAnswer const corridor =
             StagingCorridorRoute(bot, want, name, target, route);
         if (corridor.walkIt)
@@ -25035,7 +25132,7 @@ private:
             joinsCorridor = corridor.joinFirst && !route.empty();
             SayDiedOnLegs(name, target, diedOn, diedOnHeld, plannedAt);
             SayDangerZones(bot, survey, name, target, diedOn, dangerZones, planFromX, planFromY,
-                           aimX, aimY, limits, plannedAt);
+                           aimX, aimY, aimZ, limits, plannedAt);
             return route;
         }
 
@@ -25179,7 +25276,7 @@ private:
                                     : "still cost more than that, so it was not");
         SayDiedOnLegs(name, target, diedOn, diedOnHeld, plannedAt);
         SayDangerZones(bot, survey, name, target, diedOn, dangerZones, planFromX, planFromY,
-                       aimX, aimY, limits, plannedAt);
+                       aimX, aimY, aimZ, limits, plannedAt);
         return route;
     }
 
@@ -25191,7 +25288,7 @@ private:
                                std::string const& target, DiedOnLegMemory& diedOn,
                                std::vector<OverseerDecisions::DangerZone> const& dangerZones,
                                float planFromX, float planFromY, float aimX, float aimY,
-                               OverseerDecisions::RoutePlanLimits const& limits,
+                               float aimZ, OverseerDecisions::RoutePlanLimits const& limits,
                                std::time_t plannedAt)
     {
         if (dangerZones.empty())
@@ -25217,6 +25314,20 @@ private:
             LOG_WARN("module.overseer", "{}",
                      OverseerDecisions::ZoneNoWayRoundLine(name, target, reading.stillWalked,
                                                            ZONE_DANGER_LIMITS));
+        // AND WHEN THE ONLY ROUTE CROSSES THE ZONE, THE WALK IS REFUSED (#1498).
+        // The line above has always said it and then walked the leg; the leader
+        // died on it and the death breaker called the errand off afterwards. The
+        // verdict is kept for the drive, which reads it before the character
+        // moves. The walker's own zone and the aim's are not crossed.
+        Map* const map = bot->GetMap();
+        uint32 const aimZone = map ? map->GetZoneId(bot->GetPhaseMask(), aimX, aimY, aimZ) : 0;
+        OverseerDecisions::ZoneWalkVerdict const walk = OverseerDecisions::DecideZoneWalk(
+            reading.stillWalked, bot->GetZoneId(), aimZone, true, ZONE_DANGER_LIMITS);
+        if (walk.refuse)
+        {
+            diedOn.zoneRefusal = walk.reason;
+            diedOn.zoneRefusalTarget = target;
+        }
     }
 
     // HOW MANY DANGEROUS ZONES THIS CREATURE WALK'S ROUTE GOES ROUND (#1243). A
@@ -27513,9 +27624,14 @@ private:
                         return;
                     }
                 }
+                // A LEG REFUSED FOR ITS GROUND ALONE IS ASKED AGAIN SOONER (#1609):
+                // see OverseerDecisions::LONE_LEG_GROUND_HOLD_SECONDS.
+                time_t const holdFor = lethal != _lethalLegHeld.end()
+                    ? static_cast<time_t>(OverseerDecisions::LoneLegHoldSeconds(
+                          lethal->second.why, CATCH_UP_FAR_HOLD_SECONDS))
+                    : CATCH_UP_FAR_HOLD_SECONDS;
                 if (OverseerDecisions::FarCatchUpStaysHeld(
-                        gap, holdLifts, std::time(nullptr) - heldFar->second,
-                        CATCH_UP_FAR_HOLD_SECONDS))
+                        gap, holdLifts, std::time(nullptr) - heldFar->second, holdFor))
                 {
                     HoldFarFromLeader(p, name);
                     if (walkToSafety && WalkHeldToSafeGround(p, name, *safeGrave))
@@ -30277,8 +30393,33 @@ private:
             state.inertFollowerAim =
                 mover == OverseerDecisions::AimedMover::RefuseInFormation ||
                 mover == OverseerDecisions::AimedMover::RefuseCutOff;
+            if (!state.inertFollowerAim)
+                state.inertSince = 0;
             if (state.inertFollowerAim)
             {
+                // AN AIM NOTHING WALKS IS CLEARED AFTER A BOUND (#1610). Only for
+                // a follower in formation, where "aim the leader instead" is the
+                // whole remedy, and only for a counter keyword: the release gate
+                // would otherwise fence it as the bridge's and the column would
+                // keep blocking the catch-up walk and billing the errand budget.
+                if (!state.inertSince)
+                    state.inertSince = std::time(nullptr);
+                if (mover == OverseerDecisions::AimedMover::RefuseInFormation &&
+                    OverseerDecisions::InertFollowerAimMayBeCleared(
+                        target, state.learn,
+                        std::time(nullptr) - state.inertSince))
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' has carried the aim '{}' for {}s and nothing "
+                             "walks it - only its leader carries `new rpg` - so the aim is "
+                             "cleared from its column (#1610)",
+                             name, target,
+                             static_cast<uint32>(std::time(nullptr) - state.inertSince));
+                    // `state` IS DEAD AFTER THIS: Release erases the record.
+                    _travelAims.Release(name, "an aim nothing walks (a follower's counter keyword)",
+                                        true);
+                    continue;
+                }
                 if (!state.arrived)
                 {
                     state.arrived = true;  // "said already", not "got there"
@@ -31270,7 +31411,8 @@ private:
                                  "It is not walked down that leg: its walk ends and it is "
                                  "held where it stands ({}), and its leader goes back for it "
                                  "with the family once the rest are gathered. The hold "
-                                 "lifts when the leader is within {} yards (#697)",
+                                 "lifts when the leader is within {} yards, or the leg is "
+                                 "judged again after {}s (#697, #1609)",
                                  name, static_cast<uint32>(distance), target,
                                  OverseerDecisions::LoneLegReasonWord(lone.why),
                                  FamilyLegDeaths(name),
@@ -31278,7 +31420,9 @@ private:
                                  static_cast<uint32>(ground.longestLethalRunYards),
                                  bot->GetLevel() + LONE_LEG_LIMITS.levelGap, ground.worstLevel,
                                  OverseerDecisions::LoneLegStepWord(lone.step),
-                                 static_cast<uint32>(FOLLOW_CATCH_UP_DONE_YARDS));
+                                 static_cast<uint32>(FOLLOW_CATCH_UP_DONE_YARDS),
+                                 static_cast<uint32>(OverseerDecisions::LoneLegHoldSeconds(
+                                     lone.why, CATCH_UP_FAR_HOLD_SECONDS)));
                         _catchUpHeldFar[name] = std::time(nullptr);
                         LethalLegHold& held = _lethalLegHeld[name];
                         held = LethalLegHold{};
@@ -31578,6 +31722,31 @@ private:
             // priced route as a place walk, and the creature is handed over
             // when the route is spent (RouteLeg answers `pos` itself then).
             //
+            // A WALK WHOSE ONLY ROUTE CROSSES A ZONE FLAGGED FOR THE PARTY'S
+            // DEATHS IS REFUSED BEFORE THE CHARACTER MOVES (#1498). A walk to a
+            // place plans its route here, the poll RouteLeg would have, and the
+            // plan says whether it crosses such a zone. The refusal is the one
+            // the death breaker gives (Refuse, then Release) and is recorded for
+            // the bridge in the same row. A hearthstone trip is not a foot walk
+            // and never reaches this.
+            if (!entry)
+            {
+                PlanRouteOnce(bot, pos, state, name, target);
+                DiedOnLegMemory const& planned = DiedOnLegBook()[bot->GetName()];
+                if (!planned.zoneRefusal.empty() && planned.zoneRefusalTarget == target)
+                {
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' is sent to '{}' and {} - releasing the errand "
+                             "before it walks, and refusing it for {} minutes (#1498)",
+                             name, target, planned.zoneRefusal,
+                             static_cast<uint32>(ERRAND_DEATH_LIMITS.cooloffSeconds / 60));
+                    _travelAims.Refuse(name, target, planned.zoneRefusal);
+                    _travelAims.Release(name, "the travel drive (the only route crosses a "
+                                              "zone flagged for the party's deaths)");
+                    continue;
+                }
+            }
+
             // AND WHILE ITS ROUTE GOES ROUND A DANGEROUS ZONE (#1243), for the
             // same reason: upstream's mover would walk straight across it.
             std::uint32_t const zonesRound =
@@ -48888,11 +49057,12 @@ private:
     // ZUL'FARRAK'S PYRAMID EVENT AND THE WALK TO UKORZ (overseer_zf_steps.h,
     // #1389), one poll on a run the verdict left running. Reads DATA_PYRAMID
     // and DATA_END_DOOR off the core's instance_zulfarrak and the tank's
-    // distance to a living Ukorz; true when a step gave up, with `why` naming
-    // the step and the reason, and the caller ends the run as stalled.
+    // distance to a living Ukorz; a stuck walk gets a grounded recovery before
+    // a later give-up returns true with `why` naming the step and reason.
     bool StepZulFarrakSteps(GuildRun& run, OverseerDecisions::GuildRunPoll const& poll,
-                            std::time_t now, std::string& why)
+                            bool regrouping, std::time_t now, std::string& why)
     {
+        static constexpr uint32 ZF_UKORZ_RECOVERY_POINT_ID = 0;
         using OverseerDecisions::ZulFarrakStepVerdict;
         if (run.mapId != OverseerDecisions::ZF_MAP_ID)
             return false;
@@ -48907,7 +49077,9 @@ private:
         OverseerDecisions::ZulFarrakUkorzFacts walk;
         walk.read = script != nullptr;
         walk.creditedMask = poll.creditedMask;
+        walk.pauseMovement = poll.bossInCombat || regrouping || run.brainHeld;
         walk.now = now;
+        Creature* ukorz = nullptr;
         if (script)
         {
             summit.pyramidPhase = script->GetData(OverseerDecisions::ZF_DATA_PYRAMID);
@@ -48925,8 +49097,24 @@ private:
                         continue;
                     float const yards = tank->GetExactDist(candidate);
                     if (!walk.ukorzFound || yards < walk.yards)
+                    {
                         walk.yards = yards;
+                        ukorz = candidate;
+                    }
                     walk.ukorzFound = true;
+                }
+            }
+        }
+
+        if (!walk.pauseMovement)
+        {
+            for (std::string const& name : run.names)
+            {
+                Player* const member = ObjectAccessor::FindPlayerByName(name);
+                if (GuildRunAliveInside(run, member) && member->IsInCombat())
+                {
+                    walk.pauseMovement = true;
+                    break;
                 }
             }
         }
@@ -48934,9 +49122,42 @@ private:
         OverseerDecisions::ZulFarrakSummitStep const summitStep =
             OverseerDecisions::ZulFarrakSummitNext(summit, run.zfSummit);
         run.zfSummit = summitStep.clock;
+        bool const alreadyRecovering = run.zfUkorz.recoveryIssued;
         OverseerDecisions::ZulFarrakUkorzStep const walkStep =
             OverseerDecisions::ZulFarrakUkorzNext(walk, run.zfUkorz);
         run.zfUkorz = walkStep.clock;
+
+        if (walkStep.verdict == ZulFarrakStepVerdict::Recover)
+        {
+            if (tank && ukorz)
+            {
+                WorldPosition const destination(run.mapId, ukorz->GetPositionX(),
+                                                ukorz->GetPositionY(), ukorz->GetPositionZ());
+                WorldPosition step;
+                if (GroundedStep(tank, destination, step))
+                {
+                    // The point generator's generic id is intentionally zero:
+                    // PointMovementGenerator only informs Creature AIs, and
+                    // this Player walk has no callback to dispatch.
+                    tank->GetMotionMaster()->MovePoint(ZF_UKORZ_RECOVERY_POINT_ID,
+                                                       step.GetPositionX(), step.GetPositionY(),
+                                                       step.GetPositionZ());
+                    if (!alreadyRecovering)
+                        LOG_WARN("module.overseer",
+                                 "overseer: guild finder run {} - walk recovery toward Ukorz: "
+                                 "re-aiming '{}' from {:.0f}y to the nearest living Chief Ukorz "
+                                 "Sandscalp along grounded movement",
+                                 run.id, run.tank, walk.yards);
+                }
+                else if (!alreadyRecovering)
+                    LOG_WARN("module.overseer",
+                             "overseer: guild finder run {} - walk recovery toward Ukorz has no "
+                             "grounded step from {:.0f}y; retrying while the recovery window "
+                             "remains open",
+                             run.id, walk.yards);
+            }
+            return false;
+        }
 
         if (summitStep.verdict == ZulFarrakStepVerdict::GiveUp)
         {
@@ -49602,7 +49823,7 @@ private:
             // reaches while the party fights, wipes and rests.
             {
                 std::string why;
-                if (StepZulFarrakSteps(run, poll, now, why))
+                if (StepZulFarrakSteps(run, poll, regrouping, now, why))
                 {
                     EndGuildRun(run,
                                 OverseerDecisions::GuildRunVerdictWord(
@@ -52457,6 +52678,8 @@ private:
     }
     // A member whose boat home was refused, and when (LONE_CROSSING_STANDDOWN_SECONDS).
     std::map<std::string, std::pair<time_t, std::string>> _loneCrossingRefused;
+    // The leader's map each refusal above was made for (RefusedCrossingStands).
+    std::map<std::string, uint32> _loneCrossingRefusedFor;
     // Hearth casts asked of a stranded member this split (EXIT_HEARTH_ATTEMPTS).
     std::map<std::string, unsigned> _strandedHearthTries;
     // When a member's travel walk last gave up on the ground (rule 6b).
@@ -52789,11 +53012,19 @@ private:
 
         // PRICED ONLY WHEN IT CAN MATTER, and never while a refusal stands.
         auto const refused = _loneCrossingRefused.find(name);
+        // A REFUSED CROSSING STAYS REFUSED for LONE_CROSSING_REFUSAL_SECONDS or
+        // until the leader changes map (#1143), so the way does not flip
+        // between sail and refuse every quarter hour.
         bool const standingDown =
             refused != _loneCrossingRefused.end() &&
-            std::time(nullptr) - refused->second.first < time_t(LONE_CROSSING_STANDDOWN_SECONDS);
+            OverseerDecisions::RefusedCrossingStands(
+                std::time(nullptr), refused->second.first, _loneCrossingRefusedFor[name],
+                facts.leaderMap);
         if (refused != _loneCrossingRefused.end() && !standingDown)
+        {
             _loneCrossingRefused.erase(refused);
+            _loneCrossingRefusedFor.erase(name);
+        }
         std::string priced;
         if (split && !facts.aboard && !standingDown && facts.memberMap != facts.leaderMap)
         {
@@ -52809,7 +53040,8 @@ private:
         if (standingDown && way != OverseerDecisions::StrandedWay::Sail)
             why += "; its last boat home was refused (" + refused->second.second +
                    ") and is priced again within " +
-                   std::to_string(LONE_CROSSING_STANDDOWN_SECONDS / 60) + " minutes";
+                   std::to_string(OverseerDecisions::LONE_CROSSING_REFUSAL_SECONDS / 60) +
+                   " minutes, or sooner if its leader changes map";
         else if (!priced.empty() && way == OverseerDecisions::StrandedWay::Refuse)
             why += " (priced: " + priced + ")";
         // WHICH OWNER, not the list of three it might be (#1143).
@@ -53729,10 +53961,23 @@ private:
                 }
                 LOG_WARN("module.overseer",
                          "overseer: '{}' cannot sail from map {} to map {} - refused at '{}': "
-                         "{}. Its boat home is priced again in {} minutes",
+                         "{}. Its boat home is priced again in {} minutes, or sooner if its leader "
+                         "changes map",
                          name, origin, destination, OverseerDecisions::CrossingLegName(step.leg),
-                         why, LONE_CROSSING_STANDDOWN_SECONDS / 60);
+                         why, OverseerDecisions::LONE_CROSSING_REFUSAL_SECONDS / 60);
                 _loneCrossingRefused[name] = {std::time(nullptr), why};
+                {
+                    // THE LEADER'S MAP, read the way the poll reads it
+                    // (StrandedGoalOf), not the crossing's destination: the
+                    // poll compares this with facts.leaderMap, so the map
+                    // compared is the map written (#1143).
+                    float refusedGoalX = 0.f;
+                    float refusedGoalY = 0.f;
+                    _loneCrossingRefusedFor[name] =
+                        leader && leader->IsInWorld()
+                            ? StrandedGoalOf(leader, refusedGoalX, refusedGoalY).map
+                            : destination;
+                }
                 EndLoneCrossing(name, "its crossing is refused");
                 break;
 
@@ -65590,6 +65835,40 @@ private:
                << ',' << l.zoneId
                << ',' << l.guildId << ')';
         }
+        CharacterDatabase.Execute(ss.str().c_str());
+    }
+
+    // The finished hours of the realm tally (#1552), one multi-row upsert that adds
+    // to a row already written for the hour. `final` closes the open hour too, so
+    // a shutdown does not lose it. Same rule as FlushLevels: only this
+    // world-thread call touches the database, and a missing table costs counts,
+    // not the death.
+    void FlushRealmTally(bool final = false)
+    {
+        std::vector<OverseerDecisions::RealmTallyRow> rows;
+        {
+            std::lock_guard<std::mutex> guard(g_deathMutex);
+            std::int64_t const now = static_cast<std::int64_t>(std::time(nullptr));
+            rows = g_realmTally.Roll(final ? now + 3600 : now);
+        }
+        if (rows.empty())
+            return;
+        std::ostringstream ss;
+        ss << "INSERT INTO overseer_realm_hour (hour_start, level_band, zone, killer_entry, "
+              "managed, deaths, level_ups) VALUES ";
+        bool first = true;
+        for (OverseerDecisions::RealmTallyRow const& row : rows)
+        {
+            if (!first)
+                ss << ',';
+            first = false;
+            ss << "(FROM_UNIXTIME(" << row.hourStart << ")," << row.key.band << ','
+               << row.key.zone << ',' << row.key.killerEntry << ','
+               << (row.key.managed ? 1 : 0) << ',' << row.counts.deaths << ','
+               << row.counts.levelUps << ')';
+        }
+        ss << " ON DUPLICATE KEY UPDATE deaths = deaths + VALUES(deaths), "
+              "level_ups = level_ups + VALUES(level_ups)";
         CharacterDatabase.Execute(ss.str().c_str());
     }
 

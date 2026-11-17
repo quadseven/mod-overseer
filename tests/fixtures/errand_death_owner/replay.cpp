@@ -13,6 +13,16 @@ using namespace OverseerDecisions;
 
 // OWNER_KIND
 
+struct Book;
+Book* activeBook = nullptr;
+OverseerMovement::MovementOwnership& MovementOwner();
+void LogLeaderAsk(std::string const&, LeaderIntentKind, std::string const&,
+                  std::string const&, std::string const&,
+                  OverseerMovement::LeaderIntentSnapshot const&,
+                  LeaderIntentVerdict const&, time_t)
+{
+}
+
 // The column is the movement ownership module's in-memory adapter (#1312);
 // the real module decides whether a claim or a release writes.
 struct Book
@@ -28,15 +38,18 @@ struct Book
     unsigned persisted{0};
     OverseerMovement::InMemoryAimColumn column;
     OverseerMovement::MovementOwnership _wheel{column, 45};
-    bool allowIntent{true};
     std::map<std::string, std::string> _claimRefusalSaid, _aimTooLongSaid;
     LeaderIntentKind LeaderIntentNow(std::string const&) const { return LeaderIntentKind::None; }
-    bool AskForLeader(std::string const&, LeaderIntentKind, std::string const&,
-                      std::string const&, std::string const&) const { return allowIntent; }
     void EndLeaderColumnIntent(std::string const&, std::string const&) {}
     void KeepRefusal(std::string const&) { ++persisted; }
+    Book() { activeBook = this; }
     // BOOK_METHODS
 };
+
+OverseerMovement::MovementOwnership& MovementOwner()
+{
+    return activeBook->_wheel;
+}
 
 struct Adapter
 {
@@ -86,12 +99,10 @@ int main()
             claim();
             // The production cache can reuse an accepted claim without another
             // intent request; it must retain the previously recorded owner.
-            book.allowIntent = false;
             TravelOwner held = TravelOwner::TownTrip;
             Check(book.Claim("Leader", "vendor", owner) &&
                       book.ClaimedBy("Leader", "vendor", held) && held == owner,
                   "cached accepted claim retains owner", owner, active);
-            book.allowIntent = true;
             auto toll = a.Assemble("Leader", "vendor", false);
             toll.deaths = 3;
             bool const run = TravelOwnerIsALiveRun(owner);
@@ -144,7 +155,13 @@ int main()
         book.column.columns["Leader"] = refusal == 1 ? "banker" : "";
         auto const before = book.column.columns["Leader"];
         book.column.learnSkills["Leader"] = refusal == 2 ? 1 : 0;
-        book.allowIntent = refusal != 3;
+        if (refusal == 3)
+        {
+            book._wheel.ConfigureLeaderIntents(true, LeaderIntentLimits{});
+            book._wheel.SetLeaders({"Leader"});
+            book._wheel.AskForLeader("Leader", LeaderIntentKind::OperatorOrder,
+                                     "operator", "stay", "operator pin", std::time(nullptr));
+        }
         auto const aim = refusal == 0 ? std::string(33, 'x') : "vendor";
         TravelOwner held = TravelOwner::TownTrip;
         Check(!book.Claim("Leader", aim, TravelOwner::TownTrip) &&
