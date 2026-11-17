@@ -77123,6 +77123,10 @@ private:
             // The factory's own call, as RandomPlayerbotMgr::RandomizeFirst
             // makes it on a fresh random bot: gear for the level and the
             // class's spells for it, and nothing chosen by hand.
+            // natural-only: the one grant this module makes, and it is the operator's explicit
+            // override for a new test family: a `create-character` row that asks for a level above
+            // 1, refused unless Overseer.CreateCharacter.MaxLevel allows it (default 1). It reaches
+            // only the character that row just created, never an existing member.
             PlayerbotFactory factory(player, check.level);
             factory.Randomize(false);
             player->SaveToDB(false, false);
