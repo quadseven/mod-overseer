@@ -28703,4 +28703,47 @@ unsigned PickCreationAccount(std::vector<CreationAccount> const& accounts, unsig
     return best;
 }
 
+
+// ------------------------------------------------ create a bot account --
+
+bool IsCreateAccountRow(std::string const& command)
+{
+    std::vector<std::string> const words = RenameWords(command);
+    return !words.empty() && CreateLower(words[0]) == "create-account";
+}
+
+bool CreateAccountCommandOk(std::string const& command)
+{
+    std::vector<std::string> const words = RenameWords(command);
+    return words.size() == 1 && CreateLower(words[0]) == "create-account";
+}
+
+bool AccountNameValid(std::string const& name)
+{
+    if (name.size() < 2 || name.size() > 17)
+        return false;
+    for (char ch : name)
+        if (!std::isalnum(static_cast<unsigned char>(ch)))
+            return false;
+    return true;
+}
+
+CreateCharacterVerdict CreateAccountVerdictFor(CreateAccountFacts const& facts)
+{
+    auto refuse = [](char const* reason) { return CreateCharacterVerdict{CreateRoute::Refuse, reason}; };
+    if (!facts.switchOn)
+        return refuse("character creation is off (Overseer.CreateCharacter.Enable)");
+    if (!facts.commandOk)
+        return refuse("malformed create-account: want the one word create-account");
+    if (!facts.nameValid)
+        return refuse("an account name is 2 to 17 letters or digits");
+    if (facts.randomBotName)
+        return refuse("that is a random bot account name");
+    if (!facts.listed)
+        return refuse("the account is not named in Overseer.CreateCharacter.Accounts");
+    if (facts.exists)
+        return CreateCharacterVerdict{CreateRoute::AlreadyExists, ""};
+    return CreateCharacterVerdict{CreateRoute::Create, ""};
+}
+
 }  // namespace OverseerDecisions

@@ -71,6 +71,16 @@ int main()
     Check("a level above 1 goes through the factory", resolver.find("factory.Randomize(false)") != std::string::npos);
     Check("the resolver is polled", source.find("ResolveCreateChecks(sincePollMs);") != std::string::npos);
 
+    std::string const accountBody = Between(source, "char const* DoCreateAccount(", "char const* DoCreateCharacter(");
+    Check("the account verb body is found", !accountBody.empty());
+    Check("the account is made by the core", accountBody.find("sAccountMgr->CreateAccount(upper, password)") != std::string::npos);
+    Check("the password is never logged or returned",
+          accountBody.find("LOG_") != std::string::npos && accountBody.find("<< password") == std::string::npos &&
+              accountBody.find(", password)") == accountBody.rfind(", password)") &&
+              accountBody.find("J(password)") == std::string::npos);
+    Check("the account verb is routed before the character verb",
+          source.find("IsCreateAccountRow(command)") < source.find("IsCreateCharacterRow(command)"));
+
     for (char const* key : {"Overseer.CreateCharacter.Enable", "Overseer.CreateCharacter.Accounts",
                             "Overseer.CreateCharacter.SlotCap", "Overseer.CreateCharacter.MaxLevel"})
     {

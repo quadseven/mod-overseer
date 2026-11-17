@@ -185,6 +185,52 @@ void TheAccountChoice()
     Check("id 0 is never chosen", PickCreationAccount({{0, 0}}, 10) == 0);
 }
 
+
+void TheAccountVerb()
+{
+    Check("create-account is recognised", IsCreateAccountRow("create-account"));
+    Check("another word is not", !IsCreateAccountRow("create-character human warrior male alliance"));
+    Check("the command is the one word", CreateAccountCommandOk("create-account") && !CreateAccountCommandOk("create-account now") && !CreateAccountCommandOk("create-accounts"));
+    Check("a good name", AccountNameValid("JUG") && AccountNameValid("TUG2"));
+    Check("one letter is short", !AccountNameValid("J"));
+    Check("eighteen is long", !AccountNameValid("ABCDEFGHIJKLMNOPQR"));
+    Check("punctuation is refused", !AccountNameValid("JU G") && !AccountNameValid("JU;G"));
+
+    CreateAccountFacts f;
+    f.switchOn = true;
+    f.commandOk = true;
+    f.nameValid = true;
+    f.listed = true;
+    Check("a listed new account is created", CreateAccountVerdictFor(f).route == CreateRoute::Create);
+
+    CreateAccountFacts off = f;
+    off.switchOn = false;
+    Check("switch off", CreateAccountVerdictFor(off).route == CreateRoute::Refuse);
+
+    CreateAccountFacts bad = f;
+    bad.commandOk = false;
+    Check("a malformed command", CreateAccountVerdictFor(bad).route == CreateRoute::Refuse);
+
+    bad = f;
+    bad.nameValid = false;
+    Check("a bad name", CreateAccountVerdictFor(bad).route == CreateRoute::Refuse);
+
+    bad = f;
+    bad.randomBotName = true;
+    Check("a random bot account name", CreateAccountVerdictFor(bad).route == CreateRoute::Refuse);
+
+    bad = f;
+    bad.listed = false;
+    Check("an unlisted account is never invented", CreateAccountVerdictFor(bad).route == CreateRoute::Refuse);
+
+    CreateAccountFacts again = f;
+    again.exists = true;
+    Check("an existing account is a no-op", CreateAccountVerdictFor(again).route == CreateRoute::AlreadyExists);
+    again.listed = false;
+    Check("an existing account that was delisted still reads refused",
+          CreateAccountVerdictFor(again).route == CreateRoute::Refuse);
+}
+
 // Every end game family has a tank and a healer, and every name's race is of
 // its guild's faction. The rosters are the ones the tracking issue lists.
 struct Seat
@@ -249,6 +295,7 @@ int main()
     TheGates();
     TheLevel();
     TheAccountChoice();
+    TheAccountVerb();
     TheFamiliesFit();
     if (failures)
     {

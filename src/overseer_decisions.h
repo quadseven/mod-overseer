@@ -31074,6 +31074,33 @@ struct CreationAccount
 // characters that is still under `cap`, the lowest id on a tie. 0 for none.
 unsigned PickCreationAccount(std::vector<CreationAccount> const& accounts, unsigned cap);
 
+
+// ------------------------------------------------ create a bot account (2026-11-17) --
+// A DEDICATED ACCOUNT FOR A NEW FAMILY, WITHOUT A CONSOLE. The worldserver has
+// no interactive console and its remote console stays off, so an account is
+// made in process: `create-account`, kind='job', the row's target_name being
+// the account name. It is made only for a name listed in
+// Overseer.CreateCharacter.Accounts, so a row cannot invent an arbitrary
+// account, and its password is random, made in process and never stored,
+// logged or returned: nobody can log in to it, and a client login, if one is
+// ever wanted, starts from a reset by whoever holds that authority.
+bool IsCreateAccountRow(std::string const& command);
+bool AccountNameValid(std::string const& name);
+// The command is exactly the one word, with nothing after it.
+bool CreateAccountCommandOk(std::string const& command);
+
+struct CreateAccountFacts
+{
+    bool switchOn{false};      // Overseer.CreateCharacter.Enable
+    bool commandOk{false};     // the command is exactly `create-account`
+    bool nameValid{false};     // letters and digits, 2 to 17
+    bool listed{false};        // named in Overseer.CreateCharacter.Accounts
+    bool exists{false};        // an account of that name already exists
+    bool randomBotName{false}; // it starts with the random bot account prefix
+};
+
+CreateCharacterVerdict CreateAccountVerdictFor(CreateAccountFacts const& facts);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

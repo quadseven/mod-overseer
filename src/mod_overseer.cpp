@@ -67079,6 +67079,9 @@ private:
                 // target may be offline, and when it is online it is logged
                 // out before anything is done to it (see DoNaturalize).
                 detail = DoNaturalize(targetName, command, id, status, rowResult);
+            else if (kind == "job" && OverseerDecisions::IsCreateAccountRow(command))
+                // A DEDICATED BOT ACCOUNT (2026-11-17), listed accounts only; see DoCreateAccount.
+                detail = DoCreateAccount(targetName, command, status, rowResult);
             else if (kind == "job" && OverseerDecisions::IsCreateCharacterRow(command))
                 // A CREATE (2026-11-17): the target is the NEW character's name, so it is
                 // routed before the online test, and an existing name answers `exists`.
@@ -76942,6 +76945,81 @@ private:
             accounts.push_back(account);
         }
         return accounts;
+    }
+
+    // ROW: `create-account`, target_name the account name. Made in process
+    // with the core's AccountMgr::CreateAccount, the call the random bot
+    // factory makes for its own accounts, only for a name listed in
+    // Overseer.CreateCharacter.Accounts. THE PASSWORD IS RANDOM, MADE HERE AND
+    // NEVER STORED, LOGGED OR RETURNED: the row's result carries the account
+    // name and nothing else, so nobody can log in to the account. The account
+    // is written through the login database's async queue, so a
+    // create-character row sent in the same second may still find no account;
+    // it is refused with `no listed bot account has a free character slot` and
+    // is simply sent again.
+    char const* DoCreateAccount(std::string const& targetName, std::string const& command, char const*& status,
+                                std::string& out)
+    {
+        std::string upper = targetName;
+        for (char& ch : upper)
+            ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+
+        OverseerDecisions::CreateAccountFacts facts;
+        facts.switchOn = CreateEnabled();
+        facts.commandOk = OverseerDecisions::CreateAccountCommandOk(command);
+        facts.nameValid = OverseerDecisions::AccountNameValid(upper);
+        facts.randomBotName = upper.rfind("RNDBOT", 0) == 0;
+        for (std::string const& listed : CreateAccountNames())
+        {
+            std::string name = listed;
+            for (char& ch : name)
+                ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            if (name == upper)
+                facts.listed = true;
+        }
+        if (facts.nameValid)
+            facts.exists = bool(LoginDatabase.Query("SELECT id FROM account WHERE username = '{}'", upper));
+
+        OverseerDecisions::CreateCharacterVerdict const verdict = OverseerDecisions::CreateAccountVerdictFor(facts);
+        std::ostringstream o;
+        if (verdict.route == OverseerDecisions::CreateRoute::Refuse)
+        {
+            o << "{\"outcome\":\"refused\",\"reason\":" << J(verdict.reason) << ",\"account\":" << J(upper) << '}';
+            out = o.str();
+            LOG_WARN("module.overseer", "overseer: create-account '{}' refused: {}", upper, verdict.reason);
+            return verdict.reason;
+        }
+        if (verdict.route == OverseerDecisions::CreateRoute::AlreadyExists)
+        {
+            o << "{\"outcome\":\"exists\",\"account\":" << J(upper) << "}";
+            out = o.str();
+            LOG_INFO("module.overseer", "overseer: create-account '{}' already exists - no-op", upper);
+            status = "applied";
+            return "";
+        }
+
+        // A long random password nobody sees: 40 characters from a
+        // cryptographic source, which is never copied anywhere.
+        static char const alphabet[] = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        std::random_device entropy;
+        std::string password;
+        for (int i = 0; i < 40; ++i)
+            password += alphabet[entropy() % (sizeof(alphabet) - 1)];
+        AccountOpResult const made = sAccountMgr->CreateAccount(upper, password);
+        std::fill(password.begin(), password.end(), '\0');
+        if (made != AOR_OK)
+        {
+            o << "{\"outcome\":\"refused\",\"reason\":\"the core refused the account\",\"account\":" << J(upper) << '}';
+            out = o.str();
+            LOG_WARN("module.overseer", "overseer: create-account '{}' refused by the core", upper);
+            return "the core refused the account";
+        }
+        LOG_INFO("module.overseer", "overseer: create-account '{}' made; its password is random and is not kept",
+                 upper);
+        o << "{\"outcome\":\"created\",\"account\":" << J(upper) << "}";
+        out = o.str();
+        status = "applied";
+        return "";
     }
 
     char const* DoCreateCharacter(std::string const& targetName, std::string const& command, uint32 id,
