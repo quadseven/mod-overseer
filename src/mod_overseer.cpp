@@ -47350,6 +47350,13 @@ private:
         // takes off exactly those; and the members that refused one, said once.
         std::map<std::string, std::vector<std::string>> tactics;
         std::set<std::string> tacticsRefused;
+        // THE LEND BOUND (OverseerDecisions::LendBoundDue): the members this
+        // run took from their families through the family-seat path, and the
+        // ones it has released back after the bound. A released member is no
+        // longer the run's: it is not busy (InAGuildRun) and the run's poll
+        // does not count it.
+        std::set<std::string> lent;
+        std::set<std::string> released;
         // THE DOOR AND THE REST (OverseerDecisions::GuildRunEnterTogether and
         // GuildRunHoldNext): how many ghosts were last said to wait at the
         // door, how many were walked or waiting this poll, whether this run
@@ -47533,9 +47540,51 @@ private:
     bool InAGuildRun(std::string const& name) const
     {
         for (GuildRun const& run : _guildRuns)
-            if (std::find(run.names.begin(), run.names.end(), name) != run.names.end())
+            if (std::find(run.names.begin(), run.names.end(), name) != run.names.end() &&
+                !run.released.count(name))
                 return true;
         return false;
+    }
+
+    // Overseer.GuildRun.LendBoundSeconds (default LEND_BOUND_SECONDS; 0 turns
+    // the bound off): how long a guild run may keep a lent family member.
+    static uint32 GuildRunLendBoundSeconds()
+    {
+        // Silent: the key is unset on a realm that keeps the default, and this
+        // is read on every poll of a run with a lent member.
+        return sConfigMgr->GetOption<uint32>("Overseer.GuildRun.LendBoundSeconds",
+                                             OverseerDecisions::LEND_BOUND_SECONDS, false);
+    }
+
+    // THE LEND BOUND: a lent member past the bound leaves the run's group the
+    // way a player types /leave (the finder teleports a member out of its
+    // dungeon), and the family has it back: InAGuildRun stops naming it, so the
+    // one-group rule (KeepRosterGrouped) takes it home. The run goes on without
+    // it, or ends by its own verdict when it was the tank or healer.
+    void ReleaseLentGuildRunMembers(GuildRun& run, std::time_t now)
+    {
+        if (run.phase == GuildRunPhase::Leaving)
+            return;
+        for (std::string const& name : run.lent)
+        {
+            if (run.released.count(name) ||
+                !OverseerDecisions::LendBoundDue(true, run.queuedAt, now,
+                                                 GuildRunLendBoundSeconds()))
+                continue;
+            Player* const p = ObjectAccessor::FindPlayerByName(name);
+            if (p && p->IsInWorld())
+            {
+                Group* const group = p->GetGroup();
+                if (group && group->GetGUID().GetRawValue() == run.groupGuid)
+                    p->RemoveFromGroup(GROUP_REMOVEMETHOD_LEAVE);
+                if (p->GetGroup() && p->GetGroup()->GetGUID().GetRawValue() == run.groupGuid)
+                    continue;  // the core kept it; ask again next poll
+            }
+            run.released.insert(name);
+            LOG_INFO("module.overseer",
+                     "overseer: guild run {}: lent member '{}' released after {}s (bound)",
+                     run.id, name, static_cast<long long>(now - run.queuedAt));
+        }
     }
 
     // Does `p` stand in its own family's party: a group the core does not own
@@ -48005,6 +48054,8 @@ private:
 
         GuildRun run;
         run.id = id;
+        for (auto const& loan : lent)
+            run.lent.insert(loan.first->GetName());
         run.tank = tankName;
         run.names = names;
         run.carried = request.carried;
@@ -49171,6 +49222,7 @@ private:
 
     bool DriveGuildRun(GuildRun& run, std::time_t now)
     {
+        ReleaseLentGuildRunMembers(run, now);
         // An adopted carried member that was not in the world at adoption
         // takes the row's lease back on the poll it is (#1363).
         if (run.carrySaved.saved && SeedGuildCarryLease(run.carried, run.id, run.carrySaved))
@@ -49292,13 +49344,15 @@ private:
         if (run.phase == GuildRunPhase::Inside)
         {
             OverseerDecisions::GuildRunPoll poll;
-            poll.groupSize = static_cast<unsigned>(run.names.size());
+            poll.groupSize = static_cast<unsigned>(run.names.size() - run.released.size());
             poll.tankAliveInside = false;
             poll.healerAliveInside = false;
             Map* instanceMap = nullptr;
             for (std::size_t i = 0; i < run.names.size(); ++i)
             {
                 std::string const& name = run.names[i];
+                if (run.released.count(name))
+                    continue;  // lent past the bound: no longer the run's
                 Player* const p = ObjectAccessor::FindPlayerByName(name);
                 if (!p || !p->IsInWorld())
                     continue;

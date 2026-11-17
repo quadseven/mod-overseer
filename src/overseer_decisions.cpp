@@ -26127,6 +26127,13 @@ std::vector<DcArmingSubject> DcArmingSubjects(
     return subjects;
 }
 
+bool LendBoundDue(bool lent, std::int64_t startedAt, std::int64_t now, unsigned bound)
+{
+    if (!lent || bound == 0 || startedAt <= 0 || now < startedAt)
+        return false;
+    return now - startedAt > static_cast<std::int64_t>(bound);
+}
+
 bool CountsAsInADungeonRun(bool onDungeonMap, bool activeRunOnMap, bool namedByAGuildRun)
 {
     return onDungeonMap && (activeRunOnMap || namedByAGuildRun);

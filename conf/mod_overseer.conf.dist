@@ -748,3 +748,17 @@
 #        Default:     0
 #
 #Overseer.ShareRetention.Enable = 0
+
+#
+#    Overseer.GuildRun.LendBoundSeconds
+#        Description: How long a guild run (a bot guild's five-man formed from
+#                     guild chat and queued through the dungeon finder) may
+#                     keep a family member lent to it through the family-seat
+#                     path, counted from the run's start. Past it the member
+#                     leaves the run's group and its family has it back; the
+#                     run goes on without it, or ends by its own verdict when
+#                     it was the tank or healer. 0 turns the bound off.
+#
+#        Default:     2700 (45 minutes)
+#
+#Overseer.GuildRun.LendBoundSeconds = 2700

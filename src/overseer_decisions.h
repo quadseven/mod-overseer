@@ -28791,6 +28791,19 @@ bool SitsOutOfRuns(FamilyStandin const* standin, std::string const& name);
 // group, so the family's run table has nothing to say about it.
 bool MayOpenRunFor(bool sittingOut, bool lentToAGuildRun);
 
+// THE LEND BOUND. A family member lent to a guild run (the family-seat path)
+// was the run's until the run ended, with no limit: a family's only healer
+// stayed out for up to 2.5 hours and its dungeon queue waited for it. The run
+// lives in module memory, so the module bounds it: past LEND_BOUND_SECONDS from
+// the run's start (conf Overseer.GuildRun.LendBoundSeconds) a lent member is
+// released from the run's group and its family has it back.
+constexpr unsigned LEND_BOUND_SECONDS = 45 * 60;
+
+// Is a lent member due back? Only a lent member; strictly more than `bound`
+// seconds after `startedAt`; a bound of 0, an unset start or a clock behind
+// the start never release (fail closed: the run keeps its member).
+bool LendBoundDue(bool lent, std::int64_t startedAt, std::int64_t now, unsigned bound);
+
 // WHO THE ARMING DRIVE ISSUES `dc on` TO: every enabled roster character, and
 // every guest a frozen stand-in seats (2026-11-05). The CLEARING census counts
 // the run's party, guest included (RunParty), and holds its stall clock until
