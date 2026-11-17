@@ -49,7 +49,7 @@ int main()
     std::string const text((std::istreambuf_iterator<char>(source)),
                            std::istreambuf_iterator<char>());
 
-    std::string const walk = BodyOf(text, "static char const* DoWalk(Player* who,");
+    std::string const walk = BodyOf(text, "char const* DoWalk(Player* who,");
     if (walk.empty())
         return Fail("cannot find DoWalk");
     std::size_t const rule = walk.find("D::SupplyWalkReleasesSickHold(");

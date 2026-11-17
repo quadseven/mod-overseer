@@ -22084,6 +22084,20 @@ std::vector<uint32_t> ClassSpellsToBuyThisPass(std::vector<ClassSpellOffer> offe
 // never past CLASS_LEARN_MAX_PASSES passes in all.
 bool ClassWalkReadsAgain(uint32_t pass, uint32_t boughtThisPass);
 
+// A class trainer another map can serve after a safe crossing. The crossing
+// price includes the walk to the transport, its ride, and the landing walk.
+struct ClassTrainerWalkOption
+{
+    uint32_t mapId{0};
+    uint32_t spawnId{0};
+    float routeYards{0.f};
+    bool reachable{false};
+};
+
+// Select the cheapest reachable option, breaking ties by map and spawn id.
+// Returns -1 when every trainer is unreachable or has invalid route distance.
+int PickReachableClassTrainer(std::vector<ClassTrainerWalkOption> const& options);
+
 struct VendorWalkRequest
 {
     uint32_t item{0};
@@ -22150,6 +22164,8 @@ constexpr char const* NoClassTrainerOnMap = "no trainer of this character's clas
 // it a spell now.
 constexpr char const* NoClassSpellTrainerOnMap =
     "no trainer of this character's class on this map has a class spell to teach it now";
+constexpr char const* NoReachableClassSpellTrainer =
+    "no trainer of this character's class with a class spell to teach it is reachable by a safe crossing";
 }  // namespace ErrandWalkRefusal
 
 // The refusal a walk to `goal` gives where the mailbox walk gives `mailboxWall`.

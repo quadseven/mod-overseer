@@ -62,6 +62,7 @@
     {"family": "errand", "outcome": "refused", "reason": "the character cannot afford the talent reset", "retryable": true, "transient": false},
     {"family": "errand", "outcome": "refused", "reason": "no trainer of this character's class on this map resets talents", "retryable": false, "transient": false},
     {"family": "errand", "outcome": "refused", "reason": "no trainer of this character's class on this map has a class spell to teach it now", "retryable": false, "transient": false},
+    {"family": "errand", "outcome": "refused", "reason": "no trainer of this character's class with a class spell to teach it is reachable by a safe crossing", "retryable": false, "transient": false},
     {"family": "spawn", "outcome": "refused", "reason": "malformed walk-to-spawn command", "retryable": false, "transient": false},
     {"family": "spawn", "outcome": "refused", "reason": "no such spawn in the world", "retryable": false, "transient": false},
     {"family": "spawn", "outcome": "refused", "reason": "the spawn is on another map than the character", "retryable": false, "transient": false},

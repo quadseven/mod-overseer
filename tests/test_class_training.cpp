@@ -25,6 +25,7 @@
 #include <vector>
 
 using OverseerDecisions::ClassSpellOffer;
+using OverseerDecisions::ClassTrainerWalkOption;
 using OverseerDecisions::CLASS_LEARN_MAX_PASSES;
 using OverseerDecisions::ClassSpellsToBuy;
 using OverseerDecisions::ClassSpellsToBuyThisPass;
@@ -32,6 +33,7 @@ using OverseerDecisions::ClassWalkReadsAgain;
 using OverseerDecisions::ErrandWalkRefusalRetryable;
 using OverseerDecisions::JudgeTrainerVisit;
 using OverseerDecisions::ParseTrainerWalkRequest;
+using OverseerDecisions::PickReachableClassTrainer;
 using OverseerDecisions::TrainerVisitFacts;
 using OverseerDecisions::TrainerVisitOutcome;
 using OverseerDecisions::TrainerWalkRequest;
@@ -159,6 +161,26 @@ void TheVerdict()
     Check("a purse short at the trainer is worth asking again", ErrandWalkRefusalRetryable(E::TaughtNothing));
     Check("a map with no class trainer to teach it is not",
           !ErrandWalkRefusalRetryable(E::NoClassSpellTrainerOnMap));
+    Check("no reachable class trainer is not retryable",
+          !ErrandWalkRefusalRetryable(E::NoReachableClassSpellTrainer));
+}
+
+void ReachableClassTrainer()
+{
+    std::vector<ClassTrainerWalkOption> const options = {
+        {0, 21, 350.f, false},
+        {1, 8, 900.f, true},
+        {1, 5, 900.f, true},
+        {530, 2, 100.f, false},
+    };
+    Check("a class trainer on a reachable map can be selected",
+          PickReachableClassTrainer(options) == 2);
+    Check("no reachable class trainer leaves no selection",
+          PickReachableClassTrainer({{530, 2, 100.f, false}}) == -1);
+    Check("an invalid route cost is never reachable",
+          PickReachableClassTrainer({{1, 9, -1.f, true}}) == -1);
+    Check("a missing spawn is never selected",
+          PickReachableClassTrainer({{1, 0, 1.f, true}}) == -1);
 }
 
 // ONE VISIT, EVERY RANK (wow-overseer#792). A model of the core's trainer
@@ -306,6 +328,18 @@ void TheAdapterIsWired()
     has("the result says it was a class walk", "\",\\\"class\\\":true,\\\"offered\\\":\"");
     has("a map with no class trainer says so for a class walk",
         "reason = D::ErrandWalkRefusal::NoClassSpellTrainerOnMap;");
+    has("remote class trainers are ranked by the crossing price",
+        "PriceCrossingTransports(\n                    who, ev.mapId, data.mapid");
+    has("a guarded berth cannot make a remote trainer reachable",
+        "reachable = from.berthKnown &&\n                                !BerthIsGuarded");
+    has("the original walk resumes after the crossing",
+        "walkDetail = DoWalk(p, classTrainerCommand,");
+    has("the selected remote spawn stays the walk target",
+        "walkResult, _pendingMailWalks, row, classTrainerSpawn);");
+    has("the final crossing aims at the selected class trainer",
+        "memo.classTrainerMap == memo.crossingDestinationMap");
+    has("no reachable class trainer has a permanent refusal",
+        "D::ErrandWalkRefusal::NoReachableClassSpellTrainer");
 }
 
 }  // namespace
@@ -315,6 +349,7 @@ int main()
     TheGrammar();
     ThePurse();
     TheVerdict();
+    ReachableClassTrainer();
     OneVisitEveryRank();
     TheAdapterIsWired();
     if (failures)

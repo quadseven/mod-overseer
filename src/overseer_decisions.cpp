@@ -19818,6 +19818,30 @@ bool ClassWalkReadsAgain(uint32_t pass, uint32_t boughtThisPass)
     return boughtThisPass > 0 && pass + 1 < CLASS_LEARN_MAX_PASSES;
 }
 
+int PickReachableClassTrainer(std::vector<ClassTrainerWalkOption> const& options)
+{
+    int picked = -1;
+    for (std::size_t i = 0; i < options.size(); ++i)
+    {
+        ClassTrainerWalkOption const& option = options[i];
+        if (!option.reachable || !option.spawnId || !(option.routeYards >= 0.f) ||
+            !std::isfinite(option.routeYards))
+            continue;
+        if (picked < 0)
+        {
+            picked = static_cast<int>(i);
+            continue;
+        }
+        ClassTrainerWalkOption const& best = options[static_cast<std::size_t>(picked)];
+        if (option.routeYards < best.routeYards ||
+            (option.routeYards == best.routeYards &&
+             (option.mapId < best.mapId ||
+              (option.mapId == best.mapId && option.spawnId < best.spawnId))))
+            picked = static_cast<int>(i);
+    }
+    return picked;
+}
+
 VendorWalkRequest ParseVendorWalkRequest(std::string const& command)
 {
     VendorWalkRequest request;
@@ -20682,6 +20706,7 @@ std::vector<WalkRefusalRow> const& WalkRefusalCatalogue()
         {"errand", E::TalentsCannotAfford, false, false},
         {"errand", E::NoClassTrainerOnMap, false, false},
         {"errand", E::NoClassSpellTrainerOnMap, false, false},
+        {"errand", E::NoReachableClassSpellTrainer, false, false},
         {"spawn", S::MalformedSpawn, false, false},
         {"spawn", S::NoSuchSpawn, false, false},
         {"spawn", S::SpawnOtherMap, false, false},
