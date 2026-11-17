@@ -26717,8 +26717,14 @@ GuildRunRearmStep GuildRunRearmNext(GuildRunRearmFacts const& facts);
 // gives Rearm while `waitRearmsUsed` is under `maximumWaitRearms`, the family
 // coordinator's budget (#1308). The one stop that means the module finished,
 // "All bosses cleared!" (DungeonModuleStopIsCleared), gives EndComplete: the
-// run ends complete, as a family run does (#1328), not stalled (#1331). Every
-// other stop gives EndWithReason: the run stops asking and ends with
+// run ends complete, as a family run does (#1328), not stalled (#1331). But
+// only when the instance mask does not contradict it (#1587, the family rule
+// DungeonModuleStopProvesComplete of #1514): the module counts its own boss
+// list, which can be shorter than what the run expects (GuildRunExpectedMask),
+// so with `completion` NotYet that stop gives EndWithReason and the run ends
+// stalled with the module's reason. Unknowable (a map that credits nothing, or
+// masks not read) has no mask to contradict it, so the module's count stands.
+// Every other stop gives EndWithReason: the run stops asking and ends with
 // GuildRunModuleStopWhy.
 constexpr unsigned GUILD_RUN_WAIT_REARMS = 3;
 
@@ -26731,6 +26737,7 @@ enum class GuildRunModuleStopStep : std::uint8_t
 
 GuildRunModuleStopStep GuildRunArmAfterModuleStop(std::string const& stopReason,
                                                   unsigned waitRearmsUsed,
+                                                  DungeonCompletion completion,
                                                   unsigned maximumWaitRearms = GUILD_RUN_WAIT_REARMS);
 
 // The `why` of a run ended on EndWithReason: the module's words
