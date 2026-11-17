@@ -53856,7 +53856,18 @@ private:
                          name, origin, destination, OverseerDecisions::CrossingLegName(step.leg),
                          why, OverseerDecisions::LONE_CROSSING_REFUSAL_SECONDS / 60);
                 _loneCrossingRefused[name] = {std::time(nullptr), why};
-                _loneCrossingRefusedFor[name] = destination;
+                {
+                    // THE LEADER'S MAP, read the way the poll reads it
+                    // (StrandedGoalOf), not the crossing's destination: the
+                    // poll compares this with facts.leaderMap, so the map
+                    // compared is the map written (#1143).
+                    float refusedGoalX = 0.f;
+                    float refusedGoalY = 0.f;
+                    _loneCrossingRefusedFor[name] =
+                        leader && leader->IsInWorld()
+                            ? StrandedGoalOf(leader, refusedGoalX, refusedGoalY).map
+                            : destination;
+                }
                 EndLoneCrossing(name, "its crossing is refused");
                 break;
 

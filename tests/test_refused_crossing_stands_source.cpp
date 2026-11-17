@@ -26,7 +26,7 @@ int main()
                            std::istreambuf_iterator<char>());
 
     for (char const* needed :
-         {"OverseerDecisions::RefusedCrossingStands(", "_loneCrossingRefusedFor[name] = destination",
+         {"OverseerDecisions::RefusedCrossingStands(", "_loneCrossingRefusedFor[name] =", "StrandedGoalOf(leader, refusedGoalX, refusedGoalY).map",
           "_loneCrossingRefusedFor[name],\n                facts.leaderMap)"})
         if (text.find(needed) == std::string::npos)
         {
