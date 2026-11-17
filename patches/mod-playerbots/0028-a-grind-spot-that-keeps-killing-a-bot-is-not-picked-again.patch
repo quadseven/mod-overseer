@@ -1,0 +1,245 @@
+Subject: [PATCH] playerbots: a grind spot that keeps killing a bot is not picked again
+
+WHY THIS PATCH EXISTS
+
+NewRpgBaseAction::SelectRandomGrindPos picks any cached grind spot of the bot's
+level inside 2500 yards, and nothing it has done before is remembered. A bot
+that dies on a spot therefore goes straight back to it, and to the road to it.
+
+Measured on the dev realm over three days from overseer_death, for the 37
+guild lineup characters below level 50 that run on this picker (88 percent of
+their deaths are ungrouped, out of any dungeon, with the bot on its own
+autonomous status): 2,386 overworld deaths, of which 1,175 (49 percent) were
+within 150 yards of an earlier death of the same character in the preceding six
+hours, 678 (28 percent) had two or more such earlier deaths, and 415 (17
+percent) had three or more. One level 35 character died 45 times inside a
+single 100 yard square on the road past a hostile capital's guards (level 75),
+roughly hourly, and another 27 times at a hostile outpost. Their zones are not
+the problem: the killers' mean level was the character's own.
+
+WHAT IT DOES
+
+NewRpgInfo gains a NewRpgDeathMemory: where this bot died, in memory, newest 24
+kept, six hours long. AutoReleaseSpiritAction and ReleaseSpiritAction record
+the spot through IncrementDeathCount (battleground deaths are skipped there
+already). Two deaths within 150 yards make that ground hot for this bot.
+SelectRandomGrindPos skips a spot that is on hot ground, or whose straight line
+from the bot passes within 100 yards of it (a bot standing on hot ground is
+only refused spots on it, so it can walk out). Only when that leaves no spot at
+all is the rule dropped, so the memory never strands a bot. No bot is moved by
+anything but its own pick, and no XP, level, gold or item is granted.
+
+WHAT IT DOES NOT DO
+
+It does not touch quest points, camps or wander picks, and the straight line is
+an approximation of the road. A restart forgets the memory.
+
+WHAT WOULD LET THIS PATCH BE DELETED
+
+An upstream grind picker that weighs recent deaths, or that avoids ground
+guarded by creatures hostile to the bot's team.
+
+APPLIES TO
+
+  repo: https://github.com/quadseven/mod-playerbots.git
+  SHA:  40884e9c135c1daf27ffd894a6047502a5701130 (the pin), after patches
+        0001 to 0027 of this directory. It touches NewRpgInfo.h,
+        NewRpgBaseAction.cpp (SelectRandomGrindPos) and ReleaseSpiritAction.cpp
+        (IncrementDeathCount).
+
+diff --git a/src/Ai/Base/Actions/ReleaseSpiritAction.cpp b/src/Ai/Base/Actions/ReleaseSpiritAction.cpp
+index 79a806d4..bc85faf7 100644
+--- a/src/Ai/Base/Actions/ReleaseSpiritAction.cpp
++++ b/src/Ai/Base/Actions/ReleaseSpiritAction.cpp
+@@ -63,6 +63,9 @@ void ReleaseSpiritAction::IncrementDeathCount() const
+     if (bot->InBattleground())
+         return;
+ 
++    // Remember where, so the grind picker can steer clear of ground that keeps killing this bot.
++    botAI->rpgInfo.deaths.Record(bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(), time(nullptr));
++
+     // Death Count to prevent skeleton piles
+     Player* master = botAI->GetMaster();
+     if (!master || GET_PLAYERBOT_AI(master))
+diff --git a/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp b/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
+index ef0ea079..6f404d32 100644
+--- a/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
++++ b/src/Ai/World/Rpg/Action/NewRpgBaseAction.cpp
+@@ -1110,33 +1110,49 @@ WorldPosition NewRpgBaseAction::SelectRandomGrindPos(Player* bot)
+             inCity = true;
+     }
+ 
++    // Ground this bot has died on twice lately is skipped (NewRpgDeathMemory).
++    // Only when that leaves no spot at all is the rule dropped, so the memory
++    // can never leave a bot with nothing to pick.
++    NewRpgDeathMemory const* deaths = nullptr;
++    if (PlayerbotAI* ownAI = GET_PLAYERBOT_AI(bot))
++        deaths = &ownAI->rpgInfo.deaths;
++    time_t const now = time(nullptr);
++
+     // A bot standing in a zone that caches no grind spot (open sea, a strait)
+     // has nothing to pick if it may only pick from its own zone, and the
+     // caller then sits it down for good. The second pass lets it pick the
+     // nearest spot in any zone of its map so it can swim to shore.
+-    for (int pass = 0; pass < 2 && lo_prepared_locs.empty(); ++pass)
++    for (int avoidPass = 0; avoidPass < 2 && lo_prepared_locs.empty(); ++avoidPass)
+     {
+-        bool const sameZoneOnly = !inCity && pass == 0;
+-        for (auto& loc : locs)
++        for (int pass = 0; pass < 2 && lo_prepared_locs.empty(); ++pass)
+         {
+-            if (bot->GetMapId() != loc.GetMapId())
+-                continue;
++            bool const sameZoneOnly = !inCity && pass == 0;
++            for (auto& loc : locs)
++            {
++                if (bot->GetMapId() != loc.GetMapId())
++                    continue;
+ 
+-            if (bot->GetExactDist(loc) > 2500.0f)
+-                continue;
++                if (bot->GetExactDist(loc) > 2500.0f)
++                    continue;
+ 
+-            if (sameZoneOnly && bot->GetMap()->GetZoneId(bot->GetPhaseMask(), loc.GetPositionX(),
+-                                                         loc.GetPositionY(), loc.GetPositionZ()) != bot->GetZoneId())
+-                continue;
++                if (avoidPass == 0 && deaths &&
++                    deaths->Avoids(bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(), loc.GetPositionX(),
++                                   loc.GetPositionY(), now))
++                    continue;
+ 
+-            if (bot->GetExactDist(loc) < hiRange)
+-            {
+-                hi_prepared_locs.push_back(loc);
+-            }
++                if (sameZoneOnly && bot->GetMap()->GetZoneId(bot->GetPhaseMask(), loc.GetPositionX(),
++                                                             loc.GetPositionY(), loc.GetPositionZ()) != bot->GetZoneId())
++                    continue;
+ 
+-            if (bot->GetExactDist(loc) < loRange)
+-            {
+-                lo_prepared_locs.push_back(loc);
++                if (bot->GetExactDist(loc) < hiRange)
++                {
++                    hi_prepared_locs.push_back(loc);
++                }
++
++                if (bot->GetExactDist(loc) < loRange)
++                {
++                    lo_prepared_locs.push_back(loc);
++                }
+             }
+         }
+     }
+diff --git a/src/Ai/World/Rpg/NewRpgInfo.h b/src/Ai/World/Rpg/NewRpgInfo.h
+index 302b05bf..7ba86c29 100644
+--- a/src/Ai/World/Rpg/NewRpgInfo.h
++++ b/src/Ai/World/Rpg/NewRpgInfo.h
+@@ -7,6 +7,8 @@
+ #ifndef PLAYERBOTS_NEWRPGINFO_H
+ #define PLAYERBOTS_NEWRPGINFO_H
+ 
++#include <cmath>
++#include <ctime>
+ #include <unordered_set>
+ 
+ #include "Define.h"
+@@ -19,6 +21,87 @@
+ 
+ using NewRpgStatusTransitionProb = std::vector<std::vector<int>>;
+ 
++// Where this bot died lately, so a grind spot that keeps killing it is not
++// picked again. Two deaths within kRadius yards inside kWindow seconds make
++// that ground "hot" for this bot; a hot spot, or a spot whose straight line
++// from the bot passes through hot ground, is skipped while any other spot
++// exists. In memory only: a restart forgets it, which is harmless.
++struct NewRpgDeathMemory
++{
++    struct Mark
++    {
++        uint32 map{0};
++        float x{0}, y{0};
++        time_t at{0};
++    };
++
++    static constexpr time_t kWindow = 6 * 60 * 60;
++    static constexpr float kRadius = 150.0f;
++    static constexpr float kRouteRadius = 100.0f;
++    static constexpr size_t kHot = 2;
++    static constexpr size_t kCap = 24;
++
++    std::vector<Mark> marks;
++
++    void Record(uint32 map, float x, float y, time_t now)
++    {
++        std::vector<Mark> kept;
++        for (Mark const& m : marks)
++            if (now - m.at < kWindow)
++                kept.push_back(m);
++        kept.push_back(Mark{map, x, y, now});
++        if (kept.size() > kCap)
++            kept.erase(kept.begin(), kept.begin() + (kept.size() - kCap));
++        marks = std::move(kept);
++    }
++
++    static float Dist2d(float ax, float ay, float bx, float by)
++    {
++        return std::sqrt((ax - bx) * (ax - bx) + (ay - by) * (ay - by));
++    }
++
++    // Distance from point p to the segment a-b.
++    static float SegmentDist(float px, float py, float ax, float ay, float bx, float by)
++    {
++        float const dx = bx - ax, dy = by - ay;
++        float const len2 = dx * dx + dy * dy;
++        float t = len2 > 0.0f ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0.0f;
++        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
++        return Dist2d(px, py, ax + t * dx, ay + t * dy);
++    }
++
++    bool IsHot(Mark const& m, time_t now) const
++    {
++        if (now - m.at >= kWindow)
++            return false;
++        size_t near = 0;
++        for (Mark const& o : marks)
++            if (o.map == m.map && now - o.at < kWindow && Dist2d(o.x, o.y, m.x, m.y) <= kRadius)
++                ++near;
++        return near >= kHot;
++    }
++
++    // True when walking from (fx, fy) to (tx, ty) on `map` ends on, or crosses,
++    // ground this bot has died on twice lately. A bot that already stands on
++    // the hot ground is not refused the way out of it: only the end spot is
++    // tested for that mark.
++    bool Avoids(uint32 map, float fx, float fy, float tx, float ty, time_t now) const
++    {
++        for (Mark const& m : marks)
++        {
++            if (m.map != map || !IsHot(m, now))
++                continue;
++            if (Dist2d(m.x, m.y, tx, ty) <= kRadius)
++                return true;
++            if (Dist2d(m.x, m.y, fx, fy) <= kRouteRadius)
++                continue;
++            if (SegmentDist(m.x, m.y, fx, fy, tx, ty) <= kRouteRadius)
++                return true;
++        }
++        return false;
++    }
++};
++
+ struct NewRpgInfo
+ {
+     NewRpgInfo() : data(Idle{}) {}
+@@ -103,6 +186,9 @@ struct NewRpgInfo
+ 
+     uint32 startT{0};  // start timestamp of the current status
+ 
++    // Survives Reset() and every status change: it is about the bot, not the status.
++    NewRpgDeathMemory deaths;
++
+     // MOVE_FAR
+     float nearestMoveFarDis{FLT_MAX};
+     uint32 stuckTs{0};
