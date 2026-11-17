@@ -66867,6 +66867,7 @@ private:
         // fresh login before they act, and for a reset's walk home after.
         ResolveNaturalizeChecks(sincePollMs);
         ResolveRenameChecks(sincePollMs);
+        ResolveCreateChecks(sincePollMs);
 
         // ...and the retire rows, which wait for the character to stay out of
         // the world before the core deletes it.
@@ -67078,6 +67079,13 @@ private:
                 // target may be offline, and when it is online it is logged
                 // out before anything is done to it (see DoNaturalize).
                 detail = DoNaturalize(targetName, command, id, status, rowResult);
+            else if (kind == "job" && OverseerDecisions::IsCreateAccountRow(command))
+                // A DEDICATED BOT ACCOUNT (2026-11-17), listed accounts only; see DoCreateAccount.
+                detail = DoCreateAccount(targetName, command, status, rowResult);
+            else if (kind == "job" && OverseerDecisions::IsCreateCharacterRow(command))
+                // A CREATE (2026-11-17): the target is the NEW character's name, so it is
+                // routed before the online test, and an existing name answers `exists`.
+                detail = DoCreateCharacter(targetName, command, id, status, rowResult);
             else if (!player && kind == "job" && OverseerDecisions::IsRenameRow(command))
                 // A RENAME OF AN OFFLINE CHARACTER (2026-10-08): a row whose
                 // target is not in the world. With Overseer.Rename.Offline off
@@ -76855,6 +76863,362 @@ private:
         }
 
         _pendingRenames.swap(still);
+    }
+
+    // ------------------------------------------------- create a named character --
+    //
+    // ROW: `create-character <race> <class> <gender> <faction> [level <N>]`,
+    // target_name the NEW name. The grammar and every gate are
+    // OverseerDecisions::CreateCharacterVerdictFor; this is only the part that
+    // touches the core, and it is the random bot factory's own recipe
+    // (RandomPlayerbotFactory::CreateRandomBot and CreateRandomBots) with the
+    // race, class, gender and name taken from the row instead of rolled:
+    // a WorldSession for an existing account, Player::Create with a
+    // CharacterCreateInfo, SaveToDB(true, false), a character cache entry.
+    // Nothing is written to `characters` by hand.
+    //
+    // WHICH ACCOUNT. One of the accounts named in
+    // Overseer.CreateCharacter.Accounts with a slot under SlotCap. They are
+    // deliberately NOT random bot accounts: a character on one of those is
+    // handed a kit and teleported by the factory the first time the random
+    // manager logs it in, which for a level 1 character is a grant.
+    //
+    // LEVEL. A level 1 row is finished at once. A higher level (allowed only
+    // by Overseer.CreateCharacter.MaxLevel) logs the new character in headless
+    // and runs the factory's Randomize for that level on it, exactly the call
+    // RandomizeFirst makes on a fresh random bot, then logs it out again.
+    struct CreateCheck
+    {
+        uint32 id{0};
+        ObjectGuid guid;
+        std::string name;
+        unsigned level{1};
+        uint32 waitedMs{0};
+    };
+
+    std::vector<CreateCheck> _pendingCreates;
+
+    static bool CreateEnabled()
+    {
+        return sConfigMgr->GetOption<bool>("Overseer.CreateCharacter.Enable", false);
+    }
+
+    static unsigned CreateMaxLevel()
+    {
+        return sConfigMgr->GetOption<uint32>("Overseer.CreateCharacter.MaxLevel", 1);
+    }
+
+    static unsigned CreateSlotCap()
+    {
+        return sConfigMgr->GetOption<uint32>("Overseer.CreateCharacter.SlotCap", 10);
+    }
+
+    static std::vector<std::string> CreateAccountNames()
+    {
+        return OverseerDecisions::ParseNameList(
+            sConfigMgr->GetOption<std::string>("Overseer.CreateCharacter.Accounts", ""));
+    }
+
+    // The listed accounts that exist, with how many characters each holds.
+    static std::vector<OverseerDecisions::CreationAccount> CreationAccounts()
+    {
+        std::vector<OverseerDecisions::CreationAccount> accounts;
+        for (std::string const& accountName : CreateAccountNames())
+        {
+            // Account names are letters and digits; anything else is skipped
+            // rather than embedded in SQL.
+            bool clean = !accountName.empty() && accountName.size() <= 32;
+            for (char ch : accountName)
+                if (!std::isalnum(static_cast<unsigned char>(ch)))
+                    clean = false;
+            if (!clean)
+                continue;
+            std::string upper = accountName;
+            for (char& ch : upper)
+                ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            QueryResult found = LoginDatabase.Query("SELECT id FROM account WHERE username = '{}'", upper);
+            if (!found)
+                continue;
+            OverseerDecisions::CreationAccount account;
+            account.id = found->Fetch()[0].Get<uint32>();
+            account.characters = CountQuery("SELECT COUNT(*) FROM characters WHERE account = {}", account.id);
+            accounts.push_back(account);
+        }
+        return accounts;
+    }
+
+    // ROW: `create-account`, target_name the account name. Made in process
+    // with the core's AccountMgr::CreateAccount, the call the random bot
+    // factory makes for its own accounts, only for a name listed in
+    // Overseer.CreateCharacter.Accounts. THE PASSWORD IS RANDOM, MADE HERE AND
+    // NEVER STORED, LOGGED OR RETURNED: the row's result carries the account
+    // name and nothing else, so nobody can log in to the account. The account
+    // is written through the login database's async queue, so a
+    // create-character row sent in the same second may still find no account;
+    // it is refused with `no listed bot account has a free character slot` and
+    // is simply sent again.
+    char const* DoCreateAccount(std::string const& targetName, std::string const& command, char const*& status,
+                                std::string& out)
+    {
+        std::string upper = targetName;
+        for (char& ch : upper)
+            ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+
+        OverseerDecisions::CreateAccountFacts facts;
+        facts.switchOn = CreateEnabled();
+        facts.commandOk = OverseerDecisions::CreateAccountCommandOk(command);
+        facts.nameValid = OverseerDecisions::AccountNameValid(upper);
+        facts.randomBotName = upper.rfind("RNDBOT", 0) == 0;
+        for (std::string const& listed : CreateAccountNames())
+        {
+            std::string name = listed;
+            for (char& ch : name)
+                ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            if (name == upper)
+                facts.listed = true;
+        }
+        if (facts.nameValid)
+            facts.exists = bool(LoginDatabase.Query("SELECT id FROM account WHERE username = '{}'", upper));
+
+        OverseerDecisions::CreateCharacterVerdict const verdict = OverseerDecisions::CreateAccountVerdictFor(facts);
+        std::ostringstream o;
+        if (verdict.route == OverseerDecisions::CreateRoute::Refuse)
+        {
+            o << "{\"outcome\":\"refused\",\"reason\":" << J(verdict.reason) << ",\"account\":" << J(upper) << '}';
+            out = o.str();
+            LOG_WARN("module.overseer", "overseer: create-account '{}' refused: {}", upper, verdict.reason);
+            return verdict.reason;
+        }
+        if (verdict.route == OverseerDecisions::CreateRoute::AlreadyExists)
+        {
+            o << "{\"outcome\":\"exists\",\"account\":" << J(upper) << "}";
+            out = o.str();
+            LOG_INFO("module.overseer", "overseer: create-account '{}' already exists - no-op", upper);
+            status = "applied";
+            return "";
+        }
+
+        // A long random password nobody sees: 40 characters from a
+        // cryptographic source, which is never copied anywhere.
+        static char const alphabet[] = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        std::random_device entropy;
+        std::string password;
+        for (int i = 0; i < 40; ++i)
+            password += alphabet[entropy() % (sizeof(alphabet) - 1)];
+        AccountOpResult const made = sAccountMgr->CreateAccount(upper, password);
+        std::fill(password.begin(), password.end(), '\0');
+        if (made != AOR_OK)
+        {
+            o << "{\"outcome\":\"refused\",\"reason\":\"the core refused the account\",\"account\":" << J(upper) << '}';
+            out = o.str();
+            LOG_WARN("module.overseer", "overseer: create-account '{}' refused by the core", upper);
+            return "the core refused the account";
+        }
+        LOG_INFO("module.overseer", "overseer: create-account '{}' made; its password is random and is not kept",
+                 upper);
+        o << "{\"outcome\":\"created\",\"account\":" << J(upper) << "}";
+        out = o.str();
+        status = "applied";
+        return "";
+    }
+
+    char const* DoCreateCharacter(std::string const& targetName, std::string const& command, uint32 id,
+                                  char const*& status, std::string& out)
+    {
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":\"refused\",\"reason\":" << J(reason) << ",\"character\":" << J(targetName)
+              << ",\"request\":" << J(command) << '}';
+            out = o.str();
+            LOG_WARN("module.overseer", "overseer: create-character '{}' refused: {}", targetName, reason);
+            return reason;
+        };
+
+        OverseerDecisions::CreateCharacterRequest const request =
+            OverseerDecisions::ParseCreateCharacterRequest(command);
+        OverseerDecisions::CreateCharacterFacts facts;
+        facts.switchOn = CreateEnabled();
+        facts.maxLevel = CreateMaxLevel();
+
+        std::string name = targetName;
+        facts.nameValid = normalizePlayerName(name) && ObjectMgr::CheckPlayerName(name, true) == CHAR_NAME_SUCCESS;
+        for (CreateCheck const& pending : _pendingCreates)
+            if (pending.name == name)
+                facts.rowInFlight = true;
+
+        if (request.ok && facts.nameValid)
+        {
+            ObjectGuid const existing = sCharacterCache->GetCharacterGuidByName(name);
+            facts.nameTaken = bool(existing);
+            if (existing)
+            {
+                CharacterCacheEntry const* cache = sCharacterCache->GetCharacterCacheByGuid(existing);
+                facts.takenIsSame = cache && cache->Race == request.race && cache->Class == request.cls &&
+                                    cache->Sex == request.gender;
+            }
+            facts.raceClassLegal = sObjectMgr->GetPlayerInfo(request.race, request.cls) != nullptr;
+            facts.raceEnabled = !((1u << (request.race - 1)) & sWorld->getIntConfig(CONFIG_CHARACTER_CREATING_DISABLED_RACEMASK));
+            facts.freeAccount =
+                OverseerDecisions::PickCreationAccount(CreationAccounts(), CreateSlotCap());
+        }
+
+        OverseerDecisions::CreateCharacterVerdict const verdict =
+            OverseerDecisions::CreateCharacterVerdictFor(request, facts);
+        if (verdict.route == OverseerDecisions::CreateRoute::Refuse)
+            return refuse(verdict.reason);
+
+        if (verdict.route == OverseerDecisions::CreateRoute::AlreadyExists)
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":\"exists\",\"character\":" << J(name) << ",\"request\":" << J(command)
+              << ",\"note\":\"already made as asked; nothing changed\"}";
+            out = o.str();
+            LOG_INFO("module.overseer", "overseer: create-character '{}' already exists as asked - no-op", name);
+            status = "applied";
+            return "";
+        }
+
+        // The character's looks. The first valid face and hair for the race
+        // and gender, in the DBC's own order: a name and a body are what the
+        // row asks for, and the looks are not worth a roll.
+        bool haveFace = false;
+        bool haveHair = false;
+        uint8 face = 0, faceColor = 0, hair = 0, hairColor = 0;
+        for (CharSectionsEntry const* section : sCharSectionsStore)
+        {
+            if (section->RaceID != request.race || section->SexID != request.gender)
+                continue;
+            if (section->BaseSection == SECTION_TYPE_FACE && !haveFace)
+            {
+                face = section->VariationIndex;
+                faceColor = section->ColorIndex;
+                haveFace = true;
+            }
+            else if (section->BaseSection == SECTION_TYPE_HAIR && !haveHair)
+            {
+                hair = section->VariationIndex;
+                hairColor = section->ColorIndex;
+                haveHair = true;
+            }
+        }
+        if (!haveFace || !haveHair)
+            return refuse("the client data has no face or hair for that race and gender");
+
+        uint32 const accountId = facts.freeAccount;
+        WorldSession* session = new WorldSession(accountId, "", 0x0, nullptr, SEC_PLAYER,
+                                                 EXPANSION_WRATH_OF_THE_LICH_KING, time_t(0), LOCALE_enUS, 0,
+                                                 false, false, 0);
+        std::unique_ptr<CharacterCreateInfo> info = std::make_unique<CharacterCreateInfo>(
+            name, request.race, request.cls, request.gender, faceColor, face, hair, hairColor, 0);
+
+        Player* created = new Player(session);
+        created->GetMotionMaster()->Initialize();
+        if (!created->Create(sObjectMgr->GetGenerator<HighGuid::Player>().Generate(), info.get()))
+        {
+            created->CleanupsBeforeDelete();
+            delete created;
+            delete session;
+            return refuse("the core could not create the character");
+        }
+        created->setCinematic(2);
+        created->SetAtLoginFlag(AT_LOGIN_NONE);
+        created->SaveToDB(true, false);
+        ObjectGuid const guid = created->GetGUID();
+        sCharacterCache->AddCharacterCacheEntry(guid, accountId, created->GetName(), created->getGender(),
+                                                created->getRace(), created->getClass(), created->GetLevel());
+        created->CleanupsBeforeDelete();
+        delete created;
+        delete session;
+
+        // EVERY CREATION IS LOGGED, with who it is and where it went.
+        LOG_INFO("module.overseer",
+                 "overseer: create-character '{}' made: race {} class {} gender {} on account {}, level {} asked, "
+                 "command {}",
+                 name, uint32(request.race), uint32(request.cls), uint32(request.gender), accountId,
+                 request.level, id);
+
+        std::ostringstream o;
+        o << "{\"outcome\":\"created\",\"character\":" << J(name) << ",\"account\":" << accountId
+          << ",\"race\":" << uint32(request.race) << ",\"class\":" << uint32(request.cls)
+          << ",\"gender\":" << uint32(request.gender) << ",\"level\":" << request.level
+          << ",\"request\":" << J(command) << '}';
+
+        if (request.level <= 1)
+        {
+            out = o.str();
+            status = "applied";
+            return "";
+        }
+
+        // A level above 1: the character's rows must be in the database before
+        // it can log in, so the login is made on the next poll by the resolver
+        // below, which then runs the factory for the level.
+        CreateCheck check;
+        check.id = id;
+        check.guid = guid;
+        check.name = name;
+        check.level = request.level;
+        _pendingCreates.push_back(check);
+        out = o.str();
+        status = "verifying";
+        return "";
+    }
+
+    void ResolveCreateChecks(uint32 elapsedMs)
+    {
+        std::vector<CreateCheck> still;
+        still.reserve(_pendingCreates.size());
+
+        for (CreateCheck& check : _pendingCreates)
+        {
+            check.waitedMs += elapsedMs;
+            Player* player = ObjectAccessor::FindPlayer(check.guid);
+
+            // The login is asked for once the row is readable.
+            if (!player && check.waitedMs >= 4000 &&
+                CountQuery("SELECT COUNT(*) FROM characters WHERE guid = {}", check.guid.GetCounter()) > 0 &&
+                !sRandomPlayerbotMgr.GetPlayerBot(check.guid))
+                sRandomPlayerbotMgr.AddPlayerBot(check.guid, 0);
+
+            bool const ready = player && player->IsInWorld() && !player->IsBeingTeleported() &&
+                               GET_PLAYERBOT_AI(player);
+            if (!ready)
+            {
+                if (check.waitedMs < NATURALIZE_LOGIN_CEILING_MS)
+                {
+                    still.push_back(check);
+                    continue;
+                }
+                if (player && player->IsInWorld())
+                    EvictHeadlessBot(player);
+                FinishVerifyingRow(check.id, "error",
+                                   "created at level 1 but did not log in within two minutes; the level was not applied",
+                                   "{\"outcome\":\"created_not_levelled\",\"character\":" + J(check.name) + "}");
+                continue;
+            }
+
+            // The factory's own call, as RandomPlayerbotMgr::RandomizeFirst
+            // makes it on a fresh random bot: gear for the level and the
+            // class's spells for it, and nothing chosen by hand.
+            // natural-only: the one grant this module makes, and it is the operator's explicit
+            // override for a new test family: a `create-character` row that asks for a level above
+            // 1, refused unless Overseer.CreateCharacter.MaxLevel allows it (default 1). It reaches
+            // only the character that row just created, never an existing member.
+            PlayerbotFactory factory(player, check.level);
+            factory.Randomize(false);
+            player->SaveToDB(false, false);
+            LOG_INFO("module.overseer",
+                     "overseer: create-character '{}' brought to level {} by the playerbots factory (the "
+                     "level asked for in command {})",
+                     check.name, check.level, check.id);
+            EvictHeadlessBot(player);
+            FinishVerifyingRow(check.id, "applied", "",
+                               "{\"outcome\":\"created\",\"character\":" + J(check.name) + ",\"level\":" +
+                                   std::to_string(check.level) + ",\"note\":\"made, then given the factory's kit for the level\"}");
+        }
+
+        _pendingCreates.swap(still);
     }
 
     // The name questions DoRename and DoRenameOffline both ask, answered once.

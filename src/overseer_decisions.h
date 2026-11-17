@@ -30986,6 +30986,121 @@ struct EnchantForProof
 // The one log line that proves an enchant happened.
 std::string EnchantForProofLine(EnchantForProof const& proof);
 
+
+// ------------------------------------------------ create a named character (2026-11-17) --
+// A NAMED CHARACTER WITHOUT A GAME CLIENT. The core can only make a character
+// through a client's create packet or through mod-playerbots' random bot
+// factory, which picks its own race and name. This verb is the factory's own
+// recipe (a session for an existing account, Player::Create, SaveToDB, a
+// character cache entry) with the name, race, class and gender chosen by the
+// row. It needs no new account and no password: it takes a free slot on an
+// account the operator lists in Overseer.CreateCharacter.Accounts.
+//
+// THE ROW. kind='job', routed on its first word, `create-character`, so no
+// ENUM migration is needed; the row's target_name is the NEW character's name:
+//
+//   create-character <race> <class> <male|female> <alliance|horde> [level <N>]
+//
+// Race words: human dwarf nightelf gnome draenei orc undead tauren troll
+// bloodelf. Class words: warrior paladin hunter rogue priest shaman mage
+// warlock druid. A death knight is refused: it is born at 55, which is a grant.
+//
+// THE LEVEL. Absent or 1, the character is made with the starting outfit the
+// core gives every new character and nothing else. A level above 1 is an
+// explicit grant the operator asks for per row, and it is refused unless
+// Overseer.CreateCharacter.MaxLevel (default 1) allows it. It is met by the
+// playerbots factory's own Randomize for that level, the same call a fresh
+// random bot gets, never by hand picked items.
+//
+// IDEMPOTENT. A character of that name that already has the asked race, class
+// and gender answers `exists` and changes nothing. A name taken by anything
+// else is refused.
+struct CreateCharacterRequest
+{
+    bool ok{false};
+    std::uint8_t race{0};
+    std::uint8_t cls{0};
+    std::uint8_t gender{0};  // 0 male, 1 female (the core's GENDER_*)
+    bool alliance{false};    // the faction the row asked for
+    unsigned level{1};
+    std::string error;       // the refusal literal when not ok
+};
+
+constexpr unsigned CREATE_CHARACTER_LEVEL_MAX = 60;
+
+bool IsCreateCharacterRow(std::string const& command);
+CreateCharacterRequest ParseCreateCharacterRequest(std::string const& command);
+
+// Whether the core's race id belongs to the Alliance.
+bool RaceIsAlliance(std::uint8_t race);
+
+struct CreateCharacterFacts
+{
+    bool switchOn{false};        // Overseer.CreateCharacter.Enable
+    unsigned maxLevel{1};        // Overseer.CreateCharacter.MaxLevel
+    bool nameValid{false};       // normalised and CheckPlayerName said success
+    bool nameTaken{false};       // a character already has the name
+    bool takenIsSame{false};     // ...and it has the asked race, class and gender
+    bool raceClassLegal{false};  // the core has a PlayerInfo for the pair
+    bool raceEnabled{false};     // not disabled by the realm's creation masks
+    unsigned freeAccount{0};     // an account id with a free slot, 0 for none
+    bool rowInFlight{false};     // a creation for the same name is running
+};
+
+enum class CreateRoute : std::uint8_t
+{
+    Create,         // make it
+    AlreadyExists,  // idempotent no-op
+    Refuse,
+};
+
+struct CreateCharacterVerdict
+{
+    CreateRoute route{CreateRoute::Refuse};
+    char const* reason{""};  // literal, no quotes
+};
+
+// The first gate that fails, in the order a reader would check them.
+CreateCharacterVerdict CreateCharacterVerdictFor(CreateCharacterRequest const& request,
+                                                 CreateCharacterFacts const& facts);
+
+struct CreationAccount
+{
+    unsigned id{0};
+    unsigned characters{0};
+};
+
+// The account a new character goes on: the listed account with the fewest
+// characters that is still under `cap`, the lowest id on a tie. 0 for none.
+unsigned PickCreationAccount(std::vector<CreationAccount> const& accounts, unsigned cap);
+
+
+// ------------------------------------------------ create a bot account (2026-11-17) --
+// A DEDICATED ACCOUNT FOR A NEW FAMILY, WITHOUT A CONSOLE. The worldserver has
+// no interactive console and its remote console stays off, so an account is
+// made in process: `create-account`, kind='job', the row's target_name being
+// the account name. It is made only for a name listed in
+// Overseer.CreateCharacter.Accounts, so a row cannot invent an arbitrary
+// account, and its password is random, made in process and never stored,
+// logged or returned: nobody can log in to it, and a client login, if one is
+// ever wanted, starts from a reset by whoever holds that authority.
+bool IsCreateAccountRow(std::string const& command);
+bool AccountNameValid(std::string const& name);
+// The command is exactly the one word, with nothing after it.
+bool CreateAccountCommandOk(std::string const& command);
+
+struct CreateAccountFacts
+{
+    bool switchOn{false};      // Overseer.CreateCharacter.Enable
+    bool commandOk{false};     // the command is exactly `create-account`
+    bool nameValid{false};     // letters and digits, 2 to 17
+    bool listed{false};        // named in Overseer.CreateCharacter.Accounts
+    bool exists{false};        // an account of that name already exists
+    bool randomBotName{false}; // it starts with the random bot account prefix
+};
+
+CreateCharacterVerdict CreateAccountVerdictFor(CreateAccountFacts const& facts);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
