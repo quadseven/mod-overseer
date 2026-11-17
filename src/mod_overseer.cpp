@@ -6584,6 +6584,9 @@ public:
         // it: a member carrying an aim nobody walks is still behind its leader,
         // not off on an errand of its own. See MemberFollowsForFlight.
         bool inertFollowerAim{false};
+        // When the aim began to be refused as inert (#1610), or 0. Cleared with
+        // the flag, so a walked aim starts the count again.
+        time_t inertSince{0};
         // Said once per HOLD, not once per errand, which is why it is not
         // `arrived` (#311). The post-revival hold takes `new rpg` off on purpose
         // for a few seconds and gives it back itself, so the line about it is
@@ -7061,9 +7064,13 @@ public:
     // the claim and stamps the hand-back clock that keeps the quest drive off
     // the wheel (see TravelHoldsTheWheel, case 2); this book ends the errand
     // memory around it.
-    void Release(std::string const& name, std::string const& why = std::string())
+    // `inertFollowerAim` is the drive saying the aim in the column is one nothing
+    // walks and has not for INERT_FOLLOWER_AIM_SECONDS (#1610): the gate then lets
+    // a counter keyword be cleared, which it fences when the book never claimed it.
+    void Release(std::string const& name, std::string const& why = std::string(),
+                 bool inertFollowerAim = false)
     {
-        ReleaseImpl(name, why, _wheel.Release(name, std::time(nullptr)));
+        ReleaseImpl(name, why, _wheel.Release(name, std::time(nullptr), inertFollowerAim));
     }
 
     // Close a dungeon coordinator's travel state without giving back a newer
@@ -30489,8 +30496,33 @@ private:
             state.inertFollowerAim =
                 mover == OverseerDecisions::AimedMover::RefuseInFormation ||
                 mover == OverseerDecisions::AimedMover::RefuseCutOff;
+            if (!state.inertFollowerAim)
+                state.inertSince = 0;
             if (state.inertFollowerAim)
             {
+                // AN AIM NOTHING WALKS IS CLEARED AFTER A BOUND (#1610). Only for
+                // a follower in formation, where "aim the leader instead" is the
+                // whole remedy, and only for a counter keyword: the release gate
+                // would otherwise fence it as the bridge's and the column would
+                // keep blocking the catch-up walk and billing the errand budget.
+                if (!state.inertSince)
+                    state.inertSince = std::time(nullptr);
+                if (mover == OverseerDecisions::AimedMover::RefuseInFormation &&
+                    OverseerDecisions::InertFollowerAimMayBeCleared(
+                        target, state.learn,
+                        std::time(nullptr) - state.inertSince))
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' has carried the aim '{}' for {}s and nothing "
+                             "walks it - only its leader carries `new rpg` - so the aim is "
+                             "cleared from its column (#1610)",
+                             name, target,
+                             static_cast<uint32>(std::time(nullptr) - state.inertSince));
+                    // `state` IS DEAD AFTER THIS: Release erases the record.
+                    _travelAims.Release(name, "an aim nothing walks (a follower's counter keyword)",
+                                        true);
+                    continue;
+                }
                 if (!state.arrived)
                 {
                     state.arrived = true;  // "said already", not "got there"

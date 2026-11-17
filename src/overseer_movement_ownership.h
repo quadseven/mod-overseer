@@ -218,9 +218,9 @@ public:
     // blanked only by compare-and-swap on what was read, and only when the
     // gate says the aim is this module's to erase; the claim is forgotten and
     // the hand-back clock stamped either way.
-    ReleaseResult Release(std::string const& name, time_t now)
+    ReleaseResult Release(std::string const& name, time_t now, bool inertFollowerAim = false)
     {
-        return ReleaseImpl(name, nullptr, now);
+        return ReleaseImpl(name, nullptr, now, inertFollowerAim);
     }
 
     // A DUNGEON RUN ENDING. Ends only the run's own claim on exactly
@@ -342,7 +342,7 @@ private:
     }
 
     ReleaseResult ReleaseImpl(std::string const& name, std::string const* expectedRunAim,
-                              time_t now)
+                              time_t now, bool inertFollowerAim = false)
     {
         ReleaseResult result;
         result.standing = _column.Read(name);
@@ -367,6 +367,7 @@ private:
         gate.changedSinceClaim = changedSinceClaim;
         gate.learnSkill = claimed ? 0 : _column.PendingLearnSkill(name);
         gate.standing = result.standing;
+        gate.inertFollowerAim = inertFollowerAim;
         result.fence = OverseerDecisions::TravelReleaseGate(gate);
         if (result.fence.empty())
             _column.ClearIfStill(name, result.standing);
