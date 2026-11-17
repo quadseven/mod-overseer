@@ -57,7 +57,7 @@ REPLACE INTO overseer_zone_danger(name,result) VALUES ('LeaderA','{"zones":[{"zo
         self.mysql("INSERT INTO overseer_roster(name) VALUES ('NewMember');")
 
         rows = self.mysql(
-            "SELECT CONCAT(name, '\\t', family) FROM overseer_roster "
+            "SELECT CONCAT(name, CHAR(9), family) FROM overseer_roster "
             "ORDER BY name;"
         )
         self.assertEqual(
