@@ -3397,13 +3397,45 @@ std::string RunRecoveryOptions(RunFailureFacts const& facts)
     return out;
 }
 
-RunRecovery RunRecoveryHeuristic(RunFailureFacts const& facts)
+namespace
 {
+// WHICH BRANCH OF THE HEURISTIC CHOSE, kept beside the choice so the reason
+// clause is written from the branch and not guessed back from the word
+// (#1594). Three branches reach a word by a road the word's own clause does
+// not describe: the least-tried fallback, the berth split, and the ladder's
+// turn when nothing in the failure points anywhere.
+enum class HeuristicBasis
+{
+    Facts,      // the failure's own facts point at `chosen`
+    BerthSplit, // a family split at a berth meets at the shared inn (#739)
+    Ladder,     // nothing in the facts: the ladder, by how often each was tried
+    Fallback,   // `pointed` failed twice running; `chosen` is the least tried
+};
+
+struct HeuristicRead
+{
+    RunRecovery chosen;
+    RunRecovery pointed;
+    HeuristicBasis basis;
+};
+
+HeuristicRead ReadRunRecoveryHeuristic(RunFailureFacts const& facts)
+{
+    auto direct = [](RunRecovery chosen) -> HeuristicRead {
+        return {chosen, chosen, HeuristicBasis::Facts};
+    };
+    // The branch's own basis, unless the pick already fell back.
+    auto because = [](HeuristicRead read, HeuristicBasis basis) -> HeuristicRead {
+        if (read.basis == HeuristicBasis::Facts)
+            read.basis = basis;
+        return read;
+    };
+
     // A candidate the facts point at, unless it has already failed twice
     // running; then the ladder picks the least-tried recovery instead.
-    auto pick = [&](RunRecovery wanted) -> RunRecovery {
+    auto pick = [&](RunRecovery wanted) -> HeuristicRead {
         if (!TriedTwiceRunning(facts.tried, wanted))
-            return wanted;
+            return direct(wanted);
         RunRecovery best = RunRecovery::ResetInstance;
         unsigned fewest = ~0u;
         for (RunRecovery r : RUN_RECOVERY_LADDER)
@@ -3418,14 +3450,14 @@ RunRecovery RunRecoveryHeuristic(RunFailureFacts const& facts)
                 best = r;
             }
         }
-        return best;
+        return HeuristicRead{best, wanted, HeuristicBasis::Fallback};
     };
 
     // What cannot be walked around comes first. Full bags keep the door shut
     // whatever else is done, and a character without a steerable client
     // cannot be walked anywhere.
     if (facts.bagsFull || facts.outcome == "evacuated")
-        return RunRecovery::TownForBags;
+        return direct(RunRecovery::TownForBags);
     if (!facts.everyoneSteerable)
         return pick(RunRecovery::WaitForClient);
 
@@ -3438,16 +3470,16 @@ RunRecovery RunRecoveryHeuristic(RunFailureFacts const& facts)
     // chosen a third time running; the ladder below takes over then, and the
     // rung comes round again.
     if (RunRecoveryFinderOpen(facts) && !TriedTwiceRunning(facts.tried, RunRecovery::DungeonFinder))
-        return RunRecovery::DungeonFinder;
+        return direct(RunRecovery::DungeonFinder);
     if (RunRecoverySummonOpen(facts) && facts.summonerReady &&
         !TriedTwiceRunning(facts.tried, RunRecovery::Summon))
-        return RunRecovery::Summon;
+        return direct(RunRecovery::Summon);
 
     // A party split at a berth has a member the walking regroup cannot reach (#739).
     // When the shared inn is ready, meet there before trying the one-copy walk.
     if (facts.outcome == "split_failed" && facts.hearthRegroupReady &&
         Mentions(facts.reason, "split at the berth"))
-        return pick(RunRecovery::HearthRegroup);
+        return because(pick(RunRecovery::HearthRegroup), HeuristicBasis::BerthSplit);
 
     // A party on both sides of the door, or in two copies of it, is collected
     // by RESET's walk out and then enters together.
@@ -3489,8 +3521,15 @@ RunRecovery RunRecoveryHeuristic(RunFailureFacts const& facts)
         return pick(RunRecovery::Replan);
 
     // Nothing in the facts: the ladder, by how often each has been tried.
-    return pick(facts.tried.empty() ? RunRecovery::RestageNearer
-                                    : RUN_RECOVERY_LADDER[facts.tried.size() % 4]);
+    return because(pick(facts.tried.empty() ? RunRecovery::RestageNearer
+                                            : RUN_RECOVERY_LADDER[facts.tried.size() % 4]),
+                   HeuristicBasis::Ladder);
+}
+} // namespace
+
+RunRecovery RunRecoveryHeuristic(RunFailureFacts const& facts)
+{
+    return ReadRunRecoveryHeuristic(facts).chosen;
 }
 
 std::string RunRecoveryFactsLine(RunFailureFacts const& facts)
@@ -3590,6 +3629,22 @@ std::string RunRecoveryHeuristicWhy(RunFailureFacts const& facts, RunRecovery ch
                   ", so the family queues for its own dungeon in the dungeon finder "
                   "(the last resort)";
             break;
+    }
+    // The word's clause above is the cause on every branch whose facts point
+    // at the word. On the three below it is not, so the branch speaks (#1594).
+    // A word that is not the heuristic's own choice keeps the word's clause.
+    HeuristicRead const read = ReadRunRecoveryHeuristic(facts);
+    if (read.chosen == chosen)
+    {
+        if (read.basis == HeuristicBasis::Fallback)
+            why = std::string(RunRecoveryWord(read.pointed)) +
+                  " was the next recovery to try, but it has failed twice running, so " +
+                  RunRecoveryWord(chosen) + ", the least tried of the rest, takes its turn";
+        else if (read.basis == HeuristicBasis::BerthSplit)
+            why = "the family is split at the berth and most of it is bound at one inn, "
+                  "so it hearths there, meets, and walks to the door together";
+        else if (read.basis == HeuristicBasis::Ladder)
+            why = "nothing in the failure points at a recovery, so the ladder takes its turn";
     }
     if (TimesTried(facts.tried, chosen) > 0)
         why += "; tried " + std::to_string(TimesTried(facts.tried, chosen)) +

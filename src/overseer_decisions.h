@@ -4299,7 +4299,10 @@ std::string RunRecoveryOptions(RunFailureFacts const& facts);
 bool RunRecoveryApplicable(RunRecovery recovery, RunFailureFacts const& facts);
 
 // Why the heuristic chose what it chose, in one clause, for the log and the
-// request row.
+// request row. Written from the branch that chose, not only from the word: a
+// recovery reached because the pointed-at one failed twice running, a family
+// split at a berth, and the ladder's turn each say so (#1594). A `chosen` that
+// is not the heuristic's own choice gets the word's general clause.
 std::string RunRecoveryHeuristicWhy(RunFailureFacts const& facts, RunRecovery chosen);
 
 // THE FACTS LINE THE BRIDGE ASKS JEV WITH, for one failure. It carries every
