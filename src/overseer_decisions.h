@@ -1536,6 +1536,13 @@ struct PlaneHearthVerdict
 
 PlaneHearthVerdict DecidePlaneHearth(PlaneHearthFacts const& facts);
 
+// A REFUSED PLANE HEARTH THAT CLEARS BY ITSELF IS NOT AN ERROR. The cast is
+// asked again on the next poll, and the hold the hearth verb places is what
+// ends "character is moving"; a cast already running ends on its own. Said at
+// ERROR, one such refusal read as a stuck character when the cast landed
+// seconds later. Any other refusal is not guessed at and stays loud.
+bool PlaneHearthRefusalClearsItself(std::string const& refusal);
+
 // IS THIS CHARACTER BELOW THE WORLD, ON EVIDENCE AND NOT ON A MISSING
 // READING (#725)? A surface overhead by the gap, no instrument standing it on
 // the ground, and (where the movement state was measured) falling. What the

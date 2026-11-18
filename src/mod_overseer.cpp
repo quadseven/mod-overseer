@@ -41110,6 +41110,19 @@ private:
             if (said != refused)
             {
                 said = refused;
+                // A refusal the hold clears by itself is said below ERROR: the
+                // next poll casts, and ERROR read as a stuck character.
+                if (OverseerDecisions::PlaneHearthRefusalClearsItself(refused))
+                {
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' is on the hidden plane at map {} ({:.1f}, "
+                             "{:.1f}, {:.1f}) and {}, but the cast was refused: {}. That "
+                             "clears by itself and it is asked again on the next poll",
+                             name, static_cast<uint32>(bot->GetMapId()),
+                             bot->GetPositionX(), bot->GetPositionY(),
+                             bot->GetPositionZ(), verdict.reason, refused);
+                    return verdict;
+                }
                 LOG_ERROR("module.overseer",
                           "overseer: '{}' is on the hidden plane at map {} ({:.1f}, "
                           "{:.1f}, {:.1f}) and {}, but the cast was refused: {}. It is "

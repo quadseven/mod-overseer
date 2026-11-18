@@ -1378,6 +1378,11 @@ PlaneHearthVerdict DecidePlaneHearth(PlaneHearthFacts const& facts)
                   "ready and bound on this map"};
 }
 
+bool PlaneHearthRefusalClearsItself(std::string const& refusal)
+{
+    return refusal == "character is moving" || refusal == "character is already casting";
+}
+
 bool StepMayBridgeGap(float span, float verticalGap, float stepYards,
                       float maxGap)
 {
