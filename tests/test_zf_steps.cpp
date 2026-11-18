@@ -21,6 +21,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 using namespace OverseerDecisions;
@@ -328,6 +329,83 @@ void OutsideTheWalkIsIdle()
 
 }  // namespace
 
+// A RUN THAT ENDS SAYS WHICH ZUL'FARRAK STEP IT STOOD AT (#1389). The timeout
+// why read "next Hydromancer Velratha" for every run past three bosses, since
+// the next boss is the lowest uncredited bit and the pyramid event is no boss.
+// The step words come off the two clocks, so a timeout row is classified from
+// its own text.
+void TheStepWordsNameThePyramidStep()
+{
+    ZulFarrakSummitClock summit{true, 3, T0};
+    ZulFarrakUkorzClock walk;
+    std::string const words = ZulFarrakStepWords(summit, walk, T0 + 12 * 60 + 30);
+    Check("the pyramid step is named with its phase and minutes",
+          words == "at Temple Summit (Executioner event), the pyramid at phase 3 for 12 min");
+    Check("the pyramid words carry the step's own name",
+          words.find(ZF_SUMMIT_STEP) != std::string::npos);
+    Check("a clock set ahead of now reads 0 min",
+          ZulFarrakStepWords(summit, walk, T0 - 60) ==
+              "at Temple Summit (Executioner event), the pyramid at phase 3 for 0 min");
+}
+
+void TheStepWordsNameTheUkorzWalk()
+{
+    ZulFarrakSummitClock summit;
+    ZulFarrakUkorzClock walk{true, 131.4f, T0, false, 0};
+    std::string const words = ZulFarrakStepWords(summit, walk, T0 + 9 * 60);
+    Check("the walk is named with its best distance and minutes",
+          words == "on the walk to Chief Ukorz Sandscalp, no 10y nearer than 131y for 9 min");
+    Check("the walk words carry the step's own name",
+          words.find(ZF_UKORZ_STEP) != std::string::npos);
+
+    walk.recoveryIssued = true;
+    Check("a walk under recovery says so",
+          ZulFarrakStepWords(summit, walk, T0 + 9 * 60) ==
+              "on the walk to Chief Ukorz Sandscalp, no 10y nearer than 131y for 9 min "
+              "after a recovery");
+
+    // Inside ZF_UKORZ_REACHED_YARDS the walk is over: the words must not count
+    // the run as one that stopped on the way.
+    ZulFarrakUkorzClock const reached{true, ZF_UKORZ_REACHED_YARDS, T0, false, 0};
+    std::string const at = ZulFarrakStepWords(summit, reached, T0 + 60);
+    Check("a party that reached him is at the last boss, not on the walk",
+          at == "at the last boss, 40y from him" &&
+              at.find("walk") == std::string::npos);
+}
+
+// The words for every other place must not match a search for either step's
+// name, or a count of timeouts at the two steps would take them in.
+void TheStepWordsOutsideBothStepsNameNeither()
+{
+    std::string const words =
+        ZulFarrakStepWords(ZulFarrakSummitClock{}, ZulFarrakUkorzClock{}, T0);
+    Check("outside both steps says so", words == "outside the pyramid event and the last walk");
+    Check("and names neither step",
+          words.find("Temple Summit") == std::string::npos &&
+              words.find("Ukorz") == std::string::npos);
+}
+
+// The words follow the clocks the rules keep, poll by poll.
+void TheStepWordsFollowTheClocks()
+{
+    ZulFarrakSummitClock summit;
+    ZulFarrakUkorzClock walk;
+    summit = ZulFarrakSummitNext(Summit(T0, 2), summit).clock;
+    summit = ZulFarrakSummitNext(Summit(T0 + 6 * 60, 2), summit).clock;
+    Check("a standing phase is counted from when it began",
+          ZulFarrakStepWords(summit, walk, T0 + 6 * 60) ==
+              "at Temple Summit (Executioner event), the pyramid at phase 2 for 6 min");
+
+    ZulFarrakSummitFacts past = Summit(T0 + 7 * 60, 2);
+    past.endDoorState = ZF_END_DOOR_DONE;
+    summit = ZulFarrakSummitNext(past, summit).clock;
+    walk = ZulFarrakUkorzNext(Walk(T0 + 7 * 60, 200.f), walk).clock;
+    walk = ZulFarrakUkorzNext(Walk(T0 + 10 * 60, 198.f), walk).clock;
+    Check("past the End Door the words move to the walk",
+          ZulFarrakStepWords(summit, walk, T0 + 10 * 60) ==
+              "on the walk to Chief Ukorz Sandscalp, no 10y nearer than 200y for 3 min");
+}
+
 int main()
 {
     TheBoundsAreTheLiveOnes();
@@ -341,6 +419,10 @@ int main()
     ASlowWalkThatClosesInNeverGivesUp();
     AtUkorzTheWalkIsNotJudged();
     OutsideTheWalkIsIdle();
+    TheStepWordsNameThePyramidStep();
+    TheStepWordsNameTheUkorzWalk();
+    TheStepWordsOutsideBothStepsNameNeither();
+    TheStepWordsFollowTheClocks();
 
     if (failures)
     {

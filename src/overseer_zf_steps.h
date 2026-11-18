@@ -54,6 +54,7 @@
 
 #include <cstdint>
 #include <ctime>
+#include <string>
 
 namespace OverseerDecisions
 {
@@ -233,6 +234,44 @@ inline ZulFarrakUkorzStep ZulFarrakUkorzNext(ZulFarrakUkorzFacts const& f,
         step.clock.recoveryAt = f.now;
     }
     return step;
+}
+
+// WHICH STEP A RUN STANDS AT, FOR THE WORDS IT ENDS WITH (#1389). Read off the
+// two clocks above as the last poll left them, so a run that times out, stalls
+// on the ladder or is stopped by the dungeon module says where it stood:
+//
+//   "at Temple Summit (Executioner event), the pyramid at phase 3 for 12 min"
+//   "on the walk to Chief Ukorz Sandscalp, no 10y nearer than 131y for 9 min"
+//   "at the last boss, 38y from him"
+//   "outside the pyramid event and the last walk"
+//
+// The first two carry ZF_SUMMIT_STEP and ZF_UKORZ_STEP word for word, the same
+// names the give-up line logs, so one search counts both endings. The other two
+// name neither step on purpose: a run inside ZF_UKORZ_REACHED_YARDS has finished
+// the walk, and a count of runs lost at the two steps must not take it in.
+//
+// These are the overseer's own readings of the instance. The dungeon brain's
+// target is not among them: it is not a value this module can read.
+inline std::string ZulFarrakStepWords(ZulFarrakSummitClock const& summit,
+                                      ZulFarrakUkorzClock const& walk, std::time_t now)
+{
+    auto const minutes = [now](std::time_t since) {
+        return std::to_string(now > since ? (now - since) / 60 : 0);
+    };
+    if (walk.active)
+    {
+        std::string const yards = std::to_string(static_cast<std::uint32_t>(walk.best));
+        if (walk.best <= ZF_UKORZ_REACHED_YARDS)
+            return "at the last boss, " + yards + "y from him";
+        return std::string("on ") + ZF_UKORZ_STEP + ", no " +
+               std::to_string(static_cast<std::uint32_t>(ZF_UKORZ_NEARER_YARDS)) +
+               "y nearer than " + yards + "y for " + minutes(walk.since) + " min" +
+               (walk.recoveryIssued ? " after a recovery" : "");
+    }
+    if (summit.active)
+        return std::string("at ") + ZF_SUMMIT_STEP + ", the pyramid at phase " +
+               std::to_string(summit.phase) + " for " + minutes(summit.since) + " min";
+    return "outside the pyramid event and the last walk";
 }
 
 }  // namespace OverseerDecisions

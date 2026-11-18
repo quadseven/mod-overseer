@@ -24518,13 +24518,15 @@ std::string GuildRunAbsentWords(std::vector<GuildRunSeatReport> const& seats)
 }
 
 std::string GuildRunStallWords(std::string const& nextBoss, bool killed,
-                               unsigned secondsSinceKill)
+                               unsigned secondsSinceKill, std::string const& step)
 {
     std::string out;
     if (!nextBoss.empty())
         out = "next " + nextBoss + ", ";
     out += killed ? "last kill " + std::to_string(secondsSinceKill / 60) + " min ago"
                   : std::string("no boss killed yet");
+    if (!step.empty())
+        out += ", " + step;
     return out;
 }
 

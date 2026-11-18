@@ -482,6 +482,28 @@ void AnEndedRunSaysWhoWasMissingAndWhereItStalled()
               "inside for 7200s; next Gelihast, last kill 95 min ago");
     Check("the timed-out why with no stall words is the old one",
           GuildRunTimedOutWhy(7200, "") == "inside for 7200s");
+
+    // WHERE THE RUN STOOD FOLLOWS THE BOSS WORDS (#1389): "next" is the lowest
+    // uncredited boss, which is not where a run waiting on an event stands.
+    Check("a named step follows the kill words",
+          GuildRunStallWords("Hydromancer Velratha", true, 95 * 60,
+                             "at Temple Summit (Executioner event), the pyramid at phase 3 "
+                             "for 12 min") ==
+              "next Hydromancer Velratha, last kill 95 min ago, at Temple Summit "
+              "(Executioner event), the pyramid at phase 3 for 12 min");
+    Check("a named step follows 'no boss killed yet' too",
+          GuildRunStallWords("", false, 0, "outside the pyramid event and the last walk") ==
+              "no boss killed yet, outside the pyramid event and the last walk");
+    Check("an empty step leaves the words as they were",
+          GuildRunStallWords("Gelihast", true, 95 * 60, "") ==
+              "next Gelihast, last kill 95 min ago");
+    Check("the timed-out why carries the step",
+          GuildRunTimedOutWhy(7201, GuildRunStallWords(
+                                        "Hydromancer Velratha", true, 95 * 60,
+                                        "on the walk to Chief Ukorz Sandscalp, no 10y nearer "
+                                        "than 131y for 9 min")) ==
+              "inside for 7201s; next Hydromancer Velratha, last kill 95 min ago, on the walk "
+              "to Chief Ukorz Sandscalp, no 10y nearer than 131y for 9 min");
 }
 
 // A scriptless dungeon's boss count is read off the tank's own bind, which
