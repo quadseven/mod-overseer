@@ -10617,9 +10617,10 @@ ErrandDeathVerdict ErrandDeathBreaker(ErrandDeathToll const& toll,
     //    because the walk re-Claims from its own escort entry on the next party
     //    poll. The caller is told to end the WALK, which is the only thing that
     //    stops the aim coming back. See ErrandDeathToll::catchUp.
+    bool const lavaCalls = limits.lavaDeaths && toll.lavaDeaths >= limits.lavaDeaths;
     if (toll.runOwned)
     {
-        if (coolingOff || toll.deaths >= limits.deaths)
+        if (coolingOff || toll.deaths >= limits.deaths || lavaCalls)
             verdict.remedy = toll.catchUp ? ErrandDeathRemedy::EndCatchUp
                                           : ErrandDeathRemedy::DeclineRunOwned;
         return verdict;
@@ -10643,7 +10644,7 @@ ErrandDeathVerdict ErrandDeathBreaker(ErrandDeathToll const& toll,
     //    three in five minutes", and the third death in five minutes IS the
     //    evidence - a rule that waits for a fourth body to be sure is a rule
     //    that costs a body to be sure.
-    if (toll.deaths >= limits.deaths ||
+    if (toll.deaths >= limits.deaths || lavaCalls ||
         (limits.partyDeaths && toll.partyDeaths >= limits.partyDeaths))
         verdict.remedy = ErrandDeathRemedy::Release;
 
@@ -21903,6 +21904,10 @@ GhostRecoveryVerdict DecideGhostRecovery(GhostRecoveryFacts const& facts,
     if (facts.choseHealer)
         return healer(GhostRecoveryReason::AlreadyChose);
 
+    // 1a. A corpse in lava is never reclaimed (wow-overseer#2886).
+    if (facts.corpseInLava)
+        return healer(GhostRecoveryReason::CorpseInLava);
+
     // 2. It has already died here inside the window.
     if (limits.repeatDeaths && facts.deathsHere >= limits.repeatDeaths)
         return healer(GhostRecoveryReason::RepeatDeaths);
@@ -22264,6 +22269,8 @@ char const* GhostRecoveryReasonText(GhostRecoveryReason reason)
         case GhostRecoveryReason::SickButThreatened:
             return "it still carries Resurrection Sickness, but hostiles near the corpse make "
                    "reclaiming it unsafe";
+        case GhostRecoveryReason::CorpseInLava:
+            return "the corpse lies in lava, and reviving there is another death";
     }
     return "unknown";
 }

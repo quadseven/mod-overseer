@@ -16736,6 +16736,26 @@ private:
         return static_cast<uint32>(result->Fetch()[0].Get<uint64>());
     }
 
+    // How many of this character's deaths inside the last `seconds` were in
+    // lava (overseer_death.liquid_type = 'magma'), for the errand breaker
+    // (wow-overseer#2886). The same zero-window rule as RecentDeathCount, and
+    // zero on a world whose table has no liquid_type column, which is the same
+    // answer a quiet table gives: a missing column cannot call off an errand.
+    uint32 RecentLavaDeathCount(std::string const& name, int64 seconds)
+    {
+        if (seconds <= 0 || !DeathLiquidColumnPresent())
+            return 0;
+
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT COUNT(*) FROM overseer_death WHERE character_name = '{}' "
+            "AND created_at >= NOW() - INTERVAL {} SECOND AND liquid_type = 'magma'",
+            Esc(name), seconds);
+        if (!result)
+            return 0;
+
+        return static_cast<uint32>(result->Fetch()[0].Get<uint64>());
+    }
+
     // Deaths of every member of `who`'s group inside the last `seconds`, `who`
     // included, or just its own when it is in no group (#776). One COUNT over
     // the names, through the same table and the same zero-window rule as
@@ -30137,6 +30157,9 @@ private:
                 // its own - infra#2846, test_schema_degrade.py (#276). A zero window
                 // never reaches the database; RecentDeathCount owns that too.
                 toll.deaths = RecentDeathCount(name, window);
+                // A death in lava calls the errand off at the first body
+                // (wow-overseer#2886); see ErrandDeathLimits::lavaDeaths.
+                toll.lavaDeaths = RecentLavaDeathCount(name, window);
                 toll.partyDeaths = RecentPartyDeathCount(bot, window);
                 // A member on its own errand answers for its own deaths only
                 // (#1517): the rest of its family is somewhere else.
@@ -35189,6 +35212,7 @@ private:
         float corpseX{0.f};
         float corpseY{0.f};
         unsigned deathsHere{0};
+        bool corpseInLava{false};  // the corpse lies in lava (wow-overseer#2886)
         NearbyThreat spawnThreat;  // hostile spawns above its level near the corpse
         uint32 killerEntry{0};     // the creature kind that killed it here, or 0
         GraveyardStruct const* healerGrave{nullptr};
@@ -36656,6 +36680,34 @@ private:
         _guildWeaponSentTo.erase(name);
     }
 
+    // Does the corpse lie in lava (wow-overseer#2886)? Read off the map at the
+    // corpse's own point rather than off the death row, which may still be in
+    // the flush queue when the ghost is first read. The liquid must reach the
+    // corpse: a corpse standing on a bridge or a ledge above the pool is a
+    // corpse a ghost can reclaim, and the core says so by reading the point as
+    // above the liquid (LIQUID_MAP_ABOVE_WATER), not in it. The point is asked
+    // one yard below the corpse, because a body that floats on the surface can
+    // sit a hair over it and the core calls that above (Map::GetLiquidData
+    // reads `waterLevel - z` of 0 or less as above or walking on it), where a
+    // body one yard lower is in the pool; a ledge a few yards over still reads
+    // as above. Magma only, as OverseerDecisions::StepLiquidIsLethal: the
+    // core's slime damage is off.
+    static bool CorpseLiesInLava(Player* bot, Corpse const* corpse)
+    {
+        if (!bot || !corpse)
+            return false;
+        Map* map = bot->GetMap();
+        if (!map)
+            return false;
+        LiquidData const liquid = map->GetLiquidData(
+            bot->GetPhaseMask(), corpse->GetPositionX(), corpse->GetPositionY(),
+            corpse->GetPositionZ() - 1.0f, bot->GetCollisionHeight(), MAP_ALL_LIQUIDS);
+        if (liquid.Status == LIQUID_MAP_NO_WATER || liquid.Status == LIQUID_MAP_ABOVE_WATER)
+            return false;
+        return OverseerDecisions::ClassifyDeathLiquid(liquid.Flags) ==
+               OverseerDecisions::DeathLiquid::Magma;
+    }
+
     // The kind that killed this character at its corpse on `mapId` at (x, y),
     // or 0 (OverseerDecisions::KillerAtCorpse).
     static uint32 KillerEntryAt(std::string const& name, uint32 mapId, float x, float y)
@@ -36770,6 +36822,10 @@ private:
             st.deathsHere = static_cast<unsigned>(
                 std::max<uint64>({deaths, uint64(knownDeathsHere), uint64(1)}));
 
+            // A CORPSE IN LAVA IS NOT RECLAIMED (wow-overseer#2886): the corpse
+            // run revives the ghost where the corpse lies. Read once per death,
+            // like everything that does not change while the ghost walks.
+            st.corpseInLava = CorpseLiesInLava(bot, corpse);
             st.spawnThreat = HostileSpawnsNear(bot, st.mapId, st.corpseX, st.corpseY,
                                                GHOST_CORPSE_THREAT_RADIUS, bot->GetLevel());
             st.killerEntry = KillerEntryAt(name, st.mapId, st.corpseX, st.corpseY);
@@ -36826,6 +36882,7 @@ private:
         facts.healerGraveyardSafe = st.healerGrave && st.healerRefused.empty() &&
                                     (ladder || !st.healerWalkSpent);
         facts.choseHealer = st.choseHealer;
+        facts.corpseInLava = st.corpseInLava;
         // ON THE OTHER FACTION'S HOME GROUND THE CORPSE RUN IS THE TRAP. The
         // guards stand over the corpse and the graveyard alike, and no wait
         // moves them (2026-09-28: Alliance members died to Razor Hill Grunts

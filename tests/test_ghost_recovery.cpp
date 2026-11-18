@@ -316,6 +316,54 @@ int main()
               GhostRecoveryReason::Outlevelled);
     }
 
+    // A CORPSE THAT LIES IN LAVA IS NOT RECLAIMED (wow-overseer#2886). On the
+    // dev realm on 2026-11-17 a level 60 tank died in Burning Steppes at
+    // (-7922, -1305) with the lava surface at z 127.8, and its corpse was
+    // there. The corpse run walked the ghost back to it, the ghost came alive
+    // standing in the lava and died of it within seconds, and that made a new
+    // corpse in the same lava: three deaths in three minutes at one point, six
+    // in one earlier episode, 20 in the day for two characters. Only the
+    // second death at the spot took the spirit healer, and by then the corpse
+    // run had already cost one body. The first death in lava is the
+    // evidence: reviving where the corpse lies is another death.
+    {
+        GhostRecoveryFacts f = Quiet();
+        f.corpseInLava = true;
+        Check("a first death whose corpse lies in lava takes the spirit healer",
+              DecideGhostRecovery(f), GhostRecovery::SpiritHealer,
+              GhostRecoveryReason::CorpseInLava);
+
+        f.sick = true;
+        f.corpseRunPossible = true;
+        Check("resurrection sickness does not send it back into the lava",
+              DecideGhostRecovery(f), GhostRecovery::SpiritHealer,
+              GhostRecoveryReason::CorpseInLava);
+
+        f = Quiet();
+        f.corpseInLava = true;
+        f.healerGraveyardSafe = false;
+        Check("with an unsafe graveyard the lava corpse goes to the ladder, never the corpse run",
+              DecideGhostRecovery(f), GhostRecovery::Ladder, GhostRecoveryReason::CorpseInLava);
+
+        f = Quiet();
+        f.corpseInLava = true;
+        f.choseHealer = true;
+        Check("a healer already chosen is still reported as chosen", DecideGhostRecovery(f),
+              GhostRecovery::SpiritHealer, GhostRecoveryReason::AlreadyChose);
+
+        // Dry ground is untouched: the same facts without the lava are the
+        // ordinary corpse run.
+        f = Quiet();
+        Check("a corpse on dry ground is still run back to", DecideGhostRecovery(f),
+              GhostRecovery::CorpseRun, GhostRecoveryReason::Clear);
+
+        if (!std::strcmp(GhostRecoveryReasonText(GhostRecoveryReason::CorpseInLava), "unknown"))
+        {
+            std::printf("FAIL the lava corpse has no sentence of its own\n");
+            ++failures;
+        }
+    }
+
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);

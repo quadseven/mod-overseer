@@ -12136,6 +12136,13 @@ struct ErrandDeathLimits
     // last doubles the cool-off, up to `maxCooloffSeconds`.
     int64_t maxCooloffSeconds{4 * 60 * 60};
     int64_t strikeMemorySeconds{6 * 60 * 60};
+    // A DEATH IN LAVA CALLS AN ERRAND OFF AT THE FIRST BODY
+    // (wow-overseer#2886). Three bodies in five minutes cannot tell a patrol
+    // from a bad road on the first one, but a burn is the ground itself and the
+    // next walk takes the same road: a leader on a vendor errand died in one
+    // lava pool three times in 143 seconds before the rule above fired. Zero
+    // turns this off.
+    uint32_t lavaDeaths{1};
     // AND THE PARTY'S BODIES COUNT, NOT ONLY THE LEADER'S (#776). The leader
     // carries the aim, but the four behind him walk the same ground: Ugga
     // died four times to Blackrock Scouts in Redridge on the leader's errand
@@ -12171,6 +12178,9 @@ struct ErrandDeathToll
     // Deaths of every member of the traveller's party, the traveller included,
     // inside the same window (#776). Zero when the caller read none.
     uint32_t partyDeaths{0};
+    // Of the deaths above, how many were in lava (the death row's
+    // liquid_type is magma), this TRAVELLER's own, inside the same window.
+    uint32_t lavaDeaths{0};
     // How many times in a row this rule has released THIS target for this
     // character, the refusal now running included (#776). Zero when it never has.
     uint32_t strikes{0};
@@ -24314,8 +24324,10 @@ enum class GhostRecoveryReason : uint8_t
     WaitedOut,        // it waited and the corpse never cleared
     StillSick,        // it still carries Resurrection Sickness; the corpse run
                       // does not stack another
-    SickButThreatened // it still carries Resurrection Sickness, but hostiles
+    SickButThreatened,// it still carries Resurrection Sickness, but hostiles
                       // near the corpse make reclaiming it unsafe
+    CorpseInLava    // the corpse lies in lava: reviving there is
+                      // another death (wow-overseer#2886)
 };
 
 struct GhostRecoveryFacts
@@ -24342,6 +24354,11 @@ struct GhostRecoveryFacts
     // healer would stack another.
     bool sick{false};
     bool corpseRunPossible{false};
+    // THE CORPSE LIES IN LAVA (wow-overseer#2886). The corpse run
+    // brings the ghost to its corpse and revives it standing there, so a
+    // corpse in lava is a revival in lava. The adapter reads the liquid at the
+    // corpse's own point, not the death row, which may still be queued.
+    bool corpseInLava{false};
 };
 
 enum class RevivedSickGroundStep : std::uint8_t { Stay, Hearth, HoldOutOfCombat };
@@ -24405,10 +24422,15 @@ struct GhostRecoveryVerdict
     GhostRecoveryReason reason{GhostRecoveryReason::Clear};
 };
 
-// SIX RULES, IN THIS ORDER:
+// SEVEN RULES, IN THIS ORDER:
 //
 //   1. The spirit healer was already chosen for this death: keep it. A ghost
 //      halfway to the healer is not turned round because a patrol wandered off.
+//   1a. The corpse lies in lava: spirit healer, whatever else is
+//      true, sickness included. Reviving at the corpse is a death, and the
+//      second death at the spot was too late: on 2026-11-17 a character died
+//      three times in three minutes within two yards of one lava point
+//      (wow-overseer#2886).
 //   2. It has died `repeatDeaths` times here inside the window: spirit healer.
 //   2a. It still carries Resurrection Sickness, the corpse run is possible,
 //      and the corpse is clear of hostiles: corpse run, so the sickness does
