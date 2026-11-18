@@ -108,6 +108,12 @@ class HostileTest(unittest.TestCase):
 
 
 class AreaLookupTest(unittest.TestCase):
+    def test_a_missing_maps_directory_is_refused(self):
+        tool = load_tool()
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit):
+                tool.AreaReader(Path(tmp) / "absent")
+
     def test_single_value_tile_and_grid_tile(self):
         tool = load_tool()
         cells = list(range(256))

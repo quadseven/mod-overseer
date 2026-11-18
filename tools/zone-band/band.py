@@ -94,6 +94,8 @@ class AreaReader:
 
     def __init__(self, maps_dir):
         self.maps_dir = Path(maps_dir)
+        if not self.maps_dir.is_dir():
+            raise SystemExit(f"--maps is not a directory: {self.maps_dir}")
         self._tiles = {}
 
     def _tile(self, map_id, tx, ty):
