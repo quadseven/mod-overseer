@@ -29369,6 +29369,50 @@ constexpr char LEAVE_GROUP_VERB[] = "leave-group";
 // `leave-group` on kind='guild', alone on the row.
 bool IsLeaveGroupRow(std::string const& command);
 
+// THE OBSERVER'S OWN LINES (kind='gm', and only for the camera).
+//
+// kind='gm' ran a dot-command through a character's session and was retired
+// because a member must gain nothing it did not earn. The one character that
+// is not a member is the operator's camera: a real client logged in on a game
+// master account, never a bot, that the control plane points at somebody so a
+// stream can show them. A person at that client would type these lines
+// themselves, so the module runs exactly these lines for exactly that
+// character and refuses everything else with the old answer.
+enum class ObserveVerb : std::uint8_t
+{
+    None,
+    Appear,     // `.appear <name>`: stand beside a character, inside its instance
+    UnbindAll,  // `.instance unbind all`: drop saved instance binds
+    Hop,        // `.tele stormwind`: out of any instance, to a fixed city
+    GmOn,       // `.gm on`: the observer state the entry checks key on
+    GmHidden,   // `.gm visible off`: unseen by players
+};
+
+struct ObserveRow
+{
+    ObserveVerb verb = ObserveVerb::None;
+    std::string name;  // only for Appear
+};
+
+// True when the line is one of the observer's. Leading dot, case and runs of
+// spaces do not matter. Anything else, a prefix or an extra word, is not.
+bool ParseObserveRow(std::string const& command, ObserveRow& out);
+
+struct ObserveFacts
+{
+    bool isBot = false;              // the character has a playerbot AI
+    bool gameMasterAccount = false;  // its session security is a game master's
+};
+
+namespace ObserveRefusal
+{
+constexpr char NotAClient[] = "the observer lines run only for a real client, never a bot";
+constexpr char NotAGameMaster[] = "the observer lines run only for a game master account";
+}  // namespace ObserveRefusal
+
+// "" when the lines may run for this character, else the reason.
+char const* ObserveGate(ObserveFacts const& facts);
+
 struct LeaveGroupFacts
 {
     bool isBot{false};         // the character has a bot AI; a person is never moved
