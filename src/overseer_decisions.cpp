@@ -28753,4 +28753,32 @@ CreateCharacterVerdict CreateAccountVerdictFor(CreateAccountFacts const& facts)
     return CreateCharacterVerdict{CreateRoute::Create, ""};
 }
 
+// ------------------------------------------------ the airborne guard (2937) --
+AirborneVerdict AirborneGuardStep(AirborneGuardState& state, AirborneFacts const& facts,
+                                  AirborneGuardLimits const& limits, time_t now)
+{
+    AirborneVerdict verdict;
+    bool const exempt = !facts.alive || facts.betweenWorlds || facts.onTaxi ||
+                        facts.onTransport || facts.inVehicle || facts.inWater ||
+                        facts.mayFly || !facts.groundValid;
+    float const gap = facts.z - facts.groundZ;
+    if (exempt || !(gap > limits.gapYards))
+    {
+        state = AirborneGuardState{};
+        return verdict;
+    }
+    verdict.gap = gap;
+    if (state.since == 0)
+        state.since = now;
+    verdict.seconds = now - state.since;
+    verdict.action = AirborneAction::Watch;
+    if (verdict.seconds < limits.seconds)
+        return verdict;
+    if (state.stoppedAt != 0 && now - state.stoppedAt < limits.repeatSeconds)
+        return verdict;
+    state.stoppedAt = now;
+    verdict.action = AirborneAction::Stop;
+    return verdict;
+}
+
 }  // namespace OverseerDecisions

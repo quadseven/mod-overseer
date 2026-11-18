@@ -251,6 +251,7 @@
 #include "Map.h"
 #include "MapMgr.h"
 #include "MotionMaster.h"
+#include "MoveSpline.h"
 #include "PathGenerator.h"
 #include "ObjectMgr.h"
 #include "QuestDef.h"
@@ -666,6 +667,16 @@ constexpr float FALL_BASELINE_FALLING_YARDS_PER_SECOND = 7.0f;
 
 constexpr OverseerDecisions::FallBaselineLimits FALL_BASELINE_LIMITS{
     FALL_BASELINE_FALLING_YARDS_PER_SECOND};
+
+// THE AIRBORNE GUARD'S BOUND (wow-overseer issue 2937). Ten yards over the
+// floor under the character's own x and y, for five readings a second apart. A
+// jump is two or three yards. A real fall of ten yards is over inside two
+// seconds, and the fall-rate bound above (7 yards a second) puts any fall that
+// lasts five seconds far past ten yards before it lands. So five seconds
+// continuously more than ten yards up means something is carrying it. The
+// measured case was 186 yards up for over two minutes. Thirty seconds is how
+// long a stop that did not hold waits before it is tried and said again.
+constexpr OverseerDecisions::AirborneGuardLimits AIRBORNE_GUARD_LIMITS{10.f, 5, 30};
 
 // HOW CLOSE THE GROUND HAS TO BE TO COUNT AS THE FLOOR THIS CHARACTER IS
 // STANDING ON (#296). Two yards, which is the same stride
@@ -33488,6 +33499,117 @@ private:
         }
     }
 
+    // THE AIRBORNE GUARD (wow-overseer issue 2937). A ground move the navmesh
+    // cannot carry runs as a straight spline. Measured: a family leader 186
+    // yards above the Burning Steppes on a 3000-yard line to the trainer it was
+    // sent to, with a follower 0.3 yards beside it. Nothing in this module saw
+    // it, because every reader here asks about the ground ABOVE a character.
+    // The playerbots funnel now refuses such a move (patch 0029); this is the
+    // backstop for any other mover, read from what they all share.
+    //
+    // Asked once a second for each roster character. Past the bound
+    // (AIRBORNE_GUARD_LIMITS) it says ONE line: the character, its position,
+    // the floor under it, the generator in the active motion slot and where
+    // the spline in flight ends. Then it ends the fault:
+    //   * the motion master is cleared, so the straight line cannot resume
+    //     under the fall that replaces it;
+    //   * MoveFall drops it onto the floor under its own x and y. This is the
+    //     core's ordinary fall, not a teleport: same map, same x and y, the
+    //     closed remedy set the below-the-world drive keeps (#188);
+    //   * the fall start is rebased onto that floor AFTER MoveFall, which writes
+    //     its own, so the landing charges nothing. The character did not
+    //     choose this height, and a 186-yard fall would kill it;
+    //   * its upstream status goes to idle, and its travel aim is refused and
+    //     released, so the next poll does not hand the same far point straight
+    //     back to the mover that launched the line.
+    // Answers true when it acted, so the caller skips the rest of this
+    // character's terrain reading for the second it lands in.
+    bool GuardAirborne(std::string const& name, Player* bot)
+    {
+        OverseerDecisions::AirborneFacts facts;
+        facts.alive = bot->IsAlive();
+        facts.betweenWorlds = !bot->IsInWorld() || bot->IsBeingTeleported();
+        facts.onTaxi = bot->IsInFlight();
+        facts.onTransport = bot->GetTransport() != nullptr;
+        facts.inVehicle = bot->GetVehicle() != nullptr;
+        facts.inWater = bot->IsInWater();
+        facts.mayFly = bot->HasFlyAura() || bot->HasHoverAura() ||
+                       bot->HasFeatherFallAura() || bot->CanFly();
+        facts.z = bot->GetPositionZ();
+        Map* const map = bot->GetMap();
+        if (map && !facts.betweenWorlds)
+        {
+            // The floor under its own x and y: terrain, a model floor within
+            // the vmap's reach, or a water surface, whichever is highest below
+            // the feet. A character on a bridge reads the bridge; one two
+            // hundred yards over a valley reads the valley floor.
+            float const floor = map->GetWaterOrGroundLevel(
+                bot->GetPhaseMask(), bot->GetPositionX(), bot->GetPositionY(),
+                facts.z, nullptr, true, bot->GetCollisionHeight());
+            facts.groundValid = floor > INVALID_HEIGHT;
+            facts.groundZ = floor;
+        }
+
+        OverseerDecisions::AirborneVerdict const verdict =
+            OverseerDecisions::AirborneGuardStep(_airborne[LowerName(name)], facts,
+                                                 AIRBORNE_GUARD_LIMITS, std::time(nullptr));
+        if (verdict.action != OverseerDecisions::AirborneAction::Stop)
+            return false;
+
+        MotionMaster* const motion = bot->GetMotionMaster();
+        char const* owner = "none";
+        if (motion)
+            if (char const* named = OverseerDecisions::MoveGeneratorName(
+                    FoldMovementGenerator(motion->GetCurrentMovementGeneratorType())))
+                owner = named;
+        std::ostringstream heading;
+        heading << std::fixed << std::setprecision(1);
+        if (bot->movespline && !bot->movespline->Finalized())
+        {
+            G3D::Vector3 const end = bot->movespline->FinalDestination();
+            heading << "a spline in flight ending at (" << end.x << ", " << end.y << ", "
+                    << end.z << "), " << bot->GetExactDist(end.x, end.y, end.z)
+                    << " yards off";
+        }
+        else
+            heading << "no spline in flight";
+
+        std::string travelTarget;
+        {
+            std::lock_guard<std::mutex> guard(g_aimMutex);
+            auto const it = g_aimSnapshot.find(LowerName(name));
+            if (it != g_aimSnapshot.end())
+                travelTarget = it->second.travelTarget;
+        }
+
+        LOG_ERROR("module.overseer",
+                  "overseer: '{}' IS AIRBORNE at map {} position ({:.1f}, {:.1f}, {:.1f}): "
+                  "{:.1f} yards over the floor at z {:.1f} for {}s, not on a taxi, a "
+                  "transport or a vehicle, not swimming, with no flight, hover or feather "
+                  "fall aura. Movement owner: {} generator, {}. Travel aim: '{}'. Stopping "
+                  "the motion, setting it down on that floor with the landing rebased so "
+                  "it charges nothing, and releasing the aim (wow-overseer issue 2937)",
+                  name, static_cast<uint32>(bot->GetMapId()), bot->GetPositionX(),
+                  bot->GetPositionY(), facts.z, verdict.gap, facts.groundZ,
+                  static_cast<uint32>(verdict.seconds), owner, heading.str(),
+                  travelTarget);
+
+        bot->StopMoving();
+        if (motion)
+        {
+            motion->Clear();
+            motion->MoveFall();
+        }
+        bot->SetFallInformation(GameTime::GetGameTime().count(), facts.groundZ);
+        if (PlayerbotAI* const botAI = GET_PLAYERBOT_AI(bot))
+            botAI->rpgInfo.ChangeToIdle();  // NewRpgInfo.h:110
+        if (!travelTarget.empty())
+            _travelAims.Refuse(name, travelTarget,
+                               "it carried the character through the air");
+        _travelAims.Release(name, "the airborne guard (carried through the air)");
+        return true;
+    }
+
     void DriveBelowTerrainRecovery()
     {
         // THE ROSTER, AND SINCE #633 EVERY GUILD BOT ON A FAR WALK. A far walk
@@ -33695,6 +33817,11 @@ private:
 
             // A FAR WALKER GETS THE BASELINE GUARD ABOVE AND NOTHING BELOW (#633).
             if (!onRoster)
+                continue;
+
+            // CARRIED THROUGH THE AIR IS ENDED HERE, BEFORE THE BELOW-THE-WORLD
+            // READING (wow-overseer issue 2937). See GuardAirborne.
+            if (GuardAirborne(name, bot))
                 continue;
 
             // IS THIS CHARACTER IN THE LAST STRETCH ABOVE THE KILL PLANE
@@ -89940,6 +90067,10 @@ private:
         _terrainMismatchObservation;
     // Places a "nothing is being moved" terrain note was already said about (#775).
     std::unordered_set<uint64_t> _terrainNoted;
+    // The airborne guard's episode per lowered name (wow-overseer issue 2937).
+    // World thread only, like the rest of this loop; a restart forgets it,
+    // which costs one fresh five-second window.
+    std::map<std::string, OverseerDecisions::AirborneGuardState> _airborne;
 
     // Names currently proven below the world. This is a world-thread-only
     // publication between terrain recovery and the travel/quest/dungeon

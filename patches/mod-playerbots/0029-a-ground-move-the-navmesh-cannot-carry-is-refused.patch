@@ -1,0 +1,153 @@
+Subject: [PATCH] playerbots: a ground move the navmesh cannot carry is refused, not flown
+
+WHY THIS PATCH EXISTS
+
+PathGenerator, at the core pin, gives a player a two-point straight path
+whenever the navmesh cannot carry the move in one piece:
+- no polygon at either end. `bool path = creature ? creature->CanFly() : true`
+  treats every player as able to fly, so the type is NORMAL | NOT_USING_PATH;
+- a route longer than the point limit (74 points, about 296 yards).
+  BuildShortcut() runs and the type is PATHFIND_SHORT;
+- a tile that is not loaded (NORMAL | NOT_USING_PATH).
+PointMovementGenerator and MoveSplineInit::MoveTo refuse only NOPATH, and
+MoveSplineInit::MoveTo falls back to the same two-point line even then. So a
+ground move to a point the navmesh will not carry runs as a ruler-straight
+spline at run speed. It goes through the air where the ground dips and through
+the rock where it rises.
+
+MovementAction::MoveTo is the funnel every bot move goes through, and neither
+of its branches refuses such a path. The exact_waypoint branch hands the point
+straight to MovePoint. SearchForBestPath accepts a path type with a bit test,
+(type & (NORMAL | INCOMPLETE)), so NORMAL | SHORT and NORMAL | NOT_USING_PATH
+both pass. NewRpgBaseAction::MoveWorldObjectTo and the `go x;y;z` command call
+it with no distance bound.
+
+Measured on the dev realm (wow-overseer issue 2937): a family leader sent to a
+trainer 3000 yards away ran a straight line to the trainer's spawn, 186 yards
+above the ground at its highest. The position was read every 30 s, and each
+step was the same vector at 7 yards a second. The next line, to the same spawn,
+ran 33 to 49 yards under the hills. A follower ran beside it 0.3 yards away.
+
+WHAT IT DOES
+
+Before either branch of MoveTo launches a ground move (generatePath true),
+RefusesGroundShortcut asks PathGenerator for the path the move would take. A
+move longer than 20 yards whose path is a straight line rather than a route
+(NOT_USING_PATH, SHORT, NOPATH or SHORTCUT) is refused: MoveTo returns false
+and nothing is launched, so the caller's own fallback runs. For
+NewRpgBaseAction::MoveFarTo that is the forward cone, whose steps are 70 yards
+or less.
+
+Unchanged:
+- a move the navmesh carries;
+- a move of 20 yards or less, such as stepping back onto the mesh;
+- a flying or swimming bot (generatePath is false, and a straight line is how
+  it moves);
+- a bot on a transport, in a battleground (which has its own
+  DisableMoveSplinePath switch) or with UNIT_STATE_IGNORE_PATHFINDING;
+- the vehicle branch.
+
+The cost is one PathGenerator call, made only for moves longer than 20 yards.
+
+WHAT WOULD LET THIS PATCH BE DELETED
+
+An upstream MoveTo that checks the path type before it launches a move, or a
+core whose PointMovementGenerator does not launch a straight line for a ground
+player.
+
+APPLIES TO
+
+  repo: https://github.com/quadseven/mod-playerbots.git
+  SHA:  40884e9c135c1daf27ffd894a6047502a5701130 (the pin), after patches
+        0001 to 0052 of this directory (checked with git apply, then by
+        grepping the two new call sites). Mirrors patch 0053 of the
+        build's patch directory. It touches MovementActions.cpp (MoveTo) and
+        MovementActions.h.
+
+diff --git a/src/Ai/Base/Actions/MovementActions.cpp b/src/Ai/Base/Actions/MovementActions.cpp
+index f9da49ac..580811b5 100644
+--- a/src/Ai/Base/Actions/MovementActions.cpp
++++ b/src/Ai/Base/Actions/MovementActions.cpp
+@@ -166,6 +166,50 @@ bool MovementAction::MoveToLOS(WorldObject* target, bool ranged)
+     return false;
+ }
+ 
++// A GROUND MOVE THE NAVMESH CANNOT CARRY IS REFUSED, NOT FLOWN (wow-overseer
++// issue 2937). PathGenerator hands a player a two-point straight path whenever
++// the navmesh cannot carry the move in one piece: no polygon at either end
++// (it treats every player as able to fly, so the type is NORMAL |
++// NOT_USING_PATH), a route longer than its point limit (BuildShortcut with
++// PATHFIND_SHORT) or a missing tile. PointMovementGenerator and
++// MoveSplineInit::MoveTo then launch that line, and launch it even on NOPATH.
++// The character runs a ruler-straight line at run speed through the air where
++// the ground dips and through the rock where it rises: measured, a leader 186
++// yards above the Burning Steppes on a 3000-yard line to the trainer it was
++// sent to, then 49 yards under the hills on the next one.
++//
++// Nothing below changes a move the navmesh can carry, a move of a stride or
++// less (stepping back onto the mesh), a flying or swimming bot (generatePath is
++// false there and a straight line is how it moves) or a battleground, whose
++// movement has its own DisableMoveSplinePath switch.
++static constexpr float GROUND_SHORTCUT_STRIDE_YARDS = 20.0f;
++
++static bool GroundMoveLeavesTheGround(uint32 pathType, float distance)
++{
++    if (distance <= GROUND_SHORTCUT_STRIDE_YARDS)
++        return false;
++    return (pathType & (PATHFIND_NOT_USING_PATH | PATHFIND_SHORT | PATHFIND_NOPATH | PATHFIND_SHORTCUT)) != 0;
++}
++
++bool MovementAction::RefusesGroundShortcut(float x, float y, float z, bool generatePath)
++{
++    if (!generatePath || bot->GetTransport() || bot->InBattleground() ||
++        bot->HasUnitState(UNIT_STATE_IGNORE_PATHFINDING))
++        return false;
++    float const distance = bot->GetExactDist(x, y, z);
++    if (distance <= GROUND_SHORTCUT_STRIDE_YARDS)
++        return false;
++    PathGenerator path(bot);
++    path.CalculatePath(x, y, z, false);
++    if (!GroundMoveLeavesTheGround(path.GetPathType(), distance))
++        return false;
++    LOG_DEBUG("playerbots",
++              "{} refuses a {:.0f}-yard ground move to ({:.1f}, {:.1f}, {:.1f}): path type {} is a straight line, not "
++              "a route (wow-overseer issue 2937)",
++              bot->GetName(), distance, x, y, z, static_cast<uint32>(path.GetPathType()));
++    return true;
++}
++
+ bool MovementAction::MoveTo(uint32 mapId, float x, float y, float z, bool /*idle*/, bool /*react*/, bool normal_only,
+                             bool exact_waypoint, MovementPriority priority, bool lessDelay, bool backwards)
+ {
+@@ -216,6 +260,9 @@ bool MovementAction::MoveTo(uint32 mapId, float x, float y, float z, bool /*idle
+         float distance = bot->GetExactDist(x, y, z);
+         if (distance > 0.01f)
+         {
++            if (RefusesGroundShortcut(x, y, z, generatePath))
++                return false;
++
+             if (bot->IsSitState())
+                 bot->SetStandState(UNIT_STAND_STATE_STAND);
+ 
+@@ -243,6 +290,9 @@ bool MovementAction::MoveTo(uint32 mapId, float x, float y, float z, bool /*idle
+         float distance = bot->GetExactDist(x, y, modifiedZ);
+         if (distance > 0.01f)
+         {
++            if (RefusesGroundShortcut(x, y, modifiedZ, generatePath))
++                return false;
++
+             if (bot->IsSitState())
+                 bot->SetStandState(UNIT_STAND_STATE_STAND);
+ 
+diff --git a/src/Ai/Base/Actions/MovementActions.h b/src/Ai/Base/Actions/MovementActions.h
+index e7afee52..2d6ccb2e 100644
+--- a/src/Ai/Base/Actions/MovementActions.h
++++ b/src/Ai/Base/Actions/MovementActions.h
+@@ -81,6 +81,7 @@ private:
+                                                   bool normal_only = false, float step = 8.0f);
+     bool wasMovementRestricted = false;
+     void DoMovePoint(Unit* unit, float x, float y, float z, bool generatePath, bool backwards);
++    bool RefusesGroundShortcut(float x, float y, float z, bool generatePath);
+ };
+ 
+ class FleeAction : public MovementAction
