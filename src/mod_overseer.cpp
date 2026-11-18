@@ -68426,7 +68426,7 @@ private:
             "kind='gm' is retired: this module runs no dot-command on any character, "
             "because a member gains nothing it did not earn";
         D::ObserveRow row;
-        if (!D::ParseObserveRow(command, row))
+        if (!who || !D::ParseObserveRow(command, row))
             return retired;
         D::ObserveFacts facts;
         facts.isBot = GET_PLAYERBOT_AI(who) != nullptr;
