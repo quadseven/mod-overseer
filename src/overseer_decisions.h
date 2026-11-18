@@ -8193,6 +8193,18 @@ std::uint32_t ChestOpeningSpell(std::vector<ChestLockCase> const& lock,
 std::vector<std::uint8_t> ChestLootSlots(std::uint64_t opened, std::uint64_t looting,
                                          std::size_t plain, std::size_t quest);
 
+// THE LOOT WINDOW A QUEST USE OF A CHEST SAW, as one log line. A use that
+// opened a window the module then could not take from (a window that opened
+// empty, one on another object, a full bag the core refused to store into)
+// left no line at all, and all three read back as `unchanged`. "" when no use
+// parked a chest for the member (`opened` is 0): an ordinary loot window is
+// not this log's business. Otherwise the line names which of the cases the
+// window was, the counts it held, the bag room, the slots asked and the items
+// that reached the bags.
+std::string ChestWindowLine(std::uint64_t opened, std::uint64_t looting, std::size_t plain,
+                            std::size_t quest, std::uint32_t gold, std::uint32_t freeSlots,
+                            std::size_t asked, std::size_t reached);
+
 // Worth asking again without changing the row. Moving, fighting, dying, a
 // target out of reach or dead (it respawns), a hold and a use under way are.
 // A malformed row, a wrong target, a missing or unusable item are not; an

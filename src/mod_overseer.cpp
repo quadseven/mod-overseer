@@ -88650,8 +88650,22 @@ public:
             opened, lootGuid.GetRawValue(), loot.items.size(), loot.quest_items.size());
         WorldSession* const session = who->GetSession();
         if (slots.empty() || !session)
+        {
+            // A window the opener could not take from still says what it held:
+            // empty, or on another object, it left no line and read `unchanged`.
+            std::string const seen = OverseerDecisions::ChestWindowLine(
+                opened, lootGuid.GetRawValue(), loot.items.size(), loot.quest_items.size(),
+                loot.gold, who->GetFreeInventorySpace(), 0, 0);
+            if (!seen.empty())
+                LOG_INFO("module.overseer", "overseer: '{}' {}", who->GetName(), seen);
             return;
+        }
 
+        // What the window held and the bag room, read before the take empties them.
+        size_t const plainSeen = loot.items.size();
+        size_t const questSeen = loot.quest_items.size();
+        uint32 const goldSeen = loot.gold;
+        uint32 const roomSeen = who->GetFreeInventorySpace();
         std::map<uint32, uint32> before;
         for (LootItem const& item : loot.items)
             before[item.itemid] = who->GetItemCount(item.itemid);
@@ -88678,6 +88692,11 @@ public:
                  "slot(s) asked, quest items first, {} item(s) reached the bags - "
                  "chest loot taken by the opener",
                  who->GetName(), lootGuid.GetEntry(), slots.size(), taken);
+        LOG_INFO("module.overseer", "overseer: '{}' chest {} {}", who->GetName(),
+                 lootGuid.GetEntry(),
+                 OverseerDecisions::ChestWindowLine(opened, lootGuid.GetRawValue(), plainSeen,
+                                                    questSeen, goldSeen, roomSeen, slots.size(),
+                                                    taken));
     }
 
 private:
