@@ -11809,6 +11809,9 @@ private:
         static constexpr float WADE_STRIDE_YARDS = 4.0f;
         static constexpr unsigned WADE_BEARINGS = 16;
         static constexpr uint32 WADE_POINT_ID = 0;
+        // A wade that begins this soon after the last one is a repeat (#1638).
+        static constexpr time_t WADE_REPEAT_WINDOW_SECONDS = 60;
+        static constexpr unsigned WADE_REPEAT_CAP = 3;
         std::vector<std::string> names;
         if (QueryResult result = CharacterDatabase.Query(
                 "SELECT name FROM overseer_roster WHERE enabled = 1"))
@@ -11821,17 +11824,31 @@ private:
         for (std::string const& name : names)
         {
             Player* bot = ObjectAccessor::FindPlayerByName(name);
+            auto const last = _wadeLast.find(name);
             if (!FeetInLethalLiquid(bot) || bot->IsBeingTeleported())
             {
                 _wadeIssuedAt.erase(name);
+                if (last != _wadeLast.end() &&
+                    now - last->second.first > WADE_REPEAT_WINDOW_SECONDS)
+                    _wadeLast.erase(last);
                 continue;
             }
             auto const issued = _wadeIssuedAt.find(name);
             if (issued != _wadeIssuedAt.end() && now - issued->second < 2 && bot->isMoving())
                 continue;
-            OverseerDecisions::WadeOutPick const pick = OverseerDecisions::PickWadeOut(
+            // A WADE THAT FOLLOWS ANOTHER SEARCHES WIDER (#1638). One wade keeps
+            // the repeats it began with, so its aim does not move under it.
+            bool const hadEarlier = last != _wadeLast.end();
+            time_t const sinceEarlier = hadEarlier ? now - last->second.first : 0;
+            unsigned const repeats =
+                issued != _wadeIssuedAt.end()
+                    ? (hadEarlier ? last->second.second : 0)
+                    : OverseerDecisions::WadeRepeats(
+                          hadEarlier, sinceEarlier, WADE_REPEAT_WINDOW_SECONDS,
+                          hadEarlier ? last->second.second : 0, WADE_REPEAT_CAP);
+            OverseerDecisions::WadeOutPick const pick = OverseerDecisions::PickWadeOutRepeat(
                 bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), WADE_MAX_YARDS,
-                WADE_STRIDE_YARDS, WADE_BEARINGS,
+                WADE_STRIDE_YARDS, WADE_BEARINGS, repeats,
                 [bot](float x, float y, float from, float& out, bool& lethal)
                 { return SurfaceAt(bot, x, y, from, out, &lethal); });
             if (!pick.found)
@@ -11854,7 +11871,14 @@ private:
                          "(wow-overseer#2886)",
                          name, bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
                          pick.yards, pick.x, pick.y, pick.z);
+            if (issued == _wadeIssuedAt.end() && repeats > 0)
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' is in lava again {} s after its last wade-out "
+                         "(repeat {}): the dry ground it walks to has {:.0f} yards of dry "
+                         "ground measured round it (#1638)",
+                         name, static_cast<int64>(sinceEarlier), repeats, pick.clearYards);
             _wadeIssuedAt[name] = now;
+            _wadeLast[name] = {now, repeats};
             bot->GetMotionMaster()->MovePoint(WADE_POINT_ID, pick.x, pick.y, pick.z,
                                               FORCED_MOVEMENT_NONE, 0.f, 0.f,
                                               /*generatePath*/ false, /*forceDestination*/ true);
@@ -90130,6 +90154,11 @@ private:
     std::map<std::string, std::pair<int64, bool>> _revivalHoldUntil;
     // When each character in lava was last sent toward dry ground.
     std::map<std::string, time_t> _wadeIssuedAt;
+    // When each character was last sent out of lava and how many repeats that
+    // wade carried (#1638). Outlives the wade itself, which _wadeIssuedAt does
+    // not; dropped once the repeat window has passed. Lost on restart, which
+    // costs one plain wade.
+    std::map<std::string, std::pair<time_t, unsigned>> _wadeLast;
 
     std::map<std::string, RevivedSicknessState> _revivedSickness;
     // When each character's Resurrection Sickness from the spirit healer ends
