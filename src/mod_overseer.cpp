@@ -68769,7 +68769,8 @@ private:
         if (!who || !D::ParseObserveRow(command, row))
             return retired;
         D::ObserveFacts facts;
-        facts.isBot = GET_PLAYERBOT_AI(who) != nullptr;
+        facts.isBot = D::ObserveIsBot(who->GetSession() && OverseerCompat::SessionIsHeadless(*who->GetSession()),
+                                      GET_PLAYERBOT_AI(who) != nullptr);
         facts.gameMasterAccount =
             who->GetSession() && who->GetSession()->GetSecurity() >= SEC_GAMEMASTER;
         if (char const* wall = D::ObserveGate(facts); *wall)

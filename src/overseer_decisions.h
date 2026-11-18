@@ -29438,6 +29438,12 @@ constexpr char NotAGameMaster[] = "the observer lines run only for a game master
 // "" when the lines may run for this character, else the reason.
 char const* ObserveGate(ObserveFacts const& facts);
 
+// Whether the camera counts as a bot. A real client logged in on a game master
+// account is a SELFBOT (SelfBotLevel 3): it carries a playerbot AI AND a client
+// socket. Only a session with no socket behind it is a bot, so the AI does not
+// decide this, the socket does.
+bool ObserveIsBot(bool headlessSession, bool hasPlayerbotAI);
+
 struct LeaveGroupFacts
 {
     bool isBot{false};         // the character has a bot AI; a person is never moved

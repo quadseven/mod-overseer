@@ -78,6 +78,10 @@ int main()
     Check("a bot may not, even on a game master account",
           std::strcmp(D::ObserveGate(bot), D::ObserveRefusal::NotAClient) == 0);
 
+    // The camera is a selfbot: a playerbot AI AND a client socket. It is not a bot.
+    Check("a selfbot with a client socket is not a bot", !D::ObserveIsBot(false, true));
+    Check("a headless session is a bot", D::ObserveIsBot(true, true));
+
     D::ObserveFacts player;
     Check("a player account may not",
           std::strcmp(D::ObserveGate(player), D::ObserveRefusal::NotAGameMaster) == 0);
