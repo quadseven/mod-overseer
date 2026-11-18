@@ -75487,7 +75487,15 @@ private:
             facts.founderInAnotherGuild =
                 founderGuild != 0 && (!guild || founderGuild != guild->GetId());
             Player* founder = ObjectAccessor::FindPlayerByName(state.founderName);
-            facts.founderOnline = ClientAttached(founder);
+            // A FOUNDER IS ONLINE WHEN A CLIENT HOLDS HIM OR WHEN HE IS A HEADLESS ROSTER BOT IN
+            // THE WORLD. The first version asked for a client alone, which no family led by a
+            // headless roster bot can ever have (a bot's session has no socket), so a family
+            // played with no client could never found its guild. Guild::Create takes the
+            // founder's Player, which a bot is.
+            facts.founderOnline =
+                ClientAttached(founder) ||
+                (founder && founder->IsInWorld() &&
+                 OverseerDecisions::NameListHas(HeadlessRosterCache(), founder->GetName()));
             // WHO IS ALREADY IN, ASKED OF THE GUILD OBJECT AND NOT OF
             // `guild_member`. Guild::Create and Guild::AddMember write their
             // rows through a CharacterDatabase transaction, which commits on
