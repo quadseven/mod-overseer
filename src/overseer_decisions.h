@@ -1632,6 +1632,58 @@ bool FootingSampleHolds(float fromZ, float toZ, float maxDrop, float maxRise);
 // core's slime damage is disabled).
 bool StepLiquidIsLethal(float depthYards, uint32_t liquidTypeMask);
 
+// WHERE A CHARACTER STANDING IN LAVA WALKS TO (wow-overseer#2886).
+//
+// Ring by ring from the feet, `strideYards` apart out to `maxYards`, `bearings`
+// samples round each ring, the nearest sample that has ground and is not lethal
+// liquid wins. Among one ring the sample nearest the feet in height wins, so a
+// shore flat beats a ledge. `surface` is the adapter's SurfaceAt. Nothing
+// found, or settings that cannot search, answer found = false: a caller never
+// walks to a point this did not measure.
+struct WadeOutPick
+{
+    bool found = false;
+    float x = 0.f;
+    float y = 0.f;
+    float z = 0.f;
+    float yards = 0.f;
+};
+template <class SurfaceFn>
+WadeOutPick PickWadeOut(float fromX, float fromY, float fromZ, float maxYards,
+                        float strideYards, unsigned bearings, SurfaceFn&& surface)
+{
+    WadeOutPick pick;
+    if (bearings == 0 || strideYards <= 0.f)
+        return pick;
+    for (float r = strideYards; r <= maxYards; r += strideYards)
+    {
+        float bestRise = 0.f;
+        for (unsigned k = 0; k < bearings; ++k)
+        {
+            float const angle = 6.28318531f * static_cast<float>(k) / static_cast<float>(bearings);
+            float const x = fromX + r * std::cos(angle);
+            float const y = fromY + r * std::sin(angle);
+            float z = 0.f;
+            bool lethal = false;
+            if (!surface(x, y, fromZ + 10.f, z, lethal) || lethal)
+                continue;
+            float const rise = z > fromZ ? z - fromZ : fromZ - z;
+            if (!pick.found || rise < bestRise)
+            {
+                pick.found = true;
+                pick.x = x;
+                pick.y = y;
+                pick.z = z;
+                pick.yards = r;
+                bestRise = rise;
+            }
+        }
+        if (pick.found)
+            return pick;
+    }
+    return pick;
+}
+
 // IS THIS STRIDE REFUSED FOR LANDING IN LETHAL LIQUID, GIVEN WHERE THE
 // CHARACTER ALREADY STANDS (#1569)? A character whose own feet are in lethal
 // liquid is exempt, so it can wade out instead of being held in the pool and
@@ -17055,6 +17107,10 @@ struct HeldStillFacts
     // thirty yards and has just that moment stopped. A distance from a place
     // this module chose is a fact about the hold rather than about a flag.
     float driftYards{0.f};
+    // THE FEET ARE IN LETHAL LIQUID (wow-overseer#2886). A hold that pinned a
+    // character in lava would be this module standing it still while it burns,
+    // so the pin is never re-taken there; the wade-out walks it to dry ground.
+    bool feetInLethalLiquid{false};
 };
 
 // Does the hold have to be re-taken on this tick?
