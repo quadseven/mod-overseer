@@ -26483,6 +26483,49 @@ bool IsLeaveGroupRow(std::string const& command)
     return words.size() == 1 && words[0] == LEAVE_GROUP_VERB;
 }
 
+bool ParseObserveRow(std::string const& command, ObserveRow& out)
+{
+    out = ObserveRow{};
+    std::vector<std::string> words = GuildFinderWords(command);
+    if (words.empty())
+        return false;
+    if (!words[0].empty() && words[0][0] == '.')
+        words[0].erase(0, 1);
+    std::string const name = words.size() == 2 ? words[1] : std::string();
+    for (std::string& w : words)
+        for (char& ch : w)
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (words.size() == 2 && words[0] == "appear")
+    {
+        if (name.size() < 2 || name.size() > 12)
+            return false;
+        for (char ch : name)
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')))
+                return false;
+        out.verb = ObserveVerb::Appear;
+        out.name = name;
+        return true;
+    }
+    if (words.size() == 3 && words[0] == "instance" && words[1] == "unbind" && words[2] == "all")
+        out.verb = ObserveVerb::UnbindAll;
+    else if (words.size() == 2 && words[0] == "tele" && words[1] == "stormwind")
+        out.verb = ObserveVerb::Hop;
+    else if (words.size() == 2 && words[0] == "gm" && words[1] == "on")
+        out.verb = ObserveVerb::GmOn;
+    else if (words.size() == 3 && words[0] == "gm" && words[1] == "visible" && words[2] == "off")
+        out.verb = ObserveVerb::GmHidden;
+    return out.verb != ObserveVerb::None;
+}
+
+char const* ObserveGate(ObserveFacts const& facts)
+{
+    if (facts.isBot)
+        return ObserveRefusal::NotAClient;
+    if (!facts.gameMasterAccount)
+        return ObserveRefusal::NotAGameMaster;
+    return "";
+}
+
 char const* LeaveGroupGate(LeaveGroupFacts const& facts)
 {
     namespace R = LeaveGroupRefusal;

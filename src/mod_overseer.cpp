@@ -67148,7 +67148,7 @@ private:
             else if (kind == "chat")
                 detail = DoChat(player, channel, command, targetArg, status);
             else if (kind == "gm")
-                detail = DoGmCommand();
+                detail = DoGmCommand(player, command, status, rowResult);
             else if (kind == "probe")
                 detail = DoProbe(player, command, status, rowResult);
             else if (kind == "give")
@@ -68408,10 +68408,131 @@ private:
     // module does not carry one. So it takes no character and no command, and
     // the row is answered with the caller's default status, `error`, and this
     // reason: nothing was delivered, so nothing reports `delivered`.
-    static char const* DoGmCommand()
+    //
+    // THE ONE EXCEPTION IS THE CAMERA (2026-11-18). The operator's Watcher is a
+    // real client on a game master account, never a bot and never a member. A
+    // person at that client types `.appear <name>` to stand beside somebody,
+    // and the control plane does exactly that for the stream the operator
+    // watches; retiring the verb for everyone left the camera standing where it
+    // logged in while the site said it was watching. So for a character that
+    // is not a bot, on a game master account, the observer lines below run
+    // (see ParseObserveRow), and for anyone else the answer is the one above,
+    // unchanged.
+    char const* DoGmCommand(Player* who, std::string const& command, char const*& status,
+                            std::string& out)
     {
-        return "kind='gm' is retired: this module runs no dot-command on any character, "
-               "because a member gains nothing it did not earn";
+        namespace D = OverseerDecisions;
+        static char const* const retired =
+            "kind='gm' is retired: this module runs no dot-command on any character, "
+            "because a member gains nothing it did not earn";
+        D::ObserveRow row;
+        if (!D::ParseObserveRow(command, row))
+            return retired;
+        D::ObserveFacts facts;
+        facts.isBot = GET_PLAYERBOT_AI(who) != nullptr;
+        facts.gameMasterAccount =
+            who->GetSession() && who->GetSession()->GetSecurity() >= SEC_GAMEMASTER;
+        if (char const* wall = D::ObserveGate(facts); *wall)
+        {
+            // A bot or a player account gets the old answer, not a new door.
+            LOG_INFO("module.overseer", "overseer: observer line '{}' for '{}' refused - {}", command,
+                     who->GetName(), wall);
+            return retired;
+        }
+        // The observer is a GM for the entry checks: MapMgr::PlayerCannotEnter
+        // lets a game master past level, key, full-instance and raid-in-combat.
+        who->SetGameMaster(true);
+        switch (row.verb)
+        {
+            case D::ObserveVerb::GmOn:
+                status = "applied";
+                return "";
+            case D::ObserveVerb::GmHidden:
+                who->SetGMVisible(false);
+                status = "applied";
+                return "";
+            case D::ObserveVerb::UnbindAll:
+            {
+                // What `.instance unbind all` does: every bind but the map the
+                // GM stands in, so it cannot be run from inside the one it is in.
+                std::vector<std::pair<uint32, Difficulty>> drop;
+                for (uint8 i = 0; i < MAX_DIFFICULTY; ++i)
+                {
+                    BoundInstancesMap const& binds =
+                        sInstanceSaveMgr->PlayerGetBoundInstances(who->GetGUID(), Difficulty(i));
+                    for (auto const& bind : binds)
+                        if (bind.first != who->GetMapId())
+                            drop.emplace_back(bind.first, Difficulty(i));
+                }
+                for (auto const& [mapId, diff] : drop)
+                    sInstanceSaveMgr->PlayerUnbindInstance(who->GetGUID(), mapId, diff, true, who);
+                out = "{\"unbound\":" + std::to_string(drop.size()) + "}";
+                status = "applied";
+                return "";
+            }
+            case D::ObserveVerb::Hop:
+            {
+                // Stormwind, the core's own `stormwind` tele: Eastern Kingdoms,
+                // never an instance, so the instance copy is let go.
+                // natural-only: moves only the camera (a game master account's client), never a member.
+                bool const sent = who->TeleportTo(0, -8842.09f, 626.358f, 94.0867f, 3.61363f);
+                status = sent ? "applied" : "error";
+                return sent ? "" : "the teleport was refused";
+            }
+            case D::ObserveVerb::Appear:
+            {
+                Player* const target = ObjectAccessor::FindPlayerByName(row.name);
+                if (!target || !target->IsInWorld() || !target->GetMap())
+                {
+                    status = "error";
+                    return "the target is not in the world";
+                }
+                if (target == who)
+                {
+                    status = "error";
+                    return "the target is the camera itself";
+                }
+                Map* const map = target->GetMap();
+                if (map->IsNonRaidDungeon() || map->IsRaid())
+                {
+                    // `.appear` into an instance: bind the GM to the target's
+                    // copy when it holds no bind for that map and difficulty (a
+                    // bind it already holds wins, hence the unbind line first),
+                    // and take the target's difficulty.
+                    if (who->GetGroup())
+                    {
+                        status = "error";
+                        return "the camera is in a group; it must leave before it can follow into an instance";
+                    }
+                    Difficulty const diff = map->IsRaid() ? target->GetRaidDifficulty()
+                                                          : target->GetDungeonDifficulty();
+                    if (!sInstanceSaveMgr->PlayerGetBoundInstance(who->GetGUID(), map->GetId(), diff))
+                        if (InstanceSave* const save = sInstanceSaveMgr->GetInstanceSave(map->GetInstanceId()))
+                            sInstanceSaveMgr->PlayerBindToInstance(who->GetGUID(), save, !save->CanReset(), who);
+                    if (map->IsRaid())
+                        who->SetRaidDifficulty(diff);
+                    else
+                        who->SetDungeonDifficulty(diff);
+                }
+                // natural-only: moves only the camera (a game master account's client), never a member.
+                bool const sent = who->TeleportTo(map->GetId(), target->GetPositionX(),
+                                                  target->GetPositionY(), target->GetPositionZ(),
+                                                  who->GetOrientation(), TELE_TO_GM_MODE);
+                {
+                    std::ostringstream o;
+                    o << "{\"map\":" << map->GetId() << ",\"instance\":" << map->GetInstanceId() << '}';
+                    out = o.str();
+                }
+                LOG_INFO("module.overseer", "overseer: the observer '{}' goes to '{}' on map {} instance {}: {}",
+                         who->GetName(), row.name, map->GetId(), map->GetInstanceId(),
+                         sent ? "sent" : "refused");
+                status = sent ? "applied" : "error";
+                return sent ? "" : "the teleport was refused";
+            }
+            case D::ObserveVerb::None:
+                break;
+        }
+        return retired;
     }
 
     // ---------------------------------------------------------------- give --
