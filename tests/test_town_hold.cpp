@@ -120,9 +120,9 @@ void ACutOffFollowerInTownStaysUnlessItHasAnErrand()
           false);
 }
 
-// Measured on the dev realm 2026-11-18: a family on `craft` stood in town, the
-// leader kept `new rpg` (granted under the quest drive's ask) and flew to a
-// quest camp 10000 yards away on a taxi nothing issued.
+// A family on `craft` stands in town; its leader must not keep `new rpg` under
+// the quest drive's ask and fly off alone to a far quest camp on a taxi nothing
+// issued.
 void ACraftingFamilyWaitsInTownToo()
 {
     Check("craft is not the town run job", HoldsInTown("craft"), false);
