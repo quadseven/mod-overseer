@@ -120,6 +120,22 @@ void ACutOffFollowerInTownStaysUnlessItHasAnErrand()
           false);
 }
 
+// Measured on the dev realm 2026-11-18: a family on `craft` stood in town, the
+// leader kept `new rpg` (granted under the quest drive's ask) and flew to a
+// quest camp 10000 yards away on a taxi nothing issued.
+void ACraftingFamilyWaitsInTownToo()
+{
+    Check("craft is not the town run job", HoldsInTown("craft"), false);
+    Check("craft job", OverseerDecisions::IsCraftJob("craft"), true);
+    Check("quest is not craft", OverseerDecisions::IsCraftJob("quest"), false);
+    Check("empty is not craft", OverseerDecisions::IsCraftJob(""), false);
+    Check("only the leader crafts", FamilyHoldsInTown({"craft", "", "", "", ""}), true);
+    Check("only a follower crafts", FamilyHoldsInTown({"quest", "craft"}), true);
+    Check("all five craft", FamilyHoldsInTown({"craft", "craft", "craft", "craft", "craft"}),
+          true);
+    Check("a dungeon is not craft", FamilyHoldsInTown({"dungeon:ragefire"}), false);
+}
+
 std::string ReadModule()
 {
     std::ifstream source("src/mod_overseer.cpp");
@@ -201,6 +217,7 @@ int main()
     ALeaderInTownCarriesItOnlyToWalkAnErrand();
     AQuestingCutOffFollowerRoamsAsBefore();
     ACutOffFollowerInTownStaysUnlessItHasAnErrand();
+    ACraftingFamilyWaitsInTownToo();
     TheModuleAsksInTheThreePlaces();
     AnArrivalInTownKeepsTheLeaderWhereItLanded();
 

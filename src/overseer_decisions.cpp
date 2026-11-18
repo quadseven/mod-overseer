@@ -8268,9 +8268,14 @@ bool HoldsInTown(std::string const& job)
 bool FamilyHoldsInTown(std::vector<std::string> const& jobs)
 {
     for (std::string const& job : jobs)
-        if (HoldsInTown(job) || IsFarmJob(job))
+        if (HoldsInTown(job) || IsFarmJob(job) || IsCraftJob(job))
             return true;
     return false;
+}
+
+bool IsCraftJob(std::string const& job)
+{
+    return job == "craft";
 }
 
 bool IsFarmJob(std::string const& job)
