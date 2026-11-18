@@ -50558,13 +50558,11 @@ private:
     // inside the quarter hour used to have the new run's group disbanded under
     // it.
     //
-    // A ROW A ROLL ALREADY ENDED IS READ TOO (wow-overseer#789): one released
-    // as `lost at the restart` or ended as `restart:` in the last three hours.
-    // Its group lives in the database and the stray that would have disbanded
-    // it lived in the last process's memory, so a second roll inside the
-    // quarter hour left it for ever. And a stray is read through any of its
-    // members, not the tank alone (OverseerDecisions::GuildRunStrayLookAt): a
-    // run lost because its tank never came back left the rest in the group.
+    // A ROW A ROLL ALREADY ENDED IS READ TOO (wow-overseer#789): a finder group
+    // can outlive its run row indefinitely. Read the newest restart-ended
+    // row for each tank, not just recent rows, or a later process will never
+    // discover a group left by an older roll. The stray is read through any
+    // of its members, not the tank alone (OverseerDecisions::GuildRunStrayLookAt).
     void DriveGuildRunStrays(std::time_t now)
     {
         if (!_guildRunStraysRead)
@@ -50577,7 +50575,10 @@ private:
                     "AND ((status IN ('claimed', 'verifying') AND claimed_by <> '{}' "
                     "AND created_at > NOW() - INTERVAL {} SECOND) "
                     "OR (status = 'error' AND (detail LIKE 'lost at the restart:%' "
-                    "OR detail LIKE 'restart:%') AND updated_at > NOW() - INTERVAL 3 HOUR))",
+                    "OR detail LIKE 'restart:%') AND id IN (SELECT MAX(id) FROM overseer_command "
+                    "WHERE kind = 'guild' AND command LIKE 'finder-run %' AND status = 'error' "
+                    "AND (detail LIKE 'lost at the restart:%' OR detail LIKE 'restart:%') "
+                    "GROUP BY target_name)))",
                     g_runToken, OverseerDecisions::GUILD_RUN_RESTART_WINDOW_SECONDS))
                 do
                 {
