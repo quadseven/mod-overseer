@@ -6592,6 +6592,10 @@ public:
         // DriveTravel tells "this character is walking to a flight master I
         // sent it to" from "this character is walking to its errand".
         time_t flightSince{0};
+        // How far the flight master was when the leg was issued, or -1 when it
+        // was not recorded. A leg only ever gets nearer; one that is far past
+        // this has been carried off (FlightLegStrayed).
+        float flightMasterYards{-1.f};
         // "Already said why this errand is not flying", so a character that
         // would fly but holds no node for some hop of the route says so once
         // per errand rather than every fifteen seconds. Reported rather than
@@ -20813,6 +20817,8 @@ private:
                             _travelAims.StateFor(seat.read.name);
                         theirs.flights++;
                         theirs.flightSince = std::time(nullptr);
+                        theirs.flightMasterYards = seat.who->GetDistance2d(
+                            seat.fmPos.GetPositionX(), seat.fmPos.GetPositionY());
                         if (!flying.empty())
                             flying += ", ";
                         flying += '\'' + seat.read.name + '\'';
@@ -20835,6 +20841,7 @@ private:
                 chasing->second.flew = true;
             state.flights++;
             state.flightSince = std::time(nullptr);
+            state.flightMasterYards = toMaster;
             LOG_INFO("module.overseer",
                      "overseer: '{}' is sent to '{}' {} yards away and flies instead - "
                      "node {} to node {} in {} hops for {} copper, boarding at flight "
@@ -31480,6 +31487,38 @@ private:
             if (state.flightSince)
             {
                 if (botAI->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT)  // NewRpgInfo.h:99
+                {
+                    // A LEG A PORTAL HAS CARRIED AWAY FROM ITS MASTER. Upstream
+                    // leaves this status only when a flight ends, so a party
+                    // sent to a flight master and then portalled across the
+                    // continent stays aimed at the first master, 2000 yards
+                    // behind it, for the whole backstop below. Measured: a
+                    // 2170 yard straight spline over the hills that the
+                    // airborne guard had to stop. Not while flying, and the
+                    // walk below is re-issued on this same poll.
+                    if (auto const* const flightLeg =
+                            std::get_if<NewRpgInfo::TravelFlight>(&botAI->rpgInfo.data);
+                        flightLeg && !bot->IsInFlight() &&
+                        OverseerDecisions::FlightLegStrayed(
+                            bot->GetDistance2d(flightLeg->flightMasterPos.GetPositionX(),
+                                               flightLeg->flightMasterPos.GetPositionY()),
+                            state.flightMasterYards))
+                    {
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' was {:.0f} yards from its flight master when "
+                                 "the flight was issued and is {:.0f} now - something carried "
+                                 "it off (a portal, most likely), so the flight is given up and "
+                                 "the walk to '{}' goes on from here",
+                                 name, state.flightMasterYards,
+                                 bot->GetDistance2d(flightLeg->flightMasterPos.GetPositionX(),
+                                                    flightLeg->flightMasterPos.GetPositionY()),
+                                 target);
+                        botAI->rpgInfo.ChangeToIdle();  // NewRpgInfo.h:110
+                        state.flightSince = 0;
+                        state.flightMasterYards = -1.f;
+                    }
+                }
+                if (state.flightSince && botAI->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT)
                 {
                     state.progress.since = std::time(nullptr);
                     if (std::time(nullptr) - state.flightSince <=

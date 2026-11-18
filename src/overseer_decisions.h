@@ -31356,6 +31356,20 @@ struct AirborneVerdict
 AirborneVerdict AirborneGuardStep(AirborneGuardState& state, AirborneFacts const& facts,
                                   AirborneGuardLimits const& limits, time_t now);
 
+// A FLIGHT LEG THAT SOMETHING ELSE HAS CARRIED AWAY FROM ITS FLIGHT MASTER.
+// Upstream's travel flight status ends only when a flight does, so a party
+// that is sent to a flight master and then portalled to another city is still
+// aimed at the first master, thousands of yards off. Measured: 575 yards at
+// issue, about 2300 after a mage portal, then a straight spline 2170 yards
+// long across the hills. A leg only ever gets nearer its master, give or take
+// a detour round a hill, so one that is further off than it started by more
+// than this has been moved by something other than its own walk.
+constexpr float FLIGHT_LEG_STRAY_YARDS = 400.f;
+
+// `yardsAtIssue` below zero means the distance was never recorded, and then
+// nothing is guessed.
+bool FlightLegStrayed(float yardsNow, float yardsAtIssue);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
