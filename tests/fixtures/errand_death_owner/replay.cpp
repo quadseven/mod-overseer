@@ -34,6 +34,7 @@ struct Book
     std::map<std::string, State> _state;
     std::map<std::string, ErrandEnd> _lastEnd;
     std::map<std::string, Landing> _landed;
+    std::map<std::string, LandedPointState> _landedPoints;
     uint64_t _endSerial{0};
     unsigned persisted{0};
     OverseerMovement::InMemoryAimColumn column;

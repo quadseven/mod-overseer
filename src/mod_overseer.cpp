@@ -7137,9 +7137,33 @@ public:
                      "write - {} and this book did not claim the aim it would "
                      "have erased",
                      name, released.fence);
-            if (wasDriving)
+            // AN ARRIVED POINT NOBODY CLEARS IS A LATCH, NOT AN ERRAND. See
+            // OverseerDecisions::LandedPointAimStep: the same aim reached again
+            // after the stand-down, with the bridge having had its minutes to
+            // end it, is cleared by compare-and-swap so the claims queued
+            // behind it are not refused as a stranger's errand for ever.
+            // `learn_skill` is left pending.
+            bool const arrived = why.find("(arrived)") != std::string::npos;
+            if (wasDriving && arrived &&
+                OverseerDecisions::LandedPointAimStep(_landedPoints[name], standing,
+                                                      static_cast<int64_t>(std::time(nullptr))))
+            {
+                MovementOwner().ClearPoisonedAim(name, standing);
+                _lastEnd[name] = ErrandEnd{"a point aim reached again and never cleared by the "
+                                           "pass that wrote it",
+                                           false, standing, _lastEnd[name].serial};
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' has reached '{}' more than once and nothing wrote "
+                         "anything else - an errand that has finished does not hold the travel "
+                         "column, so the aim is cleared. A pending trainer trip is left pending "
+                         "and is walked once the column is free",
+                         name, standing);
+            }
+            else if (wasDriving)
                 _landed[name] = Landing{standing, std::time(nullptr), false};
         }
+        else
+            _landedPoints.erase(name);
         // THE CLOCK DIES WITH THE ERRAND (PR #2840 review). `since` is the
         // twenty-minute backstop, and a state entry outliving its errand is
         // inherited by the NEXT errand at the same target - which is then
@@ -7706,6 +7730,9 @@ private:
     // THE POISON-AIM BREAKER'S COUNT (#824), per character. See
     // OverseerDecisions::PoisonAimStep. Bounded at the size of the roster.
     std::map<std::string, OverseerDecisions::PoisonAimState> _poisonAims;
+    // Arrivals at one unclaimed point aim, counted by LandedPointAimStep. Bounded at the
+    // size of the roster.
+    std::map<std::string, OverseerDecisions::LandedPointState> _landedPoints;
     // The last aim Claim wrote for each character, never erased (#824).
     struct LastWrite
     {
