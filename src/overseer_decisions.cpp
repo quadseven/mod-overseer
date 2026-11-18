@@ -261,7 +261,10 @@ std::string NewRpgDeathTarget(std::string const& kind, std::uint32_t mapId, floa
         return "entry " + std::to_string(id);
     if (kind == "quest")
         return "quest " + std::to_string(id);
-    return "";
+    if (kind.empty() || kind == "none")
+        return "";
+    // A misspelt kind must show in the line, not drop the target silently.
+    return "unknown target kind '" + kind + "'";
 }
 
 std::string NewRpgDeathLine(std::string const& name, std::uint32_t level, std::uint32_t mapId,

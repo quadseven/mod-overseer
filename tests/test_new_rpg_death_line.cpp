@@ -66,6 +66,8 @@ int main()
 
     // Nothing to name.
     CheckText("no target", NewRpgDeathTarget("none", 0, 0.f, 0.f, 0.f, 0), "");
+    CheckText("a misspelt kind is named, not dropped",
+              NewRpgDeathTarget("positon", 1, 0.f, 0.f, 0.f, 0), "unknown target kind 'positon'");
 
     // The whole line.
     CheckText("a line with a target",
@@ -97,6 +99,9 @@ int main()
         hook == std::string::npos ? std::string() : text.substr(hook, hookEnd - hook);
     Check("the death hook logs the status line",
           body.find("LogNewRpgDeath(player)") != std::string::npos, true);
+    std::size_t const guard = body.find("if (OnRoster(player->GetName()) || InNaturalGuild(player))");
+    Check("and only for a roster or guild member",
+          guard != std::string::npos && guard < body.find("LogNewRpgDeath(player)"), true);
     std::size_t const helper = text.find("static void LogNewRpgDeath(Player* player)");
     std::size_t const helperEnd = helper == std::string::npos ? helper : text.find("\n}\n", helper);
     std::string const helperBody =
