@@ -26633,6 +26633,11 @@ char const* ObserveGate(ObserveFacts const& facts)
     return "";
 }
 
+bool ObserveIsBot(bool headlessSession, bool /*hasPlayerbotAI*/)
+{
+    return headlessSession;
+}
+
 char const* LeaveGroupGate(LeaveGroupFacts const& facts)
 {
     namespace R = LeaveGroupRefusal;
