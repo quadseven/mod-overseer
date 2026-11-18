@@ -21759,6 +21759,12 @@ bool ExitHearthStopIsStuck(long secondsReadAsMoving)
     return secondsReadAsMoving >= EXIT_HEARTH_STOP_STUCK_SECONDS;
 }
 
+bool HearthMovingIsStale(bool splineInFlight, MoveGenerator generator)
+{
+    return !splineInFlight &&
+           (generator == MoveGenerator::Idle || generator == MoveGenerator::Unsampled);
+}
+
 bool GroundGaveUpDuringWalk(std::int64_t walkSince, std::int64_t groundGaveUpAt)
 {
     return walkSince > 0 && groundGaveUpAt >= walkSince;

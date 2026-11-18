@@ -79640,6 +79640,34 @@ private:
         // arrives at a character that is standing, because the hold outlives
         // this row by its own ceiling and this module's roster sweep will not
         // undo it.
+        //
+        // A FLAG NOTHING IS DRIVING IS CLEARED, NOT HELD. A member read as moving
+        // with no spline in flight and an idle (or no) motion generator is not
+        // being walked by anything: the hold cannot make it stand because it is
+        // already still, and the refusal repeated for as long as the flag stood
+        // (eight rows in a row on one member). Clear the flag and cast. A member
+        // that really is moving keeps the refusal and the hold below.
+        if (who->isMoving())
+        {
+            MotionMaster* const motion = who->GetMotionMaster();
+            bool const splineInFlight = who->movespline && !who->movespline->Finalized();
+            OverseerDecisions::MoveGenerator const generator =
+                motion ? FoldMovementGenerator(motion->GetCurrentMovementGeneratorType())
+                       : OverseerDecisions::MoveGenerator::Unsampled;
+            if (OverseerDecisions::HearthMovingIsStale(splineInFlight, generator))
+            {
+                static std::set<std::string> said;
+                if (said.insert(ev.character).second)
+                    LOG_WARN("module.overseer",
+                             "overseer: HEARTH - '{}' read as moving with no spline in flight: "
+                             "movement flags 0x{:x}, active motion type {}; clearing the moving "
+                             "flag and casting",
+                             ev.character, static_cast<uint32>(who->GetUnitMovementFlags()),
+                             motion ? static_cast<uint32>(motion->GetCurrentMovementGeneratorType())
+                                    : 0u);
+                who->RemoveUnitMovementFlag(MOVEMENTFLAG_MASK_MOVING);
+            }
+        }
         if (who->isMoving())
         {
             HoldStillAndReport(who, ev.character, "hearth", ev.hold);

@@ -24267,6 +24267,14 @@ ExitHearthStep ExitFailureHearthStep(ExitHearthFacts const& facts,
 constexpr long EXIT_HEARTH_STOP_STUCK_SECONDS = 20;
 bool ExitHearthStopIsStuck(long secondsReadAsMoving);
 
+// A MOVING FLAG NOTHING IS DRIVING IS NOT A REASON TO REFUSE A HEARTH. The hearth
+// verb refused "character is moving" and held the member still, and a member
+// whose flag was stale (no spline in flight, an idle or absent motion
+// generator) never stood, so eight asks in a row were refused and it kept
+// dying in the zone it was asked to leave. Stale means there is nothing to
+// stop: the flag is cleared and the cast goes on. A real walk keeps the refusal.
+bool HearthMovingIsStale(bool splineInFlight, MoveGenerator generator);
+
 // The word the log and the run timeline use for a step.
 char const* ExitHearthStepWord(ExitHearthStep step);
 
