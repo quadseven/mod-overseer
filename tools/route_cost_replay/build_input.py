@@ -34,9 +34,13 @@ def _rows(path: Path, width: int) -> list[list[str]]:
 def read_factions(path: Path) -> list[dict[str, object]]:
     """Parse FactionTemplate.dbc (14 uint32 fields per record)."""
     data = path.read_bytes()
+    if len(data) < 20:
+        raise ValueError("FactionTemplate.dbc is truncated")
     magic, count, fields, record_size, _ = struct.unpack("<4s4I", data[:20])
     if magic != b"WDBC" or fields != 14 or record_size != 56:
         raise ValueError("FactionTemplate.dbc has an unexpected layout")
+    if len(data) < 20 + count * record_size:
+        raise ValueError("FactionTemplate.dbc is truncated")
     out = []
     for index in range(count):
         row = struct.unpack_from("<14I", data, 20 + index * record_size)
