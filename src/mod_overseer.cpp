@@ -21259,6 +21259,8 @@ private:
             OverseerDecisions::GearReadItemSpells(GearItemSpellsOf(proto));
         for (OverseerDecisions::GearStat const& stat : equip.stats)
             item.stats.push_back(stat);
+        item.unreadReasons.insert(item.unreadReasons.end(), equip.unreadReasons.begin(),
+                                  equip.unreadReasons.end());
         item.hasEffect = equip.unresolved;
 
         // A ROLLED STAT IS A STAT, and nothing about one is different for
@@ -21266,6 +21268,8 @@ private:
         // so it joins the same list and is weighed by the same weights.
         for (OverseerDecisions::GearStat const& stat : random.stats)
             item.stats.push_back(stat);
+        item.unreadReasons.insert(item.unreadReasons.end(), random.unreadReasons.begin(),
+                                  random.unreadReasons.end());
         item.unresolvedRandomProperty = random.unresolved;
         return item;
     }
@@ -21471,10 +21475,11 @@ private:
             if (SayGearOnce(who.name, oneHand->GetEntry()))
                 LOG_INFO("module.overseer",
                          "overseer: '{}' is a tank holding {} in both hands, and whether {} "
-                         "and {} beat it cannot be settled from the numbers - {} - so the "
+                         "and {} beat it cannot be settled from the numbers - carried: {} - "
+                         "worn: {} - so the "
                          "two-hander stays",
                          who.name, heldProto->Name1, oneHand->GetTemplate()->Name1,
-                         shield->GetTemplate()->Name1, pair.why);
+                         shield->GetTemplate()->Name1, pair.why, worn.why);
             return false;
         }
 
@@ -21731,9 +21736,10 @@ private:
                 if (SayGearOnce(who.name, item->GetEntry()))
                     LOG_INFO("module.overseer",
                              "overseer: '{}' is carrying {}, and whether it beats the {} it "
-                             "is wearing cannot be settled from the numbers - {} - so it "
-                             "stays in the bags",
-                             who.name, proto->Name1, GearSlotName(target), candidate.why);
+                             "is wearing cannot be settled from the numbers - carried: {} - "
+                             "worn: {} - so it stays in the bags",
+                             who.name, proto->Name1, GearSlotName(target), candidate.why,
+                             incumbent.why);
                 continue;
             }
 

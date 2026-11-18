@@ -128,7 +128,7 @@ GearVerdict Verdict(float score, GearConfidence confidence)
 
 GearIncumbentScore Incumbent(float score, GearConfidence confidence)
 {
-    return GearIncumbentScore{score, confidence};
+    return GearIncumbentScore{score, confidence, {}};
 }
 
 // ---------------------------------------------------------------------------

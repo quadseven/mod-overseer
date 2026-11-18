@@ -304,8 +304,13 @@ void AFloorThatDoesNotClearIsStillUndecided()
     GearItem candidate = worn;
     candidate.name = "a chest whose property is an on-equip spell";
     candidate.armour = 100;
-    candidate.unresolvedRandomProperty =
-        GearReadRandomProperty({Effect(TYPE_EQUIP_SPELL, 0, 7701)}, true).unresolved;
+    GearResolvedProperty const unreadRandom =
+        GearReadRandomProperty({Effect(TYPE_EQUIP_SPELL, 0, 7701)}, true);
+    candidate.unresolvedRandomProperty = unreadRandom.unresolved;
+    candidate.unreadReasons = unreadRandom.unreadReasons;
+    Expect("the random-property input says which effect was not priced",
+           unreadRandom.unreadReasons.size() == 1 &&
+               unreadRandom.unreadReasons[0] == "random property effect is not a priced stat");
 
     GearVerdict const wornVerdict = GearScore(worn, TheOneWearingIt());
     GearVerdict const candidateVerdict = GearScore(candidate, TheOneWearingIt());
