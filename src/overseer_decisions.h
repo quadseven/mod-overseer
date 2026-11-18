@@ -9228,8 +9228,7 @@ bool HoldsInTown(std::string const& job);
 // A CRAFTING FAMILY IS HELD THE SAME WAY. The `craft` job stands the quest drive
 // down and the crafters cast where they stand, but the leader kept `new rpg` and
 // the quest drive's intent still asked for him, so upstream's own status took
-// him by taxi to a far quest zone (a ten thousand yard flight with the four
-// others left in town, then a cross-swap as the family was sent after him).
+// him by taxi to a far quest zone with the rest of the family left in town.
 // Any craft row holds the family where its aims put it.
 bool FamilyHoldsInTown(std::vector<std::string> const& jobs);
 
