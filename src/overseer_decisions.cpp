@@ -11,6 +11,7 @@
 
 #include "overseer_decisions.h"
 
+#include <cstdio>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -245,6 +246,36 @@ std::string NameTheAttackers(std::vector<std::string> const& names)
 bool KeepsDeathHits(bool inDungeon, bool familyMember, bool naturalGuildMember)
 {
     return inDungeon || familyMember || naturalGuildMember;
+}
+
+std::string NewRpgDeathTarget(std::string const& kind, std::uint32_t mapId, float x, float y,
+                              float z, std::uint32_t id)
+{
+    char buffer[96];
+    if (kind == "position")
+    {
+        std::snprintf(buffer, sizeof buffer, "map %u (%.1f, %.1f, %.1f)", mapId, x, y, z);
+        return buffer;
+    }
+    if (kind == "entry")
+        return "entry " + std::to_string(id);
+    if (kind == "quest")
+        return "quest " + std::to_string(id);
+    return "";
+}
+
+std::string NewRpgDeathLine(std::string const& name, std::uint32_t level, std::uint32_t mapId,
+                            std::uint32_t zoneId, bool hasAi, std::string const& status,
+                            std::string const& target)
+{
+    std::string line = "death status - '" + name + "' (level " + std::to_string(level) +
+                       ") map " + std::to_string(mapId) + " zone " + std::to_string(zoneId) + ": ";
+    if (!hasAi)
+        return line + "no playerbot AI";
+    line += "new rpg status '" + (status.empty() ? std::string("unknown") : status) + "'";
+    if (!target.empty())
+        line += " heading to " + target;
+    return line;
 }
 
 DeathHitAccount AccountForDeathHits(DeathHitRing const& ring, std::int64_t deathMs)
