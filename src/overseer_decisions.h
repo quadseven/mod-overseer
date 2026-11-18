@@ -9144,7 +9144,18 @@ bool HoldsInTown(std::string const& job);
 // farm row stays where its aims put it, exactly as a family waiting in town
 // does, and every answer that reads this family's hold (the leader's grant,
 // the cut-off follower, the arrival strip, the unissued flight) treats it so.
+//
+// A CRAFTING FAMILY IS HELD THE SAME WAY. The `craft` job stands the quest drive
+// down and the crafters cast where they stand, but the leader kept `new rpg` and
+// the quest drive's intent still asked for him, so upstream's own status took
+// him by taxi to a far quest zone (a ten thousand yard flight with the four
+// others left in town, then a cross-swap as the family was sent after him).
+// Any craft row holds the family where its aims put it.
 bool FamilyHoldsInTown(std::vector<std::string> const& jobs);
+
+// Whether `job` is the crafting order (exact and lowercase, like every job
+// comparison here).
+bool IsCraftJob(std::string const& job);
 
 // Whether `job` is a farm order (#1521): `farm`, `farm:<item entry>` for a
 // named material, or `farm:mining` / `farm:herbalism` for skill. The entry is
