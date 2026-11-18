@@ -24257,6 +24257,8 @@ GuildRunVerdict GuildRunNext(GuildRunPoll const& poll)
         if (!fighting && !progressing)
             return GuildRunVerdict::TimedOut;
     }
+    if (poll.wipeLimit && poll.wipesSinceKill >= poll.wipeLimit)
+        return GuildRunVerdict::Wiped;
     if (poll.aliveInside == 0)
         return GuildRunNobodyAlive(poll);
     return GuildRunSeats(poll);

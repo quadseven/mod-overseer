@@ -47883,6 +47883,10 @@ private:
         std::time_t stillSince{0};
         std::time_t creditSince{0};
         std::time_t creditSeen{0};
+        // Full-party wipes since the last boss credit (GUILD_RUN_WIPE_LIMIT),
+        // and whether the party lies wiped now, so one wipe counts once.
+        unsigned wipesSinceKill{0};
+        bool wiped{false};
         unsigned stallSkips{0};
         // When the group split inside and has not closed up since (#1308).
         std::time_t splitSince{0};
@@ -49084,6 +49088,17 @@ private:
         bool const recovering = OverseerDecisions::GuildRunRecovering(
             poll.aliveInside, deadInside, poll.ghostsComingBack);
         run.recoverySince = recovering ? (run.recoverySince ? run.recoverySince : now) : 0;
+        // THE WIPE IS COUNTED ONCE, on the poll nobody is left alive inside.
+        bool const partyDown = poll.aliveInside == 0 && deadInside > 0;
+        if (partyDown && !run.wiped)
+        {
+            ++run.wipesSinceKill;
+            LOG_INFO("module.overseer",
+                     "overseer: guild run {} wipe {} of {} with no boss down in '{}'", run.id,
+                     run.wipesSinceKill, OverseerDecisions::GUILD_RUN_WIPE_LIMIT, run.keyword);
+        }
+        run.wiped = partyDown;
+        poll.wipesSinceKill = run.wipesSinceKill;
         poll.secondsRecovering =
             run.recoverySince ? static_cast<unsigned>(now - run.recoverySince) : 0;
 
@@ -49627,6 +49642,7 @@ private:
         if (run.lastKillAt != run.creditSeen)
         {
             run.creditSeen = run.lastKillAt;
+            run.wipesSinceKill = 0;
             run.stillSince = now;
             run.creditSince = now;
             run.stallSkips = 0;
@@ -50181,8 +50197,12 @@ private:
                                   : "every boss is down";
                         break;
                     case OverseerDecisions::GuildRunVerdict::Wiped:
-                        why = "everybody inside is dead, and nobody was back alive inside " +
-                              std::to_string(poll.secondsRecovering) + "s after the wipe";
+                        why = poll.wipeLimit && poll.wipesSinceKill >= poll.wipeLimit
+                                  ? "wiped " + std::to_string(poll.wipesSinceKill) +
+                                        " times with no boss down"
+                                  : "everybody inside is dead, and nobody was back alive inside " +
+                                        std::to_string(poll.secondsRecovering) +
+                                        "s after the wipe";
                         break;
                     case OverseerDecisions::GuildRunVerdict::Abandoned:
                         why = OverseerDecisions::GuildRunAbandonedWhy(

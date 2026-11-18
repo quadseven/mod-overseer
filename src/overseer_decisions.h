@@ -26543,6 +26543,15 @@ constexpr unsigned GUILD_RUN_ROLE_RECOVERY_SECONDS = 5 * 60;
 // not back within this window, counted from the wipe or the death.
 constexpr unsigned GUILD_RUN_RECOVERY_SECONDS = 15 * 60;
 
+// A RUN THAT KEEPS WIPING WITH NO BOSS DOWN IS OVER. Run 6257 (Scholomance,
+// level 60, 2026-11-18) wiped five times from 01:43 to 02:22 and a sixth at
+// 02:26, 28 deaths in 85 minutes with one boss down, and was pulled again
+// after every corpse run: each wipe was back inside the recovery window, the
+// module's 30 minute no-kill watchdog is re-armed by every cleared room, and
+// the ceiling is two hours. Five full-party wipes since the last boss credit
+// end the run (Wiped); a boss credit starts the count again. 0 turns it off.
+constexpr unsigned GUILD_RUN_WIPE_LIMIT = 5;
+
 struct GuildRunRecoveryFacts
 {
     unsigned aliveInside{0};
@@ -26765,6 +26774,10 @@ struct GuildRunPoll
     // Since the recovery began (GuildRunRecovering); 0 when none is under way.
     unsigned secondsRecovering{0};
     unsigned recoverySeconds{GUILD_RUN_RECOVERY_SECONDS};
+    // Full-party wipes (nobody alive inside, somebody dead there) since the
+    // run's last boss credit, and the count that ends it (GUILD_RUN_WIPE_LIMIT).
+    unsigned wipesSinceKill{0};
+    unsigned wipeLimit{GUILD_RUN_WIPE_LIMIT};
 };
 
 enum class GuildRunVerdict : std::uint8_t
