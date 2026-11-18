@@ -1,0 +1,1602 @@
+{
+ "source": "creature spawns joined to creature_template, zone from the .map area grid and AreaTable parent; hostile by FactionTemplate against player templates 1 (alliance) and 2 (horde); see tools/zone-band/README.md",
+ "percentiles": [
+  10,
+  90
+ ],
+ "families_stand_in": [
+  "0:8",
+  "0:41",
+  "0:44",
+  "0:46",
+  "0:1519"
+ ],
+ "zones": {
+  "0:1": {
+   "name": "Dun Morogh",
+   "alliance": {
+    "lo": 5,
+    "hi": 12,
+    "spawns": 619
+   },
+   "horde": {
+    "lo": 6,
+    "hi": 70,
+    "spawns": 1222
+   }
+  },
+  "0:3": {
+   "name": "Badlands",
+   "alliance": {
+    "lo": 35,
+    "hi": 44,
+    "spawns": 585
+   },
+   "horde": {
+    "lo": 35,
+    "hi": 44,
+    "spawns": 561
+   }
+  },
+  "0:4": {
+   "name": "Blasted Lands",
+   "alliance": {
+    "lo": 46,
+    "hi": 61,
+    "spawns": 437
+   },
+   "horde": {
+    "lo": 46,
+    "hi": 61,
+    "spawns": 609
+   }
+  },
+  "0:8": {
+   "name": "Swamp of Sorrows",
+   "alliance": {
+    "lo": 36,
+    "hi": 47,
+    "spawns": 643
+   },
+   "horde": {
+    "lo": 36,
+    "hi": 48,
+    "spawns": 701
+   }
+  },
+  "0:10": {
+   "name": "Duskwood",
+   "alliance": {
+    "lo": 19,
+    "hi": 30,
+    "spawns": 761
+   },
+   "horde": {
+    "lo": 19,
+    "hi": 30,
+    "spawns": 831
+   }
+  },
+  "0:11": {
+   "name": "Wetlands",
+   "alliance": {
+    "lo": 20,
+    "hi": 29,
+    "spawns": 1230
+   },
+   "horde": {
+    "lo": 20,
+    "hi": 30,
+    "spawns": 1348
+   }
+  },
+  "0:12": {
+   "name": "Elwynn Forest",
+   "alliance": {
+    "lo": 5,
+    "hi": 10,
+    "spawns": 848
+   },
+   "horde": {
+    "lo": 5,
+    "hi": 25,
+    "spawns": 1049
+   }
+  },
+  "0:28": {
+   "name": "Western Plaguelands",
+   "alliance": {
+    "lo": 50,
+    "hi": 57,
+    "spawns": 927
+   },
+   "horde": {
+    "lo": 50,
+    "hi": 57,
+    "spawns": 939
+   }
+  },
+  "0:33": {
+   "name": "Stranglethorn Vale",
+   "alliance": {
+    "lo": 32,
+    "hi": 44,
+    "spawns": 1464
+   },
+   "horde": {
+    "lo": 32,
+    "hi": 44,
+    "spawns": 1436
+   }
+  },
+  "0:36": {
+   "name": "Alterac Mountains",
+   "alliance": {
+    "lo": 25,
+    "hi": 40,
+    "spawns": 500
+   },
+   "horde": {
+    "lo": 30,
+    "hi": 40,
+    "spawns": 578
+   }
+  },
+  "0:38": {
+   "name": "Loch Modan",
+   "alliance": {
+    "lo": 10,
+    "hi": 36,
+    "spawns": 704
+   },
+   "horde": {
+    "lo": 10,
+    "hi": 36,
+    "spawns": 790
+   }
+  },
+  "0:40": {
+   "name": "Westfall",
+   "alliance": {
+    "lo": 11,
+    "hi": 18,
+    "spawns": 1134
+   },
+   "horde": {
+    "lo": 11,
+    "hi": 19,
+    "spawns": 1177
+   }
+  },
+  "0:41": {
+   "name": "Deadwind Pass",
+   "alliance": {
+    "lo": 55,
+    "hi": 70,
+    "spawns": 105
+   },
+   "horde": {
+    "lo": 55,
+    "hi": 70,
+    "spawns": 105
+   }
+  },
+  "0:44": {
+   "name": "Redridge Mountains",
+   "alliance": {
+    "lo": 16,
+    "hi": 25,
+    "spawns": 734
+   },
+   "horde": {
+    "lo": 16,
+    "hi": 26,
+    "spawns": 787
+   }
+  },
+  "0:45": {
+   "name": "Arathi Highlands",
+   "alliance": {
+    "lo": 30,
+    "hi": 39,
+    "spawns": 970
+   },
+   "horde": {
+    "lo": 30,
+    "hi": 39,
+    "spawns": 999
+   }
+  },
+  "0:46": {
+   "name": "Burning Steppes",
+   "alliance": {
+    "lo": 51,
+    "hi": 57,
+    "spawns": 480
+   },
+   "horde": {
+    "lo": 51,
+    "hi": 57,
+    "spawns": 486
+   }
+  },
+  "0:47": {
+   "name": "The Hinterlands",
+   "alliance": {
+    "lo": 42,
+    "hi": 51,
+    "spawns": 760
+   },
+   "horde": {
+    "lo": 42,
+    "hi": 51,
+    "spawns": 807
+   }
+  },
+  "0:51": {
+   "name": "Searing Gorge",
+   "alliance": {
+    "lo": 44,
+    "hi": 50,
+    "spawns": 375
+   },
+   "horde": {
+    "lo": 44,
+    "hi": 50,
+    "spawns": 377
+   }
+  },
+  "0:85": {
+   "name": "Tirisfal Glades",
+   "alliance": {
+    "lo": 5,
+    "hi": 75,
+    "spawns": 1710
+   },
+   "horde": {
+    "lo": 6,
+    "hi": 70,
+    "spawns": 1276
+   }
+  },
+  "0:130": {
+   "name": "Silverpine Forest",
+   "alliance": {
+    "lo": 11,
+    "hi": 20,
+    "spawns": 930
+   },
+   "horde": {
+    "lo": 11,
+    "hi": 19,
+    "spawns": 1107
+   }
+  },
+  "0:139": {
+   "name": "Eastern Plaguelands",
+   "alliance": {
+    "lo": 53,
+    "hi": 59,
+    "spawns": 1239
+   },
+   "horde": {
+    "lo": 53,
+    "hi": 59,
+    "spawns": 1259
+   }
+  },
+  "0:267": {
+   "name": "Hillsbrad Foothills",
+   "alliance": {
+    "lo": 20,
+    "hi": 32,
+    "spawns": 821
+   },
+   "horde": {
+    "lo": 21,
+    "hi": 32,
+    "spawns": 1016
+   }
+  },
+  "0:1519": {
+   "name": "Stormwind City",
+   "alliance": {
+    "lo": 50,
+    "hi": 80,
+    "spawns": 9
+   },
+   "horde": {
+    "lo": 15,
+    "hi": 75,
+    "spawns": 573
+   }
+  },
+  "1:14": {
+   "name": "Durotar",
+   "alliance": {
+    "lo": 5,
+    "hi": 70,
+    "spawns": 1072
+   },
+   "horde": {
+    "lo": 5,
+    "hi": 11,
+    "spawns": 822
+   }
+  },
+  "1:15": {
+   "name": "Dustwallow Marsh",
+   "alliance": {
+    "lo": 35,
+    "hi": 42,
+    "spawns": 1208
+   },
+   "horde": {
+    "lo": 35,
+    "hi": 42,
+    "spawns": 1350
+   }
+  },
+  "1:16": {
+   "name": "Azshara",
+   "alliance": {
+    "lo": 47,
+    "hi": 55,
+    "spawns": 1174
+   },
+   "horde": {
+    "lo": 47,
+    "hi": 55,
+    "spawns": 1173
+   }
+  },
+  "1:17": {
+   "name": "The Barrens",
+   "alliance": {
+    "lo": 11,
+    "hi": 27,
+    "spawns": 2458
+   },
+   "horde": {
+    "lo": 12,
+    "hi": 24,
+    "spawns": 2451
+   }
+  },
+  "1:141": {
+   "name": "Teldrassil",
+   "alliance": {
+    "lo": 5,
+    "hi": 10,
+    "spawns": 639
+   },
+   "horde": {
+    "lo": 5,
+    "hi": 13,
+    "spawns": 749
+   }
+  },
+  "1:148": {
+   "name": "Darkshore",
+   "alliance": {
+    "lo": 11,
+    "hi": 20,
+    "spawns": 1055
+   },
+   "horde": {
+    "lo": 11,
+    "hi": 20,
+    "spawns": 1123
+   }
+  },
+  "1:215": {
+   "name": "Mulgore",
+   "alliance": {
+    "lo": 5,
+    "hi": 10,
+    "spawns": 1119
+   },
+   "horde": {
+    "lo": 5,
+    "hi": 10,
+    "spawns": 1068
+   }
+  },
+  "1:331": {
+   "name": "Ashenvale",
+   "alliance": {
+    "lo": 19,
+    "hi": 30,
+    "spawns": 1412
+   },
+   "horde": {
+    "lo": 19,
+    "hi": 30,
+    "spawns": 1329
+   }
+  },
+  "1:357": {
+   "name": "Feralas",
+   "alliance": {
+    "lo": 41,
+    "hi": 54,
+    "spawns": 1483
+   },
+   "horde": {
+    "lo": 40,
+    "hi": 54,
+    "spawns": 1496
+   }
+  },
+  "1:361": {
+   "name": "Felwood",
+   "alliance": {
+    "lo": 47,
+    "hi": 54,
+    "spawns": 751
+   },
+   "horde": {
+    "lo": 47,
+    "hi": 54,
+    "spawns": 746
+   }
+  },
+  "1:400": {
+   "name": "Thousand Needles",
+   "alliance": {
+    "lo": 25,
+    "hi": 34,
+    "spawns": 668
+   },
+   "horde": {
+    "lo": 25,
+    "hi": 33,
+    "spawns": 616
+   }
+  },
+  "1:405": {
+   "name": "Desolace",
+   "alliance": {
+    "lo": 30,
+    "hi": 40,
+    "spawns": 1466
+   },
+   "horde": {
+    "lo": 30,
+    "hi": 39,
+    "spawns": 1436
+   }
+  },
+  "1:406": {
+   "name": "Stonetalon Mountains",
+   "alliance": {
+    "lo": 15,
+    "hi": 26,
+    "spawns": 767
+   },
+   "horde": {
+    "lo": 15,
+    "hi": 26,
+    "spawns": 812
+   }
+  },
+  "1:440": {
+   "name": "Tanaris",
+   "alliance": {
+    "lo": 42,
+    "hi": 50,
+    "spawns": 1703
+   },
+   "horde": {
+    "lo": 41,
+    "hi": 50,
+    "spawns": 1714
+   }
+  },
+  "1:490": {
+   "name": "Un'Goro Crater",
+   "alliance": {
+    "lo": 48,
+    "hi": 55,
+    "spawns": 657
+   },
+   "horde": {
+    "lo": 48,
+    "hi": 55,
+    "spawns": 660
+   }
+  },
+  "1:493": {
+   "name": "Moonglade",
+   "alliance": {
+    "lo": 53,
+    "hi": 80,
+    "spawns": 51
+   },
+   "horde": {
+    "lo": 53,
+    "hi": 80,
+    "spawns": 51
+   }
+  },
+  "1:618": {
+   "name": "Winterspring",
+   "alliance": {
+    "lo": 53,
+    "hi": 60,
+    "spawns": 897
+   },
+   "horde": {
+    "lo": 53,
+    "hi": 60,
+    "spawns": 906
+   }
+  },
+  "1:1377": {
+   "name": "Silithus",
+   "alliance": {
+    "lo": 55,
+    "hi": 60,
+    "spawns": 1342
+   },
+   "horde": {
+    "lo": 55,
+    "hi": 60,
+    "spawns": 1342
+   }
+  },
+  "1:1637": {
+   "name": "Orgrimmar",
+   "alliance": {
+    "lo": 1,
+    "hi": 75,
+    "spawns": 549
+   },
+   "horde": {
+    "lo": 60,
+    "hi": 80,
+    "spawns": 2
+   }
+  },
+  "1:1638": {
+   "name": "Thunder Bluff",
+   "alliance": {
+    "lo": 21,
+    "hi": 75,
+    "spawns": 256
+   },
+   "horde": {
+    "lo": 7,
+    "hi": 60,
+    "spawns": 13
+   }
+  },
+  "1:1657": {
+   "name": "Darnassus",
+   "alliance": {
+    "lo": 60,
+    "hi": 80,
+    "spawns": 2
+   },
+   "horde": {
+    "lo": 1,
+    "hi": 75,
+    "spawns": 284
+   }
+  },
+  "1:2557": {
+   "name": "Dire Maul",
+   "alliance": {
+    "lo": 52,
+    "hi": 60,
+    "spawns": 6
+   },
+   "horde": {
+    "lo": 52,
+    "hi": 60,
+    "spawns": 6
+   }
+  },
+  "33:209": {
+   "name": "Shadowfang Keep",
+   "alliance": {
+    "lo": 18,
+    "hi": 83,
+    "spawns": 187
+   },
+   "horde": {
+    "lo": 18,
+    "hi": 83,
+    "spawns": 187
+   }
+  },
+  "36:1581": {
+   "name": "The Deadmines",
+   "alliance": {
+    "lo": 17,
+    "hi": 20,
+    "spawns": 202
+   },
+   "horde": {
+    "lo": 17,
+    "hi": 20,
+    "spawns": 202
+   }
+  },
+  "47:491": {
+   "name": "Razorfen Kraul",
+   "alliance": {
+    "lo": 25,
+    "hi": 26,
+    "spawns": 187
+   },
+   "horde": {
+    "lo": 25,
+    "hi": 26,
+    "spawns": 188
+   }
+  },
+  "129:722": {
+   "name": "Razorfen Downs",
+   "alliance": {
+    "lo": 35,
+    "hi": 36,
+    "spawns": 205
+   },
+   "horde": {
+    "lo": 35,
+    "hi": 36,
+    "spawns": 205
+   }
+  },
+  "189:796": {
+   "name": "Scarlet Monastery",
+   "alliance": {
+    "lo": 30,
+    "hi": 39,
+    "spawns": 326
+   },
+   "horde": {
+    "lo": 30,
+    "hi": 39,
+    "spawns": 323
+   }
+  },
+  "209:1176": {
+   "name": "Zul'Farrak",
+   "alliance": {
+    "lo": 43,
+    "hi": 45,
+    "spawns": 197
+   },
+   "horde": {
+    "lo": 43,
+    "hi": 45,
+    "spawns": 197
+   }
+  },
+  "269:2366": {
+   "name": "The Black Morass",
+   "alliance": {
+    "lo": 67,
+    "hi": 68,
+    "spawns": 137
+   },
+   "horde": {
+    "lo": 67,
+    "hi": 68,
+    "spawns": 137
+   }
+  },
+  "289:2057": {
+   "name": "Scholomance",
+   "alliance": {
+    "lo": 57,
+    "hi": 60,
+    "spawns": 309
+   },
+   "horde": {
+    "lo": 57,
+    "hi": 60,
+    "spawns": 309
+   }
+  },
+  "309:1977": {
+   "name": "Zul'Gurub",
+   "alliance": {
+    "lo": 59,
+    "hi": 61,
+    "spawns": 798
+   },
+   "horde": {
+    "lo": 59,
+    "hi": 61,
+    "spawns": 798
+   }
+  },
+  "329:2017": {
+   "name": "Stratholme",
+   "alliance": {
+    "lo": 55,
+    "hi": 60,
+    "spawns": 439
+   },
+   "horde": {
+    "lo": 55,
+    "hi": 60,
+    "spawns": 439
+   }
+  },
+  "469:2677": {
+   "name": "Blackwing Lair",
+   "alliance": {
+    "lo": 60,
+    "hi": 62,
+    "spawns": 311
+   },
+   "horde": {
+    "lo": 60,
+    "hi": 62,
+    "spawns": 311
+   }
+  },
+  "509:3429": {
+   "name": "Ruins of Ahn'Qiraj",
+   "alliance": {
+    "lo": 60,
+    "hi": 61,
+    "spawns": 289
+   },
+   "horde": {
+    "lo": 60,
+    "hi": 61,
+    "spawns": 289
+   }
+  },
+  "529:3358": {
+   "name": "Arathi Basin",
+   "alliance": {
+    "lo": 1,
+    "hi": 1,
+    "spawns": 47
+   },
+   "horde": {
+    "lo": 1,
+    "hi": 1,
+    "spawns": 43
+   }
+  },
+  "530:3430": {
+   "name": "Eversong Woods",
+   "alliance": {
+    "lo": 5,
+    "hi": 20,
+    "spawns": 989
+   },
+   "horde": {
+    "lo": 5,
+    "hi": 10,
+    "spawns": 796
+   }
+  },
+  "530:3433": {
+   "name": "Ghostlands",
+   "alliance": {
+    "lo": 9,
+    "hi": 19,
+    "spawns": 1235
+   },
+   "horde": {
+    "lo": 9,
+    "hi": 19,
+    "spawns": 1240
+   }
+  },
+  "530:3455": {
+   "name": "The North Sea",
+   "alliance": {
+    "lo": 6,
+    "hi": 14,
+    "spawns": 29
+   },
+   "horde": {
+    "lo": 6,
+    "hi": 14,
+    "spawns": 29
+   }
+  },
+  "530:3479": {
+   "name": "The Veiled Sea",
+   "alliance": {
+    "lo": 8,
+    "hi": 10,
+    "spawns": 11
+   },
+   "horde": {
+    "lo": 1,
+    "hi": 30,
+    "spawns": 18
+   }
+  },
+  "530:3483": {
+   "name": "Hellfire Peninsula",
+   "alliance": {
+    "lo": 58,
+    "hi": 70,
+    "spawns": 2455
+   },
+   "horde": {
+    "lo": 58,
+    "hi": 70,
+    "spawns": 2414
+   }
+  },
+  "530:3487": {
+   "name": "Silvermoon City",
+   "alliance": {
+    "lo": 15,
+    "hi": 75,
+    "spawns": 314
+   },
+   "horde": {
+    "lo": 1,
+    "hi": 60,
+    "spawns": 5
+   }
+  },
+  "530:3518": {
+   "name": "Nagrand",
+   "alliance": {
+    "lo": 64,
+    "hi": 70,
+    "spawns": 1493
+   },
+   "horde": {
+    "lo": 64,
+    "hi": 70,
+    "spawns": 1403
+   }
+  },
+  "530:3519": {
+   "name": "Terokkar Forest",
+   "alliance": {
+    "lo": 62,
+    "hi": 71,
+    "spawns": 2118
+   },
+   "horde": {
+    "lo": 62,
+    "hi": 71,
+    "spawns": 2128
+   }
+  },
+  "530:3520": {
+   "name": "Shadowmoon Valley",
+   "alliance": {
+    "lo": 67,
+    "hi": 70,
+    "spawns": 2625
+   },
+   "horde": {
+    "lo": 67,
+    "hi": 70,
+    "spawns": 2645
+   }
+  },
+  "530:3521": {
+   "name": "Zangarmarsh",
+   "alliance": {
+    "lo": 60,
+    "hi": 64,
+    "spawns": 1901
+   },
+   "horde": {
+    "lo": 60,
+    "hi": 64,
+    "spawns": 1895
+   }
+  },
+  "530:3522": {
+   "name": "Blade's Edge Mountains",
+   "alliance": {
+    "lo": 60,
+    "hi": 71,
+    "spawns": 1749
+   },
+   "horde": {
+    "lo": 60,
+    "hi": 71,
+    "spawns": 1751
+   }
+  },
+  "530:3523": {
+   "name": "Netherstorm",
+   "alliance": {
+    "lo": 1,
+    "hi": 70,
+    "spawns": 2252
+   },
+   "horde": {
+    "lo": 1,
+    "hi": 70,
+    "spawns": 2253
+   }
+  },
+  "530:3524": {
+   "name": "Azuremyst Isle",
+   "alliance": {
+    "lo": 6,
+    "hi": 10,
+    "spawns": 856
+   },
+   "horde": {
+    "lo": 6,
+    "hi": 55,
+    "spawns": 1226
+   }
+  },
+  "530:3525": {
+   "name": "Bloodmyst Isle",
+   "alliance": {
+    "lo": 10,
+    "hi": 18,
+    "spawns": 1049
+   },
+   "horde": {
+    "lo": 10,
+    "hi": 18,
+    "spawns": 1110
+   }
+  },
+  "530:3540": {
+   "name": "Twisting Nether",
+   "alliance": {
+    "lo": 67,
+    "hi": 68,
+    "spawns": 1
+   },
+   "horde": {
+    "lo": 67,
+    "hi": 68,
+    "spawns": 1
+   }
+  },
+  "530:3557": {
+   "name": "The Exodar",
+   "alliance": {
+    "lo": 60,
+    "hi": 60,
+    "spawns": 1
+   },
+   "horde": {
+    "lo": 14,
+    "hi": 75,
+    "spawns": 69
+   }
+  },
+  "530:3703": {
+   "name": "Shattrath City",
+   "alliance": {
+    "lo": 30,
+    "hi": 75,
+    "spawns": 150
+   },
+   "horde": {
+    "lo": 22,
+    "hi": 75,
+    "spawns": 165
+   }
+  },
+  "530:4080": {
+   "name": "Isle of Quel'Danas",
+   "alliance": {
+    "lo": 69,
+    "hi": 71,
+    "spawns": 649
+   },
+   "horde": {
+    "lo": 69,
+    "hi": 71,
+    "spawns": 649
+   }
+  },
+  "531:3428": {
+   "name": "Ahn'Qiraj",
+   "alliance": {
+    "lo": 60,
+    "hi": 61,
+    "spawns": 150
+   },
+   "horde": {
+    "lo": 60,
+    "hi": 61,
+    "spawns": 150
+   }
+  },
+  "532:3457": {
+   "name": "Karazhan",
+   "alliance": {
+    "lo": 70,
+    "hi": 72,
+    "spawns": 594
+   },
+   "horde": {
+    "lo": 70,
+    "hi": 72,
+    "spawns": 594
+   }
+  },
+  "533:3456": {
+   "name": "Naxxramas",
+   "alliance": {
+    "lo": 80,
+    "hi": 81,
+    "spawns": 641
+   },
+   "horde": {
+    "lo": 80,
+    "hi": 81,
+    "spawns": 641
+   }
+  },
+  "534:3606": {
+   "name": "Hyjal Summit",
+   "alliance": {
+    "lo": 1,
+    "hi": 83,
+    "spawns": 43
+   },
+   "horde": {
+    "lo": 1,
+    "hi": 83,
+    "spawns": 43
+   }
+  },
+  "543:3562": {
+   "name": "Hellfire Ramparts",
+   "alliance": {
+    "lo": 59,
+    "hi": 61,
+    "spawns": 99
+   },
+   "horde": {
+    "lo": 59,
+    "hi": 61,
+    "spawns": 99
+   }
+  },
+  "560:2367": {
+   "name": "Old Hillsbrad Foothills",
+   "alliance": {
+    "lo": 20,
+    "hi": 67,
+    "spawns": 299
+   },
+   "horde": {
+    "lo": 20,
+    "hi": 67,
+    "spawns": 317
+   }
+  },
+  "564:3959": {
+   "name": "Black Temple",
+   "alliance": {
+    "lo": 70,
+    "hi": 72,
+    "spawns": 692
+   },
+   "horde": {
+    "lo": 70,
+    "hi": 72,
+    "spawns": 692
+   }
+  },
+  "568:3805": {
+   "name": "Zul'Aman",
+   "alliance": {
+    "lo": 70,
+    "hi": 71,
+    "spawns": 214
+   },
+   "horde": {
+    "lo": 70,
+    "hi": 71,
+    "spawns": 214
+   }
+  },
+  "571:65": {
+   "name": "Dragonblight",
+   "alliance": {
+    "lo": 70,
+    "hi": 74,
+    "spawns": 2979
+   },
+   "horde": {
+    "lo": 70,
+    "hi": 74,
+    "spawns": 3010
+   }
+  },
+  "571:66": {
+   "name": "Zul'Drak",
+   "alliance": {
+    "lo": 74,
+    "hi": 77,
+    "spawns": 1715
+   },
+   "horde": {
+    "lo": 74,
+    "hi": 77,
+    "spawns": 1715
+   }
+  },
+  "571:67": {
+   "name": "The Storm Peaks",
+   "alliance": {
+    "lo": 77,
+    "hi": 80,
+    "spawns": 1410
+   },
+   "horde": {
+    "lo": 77,
+    "hi": 80,
+    "spawns": 1447
+   }
+  },
+  "571:210": {
+   "name": "Icecrown",
+   "alliance": {
+    "lo": 78,
+    "hi": 80,
+    "spawns": 3965
+   },
+   "horde": {
+    "lo": 78,
+    "hi": 80,
+    "spawns": 3998
+   }
+  },
+  "571:394": {
+   "name": "Grizzly Hills",
+   "alliance": {
+    "lo": 72,
+    "hi": 75,
+    "spawns": 1408
+   },
+   "horde": {
+    "lo": 72,
+    "hi": 75,
+    "spawns": 1453
+   }
+  },
+  "571:495": {
+   "name": "Howling Fjord",
+   "alliance": {
+    "lo": 68,
+    "hi": 71,
+    "spawns": 2815
+   },
+   "horde": {
+    "lo": 68,
+    "hi": 71,
+    "spawns": 3163
+   }
+  },
+  "571:2817": {
+   "name": "Crystalsong Forest",
+   "alliance": {
+    "lo": 60,
+    "hi": 80,
+    "spawns": 392
+   },
+   "horde": {
+    "lo": 55,
+    "hi": 80,
+    "spawns": 389
+   }
+  },
+  "571:3537": {
+   "name": "Borean Tundra",
+   "alliance": {
+    "lo": 68,
+    "hi": 72,
+    "spawns": 2972
+   },
+   "horde": {
+    "lo": 68,
+    "hi": 72,
+    "spawns": 2795
+   }
+  },
+  "571:3711": {
+   "name": "Sholazar Basin",
+   "alliance": {
+    "lo": 75,
+    "hi": 77,
+    "spawns": 1088
+   },
+   "horde": {
+    "lo": 75,
+    "hi": 77,
+    "spawns": 1088
+   }
+  },
+  "571:3979": {
+   "name": "The Frozen Sea",
+   "alliance": {
+    "lo": 68,
+    "hi": 74,
+    "spawns": 2
+   },
+   "horde": {
+    "lo": 68,
+    "hi": 69,
+    "spawns": 79
+   }
+  },
+  "571:4197": {
+   "name": "Wintergrasp",
+   "alliance": {
+    "lo": 73,
+    "hi": 80,
+    "spawns": 392
+   },
+   "horde": {
+    "lo": 73,
+    "hi": 80,
+    "spawns": 394
+   }
+  },
+  "571:4258": {
+   "name": "The North Sea",
+   "alliance": {
+    "lo": 68,
+    "hi": 69,
+    "spawns": 1
+   },
+   "horde": {
+    "lo": 68,
+    "hi": 69,
+    "spawns": 1
+   }
+  },
+  "571:4742": {
+   "name": "Hrothgar's Landing",
+   "alliance": {
+    "lo": 78,
+    "hi": 80,
+    "spawns": 167
+   },
+   "horde": {
+    "lo": 78,
+    "hi": 80,
+    "spawns": 169
+   }
+  },
+  "574:206": {
+   "name": "Utgarde Keep",
+   "alliance": {
+    "lo": 70,
+    "hi": 70,
+    "spawns": 129
+   },
+   "horde": {
+    "lo": 70,
+    "hi": 70,
+    "spawns": 128
+   }
+  },
+  "575:1196": {
+   "name": "Utgarde Pinnacle",
+   "alliance": {
+    "lo": 78,
+    "hi": 80,
+    "spawns": 179
+   },
+   "horde": {
+    "lo": 78,
+    "hi": 80,
+    "spawns": 179
+   }
+  },
+  "578:4228": {
+   "name": "The Oculus",
+   "alliance": {
+    "lo": 79,
+    "hi": 79,
+    "spawns": 116
+   },
+   "horde": {
+    "lo": 79,
+    "hi": 79,
+    "spawns": 116
+   }
+  },
+  "580:4075": {
+   "name": "Sunwell Plateau",
+   "alliance": {
+    "lo": 60,
+    "hi": 71,
+    "spawns": 275
+   },
+   "horde": {
+    "lo": 60,
+    "hi": 71,
+    "spawns": 275
+   }
+  },
+  "585:4131": {
+   "name": "Magisters' Terrace",
+   "alliance": {
+    "lo": 69,
+    "hi": 71,
+    "spawns": 188
+   },
+   "horde": {
+    "lo": 69,
+    "hi": 71,
+    "spawns": 188
+   }
+  },
+  "595:4100": {
+   "name": "The Culling of Stratholme",
+   "alliance": {
+    "lo": 80,
+    "hi": 80,
+    "spawns": 139
+   },
+   "horde": {
+    "lo": 80,
+    "hi": 80,
+    "spawns": 139
+   }
+  },
+  "599:4264": {
+   "name": "Halls of Stone",
+   "alliance": {
+    "lo": 74,
+    "hi": 78,
+    "spawns": 111
+   },
+   "horde": {
+    "lo": 74,
+    "hi": 78,
+    "spawns": 111
+   }
+  },
+  "600:4196": {
+   "name": "Drak'Tharon Keep",
+   "alliance": {
+    "lo": 72,
+    "hi": 76,
+    "spawns": 115
+   },
+   "horde": {
+    "lo": 72,
+    "hi": 76,
+    "spawns": 115
+   }
+  },
+  "601:4277": {
+   "name": "Azjol-Nerub",
+   "alliance": {
+    "lo": 60,
+    "hi": 74,
+    "spawns": 62
+   },
+   "horde": {
+    "lo": 60,
+    "hi": 74,
+    "spawns": 62
+   }
+  },
+  "602:4272": {
+   "name": "Halls of Lightning",
+   "alliance": {
+    "lo": 78,
+    "hi": 80,
+    "spawns": 164
+   },
+   "horde": {
+    "lo": 78,
+    "hi": 80,
+    "spawns": 164
+   }
+  },
+  "603:4273": {
+   "name": "Ulduar",
+   "alliance": {
+    "lo": 80,
+    "hi": 82,
+    "spawns": 1048
+   },
+   "horde": {
+    "lo": 80,
+    "hi": 82,
+    "spawns": 1048
+   }
+  },
+  "604:4416": {
+   "name": "Gundrak",
+   "alliance": {
+    "lo": 77,
+    "hi": 77,
+    "spawns": 101
+   },
+   "horde": {
+    "lo": 77,
+    "hi": 77,
+    "spawns": 101
+   }
+  },
+  "608:4415": {
+   "name": "The Violet Hold",
+   "alliance": {
+    "lo": 76,
+    "hi": 77,
+    "spawns": 8
+   },
+   "horde": {
+    "lo": 76,
+    "hi": 77,
+    "spawns": 8
+   }
+  },
+  "609:4298": {
+   "name": "Plaguelands: The Scarlet Enclave",
+   "alliance": {
+    "lo": 37,
+    "hi": 57,
+    "spawns": 1314
+   },
+   "horde": {
+    "lo": 37,
+    "hi": 57,
+    "spawns": 1314
+   }
+  },
+  "615:4493": {
+   "name": "The Obsidian Sanctum",
+   "alliance": {
+    "lo": 80,
+    "hi": 81,
+    "spawns": 154
+   },
+   "horde": {
+    "lo": 80,
+    "hi": 81,
+    "spawns": 154
+   }
+  },
+  "616:4500": {
+   "name": "The Eye of Eternity",
+   "alliance": {
+    "lo": 60,
+    "hi": 83,
+    "spawns": 2
+   },
+   "horde": {
+    "lo": 60,
+    "hi": 83,
+    "spawns": 2
+   }
+  },
+  "619:4494": {
+   "name": "Ahn'kahet: The Old Kingdom",
+   "alliance": {
+    "lo": 70,
+    "hi": 75,
+    "spawns": 178
+   },
+   "horde": {
+    "lo": 70,
+    "hi": 75,
+    "spawns": 178
+   }
+  },
+  "624:4603": {
+   "name": "Vault of Archavon",
+   "alliance": {
+    "lo": 80,
+    "hi": 83,
+    "spawns": 14
+   },
+   "horde": {
+    "lo": 80,
+    "hi": 83,
+    "spawns": 14
+   }
+  },
+  "628:4710": {
+   "name": "Isle of Conquest",
+   "alliance": {
+    "lo": 60,
+    "hi": 60,
+    "spawns": 14
+   },
+   "horde": {
+    "lo": 60,
+    "hi": 60,
+    "spawns": 14
+   }
+  },
+  "631:4812": {
+   "name": "Icecrown Citadel",
+   "alliance": {
+    "lo": 80,
+    "hi": 83,
+    "spawns": 366
+   },
+   "horde": {
+    "lo": 80,
+    "hi": 83,
+    "spawns": 363
+   }
+  },
+  "632:4809": {
+   "name": "The Forge of Souls",
+   "alliance": {
+    "lo": 80,
+    "hi": 80,
+    "spawns": 100
+   },
+   "horde": {
+    "lo": 80,
+    "hi": 80,
+    "spawns": 100
+   }
+  },
+  "650:4723": {
+   "name": "Trial of the Champion",
+   "alliance": {
+    "lo": 80,
+    "hi": 80,
+    "spawns": 12
+   },
+   "horde": {
+    "lo": 80,
+    "hi": 80,
+    "spawns": 12
+   }
+  },
+  "658:4813": {
+   "name": "Pit of Saron",
+   "alliance": {
+    "lo": 80,
+    "hi": 80,
+    "spawns": 117
+   },
+   "horde": {
+    "lo": 80,
+    "hi": 80,
+    "spawns": 117
+   }
+  },
+  "668:4820": {
+   "name": "Halls of Reflection",
+   "alliance": {
+    "lo": 80,
+    "hi": 80,
+    "spawns": 49
+   },
+   "horde": {
+    "lo": 80,
+    "hi": 80,
+    "spawns": 49
+   }
+  },
+  "724:4987": {
+   "name": "The Ruby Sanctum",
+   "alliance": {
+    "lo": 80,
+    "hi": 82,
+    "spawns": 50
+   },
+   "horde": {
+    "lo": 80,
+    "hi": 82,
+    "spawns": 50
+   }
+  }
+ }
+}

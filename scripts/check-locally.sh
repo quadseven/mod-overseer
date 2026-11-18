@@ -69,6 +69,7 @@ run_decisions() {
   python3 -B tests/replay_zone_fallback.py
   python3 -B tests/replay_death_memory.py
   python3 -B tests/test_corridor_survey.py
+  python3 -B tests/test_zone_band.py
 
   # CI and the lane contract both run this function, so the workflow's single
   # step cannot drift from it (#1295). This test enforces that shape.
