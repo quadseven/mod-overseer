@@ -5636,6 +5636,61 @@ bool PoisonAimStep(PoisonAimState& state, std::string const& aim, bool claimed,
                    uint32_t mapId, int64_t now,
                    PoisonAimLimits const& limits = POISON_AIM_LIMITS);
 
+// ------------- a point aim that was reached and never cleared ----------------
+//
+// THE LATCH THE BREAKER ABOVE DOES NOT SEE. An `at:` aim the bridge wrote is
+// foreign to this book, so on arrival the release skips the column write and
+// remembers a LANDING (#558) that stands the aim down for 15 minutes. That is
+// right once: the bridge owns the aim and clears it. It is a latch when the
+// bridge does not. The aim then stays in the column, every 15 minutes the drive
+// walks to it (0 yards, the character is standing on it), arrives, is let go of
+// and stands down again, and in the meantime every claim another owner makes is
+// refused as a stranger's errand.
+//
+// Measured on the dev realm 2026-11-18. A family leader held a town errand's
+// `at:` point from 18:50, reached it at 18:56, 20:57 and 21:12, and each time
+// "skipped the column write - a profession errand (skill 171) and errand
+// 'at:...' are outstanding". The pending learn made it worse (the fence names
+// it first), but the standing aim alone was enough: the leader's vendor trip
+// was refused ("did not issue it"), no trainer walk could be written into the
+// occupied column, and the family stood still for over three hours.
+//
+// THE FENCE STAYS; ONLY AN AIM THAT PROVES ITSELF DEAD IS CLEARED. The same
+// rule as the poison-aim breaker (#824), and the same compare-and-swap in the
+// caller: a point the leader has ARRIVED at, repeatedly, over a real span of
+// time, with nobody having written anything else. An errand that has finished
+// must not hold the travel column for ever. `learn_skill` is not touched (a
+// point is never a trainer walk, which is written as a keyword), so a pending
+// trainer trip is walked once the column is free.
+struct LandedPointLimits
+{
+    // Landings on the same aim before it is called dead. The first is the
+    // ordinary one the bridge is given the chance to clear after.
+    uint32_t landings{2};
+    // The first landing must be at least this old: the bridge's own pass gets
+    // that long to end its errand.
+    int64_t minSeconds{10 * 60};
+    // A longer silence than this between two landings starts the count again.
+    int64_t gapSeconds{40 * 60};
+};
+
+constexpr LandedPointLimits LANDED_POINT_LIMITS{};
+
+struct LandedPointState
+{
+    std::string aim;
+    uint32_t landings{0};
+    int64_t firstAt{0};
+    int64_t lastAt{0};
+};
+
+// Count one arrival at `aim` that the release could not clear. True means the
+// aim is dead: the caller clears that exact aim and the state is reset.
+// Anything that is not a point aim, or is a different aim from the last one,
+// starts the count again.
+bool LandedPointAimStep(LandedPointState& state, std::string const& aim, int64_t now,
+                        LandedPointLimits const& limits = LANDED_POINT_LIMITS);
+
 // ------------- a point aim left over from before a restart (#658) ------------
 //
 // TravelAimBook remembers which aims it wrote in memory only. After a restart

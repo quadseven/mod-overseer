@@ -4534,6 +4534,29 @@ bool PoisonAimStep(PoisonAimState& state, std::string const& aim, bool claimed,
     return true;
 }
 
+bool LandedPointAimStep(LandedPointState& state, std::string const& aim, int64_t now,
+                        LandedPointLimits const& limits)
+{
+    if (aim.rfind("at:", 0) != 0)
+    {
+        state = LandedPointState{};
+        return false;
+    }
+    bool const sameRun = state.landings != 0 && state.aim == aim && now - state.lastAt <= limits.gapSeconds;
+    if (!sameRun)
+    {
+        state.aim = aim;
+        state.landings = 0;
+        state.firstAt = now;
+    }
+    ++state.landings;
+    state.lastAt = now;
+    if (state.landings < limits.landings || now - state.firstAt < limits.minSeconds)
+        return false;
+    state = LandedPointState{};
+    return true;
+}
+
 LeftoverAim ReadLeftoverAim(LeftoverAimFacts const& facts)
 {
     if (facts.target.rfind("at:", 0) != 0)
