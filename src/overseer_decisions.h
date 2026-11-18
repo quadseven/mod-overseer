@@ -31101,6 +31101,70 @@ struct CreateAccountFacts
 
 CreateCharacterVerdict CreateAccountVerdictFor(CreateAccountFacts const& facts);
 
+// ------------------------------------------------ the airborne guard (2937) --
+// A CHARACTER CARRIED THROUGH THE AIR IS STOPPED, WHATEVER CARRIES IT. A ground
+// move the navmesh cannot carry runs as a straight spline (wow-overseer issue
+// 2937): a family leader was measured 186 yards above the ground on a 3000-yard
+// line to the trainer it was sent to, with a follower 0.3 yards beside it. The
+// playerbots funnel now refuses such a move; this guard is the backstop for
+// every other mover (a follow chase after an airborne leader, a module step, a
+// mover nobody has found yet), read from the one thing they all share: the
+// character is far above the floor under it, and stays there.
+//
+// One reading a second. A character is AIRBORNE when it is more than gapYards
+// above the highest floor (terrain, model or water surface) under its own
+// x and y. A jump is two or three yards; a real fall of gapYards takes under
+// two seconds, so seconds of continuous airborne readings is a carry, not a
+// fall. Exempt, and the episode reset: dead, between worlds, on a taxi, on a
+// transport or in a vehicle, in water, with a flight, hover or feather fall
+// aura, or with no floor measured at all (which the below-the-world drive
+// owns). Each Stop is said once; a character still airborne repeatSeconds
+// after a Stop is stopped again, so a guard whose remedy did not hold is not
+// silent about it.
+struct AirborneGuardLimits
+{
+    float gapYards;
+    time_t seconds;
+    time_t repeatSeconds;
+};
+
+struct AirborneFacts
+{
+    bool alive{false};
+    bool betweenWorlds{false};  // not in the world, or being teleported
+    bool onTaxi{false};
+    bool onTransport{false};
+    bool inVehicle{false};
+    bool inWater{false};
+    bool mayFly{false};         // a flight, hover or feather fall aura
+    bool groundValid{false};
+    float z{0.f};
+    float groundZ{0.f};
+};
+
+struct AirborneGuardState
+{
+    time_t since{0};    // first airborne reading of this episode, 0 when none
+    time_t stoppedAt{0};
+};
+
+enum class AirborneAction
+{
+    Nothing,  // on the ground, or exempt
+    Watch,    // airborne, inside the bound
+    Stop      // airborne past the bound: say it once and end it
+};
+
+struct AirborneVerdict
+{
+    AirborneAction action{AirborneAction::Nothing};
+    float gap{0.f};
+    time_t seconds{0};
+};
+
+AirborneVerdict AirborneGuardStep(AirborneGuardState& state, AirborneFacts const& facts,
+                                  AirborneGuardLimits const& limits, time_t now);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H
