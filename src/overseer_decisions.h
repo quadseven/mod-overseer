@@ -24178,6 +24178,15 @@ constexpr uint32_t EXIT_HEARTH_EPISODE_SECONDS = 5 * 60;
 ExitHearthStep ExitFailureHearthStep(ExitHearthFacts const& facts,
                                      unsigned maxAttempts = EXIT_HEARTH_ATTEMPTS);
 
+// A MEMBER READ AS MOVING FOR THIS LONG DESPITE THE HOLD IS NOT GOING TO STAND.
+// The stop-first step holds the member still and waits for a poll that finds it
+// standing, which is right while a walk is really running. Measured: one
+// member stood at the same coordinates for a whole five minute episode and was
+// read as moving at every poll, so it was held still six times and never cast
+// for. Inside one hold's own ceiling (45 seconds), so it can be reached.
+constexpr long EXIT_HEARTH_STOP_STUCK_SECONDS = 20;
+bool ExitHearthStopIsStuck(long secondsReadAsMoving);
+
 // The word the log and the run timeline use for a step.
 char const* ExitHearthStepWord(ExitHearthStep step);
 

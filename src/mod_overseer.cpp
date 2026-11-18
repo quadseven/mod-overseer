@@ -40940,6 +40940,9 @@ private:
         std::time_t since{0};
         std::map<std::string, unsigned> attempts;
         std::map<std::string, std::string> lastStep;
+        // When each member was first read as moving in a run of polls, so a
+        // hold that never makes it stand is noticed (ExitHearthStopIsStuck).
+        std::map<std::string, std::time_t> stopFirstSince;
         // Members whose cast DoHearth accepted (#1316). Apart from `attempts`,
         // which counts refusals and takes a zero entry on every read.
         std::set<std::string> hearthedOut;
@@ -41185,6 +41188,8 @@ private:
             std::string const word = OverseerDecisions::ExitHearthStepWord(step);
             bool const changed = episode.lastStep[name] != word;
             episode.lastStep[name] = word;
+            if (step != ExitHearthStep::StopFirst)
+                episode.stopFirstSince.erase(name);
 
             switch (step)
             {
@@ -41244,6 +41249,33 @@ private:
                     HoldStillAndReport(bot, name, "hearth", report);
                     NoteHearthHold(name, "moving, held still first for the exit hearth",
                                    bot->GetMapId());
+                    // A MOVING READ THAT THE HOLD DOES NOT CLEAR. Measured: a
+                    // member stood at one spot for a five minute episode, read
+                    // as moving at every poll, and was never cast for. Past the
+                    // limit say what the motion master and the flags held, and
+                    // clear a moving flag that has no spline behind it: nothing
+                    // is walking such a member, so there is nothing to stop.
+                    std::time_t const readSince =
+                        episode.stopFirstSince.emplace(name, std::time(nullptr)).first->second;
+                    if (OverseerDecisions::ExitHearthStopIsStuck(
+                            static_cast<long>(std::time(nullptr) - readSince)))
+                    {
+                        MotionMaster* const motion = bot->GetMotionMaster();
+                        bool const splineInFlight = bot->movespline && !bot->movespline->Finalized();
+                        LOG_WARN("module.overseer",
+                                 "overseer: EXIT HEARTH - '{}' has been read as moving on map {} "
+                                 "for {}s and the hold has not made it stand: movement flags "
+                                 "0x{:x}, active motion type {}, spline in flight {}",
+                                 name, episode.mapId,
+                                 static_cast<uint32>(std::time(nullptr) - readSince),
+                                 static_cast<uint32>(bot->GetUnitMovementFlags()),
+                                 motion ? static_cast<uint32>(motion->GetCurrentMovementGeneratorType())
+                                        : 0u,
+                                 splineInFlight ? "yes" : "no");
+                        if (!splineInFlight)
+                            bot->RemoveUnitMovementFlag(MOVEMENTFLAG_MASK_MOVING);
+                        episode.stopFirstSince[name] = std::time(nullptr);
+                    }
                     if (changed)
                         LOG_INFO("module.overseer",
                                  "overseer: EXIT HEARTH - '{}' is moving on map {}, so it is "

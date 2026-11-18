@@ -21746,6 +21746,11 @@ ExitHearthStep ExitFailureHearthStep(ExitHearthFacts const& facts, unsigned maxA
     return ExitHearthStep::Cast;
 }
 
+bool ExitHearthStopIsStuck(long secondsReadAsMoving)
+{
+    return secondsReadAsMoving >= EXIT_HEARTH_STOP_STUCK_SECONDS;
+}
+
 bool GroundGaveUpDuringWalk(std::int64_t walkSince, std::int64_t groundGaveUpAt)
 {
     return walkSince > 0 && groundGaveUpAt >= walkSince;
