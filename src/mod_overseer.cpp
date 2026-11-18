@@ -49597,6 +49597,22 @@ private:
         }
     }
 
+    // WHERE A RUN STOOD, FOR EVERY ENDING THAT SAYS SO (#1389): the next boss
+    // and the last kill, and on Zul'Farrak's map the step the run's two clocks
+    // put it at. The timeout, the stall ladder and the module stop all end
+    // through this, so no ending names a next boss without the step. The
+    // clocks are as StepZulFarrakSteps left them on the last poll.
+    static std::string GuildRunStallWordsOf(GuildRun const& run, std::time_t now)
+    {
+        return OverseerDecisions::GuildRunStallWords(
+            run.nextBoss, run.lastKillAt != 0,
+            run.lastKillAt && now >= run.lastKillAt ? static_cast<unsigned>(now - run.lastKillAt)
+                                                    : 0,
+            run.mapId == OverseerDecisions::ZF_MAP_ID
+                ? OverseerDecisions::ZulFarrakStepWords(run.zfSummit, run.zfUkorz, now)
+                : std::string());
+    }
+
     // ZUL'FARRAK'S PYRAMID EVENT AND THE WALK TO UKORZ (overseer_zf_steps.h,
     // #1389), one poll on a run the verdict left running. Reads DATA_PYRAMID
     // and DATA_END_DOOR off the core's instance_zulfarrak and the tank's
@@ -49803,9 +49819,7 @@ private:
         if (step == OverseerDecisions::GuildRunStallStep::Nothing)
             return false;
 
-        std::string const stall = OverseerDecisions::GuildRunStallWords(
-            run.nextBoss, run.lastKillAt != 0,
-            run.lastKillAt && now >= run.lastKillAt ? static_cast<unsigned>(now - run.lastKillAt) : 0);
+        std::string const stall = GuildRunStallWordsOf(run, now);
         std::string const seen =
             facts.brainStalled
                 ? "the dungeon brain says: " + brainSays
@@ -50319,12 +50333,7 @@ private:
                         break;
                     case OverseerDecisions::GuildRunVerdict::TimedOut:
                         why = OverseerDecisions::GuildRunTimedOutWhy(
-                            poll.secondsInside,
-                            OverseerDecisions::GuildRunStallWords(
-                                run.nextBoss, run.lastKillAt != 0,
-                                run.lastKillAt && now >= run.lastKillAt
-                                    ? static_cast<unsigned>(now - run.lastKillAt)
-                                    : 0));
+                            poll.secondsInside, GuildRunStallWordsOf(run, now));
                         break;
                     default:
                         break;
@@ -50353,12 +50362,7 @@ private:
                             OverseerDecisions::GuildRunVerdictWord(
                                 OverseerDecisions::GuildRunVerdict::Stalled),
                             OverseerDecisions::GuildRunModuleStopWhy(
-                                run.moduleStop,
-                                OverseerDecisions::GuildRunStallWords(
-                                    run.nextBoss, run.lastKillAt != 0,
-                                    run.lastKillAt && now >= run.lastKillAt
-                                        ? static_cast<unsigned>(now - run.lastKillAt)
-                                        : 0)),
+                                run.moduleStop, GuildRunStallWordsOf(run, now)),
                             now);
                 return true;
             }

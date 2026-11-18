@@ -26975,8 +26975,17 @@ std::string GuildRunAbsentWords(std::vector<GuildRunSeatReport> const& seats);
 // "next Gelihast, last kill 95 min ago". An empty `nextBoss` leaves the first
 // half out ("next" is unknown, not none); a run with no kill yet says "no boss
 // killed yet". `secondsSinceKill` is read only when `killed` is true.
+//
+// `step` IS WHERE THE RUN STOOD, WHEN THE NEXT BOSS DOES NOT SAY IT (#1389).
+// "next" is the lowest uncredited boss, so a Zul'Farrak run waiting on the
+// pyramid event, which is no boss, read "next Hydromancer Velratha" like every
+// other run past three bosses and its timeout could not be told from theirs.
+// A non-empty `step` (ZulFarrakStepWords) follows the kill words: "next
+// Hydromancer Velratha, last kill 95 min ago, at Temple Summit (Executioner
+// event), the pyramid at phase 3 for 12 min". Empty leaves the words as they
+// were.
 std::string GuildRunStallWords(std::string const& nextBoss, bool killed,
-                               unsigned secondsSinceKill);
+                               unsigned secondsSinceKill, std::string const& step = "");
 
 // THE KILL CLOCK RISES ON A NEW HIGH, NOT ON A RISE FROM THE LAST POLL. A
 // guild run's boss count is read again on every poll, and for a script that
