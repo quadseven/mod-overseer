@@ -25150,6 +25150,8 @@ private:
                          // this function for the phrase.
                          "overseer: there is no travel survey on this realm - playerbots_travelnode is empty or absent - so no errand can be routed round terrain and every far walk is a greedy step at whatever is in front of it (#316). mod-playerbots ships this table as base data; a realm missing it has not had that SQL applied");
             }
+            if (!corridor.joinFirst)
+                NavmeshExitRoute(bot, want, name, target, route);
             return route;
         }
 
@@ -25380,6 +25382,7 @@ private:
                          "a problem if terrain is in the way (#316)",
                          name, target,
                          OverseerDecisions::RoutePlanVerdictName(plan.verdict));
+            NavmeshExitRoute(bot, want, name, target, route);
             return route;
         }
 
@@ -25501,6 +25504,96 @@ private:
     // way through is planned once more with the walker's died-on legs and
     // without the zones' prices, so `avoided` names only a zone this walk would
     // have crossed. A zone the route still touches has no way round.
+    // THE SURVEY HAS NO ROUTE, SO THE NAVMESH IS ASKED DIRECTLY, INSIDE AN
+    // INSTANCE ONLY. The survey tables come from upstream's node generator and
+    // routinely have no node near a party deep in a dungeon; the walk to the exit
+    // areatrigger then greedy-stepped and the run's EXIT gave up and hearthed
+    // out. The core's PathGenerator can often walk it. The aim is the one the
+    // caller already holds (a door's own row, grounded by DoorAimHeightFor); no
+    // coordinate is authored here. The path is walked only when the decision
+    // says it is complete, on the mesh at every point and ends at the aim; see
+    // OverseerDecisions::ExitRouteWithoutSurvey. Nothing here moves anybody, and
+    // patch 0029 refuses a ground move the navmesh cannot carry, which a
+    // complete path always can. Else the route stays empty, as before.
+    static bool NavmeshExitRoute(Player* bot, WorldPosition const& want,
+                                 std::string const& name, std::string const& target,
+                                 std::vector<OverseerDecisions::RoutePoint>& route)
+    {
+        Map* const map = bot->GetMap();
+        if (!map || !map->IsDungeon() || want.GetMapId() != bot->GetMapId())
+            return false;
+        PathGenerator path(bot);   // PathGenerator.h:61
+        path.SetUseStraightPath(true);
+        OverseerDecisions::NavmeshExitPathReading reading;
+        reading.computed = path.CalculatePath(want.GetPositionX(), want.GetPositionY(),
+                                              want.GetPositionZ());
+        PathType const type = path.GetPathType();
+        reading.noPath = (type & PATHFIND_NOPATH) != 0;
+        reading.partial = (type & (PATHFIND_INCOMPLETE | PATHFIND_SHORT)) != 0;
+        reading.shortcut = (type & PATHFIND_NOT_USING_PATH) != 0;
+        reading.endOffMesh = (type & PATHFIND_FARFROMPOLY_END) != 0;
+        auto const& points = path.GetPath();
+        reading.points = static_cast<unsigned>(points.size());
+        G3D::Vector3 const& end = path.GetActualEndPosition();
+        float const ex = end.x - want.GetPositionX();
+        float const ey = end.y - want.GetPositionY();
+        float const ez = end.z - want.GetPositionZ();
+        reading.endGapYards = std::sqrt(ex * ex + ey * ey + ez * ez);
+        dtNavMeshQuery const* const query =
+            map->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
+        reading.everyPointOnMesh = query && !points.empty();
+        dtQueryFilter filter;
+        for (std::size_t i = 0; i < points.size(); ++i)
+        {
+            if (i > 0)
+            {
+                float const dx = points[i].x - points[i - 1].x;
+                float const dy = points[i].y - points[i - 1].y;
+                float const dz = points[i].z - points[i - 1].z;
+                reading.longestLegYards =
+                    std::max(reading.longestLegYards, std::sqrt(dx * dx + dy * dy + dz * dz));
+            }
+            if (!reading.everyPointOnMesh)
+                continue;
+            // Detour's axes are (y, z, x) of the world's.
+            float const at[3] = {points[i].y, points[i].z, points[i].x};
+            float const extents[3] = {1.f, 3.f, 1.f};
+            float nearest[3] = {};
+            dtPolyRef polygon = 0;
+            if (dtStatusFailed(query->findNearestPoly(at, extents, &filter, &polygon, nearest)) ||
+                !polygon)
+                reading.everyPointOnMesh = false;
+        }
+        OverseerDecisions::NavmeshExitPathLimits limits;
+        limits.endGapYards = TRAVEL_ROUTE_ENDPOINT_YARDS;
+        limits.legYards = TRAVEL_ROUTE_LOOKAHEAD_YARDS;
+        if (OverseerDecisions::ExitRouteWithoutSurvey(false, reading, limits) !=
+            OverseerDecisions::ExitRouteChoice::Navmesh)
+        {
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' is sent to '{}' inside an instance, the survey has no "
+                     "route and the navmesh path is not one to walk (path type {}, {} points, "
+                     "{:.1f} yards short of the aim, on the mesh: {}); no route is planned",
+                     name, target, static_cast<uint32>(type), reading.points,
+                     reading.endGapYards, reading.everyPointOnMesh ? "yes" : "no");
+            return false;
+        }
+        route.clear();
+        for (G3D::Vector3 const& point : points)
+        {
+            OverseerDecisions::RoutePoint p;
+            p.x = point.x;
+            p.y = point.y;
+            p.z = point.z;
+            route.push_back(p);
+        }
+        LOG_INFO("module.overseer",
+                 "overseer: '{}' is sent to '{}' inside an instance, the survey has no route, "
+                 "and the navmesh has a complete path of {} points, so it walks that",
+                 name, target, reading.points);
+        return true;
+    }
+
     static void SayDangerZones(Player* bot, TravelSurvey const& survey, std::string const& name,
                                std::string const& target, DiedOnLegMemory& diedOn,
                                std::vector<OverseerDecisions::DangerZone> const& dangerZones,

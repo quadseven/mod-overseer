@@ -1535,6 +1535,20 @@ bool RoutedPathGoesWhereAsked(bool noRouteAtAll, bool endIsOffTheMesh,
     return TravelEndpointWithinTolerance(actualEndZ, requestedZ, toleranceYards);
 }
 
+ExitRouteChoice ExitRouteWithoutSurvey(bool surveyHasRoute, NavmeshExitPathReading const& path,
+                                       NavmeshExitPathLimits const& limits)
+{
+    if (surveyHasRoute)
+        return ExitRouteChoice::Survey;
+    if (!path.computed || path.noPath || path.partial || path.shortcut || path.endOffMesh)
+        return ExitRouteChoice::NoRoute;
+    if (path.points < 2 || !path.everyPointOnMesh)
+        return ExitRouteChoice::NoRoute;
+    if (!(path.endGapYards <= limits.endGapYards) || !(path.longestLegYards <= limits.legYards))
+        return ExitRouteChoice::NoRoute;
+    return ExitRouteChoice::Navmesh;
+}
+
 std::string RealmKind(std::string const& declared)
 {
     std::string const value = Normalized(declared);
