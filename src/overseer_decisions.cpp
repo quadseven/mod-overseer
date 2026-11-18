@@ -28936,4 +28936,11 @@ AirborneVerdict AirborneGuardStep(AirborneGuardState& state, AirborneFacts const
     return verdict;
 }
 
+bool FlightLegStrayed(float yardsNow, float yardsAtIssue)
+{
+    if (yardsAtIssue < 0.f)
+        return false;
+    return yardsNow > yardsAtIssue + FLIGHT_LEG_STRAY_YARDS;
+}
+
 }  // namespace OverseerDecisions
