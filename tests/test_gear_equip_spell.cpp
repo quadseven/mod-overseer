@@ -47,6 +47,7 @@ using OverseerDecisions::GearComparison;
 using OverseerDecisions::GearConfidence;
 using OverseerDecisions::GearItem;
 using OverseerDecisions::GearItemSpell;
+using OverseerDecisions::GearIncumbentScore;
 using OverseerDecisions::GearReadItemSpells;
 using OverseerDecisions::GearResolvedProperty;
 using OverseerDecisions::GearRole;
@@ -78,6 +79,7 @@ int const ARMOUR_MISC = 0;
 int const ARMOUR_PLATE = 4;
 int const INV_HEAD = 1;
 int const INV_WEAPON = 13;
+int const INV_TRINKET = 12;
 int const MOD_AGILITY = 3;
 int const MOD_STRENGTH = 4;
 int const MOD_INTELLECT = 5;
@@ -304,6 +306,7 @@ GearItem WithSpells(GearItem item, std::vector<GearItemSpell> const& spells)
     for (GearStat const& stat : read.stats)
         item.stats.push_back(stat);
     item.hasEffect = read.unresolved;
+    item.unreadReasons = read.unreadReasons;
     return item;
 }
 
@@ -366,6 +369,44 @@ void AProcWeaponStaysAFloorAndAStatRingDoesNot()
     Expect("an attack power ring is exact", ring.confidence == GearConfidence::Exact);
 }
 
+// Trinket slots were the largest live group of undecided pairs. Pin an on-use
+// effect: it stays a floor, but readable stats can still prove a clear upgrade;
+// the log must name the trigger rather than flatten every effect into one reason.
+void AnOnUseTrinketCanProveAnUpgradeAndNameItsUnreadInput()
+{
+    GearItem worn;
+    worn.name = "the worn trinket";
+    worn.itemClass = CLASS_ARMOUR;
+    worn.subClass = ARMOUR_MISC;
+    worn.inventoryType = INV_TRINKET;
+    worn.itemLevel = 30;
+    worn.stats = {{MOD_STAMINA, 2}};
+
+    GearItem carried = worn;
+    carried.name = "the carried trinket";
+    carried.itemLevel = 48;
+    carried.stats = {{MOD_STAMINA, 100}};
+    carried = WithSpells(carried, {Spell(ON_USE, {Aura(MOD_STAT, 2, 5)})});
+
+    GearVerdict const wornVerdict = GearScore(worn, TheFather());
+    GearVerdict const carriedVerdict = GearScore(carried, TheFather());
+    Expect("an on-use trinket is a floor, not an exact score",
+           carriedVerdict.confidence == GearConfidence::Floor);
+    Expect("the reason identifies the unread on-use spell",
+           carriedVerdict.why.find("on-use spell") != std::string::npos);
+    Expect("its readable stats still prove the upgrade",
+           GearCompare(carriedVerdict, GearWorn(wornVerdict)) == GearComparison::Better);
+
+    GearItem const wornWithUse =
+        WithSpells(worn, {Spell(ON_USE, {Aura(MOD_STAT, 2, 3)})});
+    GearVerdict const wornWithUseVerdict = GearScore(wornWithUse, TheFather());
+    GearIncumbentScore const wornIncumbent = GearWorn(wornWithUseVerdict);
+    Expect("the worn score retains its unread input for the comparison log",
+           wornIncumbent.why.find("on-use spell") != std::string::npos);
+    Expect("the carried floor can clear a trinket floor",
+           GearCompare(carriedVerdict, wornIncumbent) == GearComparison::Better);
+}
+
 }  // namespace
 
 int main()
@@ -377,6 +418,7 @@ int main()
     WhatIsNotAStatStaysAFloor();
     TheHelmNobodyCouldSettleIsSettled();
     AProcWeaponStaysAFloorAndAStatRingDoesNot();
+    AnOnUseTrinketCanProveAnUpgradeAndNameItsUnreadInput();
 
     if (failures)
     {

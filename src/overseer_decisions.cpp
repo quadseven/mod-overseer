@@ -5428,6 +5428,13 @@ std::string ArmourClassName(GearItem const& item)
     }
 }
 
+void AddGearUnreadReason(GearResolvedProperty& resolved, char const* reason)
+{
+    if (std::find(resolved.unreadReasons.begin(), resolved.unreadReasons.end(), reason) ==
+        resolved.unreadReasons.end())
+        resolved.unreadReasons.emplace_back(reason);
+}
+
 }  // namespace
 
 GearResolvedProperty GearReadRandomProperty(std::vector<GearEnchantEffect> const& effects,
@@ -5439,6 +5446,10 @@ GearResolvedProperty GearReadRandomProperty(std::vector<GearEnchantEffect> const
     // where the caller knows there is something and knows nothing about it.
     // Nothing to add, and the score stays a floor.
     resolved.unresolved = !everyEnchantmentRead || effects.empty();
+    if (!everyEnchantmentRead)
+        AddGearUnreadReason(resolved, "random property enchantment was not found");
+    if (effects.empty())
+        AddGearUnreadReason(resolved, "random property has no readable effects");
 
     for (GearEnchantEffect const& effect : effects)
     {
@@ -5449,6 +5460,7 @@ GearResolvedProperty GearReadRandomProperty(std::vector<GearEnchantEffect> const
         if (effect.type != ENCHANT_EFFECT_STAT)
         {
             resolved.unresolved = true;
+            AddGearUnreadReason(resolved, "random property effect is not a priced stat");
             continue;
         }
 
@@ -5459,6 +5471,7 @@ GearResolvedProperty GearReadRandomProperty(std::vector<GearEnchantEffect> const
         if (!effect.amount)
         {
             resolved.unresolved = true;
+            AddGearUnreadReason(resolved, "random property stat amount is unresolved");
             continue;
         }
 
@@ -5640,13 +5653,28 @@ GearResolvedProperty GearReadItemSpells(std::vector<GearItemSpell> const& spells
         // "Use:" and "Chance on hit:" are worth something and are not a
         // standing bonus, so nothing here prices them and the answer stays a
         // floor. A spell nobody could look up is the same answer.
-        if (spell.trigger != ITEM_SPELL_ON_EQUIP || !spell.found)
+        if (!spell.found)
         {
             resolved.unresolved = true;
+            AddGearUnreadReason(resolved, "item spell was not found");
+            continue;
+        }
+        if (spell.trigger != ITEM_SPELL_ON_EQUIP)
+        {
+            resolved.unresolved = true;
+            if (spell.trigger == ITEM_SPELL_ON_USE)
+                AddGearUnreadReason(resolved, "on-use spell");
+            else if (spell.trigger == ITEM_SPELL_CHANCE_ON_HIT)
+                AddGearUnreadReason(resolved, "chance-on-hit spell");
+            else
+                AddGearUnreadReason(resolved, "unsupported item spell trigger");
             continue;
         }
         if (!GearReadOneEquipSpell(spell.effects, resolved))
+        {
             resolved.unresolved = true;
+            AddGearUnreadReason(resolved, "on-equip spell effect is not a priced stat");
+        }
     }
     return resolved;
 }
@@ -5857,10 +5885,26 @@ GearVerdict GearScore(GearItem const& item, GearWearer const& who)
             verdict.why += " (not worn, so this does not judge it)";
         else if (who.role == GearRole::Unknown)
             verdict.why += " (no role, so not judged)";
-        else if (item.hasEffect)
-            verdict.why += " (carries an effect this does not read)";
-        else
-            verdict.why += " (random property unresolved)";
+        else if (item.hasEffect || item.unresolvedRandomProperty)
+        {
+            if (!item.unreadReasons.empty())
+            {
+                verdict.why += " (unread: ";
+                for (std::size_t i = 0; i < item.unreadReasons.size(); ++i)
+                {
+                    if (i)
+                        verdict.why += "; ";
+                    verdict.why += item.unreadReasons[i];
+                }
+                verdict.why += ")";
+            }
+            else if (item.hasEffect && item.unresolvedRandomProperty)
+                verdict.why += " (an item effect and random property are unread)";
+            else if (item.hasEffect)
+                verdict.why += " (carries an effect this does not read)";
+            else
+                verdict.why += " (random property unresolved)";
+        }
     }
     return verdict;
 }
@@ -6018,8 +6062,8 @@ GearIncumbentScore GearWorn(GearVerdict const& worn)
     // proficiency for is worth zero to it as well, and both of those are
     // certain rather than a floor under something unknown.
     if (!worn.wearable)
-        return GearIncumbentScore{0.f, GearConfidence::Exact};
-    return GearIncumbentScore{worn.score, worn.confidence};
+        return GearIncumbentScore{0.f, GearConfidence::Exact, {}};
+    return GearIncumbentScore{worn.score, worn.confidence, worn.why};
 }
 
 GearIncumbentScore GearIncumbentPair(GearIncumbentScore const& mainHand,
@@ -6027,6 +6071,14 @@ GearIncumbentScore GearIncumbentPair(GearIncumbentScore const& mainHand,
 {
     GearIncumbentScore pair;
     pair.score = mainHand.score + offHand.score;
+    if (!mainHand.why.empty())
+        pair.why = "main hand: " + mainHand.why;
+    if (!offHand.why.empty())
+    {
+        if (!pair.why.empty())
+            pair.why += "; ";
+        pair.why += "off hand: " + offHand.why;
+    }
 
     // THE WEAKER HALF DECIDES WHAT THE PAIR IS WORTH KNOWING. A sum is only
     // exactly known when both terms are; a sum with one floor in it is a floor;
@@ -21522,8 +21574,8 @@ GearVerdict GearShieldPair(GearVerdict const& oneHand, GearVerdict const& shield
     }
 
     GearIncumbentScore const summed = GearIncumbentPair(
-        GearIncumbentScore{oneHand.score, oneHand.confidence},
-        GearIncumbentScore{shield.score, shield.confidence});
+        GearIncumbentScore{oneHand.score, oneHand.confidence, oneHand.why},
+        GearIncumbentScore{shield.score, shield.confidence, shield.why});
     pair.score = summed.score;
     pair.confidence = summed.confidence;
     pair.judged = oneHand.judged && shield.judged;

@@ -6412,6 +6412,11 @@ struct GearItem
     // story about it. See GearVerdict::judged.
     bool hasEffect{false};
 
+    // The concrete spell or random-property inputs that remain unpriced.
+    // These are carried into GearVerdict::why so the world log can group floors
+    // by the input it could not read.
+    std::vector<std::string> unreadReasons;
+
     // Some part of a random suffix or property could not be turned into a
     // stat, so some of this item's worth is missing from `stats` and the
     // score is a floor rather than a figure. GearReadRandomProperty below is
@@ -6479,6 +6484,10 @@ struct GearResolvedProperty
     // ordinary weights; nothing about a stat is different for having arrived on
     // an item by a roll rather than in its template.
     std::vector<GearStat> stats;
+
+    // Why any portion of this property was not priced. Kept beside the stats
+    // so the caller can name the same missing input in a decision log.
+    std::vector<std::string> unreadReasons;
 
     // Was ANY part of the property left unpriced? Goes straight into
     // GearItem::unresolvedRandomProperty, so the verdict is a Floor rather than
@@ -6571,7 +6580,9 @@ struct GearItemSpell
 
 // The core's own ids (ItemTemplate.h, SharedDefines.h, SpellAuraDefines.h),
 // named here for the same reason every other core id in this file is.
+constexpr int ITEM_SPELL_ON_USE = 0;
 constexpr int ITEM_SPELL_ON_EQUIP = 1;
+constexpr int ITEM_SPELL_CHANCE_ON_HIT = 2;
 constexpr int SPELL_EFFECT_AURA = 6;
 constexpr int AURA_MOD_DAMAGE_DONE = 13;
 constexpr int AURA_MOD_STAT = 29;
@@ -6882,6 +6893,7 @@ struct GearIncumbentScore
 {
     float score{0.f};
     GearConfidence confidence{GearConfidence::Exact};
+    std::string why;
 };
 
 // What is worn in one slot, as something to be measured against. An empty slot
