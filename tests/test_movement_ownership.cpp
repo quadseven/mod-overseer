@@ -27,7 +27,9 @@
 
 using OverseerDecisions::TravelOwner;
 using OverseerMovement::ClaimAnswer;
+using OverseerMovement::DecideLeaderColumnEnd;
 using OverseerMovement::InMemoryAimColumn;
+using OverseerMovement::LeaderColumnEndDecision;
 using OverseerMovement::MovementOwnership;
 using OverseerMovement::ReleaseResult;
 using OverseerMovement::RunAimRetire;
@@ -414,6 +416,17 @@ void TheMovementInterfaceOwnsLeaderRosterPreferencesAndColumnEnds()
                   OverseerDecisions::LeaderIntentKind::None);
 }
 
+void ATownErrandColumnEndIsAPureDecision()
+{
+    LeaderColumnEndDecision const decision =
+        DecideLeaderColumnEnd(OverseerDecisions::LeaderIntentKind::TownErrand,
+                              "arrived at the vendor");
+    Check("the existing town errand owner is preserved",
+          decision.kind == OverseerDecisions::LeaderIntentKind::TownErrand);
+    Check("arrival completes that owner's hold",
+          decision.how == OverseerDecisions::LeaderIntentEnd::Completed);
+}
+
 // An aim wider than the column is refused before anything is read (#1139).
 void AnAimTooWideIsRefusedFirst()
 {
@@ -526,6 +539,7 @@ int main()
     ABusyLeaderIsNotWritten();
     LeaderIntentsLiveBehindTheMovementInterface();
     TheMovementInterfaceOwnsLeaderRosterPreferencesAndColumnEnds();
+    ATownErrandColumnEndIsAPureDecision();
     AnAimTooWideIsRefusedFirst();
     LeftoverAndPoisonedAimsUseTheExactClear();
     AVanishedAimIsAReleaseToo();

@@ -180,6 +180,36 @@ struct LeaderColumnEnd
     time_t since{0};
 };
 
+struct LeaderColumnEndDecision
+{
+    OverseerDecisions::LeaderIntentKind kind{OverseerDecisions::LeaderIntentKind::None};
+    OverseerDecisions::LeaderIntentEnd how{OverseerDecisions::LeaderIntentEnd::Abandoned};
+};
+
+inline LeaderColumnEndDecision DecideLeaderColumnEnd(
+    OverseerDecisions::LeaderIntentKind kind, std::string const& why)
+{
+    switch (kind)
+    {
+        case OverseerDecisions::LeaderIntentKind::EconomyErrand:
+        case OverseerDecisions::LeaderIntentKind::TownErrand:
+        case OverseerDecisions::LeaderIntentKind::Respec:
+        case OverseerDecisions::LeaderIntentKind::TrainingStop:
+        case OverseerDecisions::LeaderIntentKind::Hearth:
+        case OverseerDecisions::LeaderIntentKind::DungeonRun:
+            break;
+        default:
+            return {};
+    }
+
+    bool const done = why.find("arrived") != std::string::npos ||
+                      why.find("reached") != std::string::npos ||
+                      why.find("done") != std::string::npos ||
+                      why.find("stepped through") != std::string::npos;
+    return {kind, done ? OverseerDecisions::LeaderIntentEnd::Completed
+                       : OverseerDecisions::LeaderIntentEnd::Failed};
+}
+
 class MovementOwnership
 {
 public:
@@ -328,28 +358,17 @@ public:
     {
         LeaderColumnEnd result;
         result.kind = CurrentLeaderIntent(name, now);
-        switch (result.kind)
+        LeaderColumnEndDecision const decision = DecideLeaderColumnEnd(result.kind, why);
+        if (decision.kind == OverseerDecisions::LeaderIntentKind::None)
         {
-            case OverseerDecisions::LeaderIntentKind::EconomyErrand:
-            case OverseerDecisions::LeaderIntentKind::TownErrand:
-            case OverseerDecisions::LeaderIntentKind::Respec:
-            case OverseerDecisions::LeaderIntentKind::TrainingStop:
-            case OverseerDecisions::LeaderIntentKind::Hearth:
-            case OverseerDecisions::LeaderIntentKind::DungeonRun:
-                break;
-            default:
-                result.kind = OverseerDecisions::LeaderIntentKind::None;
-                return result;
+            result.kind = OverseerDecisions::LeaderIntentKind::None;
+            return result;
         }
         LeaderIntentSnapshot const state = LeaderIntentStateFor(name);
+        result.kind = decision.kind;
         result.owner = state.owner;
         result.since = state.since;
-        bool const done = why.find("arrived") != std::string::npos ||
-                          why.find("reached") != std::string::npos ||
-                          why.find("done") != std::string::npos ||
-                          why.find("stepped through") != std::string::npos;
-        result.how = done ? OverseerDecisions::LeaderIntentEnd::Completed
-                          : OverseerDecisions::LeaderIntentEnd::Failed;
+        result.how = decision.how;
         result.ended = EndForLeader(name, result.kind, result.owner, result.how, now);
         return result;
     }
