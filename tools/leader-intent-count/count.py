@@ -103,16 +103,20 @@ def main(argv: list[str]) -> int:
     keys = sorted(set(handoffs) | set(intents), key=lambda k: (k[0], k[1]))
     print("leader\twindow\thandoffs\tintents")
     for name, window in keys:
-        print(f"{name}\t{window}\t{handoffs.get((name, window), 0)}\t"
-              f"{intents.get((name, window), 0)}")
+        print(
+            f"{name}\t{window}\t{handoffs.get((name, window), 0)}\t"
+            f"{intents.get((name, window), 0)}"
+        )
     for name in leaders:
         mine = [k for k in keys if k[0] == name]
         if not mine:
             continue
         h = sum(handoffs.get(k, 0) for k in mine)
         i = sum(intents.get(k, 0) for k in mine)
-        print(f"# {name}: {len(mine)} window(s), {h / len(mine):.1f} handoffs and "
-              f"{i / len(mine):.1f} intent changes per 10 minutes")
+        print(
+            f"# {name}: {len(mine)} window(s), {h / len(mine):.1f} handoffs and "
+            f"{i / len(mine):.1f} intent changes per 10 minutes"
+        )
     return 0
 
 

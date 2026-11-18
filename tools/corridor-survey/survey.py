@@ -90,7 +90,9 @@ class Tile:
         if len(data) < MMAP_HEADER_SIZE:
             raise SurveyError(f"{self.path.name}: truncated MMap tile header")
 
-        magic, detour_version, mmap_version, payload_size = struct.unpack_from("<4I", data)
+        magic, detour_version, mmap_version, payload_size = struct.unpack_from(
+            "<4I", data
+        )
         if magic != MMAP_MAGIC:
             raise SurveyError(f"{self.path.name}: invalid MMap magic 0x{magic:08x}")
         if detour_version != DETOUR_VERSION or mmap_version != MMAP_VERSION:
@@ -99,15 +101,31 @@ class Tile:
                 f"MMap={mmap_version}; expected {DETOUR_VERSION}/{MMAP_VERSION}"
             )
         if len(data) != MMAP_HEADER_SIZE + payload_size:
-            raise SurveyError(f"{self.path.name}: declared payload size does not match file size")
+            raise SurveyError(
+                f"{self.path.name}: declared payload size does not match file size"
+            )
 
         payload = data[MMAP_HEADER_SIZE:]
         if len(payload) < MESH_HEADER_SIZE:
             raise SurveyError(f"{self.path.name}: truncated Detour mesh header")
         fields = struct.unpack_from("<15i10f", payload)
-        (detour_magic, version, tile_x, tile_y, _layer, _user_id,
-         poly_count, vertex_count, link_count, detail_count, detail_vertex_count,
-         detail_triangle_count, bv_count, offmesh_count, _offmesh_base) = fields[:15]
+        (
+            detour_magic,
+            version,
+            tile_x,
+            tile_y,
+            _layer,
+            _user_id,
+            poly_count,
+            vertex_count,
+            link_count,
+            detail_count,
+            detail_vertex_count,
+            detail_triangle_count,
+            bv_count,
+            offmesh_count,
+            _offmesh_base,
+        ) = fields[:15]
         self.walkable_climb = fields[17]
         if detour_magic != DETOUR_MAGIC or version != DETOUR_VERSION:
             raise SurveyError(f"{self.path.name}: invalid Detour mesh magic or version")
@@ -116,10 +134,20 @@ class Tile:
                 f"{self.path.name}: filename tile {self.x}/{self.y} differs from "
                 f"mesh tile {tile_x}/{tile_y}"
             )
-        counts = (poly_count, vertex_count, link_count, detail_count,
-                  detail_vertex_count, detail_triangle_count, bv_count, offmesh_count)
+        counts = (
+            poly_count,
+            vertex_count,
+            link_count,
+            detail_count,
+            detail_vertex_count,
+            detail_triangle_count,
+            bv_count,
+            offmesh_count,
+        )
         if any(count < 0 for count in counts):
-            raise SurveyError(f"{self.path.name}: negative array count in Detour header")
+            raise SurveyError(
+                f"{self.path.name}: negative array count in Detour header"
+            )
         if poly_count > 1_000_000 or vertex_count > 6_000_000:
             raise SurveyError(f"{self.path.name}: unreasonable Detour array count")
 
@@ -131,56 +159,95 @@ class Tile:
                 f"payload has {len(payload)}"
             )
 
-        (vert_offset, poly_offset, _link_offset, detail_offset, detail_vert_offset,
-         detail_tri_offset, _bv_offset, _offmesh_offset) = offsets
+        (
+            vert_offset,
+            poly_offset,
+            _link_offset,
+            detail_offset,
+            detail_vert_offset,
+            detail_tri_offset,
+            _bv_offset,
+            _offmesh_offset,
+        ) = offsets
         self._read_vertices(payload, vert_offset, vertex_count)
         self._read_polygons(payload, poly_offset, poly_count, vertex_count)
         self._read_details(
-            payload, detail_offset, detail_vert_offset, detail_tri_offset,
-            detail_count, poly_count, detail_vertex_count, detail_triangle_count,
+            payload,
+            detail_offset,
+            detail_vert_offset,
+            detail_tri_offset,
+            detail_count,
+            poly_count,
+            detail_vertex_count,
+            detail_triangle_count,
         )
 
     def _read_vertices(self, payload: bytes, offset: int, count: int) -> None:
         for index in range(count):
-            nav_x, nav_y, nav_z = struct.unpack_from("<3f", payload, offset + index * 12)
+            nav_x, nav_y, nav_z = struct.unpack_from(
+                "<3f", payload, offset + index * 12
+            )
             point = Vertex(nav_z, nav_x, nav_y)
             if not all(math.isfinite(value) for value in (point.x, point.y, point.z)):
                 raise SurveyError(f"{self.path.name}: non-finite vertex {index}")
             self.vertices.append(point)
 
-    def _read_polygons(self, payload: bytes, offset: int, count: int,
-                       vertex_count: int) -> None:
+    def _read_polygons(
+        self, payload: bytes, offset: int, count: int, vertex_count: int
+    ) -> None:
         for index in range(count):
-            record = struct.unpack_from("<I6H6HHBB", payload, offset + index * POLY_SIZE)
-            vertex_indices = tuple(record[1:1 + MAX_POLY_VERTS])
-            neighbor_fields = tuple(record[1 + MAX_POLY_VERTS:1 + MAX_POLY_VERTS * 2])
+            record = struct.unpack_from(
+                "<I6H6HHBB", payload, offset + index * POLY_SIZE
+            )
+            vertex_indices = tuple(record[1 : 1 + MAX_POLY_VERTS])
+            neighbor_fields = tuple(record[1 + MAX_POLY_VERTS : 1 + MAX_POLY_VERTS * 2])
             flags, vertex_count_in_poly, area_type = record[-3:]
             if not 3 <= vertex_count_in_poly <= MAX_POLY_VERTS:
-                raise SurveyError(f"{self.path.name}: polygon {index} has invalid vertex count")
+                raise SurveyError(
+                    f"{self.path.name}: polygon {index} has invalid vertex count"
+                )
             used_vertices = vertex_indices[:vertex_count_in_poly]
             if any(vertex >= vertex_count for vertex in used_vertices):
-                raise SurveyError(f"{self.path.name}: polygon {index} references a missing vertex")
+                raise SurveyError(
+                    f"{self.path.name}: polygon {index} references a missing vertex"
+                )
             node = len(self.polygons)
-            self.polygons.append(Polygon(
-                node=node,
-                tile=self,
-                index=index,
-                vertices=used_vertices,
-                neighbors=neighbor_fields[:vertex_count_in_poly],
-                flags=flags,
-                area_type=area_type,
-            ))
-
-    def _read_details(self, payload: bytes, detail_offset: int,
-                      detail_vertex_offset: int, detail_triangle_offset: int,
-                      detail_count: int, poly_count: int, detail_vertex_count: int,
-                      detail_triangle_count: int) -> None:
-        for index in range(detail_count):
-            vert_base, tri_base, vert_count, tri_count, _pad0, _pad1 = struct.unpack_from(
-                "<II4B", payload, detail_offset + index * DETAIL_SIZE
+            self.polygons.append(
+                Polygon(
+                    node=node,
+                    tile=self,
+                    index=index,
+                    vertices=used_vertices,
+                    neighbors=neighbor_fields[:vertex_count_in_poly],
+                    flags=flags,
+                    area_type=area_type,
+                )
             )
-            if vert_base + vert_count > detail_vertex_count or tri_base + tri_count > detail_triangle_count:
-                raise SurveyError(f"{self.path.name}: detail mesh {index} exceeds its arrays")
+
+    def _read_details(
+        self,
+        payload: bytes,
+        detail_offset: int,
+        detail_vertex_offset: int,
+        detail_triangle_offset: int,
+        detail_count: int,
+        poly_count: int,
+        detail_vertex_count: int,
+        detail_triangle_count: int,
+    ) -> None:
+        for index in range(detail_count):
+            vert_base, tri_base, vert_count, tri_count, _pad0, _pad1 = (
+                struct.unpack_from(
+                    "<II4B", payload, detail_offset + index * DETAIL_SIZE
+                )
+            )
+            if (
+                vert_base + vert_count > detail_vertex_count
+                or tri_base + tri_count > detail_triangle_count
+            ):
+                raise SurveyError(
+                    f"{self.path.name}: detail mesh {index} exceeds its arrays"
+                )
             self.details.append((vert_base, tri_base, vert_count, tri_count))
 
         for index in range(detail_vertex_count):
@@ -190,9 +257,13 @@ class Tile:
             self.detail_vertices.append(Vertex(nav_z, nav_x, nav_y))
 
         for index in range(detail_triangle_count):
-            self.detail_triangles.append(struct.unpack_from(
-                "<4B", payload, detail_triangle_offset + index * DETAIL_TRIANGLE_SIZE
-            ))
+            self.detail_triangles.append(
+                struct.unpack_from(
+                    "<4B",
+                    payload,
+                    detail_triangle_offset + index * DETAIL_TRIANGLE_SIZE,
+                )
+            )
 
         if detail_count > poly_count:
             raise SurveyError(f"{self.path.name}: more detail meshes than polygons")
@@ -214,7 +285,16 @@ class Tile:
 
     @staticmethod
     def _array_offsets(counts: tuple[int, ...]) -> tuple[int, ...]:
-        poly_count, vertex_count, link_count, detail_count, detail_vertex_count, detail_triangle_count, bv_count, _offmesh_count = counts
+        (
+            poly_count,
+            vertex_count,
+            link_count,
+            detail_count,
+            detail_vertex_count,
+            detail_triangle_count,
+            bv_count,
+            _offmesh_count,
+        ) = counts
         offsets = [MESH_HEADER_SIZE]
         offsets.append(offsets[-1] + vertex_count * 12)
         offsets.append(offsets[-1] + poly_count * POLY_SIZE)
@@ -236,25 +316,33 @@ class Tile:
             vert_base, tri_base, _vert_count, tri_count = self.details[poly.index]
             for local_tri in range(tri_count):
                 a, b, c, _flags = self.detail_triangles[tri_base + local_tri]
-                triangle = tuple(self._detail_vertex(poly, vert_base, vertex) for vertex in (a, b, c))
+                triangle = tuple(
+                    self._detail_vertex(poly, vert_base, vertex) for vertex in (a, b, c)
+                )
                 height = _triangle_height(triangle, x, y)
                 if height is not None:
                     return height
 
         vertices = self.poly_vertices(poly)
         for index in range(1, len(vertices) - 1):
-            height = _triangle_height((vertices[0], vertices[index], vertices[index + 1]), x, y)
+            height = _triangle_height(
+                (vertices[0], vertices[index], vertices[index + 1]), x, y
+            )
             if height is not None:
                 return height
         return None
 
-    def _detail_vertex(self, poly: Polygon, detail_base: int, local_index: int) -> Vertex:
+    def _detail_vertex(
+        self, poly: Polygon, detail_base: int, local_index: int
+    ) -> Vertex:
         if local_index < len(poly.vertices):
             return self.vertex(poly.vertices[local_index])
         return self.detail_vertices[detail_base + local_index - len(poly.vertices)]
 
 
-def _triangle_height(triangle: tuple[Vertex, Vertex, Vertex], x: float, y: float) -> float | None:
+def _triangle_height(
+    triangle: tuple[Vertex, Vertex, Vertex], x: float, y: float
+) -> float | None:
     a, b, c = triangle
     denominator = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y)
     if abs(denominator) < 1e-9:
@@ -286,11 +374,23 @@ def _contains_xy(poly: Polygon, x: float, y: float) -> bool:
     inside = False
     previous = vertices[-1]
     for current in vertices:
-        cross = (x - previous.x) * (current.y - previous.y) - (y - previous.y) * (current.x - previous.x)
-        if abs(cross) < 1e-5 and min(previous.x, current.x) - 1e-5 <= x <= max(previous.x, current.x) + 1e-5 and min(previous.y, current.y) - 1e-5 <= y <= max(previous.y, current.y) + 1e-5:
+        cross = (x - previous.x) * (current.y - previous.y) - (y - previous.y) * (
+            current.x - previous.x
+        )
+        if (
+            abs(cross) < 1e-5
+            and min(previous.x, current.x) - 1e-5
+            <= x
+            <= max(previous.x, current.x) + 1e-5
+            and min(previous.y, current.y) - 1e-5
+            <= y
+            <= max(previous.y, current.y) + 1e-5
+        ):
             return True
         if (current.y > y) != (previous.y > y):
-            crossing_x = (previous.x - current.x) * (y - current.y) / (previous.y - current.y) + current.x
+            crossing_x = (previous.x - current.x) * (y - current.y) / (
+                previous.y - current.y
+            ) + current.x
             if x < crossing_x:
                 inside = not inside
         previous = current
@@ -309,9 +409,11 @@ def _closest_xy(poly: Polygon, x: float, y: float) -> tuple[float, float]:
         dx = second.x - first.x
         dy = second.y - first.y
         length_squared = dx * dx + dy * dy
-        fraction = 0.0 if length_squared == 0 else (
-            (x - first.x) * dx + (y - first.y) * dy
-        ) / length_squared
+        fraction = (
+            0.0
+            if length_squared == 0
+            else ((x - first.x) * dx + (y - first.y) * dy) / length_squared
+        )
         fraction = min(1.0, max(0.0, fraction))
         candidate = (first.x + fraction * dx, first.y + fraction * dy)
         distance = (candidate[0] - x) ** 2 + (candidate[1] - y) ** 2
@@ -321,9 +423,12 @@ def _closest_xy(poly: Polygon, x: float, y: float) -> tuple[float, float]:
     return best_point
 
 
-def _find_polygon(polygons: list[Polygon], point: Vertex,
-                  max_horizontal: float = 3.0,
-                  max_vertical: float = 50.0) -> tuple[Polygon, Vertex] | None:
+def _find_polygon(
+    polygons: list[Polygon],
+    point: Vertex,
+    max_horizontal: float = 3.0,
+    max_vertical: float = 50.0,
+) -> tuple[Polygon, Vertex] | None:
     candidates: list[tuple[float, Polygon, Vertex]] = []
     for poly in polygons:
         if not poly.ground:
@@ -343,14 +448,17 @@ def _find_polygon(polygons: list[Polygon], point: Vertex,
     return poly, projected
 
 
-def _edge_key(a: Vertex, b: Vertex) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+def _edge_key(
+    a: Vertex, b: Vertex
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     one = (round(a.x * 100), round(a.y * 100), round(a.z * 100))
     two = (round(b.x * 100), round(b.y * 100), round(b.z * 100))
     return tuple(sorted((one, two)))  # type: ignore[return-value]
 
 
-def _external_portal(one: tuple[Vertex, Vertex], two: tuple[Vertex, Vertex],
-                     side: int, climb: float) -> Portal | None:
+def _external_portal(
+    one: tuple[Vertex, Vertex], two: tuple[Vertex, Vertex], side: int, climb: float
+) -> Portal | None:
     """Match the overlapping, climbable part of a Detour external edge."""
     if side in (0, 4):
         fixed_axis = "y"
@@ -402,10 +510,14 @@ def _external_portal(one: tuple[Vertex, Vertex], two: tuple[Vertex, Vertex],
     return Portal(point_at(portal_low), point_at(portal_high))
 
 
-def _climbable_interval(first: tuple[float, float, float, float],
-                        second: tuple[float, float, float, float],
-                        low: float, high: float, limit: float,
-                        height_at) -> tuple[float, float] | None:
+def _climbable_interval(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+    low: float,
+    high: float,
+    limit: float,
+    height_at,
+) -> tuple[float, float] | None:
     difference_low = height_at(first, low) - height_at(second, low)
     difference_high = height_at(first, high) - height_at(second, high)
     change = difference_high - difference_low
@@ -445,16 +557,18 @@ def _load_tiles(directory: Path, map_id: int) -> tuple[list[Tile], list[Polygon]
     return tiles, polygons
 
 
-def _connect(graph: dict[int, dict[int, Portal]], one: Polygon,
-             two: Polygon, portal: Portal) -> None:
+def _connect(
+    graph: dict[int, dict[int, Portal]], one: Polygon, two: Polygon, portal: Portal
+) -> None:
     if one.node == two.node or not one.ground or not two.ground:
         return
     graph[one.node][two.node] = portal
     graph[two.node][one.node] = portal
 
 
-def _internal_portal(poly: Polygon, neighbor: Polygon,
-                     vertices: tuple[Vertex, ...], edge_index: int) -> Portal | None:
+def _internal_portal(
+    poly: Polygon, neighbor: Polygon, vertices: tuple[Vertex, ...], edge_index: int
+) -> Portal | None:
     edge = _edge_key(vertices[edge_index], vertices[(edge_index + 1) % len(vertices)])
     other_vertices = neighbor.tile.poly_vertices(neighbor)
     for other_index, first in enumerate(other_vertices):
@@ -464,7 +578,9 @@ def _internal_portal(poly: Polygon, neighbor: Polygon,
     return None
 
 
-def _connect_internal_edges(tiles: list[Tile], graph: dict[int, dict[int, Portal]]) -> None:
+def _connect_internal_edges(
+    tiles: list[Tile], graph: dict[int, dict[int, Portal]]
+) -> None:
     for tile in tiles:
         for poly in tile.polygons:
             if not poly.ground:
@@ -475,7 +591,9 @@ def _connect_internal_edges(tiles: list[Tile], graph: dict[int, dict[int, Portal
                     continue
                 neighbor_index = (neighbor_field & 0x7FFF) - 1
                 if not 0 <= neighbor_index < len(tile.polygons):
-                    raise SurveyError(f"{tile.path.name}: polygon {poly.index} has invalid neighbor index")
+                    raise SurveyError(
+                        f"{tile.path.name}: polygon {poly.index} has invalid neighbor index"
+                    )
                 neighbor = tile.polygons[neighbor_index]
                 portal = _internal_portal(poly, neighbor, vertices, edge_index)
                 if portal is not None:
@@ -498,11 +616,15 @@ def _external_edges(tiles: list[Tile]) -> list[tuple[Polygon, int, Vertex, Verte
     return external_edges
 
 
-def _connect_external_edges(external_edges: list[tuple[Polygon, int, Vertex, Vertex]],
-                            graph: dict[int, dict[int, Portal]]) -> None:
+def _connect_external_edges(
+    external_edges: list[tuple[Polygon, int, Vertex, Vertex]],
+    graph: dict[int, dict[int, Portal]],
+) -> None:
     tile_deltas = {0: (1, 0), 2: (0, 1), 4: (-1, 0), 6: (0, -1)}
     opposite_sides = {0: 4, 2: 6, 4: 0, 6: 2}
-    by_tile_side: dict[tuple[int, int, int], list[tuple[Polygon, int, Vertex, Vertex]]] = {}
+    by_tile_side: dict[
+        tuple[int, int, int], list[tuple[Polygon, int, Vertex, Vertex]]
+    ] = {}
     for edge in external_edges:
         poly, side, _first, _second = edge
         by_tile_side.setdefault((poly.tile.x, poly.tile.y, side), []).append(edge)
@@ -513,13 +635,17 @@ def _connect_external_edges(external_edges: list[tuple[Polygon, int, Vertex, Ver
         opposite = opposite_sides.get(side)
         if delta is None or opposite is None:
             continue
-        neighbor_edges = by_tile_side.get((one.tile.x + delta[0], one.tile.y + delta[1], opposite), ())
+        neighbor_edges = by_tile_side.get(
+            (one.tile.x + delta[0], one.tile.y + delta[1], opposite), ()
+        )
         for two, _other_side, other_first, other_second in neighbor_edges:
             pair = (min(one.node, two.node), max(one.node, two.node))
             if pair in connected_pairs:
                 continue
             portal = _external_portal(
-                (first, second), (other_first, other_second), side,
+                (first, second),
+                (other_first, other_second),
+                side,
                 max(one.tile.walkable_climb, two.tile.walkable_climb),
             )
             if portal is not None:
@@ -527,15 +653,24 @@ def _connect_external_edges(external_edges: list[tuple[Polygon, int, Vertex, Ver
                 connected_pairs.add(pair)
 
 
-def _build_graph(tiles: list[Tile]) -> tuple[dict[int, dict[int, Portal]], dict[int, Polygon]]:
-    polygons = {poly.node: poly for tile in tiles for poly in tile.polygons if poly.ground}
+def _build_graph(
+    tiles: list[Tile],
+) -> tuple[dict[int, dict[int, Portal]], dict[int, Polygon]]:
+    polygons = {
+        poly.node: poly for tile in tiles for poly in tile.polygons if poly.ground
+    }
     graph: dict[int, dict[int, Portal]] = {node: {} for node in polygons}
     _connect_internal_edges(tiles, graph)
     _connect_external_edges(_external_edges(tiles), graph)
     return graph, polygons
 
 
-def _shortest_path(start: int, goal: int, graph: dict[int, dict[int, Portal]], polygons: dict[int, Polygon]) -> list[int]:
+def _shortest_path(
+    start: int,
+    goal: int,
+    graph: dict[int, dict[int, Portal]],
+    polygons: dict[int, Polygon],
+) -> list[int]:
     goal_center = _centroid(polygons[goal])
     queue: list[tuple[float, float, int]] = [(0.0, 0.0, start)]
     cost = {start: 0.0}
@@ -551,7 +686,9 @@ def _shortest_path(start: int, goal: int, graph: dict[int, dict[int, Portal]], p
             return list(reversed(path))
         current_center = _centroid(polygons[current])
         for neighbor in graph[current]:
-            next_cost = current_cost + _distance(current_center, _centroid(polygons[neighbor]))
+            next_cost = current_cost + _distance(
+                current_center, _centroid(polygons[neighbor])
+            )
             if next_cost >= cost.get(neighbor, math.inf):
                 continue
             cost[neighbor] = next_cost
@@ -572,7 +709,9 @@ def _same_xy(a: Vertex, b: Vertex) -> bool:
 def _point_on_poly(poly: Polygon, x: float, y: float) -> Vertex:
     height = poly.tile.ground_height(poly, x, y)
     if height is None:
-        raise SurveyError(f"{poly.tile.path.name}: cannot resolve ground height on polygon {poly.index}")
+        raise SurveyError(
+            f"{poly.tile.path.name}: cannot resolve ground height on polygon {poly.index}"
+        )
     return Vertex(x, y, height)
 
 
@@ -629,7 +768,9 @@ def _funnel(start: Vertex, door: Vertex, portals: list[Portal]) -> list[Vertex]:
     return result
 
 
-def _point_on_path(polygons: list[Polygon], x: float, y: float, height_hint: float) -> tuple[Vertex, Polygon]:
+def _point_on_path(
+    polygons: list[Polygon], x: float, y: float, height_hint: float
+) -> tuple[Vertex, Polygon]:
     candidates: list[tuple[float, Vertex, Polygon]] = []
     for poly in polygons:
         if not _contains_xy(poly, x, y):
@@ -639,12 +780,20 @@ def _point_on_path(polygons: list[Polygon], x: float, y: float, height_hint: flo
         if vertical <= 50.0:
             candidates.append((vertical, point, poly))
     if not candidates:
-        raise SurveyError(f"surveyed path leaves its polygon corridor near ({x:.2f}, {y:.2f})")
+        raise SurveyError(
+            f"surveyed path leaves its polygon corridor near ({x:.2f}, {y:.2f})"
+        )
     _difference, point, poly = min(candidates, key=lambda candidate: candidate[0])
     return point, poly
 
 
-def _survey(tiles: list[Tile], polygons: list[Polygon], start: Vertex, door: Vertex, spacing: float) -> dict[str, list[dict[str, float | str]]]:
+def _survey(
+    tiles: list[Tile],
+    polygons: list[Polygon],
+    start: Vertex,
+    door: Vertex,
+    spacing: float,
+) -> dict[str, list[dict[str, float | str]]]:
     start_match = _find_polygon(polygons, start)
     if start_match is None:
         raise SurveyError("start point is not within the core nearest-polygon extents")
@@ -658,7 +807,11 @@ def _survey(tiles: list[Tile], polygons: list[Polygon], start: Vertex, door: Ver
     path = _shortest_path(start_poly.node, door_poly.node, graph, by_node)
     portals = []
     for current, following in zip(path, path[1:], strict=False):
-        portals.append(_oriented_portal(by_node[current], by_node[following], graph[current][following]))
+        portals.append(
+            _oriented_portal(
+                by_node[current], by_node[following], graph[current][following]
+            )
+        )
     route = _funnel(start_on_mesh, door_on_mesh, portals)
     path_polygons = [by_node[node] for node in path]
 
@@ -672,44 +825,74 @@ def _survey(tiles: list[Tile], polygons: list[Polygon], start: Vertex, door: Ver
             y = first.y + (second.y - first.y) * fraction
             hint = first.z + (second.z - first.z) * fraction
             point, owner = _point_on_path(path_polygons, x, y, hint)
-            result.append({"x": point.x, "y": point.y, "z": point.z, "polygon": owner.identifier})
+            result.append(
+                {"x": point.x, "y": point.y, "z": point.z, "polygon": owner.identifier}
+            )
     final_point, final_owner = _point_on_path(
-        path_polygons, door_on_mesh.x, door_on_mesh.y, door_on_mesh.z,
+        path_polygons,
+        door_on_mesh.x,
+        door_on_mesh.y,
+        door_on_mesh.z,
     )
-    result.append({"x": final_point.x, "y": final_point.y, "z": final_point.z,
-                   "polygon": final_owner.identifier})
+    result.append(
+        {
+            "x": final_point.x,
+            "y": final_point.y,
+            "z": final_point.z,
+            "polygon": final_owner.identifier,
+        }
+    )
 
     legs = []
     for index, (one, two) in enumerate(zip(result, result[1:], strict=False)):
         first_point = Vertex(float(one["x"]), float(one["y"]), float(one["z"]))
         second_point = Vertex(float(two["x"]), float(two["y"]), float(two["z"]))
-        legs.append({
-            "from": index,
-            "to": index + 1,
-            "horizontal_yards": math.hypot(second_point.x - first_point.x, second_point.y - first_point.y),
-            "walk_yards": _distance(first_point, second_point),
-        })
+        legs.append(
+            {
+                "from": index,
+                "to": index + 1,
+                "horizontal_yards": math.hypot(
+                    second_point.x - first_point.x, second_point.y - first_point.y
+                ),
+                "walk_yards": _distance(first_point, second_point),
+            }
+        )
     return {"points": result, "legs": legs}
 
 
 def _human_output(data: dict[str, list[dict[str, float | str]]]) -> None:
     print("RoutePoint corridor[] = {")
     for point in data["points"]:
-        print(f"    {{{float(point['x']):.4f}f, {float(point['y']):.4f}f, {float(point['z']):.4f}f}}, // {point['polygon']}")
+        print(
+            f"    {{{float(point['x']):.4f}f, {float(point['y']):.4f}f, {float(point['z']):.4f}f}}, // {point['polygon']}"
+        )
     print("};")
     print("\nleg  horizontal_yards  walk_yards")
     for leg in data["legs"]:
-        print(f"{leg['from']:>3}  {float(leg['horizontal_yards']):>16.2f}  {float(leg['walk_yards']):>10.2f}")
+        print(
+            f"{leg['from']:>3}  {float(leg['horizontal_yards']):>16.2f}  {float(leg['walk_yards']):>10.2f}"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--maps", required=True, type=Path, help="directory with extracted .mmtile files")
+    parser.add_argument(
+        "--maps",
+        required=True,
+        type=Path,
+        help="directory with extracted .mmtile files",
+    )
     parser.add_argument("--map-id", required=True, type=int)
-    parser.add_argument("--start", required=True, nargs=3, type=float, metavar=("X", "Y", "Z"))
-    parser.add_argument("--door", required=True, nargs=3, type=float, metavar=("X", "Y", "Z"))
+    parser.add_argument(
+        "--start", required=True, nargs=3, type=float, metavar=("X", "Y", "Z")
+    )
+    parser.add_argument(
+        "--door", required=True, nargs=3, type=float, metavar=("X", "Y", "Z")
+    )
     parser.add_argument("--spacing-yards", type=float, default=192.0)
-    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    parser.add_argument(
+        "--json", action="store_true", help="emit machine-readable JSON"
+    )
     args = parser.parse_args(argv)
     numeric = [*args.start, *args.door, args.spacing_yards]
     if not all(math.isfinite(value) for value in numeric):
@@ -722,8 +905,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         tiles, polygons = _load_tiles(args.maps, args.map_id)
         data = _survey(
-            tiles, polygons,
-            Vertex(*args.start), Vertex(*args.door), args.spacing_yards,
+            tiles,
+            polygons,
+            Vertex(*args.start),
+            Vertex(*args.door),
+            args.spacing_yards,
         )
     except SurveyError as exc:
         print(str(exc), file=sys.stderr)

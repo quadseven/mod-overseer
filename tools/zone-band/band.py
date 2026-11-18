@@ -23,7 +23,9 @@ from pathlib import Path
 
 GRID_SIZE = 533.33333
 PERCENTILES = [10, 90]
-MAX_LEVEL = 83  # the highest real level; a few templates carry placeholders far above it
+MAX_LEVEL = (
+    83  # the highest real level; a few templates carry placeholders far above it
+)
 # Player faction templates: Human and Orc.
 SIDES = {"alliance": 1, "horde": 2}
 
@@ -42,8 +44,10 @@ def read_dbc(path):
     magic, count, fields, size, string_size = struct.unpack_from("<4s4I", data, 0)
     if magic != b"WDBC":
         raise ValueError(f"{path}: not a WDBC file")
-    records = [struct.unpack_from("<%dI" % fields, data, 20 + i * size) for i in range(count)]
-    strings = data[20 + count * size:20 + count * size + string_size]
+    records = [
+        struct.unpack_from("<%dI" % fields, data, 20 + i * size) for i in range(count)
+    ]
+    strings = data[20 + count * size : 20 + count * size + string_size]
     return records, strings
 
 
@@ -106,12 +110,15 @@ class AreaReader:
             if path.exists():
                 data = path.read_bytes()
                 offset = struct.unpack_from("<I", data, 12)[0]
-                if data[offset:offset + 4] == b"AREA":
+                if data[offset : offset + 4] == b"AREA":
                     flags, grid_area = struct.unpack_from("<HH", data, offset + 4)
                     if flags & 1:
                         tile = (grid_area, None)
                     else:
-                        tile = (grid_area, struct.unpack_from("<256H", data, offset + 8))
+                        tile = (
+                            grid_area,
+                            struct.unpack_from("<256H", data, offset + 8),
+                        )
             self._tiles[key] = tile
         return self._tiles[key]
 
@@ -139,7 +146,9 @@ def read_spawns(path):
         if not line.strip():
             continue
         f = line.split("\t")
-        rows.append((int(f[0]), float(f[1]), float(f[2]), int(f[3]), int(f[4]), int(f[5])))
+        rows.append(
+            (int(f[0]), float(f[1]), float(f[2]), int(f[3]), int(f[4]), int(f[5]))
+        )
     return rows
 
 
@@ -163,7 +172,9 @@ def build_table(maps_dir, dbc_dir, spawns_path, roster_zones_path=None):
         creature = templates.get(faction)
         for side, player in players.items():
             if hostile_to(creature, player):
-                mins, maxes = levels.setdefault(f"{map_id}:{zone}", {}).setdefault(side, ([], []))
+                mins, maxes = levels.setdefault(f"{map_id}:{zone}", {}).setdefault(
+                    side, ([], [])
+                )
                 mins.append(lo)
                 maxes.append(hi)
 
@@ -176,7 +187,9 @@ def build_table(maps_dir, dbc_dir, spawns_path, roster_zones_path=None):
     stand_in = sorted(set(stand_in), key=lambda k: tuple(int(p) for p in k.split(":")))
 
     zones = {}
-    for key in sorted(set(levels) | set(stand_in), key=lambda k: tuple(int(p) for p in k.split(":"))):
+    for key in sorted(
+        set(levels) | set(stand_in), key=lambda k: tuple(int(p) for p in k.split(":"))
+    ):
         entry = {"name": names.get(int(key.split(":")[1]), "")}
         for side in SIDES:
             pair = levels.get(key, {}).get(side)
@@ -192,8 +205,8 @@ def build_table(maps_dir, dbc_dir, spawns_path, roster_zones_path=None):
 
     return {
         "source": "creature spawns joined to creature_template, zone from the .map area grid "
-                  "and AreaTable parent; hostile by FactionTemplate against player templates "
-                  "1 (alliance) and 2 (horde); see tools/zone-band/README.md",
+        "and AreaTable parent; hostile by FactionTemplate against player templates "
+        "1 (alliance) and 2 (horde); see tools/zone-band/README.md",
         "percentiles": PERCENTILES,
         "families_stand_in": stand_in,
         "zones": zones,
@@ -203,14 +216,22 @@ def build_table(maps_dir, dbc_dir, spawns_path, roster_zones_path=None):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--maps", required=True, help="directory of extracted .map tiles")
-    ap.add_argument("--dbc", required=True, help="directory with AreaTable.dbc and FactionTemplate.dbc")
-    ap.add_argument("--spawns", required=True, help="TSV: map, x, y, minlevel, maxlevel, faction")
+    ap.add_argument(
+        "--dbc",
+        required=True,
+        help="directory with AreaTable.dbc and FactionTemplate.dbc",
+    )
+    ap.add_argument(
+        "--spawns", required=True, help="TSV: map, x, y, minlevel, maxlevel, faction"
+    )
     ap.add_argument("--roster-zones", help="TSV: map, zone of each family member")
     ap.add_argument("--out", required=True)
     args = ap.parse_args(argv)
-    for label, path in (("AreaTable.dbc", Path(args.dbc) / "AreaTable.dbc"),
-                        ("FactionTemplate.dbc", Path(args.dbc) / "FactionTemplate.dbc"),
-                        ("spawns file", Path(args.spawns))):
+    for label, path in (
+        ("AreaTable.dbc", Path(args.dbc) / "AreaTable.dbc"),
+        ("FactionTemplate.dbc", Path(args.dbc) / "FactionTemplate.dbc"),
+        ("spawns file", Path(args.spawns)),
+    ):
         if not path.exists():
             print(f"zone-band: {label} not found at {path}", file=sys.stderr)
             return 2

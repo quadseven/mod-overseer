@@ -70,6 +70,7 @@ The .map tiles are NOT in this repository and must not be: they are extracted
 game data, 54 MB for the two zones the checks below touch. README.md says where
 to get them. Point this at them with --maps DIR or OVERSEER_REPLAY_MAPS.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -123,15 +124,15 @@ HOLETAB_V = (0x000F, 0x00F0, 0x0F00, 0xF000)
 # the self-test's distances move and the run says so.
 # --------------------------------------------------------------------------
 
-TRAVEL_STEP_YARDS = 60.0            # mod_overseer.cpp:1422
-TRAVEL_GROUND_SAMPLE_YARDS = 4.0    # mod_overseer.cpp:1428
-TRAVEL_GROUND_DROP_YARDS = 10.0     # mod_overseer.cpp:1445
-TRAVEL_GROUND_RISE_YARDS = 8.0      # mod_overseer.cpp:1457
-TRAVEL_GROUND_SNAP_YARDS = 5.0      # mod_overseer.cpp:1466
-TRAVEL_GROUND_UPHILL_YARDS = 50.0   # mod_overseer.cpp:1474
-TRAVEL_STEP_SIDE_FRACTION = 0.6     # mod_overseer.cpp:1481
-TRAVEL_STEP_MIN_YARDS = TRAVEL_GROUND_SAMPLE_YARDS * 2.0   # mod_overseer.cpp:1490
-TRAVEL_STEP_VERTICAL_YARDS = 20.0   # mod_overseer.cpp:1520
+TRAVEL_STEP_YARDS = 60.0  # mod_overseer.cpp:1422
+TRAVEL_GROUND_SAMPLE_YARDS = 4.0  # mod_overseer.cpp:1428
+TRAVEL_GROUND_DROP_YARDS = 10.0  # mod_overseer.cpp:1445
+TRAVEL_GROUND_RISE_YARDS = 8.0  # mod_overseer.cpp:1457
+TRAVEL_GROUND_SNAP_YARDS = 5.0  # mod_overseer.cpp:1466
+TRAVEL_GROUND_UPHILL_YARDS = 50.0  # mod_overseer.cpp:1474
+TRAVEL_STEP_SIDE_FRACTION = 0.6  # mod_overseer.cpp:1481
+TRAVEL_STEP_MIN_YARDS = TRAVEL_GROUND_SAMPLE_YARDS * 2.0  # mod_overseer.cpp:1490
+TRAVEL_STEP_VERTICAL_YARDS = 20.0  # mod_overseer.cpp:1520
 
 # mod_overseer.cpp:1283. An AIMED POSITION is arrived at within five yards.
 # This is deliberately not TRAVEL_ARRIVED_YARDS (12, mod_overseer.cpp:1203),
@@ -195,8 +196,19 @@ class Tile:
         self.path = path
         with open(path, "rb") as f:
             blob = f.read()
-        (_magic, version, _build, _area_off, _area_sz, h_off, _h_sz,
-         _l_off, _l_sz, holes_off, holes_sz) = struct.unpack_from("<11I", blob, 0)
+        (
+            _magic,
+            version,
+            _build,
+            _area_off,
+            _area_sz,
+            h_off,
+            _h_sz,
+            _l_off,
+            _l_sz,
+            holes_off,
+            holes_sz,
+        ) = struct.unpack_from("<11I", blob, 0)
         # Version 9 is what the pinned core extracts and what this reader was
         # written against. Refusing anything else is the point: silently
         # misreading a v8 or v10 tile would produce plausible heights and wrong
@@ -213,7 +225,8 @@ class Tile:
 
         if h_off:
             fourcc, flags, grid_height, grid_max = struct.unpack_from(
-                "<IIff", blob, h_off)
+                "<IIff", blob, h_off
+            )
             if fourcc != int.from_bytes(b"MHGT", "little"):
                 raise ValueError("%s: height chunk is not MHGT" % path)
             self.grid_height = grid_height
@@ -370,8 +383,9 @@ def surface_at(mapid: int, x: float, y: float, frm: float):
     return True, h
 
 
-def footing_sample_holds(from_z: float, to_z: float, max_drop: float,
-                         max_rise: float) -> bool:
+def footing_sample_holds(
+    from_z: float, to_z: float, max_drop: float, max_rise: float
+) -> bool:
     """overseer_decisions.cpp:453. The SMALLER bound, applied to the magnitude.
     A stride is walkable exactly when the stride back is, so there is one
     number rather than two."""
@@ -379,8 +393,9 @@ def footing_sample_holds(from_z: float, to_z: float, max_drop: float,
     return abs(to_z - from_z) <= bound
 
 
-def proven_step_is_worth_taking(whole_held: bool, proved: float,
-                                min_yards: float) -> bool:
+def proven_step_is_worth_taking(
+    whole_held: bool, proved: float, min_yards: float
+) -> bool:
     """overseer_decisions.cpp:464. Nothing was truncated, so there is nothing
     for the floor to judge; otherwise the prefix has to be long enough to be
     worth walking."""
@@ -391,8 +406,9 @@ def proven_step_is_worth_taking(whole_held: bool, proved: float,
     return proved >= min_yards
 
 
-def step_may_bridge_gap(span: float, vertical_gap: float, step_yards: float,
-                        max_gap: float) -> bool:
+def step_may_bridge_gap(
+    span: float, vertical_gap: float, step_yards: float, max_gap: float
+) -> bool:
     """overseer_decisions.cpp:444. A normal walking step cannot bridge a large
     vertical gap (#203). Measured against the AIM, so it bounds a step only
     when the aim is within one step; a far aim's height is not this step's."""
@@ -401,8 +417,9 @@ def step_may_bridge_gap(span: float, vertical_gap: float, step_yards: float,
     return abs(vertical_gap) <= max_gap
 
 
-def ground_holds(mapid: int, from_x: float, from_y: float, from_z: float,
-                 to_x: float, to_y: float):
+def ground_holds(
+    mapid: int, from_x: float, from_y: float, from_z: float, to_x: float, to_y: float
+):
     """mod_overseer.cpp:13561 GroundHolds. Returns (held, footing, proved).
 
     `proved` is the length of the line the check actually WALKED before it
@@ -430,8 +447,9 @@ def ground_holds(mapid: int, from_x: float, from_y: float, from_z: float,
             ok, nxt = surface_at(mapid, sx, sy, footing + TRAVEL_GROUND_UPHILL_YARDS)
             if not ok:
                 return False, footing, proved
-        if not footing_sample_holds(footing, nxt, TRAVEL_GROUND_DROP_YARDS,
-                                    TRAVEL_GROUND_RISE_YARDS):
+        if not footing_sample_holds(
+            footing, nxt, TRAVEL_GROUND_DROP_YARDS, TRAVEL_GROUND_RISE_YARDS
+        ):
             return False, footing, proved
         footing = nxt
         proved = span * i / samples
@@ -445,8 +463,9 @@ REFUSED_VERTICAL_GAP = "vertical gap"
 REFUSED_CONE_EXHAUSTED = "cone exhausted"
 
 
-def grounded_step(mapid: int, bx: float, by: float, bz: float,
-                  wx: float, wy: float, wz: float):
+def grounded_step(
+    mapid: int, bx: float, by: float, bz: float, wx: float, wy: float, wz: float
+):
     """mod_overseer.cpp:14759 GroundedStep, without the navmesh branch (no
     mmaps here, see the module docstring) and without NothingInTheWay (no
     vmaps here). Returns (ok, tx, ty, footing, delta, reason)."""
@@ -464,8 +483,9 @@ def grounded_step(mapid: int, bx: float, by: float, bz: float,
     if span < 1.0:
         return True, wx, wy, wz, 0.0, None
 
-    if not step_may_bridge_gap(span, wz - bz, TRAVEL_STEP_YARDS,
-                               TRAVEL_STEP_VERTICAL_YARDS):
+    if not step_may_bridge_gap(
+        span, wz - bz, TRAVEL_STEP_YARDS, TRAVEL_STEP_VERTICAL_YARDS
+    ):
         return False, bx, by, bz, None, REFUSED_VERTICAL_GAP
 
     bearing = math.atan2(wy - by, wx - bx)
@@ -495,8 +515,17 @@ def grounded_step(mapid: int, bx: float, by: float, bz: float,
     return False, bx, by, bz, None, REFUSED_CONE_EXHAUSTED
 
 
-def walk(mapid: int, name: str, sx: float, sy: float, sz: float,
-         ax: float, ay: float, az: float, max_polls: int = 4000) -> dict:
+def walk(
+    mapid: int,
+    name: str,
+    sx: float,
+    sy: float,
+    sz: float,
+    ax: float,
+    ay: float,
+    az: float,
+    max_polls: int = 4000,
+) -> dict:
     """Poll GroundedStep the way DriveTravel does until it arrives or stops.
 
     Arrival is TRAVEL_ARRIVED_POSITION_YARDS because both control walks aim at
@@ -510,25 +539,61 @@ def walk(mapid: int, name: str, sx: float, sy: float, sz: float,
     for poll in range(max_polls):
         remaining = math.hypot(ax - x, ay - y)
         if remaining <= TRAVEL_ARRIVED_POSITION_YARDS:
-            return dict(name=name, outcome="ARRIVED", reason=None, polls=poll,
-                        travelled=travelled, x=x, y=y, z=z, remaining=remaining)
+            return dict(
+                name=name,
+                outcome="ARRIVED",
+                reason=None,
+                polls=poll,
+                travelled=travelled,
+                x=x,
+                y=y,
+                z=z,
+                remaining=remaining,
+            )
         ok, tx, ty, tz, _delta, reason = grounded_step(mapid, x, y, z, ax, ay, az)
         if not ok:
-            return dict(name=name, outcome="REFUSED", reason=reason, polls=poll,
-                        travelled=travelled, x=x, y=y, z=z, remaining=remaining)
+            return dict(
+                name=name,
+                outcome="REFUSED",
+                reason=reason,
+                polls=poll,
+                travelled=travelled,
+                x=x,
+                y=y,
+                z=z,
+                remaining=remaining,
+            )
         moved = math.hypot(tx - x, ty - y)
         if moved < 1e-4:
-            return dict(name=name, outcome="STALLED", reason=None, polls=poll,
-                        travelled=travelled, x=x, y=y, z=z, remaining=remaining)
+            return dict(
+                name=name,
+                outcome="STALLED",
+                reason=None,
+                polls=poll,
+                travelled=travelled,
+                x=x,
+                y=y,
+                z=z,
+                remaining=remaining,
+            )
         travelled += moved
         x, y, z = tx, ty, tz
-    return dict(name=name, outcome="MAXPOLLS", reason=None, polls=max_polls,
-                travelled=travelled, x=x, y=y, z=z,
-                remaining=math.hypot(ax - x, ay - y))
+    return dict(
+        name=name,
+        outcome="MAXPOLLS",
+        reason=None,
+        polls=max_polls,
+        travelled=travelled,
+        x=x,
+        y=y,
+        z=z,
+        remaining=math.hypot(ax - x, ay - y),
+    )
 
 
-def bearing_ring(mapid: int, x: float, y: float, z: float, aim_x: float,
-                 aim_y: float, reach: float):
+def bearing_ring(
+    mapid: int, x: float, y: float, z: float, aim_x: float, aim_y: float, reach: float
+):
     """The 36-bearing ring quoted in #316: how many directions out of a full
     circle hold ground, and how many of the five GroundedStep would actually
     try. A place where 21 of 36 hold and 0 of 5 in the cone do is a character
@@ -571,7 +636,7 @@ FAMILY = (
     ("Bork", -7455.1, -2487.6, -184.400, -184.452),
     ("Ugga", -7455.1, -2487.7, -184.300, -184.340),
     ("Grog", -8005.2, -2210.1, -152.700, -152.634),
-    ("Og",   -8004.8, -2178.1, -174.300, -174.376),
+    ("Og", -8004.8, -2178.1, -174.300, -174.376),
 )
 
 # The Un'Goro errand those five were carrying when the refusals were logged.
@@ -666,22 +731,40 @@ class SelfTest:
         # compared, which is how the failure branch gets exercised on demand.
         self.inject_drift = inject_drift
 
-    def close(self, name: str, measured: float, expected: float,
-              tolerance: float, unit: str = "yards") -> bool:
+    def close(
+        self,
+        name: str,
+        measured: float,
+        expected: float,
+        tolerance: float,
+        unit: str = "yards",
+    ) -> bool:
         measured = measured + self.inject_drift
         delta = abs(measured - expected)
         ok = delta <= tolerance
-        self.checks.append((ok, name,
-                            "measured %+.3f %s, expected %+.3f +/- %.3f (off by %.3f)"
-                            % (measured, unit, expected, tolerance, delta)))
+        self.checks.append(
+            (
+                ok,
+                name,
+                "measured %+.3f %s, expected %+.3f +/- %.3f (off by %.3f)"
+                % (measured, unit, expected, tolerance, delta),
+            )
+        )
         return ok
 
-    def at_least(self, name: str, measured: float, floor: float,
-                 unit: str = "yards") -> bool:
+    def at_least(
+        self, name: str, measured: float, floor: float, unit: str = "yards"
+    ) -> bool:
         measured = measured + self.inject_drift
         ok = measured >= floor
-        self.checks.append((ok, name, "measured %.3f %s, wanted at least %.3f %s"
-                            % (measured, unit, floor, unit)))
+        self.checks.append(
+            (
+                ok,
+                name,
+                "measured %.3f %s, wanted at least %.3f %s"
+                % (measured, unit, floor, unit),
+            )
+        )
         return ok
 
     def same(self, name: str, measured, expected) -> bool:
@@ -707,9 +790,11 @@ def check_no_missing_tiles(t: SelfTest) -> None:
     nothing about the word "REFUSED" distinguishes the two cases. The distances
     do, and so does this.
     """
-    t.same("map data: every tile touched was on disk",
-           sorted("%03d%02d%02d.map" % (KALIMDOR, gx, gy) for gx, gy in MISSING),
-           [])
+    t.same(
+        "map data: every tile touched was on disk",
+        sorted("%03d%02d%02d.map" % (KALIMDOR, gx, gy) for gx, gy in MISSING),
+        [],
+    )
 
 
 def run_self_test(t: SelfTest, stream=sys.stdout) -> bool:
@@ -717,54 +802,93 @@ def run_self_test(t: SelfTest, stream=sys.stdout) -> bool:
     stream.write("SELF-TEST  (terrain only: no vmaps, no mmaps, no liquid)\n")
     stream.write("maps: %s\n" % map_dir())
     if t.inject_drift:
-        stream.write("FAULT INJECTED: every measured number shifted by %+.3f\n"
-                     % t.inject_drift)
+        stream.write(
+            "FAULT INJECTED: every measured number shifted by %+.3f\n" % t.inject_drift
+        )
     stream.write("=" * 78 + "\n")
 
     # ---- reader validation: 12 checks -------------------------------------
     stream.write("\nreader validation: terrain under a known position vs its live z\n")
     for name, x, y, live_z, recorded in FAMILY:
         h = grid_height(KALIMDOR, x, y)
-        t.close("reader drift: %s on %s" % (name, tile_name(KALIMDOR, x, y)),
-                h, recorded, READER_DRIFT_TOLERANCE)
-        t.close("reader vs live position_z: %s" % name,
-                abs(h - live_z), 0.0, READER_DELTA_TOLERANCE)
+        t.close(
+            "reader drift: %s on %s" % (name, tile_name(KALIMDOR, x, y)),
+            h,
+            recorded,
+            READER_DRIFT_TOLERANCE,
+        )
+        t.close(
+            "reader vs live position_z: %s" % name,
+            abs(h - live_z),
+            0.0,
+            READER_DELTA_TOLERANCE,
+        )
     ax, ay, az = AIM
     ah = grid_height(KALIMDOR, ax, ay)
-    t.close("reader drift: the aim on %s" % tile_name(KALIMDOR, ax, ay),
-            ah, AIM_TERRAIN, READER_DRIFT_TOLERANCE)
+    t.close(
+        "reader drift: the aim on %s" % tile_name(KALIMDOR, ax, ay),
+        ah,
+        AIM_TERRAIN,
+        READER_DRIFT_TOLERANCE,
+    )
     t.close("reader vs the aim's own z", abs(ah - az), 0.0, READER_DELTA_TOLERANCE)
 
     # ---- replay validation: 11 checks -------------------------------------
     stream.write("replay validation: the two walks the source comments quote\n")
     door_h = grid_height(KALIMDOR, *DOOR)
-    t.close("terrain under the Wailing Caverns terrace", door_h, DOOR_TERRAIN,
-            READER_DRIFT_TOLERANCE)
+    t.close(
+        "terrain under the Wailing Caverns terrace",
+        door_h,
+        DOOR_TERRAIN,
+        READER_DRIFT_TOLERANCE,
+    )
 
     name, sx, sy, sz = SISHIR
     sishir = walk(KALIMDOR, name, sx, sy, sz, DOOR[0], DOOR[1], door_h)
     t.same("Sishir: outcome", sishir["outcome"], "REFUSED")
     t.same("Sishir: refused how", sishir["reason"], REFUSED_CONE_EXHAUSTED)
-    t.close("Sishir: yards walked before the refusal",
-            sishir["travelled"], SISHIR_TRAVELLED, DISTANCE_TOLERANCE)
-    t.close("Sishir: agrees with the published 84 yards",
-            sishir["travelled"], SISHIR_PUBLISHED, SISHIR_PUBLISHED_TOLERANCE)
+    t.close(
+        "Sishir: yards walked before the refusal",
+        sishir["travelled"],
+        SISHIR_TRAVELLED,
+        DISTANCE_TOLERANCE,
+    )
+    t.close(
+        "Sishir: agrees with the published 84 yards",
+        sishir["travelled"],
+        SISHIR_PUBLISHED,
+        SISHIR_PUBLISHED_TOLERANCE,
+    )
 
     name, rx, ry, rz = RATCHET
     ratchet = walk(KALIMDOR, name, rx, ry, rz, DOOR[0], DOOR[1], door_h)
     t.same("Ratchet: outcome", ratchet["outcome"], "REFUSED")
     t.same("Ratchet: refused how", ratchet["reason"], REFUSED_VERTICAL_GAP)
-    t.close("Ratchet: yards walked", ratchet["travelled"], RATCHET_TRAVELLED,
-            DISTANCE_TOLERANCE)
-    t.close("Ratchet: yards short of the terrace", ratchet["remaining"],
-            RATCHET_REMAINING, DISTANCE_TOLERANCE)
-    t.at_least("Ratchet: within reach of the published 1465",
-               ratchet["travelled"] + ratchet["remaining"], RATCHET_PUBLISHED)
+    t.close(
+        "Ratchet: yards walked",
+        ratchet["travelled"],
+        RATCHET_TRAVELLED,
+        DISTANCE_TOLERANCE,
+    )
+    t.close(
+        "Ratchet: yards short of the terrace",
+        ratchet["remaining"],
+        RATCHET_REMAINING,
+        DISTANCE_TOLERANCE,
+    )
+    t.at_least(
+        "Ratchet: within reach of the published 1465",
+        ratchet["travelled"] + ratchet["remaining"],
+        RATCHET_PUBLISHED,
+    )
     # The published contrast, as one number. Sishir is stopped by terrain in the
     # first hundred yards; Ratchet crosses the Barrens untroubled.
-    t.at_least("the contrast: Ratchet walks this many times Sishir's yards",
-               ratchet["travelled"] / max(sishir["travelled"], 1e-6),
-               CONTRAST_RATIO, unit="x")
+    t.at_least(
+        "the contrast: Ratchet walks this many times Sishir's yards",
+        ratchet["travelled"] / max(sishir["travelled"], 1e-6),
+        CONTRAST_RATIO,
+        unit="x",
+    )
 
     # ---- data integrity: 1 check ------------------------------------------
     check_no_missing_tiles(t)
@@ -781,21 +905,32 @@ def run_self_test(t: SelfTest, stream=sys.stdout) -> bool:
     passed = counted and failed == 0
 
     if not counted:
-        stream.write("FAIL: ran %d checks, expected exactly %d. A check was "
-                     "skipped or added without updating EXPECTED_CHECKS.\n"
-                     % (ran, EXPECTED_CHECKS))
+        stream.write(
+            "FAIL: ran %d checks, expected exactly %d. A check was "
+            "skipped or added without updating EXPECTED_CHECKS.\n"
+            % (ran, EXPECTED_CHECKS)
+        )
     if failed:
         stream.write("FAIL: %d of %d checks did not hold.\n" % (failed, ran))
     if MISSING:
-        stream.write("\nThe map tiles below were not found under %s:\n  %s\n"
-                     "Nothing in this run means anything without them. "
-                     "README.md says where to get them.\n"
-                     % (map_dir(),
-                        " ".join(sorted("%03d%02d%02d.map" % (KALIMDOR, gx, gy)
-                                        for gx, gy in MISSING))))
+        stream.write(
+            "\nThe map tiles below were not found under %s:\n  %s\n"
+            "Nothing in this run means anything without them. "
+            "README.md says where to get them.\n"
+            % (
+                map_dir(),
+                " ".join(
+                    sorted(
+                        "%03d%02d%02d.map" % (KALIMDOR, gx, gy) for gx, gy in MISSING
+                    )
+                ),
+            )
+        )
     if passed:
-        stream.write("PASS: %d of %d checks held, and all %d ran.\n"
-                     % (ran - failed, ran, EXPECTED_CHECKS))
+        stream.write(
+            "PASS: %d of %d checks held, and all %d ran.\n"
+            % (ran - failed, ran, EXPECTED_CHECKS)
+        )
     return passed
 
 
@@ -826,8 +961,9 @@ def run_fault_drill(real_map_dir: str, stream=sys.stdout) -> bool:
         set_map_dir(empty)
         drill = SelfTest()
         fired = not run_self_test(drill, sink)
-        results.append(("no map data at all", fired, len(drill.failures),
-                        len(drill.checks)))
+        results.append(
+            ("no map data at all", fired, len(drill.failures), len(drill.checks))
+        )
 
     # FAULT 2: the tiles are there and the numbers have moved. Five yards is
     # larger than every tolerance in the fixtures, so every numeric check has
@@ -835,28 +971,46 @@ def run_fault_drill(real_map_dir: str, stream=sys.stdout) -> bool:
     set_map_dir(real_map_dir)
     drill = SelfTest(inject_drift=5.0)
     fired = not run_self_test(drill, sink)
-    results.append(("every measurement shifted by 5 yards", fired,
-                    len(drill.failures), len(drill.checks)))
+    results.append(
+        (
+            "every measurement shifted by 5 yards",
+            fired,
+            len(drill.failures),
+            len(drill.checks),
+        )
+    )
 
     for label, fired, failed, ran in results:
-        stream.write("  %-4s %-40s self-test %s (%d of %d checks failed)\n"
-                     % ("ok" if fired else "FAIL", label,
-                        "failed as it should" if fired else "WRONGLY PASSED",
-                        failed, ran))
+        stream.write(
+            "  %-4s %-40s self-test %s (%d of %d checks failed)\n"
+            % (
+                "ok" if fired else "FAIL",
+                label,
+                "failed as it should" if fired else "WRONGLY PASSED",
+                failed,
+                ran,
+            )
+        )
 
     # The drill is itself a positive assertion: both faults must have fired,
     # and both must have been running a full-length self-test while they did.
     all_fired = all(r[1] for r in results)
     all_full = all(r[3] == EXPECTED_CHECKS for r in results)
     if not all_full:
-        stream.write("\nFAIL: a drill ran a short self-test, so what it proved "
-                     "is not what the gate runs.\n")
+        stream.write(
+            "\nFAIL: a drill ran a short self-test, so what it proved "
+            "is not what the gate runs.\n"
+        )
     if not all_fired:
-        stream.write("\nFAIL: a fault did not fire. The self-test cannot be "
-                     "trusted to report bad news.\n")
+        stream.write(
+            "\nFAIL: a fault did not fire. The self-test cannot be "
+            "trusted to report bad news.\n"
+        )
     if all_fired and all_full:
-        stream.write("\nPASS: %d of %d faults produced a failing self-test.\n"
-                     % (len(results), len(results)))
+        stream.write(
+            "\nPASS: %d of %d faults produced a failing self-test.\n"
+            % (len(results), len(results))
+        )
     # Leave the loader pointing back at the real tiles for anything after this.
     set_map_dir(real_map_dir)
     return all_fired and all_full
@@ -884,35 +1038,54 @@ def run_survey(stream=sys.stdout) -> None:
         straight = math.hypot(ax - x, ay - y)
         r = walk(KALIMDOR, name, x, y, live_z, ax, ay, az)
         stops.append(r)
-        stream.write("  %-5s %7.1f yards out -> %s%s after %d polls, %.1f walked\n"
-                     % (name, straight, r["outcome"],
-                        "" if not r["reason"] else " (%s)" % r["reason"],
-                        r["polls"], r["travelled"]))
-        stream.write("        stopped at (%.1f, %.1f, %.1f), still %.1f out\n"
-                     % (r["x"], r["y"], r["z"], r["remaining"]))
+        stream.write(
+            "  %-5s %7.1f yards out -> %s%s after %d polls, %.1f walked\n"
+            % (
+                name,
+                straight,
+                r["outcome"],
+                "" if not r["reason"] else " (%s)" % r["reason"],
+                r["polls"],
+                r["travelled"],
+            )
+        )
+        stream.write(
+            "        stopped at (%.1f, %.1f, %.1f), still %.1f out\n"
+            % (r["x"], r["y"], r["z"], r["remaining"])
+        )
 
     stream.write("\nthe 36-bearing ring where each walk stopped, at two strides\n")
     for r in stops:
-        held, _refused, cone = bearing_ring(KALIMDOR, r["x"], r["y"], r["z"],
-                                            ax, ay, TRAVEL_GROUND_SAMPLE_YARDS * 2)
+        held, _refused, cone = bearing_ring(
+            KALIMDOR, r["x"], r["y"], r["z"], ax, ay, TRAVEL_GROUND_SAMPLE_YARDS * 2
+        )
         cone_held = sum(1 for _d, ok in cone if ok)
-        stream.write("  %-5s %2d of 36 bearings hold, %d of the 5 in the cone; "
-                     "aim bears %.1f deg\n"
-                     % (r["name"], len(held), cone_held,
-                        math.degrees(math.atan2(ay - r["y"], ax - r["x"])) % 360.0))
+        stream.write(
+            "  %-5s %2d of 36 bearings hold, %d of the 5 in the cone; "
+            "aim bears %.1f deg\n"
+            % (
+                r["name"],
+                len(held),
+                cone_held,
+                math.degrees(math.atan2(ay - r["y"], ax - r["x"])) % 360.0,
+            )
+        )
         stream.write("        holding: %s\n" % (held,))
 
     gname, gx0, gy0, gz0, _recorded = FAMILY[0]
     stream.write("\nthe same ring at %s's start, widening the reach\n" % gname)
     for reach in (8.0, 12.0, 20.0, 30.0, 40.0, 60.0):
-        held, _refused, cone = bearing_ring(KALIMDOR, gx0, gy0, gz0,
-                                            ax, ay, reach)
+        held, _refused, cone = bearing_ring(KALIMDOR, gx0, gy0, gz0, ax, ay, reach)
         cone_held = sum(1 for _d, ok in cone if ok)
-        stream.write("  reach %4.0f yards: %2d of 36 hold, %d of 5 in the cone\n"
-                     % (reach, len(held), cone_held))
+        stream.write(
+            "  reach %4.0f yards: %2d of 36 hold, %d of 5 in the cone\n"
+            % (reach, len(held), cone_held)
+        )
 
-    stream.write("\nterrain along %s's straight line to the aim, every %.0f yards\n"
-                 % (gname, TRAVEL_GROUND_SAMPLE_YARDS))
+    stream.write(
+        "\nterrain along %s's straight line to the aim, every %.0f yards\n"
+        % (gname, TRAVEL_GROUND_SAMPLE_YARDS)
+    )
     dx = ax - gx0
     dy = ay - gy0
     tot = math.hypot(dx, dy)
@@ -928,20 +1101,36 @@ def run_survey(stream=sys.stdout) -> None:
         if i % 5 == 0:
             flag = ""
             if prev is not None and abs(h - prev) > TRAVEL_GROUND_RISE_YARDS:
-                flag = "   <-- over the %.0f yard stride bound" % TRAVEL_GROUND_RISE_YARDS
+                flag = (
+                    "   <-- over the %.0f yard stride bound" % TRAVEL_GROUND_RISE_YARDS
+                )
             stream.write("    %5.0f yards out: terrain %+9.2f%s\n" % (d, h, flag))
         prev = h
-    stream.write("    steepest single %.0f yard stride in the first %.0f yards: "
-                 "%.2f of rise, %.0f yards out\n"
-                 % (TRAVEL_GROUND_SAMPLE_YARDS, 100 * TRAVEL_GROUND_SAMPLE_YARDS,
-                    worst[0], worst[1]))
+    stream.write(
+        "    steepest single %.0f yard stride in the first %.0f yards: "
+        "%.2f of rise, %.0f yards out\n"
+        % (
+            TRAVEL_GROUND_SAMPLE_YARDS,
+            100 * TRAVEL_GROUND_SAMPLE_YARDS,
+            worst[0],
+            worst[1],
+        )
+    )
 
     if MISSING:
-        stream.write("\nWARNING: %d tile(s) under this survey were not on disk, "
-                     "so some of it is reading empty space rather than terrain: "
-                     "%s\n" % (len(MISSING),
-                               " ".join(sorted("%03d%02d%02d.map" % (KALIMDOR, gx, gy)
-                                               for gx, gy in MISSING))))
+        stream.write(
+            "\nWARNING: %d tile(s) under this survey were not on disk, "
+            "so some of it is reading empty space rather than terrain: "
+            "%s\n"
+            % (
+                len(MISSING),
+                " ".join(
+                    sorted(
+                        "%03d%02d%02d.map" % (KALIMDOR, gx, gy) for gx, gy in MISSING
+                    )
+                ),
+            )
+        )
 
 
 # --------------------------------------------------------------------------
@@ -950,15 +1139,24 @@ def run_survey(stream=sys.stdout) -> None:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Replay GroundedStep over the shipped heightmap grids. "
-                    "Terrain only: no vmaps, no mmaps, no liquid.")
-    parser.add_argument("--maps", default=None,
-                        help="directory holding the extracted .map tiles "
-                             "(default: $%s, else ./maps beside this script)"
-                             % MAP_DIR_ENV)
-    parser.add_argument("--survey", action="store_true",
-                        help="print the exploratory report instead of the self-test")
-    parser.add_argument("--fault-drill", action="store_true",
-                        help="prove the self-test fails when it should, then exit")
+        "Terrain only: no vmaps, no mmaps, no liquid."
+    )
+    parser.add_argument(
+        "--maps",
+        default=None,
+        help="directory holding the extracted .map tiles "
+        "(default: $%s, else ./maps beside this script)" % MAP_DIR_ENV,
+    )
+    parser.add_argument(
+        "--survey",
+        action="store_true",
+        help="print the exploratory report instead of the self-test",
+    )
+    parser.add_argument(
+        "--fault-drill",
+        action="store_true",
+        help="prove the self-test fails when it should, then exit",
+    )
     args = parser.parse_args(argv)
 
     if args.maps:
@@ -969,7 +1167,8 @@ def main(argv=None) -> int:
             "no map directory at %s\n"
             "The .map tiles are extracted game data and are deliberately not in "
             "this repository. See README.md in this directory for how to get "
-            "them, then pass --maps DIR or set %s.\n" % (map_dir(), MAP_DIR_ENV))
+            "them, then pass --maps DIR or set %s.\n" % (map_dir(), MAP_DIR_ENV)
+        )
         return 2
 
     if args.fault_drill:
