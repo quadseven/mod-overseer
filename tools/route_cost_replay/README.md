@@ -49,17 +49,60 @@ For each continent and player side, the report gives:
 given count, using each spawn's detection range plus 5 yards around either leg
 endpoint. They include the B rule as well.
 
-## Live replay percentages (open)
+## Building the input from exports
 
-| Result | Status |
-|---|---|
-| Real replay percentages by continent and player side | **OPEN - NOT MEASURED** |
+`build_input.py` turns read-only exports into the JSON above. Take every query
+in one session, as `mysql -B -N` output (tab separated, no header), for the
+maps measured (0 and 1):
 
-To fill this box, take one consistent, sanitized snapshot for the measured maps:
-all relevant rows from `playerbots_travelnode`, every directed link and ordered
-path point from `playerbots_travelnode_link` and `playerbots_travelnode_path`,
-all corresponding `creature` spawn rows and their `creature_template` values,
-the pinned core's faction-template data, and the Alliance and Horde player
-template faction IDs. Derive `can_be_fought`, `trigger`, `civilian`, and `active`
-with the pinned core's rules. Do not report percentages until that complete
-snapshot has been replayed.
+```sql
+-- nodes.tsv
+select id, map_id, x, y, z from playerbots_travelnode where map_id in (0,1);
+-- links.tsv (type 1 is walk)
+select node_id, to_node_id, type, distance, extra_cost from playerbots_travelnode_link;
+-- paths.tsv, ordered by nr
+select p.node_id, p.to_node_id, p.x, p.y, p.z from playerbots_travelnode_path p
+  join playerbots_travelnode n on n.id = p.node_id where n.map_id in (0,1)
+  order by p.node_id, p.to_node_id, p.nr;
+-- spawns.tsv, spawn override wins over the template, as in CanBeFought
+select c.guid, c.map, c.position_x, c.position_y, c.position_z, t.maxlevel,
+  t.`rank`, t.detection_range, t.faction,
+  if(c.unit_flags <> 0, c.unit_flags, t.unit_flags), t.flags_extra,
+  ifnull(g.eventEntry, 0)
+  from creature c join creature_template t on t.entry = c.id
+  left join game_event_creature g on g.guid = c.guid where c.map in (0,1);
+```
+
+`FactionTemplate.dbc` comes from the pinned core's data directory (it is a DBC,
+not a table). Then:
+
+```powershell
+python tools/route_cost_replay/build_input.py --nodes nodes.tsv --links links.tsv `
+  --paths paths.tsv --spawns spawns.tsv --factions FactionTemplate.dbc --output route-input.json
+```
+
+Player templates are fixed at 1 (Human, Alliance) and 2 (Orc, Horde). A spawn
+linked to a game event is treated as not standing, because the export does not
+know which events are running; a spawn in several events is read once.
+
+## Live replay percentages
+
+Measured on the dev realm's rows, 2026-11-17, walker level 60, one snapshot:
+1,260 nodes and 5,247 directed walk legs on the two continents, 60,999 spawn
+rows (none without a template), 841 faction templates. Second searches are
+over every reachable ordered node pair with at least 200 yards of progress
+(Eastern Kingdoms 384,505 routes, Kalimdor 262,174).
+
+| Continent, side | today | B | A at N=2 | A at N=3 |
+|---|---|---|---|---|
+| Eastern Kingdoms, Alliance: second search | 19.15% | 30.27% | 98.13% | 94.97% |
+| Eastern Kingdoms, Alliance: legs marked | 5.49% | 8.88% | 60.78% | 45.29% |
+| Eastern Kingdoms, Horde: second search | 11.67% | 23.32% | 99.07% | 96.68% |
+| Eastern Kingdoms, Horde: legs marked | 4.44% | 7.87% | 65.73% | 48.72% |
+| Kalimdor, Alliance: second search | 10.53% | 35.45% | 96.50% | 90.37% |
+| Kalimdor, Alliance: legs marked | 6.01% | 14.33% | 51.65% | 34.22% |
+| Kalimdor, Horde: second search | 2.75% | 29.03% | 93.03% | 81.20% |
+| Kalimdor, Horde: legs marked | 4.48% | 12.79% | 46.93% | 30.79% |
+
+Limits of this measure: it is a graph-wide workload, not observed requests, and
+one walker level. The two player templates stand in for every race of a side.
