@@ -9406,6 +9406,7 @@ public:
         {
             _terrainRecoveryTimer = 0;
             DriveBelowTerrainRecovery();
+            DriveWadeOutOfLava();
         }
     }
 
@@ -11698,6 +11699,82 @@ private:
     // short version, because a reader here will want it: a name that does not
     // resolve, a hold past its ceiling, a character a verb is walking on
     // purpose, and a character in combat.
+    // ARE THE CHARACTER'S FEET IN LETHAL LIQUID (wow-overseer#2886)? The same
+    // question the footing check asks of a stride, asked of where it stands.
+    static bool FeetInLethalLiquid(Player* bot)
+    {
+        if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->IsInFlight() ||
+            bot->GetTransport())
+            return false;
+        float surface = 0.f;
+        bool lethal = false;
+        SurfaceAt(bot, bot->GetPositionX(), bot->GetPositionY(),
+                  bot->GetPositionZ() + TRAVEL_GROUND_DROP_YARDS, surface, &lethal);
+        return lethal;
+    }
+
+    // A LIVING CHARACTER IN LAVA WALKS TO THE NEAREST DRY GROUND (wow-overseer#2886).
+    // Once a second, on the terrain poll. The walk is straight, with no generated
+    // path: the stock filter may route back across the lava, and this is a short
+    // dash to a point already measured dry. Nothing is teleported.
+    void DriveWadeOutOfLava()
+    {
+        static constexpr float WADE_MAX_YARDS = 60.0f;
+        static constexpr float WADE_STRIDE_YARDS = 4.0f;
+        static constexpr unsigned WADE_BEARINGS = 16;
+        static constexpr uint32 WADE_POINT_ID = 0;
+        std::vector<std::string> names;
+        if (QueryResult result = CharacterDatabase.Query(
+                "SELECT name FROM overseer_roster WHERE enabled = 1"))
+        {
+            do
+                names.push_back(result->Fetch()[0].Get<std::string>());
+            while (result->NextRow());
+        }
+        time_t const now = time(nullptr);
+        for (std::string const& name : names)
+        {
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            if (!FeetInLethalLiquid(bot) || bot->IsBeingTeleported())
+            {
+                _wadeIssuedAt.erase(name);
+                continue;
+            }
+            auto const issued = _wadeIssuedAt.find(name);
+            if (issued != _wadeIssuedAt.end() && now - issued->second < 2 && bot->isMoving())
+                continue;
+            OverseerDecisions::WadeOutPick const pick = OverseerDecisions::PickWadeOut(
+                bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), WADE_MAX_YARDS,
+                WADE_STRIDE_YARDS, WADE_BEARINGS,
+                [bot](float x, float y, float from, float& out, bool& lethal)
+                { return SurfaceAt(bot, x, y, from, out, &lethal); });
+            if (!pick.found)
+            {
+                if (issued == _wadeIssuedAt.end())
+                {
+                    _wadeIssuedAt[name] = now;
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' stands in lava at ({:.1f}, {:.1f}, {:.1f}) and no dry "
+                             "ground was measured within {:.0f} yards (wow-overseer#2886)",
+                             name, bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+                             WADE_MAX_YARDS);
+                }
+                continue;
+            }
+            if (issued == _wadeIssuedAt.end())
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' stands in lava at ({:.1f}, {:.1f}, {:.1f}) and walks "
+                         "{:.0f} yards to dry ground at ({:.1f}, {:.1f}, {:.1f}) "
+                         "(wow-overseer#2886)",
+                         name, bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+                         pick.yards, pick.x, pick.y, pick.z);
+            _wadeIssuedAt[name] = now;
+            bot->GetMotionMaster()->MovePoint(WADE_POINT_ID, pick.x, pick.y, pick.z,
+                                              FORCED_MOVEMENT_NONE, 0.f, 0.f,
+                                              /*generatePath*/ false, /*forceDestination*/ true);
+        }
+    }
+
     static void KeepHeldCharactersStill()
     {
         auto& holds = HoldsInForce();
@@ -11757,6 +11834,7 @@ private:
             if (facts.present)
                 facts.driftYards = who->GetExactDist2d(record.anchorX, record.anchorY);
 
+            facts.feetInLethalLiquid = facts.present && FeetInLethalLiquid(who);
             if (!OverseerDecisions::RetakeTheHold(facts, HOLD_PIN_SLACK_YARDS))
                 continue;
 
@@ -34801,6 +34879,18 @@ private:
     void HoldAfterRevival(Player* bot, PlayerbotAI* botAI, std::string const& name,
                           uint32 mapId, float x, float y)
     {
+        // NEVER HOLD A CHARACTER IN LAVA (wow-overseer#2886). Lava kills in about
+        // seven seconds and this hold is twenty; DriveWadeOutOfLava walks it out.
+        if (FeetInLethalLiquid(bot))
+        {
+            _revivalHoldUntil.erase(name);
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' revives standing in lava - not held there; it wades out "
+                     "to dry ground (wow-overseer#2886)",
+                     name);
+            return;
+        }
+
         NearbyThreat const threat = HostileSpawnsNear(bot, mapId, x, y, REVIVAL_AGGRO_RADIUS, 0);
         if (threat.count)
         {
@@ -89534,6 +89624,8 @@ private:
     // costs nothing, because a restart also resets every bot's strategies
     // to upstream's defaults and there is no `stay` left to take off.
     std::map<std::string, std::pair<int64, bool>> _revivalHoldUntil;
+    // When each character in lava was last sent toward dry ground.
+    std::map<std::string, time_t> _wadeIssuedAt;
 
     std::map<std::string, RevivedSicknessState> _revivedSickness;
     // When each character's Resurrection Sickness from the spirit healer ends

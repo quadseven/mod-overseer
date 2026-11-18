@@ -14962,6 +14962,8 @@ bool RetakeTheHold(HeldStillFacts const& facts, float slackYards)
         return false;
     if (facts.inFlight)
         return false;
+    if (facts.feetInLethalLiquid)
+        return false;
 
     // AND THEN THE ONLY MEASUREMENT. Strictly greater, so a slack of zero
     // means "any drift at all" - which is what a reader expects that word to
