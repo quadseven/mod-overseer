@@ -180,6 +180,7 @@ int main()
     std::size_t const lavaAsk = holdBody.find("FeetInLethalLiquid(bot)");
     std::size_t const stay = holdBody.find("+stay");
     Check("the revival hold asks whether the feet are in lava", lavaAsk != std::string::npos, true);
+    Check("the revival hold still takes the character's mover", stay != std::string::npos, true);
     Check("and asks before it takes the character's mover", lavaAsk < stay, true);
 
     std::size_t const sweep = text.find("static void KeepHeldCharactersStill()");
