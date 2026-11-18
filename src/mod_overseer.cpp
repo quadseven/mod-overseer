@@ -76998,20 +76998,23 @@ private:
             return "";
         }
 
-        // A long random password nobody sees: 40 characters from a
-        // cryptographic source, which is never copied anywhere.
+        // A random password nobody sees, as long as the core allows (16, see
+        // CREATE_ACCOUNT_PASSWORD_LENGTH), from a cryptographic source, which is
+        // never copied anywhere.
         static char const alphabet[] = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
         std::random_device entropy;
         std::string password;
-        for (int i = 0; i < 40; ++i)
+        for (unsigned i = 0; i < OverseerDecisions::CREATE_ACCOUNT_PASSWORD_LENGTH; ++i)
             password += alphabet[entropy() % (sizeof(alphabet) - 1)];
         AccountOpResult const made = sAccountMgr->CreateAccount(upper, password);
         std::fill(password.begin(), password.end(), '\0');
         if (made != AOR_OK)
         {
-            o << "{\"outcome\":\"refused\",\"reason\":\"the core refused the account\",\"account\":" << J(upper) << '}';
+            o << "{\"outcome\":\"refused\",\"reason\":\"the core refused the account\",\"core_result\":"
+              << uint32(made) << ",\"account\":" << J(upper) << '}';
             out = o.str();
-            LOG_WARN("module.overseer", "overseer: create-account '{}' refused by the core", upper);
+            LOG_WARN("module.overseer", "overseer: create-account '{}' refused by the core (result {})", upper,
+                     uint32(made));
             return "the core refused the account";
         }
         LOG_INFO("module.overseer", "overseer: create-account '{}' made; its password is random and is not kept",

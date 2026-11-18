@@ -191,6 +191,7 @@ void TheAccountVerb()
     Check("create-account is recognised", IsCreateAccountRow("create-account"));
     Check("another word is not", !IsCreateAccountRow("create-character human warrior male alliance"));
     Check("the command is the one word", CreateAccountCommandOk("create-account") && !CreateAccountCommandOk("create-account now") && !CreateAccountCommandOk("create-accounts"));
+    Check("the account password fits the core's 16 character limit", CREATE_ACCOUNT_PASSWORD_LENGTH > 0 && CREATE_ACCOUNT_PASSWORD_LENGTH <= 16);
     Check("a good name", AccountNameValid("JUG") && AccountNameValid("TUG2"));
     Check("one letter is short", !AccountNameValid("J"));
     Check("eighteen is long", !AccountNameValid("ABCDEFGHIJKLMNOPQR"));

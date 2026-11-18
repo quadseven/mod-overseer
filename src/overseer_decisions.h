@@ -31085,6 +31085,11 @@ unsigned PickCreationAccount(std::vector<CreationAccount> const& accounts, unsig
 // logged or returned: nobody can log in to it, and a client login, if one is
 // ever wanted, starts from a reset by whoever holds that authority.
 bool IsCreateAccountRow(std::string const& command);
+// The core refuses an account password longer than 16 characters
+// (AccountMgr::CreateAccount answers AOR_PASS_TOO_LONG, MAX_PASS_STR), so the
+// random password this verb makes is exactly that long: the first version made
+// 40 and every row was refused by the core.
+constexpr unsigned CREATE_ACCOUNT_PASSWORD_LENGTH = 16;
 bool AccountNameValid(std::string const& name);
 // The command is exactly the one word, with nothing after it.
 bool CreateAccountCommandOk(std::string const& command);
