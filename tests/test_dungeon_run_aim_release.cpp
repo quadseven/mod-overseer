@@ -121,10 +121,11 @@ void GeneralTravelReleaseCannotEraseAChangedAim()
         return;
     std::string const body = source.substr(release, 9000);
     Check("the general release asks the module",
-          body.find("_wheel.Release(name, std::time(nullptr))") != std::string::npos);
+          body.find("MovementOwner().Release(name, std::time(nullptr), inertFollowerAim)") !=
+              std::string::npos);
     Check("the run-scoped release asks the module with the recorded aim",
           body.find("bool ReleaseRunAim(") != std::string::npos &&
-              body.find("_wheel.ReleaseRunAim(name, expectedAim,") != std::string::npos);
+              body.find("MovementOwner().ReleaseRunAim(name, expectedAim,") != std::string::npos);
     std::size_t const scopedMismatch = body.find("if (released.leftNewerAim)");
     std::size_t const intentEnd = body.find("EndLeaderColumnIntent(name");
     std::size_t const mismatchReturn = body.find("return;", scopedMismatch);

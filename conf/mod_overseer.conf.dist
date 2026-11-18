@@ -721,6 +721,48 @@
 #
 #Overseer.Rename.OfflineMax = 4
 #
+#    Overseer.CreateCharacter.Enable
+#        Description: Whether a `create-character` row (kind='job') may make a
+#                     new, named character on an existing bot account, with the
+#                     race, class and gender the row asks for. The row is
+#                     `create-character <race> <class> <male|female>
+#                     <alliance|horde> [level <N>]`, the row's target is the
+#                     new name, and the race must be of the faction named.
+#                     Off, such a row is refused.
+#
+#        Default:     0
+#
+#Overseer.CreateCharacter.Enable = 0
+#
+#    Overseer.CreateCharacter.Accounts
+#        Description: The accounts, by name, comma separated, that may take a new
+#                     character. Use accounts that are not random bot accounts:
+#                     the factory hands a random bot account's character a kit
+#                     the first time it logs in. A row is refused when none of
+#                     them has a slot under SlotCap.
+#
+#        Default:     "" (none)
+#
+#Overseer.CreateCharacter.Accounts = ""
+#
+#    Overseer.CreateCharacter.SlotCap
+#        Description: The most characters an account may hold before it is
+#                     skipped.
+#
+#        Default:     10
+#
+#Overseer.CreateCharacter.SlotCap = 10
+#
+#    Overseer.CreateCharacter.MaxLevel
+#        Description: The highest level a `create-character` row may ask for.
+#                     At 1 every new character has the starting outfit only. A
+#                     higher level is met by the playerbots factory's own
+#                     Randomize for that level, never by hand picked items.
+#
+#        Default:     1
+#
+#Overseer.CreateCharacter.MaxLevel = 1
+#
 #    Overseer.Retire.KeepGuilds
 #        Description: The guilds, by name, comma separated, whose members a
 #                     `retire` row (kind='job', command `retire`) never deletes.

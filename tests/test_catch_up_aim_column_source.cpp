@@ -63,7 +63,7 @@ int main()
     std::string const claim = Body(text, "    bool Claim(std::string const& name, std::string const& target,");
     if (claim.empty())
         return Fail("cannot find TravelAimBook::Claim");
-    if (claim.find("_wheel.Claim(") == std::string::npos)
+    if (claim.find("MovementOwner().Claim(") == std::string::npos)
         return Fail("Claim must ask the movement ownership module");
     if (claim.find("UPDATE") != std::string::npos || claim.find("Execute") != std::string::npos)
         return Fail("Claim must not write the column itself; the module's adapter does");
@@ -108,7 +108,7 @@ int main()
     std::string const fence = Body(text, "    bool FenceRefuses(std::string const& name, std::string const& target,");
     if (fence.empty())
         return Fail("cannot find TravelAimBook::FenceRefuses");
-    if (fence.find("_wheel.FenceRefuses(") == std::string::npos)
+    if (fence.find("MovementOwner().FenceRefuses(") == std::string::npos)
         return Fail("FenceRefuses must ask the module, which predicts the width refusal");
 
     // --- the catch-up walk start ----------------------------------------------

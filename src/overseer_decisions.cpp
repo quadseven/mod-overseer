@@ -4423,7 +4423,20 @@ std::string TravelReleaseGate(TravelReleaseGateFacts const& facts)
     // skipped - reborn every poll.
     if (facts.claimed)
         return std::string();
+    // AN AIM NOTHING WALKS IS NOBODY'S ERRAND TO PROTECT (#1610). The fence
+    // exists so an economy pass's aim is not erased under it; a follower's
+    // counter keyword is refused every poll because only the leader walks, so
+    // the pass it protects is not running on it.
+    if (facts.inertFollowerAim &&
+        InertFollowerAimMayBeCleared(facts.standing, facts.learnSkill, INERT_FOLLOWER_AIM_SECONDS))
+        return std::string();
     return TravelReleaseFence(facts.learnSkill, facts.standing);
+}
+
+bool InertFollowerAimMayBeCleared(std::string const& aim, uint32_t learnSkill,
+                                  int64_t inertSeconds)
+{
+    return learnSkill == 0 && IsMaintenanceErrand(aim) && inertSeconds >= INERT_FOLLOWER_AIM_SECONDS;
 }
 
 bool RunAimMayBeReleased(std::string const& current,
@@ -10076,6 +10089,14 @@ LoneLegVerdict DecideLoneLeg(LoneLegFacts const& facts, LoneLegLimits const& lim
     return verdict;
 }
 
+int64_t LoneLegHoldSeconds(LoneLegReason why, int64_t farHoldSeconds)
+{
+    if (why != LoneLegReason::Ground)
+        return farHoldSeconds;
+    return farHoldSeconds < LONE_LEG_GROUND_HOLD_SECONDS ? farHoldSeconds
+                                                         : LONE_LEG_GROUND_HOLD_SECONDS;
+}
+
 char const* LoneLegStepWord(LoneLegStep step)
 {
     switch (step)
@@ -10596,9 +10617,10 @@ ErrandDeathVerdict ErrandDeathBreaker(ErrandDeathToll const& toll,
     //    because the walk re-Claims from its own escort entry on the next party
     //    poll. The caller is told to end the WALK, which is the only thing that
     //    stops the aim coming back. See ErrandDeathToll::catchUp.
+    bool const lavaCalls = limits.lavaDeaths && toll.lavaDeaths >= limits.lavaDeaths;
     if (toll.runOwned)
     {
-        if (coolingOff || toll.deaths >= limits.deaths)
+        if (coolingOff || toll.deaths >= limits.deaths || lavaCalls)
             verdict.remedy = toll.catchUp ? ErrandDeathRemedy::EndCatchUp
                                           : ErrandDeathRemedy::DeclineRunOwned;
         return verdict;
@@ -10622,7 +10644,7 @@ ErrandDeathVerdict ErrandDeathBreaker(ErrandDeathToll const& toll,
     //    three in five minutes", and the third death in five minutes IS the
     //    evidence - a rule that waits for a fourth body to be sure is a rule
     //    that costs a body to be sure.
-    if (toll.deaths >= limits.deaths ||
+    if (toll.deaths >= limits.deaths || lavaCalls ||
         (limits.partyDeaths && toll.partyDeaths >= limits.partyDeaths))
         verdict.remedy = ErrandDeathRemedy::Release;
 
@@ -21882,6 +21904,10 @@ GhostRecoveryVerdict DecideGhostRecovery(GhostRecoveryFacts const& facts,
     if (facts.choseHealer)
         return healer(GhostRecoveryReason::AlreadyChose);
 
+    // 1a. A corpse in lava is never reclaimed (wow-overseer#2886).
+    if (facts.corpseInLava)
+        return healer(GhostRecoveryReason::CorpseInLava);
+
     // 2. It has already died here inside the window.
     if (limits.repeatDeaths && facts.deathsHere >= limits.repeatDeaths)
         return healer(GhostRecoveryReason::RepeatDeaths);
@@ -22090,6 +22116,11 @@ int NearestTrainerSpot(std::vector<TrainerSpot> const& spots, uint32_t mapId, fl
     return best;
 }
 
+bool GuildTrainerSpotUsable(bool spawnStandsNow, unsigned otherSideGuards)
+{
+    return spawnStandsNow && otherSideGuards == 0;
+}
+
 GuildTrainingStep DecideGuildTraining(unsigned affordable, bool trainerFound, float yards,
                                       float reach)
 {
@@ -22238,6 +22269,8 @@ char const* GhostRecoveryReasonText(GhostRecoveryReason reason)
         case GhostRecoveryReason::SickButThreatened:
             return "it still carries Resurrection Sickness, but hostiles near the corpse make "
                    "reclaiming it unsafe";
+        case GhostRecoveryReason::CorpseInLava:
+            return "the corpse lies in lava, and reviving there is another death";
     }
     return "unknown";
 }
@@ -28505,6 +28538,219 @@ std::string EnchantForProofLine(EnchantForProof const& proof)
     for (std::size_t i = 0; i < proof.reagents.size(); ++i)
         out << (i ? "," : "") << proof.reagents[i].first << "x" << proof.reagents[i].second;
     return out.str();
+}
+
+
+// ------------------------------------------------ create a named character --
+
+static std::string CreateLower(std::string text)
+{
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return text;
+}
+
+bool IsCreateCharacterRow(std::string const& command)
+{
+    std::vector<std::string> const words = RenameWords(command);
+    return !words.empty() && CreateLower(words[0]) == "create-character";
+}
+
+bool RaceIsAlliance(std::uint8_t race)
+{
+    // The core's race ids: 1 human, 3 dwarf, 4 night elf, 7 gnome, 11 draenei.
+    return race == 1 || race == 3 || race == 4 || race == 7 || race == 11;
+}
+
+static std::uint8_t CreateRaceId(std::string const& word)
+{
+    if (word == "human") return 1;
+    if (word == "orc") return 2;
+    if (word == "dwarf") return 3;
+    if (word == "nightelf") return 4;
+    if (word == "undead") return 5;
+    if (word == "tauren") return 6;
+    if (word == "gnome") return 7;
+    if (word == "troll") return 8;
+    if (word == "bloodelf") return 10;
+    if (word == "draenei") return 11;
+    return 0;
+}
+
+static std::uint8_t CreateClassId(std::string const& word)
+{
+    if (word == "warrior") return 1;
+    if (word == "paladin") return 2;
+    if (word == "hunter") return 3;
+    if (word == "rogue") return 4;
+    if (word == "priest") return 5;
+    if (word == "shaman") return 7;
+    if (word == "mage") return 8;
+    if (word == "warlock") return 9;
+    if (word == "druid") return 11;
+    return 0;
+}
+
+CreateCharacterRequest ParseCreateCharacterRequest(std::string const& command)
+{
+    CreateCharacterRequest request;
+    std::vector<std::string> words = RenameWords(command);
+    for (std::string& word : words)
+        word = CreateLower(word);
+    if (words.empty() || words[0] != "create-character")
+    {
+        request.error = "malformed create-character: want create-character <race> <class> <male|female> <alliance|horde> [level <N>]";
+        return request;
+    }
+    if (words.size() != 5 && words.size() != 7)
+    {
+        request.error = "malformed create-character: want race, class, gender, faction and an optional level N";
+        return request;
+    }
+    request.race = CreateRaceId(words[1]);
+    if (!request.race)
+    {
+        request.error = "unknown race";
+        return request;
+    }
+    if (words[2] == "deathknight")
+    {
+        request.error = "a death knight starts at level 55, which is a grant";
+        return request;
+    }
+    request.cls = CreateClassId(words[2]);
+    if (!request.cls)
+    {
+        request.error = "unknown class";
+        return request;
+    }
+    if (words[3] == "male")
+        request.gender = 0;
+    else if (words[3] == "female")
+        request.gender = 1;
+    else
+    {
+        request.error = "unknown gender (want male or female)";
+        return request;
+    }
+    if (words[4] == "alliance")
+        request.alliance = true;
+    else if (words[4] == "horde")
+        request.alliance = false;
+    else
+    {
+        request.error = "unknown faction (want alliance or horde)";
+        return request;
+    }
+    if (words.size() == 7)
+    {
+        if (words[5] != "level" || words[6].empty() || words[6].size() > 2 ||
+            words[6].find_first_not_of("0123456789") != std::string::npos)
+        {
+            request.error = "malformed level: want level <1 to 60>";
+            return request;
+        }
+        unsigned const level = static_cast<unsigned>(std::atoi(words[6].c_str()));
+        if (level < 1 || level > CREATE_CHARACTER_LEVEL_MAX)
+        {
+            request.error = "level is outside 1 to 60";
+            return request;
+        }
+        request.level = level;
+    }
+    request.ok = true;
+    return request;
+}
+
+CreateCharacterVerdict CreateCharacterVerdictFor(CreateCharacterRequest const& request,
+                                                 CreateCharacterFacts const& facts)
+{
+    auto refuse = [](char const* reason) { return CreateCharacterVerdict{CreateRoute::Refuse, reason}; };
+    if (!facts.switchOn)
+        return refuse("character creation is off (Overseer.CreateCharacter.Enable)");
+    if (!request.ok)
+        return refuse(request.error.c_str());
+    if (!facts.nameValid)
+        return refuse("the core refuses that name");
+    if (facts.rowInFlight)
+        return refuse("a creation for that name is already running; retry in a minute");
+    // An existing character of the same shape is the idempotent answer, and it
+    // is given before the faction and level gates so that re-running a row
+    // that already did its work reads `exists` and not a new refusal.
+    if (facts.nameTaken)
+        return facts.takenIsSame ? CreateCharacterVerdict{CreateRoute::AlreadyExists, ""}
+                                 : refuse("the name is taken by a different character");
+    if (RaceIsAlliance(request.race) != request.alliance)
+        return refuse("the race is not of the guild's faction");
+    if (!facts.raceEnabled)
+        return refuse("the realm has that race disabled for creation");
+    if (!facts.raceClassLegal)
+        return refuse("that race and class cannot be combined");
+    if (request.level > 1 && request.level > facts.maxLevel)
+        return refuse("level above Overseer.CreateCharacter.MaxLevel");
+    if (!facts.freeAccount)
+        return refuse("no listed bot account has a free character slot");
+    return CreateCharacterVerdict{CreateRoute::Create, ""};
+}
+
+unsigned PickCreationAccount(std::vector<CreationAccount> const& accounts, unsigned cap)
+{
+    unsigned best = 0;
+    unsigned bestCount = 0;
+    for (CreationAccount const& account : accounts)
+    {
+        if (!account.id || account.characters >= cap)
+            continue;
+        if (!best || account.characters < bestCount || (account.characters == bestCount && account.id < best))
+        {
+            best = account.id;
+            bestCount = account.characters;
+        }
+    }
+    return best;
+}
+
+
+// ------------------------------------------------ create a bot account --
+
+bool IsCreateAccountRow(std::string const& command)
+{
+    std::vector<std::string> const words = RenameWords(command);
+    return !words.empty() && CreateLower(words[0]) == "create-account";
+}
+
+bool CreateAccountCommandOk(std::string const& command)
+{
+    std::vector<std::string> const words = RenameWords(command);
+    return words.size() == 1 && CreateLower(words[0]) == "create-account";
+}
+
+bool AccountNameValid(std::string const& name)
+{
+    if (name.size() < 2 || name.size() > 17)
+        return false;
+    for (char ch : name)
+        if (!std::isalnum(static_cast<unsigned char>(ch)))
+            return false;
+    return true;
+}
+
+CreateCharacterVerdict CreateAccountVerdictFor(CreateAccountFacts const& facts)
+{
+    auto refuse = [](char const* reason) { return CreateCharacterVerdict{CreateRoute::Refuse, reason}; };
+    if (!facts.switchOn)
+        return refuse("character creation is off (Overseer.CreateCharacter.Enable)");
+    if (!facts.commandOk)
+        return refuse("malformed create-account: want the one word create-account");
+    if (!facts.nameValid)
+        return refuse("an account name is 2 to 17 letters or digits");
+    if (facts.randomBotName)
+        return refuse("that is a random bot account name");
+    if (!facts.listed)
+        return refuse("the account is not named in Overseer.CreateCharacter.Accounts");
+    if (facts.exists)
+        return CreateCharacterVerdict{CreateRoute::AlreadyExists, ""};
+    return CreateCharacterVerdict{CreateRoute::Create, ""};
 }
 
 }  // namespace OverseerDecisions

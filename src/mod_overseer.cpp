@@ -6201,81 +6201,31 @@ void RecordDeath(Player* player)
 //
 // The book every rule that moves a family leader asks before it writes a
 // strategy, an aim or a hold for him. The decision is
-// OverseerDecisions::AskLeaderIntent; this is the world's half: which names
-// are leaders, the configuration, Jev's current pick for each family, and the
-// log lines, which are the measurement the change is judged by:
-//
-//   overseer: leader intent 'Grug' -> errand by travel column 'banker' ...
-//
-// is one intent change, and a leader that walks like a person has a handful of
-// them in ten minutes, not the dozens of handoffs measured before it.
-//
-// World-thread only, like every other per-character map in this module. Lost on
-// a restart, which costs one fresh grant per leader.
-struct LeaderIntentBookState
-{
-    bool enabled{true};
-    OverseerDecisions::LeaderIntentLimits limits{};
-    std::set<std::string> leaders;
-    std::map<std::string, OverseerDecisions::LeaderIntentState> states;
-    std::map<std::string, OverseerDecisions::LeaderIntentPreference> preferences;
-    // Leaders whose leaked `stay` was taken off, so it is said once per leak.
-    std::set<std::string> staySaid;
-};
+// One MovementOwnership instance serves every movement drive and its leader
+// holds. The roster adapter is created after its definition below.
+OverseerMovement::MovementOwnership& MovementOwner();
 
-LeaderIntentBookState& LeaderIntentBook()
-{
-    static LeaderIntentBookState book;
-    return book;
-}
-
-// Configuration, re-read on the party poll so a conf reload takes effect.
 void ReloadLeaderIntentConfig()
 {
-    LeaderIntentBookState& book = LeaderIntentBook();
-    book.enabled = sConfigMgr->GetOption<bool>("Overseer.LeaderIntent.Enable", true, false);
+    OverseerDecisions::LeaderIntentLimits limits;
     uint32 const dwell =
         sConfigMgr->GetOption<uint32>("Overseer.LeaderIntent.DwellSeconds", 90, false);
-    book.limits.dwellSeconds = std::clamp<uint32>(dwell, 30, 300);
-    book.limits.flapCooldownSeconds = book.limits.dwellSeconds;
+    limits.dwellSeconds = std::clamp<uint32>(dwell, 30, 300);
+    limits.flapCooldownSeconds = limits.dwellSeconds;
+    MovementOwner().ConfigureLeaderIntents(
+        sConfigMgr->GetOption<bool>("Overseer.LeaderIntent.Enable", true, false), limits);
 }
 
 bool LeaderIntentApplies(std::string const& name)
 {
-    LeaderIntentBookState const& book = LeaderIntentBook();
-    return book.enabled && book.leaders.count(name) != 0;
+    return MovementOwner().LeaderIntentApplies(name);
 }
 
-OverseerDecisions::LeaderIntentPreference LeaderIntentPreferenceFor(std::string const& name)
+void LogLeaderAsk(std::string const& name, OverseerDecisions::LeaderIntentKind kind,
+                  std::string const& owner, std::string const& target, std::string const& why,
+                  OverseerMovement::LeaderIntentSnapshot const& before,
+                  OverseerDecisions::LeaderIntentVerdict const& verdict, time_t now)
 {
-    LeaderIntentBookState const& book = LeaderIntentBook();
-    auto const it = book.preferences.find(name);
-    return it == book.preferences.end() ? OverseerDecisions::LeaderIntentPreference{}
-                                        : it->second;
-}
-
-// Ask the book for a leader. True when the asking rule may act on him this poll
-// (granted, renewed or retargeted). A character that is not a family leader,
-// or a world with the book switched off, is always true: the book governs
-// leaders and nothing else.
-bool AskForLeader(std::string const& name, OverseerDecisions::LeaderIntentKind kind,
-                  std::string const& owner, std::string const& target, std::string const& why)
-{
-    if (!LeaderIntentApplies(name))
-        return true;
-    LeaderIntentBookState& book = LeaderIntentBook();
-    OverseerDecisions::LeaderIntentState& state = book.states[name];
-    OverseerDecisions::LeaderIntentKind const was = state.kind;
-    std::string const wasOwner = state.owner;
-    time_t const wasSince = state.since;
-    OverseerDecisions::LeaderIntentRequest request;
-    request.kind = kind;
-    request.owner = owner;
-    request.target = target;
-    request.why = why;
-    time_t const now = std::time(nullptr);
-    OverseerDecisions::LeaderIntentVerdict const verdict = OverseerDecisions::AskLeaderIntent(
-        state, request, now, book.limits, LeaderIntentPreferenceFor(name));
     switch (verdict.answer)
     {
         case OverseerDecisions::LeaderIntentAnswer::Granted:
@@ -6287,150 +6237,99 @@ bool AskForLeader(std::string const& name, OverseerDecisions::LeaderIntentKind k
                          ? std::string("takes him from ") +
                                OverseerDecisions::LeaderIntentKindWord(verdict.replaced) +
                                " by " + verdict.replacedOwner + " after " +
-                               std::to_string(now - wasSince) + "s"
-                         : was != OverseerDecisions::LeaderIntentKind::None
+                               std::to_string(now - before.since) + "s"
+                         : before.kind != OverseerDecisions::LeaderIntentKind::None
                                ? std::string("the ") +
-                                     OverseerDecisions::LeaderIntentKindWord(was) + " by " +
-                                     wasOwner + " before it had stopped asking"
+                                     OverseerDecisions::LeaderIntentKindWord(before.kind) +
+                                     " by " + before.owner + " before it had stopped asking"
                                : std::string("he was free"),
                      why);
-            return true;
+            return;
         case OverseerDecisions::LeaderIntentAnswer::Retargeted:
             LOG_DEBUG("module.overseer", "overseer: leader intent '{}' keeps {} by {}, now '{}'",
                       name, OverseerDecisions::LeaderIntentKindWord(kind), owner, target);
-            return true;
+            return;
         case OverseerDecisions::LeaderIntentAnswer::Renewed:
-            return true;
+            return;
         case OverseerDecisions::LeaderIntentAnswer::Deferred:
             if (verdict.sayIt)
                 LOG_INFO("module.overseer",
                          "overseer: leader intent '{}' stays {} by {}; {} by {}{} waits - {}{}",
-                         name, OverseerDecisions::LeaderIntentKindWord(state.kind),
-                         state.owner.empty() ? std::string("nobody") : state.owner,
+                         name, OverseerDecisions::LeaderIntentKindWord(before.kind),
+                         before.owner.empty() ? std::string("nobody") : before.owner,
                          OverseerDecisions::LeaderIntentKindWord(kind), owner,
                          target.empty() ? std::string() : " '" + target + "'", verdict.reason,
                          verdict.waitSeconds > 0
                              ? " (" + std::to_string(verdict.waitSeconds) + "s left)"
                              : std::string());
-            return false;
+            return;
     }
-    return false;
 }
 
-// The owner is done with the leader. Said once, with how it ended.
+bool AskForLeader(std::string const& name, OverseerDecisions::LeaderIntentKind kind,
+                  std::string const& owner, std::string const& target, std::string const& why)
+{
+    if (!LeaderIntentApplies(name))
+        return true;
+    time_t const now = std::time(nullptr);
+    OverseerMovement::LeaderIntentSnapshot const before = MovementOwner().LeaderIntentStateFor(name);
+    OverseerDecisions::LeaderIntentVerdict const verdict =
+        MovementOwner().AskForLeader(name, kind, owner, target, why, now);
+    LogLeaderAsk(name, kind, owner, target, why, before, verdict, now);
+    return verdict.answer != OverseerDecisions::LeaderIntentAnswer::Deferred;
+}
+
 void EndForLeader(std::string const& name, OverseerDecisions::LeaderIntentKind kind,
                   std::string const& owner, OverseerDecisions::LeaderIntentEnd how,
                   std::string const& why)
 {
     if (!LeaderIntentApplies(name))
         return;
-    LeaderIntentBookState& book = LeaderIntentBook();
-    auto const it = book.states.find(name);
-    if (it == book.states.end())
-        return;
     time_t const now = std::time(nullptr);
-    time_t const since = it->second.since;
-    if (!OverseerDecisions::EndLeaderIntent(it->second, kind, owner, how, now, book.limits))
+    OverseerMovement::LeaderIntentSnapshot const before = MovementOwner().LeaderIntentStateFor(name);
+    if (!MovementOwner().EndForLeader(name, kind, owner, how, now))
         return;
     LOG_INFO("module.overseer", "overseer: leader intent '{}' ends {} by {} ({}) after {}s - {}",
              name, OverseerDecisions::LeaderIntentKindWord(kind), owner,
              how == OverseerDecisions::LeaderIntentEnd::Completed ? "completed"
              : how == OverseerDecisions::LeaderIntentEnd::Failed  ? "failed"
                                                                   : "abandoned",
-             now - since, why);
+             now - before.since, why);
 }
 
-// What holds the leader now; None when he is free or not a leader.
 OverseerDecisions::LeaderIntentKind LeaderIntentNow(std::string const& name)
 {
-    if (!LeaderIntentApplies(name))
-        return OverseerDecisions::LeaderIntentKind::None;
-    LeaderIntentBookState const& book = LeaderIntentBook();
-    auto const it = book.states.find(name);
-    if (it == book.states.end() ||
-        OverseerDecisions::LeaderIntentFree(it->second, std::time(nullptr), book.limits))
-        return OverseerDecisions::LeaderIntentKind::None;
-    return it->second.kind;
+    return MovementOwner().CurrentLeaderIntent(name, std::time(nullptr));
 }
 
-// The leader died or entered combat: whatever outranks his intent may take him.
 void WaiveLeaderDwell(std::string const& name)
 {
-    if (!LeaderIntentApplies(name))
-        return;
-    auto const it = LeaderIntentBook().states.find(name);
-    if (it != LeaderIntentBook().states.end())
-        OverseerDecisions::WaiveLeaderIntentDwell(it->second);
+    MovementOwner().WaiveLeaderDwell(name);
 }
 
-// The travel column let go. The column-driven intents end with it; the regroup,
-// the fetch and an operator order are ended by their own owners, and the quest
-// drive is not a column walk. A dungeon run re-claims on its next poll and,
-// never waiting, takes him straight back.
 void EndLeaderColumnIntent(std::string const& name, std::string const& why)
 {
-    OverseerDecisions::LeaderIntentKind const kind = LeaderIntentNow(name);
-    switch (kind)
-    {
-        case OverseerDecisions::LeaderIntentKind::EconomyErrand:
-        case OverseerDecisions::LeaderIntentKind::TownErrand:
-        case OverseerDecisions::LeaderIntentKind::Respec:
-        case OverseerDecisions::LeaderIntentKind::TrainingStop:
-        case OverseerDecisions::LeaderIntentKind::Hearth:
-        case OverseerDecisions::LeaderIntentKind::DungeonRun:
-            break;
-        default:
-            return;
-    }
-    std::string const owner = LeaderIntentBook().states[name].owner;
-    bool const done = why.find("arrived") != std::string::npos ||
-                      why.find("reached") != std::string::npos ||
-                      why.find("done") != std::string::npos ||
-                      why.find("stepped through") != std::string::npos;
-    EndForLeader(name, kind, owner,
-                 done ? OverseerDecisions::LeaderIntentEnd::Completed
-                      : OverseerDecisions::LeaderIntentEnd::Failed,
-                 why);
+    time_t const now = std::time(nullptr);
+    OverseerMovement::LeaderColumnEnd const ended =
+        MovementOwner().EndColumnLeaderIntent(name, why, now);
+    if (!ended.ended)
+        return;
+    LOG_INFO("module.overseer", "overseer: leader intent '{}' ends {} by {} ({}) after {}s - {}",
+             name, OverseerDecisions::LeaderIntentKindWord(ended.kind), ended.owner,
+             ended.how == OverseerDecisions::LeaderIntentEnd::Completed ? "completed"
+             : ended.how == OverseerDecisions::LeaderIntentEnd::Failed  ? "failed"
+                                                                        : "abandoned",
+             now - ended.since, why);
 }
 
-// Which intent a claim of the travel column is, by the owner that claims it.
-// The owner word is what the travel drive asks under each poll too, so the two
-// asks renew one intent rather than competing.
 void LeaderIntentForTravelOwner(OverseerDecisions::TravelOwner owner,
                                 OverseerDecisions::LeaderIntentKind& kind,
                                 std::string& ownerWord)
 {
-    switch (owner)
-    {
-        case OverseerDecisions::TravelOwner::HomeErrand:
-            kind = OverseerDecisions::LeaderIntentKind::Hearth;
-            ownerWord = "home errand";
-            return;
-        case OverseerDecisions::TravelOwner::CatchUp:
-            kind = OverseerDecisions::LeaderIntentKind::FetchMember;
-            ownerWord = "fetch";
-            return;
-        case OverseerDecisions::TravelOwner::Run:
-        case OverseerDecisions::TravelOwner::WalkBackIn:
-        case OverseerDecisions::TravelOwner::Exit:
-            kind = OverseerDecisions::LeaderIntentKind::DungeonRun;
-            ownerWord = "dungeon run";
-            return;
-        case OverseerDecisions::TravelOwner::Respec:
-            kind = OverseerDecisions::LeaderIntentKind::Respec;
-            ownerWord = "respec";
-            return;
-        case OverseerDecisions::TravelOwner::TrainingStop:
-            kind = OverseerDecisions::LeaderIntentKind::TrainingStop;
-            ownerWord = "training stop";
-            return;
-        case OverseerDecisions::TravelOwner::TownTrip:
-            kind = OverseerDecisions::LeaderIntentKind::TownErrand;
-            ownerWord = "town trip";
-            return;
-    }
-    kind = OverseerDecisions::LeaderIntentKind::TownErrand;
-    ownerWord = "travel column";
+    OverseerMovement::MovementOwnership::TravelOwnerIntent const intent =
+        OverseerMovement::MovementOwnership::ForTravelOwner(owner);
+    kind = intent.kind;
+    ownerWord = intent.owner;
 }
 
 // ----------------------------------------------------------- errand column --
@@ -6553,6 +6452,13 @@ public:
     }
 };
 
+OverseerMovement::MovementOwnership& MovementOwner()
+{
+    static RosterAimColumn column;
+    static OverseerMovement::MovementOwnership movement{column, TRAVEL_HANDBACK_SECONDS};
+    return movement;
+}
+
 class TravelAimBook
 {
 public:
@@ -6584,6 +6490,9 @@ public:
         // it: a member carrying an aim nobody walks is still behind its leader,
         // not off on an errand of its own. See MemberFollowsForFlight.
         bool inertFollowerAim{false};
+        // When the aim began to be refused as inert (#1610), or 0. Cleared with
+        // the flag, so a walked aim starts the count again.
+        time_t inertSince{0};
         // Said once per HOLD, not once per errand, which is why it is not
         // `arrived` (#311). The post-revival hold takes `new rpg` off on purpose
         // for a few seconds and gives it back itself, so the line about it is
@@ -6902,23 +6811,16 @@ public:
         // the module trusts it only while the column still holds this aim.
         auto const it = _state.find(name);
         bool const cachedDrive = it != _state.end() && it->second.target == target;
-        // A FAMILY LEADER'S COLUMN IS WRITTEN ONLY FOR THE INTENT THAT HOLDS
-        // HIM (wow-overseer#335 follow-up). The fences are about whose errand
-        // the column already carries; this is about whose turn it is. The
-        // module asks it only once every fence has passed, and a refusal
-        // leaves the column exactly as it was.
-        auto const leadersTurn = [&]() -> bool {
-            OverseerDecisions::LeaderIntentKind kind = OverseerDecisions::LeaderIntentKind::None;
-            std::string ownerWord;
-            LeaderIntentForTravelOwner(owner, kind, ownerWord);
-            bool const fetchHoldsHim =
-                kind == OverseerDecisions::LeaderIntentKind::FetchMember &&
-                LeaderIntentNow(name) == OverseerDecisions::LeaderIntentKind::FetchMember;
-            return fetchHoldsHim ||
-                   AskForLeader(name, kind, ownerWord, target, "claims the travel column");
-        };
+        // A FAMILY LEADER'S CLAIM AND HOLD ARE ONE MOVEMENT DECISION. The
+        // module asks only after the column fences pass; the returned record
+        // lets this adapter keep the existing decision logs.
+        time_t const now = std::time(nullptr);
         OverseerMovement::ClaimResult const claim =
-            _wheel.Claim(name, target, owner, cachedDrive, leadersTurn);
+            MovementOwner().Claim(name, target, owner, cachedDrive, now);
+        if (claim.leaderAsk.asked)
+            LogLeaderAsk(name, claim.leaderAsk.kind, claim.leaderAsk.owner,
+                         claim.leaderAsk.target, claim.leaderAsk.why,
+                         claim.leaderAsk.before, claim.leaderAsk.verdict, now);
         switch (claim.answer)
         {
             case OverseerMovement::ClaimAnswer::AlreadyDriving:
@@ -7030,7 +6932,7 @@ public:
     bool ClaimedBy(std::string const& name, std::string const& target,
                    OverseerDecisions::TravelOwner& owner) const
     {
-        return _wheel.ClaimedBy(name, target, owner);
+        return MovementOwner().ClaimedBy(name, target, owner);
     }
 
     // Would Claim refuse this aim on its fences, without writing anything? For
@@ -7044,7 +6946,7 @@ public:
     {
         auto const it = _state.find(name);
         bool const cachedDrive = it != _state.end() && it->second.target == target;
-        return _wheel.FenceRefuses(name, target, owner, cachedDrive);
+        return MovementOwner().FenceRefuses(name, target, owner, cachedDrive);
     }
 
     // Why this character's last claim was refused, or empty when the last
@@ -7061,9 +6963,14 @@ public:
     // the claim and stamps the hand-back clock that keeps the quest drive off
     // the wheel (see TravelHoldsTheWheel, case 2); this book ends the errand
     // memory around it.
-    void Release(std::string const& name, std::string const& why = std::string())
+    // `inertFollowerAim` is the drive saying the aim in the column is one nothing
+    // walks and has not for INERT_FOLLOWER_AIM_SECONDS (#1610): the gate then lets
+    // a counter keyword be cleared, which it fences when the book never claimed it.
+    void Release(std::string const& name, std::string const& why = std::string(),
+                 bool inertFollowerAim = false)
     {
-        ReleaseImpl(name, why, _wheel.Release(name, std::time(nullptr)));
+        ReleaseImpl(name, why,
+                    MovementOwner().Release(name, std::time(nullptr), inertFollowerAim));
     }
 
     // Close a dungeon coordinator's travel state without giving back a newer
@@ -7075,7 +6982,7 @@ public:
     {
         bool mayClearRecordedAim = true;
         OverseerMovement::ReleaseResult const released =
-            _wheel.ReleaseRunAim(name, expectedAim, std::time(nullptr), mayClearRecordedAim);
+            MovementOwner().ReleaseRunAim(name, expectedAim, std::time(nullptr), mayClearRecordedAim);
         ReleaseImpl(name, why, released);
         return mayClearRecordedAim;
     }
@@ -7088,7 +6995,7 @@ public:
                                                       std::string const& recordedRunAim,
                                                       bool mayClearRecordedAim)
     {
-        return _wheel.RetireRunAim(name, recordedRunAim, mayClearRecordedAim);
+        return MovementOwner().RetireRunAim(name, recordedRunAim, mayClearRecordedAim);
     }
 
     void ReleaseImpl(std::string const& name, std::string const& why,
@@ -7242,7 +7149,7 @@ public:
             // The character may be mid-walk under an aim nobody is renewing any
             // more, so this is a release like any other and takes the same grace.
             // The module forgets the claim and stamps the hand-back clock.
-            _wheel.ReleaseVanished(it->first, std::time(nullptr));
+            MovementOwner().ReleaseVanished(it->first, std::time(nullptr));
             _lastEnd[it->first] = ErrandEnd{
                 "the column being emptied outside this module (another owner cleared it)",
                 true};
@@ -7289,7 +7196,7 @@ public:
     // (infra#2801). The clock and its sweep live in the module (#1312).
     bool WithinHandbackGrace(std::string const& name)
     {
-        return _wheel.WithinHandbackGrace(name, std::time(nullptr));
+        return MovementOwner().WithinHandbackGrace(name, std::time(nullptr));
     }
 
     // The walk in flight, for the loop that is actually walking it. DriveTravel
@@ -7373,7 +7280,7 @@ public:
     // else's errand for the same character does not answer for it.
     bool RunOwns(std::string const& name, std::string const& target) const
     {
-        return _wheel.HoldsClaim(name, target);
+        return MovementOwner().HoldsClaim(name, target);
     }
 
     // A POINT AIM THE PROCESS THAT WROTE IT TOOK WITH IT (#658). Cleared with a
@@ -7385,7 +7292,7 @@ public:
     void ForgetLeftover(std::string const& name, std::string const& target)
     {
         // The module's exact clear, which also forgets any claim.
-        _wheel.ForgetLeftover(name, target);
+        MovementOwner().ForgetLeftover(name, target);
         _lastEnd[name] = ErrandEnd{"a point aim left from before this worldserver started (#658)",
                                    false};
         _landed.erase(name);
@@ -7428,7 +7335,7 @@ public:
     // `learn_skill` is not touched.
     void ClearPoisonedAim(std::string const& name, std::string const& target)
     {
-        _wheel.ClearPoisonedAim(name, target);
+        MovementOwner().ClearPoisonedAim(name, target);
         _lastEnd[name] = ErrandEnd{"the poison-aim breaker (an aim the travel drive could never "
                                    "resolve, refused until it proved a loop, #824)",
                                    false, target, ++_endSerial};
@@ -7736,13 +7643,8 @@ private:
     // own drain keeps it honest across the gaps, so nothing sweeps it, and it is
     // bounded at the size of the roster.
     std::map<std::string, OverseerDecisions::ErrandSpend> _spend;
-    // WHO HOLDS EACH CHARACTER'S WHEEL (#1312): the claims this book wrote and
-    // their owners, and when travel last let go of a character so the quest
-    // drive does not pick it up on the same tick the errand ended. The roster
-    // adapter is declared first because the module holds a reference to it.
-    // World thread only, like everything else on this loop.
-    RosterAimColumn _roster;
-    OverseerMovement::MovementOwnership _wheel{_roster, TRAVEL_HANDBACK_SECONDS};
+    // The travel poll owns its errand progress. Column ownership and the
+    // hand-back clock live with the shared MovementOwner above.
 };
 }  // namespace
 
@@ -10074,18 +9976,15 @@ private:
     void RefreshLeaderIntentBook(std::vector<OverseerDecisions::FamilyRoster> const& rosters)
     {
         ReloadLeaderIntentConfig();
-        LeaderIntentBookState& book = LeaderIntentBook();
         std::set<std::string> leaders;
         for (OverseerDecisions::FamilyRoster const& roster : rosters)
             if (!roster.family.empty() && !roster.leader.empty())
                 leaders.insert(roster.leader);
-        // A character that stopped leading loses its book and its pick.
-        for (auto it = book.states.begin(); it != book.states.end();)
-            it = leaders.count(it->first) ? std::next(it) : book.states.erase(it);
-        book.leaders.swap(leaders);
+        // A character that stopped leading loses its intent and its pick.
+        MovementOwner().SetLeaders(leaders);
 
-        book.preferences.clear();
-        if (!book.enabled || !FamilyIntentTablePresent())
+        MovementOwner().ClearLeaderPreferences();
+        if (!MovementOwner().LeaderIntentsEnabled() || !FamilyIntentTablePresent())
             return;
         QueryResult result = CharacterDatabase.Query(
             "SELECT leader_name, chosen_kind, chosen_target, UNIX_TIMESTAMP(chosen_until) "
@@ -10097,7 +9996,7 @@ private:
         {
             Field* row = result->Fetch();
             std::string const leader = row[0].Get<std::string>();
-            if (!book.leaders.count(leader))
+            if (!MovementOwner().LeaderIntentApplies(leader))
                 continue;
             OverseerDecisions::LeaderIntentPreference pick;
             pick.kind = OverseerDecisions::ParseLeaderIntentKind(row[1].Get<std::string>());
@@ -10118,7 +10017,7 @@ private:
                          pick.target.empty() ? std::string() : " '" + pick.target + "'",
                          leader);
             }
-            book.preferences[leader] = pick;
+            MovementOwner().SetLeaderPreference(leader, pick);
         } while (result->NextRow());
     }
 
@@ -10169,20 +10068,20 @@ private:
     // One row per leader, the module's columns only. See the migration.
     void PublishLeaderIntents(std::vector<OverseerDecisions::FamilyRoster> const& rosters)
     {
-        LeaderIntentBookState& book = LeaderIntentBook();
-        if (!book.enabled || !FamilyIntentTablePresent())
+        if (!MovementOwner().LeaderIntentsEnabled() || !FamilyIntentTablePresent())
             return;
         time_t const now = std::time(nullptr);
         for (OverseerDecisions::FamilyRoster const& roster : rosters)
         {
             if (roster.family.empty() || roster.leader.empty())
                 continue;
-            OverseerDecisions::LeaderIntentState const& state = book.states[roster.leader];
-            bool const live = !OverseerDecisions::LeaderIntentFree(state, now, book.limits);
+            OverseerMovement::LeaderIntentSnapshot const state =
+                MovementOwner().LeaderIntentStateFor(roster.leader);
+            bool const live = MovementOwner().CurrentLeaderIntent(roster.leader, now) !=
+                              OverseerDecisions::LeaderIntentKind::None;
             std::string table;
             for (OverseerDecisions::LeaderIntentRequest const& ask :
-                 OverseerDecisions::LeaderIntentsOnTheTable(
-                     state, now, book.limits, LeaderIntentPreferenceFor(roster.leader)))
+                 MovementOwner().LeaderIntentsOnTheTable(roster.leader, now))
             {
                 std::string const line =
                     std::string(OverseerDecisions::LeaderIntentKindWord(ask.kind)) + "|" +
@@ -13027,8 +12926,9 @@ private:
                 OverseerDecisions::LeaderIntentKind const held = LeaderIntentNow(leaderName);
                 if (held != OverseerDecisions::LeaderIntentKind::None &&
                     held != OverseerDecisions::LeaderIntentKind::OperatorOrder)
-                    mayCarry = OverseerDecisions::LeaderIntentWalksUnderNewRpg(held);
-                KeepLeaderStayHonest(leader, leaderName, leaderAI, held);
+                    mayCarry = MovementOwner().LeaderWalksUnderNewRpg(leaderName,
+                                                                       std::time(nullptr));
+                KeepLeaderStayHonest(leader, leaderName, leaderAI);
             }
             // AND NOT INSIDE A RUN THAT IS STAGED OR CLEARING (#1210). Asked
             // after every rule above, because it outranks all of them: the
@@ -13505,13 +13405,12 @@ private:
     // operator order behind it carries somebody else's leftover. It comes off,
     // said once per leak.
     void KeepLeaderStayHonest(Player* leader, std::string const& leaderName,
-                              PlayerbotAI* leaderAI, OverseerDecisions::LeaderIntentKind held)
+                              PlayerbotAI* leaderAI)
     {
-        LeaderIntentBookState& book = LeaderIntentBook();
         bool const carries = leaderAI->HasStrategy("stay", BOT_STATE_NON_COMBAT);
         if (!carries)
         {
-            book.staySaid.erase(leaderName);
+            MovementOwner().ForgetLeaderStayLeak(leaderName);
             return;
         }
         // Inside an instance the dungeon-clear engine runs the party and may
@@ -13524,11 +13423,11 @@ private:
         // command queue to keep it.
         Map* const map = leader->GetMap();
         if (HeldStill(leaderName) || HeldAfterRevival(leaderName) ||
-            !OverseerDecisions::LeaderIntentWalksUnderNewRpg(held) || !map ||
+            !MovementOwner().LeaderWalksUnderNewRpg(leaderName, std::time(nullptr)) || !map ||
             map->Instanceable())
             return;
         leaderAI->ChangeStrategy("-stay", BOT_STATE_NON_COMBAT);
-        if (book.staySaid.insert(leaderName).second)
+        if (MovementOwner().NoteLeaderStayLeak(leaderName))
             LOG_WARN("module.overseer",
                      "overseer: '{}' leads and carried `stay` that no hold, revival or "
                      "operator order of this module put there - taken off, because "
@@ -16833,6 +16732,26 @@ private:
             Esc(name), seconds);
         if (!result)
             return 0;  // no such table on this world, or no such deaths - same answer
+
+        return static_cast<uint32>(result->Fetch()[0].Get<uint64>());
+    }
+
+    // How many of this character's deaths inside the last `seconds` were in
+    // lava (overseer_death.liquid_type = 'magma'), for the errand breaker
+    // (wow-overseer#2886). The same zero-window rule as RecentDeathCount, and
+    // zero on a world whose table has no liquid_type column, which is the same
+    // answer a quiet table gives: a missing column cannot call off an errand.
+    uint32 RecentLavaDeathCount(std::string const& name, int64 seconds)
+    {
+        if (seconds <= 0 || !DeathLiquidColumnPresent())
+            return 0;
+
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT COUNT(*) FROM overseer_death WHERE character_name = '{}' "
+            "AND created_at >= NOW() - INTERVAL {} SECOND AND liquid_type = 'magma'",
+            Esc(name), seconds);
+        if (!result)
+            return 0;
 
         return static_cast<uint32>(result->Fetch()[0].Get<uint64>());
     }
@@ -26656,7 +26575,7 @@ private:
             // or a run granted this poll whose column write lands next poll.
             bool const onErrand =
                 !_travelAims.TargetFor(name).empty() || IsEscorted(name) ||
-                OverseerDecisions::LeaderIntentWalksUnderNewRpg(LeaderIntentNow(name));
+                MovementOwner().LeaderWalksUnderNewRpg(name, std::time(nullptr));
             bool const mayCarry =
                 OverseerDecisions::LeaderCarriesNewRpg(TownJobFor(name), onErrand);
             OverseerDecisions::UnissuedFlightStep const step =
@@ -27725,9 +27644,14 @@ private:
                         return;
                     }
                 }
+                // A LEG REFUSED FOR ITS GROUND ALONE IS ASKED AGAIN SOONER (#1609):
+                // see OverseerDecisions::LONE_LEG_GROUND_HOLD_SECONDS.
+                time_t const holdFor = lethal != _lethalLegHeld.end()
+                    ? static_cast<time_t>(OverseerDecisions::LoneLegHoldSeconds(
+                          lethal->second.why, CATCH_UP_FAR_HOLD_SECONDS))
+                    : CATCH_UP_FAR_HOLD_SECONDS;
                 if (OverseerDecisions::FarCatchUpStaysHeld(
-                        gap, holdLifts, std::time(nullptr) - heldFar->second,
-                        CATCH_UP_FAR_HOLD_SECONDS))
+                        gap, holdLifts, std::time(nullptr) - heldFar->second, holdFor))
                 {
                     HoldFarFromLeader(p, name);
                     if (walkToSafety && WalkHeldToSafeGround(p, name, *safeGrave))
@@ -30233,6 +30157,9 @@ private:
                 // its own - infra#2846, test_schema_degrade.py (#276). A zero window
                 // never reaches the database; RecentDeathCount owns that too.
                 toll.deaths = RecentDeathCount(name, window);
+                // A death in lava calls the errand off at the first body
+                // (wow-overseer#2886); see ErrandDeathLimits::lavaDeaths.
+                toll.lavaDeaths = RecentLavaDeathCount(name, window);
                 toll.partyDeaths = RecentPartyDeathCount(bot, window);
                 // A member on its own errand answers for its own deaths only
                 // (#1517): the rest of its family is somewhere else.
@@ -30489,8 +30416,33 @@ private:
             state.inertFollowerAim =
                 mover == OverseerDecisions::AimedMover::RefuseInFormation ||
                 mover == OverseerDecisions::AimedMover::RefuseCutOff;
+            if (!state.inertFollowerAim)
+                state.inertSince = 0;
             if (state.inertFollowerAim)
             {
+                // AN AIM NOTHING WALKS IS CLEARED AFTER A BOUND (#1610). Only for
+                // a follower in formation, where "aim the leader instead" is the
+                // whole remedy, and only for a counter keyword: the release gate
+                // would otherwise fence it as the bridge's and the column would
+                // keep blocking the catch-up walk and billing the errand budget.
+                if (!state.inertSince)
+                    state.inertSince = std::time(nullptr);
+                if (mover == OverseerDecisions::AimedMover::RefuseInFormation &&
+                    OverseerDecisions::InertFollowerAimMayBeCleared(
+                        target, state.learn,
+                        std::time(nullptr) - state.inertSince))
+                {
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' has carried the aim '{}' for {}s and nothing "
+                             "walks it - only its leader carries `new rpg` - so the aim is "
+                             "cleared from its column (#1610)",
+                             name, target,
+                             static_cast<uint32>(std::time(nullptr) - state.inertSince));
+                    // `state` IS DEAD AFTER THIS: Release erases the record.
+                    _travelAims.Release(name, "an aim nothing walks (a follower's counter keyword)",
+                                        true);
+                    continue;
+                }
                 if (!state.arrived)
                 {
                     state.arrived = true;  // "said already", not "got there"
@@ -31482,7 +31434,8 @@ private:
                                  "It is not walked down that leg: its walk ends and it is "
                                  "held where it stands ({}), and its leader goes back for it "
                                  "with the family once the rest are gathered. The hold "
-                                 "lifts when the leader is within {} yards (#697)",
+                                 "lifts when the leader is within {} yards, or the leg is "
+                                 "judged again after {}s (#697, #1609)",
                                  name, static_cast<uint32>(distance), target,
                                  OverseerDecisions::LoneLegReasonWord(lone.why),
                                  FamilyLegDeaths(name),
@@ -31490,7 +31443,9 @@ private:
                                  static_cast<uint32>(ground.longestLethalRunYards),
                                  bot->GetLevel() + LONE_LEG_LIMITS.levelGap, ground.worstLevel,
                                  OverseerDecisions::LoneLegStepWord(lone.step),
-                                 static_cast<uint32>(FOLLOW_CATCH_UP_DONE_YARDS));
+                                 static_cast<uint32>(FOLLOW_CATCH_UP_DONE_YARDS),
+                                 static_cast<uint32>(OverseerDecisions::LoneLegHoldSeconds(
+                                     lone.why, CATCH_UP_FAR_HOLD_SECONDS)));
                         _catchUpHeldFar[name] = std::time(nullptr);
                         LethalLegHold& held = _lethalLegHeld[name];
                         held = LethalLegHold{};
@@ -35257,6 +35212,7 @@ private:
         float corpseX{0.f};
         float corpseY{0.f};
         unsigned deathsHere{0};
+        bool corpseInLava{false};  // the corpse lies in lava (wow-overseer#2886)
         NearbyThreat spawnThreat;  // hostile spawns above its level near the corpse
         uint32 killerEntry{0};     // the creature kind that killed it here, or 0
         GraveyardStruct const* healerGrave{nullptr};
@@ -36051,6 +36007,54 @@ private:
     static constexpr float GUILD_TRAINER_WALK_YARDS = 3000.0f;
     static constexpr float GUILD_TRAINER_REACH_YARDS = 5.0f;
 
+    // HOW MANY OF THE OTHER SIDE'S SPAWNS, HOSTILE TO THIS MEMBER, STAND BESIDE
+    // EACH CLASS TRAINER SPAWN IN `spawnIds` (2026-11-17). The faction gate on a
+    // trainer reads the trainer's own template, and a seasonal trainer (entry
+    // 26331, faction 35) is friendly to everyone while standing in the other
+    // side's capital among its guards: a level 37 Horde warlock was walked to
+    // one in Dun Morogh and killed by an Ironforge Mountaineer 14 times, 15
+    // minutes apart. The same sweep the travel resolver and the graveyard use
+    // (HostileSpawnsNearEach), at level 0 so a guard below the member's level
+    // counts, since a city guard kills a member however its level compares, and
+    // on the other side's ground only, so wildlife near a trainer does not
+    // refuse it. One pass over the spawn table for all the spots that are not
+    // already cached.
+    static constexpr std::time_t GUILD_TRAINER_GUARD_CACHE_SECONDS = 3600;
+    std::vector<unsigned> GuildTrainerGuardsNear(Player* bot, uint32 mapId,
+                                                 std::vector<ObjectGuid::LowType> const& spawnIds,
+                                                 std::vector<std::pair<float, float>> const& at)
+    {
+        std::vector<unsigned> counts(spawnIds.size(), 0);
+        FactionTemplateEntry const* mine = bot ? bot->GetFactionTemplateEntry() : nullptr;
+        if (!mine)
+            return counts;
+        std::time_t const now = std::time(nullptr);
+        std::vector<std::size_t> missing;
+        std::vector<std::pair<float, float>> points;
+        for (std::size_t i = 0; i < spawnIds.size(); ++i)
+        {
+            auto const found = _guildTrainerGuards.find({spawnIds[i], mine->ID});
+            if (found != _guildTrainerGuards.end() &&
+                now - found->second.second < GUILD_TRAINER_GUARD_CACHE_SECONDS)
+            {
+                counts[i] = found->second.first;
+                continue;
+            }
+            missing.push_back(i);
+            points.push_back(at[i]);
+        }
+        if (missing.empty())
+            return counts;
+        std::vector<NearbyThreat> threats;
+        HostileSpawnsNearEach(bot, mapId, points, TRAVEL_THREAT_RADIUS, 0, true, threats);
+        for (std::size_t k = 0; k < missing.size(); ++k)
+        {
+            counts[missing[k]] = threats[k].count;
+            _guildTrainerGuards[{spawnIds[missing[k]], mine->ID}] = {threats[k].count, now};
+        }
+        return counts;
+    }
+
     void LoadClassTrainerSpots()
     {
         _classTrainersLoaded = true;
@@ -36063,6 +36067,7 @@ private:
             uint8 const cls = static_cast<uint8>(trainer->GetTrainerRequirement());
             _classTrainerSpots[cls].push_back({data.mapid, data.posX, data.posY});
             _classTrainerEntries[cls].push_back({data.id, data.posZ});
+            _classTrainerSpawnIds[cls].push_back(spawn.first);
         }
     }
 
@@ -36215,9 +36220,16 @@ private:
             std::vector<std::pair<uint32, float>> entries;
             auto const& allSpots = _classTrainerSpots[bot->getClass()];
             auto const& allEntries = _classTrainerEntries[bot->getClass()];
+            auto const& allSpawnIds = _classTrainerSpawnIds[bot->getClass()];
+            std::vector<std::size_t> kept;
+            std::vector<ObjectGuid::LowType> keptSpawnIds;
+            std::vector<std::pair<float, float>> keptAt;
             for (std::size_t i = 0; i < allSpots.size(); ++i)
             {
                 if (allSpots[i].mapId != bot->GetMapId())
+                    continue;
+                // A seasonal trainer out of season is nobody to walk to.
+                if (!CreatureSpawnStandsNow(allSpawnIds[i]))
                     continue;
                 uint32 const entry = allEntries[i].first;
                 Trainer::Trainer* trainer = sObjectMgr->GetTrainer(entry);
@@ -36228,8 +36240,21 @@ private:
                     sFactionTemplateStore.LookupEntry(tmpl->faction);
                 if (!mine || !theirs || theirs->IsHostileTo(*mine))
                     continue;
-                spots.push_back(allSpots[i]);
-                entries.push_back(allEntries[i]);
+                kept.push_back(i);
+                keptSpawnIds.push_back(allSpawnIds[i]);
+                keptAt.emplace_back(allSpots[i].x, allSpots[i].y);
+            }
+            // Friendly is not safe: the other side's guards beside it end the
+            // walk in a death (GuildTrainerGuardsNear).
+            std::vector<unsigned> const guards =
+                GuildTrainerGuardsNear(bot, bot->GetMapId(), keptSpawnIds, keptAt);
+            for (std::size_t k = 0; k < kept.size(); ++k)
+            {
+                if (!OverseerDecisions::GuildTrainerSpotUsable(
+                        CreatureSpawnStandsNow(keptSpawnIds[k]), guards[k]))
+                    continue;
+                spots.push_back(allSpots[kept[k]]);
+                entries.push_back(allEntries[kept[k]]);
             }
             int const pick = OverseerDecisions::NearestTrainerSpot(
                 spots, bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(),
@@ -36655,6 +36680,34 @@ private:
         _guildWeaponSentTo.erase(name);
     }
 
+    // Does the corpse lie in lava (wow-overseer#2886)? Read off the map at the
+    // corpse's own point rather than off the death row, which may still be in
+    // the flush queue when the ghost is first read. The liquid must reach the
+    // corpse: a corpse standing on a bridge or a ledge above the pool is a
+    // corpse a ghost can reclaim, and the core says so by reading the point as
+    // above the liquid (LIQUID_MAP_ABOVE_WATER), not in it. The point is asked
+    // one yard below the corpse, because a body that floats on the surface can
+    // sit a hair over it and the core calls that above (Map::GetLiquidData
+    // reads `waterLevel - z` of 0 or less as above or walking on it), where a
+    // body one yard lower is in the pool; a ledge a few yards over still reads
+    // as above. Magma only, as OverseerDecisions::StepLiquidIsLethal: the
+    // core's slime damage is off.
+    static bool CorpseLiesInLava(Player* bot, Corpse const* corpse)
+    {
+        if (!bot || !corpse)
+            return false;
+        Map* map = bot->GetMap();
+        if (!map)
+            return false;
+        LiquidData const liquid = map->GetLiquidData(
+            bot->GetPhaseMask(), corpse->GetPositionX(), corpse->GetPositionY(),
+            corpse->GetPositionZ() - 1.0f, bot->GetCollisionHeight(), MAP_ALL_LIQUIDS);
+        if (liquid.Status == LIQUID_MAP_NO_WATER || liquid.Status == LIQUID_MAP_ABOVE_WATER)
+            return false;
+        return OverseerDecisions::ClassifyDeathLiquid(liquid.Flags) ==
+               OverseerDecisions::DeathLiquid::Magma;
+    }
+
     // The kind that killed this character at its corpse on `mapId` at (x, y),
     // or 0 (OverseerDecisions::KillerAtCorpse).
     static uint32 KillerEntryAt(std::string const& name, uint32 mapId, float x, float y)
@@ -36769,6 +36822,10 @@ private:
             st.deathsHere = static_cast<unsigned>(
                 std::max<uint64>({deaths, uint64(knownDeathsHere), uint64(1)}));
 
+            // A CORPSE IN LAVA IS NOT RECLAIMED (wow-overseer#2886): the corpse
+            // run revives the ghost where the corpse lies. Read once per death,
+            // like everything that does not change while the ghost walks.
+            st.corpseInLava = CorpseLiesInLava(bot, corpse);
             st.spawnThreat = HostileSpawnsNear(bot, st.mapId, st.corpseX, st.corpseY,
                                                GHOST_CORPSE_THREAT_RADIUS, bot->GetLevel());
             st.killerEntry = KillerEntryAt(name, st.mapId, st.corpseX, st.corpseY);
@@ -36825,6 +36882,7 @@ private:
         facts.healerGraveyardSafe = st.healerGrave && st.healerRefused.empty() &&
                                     (ladder || !st.healerWalkSpent);
         facts.choseHealer = st.choseHealer;
+        facts.corpseInLava = st.corpseInLava;
         // ON THE OTHER FACTION'S HOME GROUND THE CORPSE RUN IS THE TRAP. The
         // guards stand over the corpse and the graveyard alike, and no wait
         // moves them (2026-09-28: Alliance members died to Razor Hill Grunts
@@ -66866,6 +66924,7 @@ private:
         // fresh login before they act, and for a reset's walk home after.
         ResolveNaturalizeChecks(sincePollMs);
         ResolveRenameChecks(sincePollMs);
+        ResolveCreateChecks(sincePollMs);
 
         // ...and the retire rows, which wait for the character to stay out of
         // the world before the core deletes it.
@@ -67077,6 +67136,13 @@ private:
                 // target may be offline, and when it is online it is logged
                 // out before anything is done to it (see DoNaturalize).
                 detail = DoNaturalize(targetName, command, id, status, rowResult);
+            else if (kind == "job" && OverseerDecisions::IsCreateAccountRow(command))
+                // A DEDICATED BOT ACCOUNT (2026-11-17), listed accounts only; see DoCreateAccount.
+                detail = DoCreateAccount(targetName, command, status, rowResult);
+            else if (kind == "job" && OverseerDecisions::IsCreateCharacterRow(command))
+                // A CREATE (2026-11-17): the target is the NEW character's name, so it is
+                // routed before the online test, and an existing name answers `exists`.
+                detail = DoCreateCharacter(targetName, command, id, status, rowResult);
             else if (!player && kind == "job" && OverseerDecisions::IsRenameRow(command))
                 // A RENAME OF AN OFFLINE CHARACTER (2026-10-08): a row whose
                 // target is not in the world. With Overseer.Rename.Offline off
@@ -76854,6 +76920,362 @@ private:
         }
 
         _pendingRenames.swap(still);
+    }
+
+    // ------------------------------------------------- create a named character --
+    //
+    // ROW: `create-character <race> <class> <gender> <faction> [level <N>]`,
+    // target_name the NEW name. The grammar and every gate are
+    // OverseerDecisions::CreateCharacterVerdictFor; this is only the part that
+    // touches the core, and it is the random bot factory's own recipe
+    // (RandomPlayerbotFactory::CreateRandomBot and CreateRandomBots) with the
+    // race, class, gender and name taken from the row instead of rolled:
+    // a WorldSession for an existing account, Player::Create with a
+    // CharacterCreateInfo, SaveToDB(true, false), a character cache entry.
+    // Nothing is written to `characters` by hand.
+    //
+    // WHICH ACCOUNT. One of the accounts named in
+    // Overseer.CreateCharacter.Accounts with a slot under SlotCap. They are
+    // deliberately NOT random bot accounts: a character on one of those is
+    // handed a kit and teleported by the factory the first time the random
+    // manager logs it in, which for a level 1 character is a grant.
+    //
+    // LEVEL. A level 1 row is finished at once. A higher level (allowed only
+    // by Overseer.CreateCharacter.MaxLevel) logs the new character in headless
+    // and runs the factory's Randomize for that level on it, exactly the call
+    // RandomizeFirst makes on a fresh random bot, then logs it out again.
+    struct CreateCheck
+    {
+        uint32 id{0};
+        ObjectGuid guid;
+        std::string name;
+        unsigned level{1};
+        uint32 waitedMs{0};
+    };
+
+    std::vector<CreateCheck> _pendingCreates;
+
+    static bool CreateEnabled()
+    {
+        return sConfigMgr->GetOption<bool>("Overseer.CreateCharacter.Enable", false);
+    }
+
+    static unsigned CreateMaxLevel()
+    {
+        return sConfigMgr->GetOption<uint32>("Overseer.CreateCharacter.MaxLevel", 1);
+    }
+
+    static unsigned CreateSlotCap()
+    {
+        return sConfigMgr->GetOption<uint32>("Overseer.CreateCharacter.SlotCap", 10);
+    }
+
+    static std::vector<std::string> CreateAccountNames()
+    {
+        return OverseerDecisions::ParseNameList(
+            sConfigMgr->GetOption<std::string>("Overseer.CreateCharacter.Accounts", ""));
+    }
+
+    // The listed accounts that exist, with how many characters each holds.
+    static std::vector<OverseerDecisions::CreationAccount> CreationAccounts()
+    {
+        std::vector<OverseerDecisions::CreationAccount> accounts;
+        for (std::string const& accountName : CreateAccountNames())
+        {
+            // Account names are letters and digits; anything else is skipped
+            // rather than embedded in SQL.
+            bool clean = !accountName.empty() && accountName.size() <= 32;
+            for (char ch : accountName)
+                if (!std::isalnum(static_cast<unsigned char>(ch)))
+                    clean = false;
+            if (!clean)
+                continue;
+            std::string upper = accountName;
+            for (char& ch : upper)
+                ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            QueryResult found = LoginDatabase.Query("SELECT id FROM account WHERE username = '{}'", upper);
+            if (!found)
+                continue;
+            OverseerDecisions::CreationAccount account;
+            account.id = found->Fetch()[0].Get<uint32>();
+            account.characters = CountQuery("SELECT COUNT(*) FROM characters WHERE account = {}", account.id);
+            accounts.push_back(account);
+        }
+        return accounts;
+    }
+
+    // ROW: `create-account`, target_name the account name. Made in process
+    // with the core's AccountMgr::CreateAccount, the call the random bot
+    // factory makes for its own accounts, only for a name listed in
+    // Overseer.CreateCharacter.Accounts. THE PASSWORD IS RANDOM, MADE HERE AND
+    // NEVER STORED, LOGGED OR RETURNED: the row's result carries the account
+    // name and nothing else, so nobody can log in to the account. The account
+    // is written through the login database's async queue, so a
+    // create-character row sent in the same second may still find no account;
+    // it is refused with `no listed bot account has a free character slot` and
+    // is simply sent again.
+    char const* DoCreateAccount(std::string const& targetName, std::string const& command, char const*& status,
+                                std::string& out)
+    {
+        std::string upper = targetName;
+        for (char& ch : upper)
+            ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+
+        OverseerDecisions::CreateAccountFacts facts;
+        facts.switchOn = CreateEnabled();
+        facts.commandOk = OverseerDecisions::CreateAccountCommandOk(command);
+        facts.nameValid = OverseerDecisions::AccountNameValid(upper);
+        facts.randomBotName = upper.rfind("RNDBOT", 0) == 0;
+        for (std::string const& listed : CreateAccountNames())
+        {
+            std::string name = listed;
+            for (char& ch : name)
+                ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            if (name == upper)
+                facts.listed = true;
+        }
+        if (facts.nameValid)
+            facts.exists = bool(LoginDatabase.Query("SELECT id FROM account WHERE username = '{}'", upper));
+
+        OverseerDecisions::CreateCharacterVerdict const verdict = OverseerDecisions::CreateAccountVerdictFor(facts);
+        std::ostringstream o;
+        if (verdict.route == OverseerDecisions::CreateRoute::Refuse)
+        {
+            o << "{\"outcome\":\"refused\",\"reason\":" << J(verdict.reason) << ",\"account\":" << J(upper) << '}';
+            out = o.str();
+            LOG_WARN("module.overseer", "overseer: create-account '{}' refused: {}", upper, verdict.reason);
+            return verdict.reason;
+        }
+        if (verdict.route == OverseerDecisions::CreateRoute::AlreadyExists)
+        {
+            o << "{\"outcome\":\"exists\",\"account\":" << J(upper) << "}";
+            out = o.str();
+            LOG_INFO("module.overseer", "overseer: create-account '{}' already exists - no-op", upper);
+            status = "applied";
+            return "";
+        }
+
+        // A long random password nobody sees: 40 characters from a
+        // cryptographic source, which is never copied anywhere.
+        static char const alphabet[] = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        std::random_device entropy;
+        std::string password;
+        for (int i = 0; i < 40; ++i)
+            password += alphabet[entropy() % (sizeof(alphabet) - 1)];
+        AccountOpResult const made = sAccountMgr->CreateAccount(upper, password);
+        std::fill(password.begin(), password.end(), '\0');
+        if (made != AOR_OK)
+        {
+            o << "{\"outcome\":\"refused\",\"reason\":\"the core refused the account\",\"account\":" << J(upper) << '}';
+            out = o.str();
+            LOG_WARN("module.overseer", "overseer: create-account '{}' refused by the core", upper);
+            return "the core refused the account";
+        }
+        LOG_INFO("module.overseer", "overseer: create-account '{}' made; its password is random and is not kept",
+                 upper);
+        o << "{\"outcome\":\"created\",\"account\":" << J(upper) << "}";
+        out = o.str();
+        status = "applied";
+        return "";
+    }
+
+    char const* DoCreateCharacter(std::string const& targetName, std::string const& command, uint32 id,
+                                  char const*& status, std::string& out)
+    {
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":\"refused\",\"reason\":" << J(reason) << ",\"character\":" << J(targetName)
+              << ",\"request\":" << J(command) << '}';
+            out = o.str();
+            LOG_WARN("module.overseer", "overseer: create-character '{}' refused: {}", targetName, reason);
+            return reason;
+        };
+
+        OverseerDecisions::CreateCharacterRequest const request =
+            OverseerDecisions::ParseCreateCharacterRequest(command);
+        OverseerDecisions::CreateCharacterFacts facts;
+        facts.switchOn = CreateEnabled();
+        facts.maxLevel = CreateMaxLevel();
+
+        std::string name = targetName;
+        facts.nameValid = normalizePlayerName(name) && ObjectMgr::CheckPlayerName(name, true) == CHAR_NAME_SUCCESS;
+        for (CreateCheck const& pending : _pendingCreates)
+            if (pending.name == name)
+                facts.rowInFlight = true;
+
+        if (request.ok && facts.nameValid)
+        {
+            ObjectGuid const existing = sCharacterCache->GetCharacterGuidByName(name);
+            facts.nameTaken = bool(existing);
+            if (existing)
+            {
+                CharacterCacheEntry const* cache = sCharacterCache->GetCharacterCacheByGuid(existing);
+                facts.takenIsSame = cache && cache->Race == request.race && cache->Class == request.cls &&
+                                    cache->Sex == request.gender;
+            }
+            facts.raceClassLegal = sObjectMgr->GetPlayerInfo(request.race, request.cls) != nullptr;
+            facts.raceEnabled = !((1u << (request.race - 1)) & sWorld->getIntConfig(CONFIG_CHARACTER_CREATING_DISABLED_RACEMASK));
+            facts.freeAccount =
+                OverseerDecisions::PickCreationAccount(CreationAccounts(), CreateSlotCap());
+        }
+
+        OverseerDecisions::CreateCharacterVerdict const verdict =
+            OverseerDecisions::CreateCharacterVerdictFor(request, facts);
+        if (verdict.route == OverseerDecisions::CreateRoute::Refuse)
+            return refuse(verdict.reason);
+
+        if (verdict.route == OverseerDecisions::CreateRoute::AlreadyExists)
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":\"exists\",\"character\":" << J(name) << ",\"request\":" << J(command)
+              << ",\"note\":\"already made as asked; nothing changed\"}";
+            out = o.str();
+            LOG_INFO("module.overseer", "overseer: create-character '{}' already exists as asked - no-op", name);
+            status = "applied";
+            return "";
+        }
+
+        // The character's looks. The first valid face and hair for the race
+        // and gender, in the DBC's own order: a name and a body are what the
+        // row asks for, and the looks are not worth a roll.
+        bool haveFace = false;
+        bool haveHair = false;
+        uint8 face = 0, faceColor = 0, hair = 0, hairColor = 0;
+        for (CharSectionsEntry const* section : sCharSectionsStore)
+        {
+            if (section->RaceID != request.race || section->SexID != request.gender)
+                continue;
+            if (section->BaseSection == SECTION_TYPE_FACE && !haveFace)
+            {
+                face = section->VariationIndex;
+                faceColor = section->ColorIndex;
+                haveFace = true;
+            }
+            else if (section->BaseSection == SECTION_TYPE_HAIR && !haveHair)
+            {
+                hair = section->VariationIndex;
+                hairColor = section->ColorIndex;
+                haveHair = true;
+            }
+        }
+        if (!haveFace || !haveHair)
+            return refuse("the client data has no face or hair for that race and gender");
+
+        uint32 const accountId = facts.freeAccount;
+        WorldSession* session = new WorldSession(accountId, "", 0x0, nullptr, SEC_PLAYER,
+                                                 EXPANSION_WRATH_OF_THE_LICH_KING, time_t(0), LOCALE_enUS, 0,
+                                                 false, false, 0);
+        std::unique_ptr<CharacterCreateInfo> info = std::make_unique<CharacterCreateInfo>(
+            name, request.race, request.cls, request.gender, faceColor, face, hair, hairColor, 0);
+
+        Player* created = new Player(session);
+        created->GetMotionMaster()->Initialize();
+        if (!created->Create(sObjectMgr->GetGenerator<HighGuid::Player>().Generate(), info.get()))
+        {
+            created->CleanupsBeforeDelete();
+            delete created;
+            delete session;
+            return refuse("the core could not create the character");
+        }
+        created->setCinematic(2);
+        created->SetAtLoginFlag(AT_LOGIN_NONE);
+        created->SaveToDB(true, false);
+        ObjectGuid const guid = created->GetGUID();
+        sCharacterCache->AddCharacterCacheEntry(guid, accountId, created->GetName(), created->getGender(),
+                                                created->getRace(), created->getClass(), created->GetLevel());
+        created->CleanupsBeforeDelete();
+        delete created;
+        delete session;
+
+        // EVERY CREATION IS LOGGED, with who it is and where it went.
+        LOG_INFO("module.overseer",
+                 "overseer: create-character '{}' made: race {} class {} gender {} on account {}, level {} asked, "
+                 "command {}",
+                 name, uint32(request.race), uint32(request.cls), uint32(request.gender), accountId,
+                 request.level, id);
+
+        std::ostringstream o;
+        o << "{\"outcome\":\"created\",\"character\":" << J(name) << ",\"account\":" << accountId
+          << ",\"race\":" << uint32(request.race) << ",\"class\":" << uint32(request.cls)
+          << ",\"gender\":" << uint32(request.gender) << ",\"level\":" << request.level
+          << ",\"request\":" << J(command) << '}';
+
+        if (request.level <= 1)
+        {
+            out = o.str();
+            status = "applied";
+            return "";
+        }
+
+        // A level above 1: the character's rows must be in the database before
+        // it can log in, so the login is made on the next poll by the resolver
+        // below, which then runs the factory for the level.
+        CreateCheck check;
+        check.id = id;
+        check.guid = guid;
+        check.name = name;
+        check.level = request.level;
+        _pendingCreates.push_back(check);
+        out = o.str();
+        status = "verifying";
+        return "";
+    }
+
+    void ResolveCreateChecks(uint32 elapsedMs)
+    {
+        std::vector<CreateCheck> still;
+        still.reserve(_pendingCreates.size());
+
+        for (CreateCheck& check : _pendingCreates)
+        {
+            check.waitedMs += elapsedMs;
+            Player* player = ObjectAccessor::FindPlayer(check.guid);
+
+            // The login is asked for once the row is readable.
+            if (!player && check.waitedMs >= 4000 &&
+                CountQuery("SELECT COUNT(*) FROM characters WHERE guid = {}", check.guid.GetCounter()) > 0 &&
+                !sRandomPlayerbotMgr.GetPlayerBot(check.guid))
+                sRandomPlayerbotMgr.AddPlayerBot(check.guid, 0);
+
+            bool const ready = player && player->IsInWorld() && !player->IsBeingTeleported() &&
+                               GET_PLAYERBOT_AI(player);
+            if (!ready)
+            {
+                if (check.waitedMs < NATURALIZE_LOGIN_CEILING_MS)
+                {
+                    still.push_back(check);
+                    continue;
+                }
+                if (player && player->IsInWorld())
+                    EvictHeadlessBot(player);
+                FinishVerifyingRow(check.id, "error",
+                                   "created at level 1 but did not log in within two minutes; the level was not applied",
+                                   "{\"outcome\":\"created_not_levelled\",\"character\":" + J(check.name) + "}");
+                continue;
+            }
+
+            // The factory's own call, as RandomPlayerbotMgr::RandomizeFirst
+            // makes it on a fresh random bot: gear for the level and the
+            // class's spells for it, and nothing chosen by hand.
+            // natural-only: the one grant this module makes, and it is the operator's explicit
+            // override for a new test family: a `create-character` row that asks for a level above
+            // 1, refused unless Overseer.CreateCharacter.MaxLevel allows it (default 1). It reaches
+            // only the character that row just created, never an existing member.
+            PlayerbotFactory factory(player, check.level);
+            factory.Randomize(false);
+            player->SaveToDB(false, false);
+            LOG_INFO("module.overseer",
+                     "overseer: create-character '{}' brought to level {} by the playerbots factory (the "
+                     "level asked for in command {})",
+                     check.name, check.level, check.id);
+            EvictHeadlessBot(player);
+            FinishVerifyingRow(check.id, "applied", "",
+                               "{\"outcome\":\"created\",\"character\":" + J(check.name) + ",\"level\":" +
+                                   std::to_string(check.level) + ",\"note\":\"made, then given the factory's kit for the level\"}");
+        }
+
+        _pendingCreates.swap(still);
     }
 
     // The name questions DoRename and DoRenameOffline both ask, answered once.
@@ -89214,6 +89636,15 @@ private:
     // the drive last ran.
     std::map<uint8, std::vector<OverseerDecisions::TrainerSpot>> _classTrainerSpots;
     std::map<uint8, std::vector<std::pair<uint32, float>>> _classTrainerEntries;
+    // The spawn id of each entry in _classTrainerEntries, index for index, so a
+    // trainer's game event can be read (CreatureSpawnStandsNow).
+    std::map<uint8, std::vector<ObjectGuid::LowType>> _classTrainerSpawnIds;
+    // How many of the other side's spawns hostile to a faction template stand
+    // beside a trainer spawn, by (spawn id, faction template id), and when that
+    // was read. The spawn table is a quarter of a million rows, so it is swept
+    // once an hour per pair rather than once a minute per member.
+    std::map<std::pair<ObjectGuid::LowType, uint32>, std::pair<unsigned, std::time_t>>
+        _guildTrainerGuards;
     bool _classTrainersLoaded{false};
     std::map<std::string, uint32> _guildTrainingSentTo;
     // DriveGuildWeaponFor: every vendor spawn that sells a weapon, every

@@ -5362,7 +5362,24 @@ struct TravelReleaseGateFacts
     uint32_t learnSkill{0};
     // The travel_npc column as the release read it.
     std::string standing;
+    // The drive has refused this aim as inert for INERT_FOLLOWER_AIM_SECONDS: a
+    // follower's counter keyword, which only the leader's `new rpg` could walk
+    // (#1610). Lets a counter keyword through the gate and nothing else.
+    bool inertFollowerAim{false};
 };
+
+// HOW LONG A FOLLOWER'S COUNTER-KEYWORD AIM MAY STAND REFUSED AS INERT BEFORE IT
+// IS CLEARED (#1610). Long enough that a bridge pass writing a follower's aim and
+// a leader still on its way to the counter are not raced; short enough that the
+// catch-up walk, which refuses a member while an errand stands, is not kept
+// off it for minutes.
+constexpr int64_t INERT_FOLLOWER_AIM_SECONDS = 120;
+
+// Is this standing aim one the release may clear because nothing walks it? A
+// counter keyword only, no pending profession errand, refused as inert for the
+// bound. A positional aim, a guard and an empty column are never cleared here.
+bool InertFollowerAimMayBeCleared(std::string const& aim, uint32_t learnSkill,
+                                  int64_t inertSeconds);
 
 // Empty means the column write goes through. Non-empty is the same whole
 // clause TravelReleaseFence returns, or "the column changed after this book's
@@ -11530,6 +11547,18 @@ char const* LoneLegStepWord(LoneLegStep step);
 // The reason in words, for the log line and the regroup's refusal.
 char const* LoneLegReasonWord(LoneLegReason why);
 
+// HOW LONG A LONE-LEG HOLD LASTS BEFORE THE LEG IS ASKED AGAIN (#1609). A leg
+// refused for its deaths is a measurement and holds for the far-catch-up ceiling.
+// A leg refused for its ground alone is a prediction about a straight line, so it
+// is asked again after five minutes: the leader may have moved, a flight or a
+// stone may be ready, and a member stood still for fifteen minutes on a guess
+// stays split from its family for all of them.
+constexpr int64_t LONE_LEG_GROUND_HOLD_SECONDS = 300;
+
+// The ceiling to hold a member for, given why the leg was refused and the
+// far-catch-up ceiling. Never longer than `farHoldSeconds`.
+int64_t LoneLegHoldSeconds(LoneLegReason why, int64_t farHoldSeconds);
+
 // A member already held for a far catch-up must not wait on ground that the
 // #697 lone-walker rule calls lethal.
 struct HeldGroundFacts
@@ -12107,6 +12136,13 @@ struct ErrandDeathLimits
     // last doubles the cool-off, up to `maxCooloffSeconds`.
     int64_t maxCooloffSeconds{4 * 60 * 60};
     int64_t strikeMemorySeconds{6 * 60 * 60};
+    // A DEATH IN LAVA CALLS AN ERRAND OFF AT THE FIRST BODY
+    // (wow-overseer#2886). Three bodies in five minutes cannot tell a patrol
+    // from a bad road on the first one, but a burn is the ground itself and the
+    // next walk takes the same road: a leader on a vendor errand died in one
+    // lava pool three times in 143 seconds before the rule above fired. Zero
+    // turns this off.
+    uint32_t lavaDeaths{1};
     // AND THE PARTY'S BODIES COUNT, NOT ONLY THE LEADER'S (#776). The leader
     // carries the aim, but the four behind him walk the same ground: Ugga
     // died four times to Blackrock Scouts in Redridge on the leader's errand
@@ -12142,6 +12178,9 @@ struct ErrandDeathToll
     // Deaths of every member of the traveller's party, the traveller included,
     // inside the same window (#776). Zero when the caller read none.
     uint32_t partyDeaths{0};
+    // Of the deaths above, how many were in lava (the death row's
+    // liquid_type is magma), this TRAVELLER's own, inside the same window.
+    uint32_t lavaDeaths{0};
     // How many times in a row this rule has released THIS target for this
     // character, the refusal now running included (#776). Zero when it never has.
     uint32_t strikes{0};
@@ -24285,8 +24324,10 @@ enum class GhostRecoveryReason : uint8_t
     WaitedOut,        // it waited and the corpse never cleared
     StillSick,        // it still carries Resurrection Sickness; the corpse run
                       // does not stack another
-    SickButThreatened // it still carries Resurrection Sickness, but hostiles
+    SickButThreatened,// it still carries Resurrection Sickness, but hostiles
                       // near the corpse make reclaiming it unsafe
+    CorpseInLava    // the corpse lies in lava: reviving there is
+                      // another death (wow-overseer#2886)
 };
 
 struct GhostRecoveryFacts
@@ -24313,6 +24354,11 @@ struct GhostRecoveryFacts
     // healer would stack another.
     bool sick{false};
     bool corpseRunPossible{false};
+    // THE CORPSE LIES IN LAVA (wow-overseer#2886). The corpse run
+    // brings the ghost to its corpse and revives it standing there, so a
+    // corpse in lava is a revival in lava. The adapter reads the liquid at the
+    // corpse's own point, not the death row, which may still be queued.
+    bool corpseInLava{false};
 };
 
 enum class RevivedSickGroundStep : std::uint8_t { Stay, Hearth, HoldOutOfCombat };
@@ -24376,10 +24422,15 @@ struct GhostRecoveryVerdict
     GhostRecoveryReason reason{GhostRecoveryReason::Clear};
 };
 
-// SIX RULES, IN THIS ORDER:
+// SEVEN RULES, IN THIS ORDER:
 //
 //   1. The spirit healer was already chosen for this death: keep it. A ghost
 //      halfway to the healer is not turned round because a patrol wandered off.
+//   1a. The corpse lies in lava: spirit healer, whatever else is
+//      true, sickness included. Reviving at the corpse is a death, and the
+//      second death at the spot was too late: on 2026-11-17 a character died
+//      three times in three minutes within two yards of one lava point
+//      (wow-overseer#2886).
 //   2. It has died `repeatDeaths` times here inside the window: spirit healer.
 //   2a. It still carries Resurrection Sickness, the corpse run is possible,
 //      and the corpse is clear of hostiles: corpse run, so the sickness does
@@ -25034,6 +25085,16 @@ struct TrainerSpot
 // or -1.
 int NearestTrainerSpot(std::vector<TrainerSpot> const& spots, uint32_t mapId, float x, float y,
                        float maxYards);
+
+// Whether a class trainer spawn is somewhere a natural member may be sent. A
+// trainer being friendly is not enough: an event trainer carries faction 35,
+// friendly to both sides, and stands inside the other side's town beside its
+// guards (Arena Tournament Warlock Trainers in Ironforge). So a spawn tied to
+// a game event that is not running is nobody to walk to, and one with a hostile
+// town guard standing beside it ends the walk in a death, over and over.
+// `otherSideGuards` is how many of the other side's spawns that are hostile to
+// the member stand within the guard radius of it.
+bool GuildTrainerSpotUsable(bool spawnStandsNow, unsigned otherSideGuards);
 
 enum class GuildTrainingStep
 {
@@ -30946,6 +31007,121 @@ struct EnchantForProof
 };
 // The one log line that proves an enchant happened.
 std::string EnchantForProofLine(EnchantForProof const& proof);
+
+
+// ------------------------------------------------ create a named character (2026-11-17) --
+// A NAMED CHARACTER WITHOUT A GAME CLIENT. The core can only make a character
+// through a client's create packet or through mod-playerbots' random bot
+// factory, which picks its own race and name. This verb is the factory's own
+// recipe (a session for an existing account, Player::Create, SaveToDB, a
+// character cache entry) with the name, race, class and gender chosen by the
+// row. It needs no new account and no password: it takes a free slot on an
+// account the operator lists in Overseer.CreateCharacter.Accounts.
+//
+// THE ROW. kind='job', routed on its first word, `create-character`, so no
+// ENUM migration is needed; the row's target_name is the NEW character's name:
+//
+//   create-character <race> <class> <male|female> <alliance|horde> [level <N>]
+//
+// Race words: human dwarf nightelf gnome draenei orc undead tauren troll
+// bloodelf. Class words: warrior paladin hunter rogue priest shaman mage
+// warlock druid. A death knight is refused: it is born at 55, which is a grant.
+//
+// THE LEVEL. Absent or 1, the character is made with the starting outfit the
+// core gives every new character and nothing else. A level above 1 is an
+// explicit grant the operator asks for per row, and it is refused unless
+// Overseer.CreateCharacter.MaxLevel (default 1) allows it. It is met by the
+// playerbots factory's own Randomize for that level, the same call a fresh
+// random bot gets, never by hand picked items.
+//
+// IDEMPOTENT. A character of that name that already has the asked race, class
+// and gender answers `exists` and changes nothing. A name taken by anything
+// else is refused.
+struct CreateCharacterRequest
+{
+    bool ok{false};
+    std::uint8_t race{0};
+    std::uint8_t cls{0};
+    std::uint8_t gender{0};  // 0 male, 1 female (the core's GENDER_*)
+    bool alliance{false};    // the faction the row asked for
+    unsigned level{1};
+    std::string error;       // the refusal literal when not ok
+};
+
+constexpr unsigned CREATE_CHARACTER_LEVEL_MAX = 60;
+
+bool IsCreateCharacterRow(std::string const& command);
+CreateCharacterRequest ParseCreateCharacterRequest(std::string const& command);
+
+// Whether the core's race id belongs to the Alliance.
+bool RaceIsAlliance(std::uint8_t race);
+
+struct CreateCharacterFacts
+{
+    bool switchOn{false};        // Overseer.CreateCharacter.Enable
+    unsigned maxLevel{1};        // Overseer.CreateCharacter.MaxLevel
+    bool nameValid{false};       // normalised and CheckPlayerName said success
+    bool nameTaken{false};       // a character already has the name
+    bool takenIsSame{false};     // ...and it has the asked race, class and gender
+    bool raceClassLegal{false};  // the core has a PlayerInfo for the pair
+    bool raceEnabled{false};     // not disabled by the realm's creation masks
+    unsigned freeAccount{0};     // an account id with a free slot, 0 for none
+    bool rowInFlight{false};     // a creation for the same name is running
+};
+
+enum class CreateRoute : std::uint8_t
+{
+    Create,         // make it
+    AlreadyExists,  // idempotent no-op
+    Refuse,
+};
+
+struct CreateCharacterVerdict
+{
+    CreateRoute route{CreateRoute::Refuse};
+    char const* reason{""};  // literal, no quotes
+};
+
+// The first gate that fails, in the order a reader would check them.
+CreateCharacterVerdict CreateCharacterVerdictFor(CreateCharacterRequest const& request,
+                                                 CreateCharacterFacts const& facts);
+
+struct CreationAccount
+{
+    unsigned id{0};
+    unsigned characters{0};
+};
+
+// The account a new character goes on: the listed account with the fewest
+// characters that is still under `cap`, the lowest id on a tie. 0 for none.
+unsigned PickCreationAccount(std::vector<CreationAccount> const& accounts, unsigned cap);
+
+
+// ------------------------------------------------ create a bot account (2026-11-17) --
+// A DEDICATED ACCOUNT FOR A NEW FAMILY, WITHOUT A CONSOLE. The worldserver has
+// no interactive console and its remote console stays off, so an account is
+// made in process: `create-account`, kind='job', the row's target_name being
+// the account name. It is made only for a name listed in
+// Overseer.CreateCharacter.Accounts, so a row cannot invent an arbitrary
+// account, and its password is random, made in process and never stored,
+// logged or returned: nobody can log in to it, and a client login, if one is
+// ever wanted, starts from a reset by whoever holds that authority.
+bool IsCreateAccountRow(std::string const& command);
+bool AccountNameValid(std::string const& name);
+// The command is exactly the one word, with nothing after it.
+bool CreateAccountCommandOk(std::string const& command);
+
+struct CreateAccountFacts
+{
+    bool switchOn{false};      // Overseer.CreateCharacter.Enable
+    bool commandOk{false};     // the command is exactly `create-account`
+    bool nameValid{false};     // letters and digits, 2 to 17
+    bool listed{false};        // named in Overseer.CreateCharacter.Accounts
+    bool exists{false};        // an account of that name already exists
+    bool randomBotName{false}; // it starts with the random bot account prefix
+};
+
+CreateCharacterVerdict CreateAccountVerdictFor(CreateAccountFacts const& facts);
 
 }  // namespace OverseerDecisions
 
