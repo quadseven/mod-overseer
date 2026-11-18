@@ -94,6 +94,13 @@ void TheMainHandSpellGrammarAndGate()
     ExpectText("missing focus", MainHandSpellGate(f), R::MainHandFocusMissing);
     f = {true, true, true, true};
     ExpectText("cooldown", MainHandSpellGate(f), R::MainHandSpellOnCooldown);
+    // A Self Only spell (range 0) beside a Runeforge of radius 10: the walk's own arrival
+    // radius is the reach, so 13 yards is in range and 25 is not.
+    Expect(MainHandFocusInRange(13.2f, 10.0f, 0.0f), "13 yards from a Runeforge is in reach");
+    Expect(MainHandFocusInRange(0.0f, 10.0f, 0.0f), "on the Runeforge is in reach");
+    Expect(!MainHandFocusInRange(25.0f, 10.0f, 0.0f), "25 yards from a Runeforge is out of reach");
+    Expect(MainHandFocusInRange(30.0f, 40.0f, 0.0f), "a focus radius wider than the walk's counts");
+    Expect(MainHandFocusInRange(30.0f, 0.0f, 35.0f), "a spell range wider than the walk's counts");
 }
 
 void TheItemGrammar()

@@ -8201,6 +8201,13 @@ struct QuestUseRequest
 // order, non-zero digits) and `use-gameobject <entry>` (one non-zero entry).
 QuestUseRequest ParseQuestUseRequest(std::string const& command);
 struct MainHandSpellFacts { bool spellKnown{false}; bool mainHandEquipped{false}; bool focusInRange{false}; bool spellOnCooldown{false}; };
+// THE FORGE IS IN REACH WITHIN THE WALK'S ARRIVAL RADIUS. The spell (Rune of Razorice) has range
+// index 1, Self Only, a maximum of 0 yards, so a distance <= the spell's range was never true: all
+// 62 casts on the dev realm in three days were refused 'no Runeforge is within spell range', while
+// the spawn walk had arrived at 13 yards. The core asks the focus object for its radius (the
+// template's spellFocus.dist, 10 for a Runeforge), and the walk counts arrival at
+// SPAWN_WALK_ARRIVE_YARDS, so the reach is the widest of the three.
+bool MainHandFocusInRange(float yards, float focusRadius, float spellMaxRange);
 char const* MainHandSpellGate(MainHandSpellFacts const& facts);
 
 namespace QuestUseRefusal

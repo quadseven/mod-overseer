@@ -27171,6 +27171,14 @@ QuestUseRequest ParseQuestUseRequest(std::string const& command)
     return request;
 }
 
+bool MainHandFocusInRange(float yards, float focusRadius, float spellMaxRange)
+{
+    float reach = SPAWN_WALK_ARRIVE_YARDS;
+    if (focusRadius > reach) reach = focusRadius;
+    if (spellMaxRange > reach) reach = spellMaxRange;
+    return yards >= 0.f && yards <= reach;
+}
+
 char const* MainHandSpellGate(MainHandSpellFacts const& facts)
 {
     namespace R = QuestUseRefusal;

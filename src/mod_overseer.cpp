@@ -89322,7 +89322,9 @@ private:
                     if (data.mapid == map->GetId() && proto &&
                         proto->type == GAMEOBJECT_TYPE_SPELL_FOCUS &&
                         proto->spellFocus.focusId == 1552 &&
-                        who->GetDistance(data.posX, data.posY, data.posZ) <= info->GetMaxRange(false, who))
+                        D::MainHandFocusInRange(who->GetDistance(data.posX, data.posY, data.posZ),
+                                                 static_cast<float>(proto->spellFocus.dist),
+                                                 info->GetMaxRange(false, who)))
                     { facts.focusInRange = true; break; }
                 }
             if (char const* wall = D::MainHandSpellGate(facts))
