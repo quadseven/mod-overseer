@@ -421,6 +421,16 @@ std::string NameTheController(ControllerFacts const& facts);
 std::string GuildDeathAttackers(DeathHitAccount const& account);
 std::string GuildDeathTelemetry(DeathHitAccount const& account);
 
+// WHICH `new rpg` STATUS DROVE A PLAYERBOT AT ITS DEATH (wow-overseer#2871).
+// One line per death. `kind` says what `target*` carries: "position" (map and
+// coordinates), "entry" (a creature or object entry), "quest" (a quest id) or
+// "none". NewRpgDeathTarget answers "" for none.
+std::string NewRpgDeathTarget(std::string const& kind, std::uint32_t mapId, float x, float y,
+                              float z, std::uint32_t id);
+std::string NewRpgDeathLine(std::string const& name, std::uint32_t level, std::uint32_t mapId,
+                            std::uint32_t zoneId, bool hasAi, std::string const& status,
+                            std::string const& target);
+
 DeathHitAccount AccountForDeathHits(DeathHitRing const& ring, std::int64_t deathMs);
 
 // The deploy proof for a sampled dungeon death, one line:

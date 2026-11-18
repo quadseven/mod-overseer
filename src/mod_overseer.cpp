@@ -5891,6 +5891,75 @@ static void RecordLevel(Player* player, uint8 oldLevel)
     g_levelQueue.push_back(std::move(l));
 }
 
+// ONE LINE PER PLAYERBOT DEATH NAMING THE `new rpg` STATUS THAT DROVE IT, and
+// what it was heading for (wow-overseer#2871). Read from the playerbot's own
+// rpgInfo in memory; no query, no write. A character with no playerbot AI says so.
+static void LogNewRpgDeath(Player* player)
+{
+    PlayerbotAI* botAI = GET_PLAYERBOT_AI(player);
+    std::string status;
+    std::string kind = "none";
+    uint32 mapId = 0;
+    float x = 0.f, y = 0.f, z = 0.f;
+    uint32 id = 0;
+    if (botAI)
+    {
+        auto const position = [&](WorldPosition const& pos)
+        {
+            kind = "position";
+            mapId = pos.GetMapId();
+            x = pos.GetPositionX();
+            y = pos.GetPositionY();
+            z = pos.GetPositionZ();
+        };
+        switch (botAI->rpgInfo.GetStatus())
+        {
+            case RPG_IDLE: status = "idle"; break;
+            case RPG_REST: status = "rest"; break;
+            case RPG_WANDER_RANDOM: status = "wander random"; break;
+            case RPG_WANDER_NPC:
+                status = "wander npc";
+                if (auto const* d = std::get_if<NewRpgInfo::WanderNpc>(&botAI->rpgInfo.data))
+                {
+                    kind = "entry";
+                    id = d->npcOrGo.GetEntry();
+                }
+                break;
+            case RPG_GO_GRIND:
+                status = "go grind";
+                if (auto const* d = std::get_if<NewRpgInfo::GoGrind>(&botAI->rpgInfo.data))
+                    position(d->pos);
+                break;
+            case RPG_GO_CAMP:
+                status = "go camp";
+                if (auto const* d = std::get_if<NewRpgInfo::GoCamp>(&botAI->rpgInfo.data))
+                    position(d->pos);
+                break;
+            case RPG_DO_QUEST:
+                status = "do quest";
+                if (auto const* d = std::get_if<NewRpgInfo::DoQuest>(&botAI->rpgInfo.data))
+                {
+                    kind = "quest";
+                    id = d->questId;
+                }
+                break;
+            case RPG_TRAVEL_FLIGHT: status = "travel flight"; break;
+            case RPG_OUTDOOR_PVP: status = "outdoor pvp"; break;
+            case RPG_DO_GATHER:
+                status = "do gather";
+                if (auto const* d = std::get_if<NewRpgInfo::DoGather>(&botAI->rpgInfo.data))
+                    position(d->nodePos);
+                break;
+            default: break;
+        }
+    }
+    LOG_INFO("module.overseer", "overseer: {}",
+             OverseerDecisions::NewRpgDeathLine(
+                 player->GetName(), player->GetLevel(), player->GetMapId(), player->GetZoneId(),
+                 botAI != nullptr, status,
+                 OverseerDecisions::NewRpgDeathTarget(kind, mapId, x, y, z, id)));
+}
+
 void RecordDeath(Player* player)
 {
     if (!player)
@@ -8470,6 +8539,8 @@ public:
             return;
         RecordEvent(player, "death", 0, "", "");
         RecordDeath(player);
+        if (OnRoster(player->GetName()) || InNaturalGuild(player))
+            LogNewRpgDeath(player);
         if (g_exitFightsActive.load(std::memory_order_relaxed))
             EndExitFight(player, "died");
         // The guild ghost drive's release clock reads the stamp too
