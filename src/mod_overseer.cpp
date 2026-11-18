@@ -42104,6 +42104,30 @@ private:
         return value ? std::string(value->Get()) : std::string();
     }
 
+    // THE STALL REASON FROM WHOEVER THE BRAIN IS RUNNING ON. The dungeon module
+    // elects its own leader (a tank), which need not be the family's head, and
+    // the reason lives on that member's context, so a read from the head alone
+    // can be empty while the brain is saying exactly what it cannot do. The head
+    // is asked first, then every other steerable member inside; the answer names
+    // who said it.
+    static std::string PartyBrainStallReason(
+        Player* head, std::vector<OverseerDecisions::DungeonRunEntryState> const& states)
+    {
+        std::string said = DungeonBrainStallReason(head);
+        if (!said.empty())
+            return head->GetName() + ": " + said;
+        for (OverseerDecisions::DungeonRunEntryState const& state : states)
+        {
+            Player* const member = ObjectAccessor::FindPlayerByName(state.name);
+            if (!member || member == head)
+                continue;
+            said = DungeonBrainStallReason(member);
+            if (!said.empty())
+                return member->GetName() + ": " + said;
+        }
+        return std::string();
+    }
+
     // THE DUNGEON BRAIN'S OWN WORD FOR SWITCHING ITSELF OFF (#1089): the text
     // mod-dungeon-clear logs after "dungeon clear disabled:" ("Dungeon clear
     // stopped: the party never became ready after 180s (Waiting on Uzza (low
@@ -42680,10 +42704,16 @@ private:
                       "skip's and '{}' has still not moved {}y on map {}, with {}. Walking "
                       "the party back out through EXIT and ending the run so the next poll "
                       "can open a fresh one; a run left 'active' inside a dungeon it is not "
-                      "clearing is the half hour of nothing this bound exists to end",
+                      "clearing is the half hour of nothing this bound exists to end. "
+                      "The dungeon brain says: {}",
                       coord.runNumber, coord.campaignId,
                       static_cast<uint32>(DUNGEON_CLEAR_SKIPS), leader->GetName(),
-                      static_cast<uint32>(DUNGEON_CLEAR_STALL_YARDS), insideMapId, busyNote);
+                      static_cast<uint32>(DUNGEON_CLEAR_STALL_YARDS), insideMapId, busyNote,
+                      [&]
+                      {
+                          std::string const brain = PartyBrainStallReason(leader, states);
+                          return brain.empty() ? std::string("nothing") : brain;
+                      }());
         }
 
         coord.phase = DungeonRunPhase::Exiting;
