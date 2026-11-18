@@ -78,6 +78,8 @@ int main()
           accountBody.find("LOG_") != std::string::npos && accountBody.find("<< password") == std::string::npos &&
               accountBody.find(", password)") == accountBody.rfind(", password)") &&
               accountBody.find("J(password)") == std::string::npos);
+    Check("the password is made at the core's limit, not longer",
+          accountBody.find("CREATE_ACCOUNT_PASSWORD_LENGTH") != std::string::npos && accountBody.find("< 40") == std::string::npos);
     Check("the account verb is routed before the character verb",
           source.find("IsCreateAccountRow(command)") < source.find("IsCreateCharacterRow(command)"));
 
