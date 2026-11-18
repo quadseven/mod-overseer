@@ -1407,6 +1407,14 @@ bool StepLiquidIsLethal(float depthYards, uint32_t liquidTypeMask)
     return (liquidTypeMask & DEATH_LIQUID_MAGMA) != 0;
 }
 
+unsigned WadeRepeats(bool hadEarlier, long long secondsSinceEarlier, long long windowSeconds,
+                     unsigned earlierRepeats, unsigned cap)
+{
+    if (!hadEarlier || secondsSinceEarlier < 0 || secondsSinceEarlier > windowSeconds)
+        return 0;
+    return earlierRepeats < cap ? earlierRepeats + 1 : cap;
+}
+
 bool StrideLiquidRefused(bool feetInLethalLiquid, bool strideLethal)
 {
     // A character already in the pool must be able to wade out: every bearing's

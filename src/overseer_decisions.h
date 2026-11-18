@@ -1647,15 +1647,51 @@ struct WadeOutPick
     float y = 0.f;
     float z = 0.f;
     float yards = 0.f;
+    // How far round the point dry ground was measured; zero on a first wade.
+    float clearYards = 0.f;
 };
+
+// IS THE POINT STILL DRY WHEN READ THE WAY THE FEET WILL BE READ (#1638)?
+//
+// A ring sample is read from above the character's feet. The feet check on
+// arrival reads from above the point's own height, so the point is read once
+// more from there, and with `clearYards` above zero so are eight points on a
+// ring that far round it. A point that cannot be measured is not dry.
 template <class SurfaceFn>
-WadeOutPick PickWadeOut(float fromX, float fromY, float fromZ, float maxYards,
-                        float strideYards, unsigned bearings, SurfaceFn&& surface)
+bool WadeGroundHolds(float x, float y, float z, float clearYards, SurfaceFn&& surface)
+{
+    static constexpr float READ_FROM_ABOVE_YARDS = 10.f;
+    static constexpr unsigned CLEAR_BEARINGS = 8;
+    float out = 0.f;
+    bool lethal = false;
+    if (!surface(x, y, z + READ_FROM_ABOVE_YARDS, out, lethal) || lethal)
+        return false;
+    if (clearYards <= 0.f)
+        return true;
+    for (unsigned k = 0; k < CLEAR_BEARINGS; ++k)
+    {
+        float const angle =
+            6.28318531f * static_cast<float>(k) / static_cast<float>(CLEAR_BEARINGS);
+        lethal = false;
+        if (!surface(x + clearYards * std::cos(angle), y + clearYards * std::sin(angle),
+                     z + READ_FROM_ABOVE_YARDS, out, lethal) ||
+            lethal)
+            return false;
+    }
+    return true;
+}
+
+// The ring search itself. `minYards` is the first ring's radius, and a sample
+// counts only when WadeGroundHolds says so for `clearYards`.
+template <class SurfaceFn>
+WadeOutPick PickWadeOutFrom(float fromX, float fromY, float fromZ, float minYards,
+                            float maxYards, float strideYards, unsigned bearings,
+                            float clearYards, SurfaceFn&& surface)
 {
     WadeOutPick pick;
-    if (bearings == 0 || strideYards <= 0.f)
+    if (bearings == 0 || strideYards <= 0.f || minYards <= 0.f)
         return pick;
-    for (float r = strideYards; r <= maxYards; r += strideYards)
+    for (float r = minYards; r <= maxYards; r += strideYards)
     {
         float bestRise = 0.f;
         for (unsigned k = 0; k < bearings; ++k)
@@ -1668,21 +1704,65 @@ WadeOutPick PickWadeOut(float fromX, float fromY, float fromZ, float maxYards,
             if (!surface(x, y, fromZ + 10.f, z, lethal) || lethal)
                 continue;
             float const rise = z > fromZ ? z - fromZ : fromZ - z;
-            if (!pick.found || rise < bestRise)
-            {
-                pick.found = true;
-                pick.x = x;
-                pick.y = y;
-                pick.z = z;
-                pick.yards = r;
-                bestRise = rise;
-            }
+            if (pick.found && rise >= bestRise)
+                continue;
+            if (!WadeGroundHolds(x, y, z, clearYards, surface))
+                continue;
+            pick.found = true;
+            pick.x = x;
+            pick.y = y;
+            pick.z = z;
+            pick.yards = r;
+            pick.clearYards = clearYards;
+            bestRise = rise;
         }
         if (pick.found)
             return pick;
     }
     return pick;
 }
+
+template <class SurfaceFn>
+WadeOutPick PickWadeOut(float fromX, float fromY, float fromZ, float maxYards,
+                        float strideYards, unsigned bearings, SurfaceFn&& surface)
+{
+    return PickWadeOutFrom(fromX, fromY, fromZ, strideYards, maxYards, strideYards, bearings,
+                           0.f, surface);
+}
+
+// A WADE-OUT THAT ENDED BACK IN THE LAVA SEARCHES WIDER (#1638).
+//
+// The nearest dry sample can be a rock inside the lava field. A character sent
+// to one stood in lava again seconds later and was sent to the next rock, for
+// 80 seconds, because nothing remembered the wade before. `repeats` is how many
+// wades in a row began within the window of the one before (WadeRepeats). Each
+// repeat starts the search one stride further out and asks for one more stride
+// of dry ground round the point, so a rock smaller than that is passed over
+// for the shore. When no point that strict is in reach the search steps back
+// down one repeat at a time, ending at the plain pick: a small dry point still
+// beats standing in lava.
+template <class SurfaceFn>
+WadeOutPick PickWadeOutRepeat(float fromX, float fromY, float fromZ, float maxYards,
+                              float strideYards, unsigned bearings, unsigned repeats,
+                              SurfaceFn&& surface)
+{
+    for (unsigned n = repeats;; --n)
+    {
+        float const step = strideYards * static_cast<float>(n);
+        WadeOutPick const pick =
+            PickWadeOutFrom(fromX, fromY, fromZ, strideYards + step, maxYards, strideYards,
+                            bearings, step, surface);
+        if (pick.found || n == 0)
+            return pick;
+    }
+}
+
+// HOW MANY WADES IN A ROW THIS ONE FOLLOWS (#1638). A wade that begins within
+// `windowSeconds` of the last time the character was sent out of lava is one
+// more repeat than that one was, up to `cap`. No earlier wade, one outside the
+// window, or a clock that ran backwards, answers zero.
+unsigned WadeRepeats(bool hadEarlier, long long secondsSinceEarlier, long long windowSeconds,
+                     unsigned earlierRepeats, unsigned cap);
 
 // IS THIS STRIDE REFUSED FOR LANDING IN LETHAL LIQUID, GIVEN WHERE THE
 // CHARACTER ALREADY STANDS (#1569)? A character whose own feet are in lethal

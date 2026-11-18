@@ -17,6 +17,13 @@
  * the revival hold is not taken there, and a living character in lethal
  * liquid walks to the nearest dry ground it can measure.
  *
+ * THE REPEAT (#1638). The nearest dry sample can be a rock inside the lava
+ * field. A character was sent to one, stood in lava again seconds later, and
+ * was sent to the next, five times in 80 seconds, 4 and 8 yards at a time. A
+ * wade that follows another within a minute searches further out and asks for
+ * dry ground round the point, and every point is read once more from its own
+ * height before it is chosen.
+ *
  * Compiled against src/overseer_decisions.cpp and nothing else. The second
  * half reads src/mod_overseer.cpp as text, because the adapter cannot be
  * compiled without a core: it pins that each place a character can be held
@@ -34,8 +41,10 @@
 
 using OverseerDecisions::HeldStillFacts;
 using OverseerDecisions::PickWadeOut;
+using OverseerDecisions::PickWadeOutRepeat;
 using OverseerDecisions::RetakeTheHold;
 using OverseerDecisions::WadeOutPick;
+using OverseerDecisions::WadeRepeats;
 
 namespace
 {
@@ -88,6 +97,75 @@ struct Lake
         }
         out = shoreZ;
         return true;
+    }
+};
+
+// A lava field with dry rocks standing in it: lava inside the disc except on
+// a rock, dry ground outside the disc.
+struct Rock
+{
+    float x, y, radius;
+};
+struct RockyField
+{
+    float radius;
+    Rock rocks[3];
+    float lavaZ = 128.f;
+    float rockZ = 128.5f;
+    float shoreZ = 129.f;
+
+    bool OnRock(float x, float y, float slack = 0.f) const
+    {
+        for (Rock const& rock : rocks)
+            if (std::hypot(x - rock.x, y - rock.y) <= rock.radius + slack)
+                return true;
+        return false;
+    }
+
+    bool operator()(float x, float y, float /*from*/, float& out, bool& lethal) const
+    {
+        lethal = false;
+        if (std::hypot(x, y) > radius)
+        {
+            out = shoreZ;
+            return true;
+        }
+        if (OnRock(x, y))
+        {
+            out = rockZ;
+            return true;
+        }
+        out = lavaZ;
+        lethal = true;
+        return true;
+    }
+};
+
+// A lake with a shelf over its east side: read from the feet the shelf is the
+// first surface found and it is dry, read from above the shelf a second lava
+// flow lies over it. Everything else is the lake.
+struct ShelfLake
+{
+    Lake lake;
+    float shelfZ = 136.f;
+    mutable int readsFromAboveTheShelf = 0;
+
+    bool operator()(float x, float y, float from, float& out, bool& lethal) const
+    {
+        if (std::hypot(x - 4.f, y) <= 1.f)
+        {
+            if (from > shelfZ + 5.f)
+            {
+                ++readsFromAboveTheShelf;
+                out = shelfZ + 8.f;
+                lethal = true;
+                return true;
+            }
+            lethal = false;
+            out = shelfZ;
+            return true;
+        }
+        return lake(x, y, from, out, lethal);
     }
 };
 
@@ -159,6 +237,76 @@ int main()
     Check("a zero stride finds nothing",
           PickWadeOut(0.f, 0.f, 128.f, 60.f, 0.f, 16, lake).found, false);
 
+    // THE RE-CHECK (#1638). A point is read once more from above its own
+    // height, the way the feet check reads a character standing on it. A point
+    // that is lava on that read is passed over for the next dry one.
+    ShelfLake const shelf{Lake{0.f, 0.f, 40.f}};
+    WadeOutPick const pastShelf = PickWadeOut(0.f, 0.f, 128.f, 60.f, 4.f, 16, shelf);
+    Check("the shelf was read again from above its own height",
+          shelf.readsFromAboveTheShelf > 0, true);
+    Check("a lake with a shelf that is lava on re-check still finds dry ground",
+          pastShelf.found, true);
+    Check("and the pick is the shore, not the shelf",
+          std::hypot(pastShelf.x, pastShelf.y) > 40.f, true);
+
+    // THE REPEAT WINDOW (#1638).
+    Check("a first wade is no repeat", WadeRepeats(false, 0, 60, 0, 3) == 0, true);
+    Check("a wade 12 s after the last is one repeat", WadeRepeats(true, 12, 60, 0, 3) == 1, true);
+    Check("a wade on the window's last second still counts",
+          WadeRepeats(true, 60, 60, 0, 3) == 1, true);
+    Check("each repeat inside the window adds one", WadeRepeats(true, 12, 60, 1, 3) == 2, true);
+    Check("the count stops at the cap", WadeRepeats(true, 12, 60, 3, 3) == 3, true);
+    Check("a wade after the window starts over", WadeRepeats(true, 61, 60, 2, 3) == 0, true);
+    Check("a clock that ran backwards starts over", WadeRepeats(true, -5, 60, 2, 3) == 0, true);
+
+    // TWO WADES FROM ONE FIELD (#1638). The field is 40 yards across with
+    // rocks in it, one of them a stride from the character and two more on the
+    // rings the second search starts from. The first wade may take the near
+    // rock: it is the nearest dry ground measured. The character stands in
+    // lava again 12 seconds later, a yard or two away, and the second wade
+    // must not be sent to a rock: its aim is outside the field.
+    RockyField const field{40.f, {{4.f, 0.f, 1.5f}, {11.f, 1.f, 1.5f}, {3.f, 13.f, 1.5f}}};
+    unsigned const firstRepeats = WadeRepeats(false, 0, 60, 0, 3);
+    WadeOutPick const first =
+        PickWadeOutRepeat(0.f, 0.f, 128.f, 60.f, 4.f, 16, firstRepeats, field);
+    Check("the first wade finds dry ground", first.found, true);
+    CheckNear("the first wade is the plain nearest pick", first.yards, 4.f, 0.01f);
+    unsigned const secondRepeats = WadeRepeats(true, 12, 60, firstRepeats, 3);
+    WadeOutPick const second =
+        PickWadeOutRepeat(3.f, 1.f, 128.f, 60.f, 4.f, 16, secondRepeats, field);
+    Check("the second wade finds dry ground", second.found, true);
+    Check("the second wade's aim is outside the lava field",
+          std::hypot(second.x, second.y) > 40.f, true);
+    Check("the second wade's aim is not a rock in the field",
+          field.OnRock(second.x, second.y, 2.f), false);
+    Check("the second wade starts its search further out", second.yards >= 8.f, true);
+    CheckNear("and its aim has a stride of dry ground measured round it", second.clearYards, 4.f,
+              0.01f);
+    // The stateless pick is what repeated: from the second standing point it
+    // answers a rock in the field again, which is the finding.
+    WadeOutPick const stateless = PickWadeOut(3.f, 1.f, 128.f, 60.f, 4.f, 16, field);
+    Check("without the repeat the same point is sent to dry ground inside the field",
+          stateless.found && std::hypot(stateless.x, stateless.y) < 40.f, true);
+
+    // A third wade in the window asks for more room still, and still lands
+    // outside the field.
+    WadeOutPick const third = PickWadeOutRepeat(
+        3.f, 1.f, 128.f, 60.f, 4.f, 16, WadeRepeats(true, 9, 60, secondRepeats, 3), field);
+    Check("a third wade finds dry ground outside the field",
+          third.found && std::hypot(third.x, third.y) > 40.f, true);
+    CheckNear("with two strides of dry ground round it", third.clearYards, 8.f, 0.01f);
+
+    // No shore in reach: a repeat steps back down to the nearest dry point
+    // rather than leaving the character standing in lava.
+    RockyField const sea{500.f, {{4.f, 0.f, 1.5f}, {4.f, 0.f, 1.5f}, {4.f, 0.f, 1.5f}}};
+    WadeOutPick const onlyRock = PickWadeOutRepeat(0.f, 0.f, 128.f, 60.f, 4.f, 16, 2, sea);
+    Check("a repeat with no shore in reach still takes the one rock", onlyRock.found, true);
+    CheckNear("and says no dry ground was measured round it", onlyRock.clearYards, 0.f, 0.01f);
+    Check("a repeat with nothing dry in reach finds nothing",
+          PickWadeOutRepeat(0.f, 0.f, 128.f, 60.f, 4.f, 16, 3, wide).found, false);
+    Check("a repeat with a zero stride finds nothing",
+          PickWadeOutRepeat(0.f, 0.f, 128.f, 60.f, 0.f, 16, 3, lake).found, false);
+
     // THE ADAPTER ASKS THE RULE, from each place that can hold a character.
     std::ifstream source("src/mod_overseer.cpp");
     if (!source)
@@ -202,7 +350,20 @@ int main()
     Check("the drive walks without a generated path, which would cross lava again",
           Has(driveBody, "/*generatePath*/ false"), true);
     Check("the drive picks through the shared decision",
-          Has(driveBody, "OverseerDecisions::PickWadeOut("), true);
+          Has(driveBody, "OverseerDecisions::PickWadeOutRepeat("), true);
+    // THE REPEAT MEMORY (#1638) outlives the wade: it is written when the
+    // character is sent, read through the shared decision, and dropped only
+    // once the window has passed, not the moment the feet read dry.
+    Check("the drive counts repeats through the shared decision",
+          Has(driveBody, "OverseerDecisions::WadeRepeats("), true);
+    Check("the drive remembers each wade it issues",
+          Has(driveBody, "_wadeLast[name] = {now, repeats};"), true);
+    Check("the drive keeps that memory for the repeat window after the feet read dry",
+          Has(driveBody, "now - last->second.first > WADE_REPEAT_WINDOW_SECONDS)\n"
+                         "                    _wadeLast.erase(last);"),
+          true);
+    Check("and drops it nowhere else", driveBody.find("_wadeLast.erase(") ==
+                                           driveBody.rfind("_wadeLast.erase("), true);
 
     if (failures)
     {
