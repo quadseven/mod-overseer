@@ -17155,6 +17155,15 @@ enum class CounterArrival : std::uint8_t
 // than releasing rather than better.
 CounterArrival CounterArrivalStep(CounterRole role, bool inReach, bool oneIsNearby);
 
+// A COUNTER HOLD DOES NOT OUTLIVE THE ERRAND IT WAS TAKEN FOR. The hold is
+// placed as the vendor errand is released, so an aim read on a character that
+// still carries it is the NEXT leg of the town trip (the bank after the
+// vendor), never the one the hold served. Left in force it took over the
+// banker walk, the walk ended, the bridge restarted it, and the family stood in
+// the street for the hold's ceiling on every pass. Vendor first, then bank: the
+// hold is lifted when the next aim arrives.
+bool CounterHoldYieldsToAim(bool holdIsCounterHold, bool hasLiveAim);
+
 // AN ARRIVAL IN TOWN THAT IS NOT A COUNTER KEEPS THE LEADER WHERE IT LANDED
 // (quadseven/wow-overseer#378). Measured on the dev realm 2026-09-27: the town
 // errand aimed Zug at the Orgrimmar mailbox, he reached it at 21:44:35 and was

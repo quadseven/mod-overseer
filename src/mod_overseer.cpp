@@ -30700,6 +30700,12 @@ private:
             // OverseerDecisions::ReadAimedMover for the measurement that ruled
             // the outside supervisor out, and for why a held character is
             // neither granted nor refused.
+            // THE VENDOR'S HOLD YIELDS TO THE BANK WALK OF THE SAME TRIP: a
+            // counter hold is placed as its errand is released, so an aim read
+            // under one is the next leg, and the hold would take it over.
+            if (OverseerDecisions::CounterHoldYieldsToAim(HasCounterHold(name), true))
+                ReleaseCounterHold(name, "the next leg of the town trip has an aim of its own");
+
             OverseerDecisions::AimedMover const mover =
                 ReadAimedMoverFor(name, bot, botAI, steersItself);
 

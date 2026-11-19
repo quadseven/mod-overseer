@@ -14927,6 +14927,11 @@ bool TakesNewRpgOffOnArrival(CounterArrival arrival, std::string const& job)
     return arrival == CounterArrival::Done && !LeaderCarriesNewRpg(job, false);
 }
 
+bool CounterHoldYieldsToAim(bool holdIsCounterHold, bool hasLiveAim)
+{
+    return holdIsCounterHold && hasLiveAim;
+}
+
 CounterArrival CounterArrivalStep(CounterRole role, bool inReach, bool oneIsNearby)
 {
     // NOT A COUNTER, NOT THIS DECISION. Answered first and answered `Done`,
