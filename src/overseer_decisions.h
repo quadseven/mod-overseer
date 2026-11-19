@@ -17218,6 +17218,26 @@ std::string FlightMasterNodeAim(uint32_t nodeId);
 bool FlightMasterAnswersForNode(float fmX, float fmY, float nodeX, float nodeY,
                                 float matchYards);
 
+// One flight master spawn a character could walk to, as `PickFlightMasterForNode`
+// sees it. `usable` is the caller's own gates (event live, faction friendly).
+struct FlightMasterCandidate
+{
+    uint32_t entry{0};
+    float x{0.f};
+    float y{0.f};
+    bool usable{false};
+};
+
+// WHICH FLIGHT MASTER SELLS THE TICKET AT THIS NODE. Only a usable candidate
+// that answers for the node (FlightMasterAnswersForNode) is ever chosen, and of
+// those the one nearest the node's own position wins. Returns the index into
+// `candidates`, or -1 when nothing answers. Choosing "the nearest flight master
+// to the character" and checking the node afterwards picked a creature that
+// serves some other node, and the flight was refused although a master that
+// does serve this node stood in reach.
+int PickFlightMasterForNode(std::vector<FlightMasterCandidate> const& candidates,
+                            float nodeX, float nodeY, float matchYards);
+
 // CAN THE FLIGHT MASTER THIS CHARACTER WOULD WALK TO SELL IT THE TICKET (#970).
 // `ConsiderFlight` asks this once it knows the departure node and before it
 // looks for a landing. Either refusal is an unreachable flight master, and

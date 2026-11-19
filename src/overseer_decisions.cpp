@@ -15012,6 +15012,28 @@ bool FlightMasterAnswersForNode(float fmX, float fmY, float nodeX, float nodeY,
     return dx * dx + dy * dy <= matchYards * matchYards;
 }
 
+int PickFlightMasterForNode(std::vector<FlightMasterCandidate> const& candidates,
+                            float nodeX, float nodeY, float matchYards)
+{
+    int best = -1;
+    float bestSq = 0.f;
+    for (size_t i = 0; i < candidates.size(); ++i)
+    {
+        FlightMasterCandidate const& c = candidates[i];
+        if (!c.usable || !FlightMasterAnswersForNode(c.x, c.y, nodeX, nodeY, matchYards))
+            continue;
+        float const dx = c.x - nodeX;
+        float const dy = c.y - nodeY;
+        float const sq = dx * dx + dy * dy;
+        if (best < 0 || sq < bestSq)
+        {
+            best = static_cast<int>(i);
+            bestSq = sq;
+        }
+    }
+    return best;
+}
+
 FlightMasterBoarding ReadFlightMasterBoarding(bool resolved, float fmX, float fmY,
                                               float nodeX, float nodeY, float matchYards)
 {
