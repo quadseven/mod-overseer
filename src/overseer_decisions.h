@@ -6683,6 +6683,12 @@ struct GearItem
     // by the input it could not read.
     std::vector<std::string> unreadReasons;
 
+    // The spells on this item that are known trinket effects, by spell id
+    // (GearResolvedProperty::knownEffects, from GearReadItemSpells). Kept by
+    // name instead of folded into `stats` because what one is worth depends on
+    // who wears it: GearScore prices each with GearKnownEffectWorth.
+    std::vector<int> knownEffects;
+
     // Some part of a random suffix or property could not be turned into a
     // stat, so some of this item's worth is missing from `stats` and the
     // score is a floor rather than a figure. GearReadRandomProperty below is
@@ -6754,6 +6760,11 @@ struct GearResolvedProperty
     // Why any portion of this property was not priced. Kept beside the stats
     // so the caller can name the same missing input in a decision log.
     std::vector<std::string> unreadReasons;
+
+    // Item spells that are known trinket effects, by spell id. Only
+    // GearReadItemSpells fills this, and the caller copies it to
+    // GearItem::knownEffects. A random property never has one.
+    std::vector<int> knownEffects;
 
     // Was ANY part of the property left unpriced? Goes straight into
     // GearItem::unresolvedRandomProperty, so the verdict is a Floor rather than
@@ -6836,6 +6847,10 @@ struct GearSpellEffect
 // One spell on one item.
 struct GearItemSpell
 {
+    // The spell's own id, as the item template names it. Read for one thing
+    // only: finding the spell in the known trinket effects below. Zero for a
+    // caller that did not say, and zero is never known.
+    int id{0};
     // ItemSpelltriggerType. Only ITEM_SPELLTRIGGER_ON_EQUIP, 1, is a standing
     // bonus; "Use:" and "Chance on hit:" are not.
     int trigger{0};
@@ -6866,7 +6881,75 @@ constexpr int AURA_MOD_RATING = 189;
 // THE STATS COME BACK EVEN WHEN SOMETHING IS UNRESOLVED, for the reason
 // GearReadRandomProperty gives: the readable half priced in is a higher floor.
 // AN EMPTY LIST IS NOT UNRESOLVED: an item with no spell has nothing unread.
+//
+// A KNOWN TRINKET EFFECT IS NOT UNRESOLVED EITHER: see GearKnownEffect below.
+// It comes back in `knownEffects` and not in `stats`, and it is read whatever
+// its trigger says, because its price is not the spell's own numbers.
 GearResolvedProperty GearReadItemSpells(std::vector<GearItemSpell> const& spells);
+
+// -------------------- what a trinket's effect is worth (wow-overseer#2358) --
+//
+// A TRINKET'S WORTH IS MOSTLY AN EFFECT A STAT SUM CANNOT PRICE. A proc and a
+// "Use:" are not standing bonuses, so GearReadItemSpells leaves them unread and
+// the piece scores its item level and whatever flat stat it happens to carry.
+// That is a floor, and a floor that does not clear what is worn settles
+// nothing: a live read found a level 60 warrior with one flat trinket in both
+// trinket slots while the trinkets whose whole value is an effect could never
+// win a slot on their merits.
+//
+// THE PRICE IS THE STANDING STAT THE EFFECT AVERAGES OUT TO, and the role's own
+// weight for that stat then says what it is worth, so no second table of
+// weights exists to drift from the first:
+//
+//   a "Use:"   the amount, times the seconds it lasts over the seconds of its
+//              cooldown. 280 attack power for 20 sec every 120 is 46.
+//   a proc     what it adds over a fight, in the stat that would add the same.
+//              One extra attack on 2% of melee hits is about 2% more white
+//              damage, about 2 damage per second on a level 60 swing, and 14
+//              attack power is one damage per second: 28.
+//
+// AND IT IS WORTH THAT ONLY TO THE ROLES IT FITS. The weights cannot say this
+// on their own: a hunter prices attack power exactly as a rogue does and will
+// never land the melee hit the proc needs. So each row names its roles, and
+// to every other role the effect is worth nothing.
+//
+// WHY A HAND TABLE, AND WHY IT IS SHORT. Deriving this from the spell is not
+// possible with what the scorers hold: a proc's worth is in the spell it
+// triggers and in its proc flags and chance, a use's is in a duration and a
+// cooldown, and the bridge's mirror of this scorer in the wow-overseer
+// repository reads spell TEXT and has none of those. A spell id is the one
+// fact both sides hold exactly, so the table is keyed by it and the two stay in
+// step by carrying the same rows. Keyed by the SPELL and not the item: every
+// item that names the spell has the effect. A row is added when a trinket the
+// family can actually win is being left in the bags for want of one; a spell
+// with no row keeps the floor it always had, which is never wrong, only low.
+//
+// A ROW MAKES THE SPELL READ, not a higher floor. The number is the opinion
+// about the whole of the effect, so nothing of it is left to credit a second
+// time when the piece is the one being worn.
+struct GearKnownEffect
+{
+    // The spell the item names (GearItemSpell::id).
+    int spell{0};
+    // The roles it fits, one GearRoleBit each.
+    unsigned roles{0};
+    // The standing stat it averages out to, as an ItemModType, and how much.
+    int stat{0};
+    int amount{0};
+};
+
+constexpr unsigned GearRoleBit(GearRole role)
+{
+    return 1u << static_cast<unsigned>(role);
+}
+
+// The row for a spell, or nullptr when the spell is not a known effect.
+GearKnownEffect const* GearKnownEffectFor(int spellId);
+
+// What the effect is worth to this role, in the armour points GearScore adds
+// up: the role's weight for the row's stat times its amount. Zero for a spell
+// with no row, for a role the row does not name, and for no role at all.
+float GearKnownEffectWorth(int spellId, GearRole role);
 
 // HOW MUCH OF THE ITEM THE NUMBER COVERS (#221).
 //

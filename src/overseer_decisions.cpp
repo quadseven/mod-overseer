@@ -5756,6 +5756,44 @@ bool GearReadOneEquipSpell(std::vector<GearSpellEffect> const& effects,
 
 }  // namespace
 
+namespace
+{
+
+// THE KNOWN TRINKET EFFECTS (wow-overseer#2358). The header says what a row
+// is and why this is a hand table; the bridge's mirror carries the same rows.
+//
+//   15600  "Chance on melee hit to gain 1 extra attack." 2% of swings struck
+//          twice is about 28 attack power on a level 60 swing. It fires on a
+//          melee hit only, so it fits the two roles that swing.
+//   25891  "Use: Increases your melee and ranged attack power by 280. Effect
+//          lasts for 20 sec.", on a 2 min cooldown: 280 * 20 / 120 = 46. Both
+//          kinds of attack power, so the hunter has it too.
+constexpr unsigned ROLES_THAT_SWING = GearRoleBit(GearRole::Tank) | GearRoleBit(GearRole::Melee);
+constexpr GearKnownEffect GEAR_KNOWN_EFFECTS[] = {
+    {15600, ROLES_THAT_SWING, MOD_ATTACK_POWER, 28},
+    {25891, ROLES_THAT_SWING | GearRoleBit(GearRole::Ranged), MOD_ATTACK_POWER, 46},
+};
+
+}  // namespace
+
+GearKnownEffect const* GearKnownEffectFor(int spellId)
+{
+    for (GearKnownEffect const& known : GEAR_KNOWN_EFFECTS)
+        if (known.spell == spellId)
+            return &known;
+    return nullptr;
+}
+
+float GearKnownEffectWorth(int spellId, GearRole role)
+{
+    GearKnownEffect const* const known = GearKnownEffectFor(spellId);
+    // No role is no opinion: StatWeight would say 1.0 for it, and a credit
+    // handed to nobody in particular is the guess the table exists to avoid.
+    if (!known || role == GearRole::Unknown || !(known->roles & GearRoleBit(role)))
+        return 0.f;
+    return StatWeight(role, known->stat) * static_cast<float>(known->amount);
+}
+
 GearResolvedProperty GearReadItemSpells(std::vector<GearItemSpell> const& spells)
 {
     GearResolvedProperty resolved;
@@ -5768,6 +5806,15 @@ GearResolvedProperty GearReadItemSpells(std::vector<GearItemSpell> const& spells
         {
             resolved.unresolved = true;
             AddGearUnreadReason(resolved, "item spell was not found");
+            continue;
+        }
+        // A KNOWN TRINKET EFFECT IS READ, whatever its trigger, and by its row
+        // rather than its own numbers: a burst is not a standing bonus and a
+        // proc's aura says nothing a stat line could. It is carried by id so
+        // GearScore can price it for the wearer's role.
+        if (GearKnownEffectFor(spell.id))
+        {
+            resolved.knownEffects.push_back(spell.id);
             continue;
         }
         if (spell.trigger != ITEM_SPELL_ON_EQUIP)
@@ -5955,6 +6002,10 @@ GearVerdict GearScore(GearItem const& item, GearWearer const& who)
         score += StatWeight(who.role, stat.type) * static_cast<float>(stat.value);
     }
     score += DpsWeight(who.role) * item.dps;
+    // A known trinket effect, at what it is worth to THIS role - nothing at
+    // all to a role it does not fit (wow-overseer#2358).
+    for (int const spellId : item.knownEffects)
+        score += GearKnownEffectWorth(spellId, who.role);
     score += ITEM_LEVEL_TIEBREAK * static_cast<float>(item.itemLevel);
 
     // A score can go negative on a piece whose only stats are ones this role

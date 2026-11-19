@@ -21434,6 +21434,7 @@ private:
             if (proto->Spells[i].SpellId <= 0)
                 continue;
             OverseerDecisions::GearItemSpell spell;
+            spell.id = static_cast<int>(proto->Spells[i].SpellId);
             spell.trigger = static_cast<int>(proto->Spells[i].SpellTrigger);
             SpellInfo const* info =
                 sSpellMgr->GetSpellInfo(static_cast<uint32>(proto->Spells[i].SpellId));
@@ -21503,6 +21504,7 @@ private:
             item.stats.push_back(stat);
         item.unreadReasons.insert(item.unreadReasons.end(), equip.unreadReasons.begin(),
                                   equip.unreadReasons.end());
+        item.knownEffects = equip.knownEffects;
         item.hasEffect = equip.unresolved;
 
         // A ROLLED STAT IS A STAT, and nothing about one is different for
