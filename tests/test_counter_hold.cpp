@@ -274,10 +274,26 @@ void TheRunGateAndTheArrivalBranchAgree()
     }
 }
 
+void ACounterHoldYieldsToTheNextAim()
+{
+    if (!OverseerDecisions::CounterHoldYieldsToAim(true, true))
+    {
+        std::printf("FAIL: the vendor's hold kept the banker walk\n");
+        ++failures;
+    }
+    if (OverseerDecisions::CounterHoldYieldsToAim(true, false) ||
+        OverseerDecisions::CounterHoldYieldsToAim(false, true))
+    {
+        std::printf("FAIL: a hold was lifted with no aim, or another hold was lifted\n");
+        ++failures;
+    }
+}
+
 }  // namespace
 
 int main()
 {
+    ACounterHoldYieldsToTheNextAim();
     ACharacterAtTheCounterIsHeldThere();
     ACounterNearbyAndOutOfReachIsNotAnErrandThatIsOver();
     ACounterAimWithNothingThereIsReleased();
