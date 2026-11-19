@@ -210,6 +210,7 @@
 #include "CellImpl.h"
 #include "CharacterCache.h"
 #include "ChannelMgr.h"
+#include "ConditionMgr.h"
 #include "Chat.h"
 // The guild recruit policy (infra#3744). This is the only configuration this
 // module reads, and it reads it here rather than baking the numbers in because
@@ -86028,6 +86029,10 @@ private:
         bool classSpells{false};
         uint32 offered{0};
         uint32 tooDear{0};
+        // A STRANDED DEATH KNIGHT'S GRYPHON CLICK: the class walk's destination is
+        // a spawn of the death knight gryphon, and arriving clicks it instead of
+        // buying (see OverseerDecisions::ChooseSpellClickSpawn).
+        bool spellClick{false};
 
         // A vendor walk's request: an item, or any vendor that buys.
         uint32 item{0};
@@ -86314,12 +86319,59 @@ private:
     // the spawn may be in a grid nobody has loaded), and it must have what the
     // row came for: a trainer with something on offer, or a vendor whose list
     // carries the item.
+    // Would a click on this creature entry be this character's to make? The
+    // death knight gryphon, a spellclick creature, with a row in
+    // npc_spellclick_spells whose conditions the walker passes: the core's own
+    // condition list, the one Unit::HandleSpellClick asks again at the click.
+    static bool SpellClickServes(Player* who, uint32 entry)
+    {
+        namespace D = OverseerDecisions;
+        if (entry != D::DEATH_KNIGHT_GRYPHON_ENTRY)
+            return false;
+        CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(entry);
+        if (!tmpl || !(tmpl->npcflag & UNIT_NPC_FLAG_SPELLCLICK))
+            return false;
+        SpellClickInfoMapBounds const bounds = sObjectMgr->GetSpellClickInfoMapBounds(entry);
+        for (auto itr = bounds.first; itr != bounds.second; ++itr)
+        {
+            ConditionList const conditions =
+                sConditionMgr->GetConditionsForSpellClickEvent(entry, itr->second.spellId);
+            if (sConditionMgr->IsObjectMeetToConditions(who, conditions))
+                return true;
+        }
+        return false;
+    }
+
+    // Does a walk on foot end at this point? The navmesh must find a path that
+    // arrives, not one that stops short or comes to nothing: a knight on the
+    // ground under a spawn 37 yards up gets no path to it.
+    static bool SpellClickPathReaches(Player* who, float x, float y, float z)
+    {
+        PathGenerator path(who);
+        if (!path.CalculatePath(x, y, z))
+            return false;
+        if (path.GetPathType() & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE))
+            return false;
+        auto const& points = path.GetPath();
+        if (points.size() < 2)
+            return false;
+        G3D::Vector3 const& end = points.back();
+        float const dx = end.x - x;
+        float const dy = end.y - y;
+        float const dz = end.z - z;
+        return dx * dx + dy * dy + dz * dz <= 6.f * 6.f;
+    }
+
     static bool CreatureServesWalk(Player* who, MailWalkEvidence const& ev, uint32 entry)
     {
         namespace D = OverseerDecisions;
         CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(entry);
         if (!tmpl || !D::MayInteractAt(ReactionTowardCharacter(who, tmpl->faction)))
             return false;
+        // A STRANDED DEATH KNIGHT'S WALK is to a gryphon it may click, and to
+        // nothing else.
+        if (ev.spellClick)
+            return SpellClickServes(who, entry);
         if (ev.goal == D::WalkGoal::Vendor)
         {
             if (!(tmpl->npcflag & UNIT_NPC_FLAG_VENDOR))
@@ -86398,10 +86450,43 @@ private:
         Creature* npc = who->FindNearestCreature(ev.mailboxEntry, INTERACTION_DISTANCE * 2.f);
         if (!npc)
             return nullptr;
+        if (ev.spellClick)
+            return who->GetNPCIfCanInteractWith(npc->GetGUID(), UNIT_NPC_FLAG_SPELLCLICK);
         uint32 const flag = ev.goal == OverseerDecisions::WalkGoal::Trainer
             ? UNIT_NPC_FLAG_TRAINER
             : UNIT_NPC_FLAG_VENDOR;
         return who->GetNPCIfCanInteractWith(npc->GetGUID(), flag);
+    }
+
+    // THE CLICK. The pattern mod-playerbots' Razuvious action uses: the creature
+    // through GetNPCIfCanInteractWith with the spellclick flag (WalkCreatureInReach),
+    // then HandleSpellClick. Reads the seat back at once and logs one line naming
+    // the spawn, the distance and the outcome. The flight itself is the core's:
+    // a click whose seat lands a tick later reads "no effect" here and is seen by
+    // the next poll's own readings.
+    static char const* ClickGryphonAtArrival(Player* bot, MailWalkEvidence& ev, uint32 id,
+                                             char const*& reason)
+    {
+        namespace D = OverseerDecisions;
+        float const zBefore = bot->GetPositionZ();
+        Creature* npc = WalkCreatureInReach(bot, ev);
+        float const yards = npc ? bot->GetDistance(npc) : ev.reachedYards;
+        if (npc)
+            npc->HandleSpellClick(bot);
+        bool const seated = bot->GetVehicle() != nullptr || bot->IsInFlight();
+        D::SpellClickOutcome const outcome =
+            D::SpellClickOutcomeFor(npc != nullptr, seated, zBefore, bot->GetPositionZ());
+        ev.visit = D::SpellClickOutcomeWord(outcome);
+        LOG_INFO("module.overseer",
+                 "overseer: spellclick walk {} - '{}' clicked gryphon spawn {} (entry {}, "
+                 "spell {}), {:.1f} yards off, z {:.1f} -> {:.1f}: {} after {}ms and {} leg(s)",
+                 id, ev.character, ev.mailboxSpawn, ev.mailboxEntry,
+                 D::DEATH_KNIGHT_GRYPHON_SPELL, yards, zBefore, bot->GetPositionZ(), ev.visit,
+                 ev.waitedMs, ev.legs);
+        if (outcome == D::SpellClickOutcome::Aboard)
+            return "applied";
+        reason = "the gryphon click did not lift the walker";
+        return "unchanged";
     }
 
     // Has the walker arrived? The mailbox walk asks the core's mailbox gate;
@@ -87624,11 +87709,44 @@ private:
         // TO THE NEAREST TRAINER ON ANOTHER CLASSIC MAP. The crossing uses the
         // existing transport state machine; after landing, this same row runs
         // the normal local walk, including its road, ground, and arrival checks.
-        if (goal == D::WalkGoal::Trainer && ev.classSpells && spawns.empty() &&
-            !D::Classic::IsExpansionContinent(ev.mapId))
+        //
+        // A DEATH KNIGHT STRANDED ON THE GROUND UNDER ACHERUS (map 609) has class
+        // trainers on the map that no walk reaches, on the decks above. Its class
+        // step is walled when none of them is on its level or joined to it by a
+        // pad, and then it takes the crossing's road like a knight with no
+        // trainer at all. When that is walled too, the gryphon click below is
+        // the last way up; nothing else is changed for any other walker.
+        bool const strandedKnight = goal == D::WalkGoal::Trainer && ev.classSpells &&
+                                    ev.mapId == D::DEATH_KNIGHT_START_MAP_ID &&
+                                    who->getClass() == CLASS_DEATH_KNIGHT && who->IsAlive();
+        bool classStepWalled = spawns.empty();
+        if (strandedKnight && !classStepWalled)
         {
+            std::vector<D::TeleportPad> const pads = TeleportPadsFor(who);
+            classStepWalled = true;
+            for (Spawn const& trainer : spawns)
+            {
+                D::MailWalkPoint const to{trainer.x, trainer.y, trainer.z};
+                if (std::fabs(trainer.z - who->GetPositionZ()) <= D::TELEPORT_PAD_LEVEL_YARDS ||
+                    D::ChooseTeleportPad(pads, StandingPoint(who), to).index >= 0)
+                {
+                    classStepWalled = false;
+                    break;
+                }
+            }
+        }
+        bool crossingWalled = false;
+        if (goal == D::WalkGoal::Trainer && ev.classSpells && classStepWalled &&
+            (spawns.empty() || strandedKnight) && !D::Classic::IsExpansionContinent(ev.mapId))
+          do
+          {
             if (!CrossEnabled())
-                return refuse(D::ErrandWalkRefusal::NoReachableClassSpellTrainer);
+            {
+                if (!strandedKnight)
+                    return refuse(D::ErrandWalkRefusal::NoReachableClassSpellTrainer);
+                crossingWalled = true;
+                break;
+            }
 
             std::vector<D::ClassTrainerWalkOption> options;
             std::vector<Spawn> remoteSpawns;
@@ -87675,7 +87793,12 @@ private:
 
             int const pick = D::PickReachableClassTrainer(options);
             if (pick < 0)
-                return refuse(D::ErrandWalkRefusal::NoReachableClassSpellTrainer);
+            {
+                if (!strandedKnight)
+                    return refuse(D::ErrandWalkRefusal::NoReachableClassSpellTrainer);
+                crossingWalled = true;
+                break;
+            }
 
             Spawn const& chosen = remoteSpawns[static_cast<std::size_t>(pick)];
             D::ClassTrainerWalkOption const& option = options[static_cast<std::size_t>(pick)];
@@ -87692,7 +87815,12 @@ private:
             (void)DoCrossToMap(who, crossingCommand, crossingStatus, crossingResult, id,
                                &target);
             if (std::string(crossingStatus) != "verifying")
-                return refuse(D::ErrandWalkRefusal::NoReachableClassSpellTrainer);
+            {
+                if (!strandedKnight)
+                    return refuse(D::ErrandWalkRefusal::NoReachableClassSpellTrainer);
+                crossingWalled = true;
+                break;
+            }
 
             status = "verifying";
             out = MailWalkJson(ev, "crossing", "");
@@ -87701,6 +87829,60 @@ private:
                      "on map {} ({:.0f} priced yards), then resumes its local walk",
                      id, ev.character, chosen.spawnId, option.mapId, option.routeYards);
             return "";
+          } while (false);
+
+        // THE LAST WAY UP: a gryphon of the death knight's own, spawned by the
+        // world at about ground height. Nothing is added or granted; a knight
+        // that cannot walk to one is left where it stands, and the line says why.
+        if (strandedKnight && classStepWalled && crossingWalled)
+        {
+            ev.spellClick = true;
+            D::SpellClickFacts clickFacts;
+            clickFacts.mapId = ev.mapId;
+            clickFacts.deathKnight = true;
+            clickFacts.alive = true;
+            clickFacts.classStepWalled = classStepWalled;
+            clickFacts.crossingWalled = crossingWalled;
+            std::vector<D::SpellClickSpawn> gryphons;
+            std::vector<Spawn> gryphonSpawns;
+            std::unordered_map<uint32, bool> gryphonServes;
+            uint32 const gryphonPhase = who->GetPhaseMask();
+            for (auto const& itr : sObjectMgr->GetAllCreatureData())
+            {
+                CreatureData const& data = itr.second;
+                if (data.id != D::DEATH_KNIGHT_GRYPHON_ENTRY || data.mapid != ev.mapId ||
+                    !(data.phaseMask & gryphonPhase) ||
+                    !SpawnInWorldNow(GameEventOfSpawn(itr.first)))
+                    continue;
+                auto const known = gryphonServes.find(data.id);
+                if (known == gryphonServes.end())
+                    gryphonServes.emplace(data.id, CreatureServesWalk(who, ev, data.id));
+                D::SpellClickSpawn candidate;
+                candidate.spawnId = static_cast<uint32>(data.spawnId);
+                candidate.at = D::MailWalkPoint{data.posX, data.posY, data.posZ};
+                candidate.conditionsMet = gryphonServes[data.id];
+                candidate.reachable = candidate.conditionsMet &&
+                                      SpellClickPathReaches(who, data.posX, data.posY, data.posZ);
+                gryphons.push_back(candidate);
+                gryphonSpawns.push_back(Spawn{candidate.spawnId, data.id, data.posX, data.posY,
+                                              data.posZ});
+            }
+            D::SpellClickChoice const pick =
+                D::ChooseSpellClickSpawn(clickFacts, gryphons, StandingPoint(who));
+            if (pick.index < 0)
+            {
+                ev.spellClick = false;
+                LOG_INFO("module.overseer",
+                         "overseer: spellclick walk {} - '{}' at z {:.1f} stays: {} (nearest "
+                         "gryphon spawn {:.0f} yards off, {} spawn(s) of entry {}); its class "
+                         "step and crossing are walled and nothing is added for it",
+                         id, ev.character, who->GetPositionZ(), pick.why, pick.nearestYards,
+                         gryphons.size(), D::DEATH_KNIGHT_GRYPHON_ENTRY);
+                if (spawns.empty())
+                    return refuse(D::ErrandWalkRefusal::NoReachableClassSpellTrainer);
+            }
+            else
+                spawns.assign(1, gryphonSpawns[static_cast<std::size_t>(pick.index)]);
         }
 
         // THE STARTING LANDS ARE AN ISLAND OF THE CLASSIC WORLD ON AN OUTLAND
@@ -88442,7 +88624,18 @@ private:
             char const* reason = D::WalkEndReasonFor(ev.goal, state);
             char const* word = D::MailWalkStateWord(state);
 
-            if (state == D::MailWalkState::Arrived && ev.goal == D::WalkGoal::Trainer)
+            if (state == D::MailWalkState::Arrived && ev.goal == D::WalkGoal::Trainer &&
+                ev.spellClick)
+            {
+                // AT THE GRYPHON: click it the way a player does, read back, and
+                // let go. One log line, whatever came of it.
+                bot->StopMoving();
+                status = ClickGryphonAtArrival(bot, ev, check.id, reason);
+                word = ev.visit;
+                ReleaseHold(check.targetName, bot, "the gryphon click is over",
+                            MAIL_WALK_HOLD_VERB);
+            }
+            else if (state == D::MailWalkState::Arrived && ev.goal == D::WalkGoal::Trainer)
             {
                 // AT THE TRAINER: buy, read back, and let go. Nothing follows a
                 // trainer walk, so there is no linger to hold it for.

@@ -27733,6 +27733,70 @@ bool OnAPaddedLevel(std::vector<TeleportPad> const& pads, MailWalkPoint const& a
     return false;
 }
 
+SpellClickChoice ChooseSpellClickSpawn(SpellClickFacts const& facts,
+                                       std::vector<SpellClickSpawn> const& spawns,
+                                       MailWalkPoint const& from)
+{
+    SpellClickChoice choice;
+    if (facts.mapId != DEATH_KNIGHT_START_MAP_ID || !facts.deathKnight || !facts.alive ||
+        !facts.classStepWalled || !facts.crossingWalled)
+        return choice;
+    choice.applies = true;
+    if (spawns.empty())
+    {
+        choice.why = SpellClickWhy::NoSpawn;
+        return choice;
+    }
+    bool anyConditions = false;
+    for (std::size_t i = 0; i < spawns.size(); ++i)
+    {
+        SpellClickSpawn const& spawn = spawns[i];
+        float const yards = PadYards(from, spawn.at);
+        if (choice.nearestYards < 0.f || yards < choice.nearestYards)
+            choice.nearestYards = yards;
+        if (!spawn.conditionsMet)
+            continue;
+        anyConditions = true;
+        if (!spawn.reachable)
+            continue;
+        bool const nearer = choice.index < 0 || yards < choice.yards ||
+                            (yards == choice.yards &&
+                             spawn.spawnId < spawns[static_cast<std::size_t>(choice.index)].spawnId);
+        if (nearer)
+        {
+            choice.index = static_cast<int>(i);
+            choice.yards = yards;
+        }
+    }
+    if (choice.index < 0)
+        choice.why = anyConditions ? SpellClickWhy::Unreachable : SpellClickWhy::ConditionsFail;
+    return choice;
+}
+
+char const* SpellClickOutcomeWord(SpellClickOutcome outcome)
+{
+    switch (outcome)
+    {
+        case SpellClickOutcome::NotInReach:
+            return "not in reach";
+        case SpellClickOutcome::Aboard:
+            return "aboard";
+        case SpellClickOutcome::NoEffect:
+            return "no effect";
+    }
+    return "no effect";
+}
+
+SpellClickOutcome SpellClickOutcomeFor(bool inReach, bool onVehicleOrFlight, float zBefore,
+                                       float zAfter)
+{
+    if (!inReach)
+        return SpellClickOutcome::NotInReach;
+    if (onVehicleOrFlight || zAfter - zBefore >= SPELLCLICK_LIFT_YARDS)
+        return SpellClickOutcome::Aboard;
+    return SpellClickOutcome::NoEffect;
+}
+
 bool SettlesOnTheDeck(DeckSettleFacts const& facts)
 {
     return facts.mapId == DEATH_KNIGHT_START_MAP_ID && facts.deathKnight &&
