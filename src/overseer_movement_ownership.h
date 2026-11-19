@@ -380,7 +380,8 @@ public:
     // whether a family leader's intent book lets this owner act now; empty
     // means no leader rule applies.
     ClaimResult Claim(std::string const& name, std::string const& target,
-                      OverseerDecisions::TravelOwner owner, bool cachedDrive, time_t now)
+                      OverseerDecisions::TravelOwner owner, bool cachedDrive, time_t now,
+                      bool errandLetGo = false)
     {
         ClaimResult result;
         if (!OverseerDecisions::TravelAimFitsColumn(target))
@@ -394,7 +395,7 @@ public:
             result.answer = ClaimAnswer::AlreadyDriving;
             return result;
         }
-        OverseerDecisions::TravelClaimFacts facts = FactsFor(name, target, owner, result.column);
+        OverseerDecisions::TravelClaimFacts facts = FactsFor(name, target, owner, result.column, errandLetGo);
         result.learnSkill = facts.learnSkill;
         result.verdict = OverseerDecisions::ReadTravelClaim(facts);
         if (!Writes(result.verdict))
@@ -436,14 +437,15 @@ public:
     // leader's turn is not forecast: it is a question of whose turn, not whose
     // errand.
     bool FenceRefuses(std::string const& name, std::string const& target,
-                      OverseerDecisions::TravelOwner owner, bool cachedDrive)
+                      OverseerDecisions::TravelOwner owner, bool cachedDrive,
+                      bool errandLetGo = false)
     {
         if (!OverseerDecisions::TravelAimFitsColumn(target))
             return true;
         std::string const column = _column.Read(name);
         if (cachedDrive && column == target)
             return false;
-        return !Writes(OverseerDecisions::ReadTravelClaim(FactsFor(name, target, owner, column)));
+        return !Writes(OverseerDecisions::ReadTravelClaim(FactsFor(name, target, owner, column, errandLetGo)));
     }
 
     // GIVE THE WHEEL BACK. Every ordinary release, in any drive. The column is
@@ -599,9 +601,11 @@ private:
     OverseerDecisions::TravelClaimFacts FactsFor(std::string const& name,
                                                  std::string const& target,
                                                  OverseerDecisions::TravelOwner owner,
-                                                 std::string const& column)
+                                                 std::string const& column,
+                                                 bool errandLetGo)
     {
         OverseerDecisions::TravelClaimFacts facts(owner);
+        facts.errandLetGo = errandLetGo;
         facts.learnSkill = _column.PendingLearnSkill(name);
         facts.column = column;
         auto const held = _claims.find(name);

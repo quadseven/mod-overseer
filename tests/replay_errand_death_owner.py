@@ -15,6 +15,8 @@ end = source.index("                // THE SECOND REASON", start)
 methods = [
     "    bool Claim(std::string const& name,",
     "    bool RunOwns(std::string const& name,",
+    "    bool ErrandLetGo(std::string const& name,",
+    "    bool HoldsLanding(std::string const& name,",
     "    bool ClaimedBy(std::string const& name,",
     "    void Refuse(std::string const& name,",
     "    int64_t SecondsSinceRefused(std::string const& name,",

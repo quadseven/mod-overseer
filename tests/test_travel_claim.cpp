@@ -245,10 +245,46 @@ void TheSameAimAgainIsWritten()
                ReadTravelClaim(vendor), TravelClaim::RefusedForeign);
 }
 
+// A TRAINER ERRAND THE MODULE HAS LET GO OF PROTECTS NOTHING. The module stood
+// the errand down (a landing, or a called-off flight), the profession fence kept
+// the aim in the column, and the same fence then refused the catch-up walk: a
+// follower left far from its family was walked by neither.
+void ACatchUpPassesATrainerErrandThatWasLetGo()
+{
+    TravelClaimFacts letGo = Facts(171, "profession trainer", false, true);
+    letGo.errandLetGo = true;
+    CheckClaim("a catch-up over a let-go trainer errand is written",
+               ReadTravelClaim(letGo), TravelClaim::Write);
+
+    // Not let go: the errand may be walking, and the fence stands.
+    CheckClaim("a catch-up over a live trainer errand is still refused",
+               ReadTravelClaim(Facts(171, "profession trainer", false, true)),
+               TravelClaim::RefusedProfession);
+
+    // Only a catch-up passes it.
+    TravelClaimFacts home = Facts(171, "profession trainer", false, false);
+    home.errandLetGo = true;
+    CheckClaim("an ordinary aim over a let-go trainer errand is still refused",
+               ReadTravelClaim(home), TravelClaim::RefusedProfession);
+
+    // A let-go counter errand is still a foreign aim.
+    TravelClaimFacts vendor = Facts(171, "vendor", false, true);
+    vendor.errandLetGo = true;
+    CheckClaim("a catch-up over a let-go vendor errand is refused as foreign",
+               ReadTravelClaim(vendor), TravelClaim::RefusedForeign);
+
+    // A guard is the operator's, let go or not.
+    TravelClaimFacts guard = Facts(171, "guard:0:1.0,2.0,3.0", false, true);
+    guard.errandLetGo = true;
+    CheckClaim("a catch-up over a guard is refused",
+               ReadTravelClaim(guard), TravelClaim::RefusedForeign);
+}
+
 }  // namespace
 
 int main()
 {
+    ACatchUpPassesATrainerErrandThatWasLetGo();
     TheSameAimAgainIsWritten();
     ACatchUpClaimAcrossTheThreeCases();
     AnOrdinaryClaimKeepsTheProfessionFence();

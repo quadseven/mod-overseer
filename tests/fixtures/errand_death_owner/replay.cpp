@@ -13,6 +13,8 @@ using namespace OverseerDecisions;
 
 // OWNER_KIND
 
+constexpr ErrandDeathLimits ERRAND_DEATH_LIMITS{};
+
 struct Book;
 Book* activeBook = nullptr;
 OverseerMovement::MovementOwnership& MovementOwner();
@@ -37,12 +39,15 @@ struct Book
     std::map<std::string, LandedPointState> _landedPoints;
     uint64_t _endSerial{0};
     unsigned persisted{0};
-    OverseerMovement::InMemoryAimColumn column;
+    mutable OverseerMovement::InMemoryAimColumn column;
     OverseerMovement::MovementOwnership _wheel{column, 45};
     std::map<std::string, std::string> _claimRefusalSaid, _aimTooLongSaid;
     LeaderIntentKind LeaderIntentNow(std::string const&) const { return LeaderIntentKind::None; }
     void EndLeaderColumnIntent(std::string const&, std::string const&) {}
     void KeepRefusal(std::string const&) { ++persisted; }
+    // The adapter reads the column through RosterAimColumn; here it is the
+    // in-memory one.
+    std::string CurrentTravelNpc(std::string const& name) const { return column.Read(name); }
     Book() { activeBook = this; }
     // BOOK_METHODS
 };

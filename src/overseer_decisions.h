@@ -5496,6 +5496,13 @@ struct TravelClaimFacts
     std::string target;
     // Whose walk the aim is. See TravelOwner.
     TravelOwner owner;
+    // The errand standing in the column was let go of or called off by this
+    // module, and its cool-off has not ended, so nothing is walking it. A
+    // catch-up walk is then let past a pending profession errand: the fence
+    // protects a walk in progress, and this one is not (a follower left far
+    // from its family stayed there for as long as the cool-off and the fence
+    // kept each other in place).
+    bool errandLetGo{false};
 };
 
 TravelClaim ReadTravelClaim(TravelClaimFacts const& facts);
