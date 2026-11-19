@@ -8459,6 +8459,78 @@ bool PartyTollCounts(bool memberOnItsOwnErrand)
     return !memberOnItsOwnErrand;
 }
 
+bool ZoneBandAdmits(bool zoneHasBand, uint32_t zoneBandTop, uint32_t level)
+{
+    if (!zoneHasBand || zoneBandTop == 0 || level == 0)
+        return false;
+    // Top minus one, not level plus one: the top is at least 1 here, and a
+    // level at the type's maximum must not wrap to zero and refuse.
+    return zoneBandTop - 1 <= level;
+}
+
+int64_t RoamOffUntil(std::vector<int64_t> const& deaths, int64_t now, int64_t offUntil,
+                     RoamDeathLimits const& limits)
+{
+    if (now < offUntil)
+        return offUntil;
+    uint32_t inWindow = 0;
+    for (int64_t const at : deaths)
+        if (at <= now && now - at < limits.windowSeconds)
+            ++inWindow;
+    return inWindow > limits.deaths ? now + limits.offSeconds : 0;
+}
+
+RoamRefusal IndividualRoamRefusal(IndividualRoamFacts const& facts)
+{
+    if (!facts.enabled)
+        return RoamRefusal::SwitchOff;
+    if (facts.leadsItsParty)
+        return RoamRefusal::Leader;
+    if (facts.familyLinked)
+        return RoamRefusal::FamilyLinked;
+    if (!facts.ownAim.empty())
+        return RoamRefusal::HasErrand;
+    if (facts.now < facts.offUntil)
+        return RoamRefusal::DeathLimit;
+    if (!ZoneBandAdmits(facts.zoneHasBand, facts.zoneBandTop, facts.level))
+        return RoamRefusal::OutOfBand;
+    return RoamRefusal::None;
+}
+
+char const* RoamRefusalName(RoamRefusal refusal)
+{
+    switch (refusal)
+    {
+        case RoamRefusal::None:
+            return "none";
+        case RoamRefusal::SwitchOff:
+            return "switch off";
+        case RoamRefusal::Leader:
+            return "leads its party";
+        case RoamRefusal::FamilyLinked:
+            return "family linked";
+        case RoamRefusal::HasErrand:
+            return "has an errand";
+        case RoamRefusal::DeathLimit:
+            return "death limit";
+        case RoamRefusal::OutOfBand:
+            return "zone above its band";
+    }
+    return "unknown";
+}
+
+bool IndividualRoams(IndividualRoamFacts const& facts)
+{
+    return IndividualRoamRefusal(facts) == RoamRefusal::None;
+}
+
+RoamStep IndividualRoamStep(bool holdsGrant, bool roams)
+{
+    if (roams)
+        return holdsGrant ? RoamStep::Leave : RoamStep::Grant;
+    return holdsGrant ? RoamStep::TakeBack : RoamStep::Leave;
+}
+
 bool CutOffFollowerRoams(std::string const& job, std::string const& target)
 {
     if (!SplitFollowerDrivesItself(target))

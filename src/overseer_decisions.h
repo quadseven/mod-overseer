@@ -9497,6 +9497,94 @@ IndividualErrandChange IndividualErrandChanges(std::set<std::string> const& befo
 uint32_t ErrandPartyDeaths(bool onItsOwnErrand, uint32_t ownDeaths, uint32_t partyDeaths);
 bool PartyTollCounts(bool memberOnItsOwnErrand);
 
+// ------ an individual member roams alone only inside its level band (#1518) --
+//
+// A member in individual mode with no errand still follows its leader, so a
+// member on a gathering job gathers only where the leader goes. Gathering or
+// questing alone needs `new rpg` on a follower, which is the free roam that
+// once scattered a family and killed members in zones above their level. So
+// the roam is fenced by the ground the member stands on.
+//
+// THE BAND. For each zone and side, the 10th to 90th percentile of the levels
+// of the hostile creature spawns in it, projected by tools/zone-band into the
+// checked-in data/zone_band.json. A zone with no hostile spawn for a side has
+// no band there, and no band means no grant.
+//
+// THE BAND TEST. The zone's band top is at most the member's own level plus
+// one. A zone with no band, a zone the table does not hold, a band top of
+// zero and an unread level all refuse.
+bool ZoneBandAdmits(bool zoneHasBand, uint32_t zoneBandTop, uint32_t level);
+
+// THE DEATH LIMIT. A member that dies more than three times in five minutes
+// rejoins its leader and is not granted again for thirty minutes.
+struct RoamDeathLimits
+{
+    uint32_t deaths{3};
+    int64_t windowSeconds{5 * 60};
+    int64_t offSeconds{30 * 60};
+};
+
+// Until when the member is held off the roam, zero for not at all. `deaths`
+// are the times of the member's own deaths in any order and `offUntil` is the
+// answer the last poll got. A hold still running is returned unchanged, so
+// deaths during it do not move its end. Otherwise the deaths inside the
+// window (now - windowSeconds, now] are counted, and more than the limit
+// starts a hold of `offSeconds` from `now`. A death stamped after `now` is
+// not counted.
+int64_t RoamOffUntil(std::vector<int64_t> const& deaths, int64_t now, int64_t offUntil,
+                     RoamDeathLimits const& limits = RoamDeathLimits());
+
+// Everything the grant turns on. The defaults are the safe reading of
+// "nothing is known": switched off, linked, no band, which grants nothing.
+struct IndividualRoamFacts
+{
+    // Overseer.Individual.Enable. Off by default, so the module ships dark.
+    bool enabled{false};
+    // The leader carries `new rpg` as leader; this rule is for followers.
+    bool leadsItsParty{false};
+    // FamilyReLinks (#1519): a dungeon or raid job, a run or a summon. An
+    // unread job or an unknown family is read as linked.
+    bool familyLinked{true};
+    // The member's own `travel_npc`. Any aim is an errand, a catch-up, an
+    // escort or a run's claim, and each of those has its own rule.
+    std::string ownAim;
+    // The band of the zone the member stands in, for the member's side.
+    bool zoneHasBand{false};
+    uint32_t zoneBandTop{0};
+    uint32_t level{0};
+    // RoamOffUntil's answer, and the clock it is read against.
+    int64_t offUntil{0};
+    int64_t now{0};
+};
+
+// Why the member may not roam, in the order the checks are made, so the
+// adapter can say it once when the answer changes.
+enum class RoamRefusal
+{
+    None,
+    SwitchOff,
+    Leader,
+    FamilyLinked,
+    HasErrand,
+    DeathLimit,
+    OutOfBand,
+};
+RoamRefusal IndividualRoamRefusal(IndividualRoamFacts const& facts);
+char const* RoamRefusalName(RoamRefusal refusal);
+bool IndividualRoams(IndividualRoamFacts const& facts);
+
+// What one poll does about it. Leaving the zone, the family re-linking, the
+// switch going off and the death limit all arrive here as `roams` false on a
+// member that holds the grant, which takes it back so the member follows its
+// leader again.
+enum class RoamStep
+{
+    Leave,
+    Grant,
+    TakeBack,
+};
+RoamStep IndividualRoamStep(bool holdsGrant, bool roams);
+
 // -------------- the family waits for the member it left behind (#404) -------
 //
 // THE MEASUREMENT, AND IT IS NOT A NAVIGATION FAULT. Four of five characters
