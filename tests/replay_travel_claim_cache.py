@@ -29,7 +29,7 @@ except (ValueError, AttributeError) as exc:
     raise SystemExit("Travel cache branch not found; update the replay anchors") from exc
 if "MovementOwner().Claim(name, target, owner, cachedDrive," not in source[claim:claim_end]:
     raise SystemExit("Claim must hand its cached drive to the movement ownership module")
-if "MovementOwner().FenceRefuses(name, target, owner, cachedDrive)" not in source[fence:fence_end]:
+if "MovementOwner().FenceRefuses(name, target, owner, cachedDrive," not in source[fence:fence_end]:
     raise SystemExit("FenceRefuses must hand its cached drive to the movement ownership module")
 
 harness = r'''
