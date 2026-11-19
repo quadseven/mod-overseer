@@ -10003,6 +10003,20 @@ FarCatchUpStep FarCatchUpWalk(float yardsToAim, float footLimitYards, bool flewT
 // "walk", "grant", "wait", "hold".
 char const* FarCatchUpStepWord(FarCatchUpStep step);
 
+// A HOLD THAT ENDS IN ANOTHER HOLD IS A MEMBER LEFT BEHIND FOR EVER. A follower
+// past the foot limit that no flight carries is held, asks again after the hold
+// retry, and is held again; the leader's fetch is fenced by any errand in its
+// travel column, so on a family whose leader is on a long errand the member
+// stands still for hours (measured: two members 2,500 yards back on one map for
+// over four hours). After FAR_HOLDS_BEFORE_WALK holds in a row the foot limit
+// widens to FAR_HOLD_WALK_YARDS, so a same-map member walks the stretch it was
+// refused; a lethal leg (#697) is judged on its own and is not widened.
+constexpr std::uint32_t FAR_HOLDS_BEFORE_WALK = 2;
+constexpr float FAR_HOLD_WALK_YARDS = 6000.f;
+
+// The foot limit for a follower that has been held `holdsInARow` times.
+float FarCatchUpFootLimit(float footLimitYards, std::uint32_t holdsInARow);
+
 // DOES A FOLLOWER HELD FOR BEING TOO FAR STAY HELD THIS POLL? It stops being
 // held when the leader is back within the line, which is the ordinary end, or
 // when the hold has lasted `retrySeconds`, so a leader who has moved somewhere
