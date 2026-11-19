@@ -4389,6 +4389,16 @@ TravelClaim ReadTravelClaim(TravelClaimFacts const& facts)
     if (TravelOwnerIsALiveRun(facts.owner) && !facts.column.empty() &&
         (!IsMaintenanceErrand(facts.column) || facts.owner == TravelOwner::Exit))
         return TravelClaim::Outrank;
+    // THE WALK BACK WINS OVER A COUNTER ERRAND. A leader fetching a far,
+    // held member claims the column as a catch-up, and the bridge's counter
+    // keyword (an auctioneer a zone has no route to, say) was refused as a
+    // foreign errand for as long as it stood. The module lets such an errand
+    // go without blanking the column, so the fetch never began and the
+    // member stayed held. An economy errand is a convenience the walk back
+    // may overwrite; `learn_skill` stays pending and a guard is never
+    // reached here (it is refused first above).
+    if (facts.owner == TravelOwner::CatchUp && IsMaintenanceErrand(facts.column))
+        return TravelClaim::Outrank;
     // THE PROFESSION FENCE, EXCEPT WHERE IT PROTECTS NOTHING. A catch-up aim
     // or any dungeon run's aim over an empty column overwrites no trainer walk
     // (wow-overseer#227, #598); the home errand, or a column that holds
