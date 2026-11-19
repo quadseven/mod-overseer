@@ -7976,6 +7976,37 @@ struct SellVendorCandidate
 // answer never depends on the order a cell sweep happened to produce.
 int ChooseSellVendor(std::vector<SellVendorCandidate> const& candidates);
 
+// WHICH VENDOR A "vendor not in range" REFUSAL WAS STANDING NEXT TO. The sale
+// and the purchase both sweep 30 yards for vendors and refuse when none of
+// them passes the core's interact gate. The row carried only how far the
+// nearest one was, so a reader of 6 to 16 yard refusals could not tell which
+// creature the character had walked up to: a real counter it stopped short
+// of, or a spawn that should never have been aimed at. The row now names it.
+//
+// `yards` is negative until the sweep has seen a vendor, which is how "the
+// sweep found nothing at all" is told apart from "the nearest one is here".
+struct NearestVendor
+{
+    float yards{-1.f};
+    std::uint32_t entry{0};  // creature_template.entry
+    std::string name;
+};
+
+// Keeps `nearest` as the nearer of itself and the creature offered. A tie
+// keeps the one already held, so the answer does not flip between two spawns
+// at the same distance from one sweep to the next. A negative or non-finite
+// distance is not a reading and is ignored.
+void KeepNearestVendor(NearestVendor& nearest, float yards, std::uint32_t entry,
+                       std::string const& name);
+
+// The members a refusal row carries for it, each led by a comma so the text
+// is appended to an object under construction:
+//   ,"nearest_vendor_yards":<n>,"nearest_vendor_entry":<n>,"nearest_vendor_name":"<name>"
+// Empty when the sweep saw no vendor. The name comes from the world, so it is
+// escaped as a JSON string. `nearest_vendor_yards` is written as it always
+// was (the stream's default float form), because rows already carry it.
+std::string NearestVendorJson(NearestVendor const& nearest);
+
 // WHETHER A REFUSAL IS WORTH ASKING AGAIN, AND WHERE. Three answers, because
 // the walls a sale can hit are of three different kinds and a sender treating
 // them alike either retries a quest item for ever or gives up on a vendor

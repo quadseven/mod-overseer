@@ -70531,12 +70531,14 @@ private:
 
         std::vector<SellVendorCandidate> candidates;
         std::vector<Creature*> reachable;
-        float nearestYards = -1.f;
+        // Which vendor was nearest, in reach or not, so a refusal can name
+        // it and not only say how far it was (wow-overseer#2220).
+        OverseerDecisions::NearestVendor nearest;
         for (Creature* creature : nearby)
         {
             float const yards = seller->GetDistance(creature);
-            if (nearestYards < 0.f || yards < nearestYards)
-                nearestYards = yards;
+            OverseerDecisions::KeepNearestVendor(nearest, yards, creature->GetEntry(),
+                                                 creature->GetName());
 
             // THE GATE. Player.h:1146; the same call ItemHandler.cpp:583
             // makes with the same flag, so a creature this accepts is one
@@ -70554,9 +70556,7 @@ private:
         if (reachable.empty())
         {
             std::ostringstream extra;
-            extra << itemJson.str();
-            if (nearestYards >= 0.f)
-                extra << ",\"nearest_vendor_yards\":" << nearestYards;
+            extra << itemJson.str() << OverseerDecisions::NearestVendorJson(nearest);
             return refuse("vendor not in range", extra.str());
         }
 
@@ -72150,7 +72150,9 @@ private:
             float discount = 1.f;
             int32 vendorSlot = -1;
             int32 stockLeft = -1;  // -1 for an unlimited vendor
-            float nearestYards = -1.f;
+            // The nearest vendor the sweep saw, in reach or not
+            // (wow-overseer#2220).
+            OverseerDecisions::NearestVendor nearest;
             bool haveInventoryResult = false;
             InventoryResult inventoryResult = EQUIP_ERR_OK;
             // Honor (wow-overseer#589): -1 when the line is not priced in it.
@@ -72197,8 +72199,13 @@ private:
                   << ",\"stock_left\":" << ev.stockLeft << "}";
             else
                 o << ",\"vendor\":null";
-            if (ev.nearestYards >= 0.f)
-                o << ",\"nearest_vendor_yards\":" << ev.nearestYards;
+            // A row with no vendor in reach names the nearest one it saw, so
+            // "vendor not in range" says what it stood next to. A row that
+            // reached a vendor already names it and keeps the bare distance.
+            if (!ev.haveVendor)
+                o << OverseerDecisions::NearestVendorJson(ev.nearest);
+            else if (ev.nearest.yards >= 0.f)
+                o << ",\"nearest_vendor_yards\":" << ev.nearest.yards;
             if (ev.haveInventoryResult)
                 o << ",\"inventory_result\":" << int32(ev.inventoryResult)
                   << ",\"inventory_result_name\":" << J(InventoryResultName(ev.inventoryResult));
@@ -72320,8 +72327,8 @@ private:
         for (Creature* creature : nearby)
         {
             float const yards = buyer->GetDistance(creature);
-            if (ev.nearestYards < 0.f || yards < ev.nearestYards)
-                ev.nearestYards = yards;
+            OverseerDecisions::KeepNearestVendor(ev.nearest, yards, creature->GetEntry(),
+                                                 creature->GetName());
 
             if (!buyer->GetNPCIfCanInteractWith(creature->GetGUID(), UNIT_NPC_FLAG_VENDOR))
                 continue;
