@@ -13528,6 +13528,10 @@ private:
             OverseerDecisions::RatchetVerdict const progress =
                 OverseerDecisions::Ratchet(stall.progress, movedFromLast,
                                            std::time(nullptr), FOLLOW_STALL_RATCHET);
+            // KEPT FOR THE FETCH. A follower that has not moved for the whole stall
+            // window and is not on its first reading is not walking back, whatever
+            // its catch-up aim says, and the leader must not wait for it.
+            stall.stalled = stall.seen && progress.stalled && !progress.progressed;
 
             // The same reading DriveCatchUp takes below, from the same pair of
             // players, so the two can never disagree about them again (#241).
@@ -28894,6 +28898,8 @@ private:
             member.stoodDown = WithinFetchStandDown(member.name);
             // ITS OWN ERRAND (#1517): the leader never goes back for it.
             member.onItsOwnErrand = WalksItsOwnErrand(member.name);
+            auto const stallIt = _followStall.find(member.name);
+            member.stalledWalkingBack = stallIt != _followStall.end() && stallIt->second.stalled;
             if (member.sameMap)
                 member.yards = p->GetDistance2d(leader);
             candidates.push_back(member);
@@ -55604,6 +55610,26 @@ private:
         return true;
     }
 
+    // IS THIS COUNTER AIM CALLED OFF FOR THIS CHARACTER? The travel drive keeps a
+    // refusal per character (a no-progress backoff, an errand that was killing
+    // it, an overspent economy budget) and clears any refused aim it finds
+    // written, on every poll, for the length of the refusal. A trip that wrote
+    // the aim regardless re-claimed the travel column every poll and was
+    // released at once, for as long as the trip stayed open, so the family
+    // could be given nothing else to do. The same reading the crossing's berth
+    // claim and the repair leg take, asked here so the town trip does too (#926).
+    bool TownTripAimCalledOff(std::string const& name, char const* aim, std::string& why) const
+    {
+        int64 const sinceRefused = _travelAims.SecondsSinceRefused(name, aim);
+        int64 const refusalSeconds = OverseerDecisions::ErrandCooloffSeconds(
+            _travelAims.LethalStrikes(name, aim), ERRAND_DEATH_LIMITS);
+        if (OverseerDecisions::ReadTownTripAimClaim(sinceRefused, refusalSeconds) !=
+            OverseerDecisions::TownTripAimClaim::StandBack)
+            return false;
+        why = _travelAims.RefusedReason(name, aim);
+        return true;
+    }
+
     // THE TRIP IS FINISHED WITH THIS MEMBER, whichever of the ways it got there.
     // Ended HERE rather than at the sweep, the discipline EndHomeEscort keeps: a
     // lease held thirty seconds longer than it is wanted is thirty seconds of a
@@ -56220,6 +56246,26 @@ private:
             WorldPosition counterPos;
             std::string said;
             char const* const aim = TownTripAimFor(plan.role);
+
+            // NO TRIP IS OPENED FOR AN AIM THE TRAVEL DRIVE HAS CALLED OFF. It
+            // would claim the column on its first poll and be released on the
+            // next, and the family would be held for a walk that is not
+            // happening. Nothing is written, so the family is free for its next
+            // job until the refusal ends and the trip is asked again then.
+            {
+                std::string refusedBecause;
+                if (TownTripAimCalledOff(leaderName, aim, refusedBecause))
+                {
+                    if (SayTownTripOnce(trip, leaderName, "aim called off"))
+                        LOG_INFO("module.overseer",
+                                 "overseer: the family is owed a town trip to a '{}' but the "
+                                 "travel drive has called that aim off for '{}' ({}), so no "
+                                 "trip is opened and the family is free for its next job. It "
+                                 "is asked again once the refusal ends",
+                                 aim, leaderName, refusedBecause);
+                    return;
+                }
+            }
             if (!ResolveTravelTarget(leader, aim, counterEntry, counterPos, 0, &said))
             {
                 LOG_WARN("module.overseer",
@@ -56409,6 +56455,34 @@ private:
                 }
 
                 case OverseerDecisions::TownStop::Walk:
+                {
+                    // AN AIM CALLED OFF MID-TRIP ENDS THE WALK, NOT JUST THE WRITE.
+                    // The drive refuses the aim and releases it on every poll, so
+                    // writing it again below would be undone at once, every poll,
+                    // until the trip's own bound. The leader's aim is the trip's
+                    // journey, so the whole trip is let go of and its cooldown
+                    // starts; a follower is only settled, the way the repair leg
+                    // gives up one member's walk.
+                    std::string refusedBecause;
+                    if (TownTripAimCalledOff(name, aim, refusedBecause))
+                    {
+                        LOG_WARN("module.overseer",
+                                 "overseer: the town trip stops walking '{}' to a '{}' - the "
+                                 "travel drive has called that aim off ({}) and would clear "
+                                 "it again on its next poll. {}",
+                                 name, aim, refusedBecause,
+                                 name == leaderName
+                                     ? "The leader's walk is the trip, so the trip is let go "
+                                       "of and the family is free for its next job"
+                                     : "It is left where it is and the trip carries on");
+                        if (name == leaderName)
+                        {
+                            EndTownTrip(trip, members, "the travel drive called the aim off");
+                            return;
+                        }
+                        SettleTownTripMember(trip, name);
+                        break;
+                    }
                     ++outstanding;
                     if (!owed.empty())
                         owed += ", ";
@@ -56429,6 +56503,7 @@ private:
                                           OverseerDecisions::TravelOwner::TownTrip);
                     trip.walked.insert(name);
                     break;
+                }
 
                 case OverseerDecisions::TownStop::TooFar:
                     // THE SAME ANSWER AS A MEMBER ON ANOTHER MAP, for the same
@@ -90872,6 +90947,7 @@ private:
     struct FollowStallState
     {
         bool seen{false};      // false until the first position is recorded
+        bool stalled{false};   // the last poll read a full stall window with no progress
         float x{0.f};          // the mark a stall is measured FROM
         float y{0.f};
         // The shared ratchet's memory: how far this character has got from

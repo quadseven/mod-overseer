@@ -8890,10 +8890,23 @@ std::string PickFetchTarget(std::vector<FetchCandidate> const& members,
             continue;
         if (!member.heldTooFar)
         {
-            // STILL WALKING BACK, so the family is not gathered yet.
-            if (member.yards > limits.gatheredYards)
-                return std::string();
-            continue;
+            // STILL WALKING BACK, so the family is not gathered yet. UNLESS IT
+            // IS NOT WALKING: a member that has stood still for the whole stall
+            // window is never going to gather, and waiting for it forever left
+            // every held member behind it unfetched. It is judged on the same
+            // line a held member is, so one inside the foot limit is left to
+            // its own walk.
+            if (member.stalledWalkingBack)
+            {
+                if (member.yards <= limits.footLimitYards)
+                    continue;
+            }
+            else
+            {
+                if (member.yards > limits.gatheredYards)
+                    return std::string();
+                continue;
+            }
         }
         // A held member inside the line is one whose hold lifts this poll. For
         // one held off a lethal leg (#697) the line is beside the leader.
@@ -9697,6 +9710,12 @@ CrossingBerthClaim ReadCrossingBerthClaim(std::int64_t sinceRefused,
 {
     return sinceRefused >= 0 && sinceRefused < refusalSeconds ? CrossingBerthClaim::StandBack
                                                               : CrossingBerthClaim::Claim;
+}
+
+TownTripAimClaim ReadTownTripAimClaim(std::int64_t sinceRefused, std::int64_t refusalSeconds)
+{
+    return sinceRefused >= 0 && sinceRefused < refusalSeconds ? TownTripAimClaim::StandBack
+                                                              : TownTripAimClaim::Claim;
 }
 
 CrossingAttemptEnd CrossingRefusalEnd(std::string const& reason)
