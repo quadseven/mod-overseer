@@ -30348,6 +30348,91 @@ float WalkYardsToGo(std::vector<TeleportPad> const& pads, MailWalkPoint const& f
 // or of a pad's exit, at its own height?
 bool OnAPaddedLevel(std::vector<TeleportPad> const& pads, MailWalkPoint const& at);
 
+// ------------------------------------ a gryphon click up to Acherus (2026-11-19) --
+//
+// A DEATH KNIGHT STRANDED ON THE GROUND UNDER ACHERUS HAS NO WAY UP BUT THE ONE A
+// PLAYER HAS: CLICK A SCOURGE GRYPHON. Entry 29501 is the death knight's own
+// (spellclick spell 54575, npc_spellclick_spells condition: class mask 32), and
+// the world already spawns it on map 609 at about z 154, which is ground height
+// for the knights who stand on the shelf beside it. Nothing is added to the
+// world for it: if a stranded knight cannot walk to one of those spawns, the
+// step says why and leaves it where it stands.
+//
+// WHEN IT IS ASKED. Only after the two ways this module already knew are both
+// shut for that knight: its class step (no class trainer on its own level that
+// a walk reaches) and its crossing (no priced crossing to a trainer elsewhere).
+// The adapter reads both; this only decides.
+constexpr uint32_t DEATH_KNIGHT_GRYPHON_ENTRY = 29501;
+constexpr uint32_t DEATH_KNIGHT_GRYPHON_SPELL = 54575;
+// How near the adapter looks for the creature to click. The arrival test itself
+// is the core's GetNPCIfCanInteractWith, not this number.
+constexpr float SPELLCLICK_FIND_YARDS = 10.0f;
+// A click that lifted the character this many yards counts as taken even when
+// the core reports no vehicle.
+constexpr float SPELLCLICK_LIFT_YARDS = 5.0f;
+
+struct SpellClickFacts
+{
+    uint32_t mapId{0};
+    bool deathKnight{false};
+    bool alive{false};
+    bool classStepWalled{false};  // no class trainer a walk reaches from here
+    bool crossingWalled{false};   // no crossing to a trainer elsewhere is priced
+};
+
+// One spawn of the gryphon, as the adapter read it from the spawn table.
+// `conditionsMet` is the walker passing the spawn entry's npc_spellclick_spells
+// conditions; `reachable` is a walk path that ends at the spawn (the navmesh
+// finds one that arrives, not one that stops short under it).
+struct SpellClickSpawn
+{
+    uint32_t spawnId{0};
+    MailWalkPoint at;
+    bool conditionsMet{false};
+    bool reachable{false};
+};
+
+namespace SpellClickWhy
+{
+constexpr char const* NoSpawn = "the map has no gryphon spawn";
+constexpr char const* ConditionsFail = "no gryphon spawn passes its spellclick conditions";
+constexpr char const* Unreachable = "no gryphon spawn is reachable on foot from here";
+}  // namespace SpellClickWhy
+
+struct SpellClickChoice
+{
+    bool applies{false};        // a stranded death knight with both ways shut
+    int index{-1};              // into the spawns, -1 for none
+    float yards{-1.f};          // 3D, to the chosen one
+    float nearestYards{-1.f};   // to the nearest spawn of any, chosen or not
+    char const* why{""};        // "" when one was chosen or the step does not apply
+};
+
+// THE NEAREST SPAWN THIS KNIGHT MAY WALK TO AND CLICK. Applies only to a living
+// death knight on the start map whose class step and crossing are both walled;
+// otherwise nothing is asked and `applies` stays false. Among the spawns that
+// pass their conditions and are reachable, the nearest by 3D distance wins; a
+// tie goes to the lower spawn id so the answer does not depend on map order.
+SpellClickChoice ChooseSpellClickSpawn(SpellClickFacts const& facts,
+                                       std::vector<SpellClickSpawn> const& spawns,
+                                       MailWalkPoint const& from);
+
+enum class SpellClickOutcome
+{
+    NotInReach,  // the core would not let the walker click from where it stands
+    Aboard,      // after the click it is on a vehicle, in flight, or well above where it was
+    NoEffect,    // the click went and the walker is where it was
+};
+
+// "not in reach", "aboard", "no effect": the word a log line carries.
+char const* SpellClickOutcomeWord(SpellClickOutcome outcome);
+
+// The outcome from what the adapter read: whether the core's gate gave the
+// creature, whether the walker sits on a vehicle or is in flight after the
+// click, and its height either side.
+SpellClickOutcome SpellClickOutcomeFor(bool inReach, bool onVehicleOrFlight, float zBefore,
+                                       float zAfter);
+
 // ------------------------------------------ the settle on the deck (2026-10-09) --
 //
 // A DEATH KNIGHT LET GO ON A DECK WANDERS OFF IT. After a hearth home to Acherus
