@@ -4403,7 +4403,11 @@ TravelClaim ReadTravelClaim(TravelClaimFacts const& facts)
     // or any dungeon run's aim over an empty column overwrites no trainer walk
     // (wow-overseer#227, #598); the home errand, or a column that holds
     // anything at all, keeps the #435 answer.
-    if (facts.learnSkill != 0 &&
+    // A trainer errand the module has itself let go of or called off, and that
+    // nothing is walking, protects nothing either: a catch-up walk passes it.
+    bool const passesLetGoErrand =
+        facts.owner == TravelOwner::CatchUp && facts.errandLetGo && !facts.column.empty();
+    if (facts.learnSkill != 0 && !passesLetGoErrand &&
         !(TravelOwnerPassesAnEmptyLearnColumn(facts.owner) && facts.column.empty()))
         return TravelClaim::RefusedProfession;
     // THE TRAINING STOP TAKES THE COLUMN FROM THE BRIDGE'S TOWN ERRANDS

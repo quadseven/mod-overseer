@@ -6901,7 +6901,8 @@ public:
         // lets this adapter keep the existing decision logs.
         time_t const now = std::time(nullptr);
         OverseerMovement::ClaimResult const claim =
-            MovementOwner().Claim(name, target, owner, cachedDrive, now);
+            MovementOwner().Claim(name, target, owner, cachedDrive, now,
+                                  ErrandLetGo(name, owner));
         if (claim.leaderAsk.asked)
             LogLeaderAsk(name, claim.leaderAsk.kind, claim.leaderAsk.owner,
                          claim.leaderAsk.target, claim.leaderAsk.why,
@@ -7012,6 +7013,28 @@ public:
         return true;
     }
 
+    // IS THE ERRAND STANDING IN THE COLUMN ONE THIS MODULE HAS LET GO OF OR
+    // CALLED OFF, WITHIN ITS COOL-OFF? Only a catch-up walk asks. Such an errand
+    // is refused to its own character for the cool-off, and the profession fence
+    // refuses the catch-up for as long as the errand stands, so a follower left
+    // far from its family was walked by neither. Cheap when it does not apply:
+    // the column is read only for a catch-up of a character the book remembers
+    // letting go of something.
+    bool ErrandLetGo(std::string const& name, OverseerDecisions::TravelOwner owner) const
+    {
+        if (owner != OverseerDecisions::TravelOwner::CatchUp)
+            return false;
+        if (!_landed.count(name) && !_refused.count(name))
+            return false;
+        std::string const column = CurrentTravelNpc(name);
+        if (column.empty())
+            return false;
+        if (HoldsLanding(name, column))
+            return true;
+        int64_t const since = SecondsSinceRefused(name, column);
+        return since >= 0 && since < ERRAND_DEATH_LIMITS.cooloffSeconds;
+    }
+
     // Which owner claimed the aim now in the column, when this book wrote it.
     // False for an aim somebody else wrote (the bridge's errands).
     bool ClaimedBy(std::string const& name, std::string const& target,
@@ -7031,7 +7054,8 @@ public:
     {
         auto const it = _state.find(name);
         bool const cachedDrive = it != _state.end() && it->second.target == target;
-        return MovementOwner().FenceRefuses(name, target, owner, cachedDrive);
+        return MovementOwner().FenceRefuses(name, target, owner, cachedDrive,
+                                            ErrandLetGo(name, owner));
     }
 
     // Why this character's last claim was refused, or empty when the last
