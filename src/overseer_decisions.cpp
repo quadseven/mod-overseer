@@ -21778,6 +21778,18 @@ bool FarWalkAllowedAt(uint32_t mapId, uint32_t zoneId)
            mapId == DEATH_KNIGHT_START_MAP_ID;
 }
 
+bool ExitHearthLandingWithinWalkRange(ExitHearthLanding const& member,
+                                      ExitHearthLanding const& leader, float maxWalkYards)
+{
+    if (!member.known || !leader.known || member.mapId != leader.mapId ||
+        member.instanceId != leader.instanceId || maxWalkYards < 0.f)
+        return false;
+    float const dx = member.x - leader.x;
+    float const dy = member.y - leader.y;
+    float const dz = member.z - leader.z;
+    return dx * dx + dy * dy + dz * dz <= maxWalkYards * maxWalkYards;
+}
+
 ExitHearthStep ExitFailureHearthStep(ExitHearthFacts const& facts, unsigned maxAttempts)
 {
     if (!facts.inWorld || !facts.onInsideMap)
@@ -21900,6 +21912,8 @@ std::string ExitHearthImpossibleReason(ExitHearthFacts const& facts, unsigned ma
         return "hearthstone on cooldown";
     if (facts.attempts >= maxAttempts)
         return "hearth attempts spent";
+    if (!facts.landingWithinLeaderWalkRange)
+        return "hearth landing is outside the leader's walking catch-up range";
     // A hearth to another continent splits the family (#1142): the stone is
     // withheld and the member stays on the walk-out path, however long that
     // walk has failed (#1388), until it is rebound on the door's continent.
