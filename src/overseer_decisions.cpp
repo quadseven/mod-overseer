@@ -7308,6 +7308,29 @@ int ChooseSellVendor(std::vector<SellVendorCandidate> const& candidates)
     return best;
 }
 
+void KeepNearestVendor(NearestVendor& nearest, float yards, std::uint32_t entry,
+                       std::string const& name)
+{
+    if (!std::isfinite(yards) || yards < 0.f)
+        return;
+    if (nearest.yards >= 0.f && yards >= nearest.yards)
+        return;
+    nearest.yards = yards;
+    nearest.entry = entry;
+    nearest.name = name;
+}
+
+std::string NearestVendorJson(NearestVendor const& nearest)
+{
+    if (nearest.yards < 0.f)
+        return std::string();
+    std::ostringstream out;
+    out << ",\"nearest_vendor_yards\":" << nearest.yards
+        << ",\"nearest_vendor_entry\":" << nearest.entry
+        << ",\"nearest_vendor_name\":" << JsonString(nearest.name);
+    return out.str();
+}
+
 SellRetry SellRefusalRetry(std::string const& detail)
 {
     // The literals mod_overseer.cpp's DoSell returns, grouped by what would
