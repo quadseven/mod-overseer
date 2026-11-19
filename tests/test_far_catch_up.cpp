@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <string>
 
+using OverseerDecisions::FarCatchUpFootLimit;
 using OverseerDecisions::FarCatchUpStaysHeld;
 using OverseerDecisions::FarCatchUpStep;
 using OverseerDecisions::FarCatchUpStepWord;
@@ -120,8 +121,30 @@ void EveryStepHasAWord()
 
 }  // namespace
 
+// A MEMBER HELD AGAIN AND AGAIN IS NOT LEFT THERE FOR EVER. Two members stood
+// about 2,500 yards back on one map for hours: past the 1,500 yard line, no
+// flight, held, asked again, held again, while the leader's fetch was fenced.
+void ARepeatedHoldWidensTheLineSoTheMemberWalks()
+{
+    Step("first hold, 2506 yards",
+         FarCatchUpWalk(2506.f, FarCatchUpFootLimit(LIMIT, 0), false, true, true),
+         FarCatchUpStep::Hold);
+    Step("second hold, 2506 yards",
+         FarCatchUpWalk(2506.f, FarCatchUpFootLimit(LIMIT, 1), false, true, true),
+         FarCatchUpStep::Hold);
+    Step("after two holds in a row, 2506 yards walks",
+         FarCatchUpWalk(2506.f, FarCatchUpFootLimit(LIMIT, 2), false, true, true),
+         FarCatchUpStep::Walk);
+    Step("after many holds, a continent away still holds",
+         FarCatchUpWalk(11505.f, FarCatchUpFootLimit(LIMIT, 9), false, true, true),
+         FarCatchUpStep::Hold);
+    Check("an unset limit stays unset", FarCatchUpFootLimit(0.f, 5) == 0.f, true);
+    Check("a wider limit is never narrowed", FarCatchUpFootLimit(9000.f, 5) == 9000.f, true);
+}
+
 int main()
 {
+    ARepeatedHoldWidensTheLineSoTheMemberWalks();
     UggaIsHeldRatherThanWalkedAcrossKalimdor();
     InsideTheLineTheWalkIsUnchanged();
     AFlightThatLandedLeavesAWalk();
