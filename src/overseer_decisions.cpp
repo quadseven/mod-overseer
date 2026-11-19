@@ -4557,12 +4557,23 @@ bool LandedPointAimStep(LandedPointState& state, std::string const& aim, int64_t
     return true;
 }
 
+namespace
+{
+// Whether the column is a walk long enough that a town trip must not break it.
+bool IsLongDoorWalk(DoorWalkFacts const& facts, DoorWalkLimits const& limits)
+{
+    if (facts.aim.rfind("at:", 0) != 0)
+        return false;
+    if (facts.runDoorWalk && !facts.sameMap)
+        return true;
+    return facts.sameMap && facts.yardsToAim >= limits.longYards;
+}
+}  // namespace
+
 DoorWalkVsErrand DoorWalkVersusTownTrip(DoorWalkFacts const& facts, DoorWalkLimits const& limits)
 {
     // A keyword, a guard or an empty column is not a point walk.
-    if (facts.aim.rfind("at:", 0) != 0 || !facts.sameMap)
-        return DoorWalkVsErrand::NoWalk;
-    if (facts.yardsToAim < limits.longYards)
+    if (!IsLongDoorWalk(facts, limits))
         return DoorWalkVsErrand::NoWalk;
     if (facts.restarts >= limits.restartBound)
         return DoorWalkVsErrand::GiveUp;
@@ -4575,7 +4586,7 @@ int64_t DoorWalkDeferredFor(std::string& deferredAim, int64_t& deferredSince,
                             DoorWalkFacts const& facts, int64_t now,
                             DoorWalkLimits const& limits)
 {
-    if (facts.aim.rfind("at:", 0) != 0 || !facts.sameMap || facts.yardsToAim < limits.longYards)
+    if (!IsLongDoorWalk(facts, limits))
     {
         deferredAim.clear();
         deferredSince = 0;

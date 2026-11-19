@@ -5714,6 +5714,12 @@ struct DoorWalkFacts
     float yardsToAim{0.f};    // planar, from the leader now
     int64_t deferredFor{0};   // seconds this target has already held a trip off
     uint32_t restarts{0};     // times this target has been preempted
+    // The leader is the head of a raid run in ASSEMBLE and `aim` is the run's
+    // door aim, which the run writes to the column itself. That walk is long
+    // whenever the head is on another map (the travel drive makes the crossing
+    // on its own legs) or at least `longYards` off on the same map; the
+    // `sameMap` rule that guards an ordinary point aim does not apply to it.
+    bool runDoorWalk{false};
 };
 
 struct DoorWalkLimits

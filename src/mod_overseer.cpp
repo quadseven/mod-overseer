@@ -56122,6 +56122,38 @@ private:
                 }
                 else
                     walk.sameMap = false;
+                // THE RAID RUN'S DOOR WALK IS A LONG WALK TOO. In ASSEMBLE the
+                // head walks to the raid door through the run's own aim, often
+                // from another map, which the same-map point test above calls no
+                // walk, so a bags or repair trip took the head off the door. Fed
+                // to the same rule, with the same ceiling and restart bound.
+                if (_raidRunPhaseByMember.count(leaderName) &&
+                    _raidRunPhaseByMember[leaderName] == OverseerDecisions::RaidRunPhase::Assemble)
+                {
+                    auto const doorIt = _raidRunDoorByMember.find(leaderName);
+                    OverseerDecisions::RaidDoor const* const raidDoor =
+                        doorIt == _raidRunDoorByMember.end() ? nullptr : doorIt->second;
+                    if (raidDoor)
+                    {
+                        bool const sameMap = leader->GetMapId() == raidDoor->outsideMapId;
+                        float const gap = sameMap ? leader->GetDistance2d(raidDoor->stageX,
+                                                                          raidDoor->stageY)
+                                                  : 0.f;
+                        bool const atDoor =
+                            sameMap && gap <= OverseerDecisions::RAID_ASSEMBLE_YARDS;
+                        std::string const doorAim = OverseerDecisions::TravelAimAtPosition(
+                            raidDoor->outsideMapId, raidDoor->stageX, raidDoor->stageY,
+                            raidDoor->stageZ);
+                        if (!atDoor && !doorAim.empty() && leader->GetMapId() != raidDoor->insideMapId)
+                        {
+                            walk.runDoorWalk = true;
+                            walk.aim = doorAim;
+                            walk.sameMap = sameMap;
+                            walk.yardsToAim = gap;
+                        }
+                    }
+                }
+                std::string const walkAim = walk.aim;
                 int64_t const nowAt = static_cast<int64_t>(std::time(nullptr));
                 // The clock runs only while this is a far same-map point; any
                 // other column clears it (see DoorWalkDeferredFor).
@@ -56129,7 +56161,7 @@ private:
                 walk.deferredFor = OverseerDecisions::DoorWalkDeferredFor(
                     trip.deferredAim, deferredSince, walk, nowAt);
                 trip.deferredSince = static_cast<time_t>(deferredSince);
-                walk.restarts = OverseerDecisions::DoorWalkRestartCount(trip.doorWalk, column, nowAt);
+                walk.restarts = OverseerDecisions::DoorWalkRestartCount(trip.doorWalk, walkAim, nowAt);
                 switch (OverseerDecisions::DoorWalkVersusTownTrip(walk))
                 {
                     case OverseerDecisions::DoorWalkVsErrand::Defer:
@@ -56139,11 +56171,14 @@ private:
                                      "from '{}' and a walk that long is not broken off for "
                                      "bag room or repairs. The trip is asked again once the "
                                      "point is reached, or after {} minutes",
-                                     leaderName, static_cast<uint32>(walk.yardsToAim), column,
+                                     leaderName, static_cast<uint32>(walk.yardsToAim), walkAim,
                                      uint32(OverseerDecisions::DOOR_WALK_LIMITS.deferCeilingSeconds / 60));
                         return;
                     case OverseerDecisions::DoorWalkVsErrand::GiveUp:
-                        _travelAims.ClearPoisonedAim(leaderName, column);
+                        // The run re-claims its own door aim, so only an ordinary
+                        // point aim is cleared here.
+                        if (!walk.runDoorWalk)
+                            _travelAims.ClearPoisonedAim(leaderName, column);
                         if (!trip.doorWalk.said)
                         {
                             trip.doorWalk.said = true;
@@ -56151,12 +56186,12 @@ private:
                                      "overseer: the walk to '{}' has been broken off {} times "
                                      "by town trips ({} bound) - it is let go of so the family "
                                      "is released to its next job instead of starting it again",
-                                     column, walk.restarts,
+                                     walkAim, walk.restarts,
                                      uint32(OverseerDecisions::DOOR_WALK_LIMITS.restartBound));
                         }
                         return;
                     case OverseerDecisions::DoorWalkVsErrand::Preempt:
-                        preemptedAim = column;
+                        preemptedAim = walkAim;
                         break;
                     case OverseerDecisions::DoorWalkVsErrand::NoWalk:
                         break;

@@ -163,6 +163,46 @@ void ADeferralClockStartsOnlyForAFarPoint()
     Expect("a near point clears a running clock", aim.empty() && since == 0);
 }
 
+// A raid-run head walking to the door (ASSEMBLE) is the walk too, even from
+// another map, where an ordinary point aim would count as no walk.
+void ARaidRunHeadWalkingToTheDoorIsNotPulledToAVendorForANonBlockingBagsNeed()
+{
+    DoorWalkFacts crossMap = Walk(0.f);
+    crossMap.runDoorWalk = true;
+    crossMap.sameMap = false;
+    Expect("a raid-run head on another map defers the vendor trip",
+           DoorWalkVersusTownTrip(crossMap) == DoorWalkVsErrand::Defer);
+    DoorWalkFacts far = Walk(2104.f);
+    far.runDoorWalk = true;
+    Expect("a raid-run head far from the door on the same map defers it",
+           DoorWalkVersusTownTrip(far) == DoorWalkVsErrand::Defer);
+    DoorWalkFacts near = Walk(20.f);
+    near.runDoorWalk = true;
+    Expect("a head already at the door is asked as before",
+           DoorWalkVersusTownTrip(near) == DoorWalkVsErrand::NoWalk);
+
+    crossMap.deferredFor = DOOR_WALK_LIMITS.deferCeilingSeconds;
+    Expect("the same ceiling lets the trip through",
+           DoorWalkVersusTownTrip(crossMap) == DoorWalkVsErrand::Preempt);
+    crossMap.deferredFor = 0;
+    crossMap.restarts = DOOR_WALK_LIMITS.restartBound;
+    Expect("and the same restart cap gives the walk up",
+           DoorWalkVersusTownTrip(crossMap) == DoorWalkVsErrand::GiveUp);
+
+    std::string aim;
+    int64_t since = 0;
+    DoorWalkFacts run = Walk(0.f);
+    run.runDoorWalk = true;
+    run.sameMap = false;
+    DoorWalkDeferredFor(aim, since, run, 100);
+    Expect("the clock runs for the cross-map run walk",
+           DoorWalkDeferredFor(aim, since, run, 160) == 60);
+    DoorWalkFacts plain = Walk(0.f);
+    plain.sameMap = false;
+    Expect("an ordinary cross-map point is still no walk",
+           DoorWalkVersusTownTrip(plain) == DoorWalkVsErrand::NoWalk);
+}
+
 }  // namespace
 
 int main()
@@ -175,6 +215,7 @@ int main()
     TheRestartBoundIsPerTarget();
     AQuietSpanForgetsTheCount();
     ADeferralClockStartsOnlyForAFarPoint();
+    ARaidRunHeadWalkingToTheDoorIsNotPulledToAVendorForANonBlockingBagsNeed();
     if (failures)
         return 1;
     std::printf("ok\n");
