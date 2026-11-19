@@ -152,6 +152,22 @@ void EveryOtherOwnerKeepsItsFences()
                TravelClaim::RefusedProfession);
 }
 
+void TheWalkBackWinsOverACounterErrand()
+{
+    CheckClaim("a catch-up over an auctioneer errand outranks it",
+               Claim(TravelOwner::CatchUp, 0, "auctioneer"), TravelClaim::Outrank);
+    CheckClaim("a catch-up over a vendor errand is still refused",
+               Claim(TravelOwner::CatchUp, 0, "vendor"), TravelClaim::RefusedForeign);
+    CheckClaim("a catch-up over an auctioneer errand with a learn pending outranks it",
+               Claim(TravelOwner::CatchUp, 197, "auctioneer"), TravelClaim::Outrank);
+    CheckClaim("a home errand over an auctioneer errand still waits",
+               Claim(TravelOwner::HomeErrand, 0, "auctioneer"),
+               TravelClaim::RefusedForeign);
+    CheckClaim("a catch-up over an operator guard is still refused",
+               Claim(TravelOwner::CatchUp, 0, "guard:hold"),
+               TravelClaim::RefusedForeign);
+}
+
 void TheBooksOwnAimIsStillAPlainWrite()
 {
     TravelClaimFacts facts(TravelOwner::Run);
@@ -173,6 +189,7 @@ int main()
     AnExitCanPreemptATownErrand();
     EveryOtherOwnerKeepsItsFences();
     TheBooksOwnAimIsStillAPlainWrite();
+    TheWalkBackWinsOverACounterErrand();
 
     if (failures)
     {

@@ -4389,6 +4389,16 @@ TravelClaim ReadTravelClaim(TravelClaimFacts const& facts)
     if (TravelOwnerIsALiveRun(facts.owner) && !facts.column.empty() &&
         (!IsMaintenanceErrand(facts.column) || facts.owner == TravelOwner::Exit))
         return TravelClaim::Outrank;
+    // THE WALK BACK WINS OVER AN AUCTIONEER ERRAND, AND ONLY THAT ONE. A leader
+    // fetching a far, held member claims the column as a catch-up, and an
+    // auctioneer errand the zone has no route to was refused as foreign for as
+    // long as it stood: the module lets such an errand go without blanking the
+    // column, so the fetch never began and the member stayed held. The other
+    // counter keywords (vendor, banker, repair) stay foreign errands a claim
+    // must not overwrite, as does a guard (refused first above); `learn_skill`
+    // stays pending.
+    if (facts.owner == TravelOwner::CatchUp && facts.column == "auctioneer")
+        return TravelClaim::Outrank;
     // THE PROFESSION FENCE, EXCEPT WHERE IT PROTECTS NOTHING. A catch-up aim
     // or any dungeon run's aim over an empty column overwrites no trainer walk
     // (wow-overseer#227, #598); the home errand, or a column that holds
