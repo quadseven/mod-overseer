@@ -8463,7 +8463,9 @@ bool ZoneBandAdmits(bool zoneHasBand, uint32_t zoneBandTop, uint32_t level)
 {
     if (!zoneHasBand || zoneBandTop == 0 || level == 0)
         return false;
-    return zoneBandTop <= level + 1;
+    // Top minus one, not level plus one: the top is at least 1 here, and a
+    // level at the type's maximum must not wrap to zero and refuse.
+    return zoneBandTop - 1 <= level;
 }
 
 int64_t RoamOffUntil(std::vector<int64_t> const& deaths, int64_t now, int64_t offUntil,

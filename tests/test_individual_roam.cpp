@@ -67,6 +67,9 @@ int main()
     Check(!ZoneBandAdmits(false, 5, 80), "no band refuses even with a top filled in");
     Check(!ZoneBandAdmits(true, 1, 0), "an unread level refuses");
     Check(!ZoneBandAdmits(true, 0, 30), "a band top of zero is not a band");
+    Check(ZoneBandAdmits(true, 80, UINT32_MAX), "a level at the type's maximum does not wrap");
+    Check(ZoneBandAdmits(true, UINT32_MAX, UINT32_MAX), "nor does a band top there");
+    Check(!ZoneBandAdmits(true, UINT32_MAX, UINT32_MAX - 2), "and two above still refuses");
 
     // --- the grant -------------------------------------------------------------
     Check(IndividualRoams(Roaming()), "a follower in its band, family unlinked, no errand, roams");
