@@ -56061,12 +56061,12 @@ private:
                 else
                     walk.sameMap = false;
                 int64_t const nowAt = static_cast<int64_t>(std::time(nullptr));
-                if (trip.deferredAim != column)
-                {
-                    trip.deferredAim = column;
-                    trip.deferredSince = std::time(nullptr);
-                }
-                walk.deferredFor = nowAt - static_cast<int64_t>(trip.deferredSince);
+                // The clock runs only while this is a far same-map point; any
+                // other column clears it (see DoorWalkDeferredFor).
+                int64_t deferredSince = static_cast<int64_t>(trip.deferredSince);
+                walk.deferredFor = OverseerDecisions::DoorWalkDeferredFor(
+                    trip.deferredAim, deferredSince, walk, nowAt);
+                trip.deferredSince = static_cast<time_t>(deferredSince);
                 walk.restarts = OverseerDecisions::DoorWalkRestartCount(trip.doorWalk, column, nowAt);
                 switch (OverseerDecisions::DoorWalkVersusTownTrip(walk))
                 {

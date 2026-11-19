@@ -134,6 +134,35 @@ void AQuietSpanForgetsTheCount()
                                  1100 + DOOR_WALK_RESTART_WINDOW_SECONDS + 1) == 1);
 }
 
+// A keyword or near column that later becomes a far point gets a fresh
+// deferral; an old clock must not make the first trip preempt at once.
+void ADeferralClockStartsOnlyForAFarPoint()
+{
+    std::string aim;
+    int64_t since = 0;
+    DoorWalkFacts keyword;
+    keyword.aim = "vendor";
+    Expect("a keyword column has no deferral", DoorWalkDeferredFor(aim, since, keyword, 100) == 0);
+    Expect("and leaves no clock behind", aim.empty() && since == 0);
+
+    DoorWalkFacts nearPoint = Walk(20.f);
+    Expect("a near point has no deferral", DoorWalkDeferredFor(aim, since, nearPoint, 200) == 0);
+    Expect("and leaves no clock behind either", aim.empty() && since == 0);
+
+    // Long after, the same column is a far point: the clock starts now.
+    DoorWalkFacts far = Walk(2104.f);
+    int64_t const later = 200 + DOOR_WALK_LIMITS.deferCeilingSeconds + 500;
+    far.deferredFor = DoorWalkDeferredFor(aim, since, far, later);
+    Expect("a far point starts a fresh deferral", far.deferredFor == 0);
+    Expect("so the first trip defers rather than preempting",
+           DoorWalkVersusTownTrip(far) == DoorWalkVsErrand::Defer);
+    Expect("the clock then runs", DoorWalkDeferredFor(aim, since, far, later + 60) == 60);
+
+    // Walking close again resets it.
+    DoorWalkDeferredFor(aim, since, nearPoint, later + 120);
+    Expect("a near point clears a running clock", aim.empty() && since == 0);
+}
+
 }  // namespace
 
 int main()
@@ -145,6 +174,7 @@ int main()
     TheDoorWalkInterruptedThenRestartedIsBounded();
     TheRestartBoundIsPerTarget();
     AQuietSpanForgetsTheCount();
+    ADeferralClockStartsOnlyForAFarPoint();
     if (failures)
         return 1;
     std::printf("ok\n");

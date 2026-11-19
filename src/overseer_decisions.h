@@ -5739,6 +5739,16 @@ enum class DoorWalkVsErrand : std::uint8_t
 DoorWalkVsErrand DoorWalkVersusTownTrip(DoorWalkFacts const& facts,
                                         DoorWalkLimits const& limits = DOOR_WALK_LIMITS);
 
+// The deferral clock. It runs only while the column is a same-map point aim at
+// least `longYards` away, the one case that can defer a trip. For any other
+// column (a keyword, a guard, an empty column, another map, a near point) it is
+// cleared, so a column that later becomes a far point starts a fresh deferral
+// instead of inheriting an old clock. Returns the seconds deferred so far;
+// `facts.deferredFor` is not read.
+int64_t DoorWalkDeferredFor(std::string& deferredAim, int64_t& deferredSince,
+                            DoorWalkFacts const& facts, int64_t now,
+                            DoorWalkLimits const& limits = DOOR_WALK_LIMITS);
+
 // Counts the preemptions of one walk target. A different target starts again,
 // and so does a silence longer than `windowSeconds`.
 struct DoorWalkRestarts

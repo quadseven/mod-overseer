@@ -4571,6 +4571,24 @@ DoorWalkVsErrand DoorWalkVersusTownTrip(DoorWalkFacts const& facts, DoorWalkLimi
     return DoorWalkVsErrand::Preempt;
 }
 
+int64_t DoorWalkDeferredFor(std::string& deferredAim, int64_t& deferredSince,
+                            DoorWalkFacts const& facts, int64_t now,
+                            DoorWalkLimits const& limits)
+{
+    if (facts.aim.rfind("at:", 0) != 0 || !facts.sameMap || facts.yardsToAim < limits.longYards)
+    {
+        deferredAim.clear();
+        deferredSince = 0;
+        return 0;
+    }
+    if (deferredAim != facts.aim)
+    {
+        deferredAim = facts.aim;
+        deferredSince = now;
+    }
+    return now - deferredSince;
+}
+
 uint32_t DoorWalkRestartCount(DoorWalkRestarts const& state, std::string const& aim, int64_t now)
 {
     if (state.aim != aim || now - state.lastAt > DOOR_WALK_RESTART_WINDOW_SECONDS)
