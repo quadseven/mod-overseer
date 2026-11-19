@@ -10185,6 +10185,12 @@ struct FetchCandidate
     // IT WALKS AN ERRAND OF ITS OWN (#1517). Never fetched, and not a member
     // still walking back: it is walking away on purpose.
     bool onItsOwnErrand{false};
+    // NOT HELD, BUT NOT MOVING EITHER: the follow drive has watched it for a
+    // whole stall window without it getting anywhere. A member walking back
+    // makes the leader wait for the family to gather; a member that only
+    // claims to be walking back, and has not moved, is never going to gather,
+    // so it is treated as the held member it is in effect.
+    bool stalledWalkingBack{false};
 };
 
 struct FetchLimits
@@ -11200,6 +11206,19 @@ enum class CrossingBerthClaim : std::uint8_t
 };
 CrossingBerthClaim ReadCrossingBerthClaim(std::int64_t sinceRefused,
                                           std::int64_t refusalSeconds);
+
+// May the town trip write its counter aim for this character on this poll?
+// Not while the travel drive refuses that aim: the drive clears a refused aim
+// on its next poll, so a trip that writes it anyway re-claims the travel column
+// every poll for as long as the trip is open and holds the family from its next
+// job for the whole of it. `sinceRefused` is seconds since the aim was refused,
+// below zero when it never was; `refusalSeconds` is the length of the refusal.
+enum class TownTripAimClaim : std::uint8_t
+{
+    Claim,
+    StandBack,
+};
+TownTripAimClaim ReadTownTripAimClaim(std::int64_t sinceRefused, std::int64_t refusalSeconds);
 
 // The reason the travel drive's no-progress backoff refuses an aim with, and
 // how the crossing's stand-back reads a refusal's reason: that backoff is
