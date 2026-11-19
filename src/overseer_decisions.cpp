@@ -4557,6 +4557,38 @@ bool LandedPointAimStep(LandedPointState& state, std::string const& aim, int64_t
     return true;
 }
 
+DoorWalkVsErrand DoorWalkVersusTownTrip(DoorWalkFacts const& facts, DoorWalkLimits const& limits)
+{
+    // A keyword, a guard or an empty column is not a point walk.
+    if (facts.aim.rfind("at:", 0) != 0 || !facts.sameMap)
+        return DoorWalkVsErrand::NoWalk;
+    if (facts.yardsToAim < limits.longYards)
+        return DoorWalkVsErrand::NoWalk;
+    if (facts.restarts >= limits.restartBound)
+        return DoorWalkVsErrand::GiveUp;
+    if (facts.deferredFor < limits.deferCeilingSeconds)
+        return DoorWalkVsErrand::Defer;
+    return DoorWalkVsErrand::Preempt;
+}
+
+uint32_t DoorWalkRestartCount(DoorWalkRestarts const& state, std::string const& aim, int64_t now)
+{
+    if (state.aim != aim || now - state.lastAt > DOOR_WALK_RESTART_WINDOW_SECONDS)
+        return 0;
+    return state.restarts;
+}
+
+uint32_t NoteDoorWalkPreempted(DoorWalkRestarts& state, std::string const& aim, int64_t now)
+{
+    uint32_t const before = DoorWalkRestartCount(state, aim, now);
+    if (before == 0)
+        state = DoorWalkRestarts{};
+    state.aim = aim;
+    state.restarts = before + 1;
+    state.lastAt = now;
+    return state.restarts;
+}
+
 LeftoverAim ReadLeftoverAim(LeftoverAimFacts const& facts)
 {
     if (facts.target.rfind("at:", 0) != 0)

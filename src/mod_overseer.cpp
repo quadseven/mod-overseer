@@ -55515,8 +55515,18 @@ private:
         std::map<std::string, time_t> stoodSince;
         std::map<std::string, OverseerDecisions::TownNeed> before;
         std::map<std::string, uint64> copperBefore;
+        // A LONG POINT WALK THE LEADER IS ON, and how often a trip has broken
+        // it off. Kept across trips on purpose: the count is of one target.
+        OverseerDecisions::DoorWalkRestarts doorWalk;
+        std::string deferredAim;
+        time_t deferredSince{0};
     };
     std::map<std::string, TownTripState> _townTrips;   // keyed by family
+
+    static void NoteDoorWalkPreemptedFor(TownTripState& trip, std::string const& aim, int64_t now)
+    {
+        OverseerDecisions::NoteDoorWalkPreempted(trip.doorWalk, aim, now);
+    }
 
     // Said once per member per reason, the same discipline SayRepairLegOnce and
     // SayHomeBindOnce keep: a walk to a town is minutes of five-second polls, and
@@ -56030,6 +56040,67 @@ private:
             bool const busy = !SteerableAI(leader) || !leader->IsAlive() ||
                               HeldStill(leaderName) || anyMemberBinding;
 
+            // A LONG POINT WALK IS NOT BROKEN UP BY A TOWN TRIP. See
+            // OverseerDecisions::DoorWalkVersusTownTrip: nothing about a walk
+            // needs bag room, so the trip waits for the point, up to a ceiling,
+            // and a target that has been broken off its bound of times is let
+            // go of so the family moves on instead of looping.
+            std::string preemptedAim;
+            if (!busy && leader && SteerableAI(leader))
+            {
+                std::string const column = _travelAims.TargetFor(leaderName);
+                OverseerDecisions::DoorWalkFacts walk;
+                walk.aim = column;
+                uint32 pointMap = 0;
+                float px = 0.f, py = 0.f, pz = 0.f;
+                if (std::sscanf(column.c_str(), "at:%u:%f,%f,%f", &pointMap, &px, &py, &pz) == 4)
+                {
+                    walk.sameMap = pointMap == leader->GetMapId();
+                    walk.yardsToAim = leader->GetDistance2d(px, py);
+                }
+                else
+                    walk.sameMap = false;
+                int64_t const nowAt = static_cast<int64_t>(std::time(nullptr));
+                if (trip.deferredAim != column)
+                {
+                    trip.deferredAim = column;
+                    trip.deferredSince = std::time(nullptr);
+                }
+                walk.deferredFor = nowAt - static_cast<int64_t>(trip.deferredSince);
+                walk.restarts = OverseerDecisions::DoorWalkRestartCount(trip.doorWalk, column, nowAt);
+                switch (OverseerDecisions::DoorWalkVersusTownTrip(walk))
+                {
+                    case OverseerDecisions::DoorWalkVsErrand::Defer:
+                        if (SayTownTripOnce(trip, leaderName, "door walk"))
+                            LOG_INFO("module.overseer",
+                                     "overseer: the town trip waits for '{}': it is {} yards "
+                                     "from '{}' and a walk that long is not broken off for "
+                                     "bag room or repairs. The trip is asked again once the "
+                                     "point is reached, or after {} minutes",
+                                     leaderName, static_cast<uint32>(walk.yardsToAim), column,
+                                     uint32(OverseerDecisions::DOOR_WALK_LIMITS.deferCeilingSeconds / 60));
+                        return;
+                    case OverseerDecisions::DoorWalkVsErrand::GiveUp:
+                        _travelAims.ClearPoisonedAim(leaderName, column);
+                        if (!trip.doorWalk.said)
+                        {
+                            trip.doorWalk.said = true;
+                            LOG_WARN("module.overseer",
+                                     "overseer: the walk to '{}' has been broken off {} times "
+                                     "by town trips ({} bound) - it is let go of so the family "
+                                     "is released to its next job instead of starting it again",
+                                     column, walk.restarts,
+                                     uint32(OverseerDecisions::DOOR_WALK_LIMITS.restartBound));
+                        }
+                        return;
+                    case OverseerDecisions::DoorWalkVsErrand::Preempt:
+                        preemptedAim = column;
+                        break;
+                    case OverseerDecisions::DoorWalkVsErrand::NoWalk:
+                        break;
+                }
+            }
+
             OverseerDecisions::TownTripPlan const plan = OverseerDecisions::PlanTownTrip(
                 needs, TOWN_TRIP_LIMITS,
                 trip.endedAt ? std::time(nullptr) - trip.endedAt
@@ -56065,6 +56136,9 @@ private:
                 return;
             }
 
+            if (!preemptedAim.empty())
+                NoteDoorWalkPreemptedFor(trip, preemptedAim,
+                                         static_cast<int64_t>(std::time(nullptr)));
             trip.active = true;
             trip.role = plan.role;
             trip.leader = leaderName;

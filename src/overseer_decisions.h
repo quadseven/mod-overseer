@@ -5691,6 +5691,73 @@ struct LandedPointState
 bool LandedPointAimStep(LandedPointState& state, std::string const& aim, int64_t now,
                         LandedPointLimits const& limits = LANDED_POINT_LIMITS);
 
+// ---- a long point walk and a town errand that wants the same leader --------
+//
+// THE FAILURE. A leader sent to a far point (a dungeon door, thousands of yards
+// off) was taken off it by a town trip for full bags; the trip ended, the point
+// was aimed again, and the next trip opened as the walk got going. Four rounds
+// of that and the family had not moved toward the door for an hour. Nothing
+// about a walk needs bag room or whole gear, so the trip waits for the point.
+//
+// THREE ANSWERS, asked once when a trip is about to open over a leader whose
+// column holds a point aim:
+//   Defer    the trip waits; the walk goes on from where it is.
+//   Preempt  the walk is short, or has already been deferred for its ceiling:
+//            the trip goes ahead, and the caller counts it as a restart of
+//            that target.
+//   GiveUp   that target has been restarted its bound of times: the point is
+//            cleared (once, logged) and the family is free for its next job.
+struct DoorWalkFacts
+{
+    std::string aim;          // the leader's column
+    bool sameMap{true};       // the point is on the map the leader stands on
+    float yardsToAim{0.f};    // planar, from the leader now
+    int64_t deferredFor{0};   // seconds this target has already held a trip off
+    uint32_t restarts{0};     // times this target has been preempted
+};
+
+struct DoorWalkLimits
+{
+    // A walk at least this long is a journey a trip must not break up.
+    float longYards{400.f};
+    // The most one walk holds a trip off.
+    int64_t deferCeilingSeconds{45 * 60};
+    // Preemptions of one target before the target is given up.
+    uint32_t restartBound{3};
+};
+
+constexpr DoorWalkLimits DOOR_WALK_LIMITS{};
+
+enum class DoorWalkVsErrand : std::uint8_t
+{
+    NoWalk,   // not a long point walk: the trip is asked as before
+    Defer,
+    Preempt,
+    GiveUp,
+};
+
+DoorWalkVsErrand DoorWalkVersusTownTrip(DoorWalkFacts const& facts,
+                                        DoorWalkLimits const& limits = DOOR_WALK_LIMITS);
+
+// Counts the preemptions of one walk target. A different target starts again,
+// and so does a silence longer than `windowSeconds`.
+struct DoorWalkRestarts
+{
+    std::string aim;
+    uint32_t restarts{0};
+    int64_t lastAt{0};
+    bool said{false};
+};
+
+constexpr int64_t DOOR_WALK_RESTART_WINDOW_SECONDS = 2 * 60 * 60;
+
+// Record one preemption of `aim`; returns the count for that target now.
+uint32_t NoteDoorWalkPreempted(DoorWalkRestarts& state, std::string const& aim, int64_t now);
+
+// The count for `aim` as it stands at `now` (zero for another target or a
+// stale record), without recording anything.
+uint32_t DoorWalkRestartCount(DoorWalkRestarts const& state, std::string const& aim, int64_t now);
+
 // ------------- a point aim left over from before a restart (#658) ------------
 //
 // TravelAimBook remembers which aims it wrote in memory only. After a restart
