@@ -41299,9 +41299,10 @@ private:
         return false;
     }
 
-    // ONE PASS OVER THE FAMILY: every member still on the instance map is cast
-    // for, held still, waited on or named as impossible. Returns whether a
-    // hearth is in play, which is what holds adoption back.
+    // PREFLIGHT THE FAMILY BEFORE A HEARTH: every proposed landing is checked
+    // against where the leader will be after this pass. The catch-up walk cannot
+    // reunite a member beyond its foot limit, so that stone is withheld. Returns
+    // whether a hearth is in play, which is what holds adoption back.
     bool DriveExitHearths(std::string const& family, std::string const& leaderName,
                           std::vector<std::string> const& members, ExitHearthEpisode& episode,
                           char const* phase, char const* reason)
@@ -41309,7 +41310,15 @@ private:
         using OverseerDecisions::ExitHearthStep;
 
         bool const familyHearthedOut = EpisodeHearthedSomebodyOut(episode, members);
-        std::vector<ExitHearthStep> steps;
+        struct ExitHearthMember
+        {
+            std::string name;
+            Player* bot{nullptr};
+            OverseerDecisions::ExitHearthFacts facts;
+            ExitHearthStep step{ExitHearthStep::NotInside};
+        };
+        std::vector<ExitHearthMember> pass;
+        pass.reserve(members.size());
         for (std::string const& name : members)
         {
             Player* bot = ObjectAccessor::FindPlayerByName(name);
@@ -41336,7 +41345,55 @@ private:
                 facts.standinGuest = IsStandinGuest(name);
             }
 
-            ExitHearthStep const step = OverseerDecisions::ExitFailureHearthStep(facts);
+            pass.push_back({name, bot, facts,
+                            OverseerDecisions::ExitFailureHearthStep(facts)});
+        }
+
+        OverseerDecisions::ExitHearthLanding leaderLanding;
+        ExitHearthMember const* leaderMember = nullptr;
+        for (ExitHearthMember const& member : pass)
+            if (member.name == leaderName)
+            {
+                leaderMember = &member;
+                break;
+            }
+        Player* leaderBot = leaderMember ? leaderMember->bot
+                                        : ObjectAccessor::FindPlayerByName(leaderName);
+        if (leaderBot && leaderBot->IsInWorld())
+        {
+            if (leaderMember && leaderMember->step == ExitHearthStep::Cast)
+            {
+                leaderLanding = {true, static_cast<uint32_t>(leaderBot->m_homebindMapId), 0,
+                                 leaderBot->m_homebindX, leaderBot->m_homebindY,
+                                 leaderBot->m_homebindZ};
+            }
+            else
+            {
+                leaderLanding = {true, leaderBot->GetMapId(), leaderBot->GetInstanceId(),
+                                 leaderBot->GetPositionX(), leaderBot->GetPositionY(),
+                                 leaderBot->GetPositionZ()};
+            }
+        }
+
+        std::vector<ExitHearthStep> steps;
+        steps.reserve(pass.size());
+        for (ExitHearthMember& member : pass)
+        {
+            std::string const& name = member.name;
+            Player* bot = member.bot;
+            OverseerDecisions::ExitHearthFacts& facts = member.facts;
+            if (member.step == ExitHearthStep::Cast)
+            {
+                OverseerDecisions::ExitHearthLanding const memberLanding{
+                    true, static_cast<uint32_t>(bot->m_homebindMapId), 0,
+                    bot->m_homebindX, bot->m_homebindY, bot->m_homebindZ};
+                facts.landingWithinLeaderWalkRange =
+                    OverseerDecisions::ExitHearthLandingWithinWalkRange(
+                        memberLanding, leaderLanding, CATCH_UP_FOOT_LIMIT_YARDS);
+                member.step = OverseerDecisions::ExitFailureHearthStep(facts);
+            }
+
+            ExitHearthStep const step = member.step;
             steps.push_back(step);
             if (step == ExitHearthStep::NotInside)
                 continue;

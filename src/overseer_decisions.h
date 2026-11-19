@@ -24347,6 +24347,21 @@ constexpr uint32_t DEATH_KNIGHT_START_MAP_ID = 609;
 // with this module's own kind='hearth' row. A person whose walk to the door
 // fails hearths out, and now the coordinator does too.
 //
+// A PROPOSED EXIT-HEARTH LANDING. A member must share both map and instance
+// with the leader and stay inside the catch-up distance the family can walk.
+struct ExitHearthLanding
+{
+    bool known{false};
+    uint32_t mapId{0};
+    uint32_t instanceId{0};
+    float x{0.f};
+    float y{0.f};
+    float z{0.f};
+};
+
+bool ExitHearthLandingWithinWalkRange(ExitHearthLanding const& member,
+                                      ExitHearthLanding const& leader, float maxWalkYards);
+
 // ONE MEMBER'S FACTS AT THE MOMENT EXIT HAS GIVEN UP (or at an IDLE poll after
 // it, while the episode is open). `pending` is a hearth this module already
 // has in flight for the character; `attempts` counts casts asked in this
@@ -24396,6 +24411,9 @@ struct ExitHearthFacts
     // Blackrock Depths party left inside after EXIT HEARTH, and stayed there
     // after its stand-in ended. Its stone is never withheld for its bind map.
     bool standinGuest{false};
+    // The adapter preflights this member's landing against the leader before
+    // asking the hearth executor to move it out of the run.
+    bool landingWithinLeaderWalkRange{true};
 };
 
 // How long a walk out must have failed before a stone bound off the door's

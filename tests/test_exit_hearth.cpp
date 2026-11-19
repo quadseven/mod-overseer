@@ -30,6 +30,8 @@ using OverseerDecisions::ExitFailureHearthStep;
 using OverseerDecisions::ExitHearthFacts;
 using OverseerDecisions::ExitHearthHoldsAdoption;
 using OverseerDecisions::ExitHearthImpossibleReason;
+using OverseerDecisions::ExitHearthLanding;
+using OverseerDecisions::ExitHearthLandingWithinWalkRange;
 using OverseerDecisions::ExitHearthStep;
 using OverseerDecisions::ExitHearthStepWord;
 using OverseerDecisions::EXIT_WALK_FAILING_GAP_SECONDS;
@@ -86,9 +88,44 @@ ExitHearthFacts Stranded()
 
 int main()
 {
+    // A member sent out by its hearthstone must land on the leader's map and
+    // within the same 1,500-yard range the family catch-up walk can cover.
+    {
+        ExitHearthLanding const leader{true, 0, 0, 10.f, 20.f, 30.f};
+        CheckBool("same-map landing inside the walk range is allowed",
+                  ExitHearthLandingWithinWalkRange(
+                      ExitHearthLanding{true, 0, 0, 1510.f, 20.f, 30.f}, leader, 1500.f),
+                  true);
+        CheckBool("a 2,517-yard landing is withheld",
+                  ExitHearthLandingWithinWalkRange(
+                      ExitHearthLanding{true, 0, 0, 2527.f, 20.f, 30.f}, leader, 1500.f),
+                  false);
+        CheckBool("a different-map landing is withheld",
+                  ExitHearthLandingWithinWalkRange(
+                      ExitHearthLanding{true, 1, 0, 10.f, 20.f, 30.f}, leader, 1500.f),
+                  false);
+        CheckBool("a different-instance landing is withheld",
+                  ExitHearthLandingWithinWalkRange(
+                      ExitHearthLanding{true, 0, 1, 10.f, 20.f, 30.f}, leader, 1500.f),
+                  false);
+        CheckBool("an unknown leader landing is withheld",
+                  ExitHearthLandingWithinWalkRange(
+                      ExitHearthLanding{true, 0, 0, 10.f, 20.f, 30.f},
+                      ExitHearthLanding{false, 0, 0, 0.f, 0.f, 0.f}, 1500.f),
+                  false);
+    }
+
     // -- one member ------------------------------------------------------------
     CheckStep("the stranded leader is cast for", ExitFailureHearthStep(Stranded()),
               ExitHearthStep::Cast);
+    {
+        ExitHearthFacts split = Stranded();
+        split.landingWithinLeaderWalkRange = false;
+        CheckStep("a hearth beyond the leader's walk range is withheld",
+                  ExitFailureHearthStep(split), ExitHearthStep::Impossible);
+        CheckText("and says why it is withheld", ExitHearthImpossibleReason(split),
+                  "hearth landing is outside the leader's walking catch-up range");
+    }
 
     {
         ExitHearthFacts outside = Stranded();
