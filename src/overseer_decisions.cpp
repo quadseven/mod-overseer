@@ -8773,6 +8773,13 @@ FarCatchUpStep FarCatchUpWalk(float yardsToAim, float footLimitYards, bool flewT
     return carriesMover ? FarCatchUpStep::Wait : FarCatchUpStep::Grant;
 }
 
+float FarCatchUpFootLimit(float footLimitYards, std::uint32_t holdsInARow)
+{
+    if (footLimitYards <= 0.f || holdsInARow < FAR_HOLDS_BEFORE_WALK)
+        return footLimitYards;
+    return footLimitYards < FAR_HOLD_WALK_YARDS ? FAR_HOLD_WALK_YARDS : footLimitYards;
+}
+
 char const* FarCatchUpStepWord(FarCatchUpStep step)
 {
     switch (step)

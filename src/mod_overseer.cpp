@@ -26700,6 +26700,30 @@ private:
     // read by DriveCatchUp before it starts another walk, and ended by
     // EndFarHold. See CATCH_UP_FOOT_LIMIT_YARDS.
     std::map<std::string, time_t> _catchUpHeldFar;
+
+    // HOW MANY FAR HOLDS IN A ROW A MEMBER HAS HAD, and when the last began. A
+    // count older than twice the hold is a fresh episode. See
+    // OverseerDecisions::FarCatchUpFootLimit.
+    std::map<std::string, std::pair<uint32, time_t>> _farHoldsInARow;
+
+    uint32 FarHoldsInARow(std::string const& name)
+    {
+        auto const it = _farHoldsInARow.find(name);
+        if (it == _farHoldsInARow.end())
+            return 0;
+        if (std::time(nullptr) - it->second.second > 2 * CATCH_UP_FAR_HOLD_SECONDS + 60)
+        {
+            _farHoldsInARow.erase(it);
+            return 0;
+        }
+        return it->second.first;
+    }
+
+    void NoteFarHold(std::string const& name)
+    {
+        uint32 const had = FarHoldsInARow(name);
+        _farHoldsInARow[name] = {had + 1, std::time(nullptr)};
+    }
     // Roster heads whose family is held because he is not leading (#736).
     std::set<std::string> _heldForAbsentHead;
 
@@ -31776,7 +31800,10 @@ private:
                 auto const walk = _dungeonEscorts.find(name);
                 OverseerDecisions::FarCatchUpStep const far =
                     OverseerDecisions::FarCatchUpWalk(
-                        distance, CATCH_UP_FOOT_LIMIT_YARDS, walk->second.flew,
+                        distance,
+                        OverseerDecisions::FarCatchUpFootLimit(CATCH_UP_FOOT_LIMIT_YARDS,
+                                                               FarHoldsInARow(name)),
+                        walk->second.flew,
                         !walk->second.mayFly, CanBeSentToNpc(botAI));
                 if (far == OverseerDecisions::FarCatchUpStep::Wait)
                     continue;
@@ -31795,6 +31822,7 @@ private:
                              static_cast<uint32>(CATCH_UP_FOOT_LIMIT_YARDS),
                              static_cast<uint32>(CATCH_UP_FAR_HOLD_SECONDS / 60));
                     _catchUpHeldFar[name] = std::time(nullptr);
+                    NoteFarHold(name);
                     // `state` IS DEAD AFTER THIS: EndOneEscort releases the
                     // errand, which erases the record it points into.
                     EndOneEscort(name, walk->second.granted);
