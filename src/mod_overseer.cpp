@@ -20480,7 +20480,41 @@ private:
         // vocabulary stays one vocabulary.
         uint32 fmEntry = 0;
         WorldPosition fmPos;
-        bool const fmResolved = ResolveTravelTarget(bot, "flight master", fmEntry, fmPos);
+        // The master is chosen AMONG THOSE THAT ANSWER FOR THE DEPARTURE NODE,
+        // never as the nearest of any and checked afterwards: the nearest one
+        // can serve a different node entirely.
+        bool fmResolved = false;
+        if (!OverseerDecisions::Classic::IsOutsideClassic(bot->GetMapId(), bot->GetZoneId()))
+        {
+            BuildTravelIndex();
+            std::vector<OverseerDecisions::FlightMasterCandidate> candidates;
+            std::vector<TravelSpawn const*> origin;
+            for (TravelSpawn const& spawn : _travelSpawns)
+            {
+                if (spawn.mapId != bot->GetMapId() ||
+                    !(spawn.npcFlags & UNIT_NPC_FLAG_FLIGHTMASTER))
+                    continue;
+                OverseerDecisions::FlightMasterCandidate c;
+                c.entry = spawn.entry;
+                c.x = spawn.x;
+                c.y = spawn.y;
+                c.usable = SpawnInWorldNow(spawn.gameEvent) &&
+                           OverseerDecisions::MayInteractAt(
+                               ReactionTowardCharacter(bot, spawn.faction)) &&
+                           !GroundOutsideClassic(bot, spawn.x, spawn.y, spawn.z);
+                candidates.push_back(c);
+                origin.push_back(&spawn);
+            }
+            int const picked = OverseerDecisions::PickFlightMasterForNode(
+                candidates, departure->x, departure->y, TRAVEL_FLIGHT_NODE_MATCH_YARDS);
+            if (picked >= 0)
+            {
+                TravelSpawn const& s = *origin[picked];
+                fmEntry = s.entry;
+                fmPos = WorldPosition(s.mapId, s.x, s.y, s.z);
+                fmResolved = true;
+            }
+        }
 
         // ...and it must be the creature that answers for the departure node.
         // See TRAVEL_FLIGHT_NODE_MATCH_YARDS: in a contested zone the nearest

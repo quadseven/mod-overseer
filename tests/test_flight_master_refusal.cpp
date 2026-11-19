@@ -13,9 +13,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 using OverseerDecisions::FlightMasterBoarding;
+using OverseerDecisions::FlightMasterCandidate;
 using OverseerDecisions::FlightMasterRefusalReason;
+using OverseerDecisions::PickFlightMasterForNode;
 using OverseerDecisions::ReadFlightMasterBoarding;
 
 namespace
@@ -78,6 +81,23 @@ void EachRefusalSaysItsOwnReason()
           FlightMasterRefusalReason(FlightMasterBoarding::Board, 3838).empty());
 }
 
+// THE MASTER IS CHOSEN AMONG THOSE THAT SERVE THE NODE. A nearer master that
+// serves another node, or one the character may not use, is never picked.
+void AMasterThatDoesNotServeTheNodeIsNeverPicked()
+{
+    std::vector<FlightMasterCandidate> c;
+    c.push_back({37888, 1000.f, 1000.f, true});   // nearest to the walker, far from the node
+    c.push_back({111, 5000.f, 5000.f, true});     // stands on the node
+    c.push_back({222, 5010.f, 5000.f, false});    // on the node but unusable
+    Check("the master that serves the node is picked over a nearer stranger",
+          PickFlightMasterForNode(c, 5000.f, 5000.f, 100.f) == 1);
+    Check("nothing serving the node picks nothing",
+          PickFlightMasterForNode(c, 9000.f, 9000.f, 100.f) == -1);
+    c[1].usable = false;
+    Check("an unusable master on the node is not picked",
+          PickFlightMasterForNode(c, 5000.f, 5000.f, 100.f) == -1);
+}
+
 }  // namespace
 
 int main()
@@ -85,6 +105,7 @@ int main()
     NothingResolvedIsNoneInReach();
     TheNodeMatchDecidesBetweenBoardAndWrongNode();
     EachRefusalSaysItsOwnReason();
+    AMasterThatDoesNotServeTheNodeIsNeverPicked();
 
     if (failures)
     {
