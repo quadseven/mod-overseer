@@ -25575,6 +25575,17 @@ private:
                  "(the last is {:.0f} yards from the aim{})",
                  name, target, OverseerDecisions::RouteNodeList(plan.nodes, 64),
                  plan.endsFromAimYards, plan.wentRound ? ", chosen as a way round" : "");
+        // WHO FINISHES A WALK TO THE MOLTEN CORE DOOR, SAID ONCE PER PLAN (#1557,
+        // #1573): a plan that ends hundreds of yards short is the survey giving
+        // way to the walkway leg, or a plan that stops, and the log says which.
+        {
+            OverseerDecisions::DoorPlanTail const tail = OverseerDecisions::ReadDoorPlanTail(
+                bot->GetMapId(), aimX, aimY, aimZ, plan);
+            std::string const tailLine =
+                OverseerDecisions::DoorPlanTailLine(tail, plan.endsFromAimYards);
+            if (!tailLine.empty())
+                LOG_INFO("module.overseer", "overseer: '{}' door walk: {}", name, tailLine);
+        }
         // AND SAID SEPARATELY WHEN THAT ROUTE IS ONLY THE FIRST HALF (#356), for
         // the same reason the guarded note below is separate: the line above has
         // meant one thing since #316 and an operator reading it for a death must

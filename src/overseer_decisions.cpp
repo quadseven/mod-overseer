@@ -29022,6 +29022,44 @@ std::size_t DropBogusDoorLinks(std::vector<RouteLink>& links, std::uint32_t mapI
 }
 
 
+DoorPlanTail ReadDoorPlanTail(std::uint32_t mapId, float aimX, float aimY, float aimZ,
+                              RoutePlan const& plan)
+{
+    if (!AimOnMoltenCoreWalkway(mapId, aimX, aimY, aimZ) ||
+        plan.verdict != RoutePlanVerdict::Planned || !(plan.endsFromAimYards >= 0.f))
+        return DoorPlanTail::NotADoorAim;
+    if (plan.endsFromAimYards <= DOOR_PLAN_REACH_YARDS)
+        return DoorPlanTail::SurveyReachesAim;
+    if (plan.endsFromAimYards <= DOOR_PLAN_HANDOVER_YARDS)
+        return DoorPlanTail::WalkwayLegFinishes;
+    return DoorPlanTail::StopsShort;
+}
+
+std::string DoorPlanTailLine(DoorPlanTail tail, float shortYards)
+{
+    char buf[400];
+    switch (tail)
+    {
+        case DoorPlanTail::SurveyReachesAim:
+            std::snprintf(buf, sizeof buf, "the plan ends %.0f yards from the door aim, so the survey reaches it", shortYards);
+            break;
+        case DoorPlanTail::WalkwayLegFinishes:
+            std::snprintf(buf, sizeof buf,
+                          "the plan ends %.0f yards short of the door aim because the survey's links into the door are not a walkable way; the rest is the walkway leg drawn from the navmesh, which refuses any polygon it cannot show is safe and never draws a straight line at the aim",
+                          shortYards);
+            break;
+        case DoorPlanTail::StopsShort:
+            std::snprintf(buf, sizeof buf,
+                          "the plan ends %.0f yards short of the door aim, farther than the walkway leg can be shown to pick up from; the walk stops at the last planned node and does not improvise the rest",
+                          shortYards);
+            break;
+        default:
+            return std::string();
+    }
+    return std::string(buf);
+}
+
+
 // ------------------------------------------------ enchant-for (trade window) --
 
 bool IsEnchantForRow(std::string const& command)
