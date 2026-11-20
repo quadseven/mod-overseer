@@ -65,6 +65,20 @@ void AWanderingGiverIsFollowed()
            "the walk closes to the stand distance, so the giver's next steps stay in reach");
 }
 
+void AGiverFarFromItsSpawnPointIsFollowed()
+{
+    // A giver on a long route stands hundreds of yards from its spawn row.
+    // The old 250 yard bound ended such a walk at the empty point and reported
+    // an arrival, and the take row then refused.
+    Expect(SpawnWalkGiverStepFor(Giver(600.f)) == SpawnWalkGiverStep::Follow,
+           "a living giver 600 yards from its spawn point is followed, not left");
+    Expect(SPAWN_WALK_GIVER_SEEN_YARDS >= 600.f,
+           "the seen distance covers a giver on a long route");
+    // Closing 800 yards at a running pace must fit in the follow seconds.
+    Expect(SPAWN_WALK_GIVER_FOLLOW_SECONDS >= 120,
+           "the follow seconds are enough to cross the seen distance on foot");
+}
+
 void TheWalkEndsBesideTheGiver()
 {
     Expect(SpawnWalkGiverStepFor(Giver(SPAWN_WALK_GIVER_STAND_YARDS)) ==
@@ -143,6 +157,7 @@ void TheAdapterFollowsTheLivingGiver()
 int main()
 {
     AWanderingGiverIsFollowed();
+    AGiverFarFromItsSpawnPointIsFollowed();
     TheWalkEndsBesideTheGiver();
     TheFollowIsBounded();
     EverythingElseIsStillAPlace();

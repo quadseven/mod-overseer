@@ -23267,14 +23267,17 @@ SpawnWalkArrivalHold SpawnWalkArrivalHoldFor(bool inQuestParty, bool asksStay,
 // it. It stops SPAWN_WALK_GIVER_STAND_YARDS short, well inside the take's
 // SPAWN_WALK_ARRIVE_YARDS, so the steps the giver takes before the quest row
 // runs do not carry it out of reach again. The follow is bounded twice: a
-// creature farther than SPAWN_WALK_GIVER_SEEN_YARDS is not chased, and one not
+// creature farther than SPAWN_WALK_GIVER_SEEN_YARDS is not chased (a giver
+// that walks a long route, an escort or a caravan, can stand several hundred
+// yards from its spawn row: a walk that stopped at the row, 600 yards from it,
+// reported arrival and the take refused seconds later), and one not
 // caught within SPAWN_WALK_GIVER_FOLLOW_SECONDS ends the walk at the place, as
 // every such walk ended before. A follow also never costs a walk its arrival:
 // when the walk's own clocks are nearly spent it ends at the place instead of
 // running into a timeout or a stall it would not have met standing still.
-constexpr float SPAWN_WALK_GIVER_SEEN_YARDS = 250.0f;
+constexpr float SPAWN_WALK_GIVER_SEEN_YARDS = 800.0f;
 constexpr float SPAWN_WALK_GIVER_STAND_YARDS = 5.0f;
-constexpr uint32_t SPAWN_WALK_GIVER_FOLLOW_SECONDS = 60;
+constexpr uint32_t SPAWN_WALK_GIVER_FOLLOW_SECONDS = 150;
 
 struct SpawnWalkGiverFacts
 {
