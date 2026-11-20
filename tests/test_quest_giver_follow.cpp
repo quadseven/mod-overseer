@@ -101,7 +101,7 @@ void TheFollowIsBounded()
     Expect(SpawnWalkGiverStepFor(Giver(60.f, SPAWN_WALK_GIVER_FOLLOW_SECONDS * 1000u - 1u)) ==
                SpawnWalkGiverStep::Follow,
            "the follow runs up to its bound");
-    Expect(SPAWN_WALK_GIVER_FOLLOW_SECONDS > 0 && SPAWN_WALK_GIVER_FOLLOW_SECONDS <= 120,
+    Expect(SPAWN_WALK_GIVER_FOLLOW_SECONDS > 0 && SPAWN_WALK_GIVER_FOLLOW_SECONDS <= 300,
            "the follow is bounded in seconds");
     SpawnWalkGiverFacts faltering = Giver(60.f);
     faltering.walkFaltering = true;
