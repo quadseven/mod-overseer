@@ -15058,6 +15058,12 @@ constexpr float WRONG_LEVEL_YARDS = 50.f;
 // True when the character stands more than WRONG_LEVEL_YARDS above the aim.
 bool EndedAboveTheAim(float stoodZ, float aimZ);
 
+// MAY THE NEXT PLAN FOR THIS AIM TAKE A WAY ROUND (#1557)? `wrongLevelAim` is
+// the aim of the walker's last attempt that ended above it ("" when none did).
+// The same aim again is planned without the way round, so the retry is not the
+// walk that already ended on the wrong level; any other aim plans as usual.
+bool RoundAllowedForRetry(std::string const& wrongLevelAim, std::string const& aim);
+
 // The planned node ids as one line fragment, "3380 1485", at most `cap` of
 // them, with "... and N more" after a cut list. Empty for an empty plan.
 std::string RouteNodeList(std::vector<std::uint32_t> const& nodes, std::size_t cap);
