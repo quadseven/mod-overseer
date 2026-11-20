@@ -14,6 +14,7 @@
 
 #include "overseer_decisions.h"
 
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -58,6 +59,11 @@ RouteLink Link(std::uint32_t from, std::uint32_t to, float yards)
 // The issue's data shape: a start node, an outside node (3380), and the two
 // door nodes (1485, 1486) 5 yards from the aim, linked only from 3380. The
 // outside node is placed 294 yards from the aim.
+// The fixture's own geometry: node 3380 sits this far south of the aim, so the
+// plan can end no nearer than this by construction (an oracle worked by hand,
+// not read back from the code under test).
+constexpr float OUTSIDE_NODE_YARDS = 294.f;
+
 struct Survey
 {
     std::vector<RouteNode> nodes;
@@ -68,7 +74,7 @@ Survey MakeSurvey()
 {
     Survey s;
     s.nodes = {Node(245, -6000.f, -2500.f, 120.f),
-               Node(3380, W::LOTHOS_X, W::LOTHOS_Y - 294.f, 150.f),
+               Node(3380, W::LOTHOS_X, W::LOTHOS_Y - OUTSIDE_NODE_YARDS, 150.f),
                Node(1485, W::LOTHOS_X + 3.f, W::LOTHOS_Y + 3.f, W::LOTHOS_Z),
                Node(1486, W::LOTHOS_X - 3.f, W::LOTHOS_Y - 2.f, W::LOTHOS_Z)};
     s.links = {Link(245, 3380, 600.f), Link(3380, 1485, 700.f), Link(3380, 1486, 700.f)};
@@ -100,13 +106,13 @@ void WithTheDoorLinksDroppedThePlanEndsShortAndTheWalkwayLegFinishes()
           DropBogusDoorLinks(s.links, 0, W::LOTHOS_X, W::LOTHOS_Y, W::LOTHOS_Z) == 2, true);
     RoutePlan const plan = Plan(s);
     Check("planned", plan.verdict == RoutePlanVerdict::Planned, true);
-    Check("ends short of the aim", plan.endsFromAimYards > 280.f && plan.endsFromAimYards < 300.f,
-          true);
+    Check("ends short of the aim by the fixture's own distance",
+          std::fabs(plan.endsFromAimYards - OUTSIDE_NODE_YARDS) < 0.01f, true);
     DoorPlanTail const tail = ReadDoorPlanTail(0, W::LOTHOS_X, W::LOTHOS_Y, W::LOTHOS_Z, plan);
     Check("the walkway leg finishes it", tail == DoorPlanTail::WalkwayLegFinishes, true);
     std::string const line = DoorPlanTailLine(tail, plan.endsFromAimYards);
     Check("the line names the walkway leg", line.find("walkway leg") != std::string::npos, true);
-    Check("the line names the yards", line.find("294") != std::string::npos, true);
+    Check("the line names the yards", line.find(std::to_string(static_cast<int>(OUTSIDE_NODE_YARDS))) != std::string::npos, true);
 }
 
 void AnUnprovenLastLegStopsAndSaysWhy()

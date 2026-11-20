@@ -31822,7 +31822,7 @@ std::size_t DropBogusDoorLinks(std::vector<RouteLink>& links, std::uint32_t mapI
 // walkway leg is in reach of the plan's end, so the plan stops there and says
 // so instead of leaving the character to find out.
 constexpr float DOOR_PLAN_REACH_YARDS = 10.f;
-constexpr float DOOR_PLAN_HANDOVER_YARDS = 400.f;
+constexpr float DOOR_PLAN_HANDOVER_YARDS = StagingCorridorLimits{}.joinYards;
 
 enum class DoorPlanTail : std::uint8_t
 {
