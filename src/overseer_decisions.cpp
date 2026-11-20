@@ -18349,6 +18349,20 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
             return step;
 
         case RaidRunPhase::Form:
+            // A FORMED RAID THE QUORUM CANNOT REACH (#1555): every seat that can be
+            // added is in, and the world holds fewer seats than the floor. The
+            // head does not walk to a door it cannot fill; it holds here, saying
+            // so, for the same wait a seat that will not join gets.
+            if (facts.raidFormed && facts.addable == 0 &&
+                facts.inWorld < facts.quorumSeats &&
+                facts.heldSeconds < RAID_FORM_WAIT_SECONDS)
+            {
+                step.phase = RaidRunPhase::Form;
+                step.shortfall = RaidQuorumShortfall(facts);
+                step.why = "the seats in the world are under the quorum; the raid "
+                           "holds in FORM before it walks to the door";
+                return step;
+            }
             if (!facts.raidFormed ||
                 (facts.addable > 0 && facts.heldSeconds < RAID_FORM_WAIT_SECONDS))
             {
