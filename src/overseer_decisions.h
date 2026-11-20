@@ -1543,6 +1543,130 @@ PlaneHearthVerdict DecidePlaneHearth(PlaneHearthFacts const& facts);
 // seconds later. Any other refusal is not guessed at and stays loud.
 bool PlaneHearthRefusalClearsItself(std::string const& refusal);
 
+// WHAT A STALLED ERRAND IS STANDING ON, AND THE ONE BOUNDED RECOVERY FOR THE
+// ONE CASE THAT CAN BE RECOVERED (#188).
+//
+// THE FAILURE. A family can stand on one spot for many hours with identical
+// coordinates while its town errands are released every minute for "no
+// progress" and backed off for fifteen minutes, again and again. The release
+// said the navmesh had no route and the survey had no way round, and nothing
+// said WHY, so nothing could tell a character standing off the mesh (on
+// geometry the mesh does not cover) from one standing on it with no connected
+// way to the aim. The first is recoverable by the module's own trusted means.
+// The second is not, and is a person's decision.
+//
+// THREE READINGS, from two instruments the server already has: the nearest
+// navigation polygon to the walker's own feet, and the path generator's answer
+// for the aim. A polygon within `feetOnMeshYards` of the feet is "on the mesh".
+// With the feet on it, a path that is a real route (computed, not NOPATH, not
+// the two-point shortcut a Player gets when no polygon is found, not ending
+// off the mesh) is CONNECTED and the stall is not terrain; anything else is
+// DISCONNECTED. With no polygon at the feet it is OFF THE MESH, whatever the
+// path generator says about the aim.
+enum class StallFooting : std::uint8_t
+{
+    OnMeshConnected,
+    OnMeshDisconnected,
+    OffMesh,
+};
+
+struct StallFootingFacts
+{
+    // Distance from the feet to the nearest polygon the server finds in its
+    // search box; negative when none was found.
+    float nearestPolygonYards{-1.f};
+    bool pathComputed{false};
+    bool pathNoPath{false};
+    bool pathShortcut{false};      // PATHFIND_NOT_USING_PATH
+    bool pathEndOffMesh{false};    // PATHFIND_FARFROMPOLY_END
+};
+
+StallFooting ClassifyStallFooting(StallFootingFacts const& facts, float feetOnMeshYards);
+char const* StallFootingName(StallFooting footing);
+
+// ONE ESCALATION, AFTER AN HOUR OF FAILING. Counted in releases AND in seconds
+// since the first of them, so a faster release cadence cannot shorten the
+// hour and a slower one cannot shorten the count. A character that has moved
+// further than `movedResetYards` from where the streak began is not stuck
+// there any more, and the streak starts over.
+struct StallRecoveryLimits
+{
+    std::uint32_t releases{30};
+    std::int64_t seconds{3600};
+    float feetOnMeshYards{2.5f};
+    // How far the nearest polygon may be for the walk rung. Twenty is the
+    // longest ground move the core's shortcut refusal lets through from off
+    // the mesh ("stepping back onto the mesh"), so the walk stays inside what
+    // that refusal allows and this module's own bound agrees with it.
+    float nearestMeshYards{20.f};
+    float movedResetYards{25.f};
+    // The disconnected case and an impossible recovery are each said at most
+    // this often per character.
+    std::int64_t saySeconds{3600};
+};
+
+struct StallRecoveryState
+{
+    std::uint32_t offMeshReleases{0};
+    std::int64_t since{0};
+    float anchorX{0.f};
+    float anchorY{0.f};
+    bool escalated{false};
+    std::int64_t unreachableSaidAt{0};
+    std::int64_t refusalSaidAt{0};
+};
+
+struct StallRecoveryFacts
+{
+    StallFooting footing{StallFooting::OnMeshConnected};
+    std::int64_t now{0};
+    float x{0.f};
+    float y{0.f};
+    float nearestPolygonYards{-1.f};
+    // The module's own drop and wall checks passed for the whole straight walk
+    // to the nearest polygon point.
+    bool walkSafe{false};
+    bool hasStone{false};
+    bool stoneReady{false};
+    std::uint32_t bindMap{0};
+    std::uint32_t currentMap{0};
+    bool hearthPending{false};
+};
+
+enum class StallRecoveryAction : std::uint8_t
+{
+    // The plain release and backoff, as before, with nothing to say.
+    Backoff,
+    // Walk to the nearest polygon point the server computed, INSTEAD of backing
+    // off again.
+    WalkToMesh,
+    // Use the hearthstone (DecidePlaneHearth's rules, same-map bind only),
+    // INSTEAD of backing off again.
+    Hearth,
+    // Feet on the mesh and no connected way: say once an hour that a person
+    // must decide. The plain backoff follows.
+    SayUnreachable,
+    // The bound was reached and no rung is available: say why, at most once an
+    // hour. The plain backoff follows.
+    SayNoRecovery,
+};
+
+struct StallRecoveryVerdict
+{
+    StallRecoveryAction action{StallRecoveryAction::Backoff};
+    std::string reason;
+    std::uint32_t releases{0};
+};
+
+StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
+                                       StallRecoveryFacts const& facts,
+                                       StallRecoveryLimits const& limits);
+
+// THE ADAPTER COULD NOT DO WHAT THE VERDICT ASKED (a hearth cast refused for a
+// reason that clears itself): the escalation is not spent, and the next
+// release asks again.
+void StallRecoveryNotDone(StallRecoveryState& state);
+
 // IS THIS CHARACTER BELOW THE WORLD, ON EVIDENCE AND NOT ON A MISSING
 // READING (#725)? A surface overhead by the gap, no instrument standing it on
 // the ground, and (where the movement state was measured) falling. What the

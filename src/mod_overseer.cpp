@@ -1946,6 +1946,18 @@ constexpr OverseerDecisions::ErrandDeathLimits ERRAND_DEATH_LIMITS{};
 // refused for a bounded period. This is a backstop for an aim writer that
 // keeps re-arming a route the character cannot reach.
 constexpr uint32 TRAVEL_STUCK_BACKOFF_RELEASES = 3;
+
+// WHEN A STALL RELEASE ESCALATES INSTEAD OF BACKING OFF AGAIN (#188). Thirty
+// no-progress releases AND an hour since the first of them, all read with the
+// walker's feet off the navigation mesh. The loop of three releases and a
+// fifteen minute backoff produces roughly nine releases an hour, so the count
+// is what an hour of failing looks like and the seconds keep it an hour if the
+// cadence ever changes. See OverseerDecisions::StallRecoveryStep.
+constexpr OverseerDecisions::StallRecoveryLimits STALL_RECOVERY_LIMITS{};
+// How far around the walker's feet the server is asked for a polygon, and how
+// far above and below. Detour's extents are half-sizes.
+constexpr float STALL_MESH_SEARCH_YARDS = 20.0f;
+constexpr float STALL_MESH_SEARCH_HEIGHT_YARDS = 20.0f;
 constexpr time_t TRAVEL_STUCK_BACKOFF_SECONDS =
     static_cast<time_t>(ERRAND_DEATH_LIMITS.cooloffSeconds);
 
@@ -32458,7 +32470,12 @@ private:
                         OverseerDecisions::ErrandProgress::NoProgress &&
                     botAI->rpgInfo.stuckAttempts >= 1)
                 {
-                    bool const backoff = _travelAims.NoteNoProgressRelease(name, target);
+                    // WHAT THE WALKER STANDS ON, SAID ONCE PER RELEASE, and the one
+                    // bounded recovery for feet that are off the mesh (#188). True
+                    // when the recovery took the place of the backoff.
+                    bool const recovered = ReadStalledFooting(bot, name, pos);
+                    bool const backoff =
+                        _travelAims.NoteNoProgressRelease(name, target) && !recovered;
                     if (backoff)
                     {
                         LOG_WARN("module.overseer",
@@ -41675,6 +41692,173 @@ private:
     // refused cast once per distinct reason; a refused cast is asked again on
     // the next poll because most refusals (moving, casting) clear by
     // themselves and DoHearth's own hold is what clears the commonest one.
+    // WHAT A STALLED ERRAND'S WALKER STANDS ON, AND THE BOUNDED RECOVERY FOR
+    // FEET OFF THE MESH (#188). Called once per no-progress release, in the
+    // open world only (an instance's mesh is a different question). The
+    // classification and every threshold are OverseerDecisions::
+    // StallRecoveryStep's; this reads the two instruments, says the line, and
+    // does the one thing the verdict allows. Returns true when an escalation
+    // was made and the plain backoff is not wanted this time.
+    //
+    // NO MESH DATA AT ALL IS "UNKNOWN", NOT "OFF THE MESH": with no query to
+    // ask, nothing is read, said or done.
+    static constexpr uint32 STALL_RECOVERY_POINT_ID = 0;
+    std::map<std::string, OverseerDecisions::StallRecoveryState> _stallRecovery;
+
+    bool ReadStalledFooting(Player* bot, std::string const& name, WorldPosition const& aim)
+    {
+        Map* const map = bot->GetMap();
+        if (!map || map->Instanceable())
+            return false;
+        dtNavMeshQuery const* const query =
+            map->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
+        if (!query)
+            return false;
+
+        // The nearest polygon to the feet, as the server computes it. Detour's
+        // axes are (y, z, x) of the world's.
+        float const feet[3] = {bot->GetPositionY(), bot->GetPositionZ(), bot->GetPositionX()};
+        float const extents[3] = {STALL_MESH_SEARCH_YARDS, STALL_MESH_SEARCH_HEIGHT_YARDS,
+                                  STALL_MESH_SEARCH_YARDS};
+        dtQueryFilter filter;
+        dtPolyRef polygon = 0;
+        float nearest[3] = {};
+        OverseerDecisions::StallFootingFacts reading;
+        if (!dtStatusFailed(query->findNearestPoly(feet, extents, &filter, &polygon, nearest)) &&
+            polygon)
+        {
+            float const ex = nearest[2] - bot->GetPositionX();
+            float const ey = nearest[0] - bot->GetPositionY();
+            float const ez = nearest[1] - bot->GetPositionZ();
+            reading.nearestPolygonYards = std::sqrt(ex * ex + ey * ey + ez * ez);
+        }
+        PathGenerator path(bot);
+        reading.pathComputed =
+            path.CalculatePath(aim.GetPositionX(), aim.GetPositionY(), aim.GetPositionZ());
+        PathType const type = path.GetPathType();
+        reading.pathNoPath = (type & PATHFIND_NOPATH) != 0;
+        reading.pathShortcut = (type & PATHFIND_NOT_USING_PATH) != 0;
+        reading.pathEndOffMesh = (type & PATHFIND_FARFROMPOLY_END) != 0;
+        OverseerDecisions::StallFooting const footing = OverseerDecisions::ClassifyStallFooting(
+            reading, STALL_RECOVERY_LIMITS.feetOnMeshYards);
+
+        // The walk rung is only ever to the polygon point the server computed,
+        // and only if this module's own ground and wall checks pass for the
+        // whole way: the same two every travel step is asked.
+        float walkFooting = bot->GetPositionZ();
+        bool walkSafe = false;
+        if (footing == OverseerDecisions::StallFooting::OffMesh && polygon &&
+            reading.nearestPolygonYards <= STALL_RECOVERY_LIMITS.nearestMeshYards)
+            walkSafe = GroundHolds(bot, nearest[2], nearest[0], walkFooting) &&
+                       NothingInTheWay(bot, nearest[2], nearest[0], walkFooting);
+
+        std::time_t const now = std::time(nullptr);
+        OverseerDecisions::StallRecoveryFacts facts;
+        facts.footing = footing;
+        facts.now = static_cast<std::int64_t>(now);
+        facts.x = bot->GetPositionX();
+        facts.y = bot->GetPositionY();
+        facts.nearestPolygonYards = polygon ? reading.nearestPolygonYards : -1.f;
+        facts.walkSafe = walkSafe;
+        uint32 const stone = HearthstoneSpellOf(bot);
+        facts.hasStone = stone != 0;
+        facts.stoneReady = stone && !bot->HasSpellCooldown(stone);
+        facts.bindMap = bot->m_homebindMapId;
+        facts.currentMap = bot->GetMapId();
+        facts.hearthPending = HearthPendingFor(bot->GetName());
+        OverseerDecisions::StallRecoveryState& state = _stallRecovery[LowerName(name)];
+        OverseerDecisions::StallRecoveryVerdict const verdict =
+            OverseerDecisions::StallRecoveryStep(state, facts, STALL_RECOVERY_LIMITS);
+
+        // THE READING, every release.
+        if (footing == OverseerDecisions::StallFooting::OffMesh)
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' was released for no progress and the server finds no "
+                     "navigation polygon at its feet ({}): it is standing OFF THE MESH at map "
+                     "{} ({:.1f}, {:.1f}, {:.1f}), path type {} toward the aim. Release {} of "
+                     "{} (and {}s) before the one bounded recovery (#188)",
+                     name,
+                     polygon ? "nearest one " + std::to_string(static_cast<int>(
+                                                    reading.nearestPolygonYards)) +
+                                   " yards away"
+                             : std::string("none within ") +
+                                   std::to_string(static_cast<int>(STALL_MESH_SEARCH_YARDS)) +
+                                   " yards",
+                     static_cast<uint32>(bot->GetMapId()), bot->GetPositionX(),
+                     bot->GetPositionY(), bot->GetPositionZ(), static_cast<uint32>(type),
+                     verdict.releases, STALL_RECOVERY_LIMITS.releases,
+                     static_cast<uint32>(STALL_RECOVERY_LIMITS.seconds));
+        else
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' was released for no progress and stands {} (polygon "
+                     "{:.1f} yards from its feet, path type {} toward the aim)",
+                     name, OverseerDecisions::StallFootingName(footing),
+                     reading.nearestPolygonYards, static_cast<uint32>(type));
+
+        using Action = OverseerDecisions::StallRecoveryAction;
+        switch (verdict.action)
+        {
+            case Action::SayUnreachable:
+                LOG_WARN("module.overseer",
+                         "overseer: the errand of '{}' is UNREACHABLE FROM HERE: {}. Nothing "
+                         "moves it and no recovery is tried; said at most once an hour",
+                         name, verdict.reason);
+                return false;
+            case Action::SayNoRecovery:
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' has been off the mesh for {} releases and the bounded "
+                         "recovery has no rung it may take: {}. The plain backoff stands; said "
+                         "at most once an hour",
+                         name, verdict.releases, verdict.reason);
+                return false;
+            case Action::WalkToMesh:
+            {
+                if (!bot->IsStandState())
+                    bot->SetStandState(UNIT_STAND_STATE_STAND);
+                bot->GetMotionMaster()->MovePoint(STALL_RECOVERY_POINT_ID, nearest[2],
+                                                  nearest[0], walkFooting);
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' has been off the mesh for {} releases over {}s: RUNG 1, "
+                         "it walks {:.1f} yards to the nearest polygon point the server "
+                         "computed, because {}. No coordinate is written here and no teleport "
+                         "is made. Once per streak",
+                         name, verdict.releases,
+                         static_cast<uint32>(STALL_RECOVERY_LIMITS.seconds),
+                         reading.nearestPolygonYards, verdict.reason);
+                return true;
+            }
+            case Action::Hearth:
+            {
+                char const* status = "error";
+                std::string evidence;
+                char const* const refused =
+                    DoHearth(bot, "use", status, evidence, _pendingHearths, 0);
+                if (refused && *refused)
+                {
+                    OverseerDecisions::StallRecoveryNotDone(state);
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' is off the mesh and RUNG 2, the hearthstone, was "
+                             "refused this release ({}); the plain backoff stands and it is "
+                             "asked again on the next release",
+                             name, refused);
+                    return false;
+                }
+                LOG_WARN("module.overseer",
+                         "overseer: '{}' has been off the mesh for {} releases over {}s: RUNG 2, "
+                         "it USES ITS HEARTHSTONE, as a player would, to its bind on the same "
+                         "map at ({:.1f}, {:.1f}, {:.1f}), because {}. No teleport is written "
+                         "and no map is changed. Once per streak",
+                         name, verdict.releases,
+                         static_cast<uint32>(STALL_RECOVERY_LIMITS.seconds), bot->m_homebindX,
+                         bot->m_homebindY, bot->m_homebindZ, verdict.reason);
+                return true;
+            }
+            case Action::Backoff:
+                break;
+        }
+        return false;
+    }
+
     std::map<std::string, std::time_t> _planeHearths;
     std::map<std::string, std::string> _planeHearthRefusal;
 
