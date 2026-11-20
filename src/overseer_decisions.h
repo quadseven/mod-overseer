@@ -29822,6 +29822,48 @@ char const* BattlegroundQueueRefusal(BattlegroundQueueFacts const& facts);
 // waiting; a full queue list, a deserter debuff or the dungeon finder do.
 TownRetry BattlegroundQueueRetry(std::string const& detail);
 
+// A MEMBER LEAVES A BATTLEGROUND QUEUE (counterpart of bg-queue). Nothing
+// else can take a member out of a queue that never pops: the playerbots
+// `bg leave` action returns early unless its own join action set its own
+// `bg type` value, which a queue made by `bg-queue` never does. The row is
+//
+//     bg-leave [<av|wsg|ab>]
+//
+// With no argument every queue the character holds is left. The executor
+// sends CMSG_BATTLEFIELD_PORT with action 0 to the core's own handler, then
+// reads the queue back. A character inside a battleground is refused, never
+// pulled out.
+bool IsBattlegroundLeaveRow(std::string const& command);
+
+struct BattlegroundLeaveRequest
+{
+    bool valid{false};
+    bool all{false};       // no argument: leave every queue
+    std::string key;       // av, wsg or ab, empty when all
+    uint32_t bgTypeId{0};  // BattlegroundTypeId, 0 when all
+    std::string error;     // the refusal literal when invalid, else empty
+};
+
+BattlegroundLeaveRequest ParseBattlegroundLeaveRequest(std::string const& command);
+
+enum class BattlegroundLeaveOutcome
+{
+    Left,    // ask the core to remove the character
+    Already, // it was not queued: nothing to do, not a failure
+    Refused, // inside a battleground
+};
+
+struct BattlegroundLeaveFacts
+{
+    bool inBattleground{false};
+    bool queued{false};  // in the named queue, or in any queue when all
+};
+
+BattlegroundLeaveOutcome DecideBattlegroundLeave(BattlegroundLeaveFacts const& facts);
+
+// The refusal literal for a Refused outcome.
+char const* BattlegroundLeaveRefusal();
+
 // ---------------------------------------------------------------- stand-ins --
 //
 // A FAMILY MEMBER SITS OUT AND A GUILD MEMBER STANDS IN (operator request,
