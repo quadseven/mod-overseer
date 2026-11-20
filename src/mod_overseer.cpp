@@ -43014,6 +43014,22 @@ private:
         return value ? std::string(value->Get()) : std::string();
     }
 
+    // THE STOP TEXT FROM WHOEVER THE MODULE RAN ON (#1483). The module logs its
+    // stop on its own elected leader's context, which need not be the run's
+    // leader; the leader is asked first, then every other member.
+    static std::string PartyBrainStopReason(
+        Player* leader, std::vector<OverseerDecisions::DungeonRunEntryState> const& states)
+    {
+        std::vector<std::string> reasons{DungeonBrainStopReason(leader)};
+        for (OverseerDecisions::DungeonRunEntryState const& state : states)
+        {
+            Player* const member = ObjectAccessor::FindPlayerByName(state.name);
+            if (member && member != leader)
+                reasons.push_back(DungeonBrainStopReason(member));
+        }
+        return OverseerDecisions::FirstDungeonStopReason(reasons);
+    }
+
     // Every bit the map's DungeonEncounter.dbc rows credit at normal
     // difficulty, 0 for a map that credits none.
     static uint32 MapEncounterMask(uint32 mapId)
@@ -43305,7 +43321,7 @@ private:
         // DUNGEON_CLEAR_STOPPED_REARM_SECONDS old, instead of after the busy
         // ceiling and the stall window. Forgetting the `dc on` record is what
         // makes the arming drive issue it next poll.
-        std::string const stopReason = DungeonBrainStopReason(leader);
+        std::string const stopReason = PartyBrainStopReason(leader, states);
         if (!OverseerDecisions::DungeonClearWaitStopRearms(stopReason, coord.clearRearms,
                                                            DUNGEON_CLEAR_WAIT_REARMS))
             coord.clearStopSeenAt = 0;
