@@ -14,6 +14,8 @@
 
 using OverseerDecisions::AnswerTradeAtHead;
 using OverseerDecisions::HeadTradeAnswer;
+using OverseerDecisions::HeadTradeFacts;
+using OverseerDecisions::JudgeTradeWindow;
 
 namespace
 {
@@ -48,6 +50,39 @@ void TheDecision()
           AnswerTradeAtHead(true, 1, 0, 0, 100, 0) == HeadTradeAnswer::Decline);
 }
 
+void TheWholeWindow()
+{
+    HeadTradeFacts gift;
+    gift.traderIsKin = true;
+    gift.theyOffer = 1;
+    Check("a gift in range with room is accepted",
+          JudgeTradeWindow(gift).answer == HeadTradeAnswer::Accept);
+    HeadTradeFacts far = gift;
+    far.inTradeRange = false;
+    Check("an accept out of trade range is declined",
+          JudgeTradeWindow(far).answer == HeadTradeAnswer::Decline);
+    HeadTradeFacts full = gift;
+    full.roomForOffered = false;
+    Check("an accept with no room is declined",
+          JudgeTradeWindow(full).answer == HeadTradeAnswer::Decline);
+    HeadTradeFacts gone = gift;
+    gone.otherSidePresent = false;
+    Check("a window whose other side is gone is cancelled",
+          JudgeTradeWindow(gone).answer == HeadTradeAnswer::Cancel);
+    HeadTradeFacts old = gift;
+    old.openSeconds = OverseerDecisions::HEAD_TRADE_MAX_OPEN_SECONDS;
+    Check("a window past the bound is cancelled even when it would be accepted",
+          JudgeTradeWindow(old).answer == HeadTradeAnswer::Cancel);
+    HeadTradeFacts waiting;
+    waiting.traderIsKin = true;
+    waiting.openSeconds = 10;
+    Check("an empty family window still waits",
+          JudgeTradeWindow(waiting).answer == HeadTradeAnswer::Wait);
+    Check("every verdict names a reason",
+          std::string(JudgeTradeWindow(far).reason).size() > 0 &&
+              std::string(JudgeTradeWindow(gone).reason).size() > 0);
+}
+
 void TheAdapterIsWired()
 {
     std::ifstream in("src/mod_overseer.cpp");
@@ -57,7 +92,9 @@ void TheAdapterIsWired()
     Check("the module source is readable (run from the repo root)", !source.empty());
     Check("the poll answers head trades", source.find("DriveHeadTrades();") != std::string::npos);
     Check("through the decision",
-          source.find("OverseerDecisions::AnswerTradeAtHead(") != std::string::npos);
+          source.find("OverseerDecisions::JudgeTradeWindow(") != std::string::npos);
+    Check("the accept path asks the bags for room",
+          source.find("CanStoreItems(") != std::string::npos);
 }
 
 }  // namespace
@@ -65,6 +102,7 @@ void TheAdapterIsWired()
 int main()
 {
     TheDecision();
+    TheWholeWindow();
     TheAdapterIsWired();
     if (failures)
         return 1;

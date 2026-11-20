@@ -23852,11 +23852,39 @@ enum class HeadTradeAnswer
     Wait,
     Accept,
     Decline,
+    Cancel,
 };
 constexpr uint32_t HEAD_TRADE_STRANGER_SECONDS = 3;
 constexpr uint32_t HEAD_TRADE_EMPTY_SECONDS = 60;
 HeadTradeAnswer AnswerTradeAtHead(bool traderIsKin, uint32_t theyOffer, uint32_t theirCopper,
                                   uint32_t weGive, uint32_t ourCopper, uint32_t openSeconds);
+
+// THE WHOLE WINDOW, NOT ONLY THE OFFER (#1495). A window the rule above keeps
+// skipping, an accept the core refuses, and a window whose other side has gone
+// all left a trade open on the head's view. This wraps the offer rule with the
+// facts it never saw: the other side is still there, the trader stands in
+// trade range, the head has room for every offered item, and no window stays
+// open past HEAD_TRADE_MAX_OPEN_SECONDS whatever the earlier answers were.
+// Cancel closes the window without an answer; Decline answers it no.
+constexpr uint32_t HEAD_TRADE_MAX_OPEN_SECONDS = 120;
+struct HeadTradeFacts
+{
+    bool traderIsKin{false};
+    uint32_t theyOffer{0};
+    uint32_t theirCopper{0};
+    uint32_t weGive{0};
+    uint32_t ourCopper{0};
+    uint32_t openSeconds{0};
+    bool otherSidePresent{true};
+    bool inTradeRange{true};
+    bool roomForOffered{true};
+};
+struct HeadTradeVerdict
+{
+    HeadTradeAnswer answer{HeadTradeAnswer::Wait};
+    char const* reason{""};
+};
+HeadTradeVerdict JudgeTradeWindow(HeadTradeFacts const& facts);
 
 // A REVIVAL HOLD THAT ENDS UNDER ANOTHER HOLD HANDS ITS DEBT ON. The revival
 // hold adds `stay` and takes `new rpg` (the leader) or `follow` (a member with

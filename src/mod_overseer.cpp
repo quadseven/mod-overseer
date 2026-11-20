@@ -18255,6 +18255,8 @@ private:
     // When each roster selfbot's open trade was first seen, for
     // AnswerTradeAtHead's waits. World thread only, like every register here.
     std::map<std::string, time_t> _headTradeSeen;
+    // Heads whose skipped window has been logged, so it is logged once.
+    std::set<std::string> _headTradeSkipLogged;
 
     // ANSWER A TRADE OPENED TO A SELFBOT ON THE ROSTER (AnswerTradeAtHead).
     // A trade this module opens itself (DoTrade) accepts both sides in the same
@@ -18266,34 +18268,70 @@ private:
         // Bounded by the roster: a name that has left it is forgotten here.
         for (auto it = _headTradeSeen.begin(); it != _headTradeSeen.end();)
             it = roster.count(it->first) ? std::next(it) : _headTradeSeen.erase(it);
+        for (auto it = _headTradeSkipLogged.begin(); it != _headTradeSkipLogged.end();)
+            it = roster.count(*it) ? std::next(it) : _headTradeSkipLogged.erase(it);
         for (auto const& entry : roster)
         {
             std::string const& name = entry.first;
             Player* head = ObjectAccessor::FindPlayerByName(name);
             TradeData* mine = head && head->IsInWorld() ? head->GetTradeData() : nullptr;
-            if (!mine || !IsSelfBot(head))
+            if (!mine)
             {
                 _headTradeSeen.erase(name);
+                _headTradeSkipLogged.erase(name);
                 continue;
             }
-            Player* trader = head->GetTrader();
-            TradeData* theirs = trader ? trader->GetTradeData() : nullptr;
-            if (!trader || !theirs)
+            if (!IsSelfBot(head))
+            {
+                // A head with a human client answers its own window. Say so once.
+                if (_headTradeSkipLogged.insert(name).second)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' has a trade window open and is not a self bot, "
+                             "so the module leaves it to the client (#1495)",
+                             name);
                 continue;
+            }
             auto const seen = _headTradeSeen.emplace(name, now).first;
             uint32 const open = static_cast<uint32>(now - seen->second);
+            Player* trader = head->GetTrader();
+            TradeData* theirs = trader ? trader->GetTradeData() : nullptr;
 
-            uint32 theyOffer = 0, weGive = 0;
-            for (uint32 slot = 0; slot < TRADE_SLOT_TRADED_COUNT; ++slot)
+            OverseerDecisions::HeadTradeFacts facts;
+            facts.openSeconds = open;
+            facts.otherSidePresent = trader && theirs;
+            std::string const traderName = trader ? trader->GetName() : std::string("nobody");
+            uint32 theyOffer = 0, theirCopper = 0;
+            if (facts.otherSidePresent)
             {
-                theyOffer += theirs->GetItem(TradeSlots(slot)) ? 1u : 0u;
-                weGive += mine->GetItem(TradeSlots(slot)) ? 1u : 0u;
+                std::vector<Item*> offered;
+                uint32 weGive = 0;
+                for (uint32 slot = 0; slot < TRADE_SLOT_TRADED_COUNT; ++slot)
+                {
+                    if (Item* item = theirs->GetItem(TradeSlots(slot)))
+                    {
+                        ++theyOffer;
+                        offered.push_back(item);
+                    }
+                    weGive += mine->GetItem(TradeSlots(slot)) ? 1u : 0u;
+                }
+                theirCopper = static_cast<uint32>(theirs->GetMoney());
+                facts.traderIsKin =
+                    OnRoster(trader->GetName()) ||
+                    (trader->GetGuildId() && trader->GetGuildId() == head->GetGuildId());
+                facts.theyOffer = theyOffer;
+                facts.theirCopper = theirCopper;
+                facts.weGive = weGive;
+                facts.ourCopper = static_cast<uint32>(mine->GetMoney());
+                facts.inTradeRange = head->IsWithinDistInMap(trader, TRADE_DISTANCE, false);
+                uint32 offending = 0;
+                facts.roomForOffered =
+                    offered.empty() ||
+                    head->CanStoreItems(offered.data(), static_cast<int>(offered.size()),
+                                        &offending) == EQUIP_ERR_OK;
             }
-            bool const kin = OnRoster(trader->GetName()) ||
-                             (trader->GetGuildId() && trader->GetGuildId() == head->GetGuildId());
-            OverseerDecisions::HeadTradeAnswer const answer = OverseerDecisions::AnswerTradeAtHead(
-                kin, theyOffer, static_cast<uint32>(theirs->GetMoney()), weGive,
-                static_cast<uint32>(mine->GetMoney()), open);
+            OverseerDecisions::HeadTradeVerdict const verdict =
+                OverseerDecisions::JudgeTradeWindow(facts);
+            OverseerDecisions::HeadTradeAnswer const answer = verdict.answer;
             if (answer == OverseerDecisions::HeadTradeAnswer::Wait)
                 continue;
             if (answer == OverseerDecisions::HeadTradeAnswer::Accept)
@@ -18304,13 +18342,15 @@ private:
             else
                 head->TradeCancel(true);
             LOG_INFO("module.overseer",
-                     "overseer: '{}' answered the trade '{}' opened - {} ({} item(s) and {} "
-                     "copper offered, {} asked of it, open {}s, {})",
-                     name, trader->GetName(),
-                     answer == OverseerDecisions::HeadTradeAnswer::Accept ? "accepted"
-                                                                          : "declined",
-                     theyOffer, static_cast<uint32>(theirs->GetMoney()), weGive, open,
-                     kin ? "family or guild" : "a stranger");
+                     "overseer: '{}' answered the trade '{}' opened - {} because {} ({} item(s) "
+                     "and {} copper offered, {} asked of it, open {}s, {}) (#1495)",
+                     name, traderName,
+                     answer == OverseerDecisions::HeadTradeAnswer::Accept    ? "accepted"
+                     : answer == OverseerDecisions::HeadTradeAnswer::Cancel ? "cancelled"
+                                                                              : "declined",
+                     verdict.reason, theyOffer, theirCopper, facts.weGive, open,
+                     facts.traderIsKin ? "family or guild" : "a stranger");
+            _headTradeSkipLogged.erase(name);
             _headTradeSeen.erase(name);
         }
     }
