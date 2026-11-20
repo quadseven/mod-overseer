@@ -1,9 +1,10 @@
 # zone-band
 
-Projects the per-zone creature level band into `data/zone_band.json` (#1518).
-The module's individual mode (#1518, later slices) reads that table to decide
-whether a member standing in a zone may roam alone: only when the zone's band
-top is at most the member's level plus one.
+Projects the per-zone creature level band into `data/zone_band.json` (#1518),
+and that table into `src/overseer_zone_band.h`, which the module compiles in.
+The module's individual mode reads the header to decide whether a member
+standing in a zone may roam alone: only when the zone's band top is at most the
+member's level plus one.
 
 ## Method
 
@@ -46,3 +47,18 @@ Extracted game data is not committed; only the table of numbers made from it is.
 
 The tool exits 2 with a named reason when an input is missing. Tests:
 `python3 -B tests/test_zone_band.py` (synthetic files, no game data).
+
+## The header
+
+The module reads no file at run time, so the band tops are compiled in. After
+any change to `data/zone_band.json`, project the header again. This step reads
+only the checked-in table and needs no game data:
+
+    python3 tools/zone-band/band.py --header src/overseer_zone_band.h
+
+`--table <file>` names another table to read. Giving `--out` and `--header`
+together builds the table and projects the header from it in one run. The
+header holds one row per zone with the band top for each side, zero where the
+side has no band. `tests/test_zone_band.py` fails when the header and the table
+disagree, so a table change without this step does not pass the `decisions`
+check.

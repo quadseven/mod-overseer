@@ -7,6 +7,7 @@ data. The checked-in table is only parsed and checked for shape and coverage.
 import importlib.util
 import json
 from pathlib import Path
+import re
 import struct
 import subprocess
 import sys
@@ -17,6 +18,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "tools/zone-band/band.py"
 TABLE = ROOT / "data/zone_band.json"
+HEADER = ROOT / "src/overseer_zone_band.h"
 
 
 def load_tool():
@@ -231,6 +233,85 @@ class CheckedInTableTest(unittest.TestCase):
     def test_the_table_records_how_it_was_made(self):
         self.assertEqual(self.table["percentiles"], [10, 90])
         self.assertIn("source", self.table)
+
+
+class HeaderTest(unittest.TestCase):
+    """The header the module compiles in is the table, projected (#1518, box 3)."""
+
+    def table(self):
+        return {
+            "zones": {
+                "0:12": {
+                    "name": "Elwynn Forest",
+                    "alliance": {"lo": 2, "hi": 10, "spawns": 5},
+                    "horde": {"lo": 2, "hi": 25, "spawns": 9},
+                },
+                "1:9999": {"name": "", "alliance": None, "horde": None},
+                "530:3483": {
+                    "name": "Hellfire\\ Peninsula\n",
+                    "alliance": None,
+                    "horde": {"lo": 58, "hi": 63, "spawns": 1},
+                },
+            }
+        }
+
+    def test_one_row_per_zone_with_each_sides_top(self):
+        text = load_tool().header_text(self.table())
+        self.assertIn("    {0, 12, 10, 25},  // Elwynn Forest\n", text)
+        self.assertIn("ZoneBandTopFor(", text)
+        self.assertEqual(len(re.findall(r"^    \{\d+, \d+, \d+, \d+\},", text, re.M)), 3)
+
+    def test_a_side_with_no_band_is_zero_and_a_name_cannot_break_the_comment(self):
+        text = load_tool().header_text(self.table())
+        self.assertIn("    {1, 9999, 0, 0},\n", text)
+        self.assertIn("    {530, 3483, 0, 63},  // Hellfire Peninsula\n", text)
+
+    def test_an_empty_table_is_refused(self):
+        with self.assertRaises(ValueError):
+            load_tool().header_text({"zones": {}})
+
+    def test_the_checked_in_header_is_the_checked_in_table_projected(self):
+        expected = load_tool().header_text(json.loads(TABLE.read_text()))
+        self.assertEqual(
+            HEADER.read_text(),
+            expected,
+            "src/overseer_zone_band.h is stale: run "
+            "python3 tools/zone-band/band.py --header src/overseer_zone_band.h",
+        )
+
+    def test_cli_projects_the_header_from_a_table_with_no_game_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            table = Path(tmp) / "table.json"
+            table.write_text(json.dumps(self.table()))
+            out = Path(tmp) / "band.h"
+            result = subprocess.run(
+                [sys.executable, "-B", str(TOOL), "--table", str(table), "--header", str(out)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(out.read_text(), load_tool().header_text(self.table()))
+
+    def test_cli_names_a_missing_or_broken_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "band.h"
+            missing = subprocess.run(
+                [sys.executable, "-B", str(TOOL), "--table", str(Path(tmp) / "none.json"),
+                 "--header", str(out)],
+                capture_output=True, text=True)
+            self.assertEqual(missing.returncode, 2)
+            self.assertIn("table not found", missing.stderr)
+            broken = Path(tmp) / "broken.json"
+            broken.write_text("{\"zones\": {\"0:1\": {}}}")
+            result = subprocess.run(
+                [sys.executable, "-B", str(TOOL), "--table", str(broken), "--header", str(out)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("is not a band table", result.stderr)
+            self.assertFalse(out.exists())
+
+    def test_cli_with_nothing_to_do_is_a_usage_error(self):
+        result = subprocess.run([sys.executable, "-B", str(TOOL)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("nothing to do", result.stderr)
 
 
 if __name__ == "__main__":

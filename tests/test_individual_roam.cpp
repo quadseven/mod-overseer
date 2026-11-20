@@ -10,7 +10,13 @@
  *  - the take-back: leaving the zone, the family re-linking, or the switch
  *    going off;
  *  - the death limit: more than three deaths in five minutes, then thirty
- *    minutes with no grant.
+ *    minutes with no grant;
+ *  - what the adapter's wiring leans on: a member something else owns is left
+ *    alone, a grant whose strategy another writer took is forgotten, a
+ *    member that leads keeps its strategy, death ages are
+ *    placed on the module's clock, and a roaming member is not waited for,
+ *    not fetched, not boarded on its leader's flight, not counted in the
+ *    family's party toll and not left to take a flight of its own.
  *
  * Compiled against src/overseer_decisions.cpp and nothing else.
  */
@@ -211,6 +217,199 @@ int main()
         f.now = now + 30 * 60;
         Check(IndividualRoams(f), "granted again once the thirty minutes are over");
     }
+
+    // --- with the switch off nobody is ever granted ------------------------------
+    // Whatever else is true of the member, of its family and of the ground it
+    // stands on, and whether or not it stands still. The adapter's only grant
+    // is on this step, so this is "behaviour unchanged while the switch is off".
+    {
+        bool anyGrant = false;
+        bool everyHolderTakenBack = true;
+        for (int bits = 0; bits < 64; ++bits)
+        {
+            IndividualRoamFacts f = Roaming();
+            f.enabled = false;
+            f.leadsItsParty = (bits & 1) != 0;
+            f.familyLinked = (bits & 2) != 0;
+            f.ownAim = (bits & 4) != 0 ? "trainer" : "";
+            f.zoneHasBand = (bits & 8) != 0;
+            f.offUntil = (bits & 16) != 0 ? f.now + 600 : 0;
+            bool const standsStill = (bits & 32) != 0;
+            anyGrant = anyGrant || IndividualRoams(f) ||
+                       IndividualRoamStep(false, IndividualRoams(f), standsStill) !=
+                           RoamStep::Leave;
+            if (!standsStill)
+                everyHolderTakenBack =
+                    everyHolderTakenBack &&
+                    IndividualRoamStep(true, IndividualRoams(f), false) == RoamStep::TakeBack;
+        }
+        Check(!anyGrant, "with the switch off no combination of facts grants the roam");
+        Check(everyHolderTakenBack,
+              "and a grant made while it was on is taken back on the first free poll");
+    }
+
+    // --- a member something else owns is left as it is ---------------------------
+    // Dead, in the air, held by the module, lent for a flight or under a
+    // command: each hands back exactly what it took, so neither a grant nor a
+    // take-back is made under one.
+    Check(IndividualRoamStep(false, true, true) == RoamStep::Leave,
+          "no grant to a member that is dead, held, flying or under a command");
+    Check(IndividualRoamStep(true, false, true) == RoamStep::Leave,
+          "no take-back under a hold: the hold's own hand-back would undo it");
+    Check(IndividualRoamStep(false, true, false) == RoamStep::Grant,
+          "the grant is made on the first poll after it is free");
+    Check(IndividualRoamStep(true, false, false) == RoamStep::TakeBack,
+          "and so is the take-back");
+    Check(IndividualRoamStep(true, true, false) == RoamStep::Leave &&
+              IndividualRoamStep(false, false, false) == RoamStep::Leave,
+          "free and nothing to change is still nothing to do");
+
+    // --- does an earlier grant still stand ----------------------------------------
+    Check(RoamGrantStands(true, true, false), "a free member that carries `new rpg` holds it");
+    Check(RoamGrantStands(true, false, true),
+          "one owned elsewhere holds it without the strategy: it is handed back");
+    Check(RoamGrantStands(true, true, true), "and with it");
+    Check(!RoamGrantStands(true, false, false),
+          "a free member that lost `new rpg` to another writer no longer holds the grant");
+    Check(!RoamGrantStands(false, true, false) && !RoamGrantStands(false, true, true) &&
+              !RoamGrantStands(false, false, true),
+          "carrying the strategy is not a grant: a lent or cut-off follower was never granted");
+    // The follow sweep stripped it on an aim that came and went between two
+    // polls: the grant is forgotten and, still admitted, made again.
+    Check(IndividualRoamStep(RoamGrantStands(true, false, false), true, false) == RoamStep::Grant,
+          "a lost grant is made afresh while the member is still admitted");
+    Check(IndividualRoamStep(RoamGrantStands(true, false, false), false, false) ==
+              RoamStep::Leave,
+          "and simply forgotten when it is not");
+
+    // --- what a take-back takes off ---------------------------------------------
+    Check(!RoamTakeBackStrips(true),
+          "a member that leads keeps `new rpg`: it carries it as leader");
+    Check(RoamTakeBackStrips(false), "a follower's is taken off");
+    {
+        // The switch goes off on a holder that has come to lead. The refusal
+        // named is the switch, asked first, and the strategy still stays.
+        auto f = Roaming();
+        f.enabled = false;
+        f.leadsItsParty = true;
+        Check(IndividualRoamRefusal(f) == RoamRefusal::SwitchOff, "the switch is named first");
+        Check(IndividualRoamStep(true, IndividualRoams(f), false) == RoamStep::TakeBack &&
+                  !RoamTakeBackStrips(f.leadsItsParty),
+              "the grant is taken back and the leader keeps its strategy");
+    }
+
+    // --- which refusals are said ---------------------------------------------------
+    Check(!RoamRefusalIsSaid(RoamRefusal::None), "no refusal, nothing to say");
+    Check(!RoamRefusalIsSaid(RoamRefusal::HasErrand),
+          "an errand says itself, and comes and goes too often to say again here");
+    for (RoamRefusal const refusal :
+         {RoamRefusal::SwitchOff, RoamRefusal::Leader, RoamRefusal::FamilyLinked,
+          RoamRefusal::DeathLimit, RoamRefusal::OutOfBand})
+        Check(RoamRefusalIsSaid(refusal), "every other refusal is said when it changes");
+
+    // --- death ages are placed on the module's clock ----------------------------
+    {
+        std::vector<std::int64_t> const times = RoamDeathTimes({250, 200, 100, 0}, now);
+        Check(times == std::vector<std::int64_t>({now - 250, now - 200, now - 100, now}),
+              "an age is that many seconds before now");
+        Check(RoamOffUntil(times, now, 0) == now + 30 * 60,
+              "four deaths aged inside five minutes trip the limit");
+        Check(RoamOffUntil(RoamDeathTimes({301, 200, 100, 0}, now), now, 0) == 0,
+              "one aged out of the window does not");
+        Check(RoamDeathTimes({-5}, now) == std::vector<std::int64_t>({now}),
+              "a row stamped after the read is placed at now, not in the future");
+        Check(RoamDeathTimes({}, now).empty(), "no rows, no deaths");
+    }
+
+    // --- the family does not hold its leader for a roaming member ---------------
+    {
+        RegroupLimits regroup;
+        regroup.splitYards = 60.f;
+        regroup.rejoinYards = 20.f;
+        regroup.maxWaitYards = 0.f;
+        RegroupMember away;
+        away.name = "Og";
+        away.seen = true;
+        away.sameMap = true;
+        away.alive = true;
+        away.yards = 300.f;
+        Check(ReadRegroupClaim(away, regroup, false) == RegroupClaim::Rejoining,
+              "a far follower that does not roam is waited for");
+        away.roamsAlone = true;
+        Check(ReadRegroupClaim(away, regroup, false) == RegroupClaim::RoamsAlone,
+              "a roaming follower is its own claim");
+        Check(!RegroupClaimIsWaitedFor(RegroupClaim::RoamsAlone),
+              "the leader is never held for a roaming member");
+        Check(!ReadFamilyRegroup({away}, regroup, false).wait,
+              "the family does not wait for a roaming member");
+        Check(std::string(RegroupClaimName(RegroupClaim::RoamsAlone)) ==
+                  "roaming alone inside its band",
+              "the claim has a name the log can say");
+        Check(RegroupCarriedOnWithout({away}, regroup, false) ==
+                  "Og (roaming alone inside its band)",
+              "and the family says whom it carries on without");
+        away.yards = 10.f;
+        Check(ReadRegroupClaim(away, regroup, false) == RegroupClaim::InFormation,
+              "a roaming member beside the leader is in formation");
+    }
+
+    // --- and the leader is never sent back for one -------------------------------
+    {
+        FetchLimits fetch;
+        fetch.footLimitYards = 100.f;
+        fetch.gatheredYards = 40.f;
+        FetchCandidate held;
+        held.name = "Og";
+        held.seen = true;
+        held.sameMap = true;
+        held.alive = true;
+        held.heldTooFar = true;
+        held.yards = 400.f;
+        Check(PickFetchTarget({held}, fetch, false) == "Og",
+              "a held member that does not roam is fetched");
+        held.roamsAlone = true;
+        Check(PickFetchTarget({held}, fetch, false).empty(), "a roaming member is never fetched");
+
+        FetchCandidate walking;
+        walking.name = "Bork";
+        walking.seen = true;
+        walking.sameMap = true;
+        walking.alive = true;
+        walking.yards = 300.f;
+        FetchCandidate other = held;
+        other.name = "Grog";
+        other.roamsAlone = false;
+        Check(PickFetchTarget({walking, other}, fetch, false).empty(),
+              "a member still walking back holds every fetch");
+        walking.roamsAlone = true;
+        Check(PickFetchTarget({walking, other}, fetch, false) == "Grog",
+              "a roaming member is not one still walking back");
+    }
+
+    // --- nor boarded on its leader's flight, nor counted in the party toll -------
+    Check(MemberFollowsForFlight(true, false, false, false, false),
+          "an empty column follows the leader's flight");
+    Check(!MemberFollowsForFlight(true, false, false, false, false, true),
+          "but not when the member roams alone: it is not behind the leader");
+    Check(!MemberFollowsForFlight(false, true, true, true, false, true),
+          "whatever else is true of it");
+    Check(PartyTollCounts(false, false), "a member with the family counts in the party toll");
+    Check(!PartyTollCounts(false, true), "a roaming member does not");
+    Check(!PartyTollCounts(true, false), "nor one on its own errand, as before");
+    Check(!PartyTollCounts(true, true), "nor one that is somehow both");
+
+    // --- a roaming member takes no flight ----------------------------------------
+    Check(RoamerUnissuedFlight(true, true, false) == UnissuedFlightStep::Cancel,
+          "a roaming member walking to a flight master is called off on the ground");
+    Check(RoamerUnissuedFlight(true, true, true) == UnissuedFlightStep::Airborne,
+          "one already in the air is said, not stopped");
+    Check(RoamerUnissuedFlight(true, false, false) == UnissuedFlightStep::Leave,
+          "any other status is the roam itself");
+    Check(RoamerUnissuedFlight(true, false, true) == UnissuedFlightStep::Leave,
+          "a taxi with no travel flight status is not upstream's roll");
+    Check(RoamerUnissuedFlight(false, true, false) == UnissuedFlightStep::Leave &&
+              RoamerUnissuedFlight(false, true, true) == UnissuedFlightStep::Leave,
+          "a member that does not roam is not this rule's");
 
     // --- the refusal has a name for the log ------------------------------------
     Check(std::string(RoamRefusalName(RoamRefusal::None)) == "none", "none");

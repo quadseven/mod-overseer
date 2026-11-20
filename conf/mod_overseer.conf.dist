@@ -634,8 +634,16 @@
 #                     while no member of its family holds a dungeon or raid
 #                     job and it stands on its leader's map; its leader does
 #                     not wait for it and does not go back for it, and it
-#                     follows again when the errand ends. 0 restores the old
-#                     behaviour, where only the leader walks an errand.
+#                     follows again when the errand ends. 1 also lets such a
+#                     follower with no errand roam alone (#1518): it is handed
+#                     `new rpg` only while the zone it stands in has a creature
+#                     level band whose top is at most its own level plus one
+#                     (data/zone_band.json, compiled in). Leaving that zone,
+#                     its family taking a dungeon or raid job, a run or a
+#                     summon, or this switch going off takes it back, and more
+#                     than three deaths in five minutes takes it back for
+#                     thirty minutes. 0 restores the old behaviour, where only
+#                     the leader walks an errand and this roam is never granted.
 #        Default:     0
 #
 #Overseer.Individual.Enable = 0
