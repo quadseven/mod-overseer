@@ -394,9 +394,14 @@ void APugTheRowCannotPlaceIsRefused()
     Check("one pug named twice",
           ParseGuildFinderRequest("finder-run deadmines A B C D pug A pug A", "T").error ==
               GuildFinderRefusal::SameNameTwice);
-    Check("no more than two pugs",
-          ParseGuildFinderRequest("finder-run deadmines A B C D pug A pug B pug C", "T").error ==
-              GuildFinderRefusal::TooManyPugs);
+    GuildFinderRequest const four = ParseGuildFinderRequest(
+        "finder-run deadmines A B C D pug A pug B pug C pug D", "T");
+    Check("one guildmate may anchor four pugs",
+          four.error == GuildFinderRefusal::None && four.pugs.size() == 4);
+    Check("no more than four pugs",
+          ParseGuildFinderRequest("finder-run deadmines A B C D pug T pug A pug B pug C pug D",
+                                  "T")
+                  .error == GuildFinderRefusal::TooManyPugs);
     Check("a pug's name is a character name",
           ParseGuildFinderRequest("finder-run deadmines A B C D pug A1", "T").error ==
               GuildFinderRefusal::BadName);

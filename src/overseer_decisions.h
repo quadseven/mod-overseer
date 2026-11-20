@@ -27379,10 +27379,11 @@ GuildRunRecoveryStep GuildRunRecoveryNext(GuildRunRecoveryFacts const& facts);
 //
 //   finder-run <keyword> <healer> <dps> <dps> <dps> pug <name> [pug <name>]
 //
-// A pug is one of the five, at most GUILD_FINDER_MAX_PUGS of them, and is the
+// A pug is one of the five, at most GUILD_FINDER_MAX_PUGS of them (four, so one
+// guildmate can anchor the row), and is the
 // only member who need not be in the guild; it must be on the guild's side.
 constexpr char GUILD_FINDER_PUG_WORD[] = "pug";
-constexpr unsigned GUILD_FINDER_MAX_PUGS = 2;
+constexpr unsigned GUILD_FINDER_MAX_PUGS = 4;
 
 enum class GuildFinderRefusal : std::uint8_t
 {
