@@ -1603,7 +1603,17 @@ struct StallRecoveryLimits
     // The disconnected case and an impossible recovery are each said at most
     // this often per character.
     std::int64_t saySeconds{3600};
+    // The release count that stands for an hour of failing when the releases
+    // are ground give-ups, which come at most once per landing ceiling (a
+    // quarter of an hour), not nine to the hour. See GroundGiveUpLimits.
+    std::uint32_t groundGiveUpReleases{4};
 };
+
+// The limits a ground give-up (every bearing refused for the whole bound) is
+// read against: the same hour and the same thresholds, with the release count
+// that fits its cadence. Never raises the count, so a limit set tighter than
+// the default stays tighter.
+StallRecoveryLimits GroundGiveUpLimits(StallRecoveryLimits const& limits);
 
 struct StallRecoveryState
 {
