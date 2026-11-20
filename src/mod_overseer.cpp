@@ -46141,9 +46141,11 @@ private:
         facts.outcome = outcome;
         facts.reason = reason;
         facts.stagingRearms = coord.stagingRearms;
+        RunBagReading const bagsRead = ReadRunBags(members);
         facts.bagsFull = OverseerDecisions::DungeonRunBagPressure(
-                             ReadRunBags(members).freeSlots,
-                             TOWN_TRIP_LIMITS.freeBagSlotsToGo, false, false) !=
+                             bagsRead.freeSlots,
+                             TOWN_TRIP_LIMITS.freeBagSlotsToGo, false, false,
+                             bagsRead.townCanMakeRoom) !=
                          OverseerDecisions::DungeonBagPressure::None;
 
         Player* const leader = ObjectAccessor::FindPlayerByName(leaderName);
@@ -57235,7 +57237,34 @@ private:
         // is also what DungeonRunBagPressure needs, so the two can never
         // disagree about it.
         bool anyMemberInside{false};
+        // Parallel to freeSlots: could a vendor pass free a slot for this member?
+        std::vector<bool> townCanMakeRoom;
     };
+
+    // Does the member carry a stack a vendor will buy? Poor or common quality,
+    // not a quest item, with a sell price. Anything else is kept by the sell rules.
+    static bool CarriesSomethingAVendorBuys(Player* member)
+    {
+        auto sellable = [](Item* item)
+        {
+            ItemTemplate const* proto = item ? item->GetTemplate() : nullptr;
+            return proto && proto->SellPrice > 0 && proto->Quality < ITEM_QUALITY_UNCOMMON &&
+                   proto->Class != ITEM_CLASS_QUEST;
+        };
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            if (sellable(member->GetItemByPos(INVENTORY_SLOT_BAG_0, slot)))
+                return true;
+        for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+        {
+            Bag* bag = member->GetBagByPos(bagSlot);
+            if (!bag)
+                continue;
+            for (uint32 i = 0; i < bag->GetBagSize(); ++i)
+                if (sellable(bag->GetItemByPos(i)))
+                    return true;
+        }
+        return false;
+    }
 
     // ONE PASS, BECAUSE "WHO IS INSIDE" MUST BE ONE ANSWER. Resolving the
     // roster twice - once to find out whether anybody is inside and again to
@@ -57248,6 +57277,7 @@ private:
         {
             unsigned freeSlots;
             bool inside;
+            bool relief;
         };
 
         std::vector<Seen> seen;
@@ -57262,7 +57292,8 @@ private:
             bool const inside = InDungeonRun(member);
             if (inside)
                 reading.anyMemberInside = true;
-            seen.push_back({static_cast<unsigned>(member->GetFreeInventorySpace()), inside});
+            seen.push_back({static_cast<unsigned>(member->GetFreeInventorySpace()), inside,
+                            CarriesSomethingAVendorBuys(member)});
         }
 
         // The selection is made after the whole roster has been seen, because
@@ -57271,7 +57302,10 @@ private:
         reading.freeSlots.reserve(seen.size());
         for (Seen const& member : seen)
             if (!reading.anyMemberInside || member.inside)
+            {
                 reading.freeSlots.push_back(member.freeSlots);
+                reading.townCanMakeRoom.push_back(member.relief);
+            }
         return reading;
     }
 
@@ -61655,7 +61689,7 @@ private:
                               OverseerDecisions::FamilyDoorHeldForBags(
                                   OverseerDecisions::DungeonRunBagPressure(
                                       bags.freeSlots, TOWN_TRIP_LIMITS.freeBagSlotsToGo, false,
-                                      false) != OverseerDecisions::DungeonBagPressure::None,
+                                      false, bags.townCanMakeRoom) != OverseerDecisions::DungeonBagPressure::None,
                                   runHasMembersInside));
 
             // A RUN INSIDE MAKES ROOM RATHER THAN LEAVING (2026-09-24), unless a
@@ -61664,7 +61698,8 @@ private:
             OverseerDecisions::DungeonBagPressure const pressure =
                 OverseerDecisions::DungeonRunBagPressure(
                     bags.freeSlots, TOWN_TRIP_LIMITS.freeBagSlotsToGo,
-                    bags.anyMemberInside, coord.phase == DungeonRunPhase::Exiting);
+                    bags.anyMemberInside, coord.phase == DungeonRunPhase::Exiting,
+                    bags.townCanMakeRoom);
             // A LOST UPGRADE ONLY EVACUATES WHEN IT STAYS LOST (wow-overseer#2062). The
             // member leaves the drop and the run keeps clearing; a walk-out
             // wipes the instance, and the kills with it.

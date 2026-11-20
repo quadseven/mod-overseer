@@ -4221,7 +4221,8 @@ char const* DungeonRunExitOutcome(bool provedComplete, bool stalled, bool evacua
 DungeonBagPressure DungeonRunBagPressure(std::vector<unsigned> const& freeBagSlots,
                                          unsigned freeSlotsFloor,
                                          bool anyMemberInside,
-                                         bool alreadyLeaving)
+                                         bool alreadyLeaving,
+                                         std::vector<bool> const& townCanMakeRoom)
 {
     // SAID FIRST, BEFORE ANYTHING IS READ. A run already walking to the door is
     // not re-decided here whatever the bags say: EXIT is the only thing that
@@ -4232,13 +4233,17 @@ DungeonBagPressure DungeonRunBagPressure(std::vector<unsigned> const& freeBagSlo
         return DungeonBagPressure::None;
 
     bool cannotLoot = false;
-    for (unsigned free : freeBagSlots)
+    bool const knowsRelief = townCanMakeRoom.size() == freeBagSlots.size();
+    for (std::size_t i = 0; i < freeBagSlots.size(); ++i)
     {
-        if (free <= freeSlotsFloor)
-        {
-            cannotLoot = true;
-            break;
-        }
+        if (freeBagSlots[i] > freeSlotsFloor)
+            continue;
+        // A FLOOR NO TOWN PASS CAN LOWER IS NOT A REASON TO WAIT FOR ONE. Outside
+        // only: inside, the run makes room where it stands or walks out.
+        if (!anyMemberInside && knowsRelief && !townCanMakeRoom[i])
+            continue;
+        cannotLoot = true;
+        break;
     }
 
     // An empty list lands here too, and that is the answer it should get: a

@@ -5064,10 +5064,21 @@ enum class DungeonBagPressure : std::uint8_t
 // and counts it, and a HoldOut that returned the coordinator to IDLE mid-EXIT
 // would leave a row 'active' inside a dungeon with nobody walking anybody out -
 // the stranding shape this drive family has already produced four times.
+//
+// `townCanMakeRoom` is parallel to `freeBagSlots` (same order, same length) and
+// says whether a town pass could lower that member's floor: it carries at least
+// one stack a vendor will buy. A member at the floor whose bags hold only
+// kept items (quest items, profession stock, uncommon or better, nothing with a
+// vendor price) can never be relieved by the trip the hold waits for, so
+// holding the run out for it holds the family out for ever. Such a member is
+// not counted when the run has not opened; the in-run make-room pass and the
+// evacuation rule still read it once the party is inside. An empty vector means
+// "not read" and every member counts, as before.
 DungeonBagPressure DungeonRunBagPressure(std::vector<unsigned> const& freeBagSlots,
                                          unsigned freeSlotsFloor,
                                          bool anyMemberInside,
-                                         bool alreadyLeaving);
+                                         bool alreadyLeaving,
+                                         std::vector<bool> const& townCanMakeRoom = {});
 
 // WHAT A RUN INSIDE DOES ABOUT IT (2026-09-24). Measured on the dev realm: a
 // Horde Ragefire run credited two bosses and was then walked out mid-clear
