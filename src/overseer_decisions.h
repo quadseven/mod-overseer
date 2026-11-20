@@ -16123,6 +16123,18 @@ std::string ZoneNoWayRoundLine(std::string const& name, std::string const& targe
                                std::vector<DangerZone> const& stillWalked,
                                ZoneDangerLimits const& limits);
 
+// WHAT THE BRIDGE READS OF A REFUSED OR LONG ERRAND WALK (#1498). The bridge picks an
+// errand's aim by straight-line distance and cannot read the planned route, so the
+// travel refusal row also carries when the refusal ends and how many times longer the
+// planned walk is than the straight line to its aim.
+//
+// The refusal ends one cool-off after it was recorded. Zero when nothing was refused.
+int64_t TravelRefusalEndsAt(int64_t refusedAt, int64_t cooloffSeconds);
+
+// Planned walking yards over straight-line yards to the aim. Zero (not recorded) when
+// nothing was planned or the aim is under a yard away, where the ratio means nothing.
+float RouteLengthRatio(float plannedYards, float straightYards);
+
 // WHETHER AN ERRAND'S FOOT WALK IS STARTED AT ALL (#1498). ReadZoneRoute says which
 // flagged zones the planned route still walks because no way round exists. Before
 // this the planner only logged that and walked the leg, and the leader died on it
