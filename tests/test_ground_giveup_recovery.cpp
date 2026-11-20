@@ -1,13 +1,8 @@
 // A ground give-up (every bearing refused) is read like a no-progress release.
 //
-// Measured on a realm: a family head stood on one spot for a day and a half.
-// Each cycle its errand to a point a hundred yards off was refused every
-// bearing, released as unreachable, and let go of for a quarter of an hour
-// before the same point came back. That path never read what the character
-// stands on, and the bounded recovery counts thirty releases, which at one
-// give-up per quarter hour is seven and a half hours of failing before the
-// hour bound could even matter. The recovery has to be reachable at that
-// cadence.
+// The escalation depends on time off the mesh at the same spot, not on a
+// release count that depends on poll cadence. A streak releasing every quarter
+// of an hour reaches it at the hour.
 
 #include "overseer_decisions.h"
 
@@ -56,29 +51,37 @@ StallRecoveryAction Nth(StallRecoveryLimits const& lim, unsigned n)
 
 int main()
 {
-    StallRecoveryLimits const plain;
-    StallRecoveryLimits const ground = GroundGiveUpLimits(plain);
+    StallRecoveryLimits const lim;
 
-    Check(ground.releases < plain.releases, "a ground give-up needs fewer releases");
-    Check(ground.seconds == plain.seconds, "and still a whole hour");
-    Check(ground.feetOnMeshYards == plain.feetOnMeshYards &&
-              ground.nearestMeshYards == plain.nearestMeshYards,
-          "the thresholds are the same ones");
+    Check(lim.seconds == 3600, "the bound is a whole hour");
+    Check(lim.releases >= 2 && lim.releases <= 3, "a small minimum number of releases");
 
-    // Give-ups at the landing ceiling's cadence: the fifth is an hour in.
-    Check(Nth(plain, 5) == StallRecoveryAction::Backoff,
-          "the no-progress count does not escalate at five give-ups");
-    Check(Nth(plain, 9) == StallRecoveryAction::Backoff,
-          "nor at nine, which is two hours at this cadence");
-    Check(Nth(ground, 4) == StallRecoveryAction::Backoff,
-          "ground limits wait out the hour: the fourth is 45 minutes in");
-    Check(Nth(ground, 5) == StallRecoveryAction::WalkToMesh,
-          "ground limits escalate on the give-up an hour in");
+    // A streak at a quarter-hour cadence escalates at the hour, not before.
+    Check(Nth(lim, 4) == StallRecoveryAction::Backoff,
+          "the fourth release is 45 minutes in and does not escalate");
+    Check(Nth(lim, 5) == StallRecoveryAction::WalkToMesh,
+          "the release an hour in escalates at a quarter-hour cadence");
 
-    // Never loosens a limit set tighter than the default.
-    StallRecoveryLimits tight;
-    tight.releases = 2;
-    Check(GroundGiveUpLimits(tight).releases == 2, "a tighter count is kept");
+    // A character that moved further than the reset distance starts over.
+    {
+        StallRecoveryState s;
+        for (unsigned i = 0; i < 4; ++i)
+            StallRecoveryStep(s, Off(1000 + static_cast<std::int64_t>(i) * 900), lim);
+        StallRecoveryFacts moved = Off(1000 + 4 * 900);
+        moved.x += lim.movedResetYards + 5.f;
+        Check(StallRecoveryStep(s, moved, lim).action == StallRecoveryAction::Backoff,
+              "after it moved the hour is not reached");
+        Check(s.offMeshReleases == 1, "and the streak starts over");
+    }
+
+    // Fewer than the minimum releases never escalates, however long they span.
+    {
+        StallRecoveryState s;
+        StallRecoveryAction last = StallRecoveryAction::Backoff;
+        for (unsigned i = 0; i + 1 < lim.releases; ++i)
+            last = StallRecoveryStep(s, Off(1000 + static_cast<std::int64_t>(i) * 36000), lim).action;
+        Check(last == StallRecoveryAction::Backoff, "too few releases never escalate");
+    }
 
     // The adapter has to ask: DriveTravel's give-up branch reads the footing.
     std::ifstream in("src/mod_overseer.cpp");

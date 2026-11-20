@@ -1584,14 +1584,18 @@ struct StallFootingFacts
 StallFooting ClassifyStallFooting(StallFootingFacts const& facts, float feetOnMeshYards);
 char const* StallFootingName(StallFooting footing);
 
-// ONE ESCALATION, AFTER AN HOUR OF FAILING. Counted in releases AND in seconds
-// since the first of them, so a faster release cadence cannot shorten the
-// hour and a slower one cannot shorten the count. A character that has moved
-// further than `movedResetYards` from where the streak began is not stuck
-// there any more, and the streak starts over.
+// ONE ESCALATION, AFTER AN HOUR OFF THE MESH AT THE SAME SPOT. The streak is
+// measured in TIME: it escalates once `seconds` have passed since the first
+// release of the streak, provided at least `releases` of them were seen so a
+// single stale reading cannot trigger it. The release cadence depends on what
+// is releasing (a no-progress backoff, a ground give-up) and on how often the
+// aim is re-armed, anywhere from minutes to a quarter of an hour apart, so a
+// large release count would stand for many hours, not one. A character that
+// has moved further than `movedResetYards` from where the streak began is not
+// stuck there any more, and the streak starts over.
 struct StallRecoveryLimits
 {
-    std::uint32_t releases{30};
+    std::uint32_t releases{3};
     std::int64_t seconds{3600};
     float feetOnMeshYards{2.5f};
     // How far the nearest polygon may be for the walk rung. Twenty is the
@@ -1603,17 +1607,7 @@ struct StallRecoveryLimits
     // The disconnected case and an impossible recovery are each said at most
     // this often per character.
     std::int64_t saySeconds{3600};
-    // The release count that stands for an hour of failing when the releases
-    // are ground give-ups, which come at most once per landing ceiling (a
-    // quarter of an hour), not nine to the hour. See GroundGiveUpLimits.
-    std::uint32_t groundGiveUpReleases{4};
 };
-
-// The limits a ground give-up (every bearing refused for the whole bound) is
-// read against: the same hour and the same thresholds, with the release count
-// that fits its cadence. Never raises the count, so a limit set tighter than
-// the default stays tighter.
-StallRecoveryLimits GroundGiveUpLimits(StallRecoveryLimits const& limits);
 
 struct StallRecoveryState
 {

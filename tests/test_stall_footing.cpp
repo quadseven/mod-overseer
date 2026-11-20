@@ -60,6 +60,8 @@ StallRecoveryVerdict Run(StallRecoveryState& s, StallRecoveryFacts base, unsigne
     }
     return v;
 }
+// The release that reaches the hour at a two minute cadence (28 gaps of 130 s).
+constexpr unsigned kEnough = 29;
 }  // namespace
 
 int main()
@@ -104,7 +106,7 @@ int main()
               "releases faster than the hour do not escalate");
         // Enough seconds, too few releases: still none.
         StallRecoveryState slow;
-        v = Run(slow, Off(0), 5, lim, 1000, 3600);
+        v = Run(slow, Off(0), lim.releases - 1, lim, 1000, 3600);
         Check(v.action == StallRecoveryAction::Backoff, "few releases do not escalate");
     }
 
@@ -112,7 +114,7 @@ int main()
     // is near and safe.
     {
         StallRecoveryState s;
-        StallRecoveryVerdict v = Run(s, Off(0), lim.releases, lim, 1000, 130);
+        StallRecoveryVerdict v = Run(s, Off(0), kEnough, lim, 1000, 130);
         Check(v.action == StallRecoveryAction::WalkToMesh, "escalates to the walk at the bound");
         v = Run(s, Off(0), 1, lim, 1000 + 40 * 130, 130);
         Check(v.action == StallRecoveryAction::Backoff, "does not escalate a second time");
@@ -125,17 +127,17 @@ int main()
         StallRecoveryState s;
         StallRecoveryFacts f = Off(0);
         f.walkSafe = false;
-        StallRecoveryVerdict v = Run(s, f, lim.releases, lim, 1000, 130);
+        StallRecoveryVerdict v = Run(s, f, kEnough, lim, 1000, 130);
         Check(v.action == StallRecoveryAction::Hearth, "an unsafe walk falls to the hearthstone");
         StallRecoveryState far;
         f = Off(0);
         f.nearestPolygonYards = lim.nearestMeshYards + 1.f;
-        v = Run(far, f, lim.releases, lim, 1000, 130);
+        v = Run(far, f, kEnough, lim, 1000, 130);
         Check(v.action == StallRecoveryAction::Hearth, "a far polygon falls to the hearthstone");
         StallRecoveryState none;
         f = Off(0);
         f.nearestPolygonYards = -1.f;
-        v = Run(none, f, lim.releases, lim, 1000, 130);
+        v = Run(none, f, kEnough, lim, 1000, 130);
         Check(v.action == StallRecoveryAction::Hearth, "no polygon at all falls to the hearthstone");
     }
 
@@ -166,7 +168,7 @@ int main()
             f.stoneReady = c.stoneReady;
             f.bindMap = c.bindMap;
             f.hearthPending = c.pending;
-            StallRecoveryVerdict v = Run(s, f, lim.releases, lim, 1000, 130);
+            StallRecoveryVerdict v = Run(s, f, kEnough, lim, 1000, 130);
             Check(v.action == StallRecoveryAction::SayNoRecovery, c.name);
             Check(v.reason.find(c.mention) != std::string::npos, c.name);
             // Not spent: asked again, said again only after the say interval.
@@ -223,7 +225,7 @@ int main()
     {
         StallRecoveryState s;
         StallRecoveryFacts f = Off(0);
-        Check(Run(s, f, lim.releases, lim, 1000, 130).action == StallRecoveryAction::WalkToMesh,
+        Check(Run(s, f, kEnough, lim, 1000, 130).action == StallRecoveryAction::WalkToMesh,
               "first streak escalates");
         f.x += lim.movedResetYards + 5.f;
         f.now = 1000 + 100 * 130;
@@ -237,7 +239,7 @@ int main()
         StallRecoveryState s;
         StallRecoveryFacts f = Off(0);
         f.walkSafe = false;
-        Check(Run(s, f, lim.releases, lim, 1000, 130).action == StallRecoveryAction::Hearth,
+        Check(Run(s, f, kEnough, lim, 1000, 130).action == StallRecoveryAction::Hearth,
               "hearth chosen");
         StallRecoveryNotDone(s);
         f.now = 1000 + 40 * 130;

@@ -1947,12 +1947,11 @@ constexpr OverseerDecisions::ErrandDeathLimits ERRAND_DEATH_LIMITS{};
 // keeps re-arming a route the character cannot reach.
 constexpr uint32 TRAVEL_STUCK_BACKOFF_RELEASES = 3;
 
-// WHEN A STALL RELEASE ESCALATES INSTEAD OF BACKING OFF AGAIN (#188). Thirty
-// no-progress releases AND an hour since the first of them, all read with the
-// walker's feet off the navigation mesh. The loop of three releases and a
-// fifteen minute backoff produces roughly nine releases an hour, so the count
-// is what an hour of failing looks like and the seconds keep it an hour if the
-// cadence ever changes. See OverseerDecisions::StallRecoveryStep.
+// WHEN A STALL RELEASE ESCALATES INSTEAD OF BACKING OFF AGAIN (#188). An hour
+// since the first release at the same spot AND at least a few releases, all
+// read with the walker's feet off the navigation mesh. The rule is in time, not
+// in a release count, because the release cadence varies from minutes to a
+// quarter of an hour. See OverseerDecisions::StallRecoveryStep.
 constexpr OverseerDecisions::StallRecoveryLimits STALL_RECOVERY_LIMITS{};
 // How far around the walker's feet the server is asked for a polygon, and how
 // far above and below. Detour's extents are half-sizes.
@@ -41725,12 +41724,9 @@ private:
     bool ReadStalledFooting(Player* bot, std::string const& name, WorldPosition const& aim,
                             bool groundRefused = false)
     {
-        // A GIVE-UP AFTER EVERY BEARING WAS REFUSED IS A RELEASE TOO, and it
-        // is read by the same instruments with a count that fits its slower
-        // cadence (see OverseerDecisions::GroundGiveUpLimits).
-        OverseerDecisions::StallRecoveryLimits const limits =
-            groundRefused ? OverseerDecisions::GroundGiveUpLimits(STALL_RECOVERY_LIMITS)
-                          : STALL_RECOVERY_LIMITS;
+        // A GIVE-UP AFTER EVERY BEARING WAS REFUSED IS A RELEASE TOO, read by
+        // the same instruments and the same time-based rule.
+        OverseerDecisions::StallRecoveryLimits const& limits = STALL_RECOVERY_LIMITS;
         char const* const released =
             groundRefused ? "was released as unreachable after every bearing was refused"
                           : "was released for no progress";

@@ -1407,14 +1407,6 @@ char const* StallFootingName(StallFooting footing)
     return "unknown";
 }
 
-StallRecoveryLimits GroundGiveUpLimits(StallRecoveryLimits const& limits)
-{
-    StallRecoveryLimits out = limits;
-    if (limits.groundGiveUpReleases < out.releases)
-        out.releases = limits.groundGiveUpReleases;
-    return out;
-}
-
 StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
                                        StallRecoveryFacts const& facts,
                                        StallRecoveryLimits const& limits)
