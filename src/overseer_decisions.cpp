@@ -1383,6 +1383,117 @@ bool PlaneHearthRefusalClearsItself(std::string const& refusal)
     return refusal == "character is moving" || refusal == "character is already casting";
 }
 
+StallFooting ClassifyStallFooting(StallFootingFacts const& facts, float feetOnMeshYards)
+{
+    if (facts.nearestPolygonYards < 0.f || facts.nearestPolygonYards > feetOnMeshYards)
+        return StallFooting::OffMesh;
+    if (facts.pathComputed && !facts.pathNoPath && !facts.pathShortcut &&
+        !facts.pathEndOffMesh)
+        return StallFooting::OnMeshConnected;
+    return StallFooting::OnMeshDisconnected;
+}
+
+char const* StallFootingName(StallFooting footing)
+{
+    switch (footing)
+    {
+        case StallFooting::OnMeshConnected:
+            return "on the mesh, route connected";
+        case StallFooting::OnMeshDisconnected:
+            return "on the mesh, no connected route";
+        case StallFooting::OffMesh:
+            return "off the mesh";
+    }
+    return "unknown";
+}
+
+StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
+                                       StallRecoveryFacts const& facts,
+                                       StallRecoveryLimits const& limits)
+{
+    StallRecoveryVerdict verdict;
+    if (facts.footing != StallFooting::OffMesh)
+    {
+        // Not the recoverable case: the streak ends, and so does any spent
+        // escalation, because the character is no longer in that state.
+        state.offMeshReleases = 0;
+        state.since = 0;
+        state.escalated = false;
+        state.refusalSaidAt = 0;
+        if (facts.footing == StallFooting::OnMeshDisconnected &&
+            (state.unreachableSaidAt == 0 ||
+             facts.now - state.unreachableSaidAt >= limits.saySeconds))
+        {
+            state.unreachableSaidAt = facts.now;
+            verdict.action = StallRecoveryAction::SayUnreachable;
+            verdict.reason =
+                "its feet are on the mesh and the path generator has no connected route "
+                "to the aim, so the errand is unreachable from here and nothing here "
+                "moves it: a person must decide";
+        }
+        return verdict;
+    }
+
+    float const dx = facts.x - state.anchorX;
+    float const dy = facts.y - state.anchorY;
+    if (state.offMeshReleases == 0 ||
+        dx * dx + dy * dy > limits.movedResetYards * limits.movedResetYards)
+    {
+        state.offMeshReleases = 0;
+        state.since = facts.now;
+        state.anchorX = facts.x;
+        state.anchorY = facts.y;
+        state.escalated = false;
+        state.refusalSaidAt = 0;
+    }
+    ++state.offMeshReleases;
+    verdict.releases = state.offMeshReleases;
+    if (state.escalated || state.offMeshReleases < limits.releases ||
+        facts.now - state.since < limits.seconds)
+        return verdict;
+
+    if (facts.nearestPolygonYards >= 0.f && facts.nearestPolygonYards <= limits.nearestMeshYards &&
+        facts.walkSafe)
+    {
+        state.escalated = true;
+        verdict.action = StallRecoveryAction::WalkToMesh;
+        verdict.reason = "the nearest polygon the server finds is within reach and the "
+                         "walk to it holds ground";
+        return verdict;
+    }
+
+    PlaneHearthFacts hearth;
+    hearth.onPlane = true;
+    hearth.groundOnRecord = false;
+    hearth.hasStone = facts.hasStone;
+    hearth.stoneReady = facts.stoneReady;
+    hearth.bindMap = facts.bindMap;
+    hearth.currentMap = facts.currentMap;
+    hearth.alreadyHearthedThisWindow = facts.hearthPending;
+    PlaneHearthVerdict const hearthVerdict = DecidePlaneHearth(hearth);
+    if (hearthVerdict.action == PlaneHearthAction::Hearth)
+    {
+        state.escalated = true;
+        verdict.action = StallRecoveryAction::Hearth;
+        verdict.reason = "no safe polygon within reach to walk to, and its hearthstone is "
+                         "ready and bound on this map";
+        return verdict;
+    }
+    if (state.refusalSaidAt == 0 || facts.now - state.refusalSaidAt >= limits.saySeconds)
+    {
+        state.refusalSaidAt = facts.now;
+        verdict.action = StallRecoveryAction::SayNoRecovery;
+        verdict.reason = std::string("no safe polygon within reach to walk to, and ") +
+                         hearthVerdict.reason;
+    }
+    return verdict;
+}
+
+void StallRecoveryNotDone(StallRecoveryState& state)
+{
+    state.escalated = false;
+}
+
 bool StepMayBridgeGap(float span, float verticalGap, float stepYards,
                       float maxGap)
 {
