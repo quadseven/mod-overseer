@@ -18327,7 +18327,7 @@ private:
                 facts.roomForOffered =
                     offered.empty() ||
                     head->CanStoreItems(offered.data(), static_cast<int>(offered.size()),
-                                        offending) == EQUIP_ERR_OK;
+                                        &offending) == EQUIP_ERR_OK;
             }
             OverseerDecisions::HeadTradeVerdict const verdict =
                 OverseerDecisions::JudgeTradeWindow(facts);
