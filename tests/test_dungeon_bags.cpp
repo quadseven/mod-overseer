@@ -192,6 +192,28 @@ void TheFloorIsWhateverTheCallerHandsOver()
           DungeonBagPressure::HoldOut);
 }
 
+void AFloorNoTownPassCanLowerDoesNotHoldTheRunOut()
+{
+    // A member at the floor whose bags hold only kept items (nothing a vendor
+    // buys) is not relieved by the trip the hold waits for, so the family was
+    // held out of its dungeon for ever.
+    Check("kept-items member at the floor, outside, no relief",
+          DungeonRunBagPressure({20, 2, 31}, FLOOR, false, false, {true, false, true}),
+          DungeonBagPressure::None);
+    Check("same member, a vendor could help",
+          DungeonRunBagPressure({20, 2, 31}, FLOOR, false, false, {true, true, true}),
+          DungeonBagPressure::HoldOut);
+    Check("one relievable member still holds",
+          DungeonRunBagPressure({1, 2}, FLOOR, false, false, {true, false}),
+          DungeonBagPressure::HoldOut);
+    Check("relief not read: every member counts",
+          DungeonRunBagPressure({20, 2, 31}, FLOOR, false, false),
+          DungeonBagPressure::HoldOut);
+    Check("inside, the old answer stands",
+          DungeonRunBagPressure({20, 2, 31}, FLOOR, true, false, {true, false, true}),
+          DungeonBagPressure::Evacuate);
+}
+
 void TheRowSaysEvacuatedRatherThanLeft()
 {
     CheckWord("bags ended it", DungeonRunExitOutcome(false, false, true), "evacuated");
@@ -254,6 +276,7 @@ int main()
     AMemberNOBODYCouldReadIsUnknownAndNotFull();
     AFloorOfZeroIsStillARealBound();
     TheFloorIsWhateverTheCallerHandsOver();
+    AFloorNoTownPassCanLowerDoesNotHoldTheRunOut();
     TheRowSaysEvacuatedRatherThanLeft();
     AnEvacuatedRunSpendsNoSlotOfTheCampaign();
     EvacuationsStillCountTowardTheFailureStop();
