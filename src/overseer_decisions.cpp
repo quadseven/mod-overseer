@@ -21216,6 +21216,25 @@ HeadTradeAnswer AnswerTradeAtHead(bool traderIsKin, uint32_t theyOffer, uint32_t
                                                    : HeadTradeAnswer::Wait;
 }
 
+HeadTradeVerdict JudgeTradeWindow(HeadTradeFacts const& f)
+{
+    if (!f.otherSidePresent)
+        return {HeadTradeAnswer::Cancel, "the other side of the window is gone"};
+    if (f.openSeconds >= HEAD_TRADE_MAX_OPEN_SECONDS)
+        return {HeadTradeAnswer::Cancel, "the window stayed open past its bound"};
+    HeadTradeAnswer const answer = AnswerTradeAtHead(f.traderIsKin, f.theyOffer,
+                                                     f.theirCopper, f.weGive, f.ourCopper,
+                                                     f.openSeconds);
+    if (answer != HeadTradeAnswer::Accept)
+        return {answer, answer == HeadTradeAnswer::Decline ? "the offer rule declines it"
+                                                           : "the offer rule waits"};
+    if (!f.inTradeRange)
+        return {HeadTradeAnswer::Decline, "the trader is out of trade range"};
+    if (!f.roomForOffered)
+        return {HeadTradeAnswer::Decline, "no room in the bags for every offered item"};
+    return {HeadTradeAnswer::Accept, "family or guild gift, in range, with room"};
+}
+
 HoldDebt HandRevivalDebtOn(HoldDebt inForce, bool revivalLed, bool hasMaster)
 {
     HoldDebt out = inForce;
