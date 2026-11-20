@@ -8639,6 +8639,17 @@ UnissuedFlightStep TownLeaderUnissuedFlight(bool mayCarryNewRpg, bool statusIsTr
     return statusIsTravelFlight ? UnissuedFlightStep::Cancel : UnissuedFlightStep::Leave;
 }
 
+UnissuedFlightStep ErrandLeaderUnissuedFlight(bool statusIsTravelFlight, bool moduleIssuedFlight,
+                                              bool inFlight, float goalYards,
+                                              float flightMinYards)
+{
+    if (moduleIssuedFlight || !statusIsTravelFlight)
+        return UnissuedFlightStep::Leave;
+    if (inFlight)
+        return UnissuedFlightStep::Airborne;
+    return goalYards < flightMinYards ? UnissuedFlightStep::Cancel : UnissuedFlightStep::Leave;
+}
+
 bool IsLinkingJob(std::string const& job)
 {
     std::size_t const first = job.find_first_not_of(" \t");

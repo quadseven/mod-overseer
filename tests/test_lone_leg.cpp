@@ -267,6 +267,34 @@ void AnUnissuedFlightIsCancelledOnATownLeader()
           true);
 }
 
+// AN ERRAND HOLDER IS NOT PROOF OF A MODULE FLIGHT (#1542). A leader 35 yards
+// from its errand goal, on a flight status the module did not issue, is called
+// back to idle; the module's own leg is left; one in the air is said.
+void AnUnissuedFlightIsCancelledOnAnErrandLeader()
+{
+    float const minYards = 1500.f;
+    Check("35 yards from the goal, unissued, on the ground: cancelled",
+          ErrandLeaderUnissuedFlight(true, false, false, 35.f, minYards) ==
+              UnissuedFlightStep::Cancel,
+          true);
+    Check("the module's own flight leg (flightSince set) is left",
+          ErrandLeaderUnissuedFlight(true, true, false, 35.f, minYards) ==
+              UnissuedFlightStep::Leave,
+          true);
+    Check("already in the air is said, not stopped",
+          ErrandLeaderUnissuedFlight(true, false, true, 35.f, minYards) ==
+              UnissuedFlightStep::Airborne,
+          true);
+    Check("a goal far enough to fly to is left",
+          ErrandLeaderUnissuedFlight(true, false, false, 4000.f, minYards) ==
+              UnissuedFlightStep::Leave,
+          true);
+    Check("no flight status is left",
+          ErrandLeaderUnissuedFlight(false, false, false, 35.f, minYards) ==
+              UnissuedFlightStep::Leave,
+          true);
+}
+
 }  // namespace
 
 int main()
@@ -279,6 +307,7 @@ int main()
     TheLeaderComesAllTheWayBackForIt();
     AFailedRunWithAMemberHeldOffALethalLegMeetsAtTheInn();
     AnUnissuedFlightIsCancelledOnATownLeader();
+    AnUnissuedFlightIsCancelledOnAnErrandLeader();
     if (failures)
     {
         std::printf("%d failure(s)\n", failures);
