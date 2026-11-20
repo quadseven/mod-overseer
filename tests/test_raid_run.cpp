@@ -437,6 +437,28 @@ void AnOrderFormsFirstAndKeepsFormingWhileSeatsCanJoin()
     Check("and knocks nobody yet", !done.knockMembers && !done.knockHead);
 }
 
+void AFormedRaidUnderTheQuorumHoldsInFormAndSaysSo()
+{
+    RaidRunFacts facts = Ready();
+    facts.raidFormed = true;
+    facts.addable = 0;
+    facts.inWorld = 31;
+    facts.heldSeconds = 0;
+    RaidRunStep const held = StepRaidRun(RaidRunPhase::Form, facts);
+    CheckPhase("31 seats in the world hold in FORM", held.phase, RaidRunPhase::Form);
+    Check("and walk nobody to the door", !held.aimStaging && !held.aimSeats);
+    Check("and say why", !held.shortfall.empty());
+
+    facts.heldSeconds = RAID_FORM_WAIT_SECONDS;
+    CheckPhase("after the wait the raid goes on, as before",
+               StepRaidRun(RaidRunPhase::Form, facts).phase, RaidRunPhase::Assemble);
+
+    facts.heldSeconds = 0;
+    facts.inWorld = 36;
+    CheckPhase("a raid at the floor does not hold",
+               StepRaidRun(RaidRunPhase::Form, facts).phase, RaidRunPhase::Assemble);
+}
+
 void AssembleWaitsForTheRaidThenForNobodyForever()
 {
     RaidRunFacts facts = Ready();
@@ -975,6 +997,7 @@ int main()
     NoOrderIsIdleAndAnEndedOrderReleases();
     AHeadWithoutAClientHoldsTheRunWhereItIs();
     AnOrderFormsFirstAndKeepsFormingWhileSeatsCanJoin();
+    AFormedRaidUnderTheQuorumHoldsInFormAndSaysSo();
     AssembleWaitsForTheRaidThenForNobodyForever();
     TheRaidEntersOnlyWithAQuorumAtTheDoor();
     TheHeadCrossesLast();

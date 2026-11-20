@@ -59463,7 +59463,8 @@ private:
             {
                 run.quorumShortSaid = step.shortfall;
                 LOG_WARN("module.overseer",
-                         "overseer: raid run for family '{}' holds at the door - {}",
+                         "overseer: raid run for family '{}' holds short of a quorum "
+                         "- {}",
                          roster.family, step.shortfall);
             }
             if (step.quorumEnds)
