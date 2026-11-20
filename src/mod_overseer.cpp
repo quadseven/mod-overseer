@@ -38103,6 +38103,19 @@ private:
                      st.healerGrave ? st.healerGrave->name : "unknown");
             st.refusedStatusSince = now;
         }
+        // A HOLD WITH NO HEALER WALK UNDER WAY IS SAID ON A TIMER TOO (#1284): the
+        // hold is logged once when it starts, and a ghost kept waiting past it
+        // (no healer on this map, hostile still at the corpse) would be silent.
+        if (step == OverseerDecisions::GhostRecovery::Wait && st.refusedHoldSince &&
+            !(st.refusedHealerTaken && !st.healerWalkSpent) &&
+            now - st.refusedStatusSince >= 300)
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' has waited {}s with {} hostile(s) at its corpse and no "
+                     "healer on this map to walk to; it remains a ghost and keeps waiting",
+                     name, facts.heldSeconds, ghost.liveThreatsNearCorpse);
+            st.refusedStatusSince = now;
+        }
         if (step == OverseerDecisions::GhostRecovery::SpiritHealer &&
             (!st.refusedHealerTaken || st.healerWalkSpent))
         {

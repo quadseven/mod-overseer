@@ -130,6 +130,9 @@ std::string Source()
 void TheAdapterIsWired()
 {
     std::string const source = Source();
+    Check("a hold with no healer walk is said on a timer (#1284)",
+          source.find("healer on this map to walk to; it remains a ghost") !=
+              std::string::npos);
     Check("the module source is readable (run from the repo root)", !source.empty());
     Check("a caller without the ladder asks the fallback",
           source.find("OverseerDecisions::RefusedHealerFallback(facts, GHOST_RECOVERY_LIMITS)") !=
