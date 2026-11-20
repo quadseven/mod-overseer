@@ -16132,6 +16132,33 @@ ZoneWalkVerdict DecideZoneWalk(std::vector<DangerZone> const& stillWalked,
                                std::uint32_t walkerZone, std::uint32_t aimZone, bool onFoot,
                                ZoneDangerLimits const& limits);
 
+// A STRETCH OF A CROSS-ZONE LINE WITH NO GROUND UNDER IT (#1534). Two level 60
+// characters on the long walk between the Burning Steppes and the Stormwind
+// area fell under the world and died of their own fall (driver recovery, z
+// near -500) at two points on map 0. The stretch is the segment between the
+// recorded fall points, widened by `radius`; the points are death rows, not
+// hand-written coordinates. A foot walk whose straight line from the walker to
+// its aim comes within `radius` of that segment is refused before it starts.
+struct VoidStretch
+{
+    std::uint32_t mapId{0};
+    float ax{0}, ay{0};  // first recorded fall point
+    float bx{0}, by{0};  // second recorded fall point
+    float radius{0};     // yards either side of the segment
+};
+
+// The stretches recorded so far.
+std::vector<VoidStretch> const& KnownVoidStretches();
+
+// True when the straight line from (fromX, fromY) to (toX, toY) on `mapId`
+// passes within the stretch's radius of its segment.
+bool LineCrossesVoidStretch(VoidStretch const& stretch, std::uint32_t mapId, float fromX,
+                            float fromY, float toX, float toY);
+
+// The refusal's reason for the first known stretch the line crosses, or empty.
+std::string VoidStretchRefusal(std::uint32_t mapId, float fromX, float fromY, float toX,
+                               float toY, bool onFoot);
+
 // ------------------ a staging walk that is measured rather than routed (#342) --
 //
 // THE ROUTE PLANNER ABOVE IS RIGHT ABOUT ITS GRAPH AND WRONG ABOUT THE WORLD,

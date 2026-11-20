@@ -13715,6 +13715,68 @@ ZoneWalkVerdict DecideZoneWalk(std::vector<DangerZone> const& stillWalked,
     return verdict;
 }
 
+namespace
+{
+float SegmentDistance(float px, float py, float ax, float ay, float bx, float by)
+{
+    float const dx = bx - ax;
+    float const dy = by - ay;
+    float const len2 = dx * dx + dy * dy;
+    float t = len2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0.0f;
+    t = t < 0 ? 0 : (t > 1 ? 1 : t);
+    float const cx = ax + t * dx - px;
+    float const cy = ay + t * dy - py;
+    return std::sqrt(cx * cx + cy * cy);
+}
+
+bool SegmentsIntersect(float ax, float ay, float bx, float by, float cx, float cy, float dx,
+                       float dy)
+{
+    auto side = [](float px, float py, float qx, float qy, float rx, float ry) {
+        return (qx - px) * (ry - py) - (qy - py) * (rx - px);
+    };
+    float const d1 = side(ax, ay, bx, by, cx, cy);
+    float const d2 = side(ax, ay, bx, by, dx, dy);
+    float const d3 = side(cx, cy, dx, dy, ax, ay);
+    float const d4 = side(cx, cy, dx, dy, bx, by);
+    return ((d1 > 0) != (d2 > 0)) && ((d3 > 0) != (d4 > 0));
+}
+}  // namespace
+
+std::vector<VoidStretch> const& KnownVoidStretches()
+{
+    // Map 0, Elwynn Forest: the two recorded fall deaths of #1534.
+    static std::vector<VoidStretch> const stretches = {
+        {0, -8501.0f, -820.0f, -8216.0f, -562.0f, 60.0f},
+    };
+    return stretches;
+}
+
+bool LineCrossesVoidStretch(VoidStretch const& s, std::uint32_t mapId, float fromX, float fromY,
+                            float toX, float toY)
+{
+    if (mapId != s.mapId)
+        return false;
+    if (SegmentsIntersect(fromX, fromY, toX, toY, s.ax, s.ay, s.bx, s.by))
+        return true;
+    return SegmentDistance(s.ax, s.ay, fromX, fromY, toX, toY) <= s.radius ||
+           SegmentDistance(s.bx, s.by, fromX, fromY, toX, toY) <= s.radius ||
+           SegmentDistance(fromX, fromY, s.ax, s.ay, s.bx, s.by) <= s.radius ||
+           SegmentDistance(toX, toY, s.ax, s.ay, s.bx, s.by) <= s.radius;
+}
+
+std::string VoidStretchRefusal(std::uint32_t mapId, float fromX, float fromY, float toX,
+                               float toY, bool onFoot)
+{
+    if (!onFoot)
+        return std::string();
+    for (VoidStretch const& s : KnownVoidStretches())
+        if (LineCrossesVoidStretch(s, mapId, fromX, fromY, toX, toY))
+            return "its straight line crosses a stretch where two walkers fell under the world "
+                   "(no ground under it)";
+    return std::string();
+}
+
 std::uint32_t DiedOnLegsOnRoute(std::vector<RouteLegSpan> const& legs,
                                 std::vector<DiedOnLeg> const& died, std::time_t now)
 {

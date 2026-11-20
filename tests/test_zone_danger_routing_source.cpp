@@ -117,6 +117,10 @@ int main()
         refusal.find("continue;") == std::string::npos)
         return Fail("a refused zone walk must be refused and released like the death breaker's");
 
+    // #1534: a line across the recorded no-ground stretch takes the same refusal.
+    if (refusal.find("OverseerDecisions::VoidStretchRefusal(") == std::string::npos)
+        return Fail("the drive must ask the no-ground stretch rule");
+
     std::cout << "zone danger routing source: all checks passed\n";
     return EXIT_SUCCESS;
 }

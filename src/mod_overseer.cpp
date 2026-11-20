@@ -32670,7 +32670,19 @@ private:
             if (!entry)
             {
                 PlanRouteOnce(bot, pos, state, name, target);
-                DiedOnLegMemory const& planned = DiedOnLegBook()[bot->GetName()];
+                DiedOnLegMemory& planned = DiedOnLegBook()[bot->GetName()];
+                // A line across a recorded no-ground stretch is refused too (#1534).
+                if (planned.zoneRefusal.empty() || planned.zoneRefusalTarget != target)
+                {
+                    std::string const voidReason = OverseerDecisions::VoidStretchRefusal(
+                        bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(),
+                        pos.GetPositionX(), pos.GetPositionY(), true);
+                    if (!voidReason.empty())
+                    {
+                        planned.zoneRefusal = voidReason;
+                        planned.zoneRefusalTarget = target;
+                    }
+                }
                 if (!planned.zoneRefusal.empty() && planned.zoneRefusalTarget == target)
                 {
                     LOG_WARN("module.overseer",
