@@ -31930,6 +31930,44 @@ bool WalkwayRouteArrives(float endX, float endY, float endZ, float aimX, float a
 std::size_t DropBogusDoorLinks(std::vector<RouteLink>& links, std::uint32_t mapId, float aimX,
                                float aimY, float aimZ);
 
+// WHERE A SURVEY PLAN FOR THE DOOR ENDS, AND WHO FINISHES THE WALK (#1557, #1573).
+//
+// With the two links into the door node dropped, the survey cannot reach the
+// door, so the plan ends at the nearest node it can, which is hundreds of yards
+// short (294 on the rehearsal that raised this). That is not a fault of the
+// plan: the stretch past its end is the walkway leg, drawn from the navmesh at
+// run time and policed polygon by polygon. What was missing is that nothing
+// SAID so, so a plan that ended 294 yards short read the same as a plan that
+// simply gave up. This names which of three things a plan's end is.
+//
+// DOOR_PLAN_REACH_YARDS is the bound the issues ask for ("within 10 yards").
+// DOOR_PLAN_HANDOVER_YARDS is the bound the module already puts on unsurveyed
+// ground (StagingCorridorLimits::joinYards): past it, nothing proves the
+// walkway leg is in reach of the plan's end, so the plan stops there and says
+// so instead of leaving the character to find out.
+constexpr float DOOR_PLAN_REACH_YARDS = 10.f;
+constexpr float DOOR_PLAN_HANDOVER_YARDS = StagingCorridorLimits{}.joinYards;
+
+enum class DoorPlanTail : std::uint8_t
+{
+    // The aim is not on the door's walkway, or there is no plan to read.
+    NotADoorAim,
+    // The plan ends within DOOR_PLAN_REACH_YARDS of the aim.
+    SurveyReachesAim,
+    // The plan ends short and the walkway leg takes the rest.
+    WalkwayLegFinishes,
+    // The plan ends short, farther than the walkway leg can be trusted to pick
+    // up from. The walk stops at the plan's last node.
+    StopsShort,
+};
+
+DoorPlanTail ReadDoorPlanTail(std::uint32_t mapId, float aimX, float aimY, float aimZ,
+                              RoutePlan const& plan);
+
+// One log line for the tail, or "" for NotADoorAim. It names the yards short
+// and the reason, with no coordinate in it.
+std::string DoorPlanTailLine(DoorPlanTail tail, float shortYards);
+
 
 // ------------------------------------------------ enchant-for (trade window) --
 //
