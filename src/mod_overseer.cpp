@@ -7389,6 +7389,15 @@ public:
         return true;
     }
 
+    // WHETHER THIS MODULE ISSUED THE FLIGHT THE CHARACTER IS ON (#1542): its own
+    // leg sets flightSince and nothing else does. Read without creating a
+    // record, for the reason TargetFor gives.
+    bool HoldsIssuedFlight(std::string const& name) const
+    {
+        auto const it = _state.find(name);
+        return it != _state.end() && it->second.flightSince != 0;
+    }
+
     // WHETHER THE AIM IN THIS CHARACTER'S COLUMN IS ONE THE DRIVE REFUSED TO
     // WALK, read without creating a record, for the reason TargetFor gives: the
     // party flight asks it about every member it seats.
@@ -27088,21 +27097,40 @@ private:
                 MovementOwner().LeaderWalksUnderNewRpg(name, std::time(nullptr));
             bool const mayCarry =
                 OverseerDecisions::LeaderCarriesNewRpg(TownJobFor(name), onErrand);
-            OverseerDecisions::UnissuedFlightStep const step =
-                OverseerDecisions::TownLeaderUnissuedFlight(
-                    mayCarry, ai->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT,  // NewRpgInfo.h:99
-                    onErrand, leader->IsInFlight());
+            // The flight leg's own marker, not the errand: holding an errand is
+            // no proof this module issued the flight (#1542).
+            bool const issued = _travelAims.HoldsIssuedFlight(name);
+            bool const statusIsFlight =
+                ai->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT;  // NewRpgInfo.h:99
+            OverseerDecisions::UnissuedFlightStep step =
+                OverseerDecisions::TownLeaderUnissuedFlight(mayCarry, statusIsFlight, issued,
+                                                            leader->IsInFlight());
+            if (onErrand)
+            {
+                // An errand holder carries `new rpg`, so the town verdict leaves
+                // it. A goal this module would not fly to is still not flown to
+                // by a status upstream rolled (#1542). Unknown goal: left.
+                uint32 goalMap = 0;
+                float goalX = 0.f;
+                float goalY = 0.f;
+                if (_travelAims.ResolvedPoint(name, goalMap, goalX, goalY) &&
+                    goalMap == leader->GetMapId())
+                    step = OverseerDecisions::ErrandLeaderUnissuedFlight(
+                        statusIsFlight, issued, leader->IsInFlight(),
+                        leader->GetDistance2d(goalX, goalY), TRAVEL_FLIGHT_MIN_YARDS);
+            }
             if (step == OverseerDecisions::UnissuedFlightStep::Cancel)
             {
                 ai->rpgInfo.ChangeToIdle();  // NewRpgInfo.h:110
                 if (ai->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
                     ai->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
                 LOG_WARN("module.overseer",
-                         "overseer: '{}' leads a family waiting in town with no errand and "
+                         "overseer: '{}' leads a family waiting in town {} and "
                          "was walking to a flight master on a flight this module did not "
                          "issue - the flight is called off and `new rpg` taken off, so the "
-                         "family is not led to another zone by a random status (#697)",
-                         name);
+                         "family is not led to another zone by a random status (#697, #1542)",
+                         name, onErrand ? "holding an errand whose goal is on foot" :
+                                          "with no errand");
             }
             else if (step == OverseerDecisions::UnissuedFlightStep::Airborne)
             {
