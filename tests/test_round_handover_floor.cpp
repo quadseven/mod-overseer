@@ -149,6 +149,14 @@ int main()
           OverseerDecisions::EndedAboveTheAim(AIM_Z + OverseerDecisions::WRONG_LEVEL_YARDS, AIM_Z),
           false);
 
+    // The retry of an attempt that ended above the aim takes no way round.
+    Check("no earlier wrong level: a way round is allowed",
+          OverseerDecisions::RoundAllowedForRetry("", "at:0:1,2,3"), true);
+    Check("the same aim again: no way round",
+          OverseerDecisions::RoundAllowedForRetry("at:0:1,2,3", "at:0:1,2,3"), false);
+    Check("another aim plans as usual",
+          OverseerDecisions::RoundAllowedForRetry("at:0:1,2,3", "at:0:4,5,6"), true);
+
     // The planned nodes, named once in the log.
     Check("the node list names every node",
           OverseerDecisions::RouteNodeList({DRACODAR, DOOR}, 64) == "3380 1485", true);

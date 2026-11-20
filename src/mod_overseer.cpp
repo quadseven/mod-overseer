@@ -25224,6 +25224,14 @@ private:
     // "there is no route to plan", which every caller must read as "aim at the
     // errand", never as an error: that is what this module did before #316 and
     // what it keeps doing for every journey a survey cannot improve on.
+    // The aim of each walker's last attempt that ended above it (#1557), so the
+    // next plan for that aim is not the same walk. One entry per walker.
+    static std::map<std::string, std::string>& WrongLevelAims()
+    {
+        static std::map<std::string, std::string> book;
+        return book;
+    }
+
     static std::vector<OverseerDecisions::RoutePoint> PlanRoute(
         Player* bot, WorldPosition const& want, std::string const& name,
         std::string const& target, bool& measured, bool& joinsCorridor)
@@ -25390,6 +25398,18 @@ private:
         // head stopped on the Spire ledge 105 yards above it.
         limits.aimZKnown = true;
         limits.aimZ = aimZ;
+        // AND THE RETRY OF AN ATTEMPT THAT ENDED ABOVE THE AIM TAKES NO WAY
+        // ROUND (#1557): see RoutePlanLimits::allowRound.
+        {
+            auto const wrong = WrongLevelAims().find(name);
+            limits.allowRound = OverseerDecisions::RoundAllowedForRetry(
+                wrong == WrongLevelAims().end() ? std::string() : wrong->second, target);
+            if (!limits.allowRound)
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' last ended an attempt at '{}' above the aim, so "
+                         "this plan takes no way round (#1557)",
+                         name, target);
+        }
         OverseerDecisions::RoutePlan plan;
         unsigned refusedEntries = 0;
         uint32 walkableEntry = 0;
@@ -32815,6 +32835,7 @@ private:
                                  name, target, bot->GetPositionZ() - pos.GetPositionZ(),
                                  bot->GetPositionZ(), pos.GetPositionZ(),
                                  static_cast<uint32>(distance));
+                        WrongLevelAims()[name] = target;
                     }
                     _travelAims.Release(name, OverseerDecisions::TravelGroundGiveUpReleaseReason);
                     // A stranded member whose walk to its berth gives up here

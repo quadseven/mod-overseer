@@ -13911,6 +13911,11 @@ bool EndedAboveTheAim(float stoodZ, float aimZ)
     return std::isfinite(stoodZ) && std::isfinite(aimZ) && stoodZ - aimZ > WRONG_LEVEL_YARDS;
 }
 
+bool RoundAllowedForRetry(std::string const& wrongLevelAim, std::string const& aim)
+{
+    return wrongLevelAim.empty() || wrongLevelAim != aim;
+}
+
 std::string RouteNodeList(std::vector<std::uint32_t> const& nodes, std::size_t cap)
 {
     std::string out;

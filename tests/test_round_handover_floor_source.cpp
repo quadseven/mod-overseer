@@ -48,6 +48,10 @@ int main()
           Has(src, "limits.aimZKnown = true;\n        limits.aimZ = aimZ;"));
     Check("the unreachable release asks whether it ended above the aim",
           Has(src, "OverseerDecisions::EndedAboveTheAim(bot->GetPositionZ(),"));
+    Check("the retry is planned without a way round",
+          Has(src, "limits.allowRound = OverseerDecisions::RoundAllowedForRetry("));
+    Check("the unreachable release remembers the aim it ended above",
+          Has(src, "WrongLevelAims()[name] = target;"));
     Check("the planned nodes are logged",
           Has(src, "OverseerDecisions::RouteNodeList(plan.nodes, 64)"));
 
