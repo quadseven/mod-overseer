@@ -68802,6 +68802,10 @@ private:
                 // kind='guild' and routed on the first word like the finder
                 // run below, so no ENUM migration is needed.
                 detail = DoBattlegroundQueue(player, command, status, rowResult);
+            else if (kind == "guild" && OverseerDecisions::IsBattlegroundLeaveRow(command))
+                // A MEMBER LEAVES A BATTLEGROUND QUEUE, the counterpart of
+                // bg-queue, routed on the first word the same way.
+                detail = DoBattlegroundLeave(player, command, status, rowResult);
             else if (kind == "guild" && OverseerDecisions::IsPartyUpRow(command))
                 // A QUEST PARTY (see DoPartyUp), on kind='guild' beside the
                 // finder run and routed on the first word, so no ENUM
@@ -73389,6 +73393,103 @@ private:
                  asGroup ? " with its group" : "");
         facts.queuedForThis = true;
         describe("queued", "");
+        status = "delivered";
+        return "";
+    }
+
+    // A MEMBER LEAVES A BATTLEGROUND QUEUE: `bg-leave [<av|wsg|ab>]`.
+    //
+    // The core's own leave is CMSG_BATTLEFIELD_PORT with action 0, handled by
+    // WorldSession::HandleBattleFieldPortOpcode; the playerbots `bg leave`
+    // action is no use because it returns early unless its own join action
+    // set its `bg type` value. The queue is READ BACK afterwards. A character
+    // inside a battleground is refused, never pulled out.
+    static char const* DoBattlegroundLeave(Player* who, std::string const& command,
+                                           char const*& status, std::string& out)
+    {
+        using OverseerDecisions::BattlegroundLeaveFacts;
+        using OverseerDecisions::BattlegroundLeaveOutcome;
+        using OverseerDecisions::BattlegroundLeaveRequest;
+        using OverseerDecisions::ParseBattlegroundLeaveRequest;
+
+        BattlegroundLeaveRequest const request = ParseBattlegroundLeaveRequest(command);
+        auto describe = [&](char const* outcome, char const* reason)
+        {
+            std::ostringstream o;
+            o << "{\"outcome\":" << J(outcome) << ",\"reason\":" << J(reason)
+              << ",\"character\":" << J(who->GetName())
+              << ",\"battleground\":" << J(request.all ? "all" : request.key)
+              << ",\"request\":" << J(command) << "}";
+            out = o.str();
+        };
+        auto refuse = [&](char const* reason) -> char const*
+        {
+            describe("refused", reason);
+            return reason;
+        };
+
+        if (!request.valid)
+        {
+            describe("refused", request.error.c_str());
+            return "malformed bg-leave request";
+        }
+        WorldSession* session = who->GetSession();
+        if (!session)
+            return refuse("character has no session");
+
+        // The battlegrounds this row names, as (type, queue type) pairs.
+        std::vector<std::pair<BattlegroundTypeId, BattlegroundQueueTypeId>> targets;
+        for (uint32 type : {1u, 2u, 3u})
+        {
+            if (!request.all && type != request.bgTypeId)
+                continue;
+            BattlegroundTypeId const bgTypeId = BattlegroundTypeId(type);
+            BattlegroundQueueTypeId const queueTypeId = BattlegroundMgr::BGQueueTypeId(bgTypeId, 0);
+            if (queueTypeId != BATTLEGROUND_QUEUE_NONE)
+                targets.emplace_back(bgTypeId, queueTypeId);
+        }
+        auto queuedAny = [&]()
+        {
+            for (auto const& target : targets)
+                if (who->InBattlegroundQueueForBattlegroundQueueType(target.second))
+                    return true;
+            return false;
+        };
+
+        BattlegroundLeaveFacts facts;
+        facts.inBattleground = who->InBattleground();
+        facts.queued = queuedAny();
+        switch (OverseerDecisions::DecideBattlegroundLeave(facts))
+        {
+            case BattlegroundLeaveOutcome::Refused:
+                return refuse(OverseerDecisions::BattlegroundLeaveRefusal());
+            case BattlegroundLeaveOutcome::Already:
+                describe("already", "not in that queue");
+                status = "delivered";
+                return "";
+            case BattlegroundLeaveOutcome::Left:
+                break;
+        }
+
+        for (auto const& target : targets)
+        {
+            if (!who->InBattlegroundQueueForBattlegroundQueueType(target.second))
+                continue;
+            WorldPacket packet(CMSG_BATTLEFIELD_PORT, 1 + 1 + 4 + 2 + 1);
+            packet << uint8(0);                    // arena type
+            packet << uint8(0);                    // unused
+            packet << uint32(target.first);        // battleground type
+            packet << uint16(0x1F90);              // the client's constant
+            packet << uint8(0);                    // action 0: leave the queue
+            session->HandleBattleFieldPortOpcode(packet);
+        }
+
+        if (queuedAny())
+            return refuse("the core did not remove the character from the queue");
+
+        LOG_INFO("module.overseer", "overseer: '{}' left battleground queue {}", who->GetName(),
+                 request.all ? "all" : request.key);
+        describe("left", "");
         status = "delivered";
         return "";
     }

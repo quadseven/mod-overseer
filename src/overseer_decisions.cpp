@@ -26793,6 +26793,65 @@ TownRetry BattlegroundQueueRetry(std::string const& detail)
     return TownRetry::Later;
 }
 
+bool IsBattlegroundLeaveRow(std::string const& command)
+{
+    std::vector<std::string> const words = TownWords(command);
+    return !words.empty() && words[0] == "bg-leave";
+}
+
+BattlegroundLeaveRequest ParseBattlegroundLeaveRequest(std::string const& command)
+{
+    BattlegroundLeaveRequest out;
+    std::vector<std::string> const words = TownWords(command);
+    if (words.empty() || words[0] != "bg-leave")
+    {
+        out.error = "malformed bg-leave: want bg-leave [<av|wsg|ab>]";
+        return out;
+    }
+    if (words.size() == 1)
+    {
+        out.valid = true;
+        out.all = true;
+        return out;
+    }
+    if (words.size() != 2)
+    {
+        out.error = "malformed bg-leave: want at most one battleground (av, wsg or ab)";
+        return out;
+    }
+    static struct
+    {
+        char const* key;
+        uint32_t type;
+    } const KNOWN[] = {{"av", 1}, {"wsg", 2}, {"ab", 3}};
+    for (auto const& known : KNOWN)
+    {
+        if (words[1] == known.key)
+        {
+            out.valid = true;
+            out.key = known.key;
+            out.bgTypeId = known.type;
+            return out;
+        }
+    }
+    out.error = "malformed bg-leave: unknown battleground (want av, wsg or ab)";
+    return out;
+}
+
+BattlegroundLeaveOutcome DecideBattlegroundLeave(BattlegroundLeaveFacts const& facts)
+{
+    if (facts.inBattleground)
+        return BattlegroundLeaveOutcome::Refused;
+    if (!facts.queued)
+        return BattlegroundLeaveOutcome::Already;
+    return BattlegroundLeaveOutcome::Left;
+}
+
+char const* BattlegroundLeaveRefusal()
+{
+    return "inside a battleground";
+}
+
 // ---------------------------------------------------------------- stand-ins --
 
 bool ParseStandinSeat(std::string const& word, StandinSeat& seat)
