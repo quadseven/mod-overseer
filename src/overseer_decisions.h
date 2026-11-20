@@ -3919,6 +3919,14 @@ DungeonClearStallAction DungeonClearStallDecision(bool bossProgress,
 bool DungeonClearWaitStopRearms(std::string const& stopReason, unsigned rearms,
                                 unsigned maximumRearms);
 
+// THE STOP TEXT IS READ FROM WHOEVER THE MODULE RAN ON (#1483). The dungeon
+// module elects its own leader (often the tank), which need not be the run's
+// leader, and it logs "dungeon clear stopped" on that member's context only. A
+// read from the run's leader alone is empty then, and the party-wait re-arm never
+// fires. `reasons` is each member's stop text, the run's leader first; the first
+// non-empty one wins, empty when nobody holds one.
+std::string FirstDungeonStopReason(std::vector<std::string> const& reasons);
+
 // A STOPPED RUN IS ARMED AGAIN WITHIN THE GRACE, WHATEVER A MEMBER REPORTS
 // (#1483). The busy hold protects a run that is fighting; a run the module has
 // switched off cannot fight, so a member still reporting "looting" must not keep

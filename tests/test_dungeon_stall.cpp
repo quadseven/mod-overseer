@@ -60,6 +60,35 @@ void APartyWaitStopRearmsBeforeTheLadder()
     }
 }
 
+// THE STOP TEXT IS THE MODULE LEADER'S, NOT NECESSARILY THE RUN LEADER'S (#1483).
+// The module stopped on its elected tank while the run's leader held nothing, so
+// a leader-only read never re-armed the run.
+void AStopHeldByAnotherMemberStillRearms()
+{
+    using OverseerDecisions::DungeonClearWaitStopRearms;
+    using OverseerDecisions::FirstDungeonStopReason;
+    std::string const wait =
+        "Dungeon clear stopped: the party never became ready after 205s "
+        "(Waiting on Trog (low mana, no drink)).";
+    std::string const found = FirstDungeonStopReason({"", wait, ""});
+    if (found != wait || !DungeonClearWaitStopRearms(found, 0, 3))
+    {
+        std::printf("FAIL a stop held by a member other than the leader must re-arm\n");
+        ++failures;
+    }
+    if (FirstDungeonStopReason({"No bosses left - disabling", wait}) !=
+        "No bosses left - disabling")
+    {
+        std::printf("FAIL the leader's own stop text comes first\n");
+        ++failures;
+    }
+    if (!FirstDungeonStopReason({"", ""}).empty() || !FirstDungeonStopReason({}).empty())
+    {
+        std::printf("FAIL no stop text anywhere reads empty\n");
+        ++failures;
+    }
+}
+
 void HealthyProgressIsNeverInterrupted()
 {
     Check("boss progress", DungeonClearStallDecision(true, false, false, true, 3, 3),
@@ -194,6 +223,7 @@ int main()
     AStallSkipNeverSpendsTheLastBossOfBlackrockDepths();
     HealthyProgressIsNeverInterrupted();
     APartyWaitStopRearmsBeforeTheLadder();
+    AStopHeldByAnotherMemberStillRearms();
     StalledRunGetsBoundedSkips();
     ExhaustedRunIsExtracted();
     ARefusedSkipExtractsAtOnce();

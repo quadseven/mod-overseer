@@ -55,6 +55,9 @@ int main()
     if (watchdog.find("_dcOnIssued.erase(state.name)", rearm) > busyHold)
         return Fail("the re-arm forgets every member's dc on record");
 
+    if (watchdog.find("PartyBrainStopReason(leader, states)") > rearm)
+        return Fail("the stop text is read from every member, not the leader alone (#1483)");
+
     std::size_t const grace = watchdog.find("DungeonClearStopIsInGrace");
     if (grace == std::string::npos || grace < rearm || grace > busyHold)
         return Fail("the grace holds the ladder right after the re-arm, before the busy hold");

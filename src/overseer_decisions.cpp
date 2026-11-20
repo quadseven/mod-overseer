@@ -2939,6 +2939,14 @@ bool DungeonClearWaitStopRearms(std::string const& stopReason, unsigned rearms,
            stopReason.find("the party never became ready") != std::string::npos;
 }
 
+std::string FirstDungeonStopReason(std::vector<std::string> const& reasons)
+{
+    for (std::string const& reason : reasons)
+        if (!reason.empty())
+            return reason;
+    return std::string();
+}
+
 bool DungeonClearStoppedRunRearmsNow(std::string const& stopReason, unsigned rearms,
                                      unsigned maximumRearms, time_t stopSeenAt, time_t now,
                                      time_t graceSeconds)
