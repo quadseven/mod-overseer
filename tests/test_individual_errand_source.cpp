@@ -139,7 +139,7 @@ int main()
                  "                    WalksItsOwnErrand(name), toll.deaths, toll.partyDeaths);"),
           "the walker's own toll goes through ErrandPartyDeaths with its own errand");
     std::string const party = Body(text, "    uint32 RecentPartyDeathCount(");
-    Check(party.find("OverseerDecisions::PartyTollCounts(WalksItsOwnErrand(member->GetName()))") !=
+    Check(party.find("OverseerDecisions::PartyTollCounts(WalksItsOwnErrand(member->GetName()),") !=
               std::string::npos,
           "a member on its own errand is left out of another walker's party toll");
 

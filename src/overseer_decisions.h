@@ -9789,6 +9789,60 @@ enum class RoamStep
 };
 RoamStep IndividualRoamStep(bool holdsGrant, bool roams);
 
+// THE SAME STEP FOR A MEMBER SOMETHING ELSE OWNS THIS POLL: dead, in the air,
+// held by the module (a revival, a cast, a counter, the too-far hold), lent
+// `new rpg` to board its leader's flight, or under a command that took the
+// strategy off (a hunt, a quest party). That poll changes nothing either way.
+// Each of those took the mover off or put it on for its own reason and hands
+// back exactly what it took, so a grant made under one would move a member it
+// is holding, and a take-back made under one would be undone by its hand-back.
+// The step is taken on the first poll after the member is free.
+RoamStep IndividualRoamStep(bool holdsGrant, bool roams, bool ownedElsewhere);
+
+// DOES A GRANT MADE EARLIER STILL STAND? Only while the member still carries
+// `new rpg`, or while something else owns it and will hand the strategy back.
+// A free member without the strategy has lost it to another writer: the
+// follow sweep strips a follower whose column held an aim, and an aim can
+// come and go between two travel polls. Its grant is forgotten, so it is a
+// follower again to every gate, and it is granted afresh if still admitted.
+bool RoamGrantStands(bool granted, bool carriesNewRpg, bool ownedElsewhere);
+
+// Does a take-back take `new rpg` off the member? Not off one that leads its
+// party, whatever the refusal that took the grant back was (the switch going
+// off is asked before the leader): a leader carries the strategy as leader,
+// and the follow sweep's leader block owns it from there. The grant is
+// forgotten either way.
+bool RoamTakeBackStrips(bool leadsItsParty);
+
+// Is this refusal worth a line of its own when it changes on a member that
+// does not hold the grant? Not an errand: a catch-up, a walk home and every
+// other aim already says itself, starts and ends many times an hour, and
+// would bury the refusals that explain why a member is not roaming.
+bool RoamRefusalIsSaid(RoamRefusal refusal);
+
+// The times of a member's deaths, from how long ago each one was. The death
+// table and the module may not share a clock, so the table is asked for ages
+// and they are placed on the clock RoamOffUntil is read against. A negative
+// age is a row stamped after the read and is placed at `now`.
+std::vector<int64_t> RoamDeathTimes(std::vector<int64_t> const& secondsAgo, int64_t now);
+
+// A ROAMING MEMBER TAKES NO FLIGHT. Upstream rolls a travel flight from idle
+// like any other status, and a taxi carries the member out of the zone its
+// grant is fenced to and lands it wherever the node is, which is the scatter
+// the band exists to prevent. The module issues no flight to a roaming member
+// (it has no errand, and its leader's flight does not board it), so any
+// travel flight status on one is upstream's own. On the ground it is
+// cancelled by setting the status idle, and the member keeps the strategy. In
+// the air it is only said: stopping a taxi mid-route is a teleport, and the
+// band test takes the grant back once it has landed outside its band.
+UnissuedFlightStep RoamerUnissuedFlight(bool roamsAlone, bool statusIsTravelFlight,
+                                        bool inFlight);
+
+// THE FAMILY'S PARTY TOLL LEAVES OUT A MEMBER AWAY ON ITS OWN (#1517, #1518):
+// one walking an errand of its own, or one roaming alone inside its band. It
+// is somewhere else, and its deaths are not the walk's the toll is read for.
+bool PartyTollCounts(bool memberOnItsOwnErrand, bool memberRoamsAlone);
+
 // -------------- the family waits for the member it left behind (#404) -------
 //
 // THE MEASUREMENT, AND IT IS NOT A NAVIGATION FAULT. Four of five characters
@@ -9897,6 +9951,10 @@ struct RegroupMember
     // waited for: holding the leader still for a member that is walking away
     // on purpose is a family standing still until the errand ends.
     bool onItsOwnErrand{false};
+    // IT ROAMS ALONE INSIDE ITS BAND (#1518, IndividualRoams). Never waited
+    // for, for the same reason: it is away on purpose until the grant is
+    // taken back, and the catch-up walks it to its leader from that poll.
+    bool roamsAlone{false};
 };
 
 // What one member asks of the family, and each value is a separate answer
@@ -9940,6 +9998,9 @@ enum class RegroupClaim : std::uint8_t
     // IT WALKS AN ERRAND OF ITS OWN (#1517). Not waited for, and not fetched:
     // it rejoins by `follow` when the errand ends.
     OwnErrand,
+    // IT ROAMS ALONE INSIDE ITS BAND (#1518). Not waited for, and not fetched:
+    // it is walked back by the catch-up once the grant is taken back.
+    RoamsAlone,
 };
 
 char const* RegroupClaimName(RegroupClaim claim);
@@ -10192,6 +10253,9 @@ struct FetchCandidate
     // IT WALKS AN ERRAND OF ITS OWN (#1517). Never fetched, and not a member
     // still walking back: it is walking away on purpose.
     bool onItsOwnErrand{false};
+    // IT ROAMS ALONE INSIDE ITS BAND (#1518). Never fetched, and not a member
+    // still walking back, for the same reason.
+    bool roamsAlone{false};
     // NOT HELD, BUT NOT MOVING EITHER: the follow drive has watched it for a
     // whole stall window without it getting anywhere. A member walking back
     // makes the leader wait for the family to gather; a member that only
@@ -18133,8 +18197,14 @@ PartyFlightPlan PlanPartyFlight(std::vector<PartyFlightMember> const& members);
 // flying TO it, so it is not behind him, and it is held because it cannot reach
 // a flight master: counting it as a passenger would refuse every flight the
 // fetch could take. The rest of the family still boards with him.
+//
+// NOR A MEMBER ROAMING ALONE INSIDE ITS BAND (#1518). Its column is empty, but
+// it is not behind the leader: boarding it would carry it out of the zone its
+// grant is fenced to, and holding the departure for it would ground the family
+// for a member that is away on purpose.
 bool MemberFollowsForFlight(bool columnEmpty, bool catchingUp, bool aimInert,
-                            bool heldForLeader, bool beingFetched);
+                            bool heldForLeader, bool beingFetched,
+                            bool roamsAlone = false);
 
 // THE GATHERING CLOCK COUNTS TIME WITHOUT PROGRESS, NOT TIME SINCE STAGING.
 //

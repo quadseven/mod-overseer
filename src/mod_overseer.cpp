@@ -367,6 +367,8 @@
 #include "overseer_core_compat.h"
 // A grouped follower with full bags may take its sale walk (#1395).
 #include "overseer_follower_sale.h"
+// Each zone's band top per side, compiled in from data/zone_band.json (#1518).
+#include "overseer_zone_band.h"
 
 #include <algorithm>
 #include <atomic>
@@ -9243,6 +9245,8 @@ public:
             // what it catches is a walk to a flight master that takes seconds
             // (#697). See KeepTownLeadersGrounded.
             KeepTownLeadersGrounded();
+            // And a member roaming alone, for the same reason (#1518).
+            KeepRoamersGrounded();
         }
         if (_partyTimer >= PARTY_POLL_MS)
         {
@@ -13594,8 +13598,12 @@ private:
             // character on another continent has not stopped walking, it has
             // nowhere to walk. FollowGapIsBehind answers false there, and
             // DriveCatchUp below says what is actually wrong instead.
+            //
+            // NOR FOR A MEMBER ROAMING ALONE INSIDE ITS BAND (#1518): it is
+            // far from its leader on purpose, and standing at a node or a camp
+            // is not a stalled follow.
             else if (OverseerDecisions::FollowGapIsBehind(behind) &&
-                     progress.stalled &&
+                     !RoamsAlone(p->GetName()) && progress.stalled &&
                      std::time(nullptr) - stall.nudged > FOLLOW_STALL_SECONDS)
             {
                 LOG_WARN("module.overseer",
@@ -17000,6 +17008,31 @@ private:
         return static_cast<uint32>(result->Fetch()[0].Get<uint64>());
     }
 
+    // How long ago each of this character's deaths inside the last `seconds`
+    // was, in seconds, for the roam death limit (#1518). Ages and not times:
+    // both ends of TIMESTAMPDIFF are the database's clock, the same one the
+    // counts above are read against, and OverseerDecisions::RoamDeathTimes
+    // places them on the module's. The same zero-window rule, and a world
+    // without the table answers nothing, which is nobody having died.
+    std::vector<int64_t> RecentDeathAges(std::string const& name, int64 seconds)
+    {
+        std::vector<int64_t> ages;
+        if (seconds <= 0)
+            return ages;
+
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT TIMESTAMPDIFF(SECOND, created_at, NOW()) FROM overseer_death "
+            "WHERE character_name = '{}' AND created_at >= NOW() - INTERVAL {} SECOND",
+            Esc(name), seconds);
+        if (!result)
+            return ages;
+        do
+        {
+            ages.push_back(result->Fetch()[0].Get<int64>());
+        } while (result->NextRow());
+        return ages;
+    }
+
     // Deaths of every member of `who`'s group inside the last `seconds`, `who`
     // included, or just its own when it is in no group (#776). One COUNT over
     // the names, through the same table and the same zero-window rule as
@@ -17024,8 +17057,11 @@ private:
             for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
             {
                 Player* const member = ref->GetSource();
+                // A member away on its own is left out: on its own errand
+                // (#1517) or roaming alone inside its band (#1518).
                 if (member && member != who && plain(member->GetName()) &&
-                    OverseerDecisions::PartyTollCounts(WalksItsOwnErrand(member->GetName())))
+                    OverseerDecisions::PartyTollCounts(WalksItsOwnErrand(member->GetName()),
+                                                       RoamsAlone(member->GetName())))
                     names += ",'" + Esc(member->GetName()) + "'";
             }
         }
@@ -20266,11 +20302,16 @@ private:
         //
         // AND NOT THE MEMBER THIS LEADER IS GOING BACK FOR (2026-09-23): he is
         // flying to it, and it is held because it cannot reach a flight master.
+        //
+        // NOR A MEMBER ROAMING ALONE INSIDE ITS BAND (#1518): its column is
+        // empty, but it is not behind him, and the flight would carry it out of
+        // the zone its grant is fenced to.
         seat.read.followingTheLeader = OverseerDecisions::MemberFollowsForFlight(
             _travelAims.TargetFor(seat.read.name).empty(), IsCatchingUp(seat.read.name),
             _travelAims.InertFollowerAim(seat.read.name),
             HeldWaitingForLeader(seat.read.name),
-            FetchTargetOf(leader->GetName()) == seat.read.name);
+            FetchTargetOf(leader->GetName()) == seat.read.name,
+            RoamsAlone(seat.read.name));
 
         if (!seat.read.onSameMap || !seat.read.alive || seat.read.inFlight ||
             seat.read.atArrival || !seat.read.followingTheLeader)
@@ -27057,9 +27098,89 @@ private:
     // walked again when the landing ceiling lapses.
     std::map<std::string, std::string> _individualLanded;
 
+    // ROAMING ALONE INSIDE ITS BAND, IN INDIVIDUAL MODE (#1518). The followers
+    // RefreshIndividualRoams has handed `new rpg` with no errand at all: the
+    // switch is on, the family is on no dungeon or raid job, and the zone the
+    // member stands in tops out at most one level above it
+    // (OverseerDecisions::IndividualRoams). Empty for as long as
+    // Overseer.Individual.Enable is off, because only that poll's Grant step
+    // inserts a name. Read by the follow sweep's strip through
+    // MaySteerItself, by DriveCatchUp, by the stall nudge, by the regroup
+    // wait, by the fetch, by the party flight, by the party death toll and by
+    // KeepRoamersGrounded, so none of them walks back, waits for, boards or
+    // counts a member that is away on purpose.
+    std::set<std::string> _individualRoams;
+    // AND ONLY WHILE ITS COLUMN IS EMPTY: an aim written between two travel
+    // polls makes it an errand or a catch-up from that moment, and each of
+    // those has its own rule. The next poll takes the grant back by name.
+    bool RoamsAlone(std::string const& name) const
+    {
+        return _individualRoams.count(name) != 0 && _travelAims.TargetFor(name).empty();
+    }
+    // Until when each member is held off the roam by its own deaths
+    // (OverseerDecisions::RoamOffUntil). In memory only: a restart forgets a
+    // hold, and the deaths themselves are read from the death table again.
+    std::map<std::string, int64_t> _roamOffUntil;
+    // Why each member was last refused, so a refusal is said when it changes
+    // and not once per poll.
+    std::map<std::string, OverseerDecisions::RoamRefusal> _roamRefusalSaid;
+    static constexpr OverseerDecisions::RoamDeathLimits ROAM_DEATH_LIMITS{};
+
+    // A ROAMING MEMBER TAKES NO FLIGHT (#1518). Upstream rolls a travel flight
+    // from idle like any other status (NewRpgStatusUpdateAction, read at the
+    // pin: no group or master gate), and it begins with a walk to a flight
+    // master, which this five second poll can still catch on the ground, the
+    // way KeepTownLeadersGrounded does. The status is set idle and the member
+    // keeps `new rpg`: the roam goes on, in the zone it was granted for. One
+    // already in the air is said once and left; the band test takes its grant
+    // back once it has landed outside its band. Never the module's own flight:
+    // a member lent `new rpg` to board its leader's is not granted the roam
+    // (RoamOwnedElsewhere), and a roaming member is not boarded. Nothing to
+    // do, and no read, while nobody holds a grant, which is always the case
+    // with the switch off.
+    void KeepRoamersGrounded()
+    {
+        std::set<std::string> airborne;
+        for (std::string const& name : _individualRoams)
+        {
+            Player* const bot = ObjectAccessor::FindPlayerByName(name);
+            PlayerbotAI* const ai = SteerableAI(bot);
+            if (!ai)
+                continue;
+            OverseerDecisions::UnissuedFlightStep const step =
+                OverseerDecisions::RoamerUnissuedFlight(
+                    RoamsAlone(name), ai->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT,
+                    bot->IsInFlight());
+            if (step == OverseerDecisions::UnissuedFlightStep::Cancel)
+            {
+                ai->rpgInfo.ChangeToIdle();
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' roams alone and was walking to a flight master on "
+                         "a flight this module did not issue - the flight is called off, "
+                         "so it stays in the zone it was granted for (#1518)",
+                         name);
+            }
+            else if (step == OverseerDecisions::UnissuedFlightStep::Airborne)
+            {
+                airborne.insert(name);
+                if (!_roamAirborneSaid.count(name))
+                    LOG_WARN("module.overseer",
+                             "overseer: '{}' roams alone and is already in the air on a "
+                             "flight this module did not issue - it cannot be stopped "
+                             "without a teleport; its grant is taken back if it lands "
+                             "outside its band (#1518)",
+                             name);
+            }
+        }
+        _roamAirborneSaid.swap(airborne);
+    }
+    // Said once per flight: the names the last poll found airborne.
+    std::set<std::string> _roamAirborneSaid;
+
     bool MaySteerItself(std::string const& name) const
     {
         return IsEscorted(name) || WalksItsGuard(name) || WalksItsOwnErrand(name) ||
+               RoamsAlone(name) ||
                (SplitFromLeader(name) &&
                 OverseerDecisions::CutOffFollowerRoams(TownJobFor(name),
                                                        _travelAims.TargetFor(name)));
@@ -27717,6 +27838,14 @@ private:
             _partySplitSaid.erase(name);
             _partySplitLineSaid.erase(name);
         }
+
+        // ROAMING ALONE INSIDE ITS BAND (#1518): not walked back to its leader.
+        // A catch-up aim would end the roam it was granted a poll ago; the
+        // take-back ends it, and this walks it back from the next poll. Asked
+        // after the split is forgotten above, so a split that ended while it
+        // roamed is not still remembered when its grant is taken back.
+        if (RoamsAlone(name))
+            return;
 
         // A MEMBER ON ANOTHER CONTINENT GOES BACK AS A PLAYER WOULD (#274): its
         // hearthstone if it is bound on the leader's continent and ready, or
@@ -28471,6 +28600,8 @@ private:
             member.beingFetched = member.name == FetchTargetOf(leaderName);
             // ITS OWN ERRAND (#1517): the leader is never held for it.
             member.onItsOwnErrand = WalksItsOwnErrand(member.name);
+            // NOR FOR A MEMBER ROAMING ALONE INSIDE ITS BAND (#1518).
+            member.roamsAlone = RoamsAlone(member.name);
             members.push_back(member);
         }
 
@@ -28922,6 +29053,8 @@ private:
             member.stoodDown = WithinFetchStandDown(member.name);
             // ITS OWN ERRAND (#1517): the leader never goes back for it.
             member.onItsOwnErrand = WalksItsOwnErrand(member.name);
+            // NOR FOR A MEMBER ROAMING ALONE INSIDE ITS BAND (#1518).
+            member.roamsAlone = RoamsAlone(member.name);
             auto const stallIt = _followStall.find(member.name);
             member.stalledWalkingBack = stallIt != _followStall.end() && stallIt->second.stalled;
             if (member.sameMap)
@@ -30127,6 +30260,265 @@ private:
         _individualErrands.swap(next);
     }
 
+    // IS THIS MEMBER SOMETHING ELSE'S THIS POLL, so that the roam neither
+    // grants it nor takes its grant back (#1518)? Dead or in the air; held by
+    // the module (a revival, a cast, a counter, the too-far hold); lent
+    // `new rpg` to board its leader's flight, which the loan takes back on
+    // landing; hunting, or in a quest party, each of which took `new rpg` off
+    // on purpose and hands it back when it ends. The last two are not in the
+    // hold register, so they are asked by name.
+    bool RoamOwnedElsewhere(Player* bot, std::string const& name) const
+    {
+        if (!bot->IsAlive() || bot->IsInFlight() || HeldAfterRevival(name) || HeldStill(name) ||
+            _flightLoans.count(name) != 0)
+            return true;
+        for (HuntState const& hunt : _hunts)
+            if (hunt.character == name)
+                return true;
+        for (QuestParty const& party : _questParties)
+            if (party.leader == name ||
+                std::find(party.helpers.begin(), party.helpers.end(), name) !=
+                    party.helpers.end())
+                return true;
+        return false;
+    }
+
+    // WHICH FAMILIES ARE LINKED THIS POLL, for the roam grant (#1518): the
+    // three re-link facts of #1519, read for the whole family the way
+    // RefreshIndividualErrands reads them, so a dungeon or raid job on one
+    // member, a run that has taken one, or a summon asked for one takes the
+    // roam back from all of them.
+    struct FamilyLinkRead
+    {
+        bool jobsRead{false};
+        std::map<std::string, std::string> familyOf;
+        std::set<std::string> reLinked;
+
+        // FAILS CLOSED: a failed job read, a member the roster does not name
+        // and a member with no family are all read as linked.
+        bool LinkedFor(std::string const& name) const
+        {
+            auto const family = familyOf.find(name);
+            return !jobsRead || family == familyOf.end() || family->second.empty() ||
+                   reLinked.count(family->second) != 0;
+        }
+    };
+
+    FamilyLinkRead ReadFamilyLinks() const
+    {
+        FamilyLinkRead read;
+        std::map<std::string, std::string> const jobs = LoadAllJobs(read.jobsRead);
+        if (!read.jobsRead)
+            return read;
+        read.familyOf = LoadRosterFamilies();
+        std::map<std::string, OverseerDecisions::FamilyReLinkFacts> facts;
+        for (auto const& [member, family] : read.familyOf)
+        {
+            OverseerDecisions::FamilyReLinkFacts& relink = facts[family];
+            auto const job = jobs.find(member);
+            if (job != jobs.end())
+                relink.memberJobs.push_back(job->second);
+            if (Player* const m = ObjectAccessor::FindPlayerByName(member))
+                if (InAnyDungeonRun(m))
+                    relink.anyMemberInRun = true;
+        }
+        for (std::string const& target : SummonAskedFor())
+        {
+            auto const family = read.familyOf.find(target);
+            if (family != read.familyOf.end())
+                facts[family->second].summonAsked = true;
+        }
+        for (auto const& [family, relink] : facts)
+            if (OverseerDecisions::FamilyReLinks(relink))
+                read.reLinked.insert(family);
+        return read;
+    }
+
+    // WHO ROAMS ALONE INSIDE ITS BAND THIS POLL (#1518). Behind
+    // Overseer.Individual.Enable, off by default. A follower of a family on no
+    // dungeon or raid job, with an empty errand column, is handed `new rpg`
+    // only while the zone it stands in tops out at most one level above it.
+    // Leaving the zone, the family re-linking, the switch going off, an aim in
+    // its column or more than three deaths in five minutes takes it back, and
+    // the follow drive walks it to its leader from the next party poll.
+    //
+    // WITH THE SWITCH OFF AND NO GRANT OUTSTANDING THIS RETURNS AT ONCE: no
+    // read, no strategy touched, nothing said. The Grant step below is the
+    // only writer of a name into _individualRoams and it is unreachable with
+    // the switch off (OverseerDecisions::IndividualRoamRefusal answers
+    // SwitchOff first), so every gate that asks RoamsAlone answers false and
+    // the module behaves as it did before this rule existed.
+    //
+    // THE DECISION IS OverseerDecisions'. This gathers the facts, acts on the
+    // step, and says each change once.
+    void RefreshIndividualRoams(std::map<std::string, std::string> const& aims)
+    {
+        bool const enabled =
+            sConfigMgr->GetOption<bool>("Overseer.Individual.Enable", false, false);
+        int64_t const now = static_cast<int64_t>(std::time(nullptr));
+        // A death hold ends on its clock and not on its member's presence: a
+        // member that leaves the world for a moment is still held off.
+        for (auto it = _roamOffUntil.begin(); it != _roamOffUntil.end();)
+            it = now < it->second ? std::next(it) : _roamOffUntil.erase(it);
+        if (!enabled && _individualRoams.empty())
+        {
+            _roamRefusalSaid.clear();
+            return;
+        }
+
+        // Every enabled roster member while the switch is on, and every holder
+        // of a grant either way, so a grant is still taken back on the poll
+        // after the switch goes off or its holder's row is disabled.
+        FamilyLinkRead const links = enabled ? ReadFamilyLinks() : FamilyLinkRead();
+        std::set<std::string> names = _individualRoams;
+        for (auto const& entry : links.familyOf)
+            names.insert(entry.first);
+
+        std::set<std::string> seen;
+        for (std::string const& name : names)
+        {
+            Player* const bot = ObjectAccessor::FindPlayerByName(name);
+            PlayerbotAI* const botAI = SteerableAI(bot);
+            // Not in the world, not steered, or led by a person at a keyboard:
+            // not this poll's to grant or to sweep, as in the follow sweep. Its
+            // grant is forgotten below; the follow sweep's own backstop takes
+            // the strategy off a follower nothing accounts for.
+            if (!botAI || IsRealPlayer(botAI->GetMaster()))
+                continue;
+            seen.insert(name);
+
+            OverseerDecisions::IndividualRoamFacts facts;
+            facts.enabled = enabled;
+            facts.leadsItsParty = LeadsItsParty(bot);
+            facts.familyLinked = links.LinkedFor(name);
+            // The column as this poll read it, or an aim claimed since.
+            auto const aim = aims.find(name);
+            facts.ownAim = aim != aims.end() ? aim->second : _travelAims.TargetFor(name);
+            // THE BAND OF THE GROUND IT STANDS ON, FOR ITS SIDE. Never inside a
+            // dungeon, a raid or a battleground, whatever the table holds for
+            // that map: individual mode is for the open world.
+            OverseerDecisions::ZoneBandTop const band = OverseerDecisions::ZoneBandTopFor(
+                bot->GetMapId(), bot->GetZoneId(), bot->GetTeamId() == TEAM_HORDE);
+            Map* const map = bot->GetMap();
+            facts.zoneHasBand = band.hasBand && map && !map->Instanceable();
+            facts.zoneBandTop = band.top;
+            facts.level = bot->GetLevel();
+            facts.now = now;
+            auto const off = _roamOffUntil.find(name);
+            facts.offUntil = off == _roamOffUntil.end() ? 0 : off->second;
+            // THE DEATH LIMIT, read only for a member everything else admits:
+            // a hold still running refuses above without a read, and nobody
+            // else's deaths are asked for at all. Its own deaths only.
+            if (OverseerDecisions::IndividualRoams(facts))
+            {
+                facts.offUntil = OverseerDecisions::RoamOffUntil(
+                    OverseerDecisions::RoamDeathTimes(
+                        RecentDeathAges(name, ROAM_DEATH_LIMITS.windowSeconds), now),
+                    now, facts.offUntil, ROAM_DEATH_LIMITS);
+                if (facts.offUntil > 0)
+                    _roamOffUntil[name] = facts.offUntil;
+            }
+
+            OverseerDecisions::RoamRefusal const refusal =
+                OverseerDecisions::IndividualRoamRefusal(facts);
+            // Something else's this poll: nothing is changed either way.
+            bool const ownedElsewhere = RoamOwnedElsewhere(bot, name);
+            // A GRANT STANDS ONLY WHILE THE STRATEGY IS STILL THERE, or is
+            // coming back. The follow sweep strips a follower whose column
+            // held an aim, and an aim can come and go between two polls: such
+            // a member would stay in the set with nothing to roam on, and
+            // every gate would leave it standing. Its grant is forgotten, and
+            // the step below makes it afresh if it is still admitted.
+            bool const granted = _individualRoams.count(name) != 0;
+            bool const holdsGrant = OverseerDecisions::RoamGrantStands(
+                granted, botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT), ownedElsewhere);
+            if (granted && !holdsGrant)
+            {
+                _individualRoams.erase(name);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' held the roam grant but no longer carries "
+                         "`new rpg` - another drive took it off, so the grant is "
+                         "forgotten and made afresh only if it is still admitted (#1518)",
+                         name);
+            }
+            OverseerDecisions::RoamStep const step = OverseerDecisions::IndividualRoamStep(
+                holdsGrant, refusal == OverseerDecisions::RoamRefusal::None, ownedElsewhere);
+            if (step == OverseerDecisions::RoamStep::Grant)
+            {
+                botAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+                // READ BACK, like every other grant in this file.
+                if (!botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+                {
+                    LOG_ERROR("module.overseer",
+                              "overseer: '{}' was granted `new rpg` to roam alone and still "
+                              "does not carry it - it keeps following its leader (#1518)",
+                              name);
+                    continue;
+                }
+                _individualRoams.insert(name);
+                _roamRefusalSaid.erase(name);
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' (level {}) roams alone in zone {} on map {}, whose "
+                         "band tops out at {} - granting `new rpg`; its family is on no "
+                         "dungeon or raid job and its leader does not wait for it "
+                         "(individual mode, #1518)",
+                         name, facts.level, bot->GetZoneId(), bot->GetMapId(),
+                         facts.zoneBandTop);
+                continue;
+            }
+            if (step == OverseerDecisions::RoamStep::TakeBack)
+            {
+                _individualRoams.erase(name);
+                _roamRefusalSaid[name] = refusal;
+                // A member that leads keeps the strategy, whatever took the
+                // grant back: the leader carries it as leader. The rpg status
+                // is set idle with it, so a status rolled while roaming does
+                // not walk a follower away after the strategy is gone.
+                if (OverseerDecisions::RoamTakeBackStrips(facts.leadsItsParty) &&
+                    botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+                {
+                    botAI->rpgInfo.ChangeToIdle();
+                    botAI->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+                    if (botAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+                        LOG_ERROR("module.overseer",
+                                  "overseer: '{}' still carries `new rpg` after its roam "
+                                  "was taken back - it will keep travelling on its own "
+                                  "(#1518)",
+                                  name);
+                }
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' no longer roams alone ({}) - its grant is taken "
+                         "back{} (#1518)",
+                         name, OverseerDecisions::RoamRefusalName(refusal),
+                         facts.leadsItsParty ? "; it leads now and keeps `new rpg` as leader"
+                                             : " and it follows its leader again");
+                continue;
+            }
+            // NOT ROAMING, AND WHY, said when the reason changes. A member
+            // that holds the grant has nothing to say, and an errand says
+            // itself (OverseerDecisions::RoamRefusalIsSaid).
+            if (holdsGrant || !OverseerDecisions::RoamRefusalIsSaid(refusal))
+                continue;
+            auto const said = _roamRefusalSaid.find(name);
+            if (said != _roamRefusalSaid.end() && said->second == refusal)
+                continue;
+            _roamRefusalSaid[name] = refusal;
+            LOG_INFO("module.overseer",
+                     "overseer: '{}' does not roam alone: {} (level {}, zone {} on map {}, "
+                     "band top {}) (#1518)",
+                     name, OverseerDecisions::RoamRefusalName(refusal), facts.level,
+                     bot->GetZoneId(), bot->GetMapId(), facts.zoneBandTop);
+        }
+
+        // Whoever this poll did not see has left the world, the roster or the
+        // module's hands: its grant and its last refusal are forgotten. A
+        // death hold is kept until its clock ends it, above.
+        for (auto it = _individualRoams.begin(); it != _individualRoams.end();)
+            it = seen.count(*it) ? std::next(it) : _individualRoams.erase(it);
+        for (auto it = _roamRefusalSaid.begin(); it != _roamRefusalSaid.end();)
+            it = seen.count(it->first) ? std::next(it) : _roamRefusalSaid.erase(it);
+    }
+
     // Stop a character whose next step the ground gate refused: clear the
     // MotionMaster and the unit's movement, idle the rpg status and take
     // `new rpg` off, so neither the walk in flight nor upstream's own status
@@ -30204,6 +30596,11 @@ private:
         // being weakened for everybody.
         std::map<std::string, std::string> const jobs = LoadJobs();
         RefreshIndividualErrands(aims);
+        // AFTER THE ERRANDS AND BEFORE THE EMPTY RETURN (#1518): a member
+        // roams with an empty column, so this must run when nobody has an aim,
+        // and an aim written since the last poll takes the roam back before
+        // the loop below walks it.
+        RefreshIndividualRoams(aims);
         if (aims.empty())
         {
             // No errands anywhere, so nothing this loop remembers is still

@@ -8608,6 +8608,11 @@ bool PartyTollCounts(bool memberOnItsOwnErrand)
     return !memberOnItsOwnErrand;
 }
 
+bool PartyTollCounts(bool memberOnItsOwnErrand, bool memberRoamsAlone)
+{
+    return PartyTollCounts(memberOnItsOwnErrand) && !memberRoamsAlone;
+}
+
 bool ZoneBandAdmits(bool zoneHasBand, uint32_t zoneBandTop, uint32_t level)
 {
     if (!zoneHasBand || zoneBandTop == 0 || level == 0)
@@ -8680,6 +8685,43 @@ RoamStep IndividualRoamStep(bool holdsGrant, bool roams)
     return holdsGrant ? RoamStep::TakeBack : RoamStep::Leave;
 }
 
+RoamStep IndividualRoamStep(bool holdsGrant, bool roams, bool ownedElsewhere)
+{
+    return ownedElsewhere ? RoamStep::Leave : IndividualRoamStep(holdsGrant, roams);
+}
+
+bool RoamGrantStands(bool granted, bool carriesNewRpg, bool ownedElsewhere)
+{
+    return granted && (carriesNewRpg || ownedElsewhere);
+}
+
+bool RoamTakeBackStrips(bool leadsItsParty)
+{
+    return !leadsItsParty;
+}
+
+bool RoamRefusalIsSaid(RoamRefusal refusal)
+{
+    return refusal != RoamRefusal::None && refusal != RoamRefusal::HasErrand;
+}
+
+UnissuedFlightStep RoamerUnissuedFlight(bool roamsAlone, bool statusIsTravelFlight,
+                                        bool inFlight)
+{
+    if (!roamsAlone || !statusIsTravelFlight)
+        return UnissuedFlightStep::Leave;
+    return inFlight ? UnissuedFlightStep::Airborne : UnissuedFlightStep::Cancel;
+}
+
+std::vector<int64_t> RoamDeathTimes(std::vector<int64_t> const& secondsAgo, int64_t now)
+{
+    std::vector<int64_t> times;
+    times.reserve(secondsAgo.size());
+    for (int64_t const ago : secondsAgo)
+        times.push_back(ago > 0 ? now - ago : now);
+    return times;
+}
+
 bool CutOffFollowerRoams(std::string const& job, std::string const& target)
 {
     if (!SplitFollowerDrivesItself(target))
@@ -8704,6 +8746,7 @@ char const* RegroupClaimName(RegroupClaim claim)
             return "too far back to hold the leader still for; it walks back while the "
                    "family carries on";
         case RegroupClaim::OwnErrand:     return "on an errand of its own";
+        case RegroupClaim::RoamsAlone:    return "roaming alone inside its band";
     }
     return "unknown";
 }
@@ -8758,6 +8801,10 @@ RegroupClaim ReadRegroupClaim(RegroupMember const& member,
     // family standing still until the errand ends.
     if (member.onItsOwnErrand)
         return RegroupClaim::OwnErrand;
+    // AND SO IS ONE ROAMING ALONE INSIDE ITS BAND (#1518): it is away until
+    // the grant is taken back, and no catch-up walks it before then.
+    if (member.roamsAlone)
+        return RegroupClaim::RoamsAlone;
     if (!member.aimRefusedBecause.empty())
         return RegroupClaim::AimRefused;
     if (limits.maxWaitYards > 0.f && member.yards > limits.maxWaitYards)
@@ -8891,6 +8938,9 @@ std::string PickFetchTarget(std::vector<FetchCandidate> const& members,
             continue;
         // ITS OWN ERRAND (#1517): never fetched, and not still walking back.
         if (member.onItsOwnErrand)
+            continue;
+        // ROAMING ALONE INSIDE ITS BAND (#1518): the same, for the same reason.
+        if (member.roamsAlone)
             continue;
         if (!member.heldTooFar)
         {
@@ -15524,9 +15574,9 @@ StagingClock StagingClockAfterReading(StagingClock clock, bool measured, float y
 }
 
 bool MemberFollowsForFlight(bool columnEmpty, bool catchingUp, bool aimInert,
-                            bool heldForLeader, bool beingFetched)
+                            bool heldForLeader, bool beingFetched, bool roamsAlone)
 {
-    if (beingFetched)
+    if (beingFetched || roamsAlone)
         return false;
     return columnEmpty || catchingUp || aimInert || heldForLeader;
 }
