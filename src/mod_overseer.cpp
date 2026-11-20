@@ -32739,7 +32739,7 @@ private:
             {
                 PlanRouteOnce(bot, pos, state, name, target);
                 DiedOnLegMemory& planned = DiedOnLegBook()[bot->GetName()];
-                if (planned.routeRatioTarget == target && planned.routeRatio > 0.f)
+                if (planned.routeRatioTarget == target)
                     _travelAims.NoteRouteRatio(name, target, planned.routeRatio);
                 // A line across a recorded no-ground stretch is refused too (#1534).
                 if (planned.zoneRefusal.empty() || planned.zoneRefusalTarget != target)
