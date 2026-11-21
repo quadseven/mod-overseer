@@ -37,6 +37,29 @@ int main()
         !Has(text, "last movement step", mismatchLog) ||
         !Has(text, "recovery reason", mismatchLog))
         return Fail("the sustained mismatch log must name its movement step and recovery reason");
+    // THE READINGS BEHIND THE LINE (#1604). The old sentence stays whole and
+    // in front, so a search for it still matches; the readings are appended.
+    // Anything probed only for the line goes into a copy, never into the
+    // reading the recovery decides on, so the line changes no decision.
+    std::size_t const reportStart = text.find("if (mismatch.report)", observation);
+    std::size_t const reportEnd = text.find("bool const groundOnRecord", reportStart);
+    if (reportStart == std::string::npos || reportEnd == std::string::npos ||
+        mismatchLog < reportStart || mismatchLog > reportEnd)
+        return Fail("cannot find the sustained mismatch report block");
+    std::string const report = text.substr(reportStart, reportEnd - reportStart);
+    if (!Has(report, "recovery reason: {} (#1482). readings: {} (#1604)\"") ||
+        !Has(report, "OverseerDecisions::TerrainMismatchReadings(reported, gapCouldMatter)"))
+        return Fail("the sustained mismatch log must append the readings behind it");
+    if (!Has(report, "OverseerDecisions::TerrainReading reported = reading;") ||
+        !Has(report, "if (!gapCouldMatter)") ||
+        !Has(report, "reported.hasLocalNavmesh = HasLocalNavmesh(bot);") ||
+        !Has(report, "reported.floorBelowValid = SurfaceAt("))
+        return Fail("the mismatch log must probe what the recovery gate skipped, into a copy");
+    if (Has(report, " reading.hasLocalNavmesh =") ||
+        Has(report, " reading.floorBelowValid =") ||
+        Has(report, " reading.footingHolds =") ||
+        Has(report, "reading.floorBelowZ)"))
+        return Fail("the mismatch log must not write to the reading the recovery decides on");
     std::size_t const reasonSwitch = text.find("switch (verdict.remedy)", observation);
     std::size_t const reasonEnd = text.find("std::string const lastMovementStep", reasonSwitch);
     if (reasonSwitch == std::string::npos || reasonEnd == std::string::npos)

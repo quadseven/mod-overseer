@@ -961,6 +961,56 @@ BelowTerrainObservationVerdict ObserveTerrainMismatch(
     return {true, report, seconds};
 }
 
+std::string TerrainMismatchReadings(TerrainReading const& reading,
+                                    bool gatedProbesRan)
+{
+    char number[96];
+    std::string out;
+
+    if (reading.surfaceValid)
+    {
+        float const over = reading.surfaceAboveZ - reading.z;
+        std::snprintf(number, sizeof number,
+                      "overhead surface z %.1f (%.1f %s the character)",
+                      reading.surfaceAboveZ, over < 0.f ? -over : over,
+                      over < 0.f ? "below" : "above");
+        out += number;
+    }
+    else
+        out += "overhead surface none in reach";
+
+    out += reading.hasLocalNavmesh ? "; local navmesh yes" : "; local navmesh no";
+
+    // The fan is walked only behind the gate and only over a polygon; anywhere
+    // else `footingHolds` is its default and not a measurement.
+    if (gatedProbesRan && reading.hasLocalNavmesh)
+        out += reading.footingHolds ? "; footing fan holds"
+                                    : "; footing fan does not hold";
+    else
+        out += "; footing fan not measured";
+
+    if (reading.floorBelowValid)
+    {
+        float const drop = reading.z - reading.floorBelowZ;
+        std::snprintf(number, sizeof number,
+                      "; floor under the feet z %.1f (character %.1f %s it)",
+                      reading.floorBelowZ, drop < 0.f ? -drop : drop,
+                      drop < 0.f ? "below" : "above");
+        out += number;
+    }
+    else
+        out += "; floor under the feet none in reach";
+
+    if (!reading.movementMeasured)
+        out += "; falling not measured";
+    else
+        out += reading.falling ? "; falling yes" : "; falling no";
+
+    out += gatedProbesRan ? "; navmesh and floor probed by the recovery gate"
+                          : "; navmesh and floor probed for this line only";
+    return out;
+}
+
 UnmeasuredLeaderGround ClassifyUnmeasuredLeaderGround(bool leaderFalling,
                                                       bool polygonAtItsFeet)
 {
