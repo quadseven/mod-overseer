@@ -13217,6 +13217,7 @@ private:
                 bool const campaignActive = FamilyOnADungeonRun(family);
                 if (OverseerDecisions::QuestDriveMayTakeCampaignLeader(campaignActive,
                                                                        FamilyCrossing(family)) &&
+                    OverseerDecisions::QuestDriveHasWorkForLeader(LeaderJobOf(leaderName)) &&
                     OverseerDecisions::LeaderCarriesNewRpg(TownJobFor(leaderName), false))
                     AskForLeader(leaderName, OverseerDecisions::LeaderIntentKind::QuestDrive,
                                  "quest drive", std::string(),
@@ -13944,6 +13945,14 @@ private:
     // down", so the map holds exactly the characters whose mode is something
     // other than quest, and absence from it already means "drive as normal" -
     // no separate default branch to keep in sync with the schema's DEFAULT.
+    // The leader's job as the roster holds it, '' when it is 'quest' or unset.
+    std::string LeaderJobOf(std::string const& name)
+    {
+        std::map<std::string, std::string> const jobs = LoadJobs();
+        auto const it = jobs.find(name);
+        return it == jobs.end() ? std::string() : it->second;
+    }
+
     std::map<std::string, std::string> LoadJobs()
     {
         std::map<std::string, std::string> jobs;

@@ -3504,6 +3504,11 @@ bool QuestDriveMayTakeCampaignLeader(bool campaignActive, bool crossingUnderWay)
     return !campaignActive && !crossingUnderWay;
 }
 
+bool QuestDriveHasWorkForLeader(std::string const& leaderJob)
+{
+    return leaderJob.empty() || leaderJob == "quest";
+}
+
 bool QuestDriveTargetFitsYoungest(int youngestLevel, int questLevel, int minLevel,
                                   int maximumLevelGap)
 {
