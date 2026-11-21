@@ -29841,4 +29841,128 @@ bool FlightLegStrayed(float yardsNow, float yardsAtIssue)
     return yardsNow > yardsAtIssue + FLIGHT_LEG_STRAY_YARDS;
 }
 
+// ------------------------------------------- a death loop holds the idle AI --
+
+int64_t DeathLoopHoldBound(int64_t configuredSeconds)
+{
+    if (configuredSeconds <= 0)
+        return 0;
+    return configuredSeconds > DEATH_LOOP_HOLD_MAX_SECONDS ? DEATH_LOOP_HOLD_MAX_SECONDS
+                                                           : configuredSeconds;
+}
+
+namespace
+{
+// The whole non-negative number after `"key"` and its colon, or false.
+bool DeathLoopFlagNumber(std::string const& value, char const* key, uint32_t& out)
+{
+    std::string const quoted = std::string("\"") + key + "\"";
+    std::size_t at = value.find(quoted);
+    if (at == std::string::npos)
+        return false;
+    at += quoted.size();
+    while (at < value.size() && (value[at] == ' ' || value[at] == '\t'))
+        ++at;
+    if (at >= value.size() || value[at] != ':')
+        return false;
+    ++at;
+    while (at < value.size() && (value[at] == ' ' || value[at] == '\t'))
+        ++at;
+    uint64_t number = 0;
+    std::size_t digits = 0;
+    while (at < value.size() && value[at] >= '0' && value[at] <= '9')
+    {
+        number = number * 10 + uint64_t(value[at] - '0');
+        if (number > 0xFFFFFFFFull)
+            return false;
+        ++at;
+        ++digits;
+    }
+    if (!digits)
+        return false;
+    if (at < value.size() && value[at] != ',' && value[at] != '}' && value[at] != ' ')
+        return false;
+    out = uint32_t(number);
+    return true;
+}
+}  // namespace
+
+DeathLoopFlag ParseDeathLoopFlag(std::string const& value)
+{
+    DeathLoopFlag flag;
+    std::size_t const open = value.find_first_not_of(" \t");
+    if (open == std::string::npos || value[open] != '{' || value.find('}') == std::string::npos)
+        return flag;
+    uint32_t mapId = 0;
+    uint32_t zoneId = 0;
+    if (!DeathLoopFlagNumber(value, "map", mapId) || !DeathLoopFlagNumber(value, "zone", zoneId) ||
+        zoneId == 0)
+        return flag;
+    flag.ok = true;
+    flag.mapId = mapId;
+    flag.zoneId = zoneId;
+    return flag;
+}
+
+DeathLoopHoldWhy DeathLoopHoldReason(DeathLoopHoldFacts const& facts)
+{
+    if (!facts.enabled || facts.boundSeconds <= 0)
+        return DeathLoopHoldWhy::SwitchOff;
+    // A flag time after now is a clock the module cannot read a bound off, so
+    // it holds nobody rather than holding for longer than the bound.
+    if (!facts.flagged || facts.flagZoneId == 0 || facts.flaggedAt <= 0 ||
+        facts.flaggedAt > facts.now)
+        return DeathLoopHoldWhy::NotFlagged;
+    if (facts.hasJob)
+        return DeathLoopHoldWhy::HasJob;
+    if (facts.follower)
+        return DeathLoopHoldWhy::Follower;
+    if (facts.mapId != facts.flagMapId || facts.zoneId != facts.flagZoneId)
+        return DeathLoopHoldWhy::LeftZone;
+    if (facts.now - facts.flaggedAt >= DeathLoopHoldBound(facts.boundSeconds))
+        return DeathLoopHoldWhy::BoundPassed;
+    return DeathLoopHoldWhy::Holds;
+}
+
+char const* DeathLoopHoldWhyName(DeathLoopHoldWhy why)
+{
+    switch (why)
+    {
+        case DeathLoopHoldWhy::Holds:
+            return "held in its death loop's zone";
+        case DeathLoopHoldWhy::SwitchOff:
+            return "the hold is switched off";
+        case DeathLoopHoldWhy::NotFlagged:
+            return "no death loop is flagged";
+        case DeathLoopHoldWhy::HasJob:
+            return "it has a job";
+        case DeathLoopHoldWhy::Follower:
+            return "it follows somebody";
+        case DeathLoopHoldWhy::LeftZone:
+            return "it left the loop's zone";
+        case DeathLoopHoldWhy::BoundPassed:
+            return "the hold's bound has passed";
+    }
+    return "unknown";
+}
+
+bool DeathLoopHolds(DeathLoopHoldFacts const& facts)
+{
+    return DeathLoopHoldReason(facts) == DeathLoopHoldWhy::Holds;
+}
+
+DeathLoopHoldStep DeathLoopHoldStepFor(DeathLoopHoldWhy why, bool tookItOff, bool carriesNewRpg,
+                                       bool otherHoldInForce)
+{
+    if (why == DeathLoopHoldWhy::HasJob || why == DeathLoopHoldWhy::Follower)
+        return tookItOff ? DeathLoopHoldStep::Forget : DeathLoopHoldStep::Nothing;
+    if (otherHoldInForce)
+        return DeathLoopHoldStep::Nothing;
+    if (why == DeathLoopHoldWhy::Holds)
+        return carriesNewRpg ? DeathLoopHoldStep::TakeOff : DeathLoopHoldStep::Nothing;
+    if (!tookItOff)
+        return DeathLoopHoldStep::Nothing;
+    return DeathLoopHoldStep::HandBack;
+}
+
 }  // namespace OverseerDecisions
