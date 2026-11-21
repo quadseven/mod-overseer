@@ -9177,6 +9177,13 @@ public:
     {
         _shareSweepQuery.ProcessReadyCallbacks();
         _disenchantQueries.ProcessReadyCallbacks();
+        _deathLoopQuery.ProcessReadyCallbacks();
+        _deathLoopTimer += diff;
+        if (_deathLoopTimer >= DEATH_LOOP_HOLD_POLL_MS)
+        {
+            _deathLoopTimer = 0;
+            DriveDeathLoopHold();
+        }
         _disenchantTimer += diff;
         if (_disenchantTimer >= 1000)
         {
@@ -91693,6 +91700,227 @@ private:
         _hunts.swap(still);
     }
 
+
+    // ------------------------------------------- a death loop holds the idle AI --
+    //
+    // A CHARACTER THE BRIDGE FLAGGED AS DYING OVER AND OVER IN ONE ZONE IS HELD
+    // OFF ITS OWN WANDERING THERE (wow-overseer#2152). The rule, its bound and
+    // every refusal are OverseerDecisions::DeathLoopHoldReason; what a poll
+    // does about it is DeathLoopHoldStepFor. The lever is `new rpg`, the
+    // strategy whose status picks the bot's next grind spot, camp or wander,
+    // taken off with its status set idle as the dungeon run's hold does it.
+    // Strategies are not saved across a logout at the pinned playerbots
+    // (PlayerbotAI::ResetStrategies leaves the load commented out), so a roll
+    // or a relog can only ever hand the strategy back, never keep it off.
+    //
+    // The flag rows are read off overseer_bridge_memo every poll, async; the
+    // hold is applied when they arrive. A world whose bridge has not created
+    // the table yet holds nobody and is asked again next poll.
+    static constexpr uint32 DEATH_LOOP_HOLD_POLL_MS = 30000;
+
+    struct DeathLoopFlagRow
+    {
+        uint32 mapId{0};
+        uint32 zoneId{0};
+        int64 since{0};
+    };
+
+    bool DeathLoopHoldEnabled() const
+    {
+        return sConfigMgr->GetOption<bool>("Overseer.DeathLoopHold.Enable", true, false);
+    }
+
+    void DriveDeathLoopHold()
+    {
+        if (_deathLoopBusy)
+            return;
+        if (!DeathLoopHoldEnabled())
+        {
+            // Off: nothing is read, and every hold this rule placed is handed back.
+            _deathLoopFlags.clear();
+            ApplyDeathLoopHolds();
+            return;
+        }
+        if (!_deathLoopTablePresent)
+        {
+            QueryResult present = CharacterDatabase.Query(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'overseer_bridge_memo'");
+            _deathLoopTablePresent = present && present->Fetch()[0].Get<uint64>() > 0;
+            if (!_deathLoopTablePresent)
+            {
+                if (!_deathLoopTableSaid)
+                    LOG_INFO("module.overseer",
+                             "overseer: death loop hold: overseer_bridge_memo is not there yet, so "
+                             "no death loop is flagged and nobody is held; asked again each poll");
+                _deathLoopTableSaid = true;
+                _deathLoopFlags.clear();
+                ApplyDeathLoopHolds();
+                return;
+            }
+        }
+        _deathLoopBusy = true;
+        _deathLoopQuery.AddCallback(
+            CharacterDatabase.AsyncQuery(
+                std::string("SELECT subject, value, since FROM overseer_bridge_memo WHERE kind = '") +
+                OverseerDecisions::DEATH_LOOP_FLAG_KIND + "' AND expires > UNIX_TIMESTAMP()")
+                .WithCallback([this](QueryResult result) { ReadDeathLoopFlags(std::move(result)); }));
+    }
+
+    void ReadDeathLoopFlags(QueryResult result)
+    {
+        _deathLoopBusy = false;
+        std::map<std::string, DeathLoopFlagRow> flags;
+        if (result)
+        {
+            do
+            {
+                Field* f = result->Fetch();
+                OverseerDecisions::DeathLoopFlag const flag =
+                    OverseerDecisions::ParseDeathLoopFlag(f[1].Get<std::string>());
+                if (!flag.ok)
+                    continue;
+                DeathLoopFlagRow row;
+                row.mapId = flag.mapId;
+                row.zoneId = flag.zoneId;
+                row.since = static_cast<int64>(f[2].Get<double>());
+                flags[f[0].Get<std::string>()] = row;
+            } while (result->NextRow());
+        }
+        _deathLoopFlags.swap(flags);
+        ApplyDeathLoopHolds();
+    }
+
+    bool HuntsNow(std::string const& name) const
+    {
+        for (HuntState const& hunt : _hunts)
+            if (hunt.character == name)
+                return true;
+        return false;
+    }
+
+    void ApplyDeathLoopHolds()
+    {
+        namespace D = OverseerDecisions;
+        std::set<std::string> names(_deathLoopHeld.begin(), _deathLoopHeld.end());
+        for (auto const& flag : _deathLoopFlags)
+            names.insert(flag.first);
+        bool const enabled = DeathLoopHoldEnabled();
+        int64 const bound = D::DeathLoopHoldBound(sConfigMgr->GetOption<int64>(
+            "Overseer.DeathLoopHold.Seconds", D::DEATH_LOOP_HOLD_DEFAULT_SECONDS, false));
+        int64 const now = int64(std::time(nullptr));
+        for (std::string const& name : names)
+        {
+            bool const tookItOff = _deathLoopHeld.count(name) != 0;
+            Player* const p = ObjectAccessor::FindPlayerByName(name, false);
+            if (!p)
+            {
+                // Logged out: the next login starts from the default strategies.
+                _deathLoopHeld.erase(name);
+                _deathLoopSaid.erase(name);
+                continue;
+            }
+            // Between maps: asked again next poll, the record kept.
+            if (!p->IsInWorld())
+                continue;
+            PlayerbotAI* const ai = GET_PLAYERBOT_AI(p);
+            if (!ai || ClientAttached(p))
+            {
+                _deathLoopHeld.erase(name);
+                continue;
+            }
+            D::DeathLoopHoldFacts facts;
+            facts.enabled = enabled;
+            auto const flag = _deathLoopFlags.find(name);
+            facts.flagged = flag != _deathLoopFlags.end();
+            if (facts.flagged)
+            {
+                facts.flagMapId = flag->second.mapId;
+                facts.flagZoneId = flag->second.zoneId;
+                facts.flaggedAt = flag->second.since;
+            }
+            facts.mapId = p->GetMapId();
+            facts.zoneId = p->GetZoneId();
+            facts.now = now;
+            facts.boundSeconds = bound;
+            // Every roster row carries a job (`quest` by default), and a
+            // family is roster rows, so the roster is the job and family test.
+            facts.hasJob = OnRoster(name);
+            facts.follower = !LeadsItsParty(p) || IsStandinGuest(name);
+            D::DeathLoopHoldWhy const why = D::DeathLoopHoldReason(facts);
+            bool const carries = ai->HasStrategy("new rpg", BOT_STATE_NON_COMBAT);
+            bool const otherHold = HeldStill(name) || HeldAfterRevival(name) || HuntsNow(name);
+            switch (D::DeathLoopHoldStepFor(why, tookItOff, carries, otherHold))
+            {
+                case D::DeathLoopHoldStep::TakeOff:
+                    ai->rpgInfo.ChangeToIdle();
+                    ai->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+                    if (ai->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+                    {
+                        LOG_ERROR("module.overseer",
+                                  "overseer: death loop hold: '{}' still carries `new rpg` after "
+                                  "being told to drop it - it can still walk back into zone {}",
+                                  name, facts.zoneId);
+                        break;
+                    }
+                    _deathLoopHeld.insert(name);
+                    if (!tookItOff)
+                        LOG_INFO("module.overseer",
+                                 "overseer: death loop hold: '{}' is flagged as dying over and over "
+                                 "in zone {} and stands in it - taking `new rpg` off so its own AI "
+                                 "does not walk it back to what keeps killing it; handed back when "
+                                 "it leaves the zone or after {} minutes at most",
+                                 name, facts.zoneId,
+                                 (facts.flaggedAt + bound - now + 59) / 60);
+                    break;
+                case D::DeathLoopHoldStep::HandBack:
+                    if (!carries)
+                        ai->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+                    _deathLoopHeld.erase(name);
+                    LOG_INFO("module.overseer",
+                             "overseer: death loop hold: '{}' is handed `new rpg` back: {}",
+                             name, D::DeathLoopHoldWhyName(why));
+                    if (!ai->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+                        LOG_ERROR("module.overseer",
+                                  "overseer: death loop hold: '{}' was handed `new rpg` back and "
+                                  "does not carry it", name);
+                    break;
+                case D::DeathLoopHoldStep::Forget:
+                    _deathLoopHeld.erase(name);
+                    LOG_INFO("module.overseer",
+                             "overseer: death loop hold: '{}' is let go without `new rpg`: {}, "
+                             "and that owner decides its strategies",
+                             name, D::DeathLoopHoldWhyName(why));
+                    break;
+                case D::DeathLoopHoldStep::Nothing:
+                    break;
+            }
+            // Said once per change of reason, for a flagged character only.
+            if (facts.flagged && why != D::DeathLoopHoldWhy::Holds)
+            {
+                auto const said = _deathLoopSaid.find(name);
+                if (said == _deathLoopSaid.end() || said->second != why)
+                    LOG_INFO("module.overseer",
+                             "overseer: death loop hold: '{}' is flagged in zone {} and not held: {}",
+                             name, facts.flagZoneId, D::DeathLoopHoldWhyName(why));
+            }
+            if (facts.flagged)
+                _deathLoopSaid[name] = why;
+            else
+                _deathLoopSaid.erase(name);
+        }
+    }
+
+    QueryCallbackProcessor _deathLoopQuery;
+    uint32 _deathLoopTimer = 0;
+    bool _deathLoopBusy = false;
+    bool _deathLoopTablePresent = false;
+    bool _deathLoopTableSaid = false;
+    std::map<std::string, DeathLoopFlagRow> _deathLoopFlags;
+    // The characters this rule took `new rpg` off, and so the only ones it
+    // ever hands it back to.
+    std::set<std::string> _deathLoopHeld;
+    std::map<std::string, OverseerDecisions::DeathLoopHoldWhy> _deathLoopSaid;
 
     void SampleFallMovement()
     {
