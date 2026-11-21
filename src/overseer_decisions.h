@@ -32501,8 +32501,8 @@ bool FlightLegStrayed(float yardsNow, float yardsAtIssue);
 //
 // THE FLAG. One row the bridge keeps in overseer_bridge_memo, kind
 // DEATH_LOOP_FLAG_KIND, subject the character's name, value the JSON object
-// {"map": <map id>, "zone": <zone id>}, `since` the Unix time the bridge first
-// flagged this loop in this zone. The row's own `expires` lets the bridge
+// {"map": <map id>, "zone": <zone id>, ...} (other keys are ignored), `since`
+// the Unix time the bridge first flagged this loop in this zone. The row's own `expires` lets the bridge
 // leave the zone alone for a while after the hold ends; the module asks only
 // that the row is unexpired and reads its bound off `since`.
 constexpr char const* DEATH_LOOP_FLAG_KIND = "death_loop_zone";
