@@ -7524,6 +7524,19 @@ public:
         KeepRefusal(name);
     }
 
+    // The planned walk's length over the straight line to its aim, refused or not
+    // (#1498). Written to the character's row only when it changes, so a poll that
+    // plans nothing new writes nothing.
+    void NoteRouteRatio(std::string const& name, std::string const& target, float ratio)
+    {
+        RouteRatio& kept = _routeRatio[name];
+        if (kept.target == target && kept.ratio == ratio)
+            return;
+        kept.target = target;
+        kept.ratio = ratio;
+        KeepRefusal(name);
+    }
+
     // Record one more lethal release of `target` for `name` and return the
     // strike count it now stands at: one more than before when the last one
     // was the same target inside strikeMemorySeconds, else one (#776).
@@ -7714,12 +7727,23 @@ private:
             strikes = lethal->second.count;
             struckAt = static_cast<int64>(lethal->second.at);
         }
+        std::string ratioTarget;
+        float ratio = 0.f;
+        auto const kept = _routeRatio.find(name);
+        if (kept != _routeRatio.end())
+        {
+            ratioTarget = kept->second.target.substr(0, 255);
+            ratio = kept->second.ratio;
+        }
+        int64 const refusedUntil = OverseerDecisions::TravelRefusalEndsAt(
+            refusedAt, ERRAND_DEATH_LIMITS.cooloffSeconds);
         CharacterDatabase.DirectExecute(
             "REPLACE INTO overseer_travel_refusal "
-            "(name, refused_target, reason, refused_at, strike_target, strikes, struck_at) "
-            "VALUES ('{}', '{}', '{}', {}, '{}', {}, {})",
-            Esc(name), Esc(refusedTarget), Esc(reason), refusedAt, Esc(strikeTarget), strikes,
-            struckAt);
+            "(name, refused_target, reason, refused_at, refused_until, strike_target, strikes, "
+            "struck_at, route_ratio, route_ratio_target) "
+            "VALUES ('{}', '{}', '{}', {}, {}, '{}', {}, {}, {:.2f}, '{}')",
+            Esc(name), Esc(refusedTarget), Esc(reason), refusedAt, refusedUntil,
+            Esc(strikeTarget), strikes, struckAt, ratio, Esc(ratioTarget));
     }
 
     // Whether overseer_travel_refusal is there to write (#1193). Set once, by
@@ -7734,6 +7758,15 @@ private:
         time_t at{0};
         time_t said{0};  // when the re-issue was last reported, 0 = never
     };
+
+    // The planned walk's length over the straight line to the aim, kept with the
+    // refusal row for the bridge to read (#1498). One per character.
+    struct RouteRatio
+    {
+        std::string target;
+        float ratio{0.f};
+    };
+    std::map<std::string, RouteRatio> _routeRatio;
 
     // LETHAL RELEASES OF ONE TARGET IN A ROW (#776). Kept apart from `_refused`
     // because an economy-budget refusal overwrites that entry and must neither
@@ -9046,8 +9079,9 @@ public:
     {
         bool const present = SchemaHasColumns(
             "overseer_travel_refusal",
-            "'name','refused_target','reason','refused_at','strike_target','strikes','struck_at'",
-            7);
+            "'name','refused_target','reason','refused_at','refused_until','strike_target',"
+            "'strikes','struck_at','route_ratio','route_ratio_target'",
+            10);
         std::size_t const restored = _travelAims.RestoreRefusals(present);
         if (present)
             LOG_INFO("module.overseer",
@@ -24183,6 +24217,10 @@ private:
         // it before the character moves and refuses the errand.
         std::string zoneRefusal;
         std::string zoneRefusalTarget;
+        // How many times longer the last plan's walk is than the straight line
+        // to its aim, and for which target (#1498). Zero when not planned.
+        float routeRatio{0.f};
+        std::string routeRatioTarget;
     };
 
     // How many legs this walker died on are still priced at `now` (#1228).
@@ -25637,6 +25675,9 @@ private:
         // to. Asked of an empty route it is false, because a leg nobody is
         // walking reaches nothing.
         joinsCorridor = corridor.joinFirst && !route.empty();
+        diedOn.routeRatio = OverseerDecisions::RouteLengthRatio(
+            plan.yards, bot->GetDistance2d(want.GetPositionX(), want.GetPositionY()));
+        diedOn.routeRatioTarget = target;
 
         LOG_INFO("module.overseer",
                  "overseer: '{}' is sent to '{}' and is routed round it - {} surveyed nodes, "
@@ -32718,6 +32759,8 @@ private:
             {
                 PlanRouteOnce(bot, pos, state, name, target);
                 DiedOnLegMemory& planned = DiedOnLegBook()[bot->GetName()];
+                if (planned.routeRatioTarget == target)
+                    _travelAims.NoteRouteRatio(name, target, planned.routeRatio);
                 // A line across a recorded no-ground stretch is refused too (#1534).
                 if (planned.zoneRefusal.empty() || planned.zoneRefusalTarget != target)
                 {

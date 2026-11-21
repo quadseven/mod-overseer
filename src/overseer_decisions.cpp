@@ -21335,6 +21335,18 @@ HeadTradeVerdict JudgeTradeWindow(HeadTradeFacts const& f)
     return {HeadTradeAnswer::Accept, "family or guild gift, in range, with room"};
 }
 
+int64_t TravelRefusalEndsAt(int64_t refusedAt, int64_t cooloffSeconds)
+{
+    return refusedAt > 0 && cooloffSeconds > 0 ? refusedAt + cooloffSeconds : 0;
+}
+
+float RouteLengthRatio(float plannedYards, float straightYards)
+{
+    if (plannedYards <= 0.f || straightYards < 1.f)
+        return 0.f;
+    return plannedYards / straightYards;
+}
+
 HoldDebt HandRevivalDebtOn(HoldDebt inForce, bool revivalLed, bool hasMaster)
 {
     HoldDebt out = inForce;
