@@ -32475,6 +32475,115 @@ constexpr float FLIGHT_LEG_STRAY_YARDS = 400.f;
 // nothing is guessed.
 bool FlightLegStrayed(float yardsNow, float yardsAtIssue);
 
+// ------------------------------------------- a death loop holds the idle AI --
+//
+// A CHARACTER THE BRIDGE HAS FLAGGED AS DYING OVER AND OVER IN ONE ZONE IS
+// HELD OFF ITS IDLE WANDERING THERE (wow-overseer#2152). Most of the realm's
+// deaths are guild members with no job, dying on their own playerbot AI: the
+// rpg status picks the nearest grind spot or camp for the level, which is the
+// zone it keeps dying in, after every spirit healer. The bridge already judges
+// the loop (its deathloop.loops, with the day-long rule) and its escape hearths
+// the member out, but a hearth on cooldown or bound inside the zone leaves the
+// member there, and its own AI walks it straight back.
+//
+// So while the flag stands, the character is in the flagged zone, and the
+// bound has not passed, `new rpg` is off and the character does not choose a
+// destination of its own. Nothing is granted, teleported or written: the
+// character still fights what attacks it, and any verb that walks or hearths
+// it still runs. The hold ends when it leaves the zone (a hearth, a walk), when
+// the bound passes, or when the bridge drops the flag.
+//
+// BOUNDED, ALWAYS. The bound is read from config and clamped to
+// DEATH_LOOP_HOLD_MAX_SECONDS, and zero or less holds nobody, so no setting
+// can make the hold permanent. A character with a job (every roster row
+// carries one, `quest` by default) or a follower (a grouped character its
+// leader moves, or a family stand-in) is never held.
+//
+// THE FLAG. One row the bridge keeps in overseer_bridge_memo, kind
+// DEATH_LOOP_FLAG_KIND, subject the character's name, value the JSON object
+// {"map": <map id>, "zone": <zone id>, ...} (other keys are ignored), `since`
+// the Unix time the bridge first flagged this loop in this zone. The row's own `expires` lets the bridge
+// leave the zone alone for a while after the hold ends; the module asks only
+// that the row is unexpired and reads its bound off `since`.
+constexpr char const* DEATH_LOOP_FLAG_KIND = "death_loop_zone";
+constexpr int64_t DEATH_LOOP_HOLD_DEFAULT_SECONDS = 3 * 3600;
+constexpr int64_t DEATH_LOOP_HOLD_MAX_SECONDS = 12 * 3600;
+
+// The configured bound as the rule uses it: zero or less is no hold at all,
+// and anything above DEATH_LOOP_HOLD_MAX_SECONDS is that maximum.
+int64_t DeathLoopHoldBound(int64_t configuredSeconds);
+
+// The bridge's value, read. `ok` false for anything that is not an object
+// naming a whole map and a non-zero zone, so a malformed row holds nobody.
+struct DeathLoopFlag
+{
+    bool ok{false};
+    uint32_t mapId{0};
+    uint32_t zoneId{0};
+};
+DeathLoopFlag ParseDeathLoopFlag(std::string const& value);
+
+// Everything the hold turns on. The defaults are the safe reading of "nothing
+// is known": switched off, unflagged, with a job and a follower, which holds
+// nobody.
+struct DeathLoopHoldFacts
+{
+    // Overseer.DeathLoopHold.Enable.
+    bool enabled{false};
+    // An unexpired flag row for this character, and what it names.
+    bool flagged{false};
+    uint32_t flagMapId{0};
+    uint32_t flagZoneId{0};
+    int64_t flaggedAt{0};
+    // Where the character stands now, and the clock.
+    uint32_t mapId{0};
+    uint32_t zoneId{0};
+    int64_t now{0};
+    // DeathLoopHoldBound of the configured seconds.
+    int64_t boundSeconds{0};
+    bool hasJob{true};
+    bool follower{true};
+};
+
+// Why the character is or is not held, in the order the checks are made, so
+// the adapter can say it once when the answer changes.
+enum class DeathLoopHoldWhy
+{
+    Holds,
+    SwitchOff,
+    NotFlagged,
+    HasJob,
+    Follower,
+    LeftZone,
+    BoundPassed,
+};
+DeathLoopHoldWhy DeathLoopHoldReason(DeathLoopHoldFacts const& facts);
+char const* DeathLoopHoldWhyName(DeathLoopHoldWhy why);
+bool DeathLoopHolds(DeathLoopHoldFacts const& facts);
+
+// What one poll does about it.
+//
+//   TakeOff   held, carries `new rpg`, nothing else holds it: take it off.
+//   HandBack  this rule took it off and the hold has ended for the character's
+//             own sake (it left, the bound passed, the flag or the switch went):
+//             hand it back.
+//   Forget    this rule took it off, but the character now has a job or follows
+//             somebody, whose owner decides its strategies: drop the record
+//             and grant nothing.
+//   Nothing   otherwise, including any poll on which another hold of this
+//             module (a walk, a cast, a revival, a hunt) has the character:
+//             that hold owns `new rpg` until it ends, and the next poll asks
+//             again.
+enum class DeathLoopHoldStep
+{
+    Nothing,
+    TakeOff,
+    HandBack,
+    Forget,
+};
+DeathLoopHoldStep DeathLoopHoldStepFor(DeathLoopHoldWhy why, bool tookItOff, bool carriesNewRpg,
+                                       bool otherHoldInForce);
+
 }  // namespace OverseerDecisions
 
 #endif  // MOD_OVERSEER_DECISIONS_H

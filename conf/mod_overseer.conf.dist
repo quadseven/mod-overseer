@@ -812,3 +812,32 @@
 #        Default:     2700 (45 minutes)
 #
 #Overseer.GuildRun.LendBoundSeconds = 2700
+
+#
+#    Overseer.DeathLoopHold.Enable
+#        Description: Hold a character the bridge has flagged as dying over and
+#                     over in one zone off its own wandering there: while it
+#                     stands in that zone, its `new rpg` strategy is off, so its
+#                     idle AI does not pick a grind spot, camp or wander that
+#                     walks it back to what keeps killing it. Ends when it leaves
+#                     the zone, when Overseer.DeathLoopHold.Seconds pass from the
+#                     flag, or when the bridge drops the flag. Grants, teleports
+#                     and writes nothing; walks and hearths still run. Never holds
+#                     a roster character (each has a job), a follower in a group,
+#                     or a family stand-in. The flag is the bridge's
+#                     `death_loop_zone` row in overseer_bridge_memo. 0 holds
+#                     nobody and hands back every hold it placed.
+#
+#        Default:     1
+#
+#Overseer.DeathLoopHold.Enable = 1
+
+#
+#    Overseer.DeathLoopHold.Seconds
+#        Description: The longest one flag holds a character, counted from the
+#                     time the bridge flagged the loop. 0 or less holds nobody;
+#                     anything over 43200 (12 hours) is read as 43200.
+#
+#        Default:     10800 (3 hours)
+#
+#Overseer.DeathLoopHold.Seconds = 10800
