@@ -35075,12 +35075,30 @@ private:
                 std::string const lastMovementStep = mismatchMemory.lastMovementStep.empty()
                     ? "no moving step was sampled"
                     : mismatchMemory.lastMovementStep;
+                // WHAT THE OTHER INSTRUMENTS READ HERE (#1604), so a place that
+                // repeats can be told from the log as a floor the detector
+                // does not credit or a real fall. Where the recovery gate
+                // skipped Detour and the look down (no gap that could matter
+                // to it), both are asked once for this line, INTO A COPY: the
+                // reading the recovery decided on, and everything below that
+                // still reads it, is exactly what it was. Once per reported
+                // episode, so the four path queries are not a per-poll cost.
+                OverseerDecisions::TerrainReading reported = reading;
+                if (!gapCouldMatter)
+                {
+                    reported.hasLocalNavmesh = HasLocalNavmesh(bot);
+                    reported.floorBelowValid = SurfaceAt(
+                        bot, reported.x, reported.y,
+                        reported.z + TERRAIN_RECOVERY_FOOTING_REACH_YARDS,
+                        reported.floorBelowZ);
+                }
                 LOG_ERROR("module.overseer",
                           "overseer: '{}' remained below raw terrain for {} seconds at map {} "
                           "position ({:.1f}, {:.1f}, {:.1f}); terrain z {:.1f}, gap {:.1f}. "
-                          "last movement step: {}. recovery reason: {} (#1482)",
+                          "last movement step: {}. recovery reason: {} (#1482). readings: {} (#1604)",
                           name, mismatch.seconds, reading.mapId, reading.x, reading.y,
-                          reading.z, reading.terrainZ, terrainGap, lastMovementStep, reason);
+                          reading.z, reading.terrainZ, terrainGap, lastMovementStep, reason,
+                          OverseerDecisions::TerrainMismatchReadings(reported, gapCouldMatter));
             }
             bool const groundOnRecord = memory.plane.ground.valid &&
                                         memory.plane.ground.mapId == bot->GetMapId();

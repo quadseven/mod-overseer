@@ -1230,6 +1230,29 @@ BelowTerrainObservationVerdict ObserveTerrainMismatch(
     bool standingOnGround, std::string const& movementStep,
     BelowTerrainObservationLimits const& limits, time_t now);
 
+// THE READINGS BEHIND A SUSTAINED-MISMATCH REPORT, IN WORDS (#1604). The
+// report said where a character was and how far under the raw terrain, and
+// none of what the other instruments read there, so two places that repeated
+// on a live realm could not be told apart from the log as "the detector is
+// wrong here" (a floor under a cliff or in a cave) or "a real fall". This is
+// the sentence that carries them: the overhead surface, Detour's answer, the
+// footing fan, the floor looked for under the feet, and whether the character
+// is falling.
+//
+// A READING THAT WAS NOT TAKEN IS SAID AS NOT TAKEN, never as its default. An
+// invalid surface or floor prints no number (the field still holds whatever
+// was there before), and the footing fan is called measured only where the
+// adapter walks it: behind the recovery gate, over a polygon Detour found.
+//
+// `gatedProbesRan` is the adapter's own gate (a vertical gap that could need
+// recovery). Where it is false the recovery never asked Detour or looked down,
+// and the adapter asks both once for the report alone, into a copy no decision
+// reads; the last clause says which of the two happened.
+//
+// Words only. It decides nothing and nothing reads it back.
+std::string TerrainMismatchReadings(TerrainReading const& reading,
+                                    bool gatedProbesRan);
+
 // IS THIS CHARACTER STANDING ON THE GROUND, or only near some ground?
 //
 // `hasLocalNavmesh` is what Detour answers when it is asked for a path a
