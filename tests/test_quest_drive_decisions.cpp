@@ -26,6 +26,15 @@ void ACampaignKeepsTheLeaderForItsFamily()
     Check("idle but crossing", QuestDriveMayTakeCampaignLeader(false, true), false);
 }
 
+void ALeaderOnAnotherJobIsNotTakenByTheQuestDrive()
+{
+    using OverseerDecisions::QuestDriveHasWorkForLeader;
+    Check("quest job", QuestDriveHasWorkForLeader("quest"), true);
+    Check("unset job", QuestDriveHasWorkForLeader(""), true);
+    Check("farm job", QuestDriveHasWorkForLeader("farm:mining"), false);
+    Check("town run job", QuestDriveHasWorkForLeader("town run"), false);
+}
+
 void QuestTargetsStayWithinTheYoungestMembersLevelGap()
 {
     using OverseerDecisions::QuestDriveTargetFitsYoungest;
@@ -40,6 +49,7 @@ void QuestTargetsStayWithinTheYoungestMembersLevelGap()
 int main()
 {
     ACampaignKeepsTheLeaderForItsFamily();
+    ALeaderOnAnotherJobIsNotTakenByTheQuestDrive();
     QuestTargetsStayWithinTheYoungestMembersLevelGap();
     if (failures)
     {

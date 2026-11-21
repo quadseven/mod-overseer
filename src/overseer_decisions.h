@@ -4439,6 +4439,14 @@ bool DungeonCampaignRecovers(unsigned trailingFailures);
 // the four followers sailed for Menethil without him, and the crossing split.
 bool QuestDriveMayTakeCampaignLeader(bool campaignActive, bool crossingUnderWay);
 
+// The quest drive asks for the leader only when the leader's own job is 'quest'
+// (an empty job is the schema default and also means quest). The drive's loop
+// already stands a character down whose job is anything else, so an ask for such
+// a leader holds the family leader for a drive that has nothing to complete: it
+// takes him from his baseline, finds nothing, and is displaced again a few minutes
+// later, over and over, without a quest ever being handed in.
+bool QuestDriveHasWorkForLeader(std::string const& leaderJob);
+
 // A quest drive must not choose work above the youngest member by more than
 // the shared lone-leg level gap. Quest levels are supplied by quest_template.
 bool QuestDriveTargetFitsYoungest(int youngestLevel, int questLevel, int minLevel,
