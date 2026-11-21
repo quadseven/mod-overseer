@@ -30661,6 +30661,12 @@ private:
         // an empty target never reaches this loop, exactly as before.
         std::map<std::string, std::string> const aims = _travelAims.Load();
         NoteTravelGuards(aims);
+        {
+            std::set<std::string> aimedLower;
+            for (auto const& aim : aims)
+                aimedLower.insert(LowerName(aim.first));
+            RecoverIdleOffMesh(aimedLower);
+        }
         // Before the empty return: a party can still be at the portal after the
         // leader's errand has ended on landing (#1161).
         StepMageTravels(aims);
@@ -41834,6 +41840,36 @@ private:
     // ask, nothing is read, said or done.
     static constexpr uint32 STALL_RECOVERY_POINT_ID = 0;
     std::map<std::string, OverseerDecisions::StallRecoveryState> _stallRecovery;
+
+    // A STREAK THAT IS DUE WITH NO RELEASE COMING. The recovery is otherwise
+    // reached only from a no-progress release of a walked errand, and a head
+    // standing off the mesh stops being given one (backoff, a flight leg, a
+    // regroup or dungeon hold), so its armed streak never fired. Called once a
+    // poll with the names that hold an aim: for every other streak the pure
+    // StallRecoveryIdleDue says whether it is due, and the same reading and
+    // rungs run as for a release. The aim is the character's own feet: the
+    // classification and both rungs read the mesh at the feet, not the route.
+    void RecoverIdleOffMesh(std::set<std::string> const& aimedLower)
+    {
+        std::time_t const now = std::time(nullptr);
+        for (auto& entry : _stallRecovery)
+        {
+            if (aimedLower.count(entry.first))
+                continue;
+            Player* bot = ObjectAccessor::FindPlayerByName(entry.first);
+            if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->IsInCombat())
+                continue;
+            if (!OverseerDecisions::StallRecoveryIdleDue(
+                    entry.second, bot->GetPositionX(), bot->GetPositionY(),
+                    static_cast<std::int64_t>(now), STALL_RECOVERY_LIMITS,
+                    STALL_IDLE_READ_SECONDS))
+                continue;
+            WorldPosition const here(bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(),
+                                    bot->GetPositionZ());
+            ReadStalledFooting(bot, bot->GetName(), here);
+        }
+    }
+    static constexpr std::int64_t STALL_IDLE_READ_SECONDS = 60;
 
     bool ReadStalledFooting(Player* bot, std::string const& name, WorldPosition const& aim,
                             bool groundRefused = false)
