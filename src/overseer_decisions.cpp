@@ -1489,6 +1489,22 @@ StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
     return verdict;
 }
 
+bool StallRecoveryIdleDue(StallRecoveryState& state, float x, float y, std::int64_t now,
+                          StallRecoveryLimits const& limits, std::int64_t intervalSeconds)
+{
+    if (state.offMeshReleases == 0 || state.escalated ||
+        state.offMeshReleases < limits.releases || now - state.since < limits.seconds)
+        return false;
+    float const dx = x - state.anchorX;
+    float const dy = y - state.anchorY;
+    if (dx * dx + dy * dy > limits.movedResetYards * limits.movedResetYards)
+        return false;
+    if (state.idleReadAt != 0 && now - state.idleReadAt < intervalSeconds)
+        return false;
+    state.idleReadAt = now;
+    return true;
+}
+
 void StallRecoveryNotDone(StallRecoveryState& state)
 {
     state.escalated = false;

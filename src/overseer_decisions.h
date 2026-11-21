@@ -1618,6 +1618,8 @@ struct StallRecoveryState
     bool escalated{false};
     std::int64_t unreachableSaidAt{0};
     std::int64_t refusalSaidAt{0};
+    // When the idle check last said "read it now" (StallRecoveryIdleDue).
+    std::int64_t idleReadAt{0};
 };
 
 struct StallRecoveryFacts
@@ -1665,6 +1667,19 @@ struct StallRecoveryVerdict
 StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
                                        StallRecoveryFacts const& facts,
                                        StallRecoveryLimits const& limits);
+
+// A STREAK THAT HAS EARNED ITS RECOVERY BUT HAS NO RELEASE TO CARRY IT. The
+// step above runs only when a walked errand is released for no progress, and a
+// head standing off the mesh stops being given walked errands (backoff, a
+// flight leg, a hold, a refused aim), so a streak that was armed could wait
+// for a release that never came. True when the streak is armed (enough
+// releases over the bound, not yet escalated), the character is still within
+// the moved-reset distance of where the streak began, and `intervalSeconds`
+// have passed since the last time this said yes. Saying yes records the time.
+// The caller then reads the footing and runs StallRecoveryStep as for a
+// release. False for a character with no streak.
+bool StallRecoveryIdleDue(StallRecoveryState& state, float x, float y, std::int64_t now,
+                          StallRecoveryLimits const& limits, std::int64_t intervalSeconds);
 
 // THE ADAPTER COULD NOT DO WHAT THE VERDICT ASKED (a hearth cast refused for a
 // reason that clears itself): the escalation is not spent, and the next
