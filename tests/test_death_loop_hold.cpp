@@ -180,6 +180,13 @@ void TestParseFlag()
     Check("a fractional zone is no flag", !D::ParseDeathLoopFlag("{\"map\": 1, \"zone\": 1.5}").ok);
     Check("a zone past 32 bits is no flag",
           !D::ParseDeathLoopFlag("{\"map\": 1, \"zone\": 99999999999}").ok);
+    // 2^64 + 1377: a parser that let the 64-bit value wrap would read zone 1377
+    // and hold the wrong character. The per-digit 32-bit check refuses it long
+    // before the multiply could wrap.
+    Check("a zone that would wrap 64 bits to a valid zone is no flag",
+          !D::ParseDeathLoopFlag("{\"map\": 1, \"zone\": 18446744073709552993}").ok);
+    Check("a 25-digit map is no flag",
+          !D::ParseDeathLoopFlag("{\"map\": 1000000000000000000000001, \"zone\": 1377}").ok);
 }
 
 void TestSteps()
