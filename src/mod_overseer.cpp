@@ -6361,14 +6361,15 @@ void LogLeaderAsk(std::string const& name, OverseerDecisions::LeaderIntentKind k
 }
 
 bool AskForLeader(std::string const& name, OverseerDecisions::LeaderIntentKind kind,
-                  std::string const& owner, std::string const& target, std::string const& why)
+                  std::string const& owner, std::string const& target, std::string const& why,
+                  bool leftMemberBehind = false)
 {
     if (!LeaderIntentApplies(name))
         return true;
     time_t const now = std::time(nullptr);
     OverseerMovement::LeaderIntentSnapshot const before = MovementOwner().LeaderIntentStateFor(name);
     OverseerDecisions::LeaderIntentVerdict const verdict =
-        MovementOwner().AskForLeader(name, kind, owner, target, why, now);
+        MovementOwner().AskForLeader(name, kind, owner, target, why, now, leftMemberBehind);
     LogLeaderAsk(name, kind, owner, target, why, before, verdict, now);
     return verdict.answer != OverseerDecisions::LeaderIntentAnswer::Deferred;
 }
@@ -7686,7 +7687,9 @@ public:
         return true;
     }
 
-    bool NoteNoProgressRelease(std::string const& name, std::string const& target)
+    // The leader intent that last held `target` off this character.
+    void NoteUrgency(std::string const& name, std::string const& target,
+                     std::string const& urgency)
     {
         NoProgressBackoff& backoff = _noProgressBackoff[name];
         if (backoff.target != target)
@@ -7694,9 +7697,21 @@ public:
             backoff.target = target;
             backoff.state = OverseerDecisions::TravelNoProgressBackoffState{};
         }
+        backoff.urgency = urgency;
+    }
+
+    bool NoteNoProgressRelease(std::string const& name, std::string const& target)
+    {
+        NoProgressBackoff& backoff = _noProgressBackoff[name];
+        if (backoff.target != target)
+        {
+            backoff.target = target;
+            backoff.state = OverseerDecisions::TravelNoProgressBackoffState{};
+            backoff.urgency.clear();
+        }
         return OverseerDecisions::TravelNoProgressBackoffStep(
                    backoff.state, std::time(nullptr), TRAVEL_STUCK_BACKOFF_RELEASES,
-                   TRAVEL_STUCK_BACKOFF_SECONDS) ==
+                   TRAVEL_STUCK_BACKOFF_SECONDS, backoff.urgency) ==
                OverseerDecisions::TravelNoProgressBackoffAction::Backoff;
     }
 
@@ -7782,6 +7797,7 @@ private:
     struct NoProgressBackoff
     {
         std::string target;
+        std::string urgency;
         OverseerDecisions::TravelNoProgressBackoffState state;
     };
 
@@ -30970,10 +30986,26 @@ private:
                             !FetchTargetOf(name).empty()
                         ? FetchTargetOf(name)
                         : target;
-                if (!AskForLeader(name, kind, owner, about, "walks to '" + target + "'"))
+                // A MAINTENANCE ERRAND THE BRIDGE WROTE IS ITS DECISION TO GO WITHOUT
+                // ANY HELD MEMBER: it writes the aim only once vendor_stall's
+                // held_fetch_bound has left them behind, so a fetch or regroup
+                // for one does not take the leader off it again.
+                bool const bridgeErrand = kind == OverseerDecisions::LeaderIntentKind::EconomyErrand &&
+                                          OverseerDecisions::IsMaintenanceErrand(target) &&
+                                          !MovementOwner().HoldsClaim(name, columnAim);
+                if (!AskForLeader(name, kind, owner, about, "walks to '" + target + "'",
+                                  bridgeErrand))
                 {
                     state.progress.since = std::time(nullptr);
                     state.progressWindow = OverseerDecisions::ErrandProgressWindow{};
+                    // WHO HOLDS HIM, remembered, so a no-progress backoff that
+                    // lapses while the same holder stands does not start again.
+                    OverseerMovement::LeaderIntentSnapshot const holder =
+                        MovementOwner().LeaderIntentStateFor(name);
+                    _travelAims.NoteUrgency(
+                        name, target,
+                        std::to_string(static_cast<int>(holder.kind)) + "|" + holder.owner + "|" +
+                            holder.target);
                     continue;
                 }
                 if (!bot->IsAlive() || bot->IsInCombat())
