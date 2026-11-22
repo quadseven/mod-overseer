@@ -22079,6 +22079,9 @@ struct TravelNoProgressBackoffState
 {
     uint32_t releases{0};
     time_t until{0};
+    // The urgency that stood over the errand when the backoff began (the
+    // leader intent that held it off, as "kind|owner|target"); empty when none.
+    std::string urgency;
 };
 
 enum class TravelNoProgressBackoffAction
@@ -22087,9 +22090,17 @@ enum class TravelNoProgressBackoffAction
     Backoff,
 };
 
+//
+// THE COUNT DOES NOT RESTART WHILE THE SAME URGENCY STANDS. A backoff that
+// lapsed zeroed the count, so a far fetch or regroup that kept preempting the
+// same errand bought three fresh releases, a fresh cooldown and a fresh
+// "took over / ended" pair each time, for ever. With a non-empty `urgency`
+// equal to the one the backoff began under, the lapse keeps the count one
+// short of the limit, so the next release backs off again at once instead of
+// starting over. A different or empty urgency starts the count again as before.
 TravelNoProgressBackoffAction TravelNoProgressBackoffStep(
     TravelNoProgressBackoffState& state, time_t now, uint32_t releaseLimit,
-    time_t cooldownSeconds);
+    time_t cooldownSeconds, std::string const& urgency = std::string());
 
 // ------------- holding a character on the ground, when the ground is water --
 //
@@ -29367,6 +29378,11 @@ struct LeaderIntentRequest
     std::string owner;   // the rule asking: "regroup", "fetch", "travel column"...
     std::string target;  // what about: an NPC, a member, an aim; may be empty
     std::string why;     // one clause for the log line
+    // A vendor or town errand the bridge wrote ONLY AFTER it left the held
+    // member behind (vendor_stall.held_fetch_bound): the family has already
+    // decided not to wait for that member, so the errand outranks a fetch or a
+    // regroup for it. Read by AskLeaderIntent for EconomyErrand/TownErrand only.
+    bool leftMemberBehind{false};
 };
 
 struct LeaderIntentState
@@ -29375,6 +29391,7 @@ struct LeaderIntentState
     std::string owner;
     std::string target;
     std::string why;
+    bool leftMemberBehind{false};  // see LeaderIntentRequest
     std::time_t since{0};       // when this intent was granted
     std::time_t lastAsked{0};   // when its owner last asked for it
     bool dwellWaived{false};    // death or combat since it was granted
@@ -29430,7 +29447,8 @@ struct LeaderIntentVerdict
 // The rank a request gets: its kind's own, raised just below DungeonRun when
 // it is Jev's current pick for the family.
 int LeaderIntentRank(LeaderIntentKind kind, std::string const& target,
-                     LeaderIntentPreference const& preference, std::time_t now);
+                     LeaderIntentPreference const& preference, std::time_t now,
+                     bool leftMemberBehind = false);
 
 // Ask for the leader. See the block above for the rules.
 LeaderIntentVerdict AskLeaderIntent(LeaderIntentState& state,

@@ -19490,7 +19490,7 @@ TravelStuckAction TravelStuckDecision(uint32_t attempts, uint32_t limit,
 
 TravelNoProgressBackoffAction TravelNoProgressBackoffStep(
     TravelNoProgressBackoffState& state, time_t now, uint32_t releaseLimit,
-    time_t cooldownSeconds)
+    time_t cooldownSeconds, std::string const& urgency)
 {
     if (releaseLimit == 0 || cooldownSeconds <= 0)
         return TravelNoProgressBackoffAction::Continue;
@@ -19498,13 +19498,15 @@ TravelNoProgressBackoffAction TravelNoProgressBackoffStep(
         return TravelNoProgressBackoffAction::Backoff;
     if (state.until != 0 && state.until <= now)
     {
-        state.releases = 0;
+        bool const sameUrgency = !urgency.empty() && urgency == state.urgency;
+        state.releases = sameUrgency ? releaseLimit - 1 : 0;
         state.until = 0;
     }
     ++state.releases;
     if (state.releases < releaseLimit)
         return TravelNoProgressBackoffAction::Continue;
     state.until = now + cooldownSeconds;
+    state.urgency = urgency;
     return TravelNoProgressBackoffAction::Backoff;
 }
 
@@ -26143,6 +26145,7 @@ void ClearLeaderIntent(LeaderIntentState& state)
     state.since = 0;
     state.lastAsked = 0;
     state.dwellWaived = false;
+    state.leftMemberBehind = false;
 }
 
 std::string LowerTrimmed(std::string const& text)
@@ -26201,9 +26204,19 @@ bool LeaderIntentWalksUnderNewRpg(LeaderIntentKind kind)
 }
 
 int LeaderIntentRank(LeaderIntentKind kind, std::string const& target,
-                     LeaderIntentPreference const& preference, std::time_t now)
+                     LeaderIntentPreference const& preference, std::time_t now,
+                     bool leftMemberBehind)
 {
-    int const own = static_cast<int>(kind) * 10;
+    // A VENDOR ERRAND AFTER THE BRIDGE LEFT THE HELD MEMBER BEHIND OUTRANKS A
+    // FETCH AND A REGROUP. The bridge writes it only once the member passed its
+    // bound, so fetching that member again undoes the family's decision: the
+    // leader walked back for it, the errand ended, the bridge re-armed it, and
+    // nobody ever sold. Just above FetchMember, below the family's trip home.
+    bool const errandKind =
+        kind == LeaderIntentKind::EconomyErrand || kind == LeaderIntentKind::TownErrand;
+    int const own = leftMemberBehind && errandKind
+                        ? static_cast<int>(LeaderIntentKind::FetchMember) * 10 + 5
+                        : static_cast<int>(kind) * 10;
     bool const preferred = preference.kind != LeaderIntentKind::None &&
                            now < preference.until && kind == preference.kind &&
                            (preference.target.empty() || preference.target == target);
@@ -26255,6 +26268,7 @@ LeaderIntentVerdict AskLeaderIntent(LeaderIntentState& state,
         state.kind = request.kind;
         state.target = request.target;
         state.why = request.why;
+        state.leftMemberBehind = request.leftMemberBehind;
         state.lastAsked = now;
         state.deferralSaid.erase(request.owner);
         verdict.answer = LeaderIntentAnswer::Retargeted;
@@ -26270,6 +26284,7 @@ LeaderIntentVerdict AskLeaderIntent(LeaderIntentState& state,
         if (yielded != state.cooldownUntil.end() && now < yielded->second)
             yielded->second = std::max(yielded->second, now + limits.regroupYieldCooldownSeconds);
         state.lastAsked = now;
+        state.leftMemberBehind = request.leftMemberBehind;
         state.deferralSaid.erase(request.owner);
         if (state.target == request.target)
         {
@@ -26292,10 +26307,21 @@ LeaderIntentVerdict AskLeaderIntent(LeaderIntentState& state,
 
     if (live)
     {
-        int const held = LeaderIntentRank(state.kind, state.target, preference, now);
-        int const asked = LeaderIntentRank(request.kind, request.target, preference, now);
+        int const held = LeaderIntentRank(state.kind, state.target, preference, now,
+                                          state.leftMemberBehind);
+        int const asked = LeaderIntentRank(request.kind, request.target, preference, now,
+                                           request.leftMemberBehind);
         std::time_t const ran = now - state.since;
-        bool const dwellOver = state.dwellWaived || ran >= limits.dwellSeconds;
+        // The errand that outranks the fetch for a member left behind takes the
+        // leader at once: waiting out a dwell for a fetch it overrides is the
+        // loop this rule exists to end.
+        bool const overridesFetch =
+            request.leftMemberBehind &&
+            (state.kind == LeaderIntentKind::FetchMember ||
+             state.kind == LeaderIntentKind::Regroup) &&
+            (request.kind == LeaderIntentKind::EconomyErrand ||
+             request.kind == LeaderIntentKind::TownErrand);
+        bool const dwellOver = state.dwellWaived || overridesFetch || ran >= limits.dwellSeconds;
         bool const regroupYields = state.kind == LeaderIntentKind::Regroup &&
                                    (request.kind == LeaderIntentKind::EconomyErrand ||
                                     request.kind == LeaderIntentKind::TownErrand) &&
@@ -26325,6 +26351,7 @@ LeaderIntentVerdict AskLeaderIntent(LeaderIntentState& state,
     state.owner = request.owner;
     state.target = request.target;
     state.why = request.why;
+    state.leftMemberBehind = request.leftMemberBehind;
     state.since = now;
     state.lastAsked = now;
     state.dwellWaived = false;
