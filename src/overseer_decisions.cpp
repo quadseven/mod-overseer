@@ -1497,6 +1497,7 @@ StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
         state.refusalSaidAt = 0;
     }
     ++state.offMeshReleases;
+    state.lastReleaseAt = facts.now;
     verdict.releases = state.offMeshReleases;
     if (state.escalated || state.offMeshReleases < limits.releases ||
         facts.now - state.since < limits.seconds)
@@ -1537,6 +1538,13 @@ StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
                          hearthVerdict.reason;
     }
     return verdict;
+}
+
+bool StallRecoveryLeaveBehind(StallRecoveryState const& state, std::int64_t now,
+                              StallRecoveryLimits const& limits)
+{
+    return state.offMeshReleases >= limits.leaveBehindReleases &&
+           now - state.lastReleaseAt <= limits.freshSeconds;
 }
 
 bool StallRecoveryIdleDue(StallRecoveryState& state, float x, float y, std::int64_t now,
@@ -16189,6 +16197,10 @@ TownStop TownTripMemberStop(TownStopFacts const& facts)
         return TownStop::Done;
     if (facts.atTheCounter)
         return TownStop::Trade;
+    // An off-mesh member whose aim keeps being refused is not waited for, at
+    // any distance and whether or not the leader is at the counter.
+    if (!facts.isLeader && facts.offMeshHeld)
+        return TownStop::OffMesh;
     // The journey is the leader's. A follower is brought by the catch-up walk
     // and the regroup wait (#404), not by an aim of this trip's own.
     if (!facts.isLeader && !facts.leaderAtTheCounter)
@@ -16236,6 +16248,7 @@ char const* TownStopWord(TownStop stop)
         case TownStop::Follow: return "follow";
         case TownStop::TooFar: return "too far";
         case TownStop::StoodDown: return "stood down";
+        case TownStop::OffMesh: return "off the mesh";
     }
     return "unknown";
 }

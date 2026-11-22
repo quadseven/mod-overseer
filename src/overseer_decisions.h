@@ -1630,12 +1630,19 @@ struct StallRecoveryLimits
     // The disconnected case and an impossible recovery are each said at most
     // this often per character.
     std::int64_t saySeconds{3600};
+    // A member this many releases into one off-mesh streak is left behind by
+    // an errand that waits for it, without waiting for the hour. The releases
+    // must also be recent: a streak nobody has released for `freshSeconds` is
+    // history, not a member that is stuck now.
+    std::uint32_t leaveBehindReleases{6};
+    std::int64_t freshSeconds{300};
 };
 
 struct StallRecoveryState
 {
     std::uint32_t offMeshReleases{0};
     std::int64_t since{0};
+    std::int64_t lastReleaseAt{0};
     float anchorX{0.f};
     float anchorY{0.f};
     bool escalated{false};
@@ -1690,6 +1697,14 @@ struct StallRecoveryVerdict
 StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
                                        StallRecoveryFacts const& facts,
                                        StallRecoveryLimits const& limits);
+
+// IS THIS MEMBER ONE AN ERRAND SHOULD STOP WAITING FOR? True when it is in an
+// off-mesh streak of at least `leaveBehindReleases` releases at one spot, the
+// latest of them within `freshSeconds` of `now`. Independent of the hour the
+// recovery rungs wait for: the errand leaves the member where it is and the
+// recovery runs on its own clock.
+bool StallRecoveryLeaveBehind(StallRecoveryState const& state, std::int64_t now,
+                              StallRecoveryLimits const& limits);
 
 // A STREAK THAT HAS EARNED ITS RECOVERY BUT HAS NO RELEASE TO CARRY IT. The
 // step above runs only when a walked errand is released for no progress, and a
@@ -19029,6 +19044,10 @@ struct TownStopFacts
     // the stand-down that death opened (#298). The catch-up walk already
     // honors it; the trip's own walk took the catch-up over and did not.
     bool stoodDown{false};
+    // THIS MEMBER STANDS OFF THE MESH AND ITS AIM HAS BEEN REFUSED RELEASE
+    // AFTER RELEASE (StallRecoveryLeaveBehind). Walking it again is re-arming
+    // the same aim every poll, so the trip leaves it where it is.
+    bool offMeshHeld{false};
 };
 
 enum class TownStop : std::uint8_t
@@ -19040,6 +19059,7 @@ enum class TownStop : std::uint8_t
     Follow,     // do NOT aim it: the journey is the leader's and follow brings this one
     TooFar,     // do NOT aim it: the counter is a journey away, not the last few yards
     StoodDown,  // do NOT aim it: its last walk toward the family killed it (#298)
+    OffMesh,    // do NOT aim or wait for it: off the mesh, its aim refused again and again
 };
 
 // THE ORDER OF THE FIVE TESTS IS THE MEANING, and each one makes the ones below

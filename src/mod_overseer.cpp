@@ -57271,6 +57271,14 @@ private:
                     leader ? bot->GetDistance2d(leader) : 0.f;
                 facts.walkLimitYards = TOWN_TRIP_WALK_LIMIT_YARDS;
                 facts.stoodDown = WithinCatchUpStandDown(name);
+                {
+                    auto const held = _stallRecovery.find(LowerName(name));
+                    facts.offMeshHeld =
+                        held != _stallRecovery.end() &&
+                        OverseerDecisions::StallRecoveryLeaveBehind(
+                            held->second, static_cast<std::int64_t>(std::time(nullptr)),
+                            STALL_RECOVERY_LIMITS);
+                }
             }
 
             switch (OverseerDecisions::TownTripMemberStop(facts))
@@ -57393,6 +57401,18 @@ private:
                                  "together again",
                                  name, static_cast<uint32>(facts.yardsFromLeader), aim,
                                  static_cast<uint32>(TOWN_TRIP_WALK_LIMIT_YARDS));
+                    SettleTownTripMember(trip, name);
+                    break;
+
+                case OverseerDecisions::TownStop::OffMesh:
+                    if (SayTownTripOnce(trip, name, "off the mesh"))
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' stands off the mesh and its aim has been "
+                                 "refused release after release, so the trip does not wait "
+                                 "for it or re-arm the same aim to the '{}'. It is left where "
+                                 "it is and the trip carries on without it; the off-mesh "
+                                 "recovery keeps its own clock (#188)",
+                                 name, aim);
                     SettleTownTripMember(trip, name);
                     break;
 
