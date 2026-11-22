@@ -53,6 +53,9 @@ void WithoutTheBoundTheFetchTakesTheLeaderBack()
     auto v = AskLeaderIntent(state, Req(LeaderIntentKind::EconomyErrand, "travel column", "vendor"),
                              1000, LIMITS);
     Check("the errand starts", v.answer == LeaderIntentAnswer::Granted);
+    for (std::time_t t = 1030; t < 1100; t += 30)
+        AskLeaderIntent(state, Req(LeaderIntentKind::EconomyErrand, "travel column", "vendor"), t,
+                        LIMITS);
     v = AskLeaderIntent(state, Req(LeaderIntentKind::FetchMember, "fetch", "far member"), 1100,
                         LIMITS);
     Check("an unbounded fetch takes the leader off the errand",
@@ -66,14 +69,14 @@ void ABridgeErrandOutranksAFetchForTheMemberItLeftBehind()
         Req(LeaderIntentKind::EconomyErrand, "travel column", "vendor", true);
     auto v = AskLeaderIntent(state, errand, 1000, LIMITS);
     Check("the errand starts", v.answer == LeaderIntentAnswer::Granted);
-    // Well past the dwell, as in the log, and the fetch asks every poll.
-    for (std::time_t t = 1100; t < 1000 + 3600; t += 30)
+    // Past the dwell, as in the log, and both ask every poll.
+    for (std::time_t t = 1030; t < 1000 + 3600; t += 30)
     {
+        v = AskLeaderIntent(state, errand, t, LIMITS);
+        Check("the errand keeps the leader", v.answer == LeaderIntentAnswer::Renewed);
         v = AskLeaderIntent(state, Req(LeaderIntentKind::FetchMember, "fetch", "far member"), t,
                             LIMITS);
         Check("the fetch waits behind the errand", v.answer == LeaderIntentAnswer::Deferred);
-        v = AskLeaderIntent(state, errand, t, LIMITS);
-        Check("the errand keeps the leader", v.answer == LeaderIntentAnswer::Renewed);
     }
     Check("the leader never changed hands again", state.changes == 1);
 }
@@ -105,14 +108,16 @@ void WhatIsNotTheBridgesBoundStillRanksAsBefore()
     Check("an errand with no bound waits behind a fetch", v.answer == LeaderIntentAnswer::Deferred);
 
     LeaderIntentState hearth;
-    AskLeaderIntent(hearth, Req(LeaderIntentKind::Hearth, "home errand", "inn"), 1000, LIMITS);
+    for (std::time_t t = 1000; t <= 1500; t += 30)
+        AskLeaderIntent(hearth, Req(LeaderIntentKind::Hearth, "home errand", "inn"), t, LIMITS);
     v = AskLeaderIntent(hearth,
                         Req(LeaderIntentKind::EconomyErrand, "travel column", "vendor", true), 1500,
                         LIMITS);
     Check("the family's trip home still outranks it", v.answer == LeaderIntentAnswer::Deferred);
 
     LeaderIntentState run;
-    AskLeaderIntent(run, Req(LeaderIntentKind::DungeonRun, "dungeon run", "door"), 1000, LIMITS);
+    for (std::time_t t = 1000; t <= 1500; t += 30)
+        AskLeaderIntent(run, Req(LeaderIntentKind::DungeonRun, "dungeon run", "door"), t, LIMITS);
     v = AskLeaderIntent(run, Req(LeaderIntentKind::EconomyErrand, "travel column", "vendor", true),
                         1500, LIMITS);
     Check("and so does a dungeon run", v.answer == LeaderIntentAnswer::Deferred);
