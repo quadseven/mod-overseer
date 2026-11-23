@@ -31008,7 +31008,11 @@ private:
                             stall->second, bot->GetPositionX(), bot->GetPositionY(), stallNow,
                             STALL_RECOVERY_LIMITS))
                     {
-                        if (OverseerDecisions::StallRecoveryIdleDue(
+                        // ALIVE AND OUT OF COMBAT, as RecoverIdleOffMesh asks: a
+                        // guarded walker is left alone this poll, streak kept.
+                        if (OverseerDecisions::StallRecoveryMayRead(bot->IsAlive(),
+                                                                    bot->IsInCombat()) &&
+                            OverseerDecisions::StallRecoveryIdleDue(
                                 stall->second, bot->GetPositionX(), bot->GetPositionY(), stallNow,
                                 STALL_RECOVERY_LIMITS, STALL_IDLE_READ_SECONDS))
                             ReadStalledFooting(

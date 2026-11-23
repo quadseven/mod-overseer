@@ -1735,6 +1735,13 @@ bool StallRecoveryHoldsErrand(StallRecoveryState const& state, float x, float y,
 bool StallRecoveryIdleDue(StallRecoveryState& state, float x, float y, std::int64_t now,
                           StallRecoveryLimits const& limits, std::int64_t intervalSeconds);
 
+// MAY THE FOOTING BE READ AND A RUNG TAKEN THIS POLL (mod-overseer#1705). Only
+// a living character out of combat: a rung walks it to a polygon, which must
+// not happen mid-fight or to a ghost. Asked BEFORE StallRecoveryIdleDue, which
+// records the time on a yes, so a guarded character keeps its streak and is
+// read on the next poll.
+bool StallRecoveryMayRead(bool alive, bool inCombat);
+
 // THE ADAPTER COULD NOT DO WHAT THE VERDICT ASKED (a hearth cast refused for a
 // reason that clears itself): the escalation is not spent, and the next
 // release asks again.
