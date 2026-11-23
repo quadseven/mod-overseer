@@ -184,6 +184,62 @@ void ADifferentOrNoUrgencyStartsTheCountAgain()
               TravelNoProgressBackoffAction::Continue);
 }
 
+// The measured cycle of a leader that cannot path (off the mesh): each walk is
+// released for no progress after 66s, the trip is claimed again 5s later, three
+// releases back off for 15 minutes, and the lapse used to hand back a fresh
+// count of three. Returns the walks begun in an hour; `arrivedAfterMove` says
+// whether the walk the character makes once it has been moved off the spot is
+// let through to arrive.
+unsigned WalksInAnHourFromOneSpot(bool giveFeet, bool& arrivedAfterMove)
+{
+    TravelNoProgressBackoffState state;
+    TravelFeet const feet{-6265.f, -97.f};
+    unsigned walks = 0;
+    std::time_t t = 0;
+    while (t < 3600)
+    {
+        ++walks;
+        t += 66;
+        auto const action =
+            TravelNoProgressBackoffStep(state, t, 3, 900, "", giveFeet ? &feet : nullptr);
+        t += action == TravelNoProgressBackoffAction::Backoff ? 900 : 5;
+    }
+    // The stall recovery then moves the character far from that spot. Its next
+    // walk is not held by the old count, and it arrives (no further release).
+    TravelFeet const moved{-618.f, -4251.f};
+    t += 900;
+    auto const action = TravelNoProgressBackoffStep(state, t, 3, 900, "", giveFeet ? &moved : nullptr);
+    arrivedAfterMove = action == TravelNoProgressBackoffAction::Continue;
+    return walks;
+}
+
+void AWalkThatNeverPathsDoesNotTakeTheLeaderNineTimesAnHour()
+{
+    bool arrived = false;
+    unsigned const before = WalksInAnHourFromOneSpot(false, arrived);
+    Check("the measured cycle: ten or more walks an hour without the spot", before >= 9);
+    unsigned const after = WalksInAnHourFromOneSpot(true, arrived);
+    Check("with the spot known only the first backoff buys three walks", after <= 6 && after + 3 <= before);
+    Check("and once the character is moved its walk is let through to arrive", arrived);
+}
+
+void AWalkerThatMovedStartsTheCountAgain()
+{
+    TravelNoProgressBackoffState state;
+    TravelFeet const here{0.f, 0.f};
+    TravelFeet const elsewhere{500.f, 0.f};
+    TravelNoProgressBackoffStep(state, 100, 3, 900, "", &here);
+    TravelNoProgressBackoffStep(state, 160, 3, 900, "", &here);
+    TravelNoProgressBackoffStep(state, 220, 3, 900, "", &here);
+    Check("lapsed on the same spot backs off at once",
+          TravelNoProgressBackoffStep(state, 1200, 3, 900, "", &here) ==
+              TravelNoProgressBackoffAction::Backoff);
+    TravelNoProgressBackoffStep(state, 2200, 3, 900, "", &here);
+    Check("lapsed after moving counts afresh",
+          TravelNoProgressBackoffStep(state, 3200, 3, 900, "", &elsewhere) ==
+              TravelNoProgressBackoffAction::Continue);
+}
+
 }  // namespace
 
 int main()
@@ -195,6 +251,8 @@ int main()
     TheCycleEndsInArrival();
     TheBackoffCountDoesNotRestartWhileTheSameUrgencyStands();
     ADifferentOrNoUrgencyStartsTheCountAgain();
+    AWalkThatNeverPathsDoesNotTakeTheLeaderNineTimesAnHour();
+    AWalkerThatMovedStartsTheCountAgain();
     if (failures)
         return 1;
     std::printf("town trip cycle: ok\n");
