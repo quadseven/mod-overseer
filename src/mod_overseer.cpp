@@ -7700,7 +7700,8 @@ public:
         backoff.urgency = urgency;
     }
 
-    bool NoteNoProgressRelease(std::string const& name, std::string const& target)
+    bool NoteNoProgressRelease(std::string const& name, std::string const& target,
+                               float x, float y)
     {
         NoProgressBackoff& backoff = _noProgressBackoff[name];
         if (backoff.target != target)
@@ -7709,9 +7710,10 @@ public:
             backoff.state = OverseerDecisions::TravelNoProgressBackoffState{};
             backoff.urgency.clear();
         }
+        OverseerDecisions::TravelFeet const feet{x, y};
         return OverseerDecisions::TravelNoProgressBackoffStep(
                    backoff.state, std::time(nullptr), TRAVEL_STUCK_BACKOFF_RELEASES,
-                   TRAVEL_STUCK_BACKOFF_SECONDS, backoff.urgency) ==
+                   TRAVEL_STUCK_BACKOFF_SECONDS, backoff.urgency, &feet) ==
                OverseerDecisions::TravelNoProgressBackoffAction::Backoff;
     }
 
@@ -32668,7 +32670,8 @@ private:
                     // when the recovery took the place of the backoff.
                     bool const recovered = ReadStalledFooting(bot, name, pos);
                     bool const backoff =
-                        _travelAims.NoteNoProgressRelease(name, target) && !recovered;
+                        _travelAims.NoteNoProgressRelease(name, target, reading.x, reading.y) &&
+                        !recovered;
                     if (backoff)
                     {
                         LOG_WARN("module.overseer",

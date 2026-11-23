@@ -22082,7 +22082,16 @@ struct TravelNoProgressBackoffState
     // The urgency that stood over the errand when the backoff began (the
     // leader intent that held it off, as "kind|owner|target"); empty when none.
     std::string urgency;
+    // Where the walker stood when the backoff began (set only when the caller
+    // read its feet), so a lapse can tell "still on that spot" from "moved".
+    bool anchored{false};
+    float anchorX{0.f};
+    float anchorY{0.f};
 };
+
+// A walker still within this many yards of where its backoff began has not
+// moved on: the same bound the stall recovery uses to call a streak over.
+constexpr float TRAVEL_BACKOFF_SAME_SPOT_YARDS = 25.f;
 
 enum class TravelNoProgressBackoffAction
 {
@@ -22098,9 +22107,27 @@ enum class TravelNoProgressBackoffAction
 // equal to the one the backoff began under, the lapse keeps the count one
 // short of the limit, so the next release backs off again at once instead of
 // starting over. A different or empty urgency starts the count again as before.
+//
+// NOR DOES IT RESTART WHILE THE WALKER STILL STANDS ON THE SPOT IT WAS
+// RELEASED ON. A walk that never paths (a character off the mesh, under the
+// ground) has no urgency standing over it: nothing preempts it, it simply
+// cannot move. The lapse zeroed the count, so every fifteen minutes the town
+// trip took the leader three more times, each ending in "no progress", about
+// nine took-over / ended pairs an hour until the hour-long stall recovery
+// moved the character. With `feet` given (the walker's x, y at this release)
+// and the walker within TRAVEL_BACKOFF_SAME_SPOT_YARDS of where the backoff
+// began, the lapse keeps the count one short, so one release backs off again.
+// A walker that has moved starts the count again, and so does a caller that
+// gives no feet.
+struct TravelFeet
+{
+    float x{0.f};
+    float y{0.f};
+};
 TravelNoProgressBackoffAction TravelNoProgressBackoffStep(
     TravelNoProgressBackoffState& state, time_t now, uint32_t releaseLimit,
-    time_t cooldownSeconds, std::string const& urgency = std::string());
+    time_t cooldownSeconds, std::string const& urgency = std::string(),
+    TravelFeet const* feet = nullptr);
 
 // ------------- holding a character on the ground, when the ground is water --
 //

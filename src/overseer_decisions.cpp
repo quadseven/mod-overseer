@@ -19490,7 +19490,7 @@ TravelStuckAction TravelStuckDecision(uint32_t attempts, uint32_t limit,
 
 TravelNoProgressBackoffAction TravelNoProgressBackoffStep(
     TravelNoProgressBackoffState& state, time_t now, uint32_t releaseLimit,
-    time_t cooldownSeconds, std::string const& urgency)
+    time_t cooldownSeconds, std::string const& urgency, TravelFeet const* feet)
 {
     if (releaseLimit == 0 || cooldownSeconds <= 0)
         return TravelNoProgressBackoffAction::Continue;
@@ -19499,7 +19499,16 @@ TravelNoProgressBackoffAction TravelNoProgressBackoffStep(
     if (state.until != 0 && state.until <= now)
     {
         bool const sameUrgency = !urgency.empty() && urgency == state.urgency;
-        state.releases = sameUrgency ? releaseLimit - 1 : 0;
+        bool sameSpot = false;
+        if (feet && state.anchored)
+        {
+            float const dx = feet->x - state.anchorX;
+            float const dy = feet->y - state.anchorY;
+            sameSpot = dx * dx + dy * dy <=
+                       TRAVEL_BACKOFF_SAME_SPOT_YARDS * TRAVEL_BACKOFF_SAME_SPOT_YARDS;
+        }
+        state.releases = (sameUrgency || sameSpot) ? releaseLimit - 1 : 0;
+        state.anchored = false;
         state.until = 0;
     }
     ++state.releases;
@@ -19507,6 +19516,12 @@ TravelNoProgressBackoffAction TravelNoProgressBackoffStep(
         return TravelNoProgressBackoffAction::Continue;
     state.until = now + cooldownSeconds;
     state.urgency = urgency;
+    state.anchored = feet != nullptr;
+    if (feet)
+    {
+        state.anchorX = feet->x;
+        state.anchorY = feet->y;
+    }
     return TravelNoProgressBackoffAction::Backoff;
 }
 
