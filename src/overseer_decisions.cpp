@@ -4593,6 +4593,32 @@ bool ReleaseLandsAim(ReleaseLandingFacts const& facts)
     return !facts.anyClaim && !facts.standing.empty() && facts.driving == facts.standing;
 }
 
+void NoteCounterArrival(CounterArrivalMemory& memory, std::string const& aim)
+{
+    memory.aim = aim;
+    memory.said = false;
+}
+
+LandedErrand CounterArrivalMemoryStep(CounterArrivalMemory& memory,
+                                      std::string const& columnAim, bool counterHoldActive,
+                                      bool& sayIt)
+{
+    sayIt = false;
+    LandedErrand const step =
+        LandedErrandStep(memory.aim, columnAim, true, counterHoldActive, 0, 0);
+    if (step == LandedErrand::Resume)
+    {
+        memory = CounterArrivalMemory{};
+        return step;
+    }
+    if (step == LandedErrand::StandDown && !memory.said)
+    {
+        memory.said = true;
+        sayIt = true;
+    }
+    return step;
+}
+
 bool UnresolvedAimStandsDown(std::string const& aim)
 {
     return !aim.empty() && aim.rfind("at:", 0) != 0;

@@ -5591,6 +5591,39 @@ struct ReleaseLandingFacts
 
 bool ReleaseLandsAim(ReleaseLandingFacts const& facts);
 
+// AN ARRIVAL AT A COUNTER IS REMEMBERED ON ITS OWN, NOT AS A LANDING (#1708).
+//
+// The landing above is remembered only when the release left the aim standing
+// in the column. A release that cleared the column (a claimed aim) leaves no
+// landing, and the writer of the aim then writes the same counter again a few
+// seconds later: the drive reads it as a new errand, asks for the leader, and
+// takes down the counter hold the arrival had just put up, every poll the aim
+// is up. The hold is taken and the errand released on one statement, so the
+// hold's own presence is the visit, and this memory says WHICH counter the
+// hold is for.
+//
+// The same rule as a counter landing, minus the column: the same aim written
+// again while the hold stands is not walked; another aim, or the hold gone
+// (its ceiling, or the character let go of it) forgets the arrival and the aim
+// is an ordinary errand again. The stand-down is said once per arrival.
+struct CounterArrivalMemory
+{
+    std::string aim;   // the counter aim the character arrived at, empty when none
+    bool said{false};  // the stand-down was said for this arrival
+};
+
+// Remember an arrival at `aim` that took the counter hold. Replaces any earlier
+// one, and is said again for it.
+void NoteCounterArrival(CounterArrivalMemory& memory, std::string const& aim);
+
+// What the drive does with `columnAim` read now. NotLanded when no arrival is
+// remembered; StandDown while the same aim stands and the hold is in force;
+// Resume (and the memory forgotten) otherwise. `sayIt` is set on the first
+// StandDown of an arrival only.
+LandedErrand CounterArrivalMemoryStep(CounterArrivalMemory& memory,
+                                      std::string const& columnAim, bool counterHoldActive,
+                                      bool& sayIt);
+
 // AN UNRESOLVABLE AIM STANDS DOWN AFTER ITS RELEASE, EXCEPT A POINT (#722).
 // The travel drive refuses an aim it cannot resolve from where the character
 // stands (no spawn of that role on the map, or none within the town-service
