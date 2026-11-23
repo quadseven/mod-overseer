@@ -21,7 +21,7 @@ int main()
                            std::istreambuf_iterator<char>());
     for (char const* needle : {"bool const bridgeErrand =", "!MovementOwner().HoldsClaim(name, columnAim)",
                                "\"walks to '\" + target + \"'\",\n                                  bridgeErrand)",
-                               "_travelAims.NoteUrgency(", "TRAVEL_STUCK_BACKOFF_SECONDS, backoff.urgency)"})
+                               "_travelAims.NoteUrgency(", "TRAVEL_STUCK_BACKOFF_SECONDS, backoff.urgency,"})
         if (text.find(needle) == std::string::npos)
             return std::cerr << "missing wiring: " << needle << "\n", EXIT_FAILURE;
     return EXIT_SUCCESS;
