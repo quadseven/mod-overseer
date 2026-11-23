@@ -14,6 +14,7 @@ using namespace OverseerDecisions;
 // OWNER_KIND
 
 constexpr ErrandDeathLimits ERRAND_DEATH_LIMITS{};
+constexpr time_t TRAVEL_LANDED_CEILING_SECONDS = 15 * 60;
 
 struct Book;
 Book* activeBook = nullptr;
@@ -175,6 +176,39 @@ int main()
               !book.ClaimedBy("Leader", aim, held) && book.column.writes == 0 &&
               book.column.columns["Leader"] == before,
               "refused claim leaves owner and column untouched", TravelOwner::TownTrip, false);
+    }
+    // #1708: a leader that arrived at a counter and took the counter hold is not
+    // re-claimed for the same counter while the hold stands. The arrival is the
+    // real Claim then Release then MarkCounterLanding; the release clears the
+    // column because the book claimed the aim, so no landing exists.
+    {
+        Adapter a;
+        auto& book = a._travelAims;
+        auto arrive = [&] {
+            book.column.columns["Leader"].clear();
+            book.Claim("Leader", "vendor", TravelOwner::TownTrip);
+            book._state["Leader"] = {"vendor"};
+            book.Release("Leader", "the travel drive (arrived)");
+            book.MarkCounterLanding("Leader", "vendor");
+        };
+        arrive();
+        Check(book.column.columns["Leader"].empty() && !book._landed.count("Leader"),
+              "arrival: column cleared and no landing", TravelOwner::TownTrip, false);
+        // The writer puts the same counter up again.
+        book.column.columns["Leader"] = "vendor";
+        unsigned standing = 0;
+        for (unsigned poll = 0; poll < 100; ++poll)
+            standing += book.LandedStep("Leader", "vendor", true) == LandedErrand::StandDown;
+        Check(standing == 100, "same counter under the hold: no re-claim over 100 polls",
+              TravelOwner::TownTrip, false);
+        Check(book.LandedStep("Leader", "banker", true) == LandedErrand::Resume,
+              "another aim is claimed as before", TravelOwner::TownTrip, false);
+        arrive();
+        Check(book.LandedStep("Leader", "at:0:1,2,3", true) == LandedErrand::Resume,
+              "an at: aim is claimed as before", TravelOwner::TownTrip, false);
+        arrive();
+        Check(book.LandedStep("Leader", "vendor", false) == LandedErrand::Resume,
+              "the hold ending claims the same aim again", TravelOwner::TownTrip, false);
     }
     if (!failures)
         std::cout << "PASS 16 owner/run combinations with guard, target, release and reissue controls\n";
