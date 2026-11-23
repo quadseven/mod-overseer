@@ -1627,6 +1627,18 @@ struct StallRecoveryLimits
     // that refusal allows and this module's own bound agrees with it.
     float nearestMeshYards{20.f};
     float movedResetYards{25.f};
+    // THE QUICK RULE FOR A WALKER THAT STANDS STILL OFF THE MESH. With the
+    // streak armed (`releases` seen) and the walker within `stillYards` of one
+    // spot for `stillSeconds`, the recovery does not wait for the full hour
+    // above: a stand-still off the mesh is not a walk that is merely slow.
+    // Read only when the caller sets StallRecoveryFacts::stillRule.
+    std::int64_t stillSeconds{300};
+    float stillYards{3.f};
+    // While the quick rule's recovery is pending, errands do not claim the
+    // walker (StallRecoveryHoldsErrand); the hold is dropped this long after
+    // the quick rule came due if no rung could be taken, so a walker with no
+    // available rung is not held for ever.
+    std::int64_t holdGraceSeconds{900};
     // The disconnected case and an impossible recovery are each said at most
     // this often per character.
     std::int64_t saySeconds{3600};
@@ -1650,6 +1662,12 @@ struct StallRecoveryState
     std::int64_t refusalSaidAt{0};
     // When the idle check last said "read it now" (StallRecoveryIdleDue).
     std::int64_t idleReadAt{0};
+    // The quick rule: where and since when the walker has stood still, and
+    // whether the last reading asked for the rule.
+    float stillX{0.f};
+    float stillY{0.f};
+    std::int64_t stillSince{0};
+    bool stillRule{false};
 };
 
 struct StallRecoveryFacts
@@ -1667,6 +1685,10 @@ struct StallRecoveryFacts
     std::uint32_t bindMap{0};
     std::uint32_t currentMap{0};
     bool hearthPending{false};
+    // Ask for the quick rule (StallRecoveryLimits::stillSeconds). Off by
+    // default so a caller that does not track a standing walker keeps the
+    // hour-long bound alone.
+    bool stillRule{false};
 };
 
 enum class StallRecoveryAction : std::uint8_t
@@ -1705,6 +1727,15 @@ StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
 // recovery runs on its own clock.
 bool StallRecoveryLeaveBehind(StallRecoveryState const& state, std::int64_t now,
                               StallRecoveryLimits const& limits);
+
+// DOES AN ARMED OFF-MESH STREAK HOLD THE WALKER OFF ERRANDS. True while the
+// quick rule is on, the streak has its releases, no rung has been taken yet,
+// the walker is still within the moved-reset distance of where it began, and
+// the stand-still is younger than stillSeconds + holdGraceSeconds. A town trip
+// or any errand walk asks this before claiming the walker: re-claiming it and
+// re-arming a walk that never paths is what kept the streak from recovering.
+bool StallRecoveryHoldsErrand(StallRecoveryState const& state, float x, float y,
+                              std::int64_t now, StallRecoveryLimits const& limits);
 
 // A STREAK THAT HAS EARNED ITS RECOVERY BUT HAS NO RELEASE TO CARRY IT. The
 // step above runs only when a walked errand is released for no progress, and a
@@ -22099,7 +22130,19 @@ struct TravelNoProgressBackoffState
 {
     uint32_t releases{0};
     time_t until{0};
+    // The urgency that stood over the errand when the backoff began (the
+    // leader intent that held it off, as "kind|owner|target"); empty when none.
+    std::string urgency;
+    // Where the walker stood when the backoff began (set only when the caller
+    // read its feet), so a lapse can tell "still on that spot" from "moved".
+    bool anchored{false};
+    float anchorX{0.f};
+    float anchorY{0.f};
 };
+
+// A walker still within this many yards of where its backoff began has not
+// moved on: the same bound the stall recovery uses to call a streak over.
+constexpr float TRAVEL_BACKOFF_SAME_SPOT_YARDS = 25.f;
 
 enum class TravelNoProgressBackoffAction
 {
@@ -22107,9 +22150,35 @@ enum class TravelNoProgressBackoffAction
     Backoff,
 };
 
+//
+// THE COUNT DOES NOT RESTART WHILE THE SAME URGENCY STANDS. A backoff that
+// lapsed zeroed the count, so a far fetch or regroup that kept preempting the
+// same errand bought three fresh releases, a fresh cooldown and a fresh
+// "took over / ended" pair each time, for ever. With a non-empty `urgency`
+// equal to the one the backoff began under, the lapse keeps the count one
+// short of the limit, so the next release backs off again at once instead of
+// starting over. A different or empty urgency starts the count again as before.
+//
+// NOR DOES IT RESTART WHILE THE WALKER STILL STANDS ON THE SPOT IT WAS
+// RELEASED ON. A walk that never paths (a character off the mesh, under the
+// ground) has no urgency standing over it: nothing preempts it, it simply
+// cannot move. The lapse zeroed the count, so every fifteen minutes the town
+// trip took the leader three more times, each ending in "no progress", about
+// nine took-over / ended pairs an hour until the hour-long stall recovery
+// moved the character. With `feet` given (the walker's x, y at this release)
+// and the walker within TRAVEL_BACKOFF_SAME_SPOT_YARDS of where the backoff
+// began, the lapse keeps the count one short, so one release backs off again.
+// A walker that has moved starts the count again, and so does a caller that
+// gives no feet.
+struct TravelFeet
+{
+    float x{0.f};
+    float y{0.f};
+};
 TravelNoProgressBackoffAction TravelNoProgressBackoffStep(
     TravelNoProgressBackoffState& state, time_t now, uint32_t releaseLimit,
-    time_t cooldownSeconds);
+    time_t cooldownSeconds, std::string const& urgency = std::string(),
+    TravelFeet const* feet = nullptr);
 
 // ------------- holding a character on the ground, when the ground is water --
 //
@@ -29387,6 +29456,11 @@ struct LeaderIntentRequest
     std::string owner;   // the rule asking: "regroup", "fetch", "travel column"...
     std::string target;  // what about: an NPC, a member, an aim; may be empty
     std::string why;     // one clause for the log line
+    // A vendor or town errand the bridge wrote ONLY AFTER it left the held
+    // member behind (vendor_stall.held_fetch_bound): the family has already
+    // decided not to wait for that member, so the errand outranks a fetch or a
+    // regroup for it. Read by AskLeaderIntent for EconomyErrand/TownErrand only.
+    bool leftMemberBehind{false};
 };
 
 struct LeaderIntentState
@@ -29395,6 +29469,7 @@ struct LeaderIntentState
     std::string owner;
     std::string target;
     std::string why;
+    bool leftMemberBehind{false};  // see LeaderIntentRequest
     std::time_t since{0};       // when this intent was granted
     std::time_t lastAsked{0};   // when its owner last asked for it
     bool dwellWaived{false};    // death or combat since it was granted
@@ -29450,7 +29525,8 @@ struct LeaderIntentVerdict
 // The rank a request gets: its kind's own, raised just below DungeonRun when
 // it is Jev's current pick for the family.
 int LeaderIntentRank(LeaderIntentKind kind, std::string const& target,
-                     LeaderIntentPreference const& preference, std::time_t now);
+                     LeaderIntentPreference const& preference, std::time_t now,
+                     bool leftMemberBehind = false);
 
 // Ask for the leader. See the block above for the rules.
 LeaderIntentVerdict AskLeaderIntent(LeaderIntentState& state,

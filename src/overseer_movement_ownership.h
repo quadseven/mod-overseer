@@ -281,7 +281,8 @@ public:
 
     OverseerDecisions::LeaderIntentVerdict AskForLeader(
         std::string const& name, OverseerDecisions::LeaderIntentKind kind,
-        std::string const& owner, std::string const& target, std::string const& why, time_t now)
+        std::string const& owner, std::string const& target, std::string const& why, time_t now,
+        bool leftMemberBehind = false)
     {
         OverseerDecisions::LeaderIntentVerdict verdict;
         if (!LeaderIntentApplies(name))
@@ -294,6 +295,7 @@ public:
         request.owner = owner;
         request.target = target;
         request.why = why;
+        request.leftMemberBehind = leftMemberBehind;
         return OverseerDecisions::AskLeaderIntent(_leaderStates[name], request, now, _leaderLimits,
                                                    LeaderPreferenceFor(name));
     }

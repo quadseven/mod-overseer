@@ -71,6 +71,17 @@ run_decisions() {
   python3 -B tests/replay_ground_shortcut.py
   python3 -B tests/test_corridor_survey.py
   python3 -B tests/test_zone_band.py
+  python3 -B tests/replay_attack_target.py
+  python3 -B tests/replay_disenchant.py
+  python3 -B tests/replay_dismount_fall.py
+  python3 -B tests/replay_errand_death_owner.py
+  python3 -B tests/replay_mail_batch.py
+  python3 -B tests/replay_share_retention.py
+  python3 -B tests/test_route_cost_build_input.py
+  python3 -B tests/test_route_cost_replay.py
+  python3 -B tests/test_share_refusal_contract.py
+  # Fails for any tests/test_*.py or tests/replay_*.py named nowhere here.
+  python3 -B tests/test_python_tests_are_wired.py
 
   # CI and the lane contract both run this function, so the workflow's single
   # step cannot drift from it (#1295). This test enforces that shape.
