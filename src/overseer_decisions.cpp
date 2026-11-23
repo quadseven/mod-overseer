@@ -1565,6 +1565,11 @@ static bool StallRecoveryStood(StallRecoveryState const& state, float x, float y
            now - state.stillSince >= limits.stillSeconds;
 }
 
+bool StallFootingReadAllowed(bool alive, bool inCombat)
+{
+    return alive && !inCombat;
+}
+
 bool StallRecoveryHoldsErrand(StallRecoveryState const& state, float x, float y,
                               std::int64_t now, StallRecoveryLimits const& limits)
 {

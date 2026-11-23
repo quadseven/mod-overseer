@@ -1722,6 +1722,13 @@ StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
 bool StallRecoveryHoldsErrand(StallRecoveryState const& state, float x, float y,
                               std::int64_t now, StallRecoveryLimits const& limits);
 
+// MAY THE FOOTING BE READ, AND SO A RUNG TAKEN, THIS POLL. Only for a
+// character that is alive and not in a fight: a ghost or a fighter is left
+// alone for the poll, its streak kept, and read again on a later one. The
+// idle read asks this BEFORE StallRecoveryIdleDue, which records the time when
+// it says yes, so a guarded poll does not spend the interval.
+bool StallFootingReadAllowed(bool alive, bool inCombat);
+
 // A STREAK THAT HAS EARNED ITS RECOVERY BUT HAS NO RELEASE TO CARRY IT. The
 // step above runs only when a walked errand is released for no progress, and a
 // head standing off the mesh stops being given walked errands (backoff, a

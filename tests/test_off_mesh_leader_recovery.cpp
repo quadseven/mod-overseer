@@ -133,6 +133,43 @@ void TheHoldIsBoundedWhenNoRungCanBeTaken()
     StallRecoveryStep(s, on, LIM);
     Check("on the mesh: not held", !StallRecoveryHoldsErrand(s, X, Y, 1310, LIM));
 }
+
+// A held walker that is dead or in a fight takes no rung on that poll, keeps
+// its streak, and takes rung 1 on a later poll once alive and out of combat.
+void AGuardedHeldWalkerTakesNoRungUntilItIsClear()
+{
+    Check("alive and clear may be read", StallFootingReadAllowed(true, false));
+    Check("dead may not be read", !StallFootingReadAllowed(false, false));
+    Check("in combat may not be read", !StallFootingReadAllowed(true, true));
+
+    StallRecoveryState s;
+    for (int i = 0; i < 3; ++i)
+        StallRecoveryStep(s, Off(1000 + i * 60), LIM);
+
+    // Polls every 30 s: dead, then in combat, then clear. The guard is asked
+    // before the idle clock, as the hold block does.
+    bool const alive[] = {false, true, true};
+    bool const combat[] = {false, true, false};
+    std::int64_t const t[] = {1000 + LIM.stillSeconds + 10, 1000 + LIM.stillSeconds + 40,
+                              1000 + LIM.stillSeconds + 70};
+    int rungs = 0;
+    int rungAtPoll = -1;
+    for (int i = 0; i < 3; ++i)
+    {
+        Check("held on every poll", StallRecoveryHoldsErrand(s, X, Y, t[i], LIM));
+        if (!StallFootingReadAllowed(alive[i], combat[i]))
+            continue;
+        if (!StallRecoveryIdleDue(s, X, Y, t[i], LIM, 60))
+            continue;
+        if (StallRecoveryStep(s, Off(t[i]), LIM).action == StallRecoveryAction::WalkToMesh)
+        {
+            ++rungs;
+            rungAtPoll = i;
+        }
+    }
+    Check("exactly one rung", rungs == 1);
+    Check("taken on the clear poll, not before", rungAtPoll == 2);
+}
 }  // namespace
 
 int main()
@@ -142,6 +179,7 @@ int main()
     WithoutTheQuickRuleTheHourStands();
     AWalkerThatMovesIsNeitherHeldNorRecovered();
     TheHoldIsBoundedWhenNoRungCanBeTaken();
+    AGuardedHeldWalkerTakesNoRungUntilItIsClear();
     if (failures == 0)
         std::printf("ok\n");
     return failures ? 1 : 0;

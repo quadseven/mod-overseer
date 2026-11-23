@@ -31008,7 +31008,12 @@ private:
                             stall->second, bot->GetPositionX(), bot->GetPositionY(), stallNow,
                             STALL_RECOVERY_LIMITS))
                     {
-                        if (OverseerDecisions::StallRecoveryIdleDue(
+                        // ALIVE AND NOT IN A FIGHT, as RecoverIdleOffMesh asks, before
+                        // the idle clock is spent or the footing read: a guarded
+                        // walker keeps its streak and is read on a later poll.
+                        if (OverseerDecisions::StallFootingReadAllowed(bot->IsAlive(),
+                                                                       bot->IsInCombat()) &&
+                            OverseerDecisions::StallRecoveryIdleDue(
                                 stall->second, bot->GetPositionX(), bot->GetPositionY(), stallNow,
                                 STALL_RECOVERY_LIMITS, STALL_IDLE_READ_SECONDS))
                             ReadStalledFooting(
@@ -41994,7 +41999,8 @@ private:
             if (aimedLower.count(entry.first))
                 continue;
             Player* bot = ObjectAccessor::FindPlayerByName(entry.first);
-            if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->IsInCombat())
+            if (!bot || !bot->IsInWorld() ||
+                !OverseerDecisions::StallFootingReadAllowed(bot->IsAlive(), bot->IsInCombat()))
                 continue;
             if (!OverseerDecisions::StallRecoveryIdleDue(
                     entry.second, bot->GetPositionX(), bot->GetPositionY(),
