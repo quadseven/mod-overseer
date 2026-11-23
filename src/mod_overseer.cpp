@@ -7019,6 +7019,13 @@ public:
         // run's own errand from anybody else's (the death breaker reads it).
         _state.erase(name);
         _landed.erase(name);
+        {
+            // The same counter written again is not another errand while its
+            // hold stands (#1708); only a different aim forgets the arrival.
+            auto const arrived = _counterArrivals.find(name);
+            if (arrived != _counterArrivals.end() && arrived->second.aim != target)
+                _counterArrivals.erase(arrived);
+        }
         // AND WHAT IT WROTE, KEPT PAST THE CLAIM (#824). The claim ends with
         // the errand; this does not, so a poisoned aim found later can be told
         // apart: one this module wrote and lost the claim on, or one a writer
@@ -7154,6 +7161,7 @@ public:
         // reads as a new errand. The landing recorded below is what stops
         // that; see LandedStep and OverseerDecisions::LandedErrandStep.
         _landed.erase(name);
+        _counterArrivals.erase(name);
         // ONLY AN AIM THIS BOOK WAS DRIVING LANDS. A release that finds an aim
         // in the column the travel drive was not walking has not walked it at
         // all, and must not stop the travel drive from starting it. AND ONLY AN
@@ -7223,6 +7231,10 @@ public:
     // there is then no landing to mark.
     void MarkCounterLanding(std::string const& name, std::string const& target)
     {
+        // REMEMBERED WHETHER OR NOT THE RELEASE LEFT A LANDING (#1708): a claimed
+        // aim's release clears the column, and the writer then writes the same
+        // counter again with nothing here to say the character is already at it.
+        OverseerDecisions::NoteCounterArrival(_counterArrivals[name], target);
         auto const it = _landed.find(name);
         if (it == _landed.end() || it->second.aim != target)
             return;
@@ -7253,6 +7265,26 @@ public:
                                                std::string const& columnAim,
                                                bool counterHoldActive)
     {
+        auto const arrival = _counterArrivals.find(name);
+        if (arrival != _counterArrivals.end())
+        {
+            bool sayIt = false;
+            OverseerDecisions::LandedErrand const arrived =
+                OverseerDecisions::CounterArrivalMemoryStep(arrival->second, columnAim,
+                                                            counterHoldActive, sayIt);
+            if (arrived == OverseerDecisions::LandedErrand::Resume)
+                _counterArrivals.erase(arrival);
+            else if (arrived == OverseerDecisions::LandedErrand::StandDown)
+            {
+                if (sayIt)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is at '{}' with its counter hold in force and "
+                             "the same aim is up again - not walked or claimed again while "
+                             "the hold stands (#1708). Said once per arrival",
+                             name, columnAim);
+                return arrived;
+            }
+        }
         auto const it = _landed.find(name);
         if (it == _landed.end())
             return OverseerDecisions::LandedErrand::NotLanded;
@@ -7452,6 +7484,7 @@ public:
         _lastEnd[name] = ErrandEnd{"a point aim left from before this worldserver started (#658)",
                                    false};
         _landed.erase(name);
+        _counterArrivals.erase(name);
         EndLeaderColumnIntent(name, "a point aim left from before this worldserver started");
         _state.erase(name);
     }
@@ -7820,6 +7853,11 @@ private:
         bool said{false};
     };
     std::map<std::string, Landing> _landed;
+    // An arrival at a counter that took the counter hold, kept even when the
+    // release cleared the column and so left no landing above (#1708). Written
+    // by MarkCounterLanding, erased by Release, a Claim of another aim,
+    // ForgetLeftover and CounterArrivalMemoryStep. World thread only.
+    std::map<std::string, OverseerDecisions::CounterArrivalMemory> _counterArrivals;
     // Which errand each character was last called off, so a re-aim at it is
     // refused rather than walked. Deliberately outlives the errand it ended; see
     // Refuse. World thread only, like everything else on this loop.
