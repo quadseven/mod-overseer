@@ -21222,6 +21222,7 @@ struct RaidRunStep
     RaidRunPhase phase{RaidRunPhase::Idle};
     bool form{false};         // convert, invite and seat this poll
     bool aimStaging{false};   // the head walks to the staging point
+    bool headHolds{false};    // the head stands at the staging point, waiting for seats (#1703)
     bool aimSeats{false};     // every other raider in the world walks there too (#765)
     bool aimDoor{false};      // the head walks onto the door
     bool knockMembers{false}; // knock every member standing in the door
