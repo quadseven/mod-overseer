@@ -30995,6 +30995,31 @@ private:
                 bool const bridgeErrand = kind == OverseerDecisions::LeaderIntentKind::EconomyErrand &&
                                           OverseerDecisions::IsMaintenanceErrand(target) &&
                                           !MovementOwner().HoldsClaim(name, columnAim);
+                // A WALKER STANDING STILL OFF THE MESH IS NOT CLAIMED FOR AN ERRAND
+                // until the bounded recovery has taken it off (mod-overseer#1698):
+                // its walk never paths, and claiming it again only re-armed that
+                // walk. The recovery is read here, at the idle interval, since
+                // no release comes while it is not walking.
+                {
+                    auto const stall = _stallRecovery.find(LowerName(name));
+                    std::int64_t const stallNow = static_cast<std::int64_t>(std::time(nullptr));
+                    if (stall != _stallRecovery.end() &&
+                        OverseerDecisions::StallRecoveryHoldsErrand(
+                            stall->second, bot->GetPositionX(), bot->GetPositionY(), stallNow,
+                            STALL_RECOVERY_LIMITS))
+                    {
+                        if (OverseerDecisions::StallRecoveryIdleDue(
+                                stall->second, bot->GetPositionX(), bot->GetPositionY(), stallNow,
+                                STALL_RECOVERY_LIMITS, STALL_IDLE_READ_SECONDS))
+                            ReadStalledFooting(
+                                bot, name,
+                                WorldPosition(bot->GetMapId(), bot->GetPositionX(),
+                                              bot->GetPositionY(), bot->GetPositionZ()));
+                        state.progress.since = std::time(nullptr);
+                        state.progressWindow = OverseerDecisions::ErrandProgressWindow{};
+                        continue;
+                    }
+                }
                 if (!AskForLeader(name, kind, owner, about, "walks to '" + target + "'",
                                   bridgeErrand))
                 {
@@ -42051,6 +42076,7 @@ private:
         facts.bindMap = bot->m_homebindMapId;
         facts.currentMap = bot->GetMapId();
         facts.hearthPending = HearthPendingFor(bot->GetName());
+        facts.stillRule = true;
         OverseerDecisions::StallRecoveryState& state = _stallRecovery[LowerName(name)];
         OverseerDecisions::StallRecoveryVerdict const verdict =
             OverseerDecisions::StallRecoveryStep(state, facts, limits);
