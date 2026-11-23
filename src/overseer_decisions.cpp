@@ -4598,6 +4598,22 @@ bool UnresolvedAimStandsDown(std::string const& aim)
     return !aim.empty() && aim.rfind("at:", 0) != 0;
 }
 
+bool UnresolvedSpawnIsRefused(std::string const& aim, bool guarded)
+{
+    if (guarded || aim.empty())
+        return false;
+    for (char const ch : aim)
+        if (ch < '0' || ch > '9')
+            return false;
+    return true;
+}
+
+std::string UnresolvedSpawnRefusal(std::uint32_t leaderMap)
+{
+    return "its spawn is not on map " + std::to_string(leaderMap) +
+           ", where the character stands, and no route to its own map is built (#1711)";
+}
+
 TravelClaim ReadTravelClaim(TravelClaimFacts const& facts)
 {
     // AN OPERATOR'S GUARD BEFORE ANYTHING (#163). It outranks every owner this

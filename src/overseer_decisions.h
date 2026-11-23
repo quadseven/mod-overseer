@@ -5602,6 +5602,23 @@ bool ReleaseLandsAim(ReleaseLandingFacts const& facts);
 // poll and clears it, and a landing would starve that count.
 bool UnresolvedAimStandsDown(std::string const& aim);
 
+// A BARE SPAWN ID THAT IS NOT ON THE LEADER'S MAP IS REFUSED FOR THE COOL-OFF
+// (#1711). A quest pick whose giver or objective is a creature spawn on another
+// continent reaches the travel drive as a bare spawn id with no map. The drive
+// resolves it on the leader's current map, finds nothing and releases the
+// errand in the same second, and the quest drive picked the same quest again:
+// no walk, no hold, no progress, for hours. A release alone records nothing the
+// next pick reads, so the aim is also marked refused for this character, the
+// same bounded refusal row the bridge reads (refused_until) to pick another
+// quest. Only a bare number is a spawn id; a counter keyword stands down by its
+// landing (#722), a point by the poison-aim breaker (#824), and an operator's
+// guard is never called off (#163).
+bool UnresolvedSpawnIsRefused(std::string const& aim, bool guarded);
+
+// The reason carried on the refusal row and in the log: which map the leader
+// stands on and that no route to the spawn's own map is built here (#513).
+std::string UnresolvedSpawnRefusal(std::uint32_t leaderMap);
+
 // MAY TravelAimBook::Claim WRITE THIS AIM (#560)?
 //
 // TWO FENCES, AND EACH PROTECTS A WALK SOMEBODY ELSE STARTED. A profession
