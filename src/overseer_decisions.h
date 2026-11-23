@@ -1627,6 +1627,18 @@ struct StallRecoveryLimits
     // that refusal allows and this module's own bound agrees with it.
     float nearestMeshYards{20.f};
     float movedResetYards{25.f};
+    // THE QUICK RULE FOR A WALKER THAT STANDS STILL OFF THE MESH. With the
+    // streak armed (`releases` seen) and the walker within `stillYards` of one
+    // spot for `stillSeconds`, the recovery does not wait for the full hour
+    // above: a stand-still off the mesh is not a walk that is merely slow.
+    // Read only when the caller sets StallRecoveryFacts::stillRule.
+    std::int64_t stillSeconds{300};
+    float stillYards{3.f};
+    // While the quick rule's recovery is pending, errands do not claim the
+    // walker (StallRecoveryHoldsErrand); the hold is dropped this long after
+    // the quick rule came due if no rung could be taken, so a walker with no
+    // available rung is not held for ever.
+    std::int64_t holdGraceSeconds{900};
     // The disconnected case and an impossible recovery are each said at most
     // this often per character.
     std::int64_t saySeconds{3600};
@@ -1643,6 +1655,12 @@ struct StallRecoveryState
     std::int64_t refusalSaidAt{0};
     // When the idle check last said "read it now" (StallRecoveryIdleDue).
     std::int64_t idleReadAt{0};
+    // The quick rule: where and since when the walker has stood still, and
+    // whether the last reading asked for the rule.
+    float stillX{0.f};
+    float stillY{0.f};
+    std::int64_t stillSince{0};
+    bool stillRule{false};
 };
 
 struct StallRecoveryFacts
@@ -1660,6 +1678,10 @@ struct StallRecoveryFacts
     std::uint32_t bindMap{0};
     std::uint32_t currentMap{0};
     bool hearthPending{false};
+    // Ask for the quick rule (StallRecoveryLimits::stillSeconds). Off by
+    // default so a caller that does not track a standing walker keeps the
+    // hour-long bound alone.
+    bool stillRule{false};
 };
 
 enum class StallRecoveryAction : std::uint8_t
@@ -1690,6 +1712,15 @@ struct StallRecoveryVerdict
 StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
                                        StallRecoveryFacts const& facts,
                                        StallRecoveryLimits const& limits);
+
+// DOES AN ARMED OFF-MESH STREAK HOLD THE WALKER OFF ERRANDS. True while the
+// quick rule is on, the streak has its releases, no rung has been taken yet,
+// the walker is still within the moved-reset distance of where it began, and
+// the stand-still is younger than stillSeconds + holdGraceSeconds. A town trip
+// or any errand walk asks this before claiming the walker: re-claiming it and
+// re-arming a walk that never paths is what kept the streak from recovering.
+bool StallRecoveryHoldsErrand(StallRecoveryState const& state, float x, float y,
+                              std::int64_t now, StallRecoveryLimits const& limits);
 
 // A STREAK THAT HAS EARNED ITS RECOVERY BUT HAS NO RELEASE TO CARRY IT. The
 // step above runs only when a walked errand is released for no progress, and a

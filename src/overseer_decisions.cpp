@@ -1470,6 +1470,8 @@ StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
         state.since = 0;
         state.escalated = false;
         state.refusalSaidAt = 0;
+        state.stillSince = 0;
+        state.stillRule = false;
         if (facts.footing == StallFooting::OnMeshDisconnected &&
             (state.unreachableSaidAt == 0 ||
              facts.now - state.unreachableSaidAt >= limits.saySeconds))
@@ -1495,11 +1497,24 @@ StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
         state.anchorY = facts.y;
         state.escalated = false;
         state.refusalSaidAt = 0;
+        state.stillSince = 0;
+    }
+    state.stillRule = facts.stillRule;
+    {
+        float const sx = facts.x - state.stillX;
+        float const sy = facts.y - state.stillY;
+        if (state.stillSince == 0 || sx * sx + sy * sy > limits.stillYards * limits.stillYards)
+        {
+            state.stillSince = facts.now;
+            state.stillX = facts.x;
+            state.stillY = facts.y;
+        }
     }
     ++state.offMeshReleases;
     verdict.releases = state.offMeshReleases;
+    bool const stoodStill = facts.stillRule && facts.now - state.stillSince >= limits.stillSeconds;
     if (state.escalated || state.offMeshReleases < limits.releases ||
-        facts.now - state.since < limits.seconds)
+        (facts.now - state.since < limits.seconds && !stoodStill))
         return verdict;
 
     if (facts.nearestPolygonYards >= 0.f && facts.nearestPolygonYards <= limits.nearestMeshYards &&
@@ -1539,11 +1554,36 @@ StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
     return verdict;
 }
 
+static bool StallRecoveryStood(StallRecoveryState const& state, float x, float y,
+                               std::int64_t now, StallRecoveryLimits const& limits)
+{
+    if (!state.stillRule || state.stillSince == 0)
+        return false;
+    float const dx = x - state.stillX;
+    float const dy = y - state.stillY;
+    return dx * dx + dy * dy <= limits.stillYards * limits.stillYards &&
+           now - state.stillSince >= limits.stillSeconds;
+}
+
+bool StallRecoveryHoldsErrand(StallRecoveryState const& state, float x, float y,
+                              std::int64_t now, StallRecoveryLimits const& limits)
+{
+    if (!state.stillRule || state.offMeshReleases < limits.releases || state.escalated ||
+        state.stillSince == 0)
+        return false;
+    float const dx = x - state.anchorX;
+    float const dy = y - state.anchorY;
+    if (dx * dx + dy * dy > limits.movedResetYards * limits.movedResetYards)
+        return false;
+    return now - state.stillSince < limits.stillSeconds + limits.holdGraceSeconds;
+}
+
 bool StallRecoveryIdleDue(StallRecoveryState& state, float x, float y, std::int64_t now,
                           StallRecoveryLimits const& limits, std::int64_t intervalSeconds)
 {
     if (state.offMeshReleases == 0 || state.escalated ||
-        state.offMeshReleases < limits.releases || now - state.since < limits.seconds)
+        state.offMeshReleases < limits.releases ||
+        (now - state.since < limits.seconds && !StallRecoveryStood(state, x, y, now, limits)))
         return false;
     float const dx = x - state.anchorX;
     float const dy = y - state.anchorY;
