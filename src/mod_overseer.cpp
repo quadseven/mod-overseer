@@ -31824,9 +31824,9 @@ private:
                 {
                     _travelAims.Refuse(name, target, call.reason);
                     LOG_INFO("module.overseer",
-                             "overseer: '{}' will not be sent to '{}' again - {} - refusing it "
-                             "for {}s so the leader moves on to another quest or its next job "
-                             "(#1711)",
+                             "overseer: '{}' will not be sent to '{}' again - {} - "
+                             "refusing it for {}s so the leader moves on to another quest or "
+                             "its next job (#1711)",
                              name, target, call.reason,
                              static_cast<long long>(call.boundSeconds));
                 }
