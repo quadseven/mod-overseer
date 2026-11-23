@@ -57824,6 +57824,8 @@ private:
         // that group and never one the family formed afterwards.
         uint64 groupId{0};
         std::string lastWhy;
+        // The wait-for-seats line was said for this wait (#1703).
+        bool headHoldSaid{false};
 
         // -- inside (#640) --
         // What the timeline counts, for the whole order.
@@ -59969,6 +59971,20 @@ private:
 
             if (step.form)
                 FormRaidFromSeats(roster.family, head, seats, run);
+
+            if (step.headHolds)
+            {
+                if (!run.headHoldSaid)
+                    LOG_INFO("module.overseer",
+                             "overseer: raid run for family '{}' has its head at the {} door "
+                             "and is waiting for seats: {} of {} in the world at the door, "
+                             "quorum {}",
+                             roster.family, door->name, facts.assembled, facts.inWorld,
+                             OverseerDecisions::RaidQuorumMet(facts) ? "met" : "not met");
+                run.headHoldSaid = true;
+            }
+            else
+                run.headHoldSaid = false;
 
             if (step.aimStaging || step.aimDoor)
             {

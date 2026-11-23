@@ -18624,7 +18624,8 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
                     return step;
                 }
                 step.phase = RaidRunPhase::Assemble;
-                step.aimStaging = true;
+                step.aimStaging = !facts.headAssembled;
+                step.headHolds = facts.headAssembled;
                 step.aimSeats = true;
                 step.summonStragglers = true;
                 step.why = "the wait is over but the raid at the door is short of a "
@@ -18632,7 +18633,10 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
                 return step;
             }
             step.phase = RaidRunPhase::Assemble;
-            step.aimStaging = true;
+            // A head already inside the assemble radius is not walked again (#1703):
+            // the walk arrived, and re-claiming it every poll only churns.
+            step.aimStaging = !facts.headAssembled;
+            step.headHolds = facts.headAssembled;
             step.aimSeats = true;
             step.summonStragglers = facts.headAssembled &&
                                     facts.heldSeconds >= RAID_STONE_SUMMON_AFTER_SECONDS;
