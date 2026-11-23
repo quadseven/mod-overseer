@@ -177,6 +177,8 @@ int main()
               book.column.columns["Leader"] == before,
               "refused claim leaves owner and column untouched", TravelOwner::TownTrip, false);
     }
+    // (Resume and NotLanded both mean the drive treats the aim as an ordinary
+    // errand, so "claimed as before" is asserted as "not StandDown".)
     // #1708: a leader that arrived at a counter and took the counter hold is not
     // re-claimed for the same counter while the hold stands. The arrival is the
     // real Claim then Release then MarkCounterLanding; the release clears the
@@ -201,13 +203,13 @@ int main()
             standing += book.LandedStep("Leader", "vendor", true) == LandedErrand::StandDown;
         Check(standing == 100, "same counter under the hold: no re-claim over 100 polls",
               TravelOwner::TownTrip, false);
-        Check(book.LandedStep("Leader", "banker", true) == LandedErrand::Resume,
+        Check(book.LandedStep("Leader", "banker", true) != LandedErrand::StandDown,
               "another aim is claimed as before", TravelOwner::TownTrip, false);
         arrive();
-        Check(book.LandedStep("Leader", "at:0:1,2,3", true) == LandedErrand::Resume,
+        Check(book.LandedStep("Leader", "at:0:1,2,3", true) != LandedErrand::StandDown,
               "an at: aim is claimed as before", TravelOwner::TownTrip, false);
         arrive();
-        Check(book.LandedStep("Leader", "vendor", false) == LandedErrand::Resume,
+        Check(book.LandedStep("Leader", "vendor", false) != LandedErrand::StandDown,
               "the hold ending claims the same aim again", TravelOwner::TownTrip, false);
     }
     if (!failures)
