@@ -179,9 +179,9 @@ int main()
     }
     // (DriveTravel skips a row only on `LandedStep(...) == StandDown` and
     // otherwise goes on to claim and walk it, in src/mod_overseer.cpp; so
-    // "claimed as before" is asserted as "not StandDown". The exact value after
-    // the memory resumes is NotLanded, because LandedStep then falls through to
-    // the older landing map, which is empty here.)
+    // "claimed as before" is asserted only as "not StandDown". The exact value
+    // is not pinned here; tests/test_counter_arrival_memory.cpp pins NotLanded
+    // for the resumed case.)
     // #1708: a leader that arrived at a counter and took the counter hold is not
     // re-claimed for the same counter while the hold stands. The arrival is the
     // real Claim then Release then MarkCounterLanding; the release clears the
