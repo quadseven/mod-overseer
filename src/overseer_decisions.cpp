@@ -4598,6 +4598,22 @@ bool UnresolvedAimStandsDown(std::string const& aim)
     return !aim.empty() && aim.rfind("at:", 0) != 0;
 }
 
+UnresolvedErrandCallOff ReadUnresolvedErrand(std::string const& target, bool guarded,
+                                             uint32_t leaderMap)
+{
+    UnresolvedErrandCallOff call;
+    if (guarded || target.empty() ||
+        target.find_first_not_of("0123456789") != std::string::npos)
+        return call;
+    ErrandDeathLimits const limits;
+    call.refuse = true;
+    call.boundSeconds = limits.cooloffSeconds;
+    call.reason = "creature " + target + " has no spawn on map " + std::to_string(leaderMap) +
+                  ", so it is not tried again for " + std::to_string(call.boundSeconds / 60) +
+                  " minutes";
+    return call;
+}
+
 TravelClaim ReadTravelClaim(TravelClaimFacts const& facts)
 {
     // AN OPERATOR'S GUARD BEFORE ANYTHING (#163). It outranks every owner this

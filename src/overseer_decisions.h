@@ -5602,6 +5602,31 @@ bool ReleaseLandsAim(ReleaseLandingFacts const& facts);
 // poll and clears it, and a landing would starve that count.
 bool UnresolvedAimStandsDown(std::string const& aim);
 
+// A SPAWN ID THAT IS NOT ON THE LEADER'S MAP IS REFUSED FOR A BOUNDED TIME
+// (#1711). The quest drive writes the bare id of a quest giver or objective
+// that may stand on another continent. The errand resolves it on the leader's
+// map, finds nothing and releases, and the quest drive writes the same id again
+// within the poll: no walk, no hold, no progress, for hours. A refusal is the
+// memory the quest drive's re-pick was missing: the travel drive clears the
+// column for the length of the cool-off, so the leader falls through to another
+// quest or its next job, and the id is tried again once the bound ends.
+//
+// ONLY A BARE CREATURE ID. A keyword aim keeps the release it had (a vendor
+// that is not on this map is a different fact, and refusing the keyword would
+// stand the repair and town drives back), a point is the poison-aim breaker's
+// (#824), and an operator's guard is never ended by this module (#163).
+struct UnresolvedErrandCallOff
+{
+    bool refuse{false};
+    int64_t boundSeconds{0};
+    // Said in the log and kept on the refusal, so the reason and the bound can
+    // be read where the refusal is read.
+    std::string reason;
+};
+
+UnresolvedErrandCallOff ReadUnresolvedErrand(std::string const& target, bool guarded,
+                                             uint32_t leaderMap);
+
 // MAY TravelAimBook::Claim WRITE THIS AIM (#560)?
 //
 // TWO FENCES, AND EACH PROTECTS A WALK SOMEBODY ELSE STARTED. A profession

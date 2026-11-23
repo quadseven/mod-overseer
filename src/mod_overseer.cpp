@@ -31813,6 +31813,23 @@ private:
                 // clear it anyway, and only a person ends a guard.
                 bool const poisoned = !guarded &&
                     _travelAims.NoteUnresolvedAim(name, target, static_cast<uint32>(bot->GetMapId()));
+                // A BARE SPAWN ID IS REFUSED FOR A BOUNDED TIME (#1711). The quest
+                // drive writes it again within the poll, so without a memory the
+                // leader is sent, released and re-sent for ever. The refusal
+                // clears the column on each poll until it ends.
+                OverseerDecisions::UnresolvedErrandCallOff const call =
+                    OverseerDecisions::ReadUnresolvedErrand(target, guarded,
+                                                            static_cast<uint32>(bot->GetMapId()));
+                if (call.refuse)
+                {
+                    _travelAims.Refuse(name, target, call.reason);
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' will not be sent to '{}' again - {} - refusing it "
+                             "for {}s so the leader moves on to another quest or its next job "
+                             "(#1711)",
+                             name, target, call.reason,
+                             static_cast<long long>(call.boundSeconds));
+                }
                 _travelAims.Release(name, "the travel drive (no such spawn on this map)");
                 // A KEYWORD OR AN ENTRY STANDS DOWN; A POINT IS COUNTED (#722).
                 // The release above leaves a landing for a foreign aim it could
