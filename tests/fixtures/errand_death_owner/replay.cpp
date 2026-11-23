@@ -177,8 +177,11 @@ int main()
               book.column.columns["Leader"] == before,
               "refused claim leaves owner and column untouched", TravelOwner::TownTrip, false);
     }
-    // (Resume and NotLanded both mean the drive treats the aim as an ordinary
-    // errand, so "claimed as before" is asserted as "not StandDown".)
+    // (DriveTravel skips a row only on `LandedStep(...) == StandDown` and
+    // otherwise goes on to claim and walk it, in src/mod_overseer.cpp; so
+    // "claimed as before" is asserted as "not StandDown". The exact value after
+    // the memory resumes is NotLanded, because LandedStep then falls through to
+    // the older landing map, which is empty here.)
     // #1708: a leader that arrived at a counter and took the counter hold is not
     // re-claimed for the same counter while the hold stands. The arrival is the
     // real Claim then Release then MarkCounterLanding; the release clears the
@@ -188,7 +191,8 @@ int main()
         auto& book = a._travelAims;
         auto arrive = [&] {
             book.column.columns["Leader"].clear();
-            book.Claim("Leader", "vendor", TravelOwner::TownTrip);
+            Check(book.Claim("Leader", "vendor", TravelOwner::TownTrip),
+                  "arrival claim accepted", TravelOwner::TownTrip, false);
             book._state["Leader"] = {"vendor"};
             book.Release("Leader", "the travel drive (arrived)");
             book.MarkCounterLanding("Leader", "vendor");
