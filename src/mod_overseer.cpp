@@ -92077,6 +92077,8 @@ private:
 
         std::ostringstream ss;
         bool first = true;
+        std::ostringstream dangerSs;
+        bool firstDanger = true;
         for (auto const& itr : allPlayers)
         {
             Player* p = itr.second;
@@ -92122,9 +92124,13 @@ private:
             // alongside a walk that was happening anyway costs nothing extra.
             if (OnRoster(p->GetName()))
             {
-                CharacterDatabase.Execute(
-                    "REPLACE INTO overseer_zone_danger (name, result) VALUES ('{}', '{}')",
-                    Esc(p->GetName()), EscLong(ZoneDangerFor(p, std::time(nullptr))));
+                if (firstDanger)
+                    dangerSs << "REPLACE INTO overseer_zone_danger (name, result) VALUES ";
+                else
+                    dangerSs << ',';
+                firstDanger = false;
+                dangerSs << "('" << Esc(p->GetName()) << "','"
+                         << EscLong(ZoneDangerFor(p, std::time(nullptr))) << "')";
                 RememberHealth(p->GetName(), p->GetHealth(), p->GetMaxHealth());
                 // #188: the same argument, for the same walk. What had hold of
                 // this character and whether it was fighting are both gone by
@@ -92146,6 +92152,8 @@ private:
 
         if (!first)
             CharacterDatabase.Execute(ss.str().c_str());
+        if (!firstDanger)
+            CharacterDatabase.Execute(dangerSs.str().c_str());
 
         // Logged-out characters age out rather than being tracked explicitly:
         // one sweep interval of grace, then the map stops drawing them.
