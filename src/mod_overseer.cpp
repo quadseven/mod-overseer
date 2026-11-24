@@ -56489,11 +56489,12 @@ private:
     static constexpr float TOWN_TRIP_WALK_LIMIT_YARDS = TRAVEL_FLIGHT_MIN_YARDS;
 
     static constexpr OverseerDecisions::TownTripLimits TOWN_TRIP_LIMITS{
-        // freeBagSlotsToGo, brokenToGo, cooldownSeconds, boundSeconds, dwellSeconds
+        // freeBagSlotsToGo, brokenToGo, cooldownSeconds, boundSeconds, dwellSeconds,
+        // fruitlessBagsSeconds
         // The bridge's vendor pass defaults to 300s. Keep the family at the
         // counter for one complete pass so the leader-arrival queue can be
         // observed before the world releases the trip.
-        3, 1, 15 * 60, 20 * 60, 6 * 60};
+        3, 1, 15 * 60, 20 * 60, 6 * 60, 2 * 60 * 60};
 
     // The role keyword ResolveTravelTarget takes for the counter this trip is
     // going to. Role aims remain preferable here because the trip already
@@ -56580,6 +56581,9 @@ private:
         OverseerDecisions::DoorWalkRestarts doorWalk;
         std::string deferredAim;
         time_t deferredSince{0};
+        // MEMBERS A VENDOR VISIT LEFT NO ROOMIER (wow-overseer#1261). Kept
+        // across trips on purpose: the mark is what stops the next trip.
+        std::map<std::string, OverseerDecisions::FruitlessBagsMark> fruitlessBags;
     };
     std::map<std::string, TownTripState> _townTrips;   // keyed by family
 
@@ -56707,6 +56711,31 @@ private:
                << after.freeBagSlots << " after; purse " << copperBefore << " to "
                << copperAfter;
         RecordEvent(bot, "town_trip", uint32(proof), name, detail.str());
+
+        // A VENDOR VISIT THAT MADE NO BAG ROOM IS REMEMBERED (wow-overseer#1261),
+        // so the next trip is not opened for this member's bags. Only a member
+        // that stood at the counter proves anything about the counter.
+        {
+            auto const markIt = trip.fruitlessBags.find(name);
+            OverseerDecisions::FruitlessBagsMark const previous =
+                markIt != trip.fruitlessBags.end() ? markIt->second
+                                                   : OverseerDecisions::FruitlessBagsMark{};
+            OverseerDecisions::FruitlessBagsMark const mark = OverseerDecisions::NoteTownTripBags(
+                beforeIt->second, after, copperBefore, copperAfter, trip.role,
+                trip.stoodSince.count(name) > 0, TOWN_TRIP_LIMITS, std::time(nullptr),
+                previous);
+            if (mark.set && !previous.set)
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' stood at a vendor at {} free bag slot(s) and the "
+                         "visit made no room, so its bags open no town trip until it has "
+                         "more room than that or {} minutes pass (wow-overseer#1261)",
+                         name, mark.freeBagSlots,
+                         uint32(TOWN_TRIP_LIMITS.fruitlessBagsSeconds / 60));
+            if (mark.set)
+                trip.fruitlessBags[name] = mark;
+            else
+                trip.fruitlessBags.erase(name);
+        }
 
         // THE ACCEPTANCE LINE, AND IT IS ASKED OF THE GEAR THAT CAN WEAR. "No
         // item at durability 0" is a criterion that can never pass, because four
@@ -57216,13 +57245,35 @@ private:
                 }
             }
 
+            // THE MEMBERS A VENDOR ALREADY FAILED (wow-overseer#1261) do not open
+            // a trip for their bags; see OverseerDecisions::FruitlessBagsMark.
+            time_t const planNow = std::time(nullptr);
+            std::vector<bool> bagsFruitless(members.size(), false);
+            for (size_t i = 0; i < members.size(); ++i)
+            {
+                auto const markIt = trip.fruitlessBags.find(members[i]);
+                if (markIt != trip.fruitlessBags.end())
+                    bagsFruitless[i] = OverseerDecisions::TownTripBagsFruitless(
+                        needs[i], markIt->second, TOWN_TRIP_LIMITS, planNow);
+            }
+            time_t const sinceLastTrip = trip.endedAt ? planNow - trip.endedAt
+                                                      : TOWN_TRIP_LIMITS.cooldownSeconds;
             OverseerDecisions::TownTripPlan const plan = OverseerDecisions::PlanTownTrip(
-                needs, TOWN_TRIP_LIMITS,
-                trip.endedAt ? std::time(nullptr) - trip.endedAt
-                                 : TOWN_TRIP_LIMITS.cooldownSeconds,
-                busy);
+                needs, TOWN_TRIP_LIMITS, sinceLastTrip, busy, bagsFruitless);
             if (!plan.go)
+            {
+                if (OverseerDecisions::PlanTownTrip(needs, TOWN_TRIP_LIMITS, sinceLastTrip,
+                                                    busy).go &&
+                    SayTownTripOnce(trip, leaderName, "bags fruitless"))
+                    LOG_INFO("module.overseer",
+                             "overseer: no town trip for '{}''s family: every member short of "
+                             "bag room stood at a vendor that made it none, so a walk there "
+                             "would change nothing. Asked again when a member's bags rise or "
+                             "after {} minutes (wow-overseer#1261)",
+                             leaderName,
+                             uint32(TOWN_TRIP_LIMITS.fruitlessBagsSeconds / 60));
                 return;
+            }
 
             // THE DESTINATION IS RESOLVED ONCE, FROM THE LEADER, BEFORE ANYBODY
             // WALKS. Not to write a coordinate down - every member is aimed with

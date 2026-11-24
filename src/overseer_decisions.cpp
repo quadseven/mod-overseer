@@ -16211,6 +16211,41 @@ TownTripPlan PlanTownTrip(std::vector<TownNeed> const& members,
                           TownTripLimits const& limits,
                           time_t secondsSinceLastTrip, bool busy)
 {
+    return PlanTownTrip(members, limits, secondsSinceLastTrip, busy, std::vector<bool>{});
+}
+
+bool TownTripBagsFruitless(TownNeed const& need, FruitlessBagsMark const& mark,
+                           TownTripLimits const& limits, time_t now)
+{
+    if (!mark.set || !need.present)
+        return false;
+    if (now - mark.at >= limits.fruitlessBagsSeconds)
+        return false;
+    return need.freeBagSlots <= mark.freeBagSlots;
+}
+
+FruitlessBagsMark NoteTownTripBags(TownNeed const& before, TownNeed const& after,
+                                   std::uint64_t copperBefore, std::uint64_t copperAfter,
+                                   CounterRole role, bool stoodAtCounter,
+                                   TownTripLimits const& limits, time_t now,
+                                   FruitlessBagsMark const& previous)
+{
+    if (role != CounterRole::Vendor || !stoodAtCounter || !before.present || !after.present)
+        return previous;
+    if (before.freeBagSlots > limits.freeBagSlotsToGo)
+        return previous;
+    bool const madeRoom =
+        after.freeBagSlots > before.freeBagSlots || copperAfter > copperBefore;
+    if (madeRoom)
+        return FruitlessBagsMark{};
+    return FruitlessBagsMark{true, after.freeBagSlots, now};
+}
+
+TownTripPlan PlanTownTrip(std::vector<TownNeed> const& members,
+                          TownTripLimits const& limits,
+                          time_t secondsSinceLastTrip, bool busy,
+                          std::vector<bool> const& bagsFruitless)
+{
     TownTripPlan plan;
 
     if (busy)
@@ -16222,9 +16257,15 @@ TownTripPlan PlanTownTrip(std::vector<TownNeed> const& members,
     if (secondsSinceLastTrip < limits.cooldownSeconds)
         return plan;
 
-    for (TownNeed const& need : members)
+    for (size_t i = 0; i < members.size(); ++i)
     {
-        TownReason const reason = TownTripMemberReason(need, limits);
+        TownNeed const& need = members[i];
+        TownReason reason = TownTripMemberReason(need, limits);
+        // A VENDOR ALREADY FAILED THIS MEMBER'S BAGS (wow-overseer#1261): its
+        // bags are no reason, and what is left is its gear, read as if the bags
+        // had room.
+        if (reason == TownReason::Bags && i < bagsFruitless.size() && bagsFruitless[i])
+            reason = need.damagedItems ? TownReason::Worn : TownReason::None;
         if (reason == TownReason::None)
             continue;
 
