@@ -18926,6 +18926,12 @@ struct TownTripLimits
     // dwell lets a family arrive, wait, and leave before the bridge can write
     // the commands that make the visit useful.
     time_t dwellSeconds{6 * 60};
+    // HOW LONG A VENDOR VISIT THAT MADE NO BAG ROOM KEEPS ITS MEMBER OUT OF THE
+    // BAGS REASON (wow-overseer#1261). Such a member carries only stacks a
+    // vendor will not buy, so the next visit changes nothing either; after this
+    // long the visit is tried once more. The bridge's profession loop uses the
+    // same two hours for the same visits.
+    time_t fruitlessBagsSeconds{2 * 60 * 60};
 };
 
 // WHY THIS MEMBER WANTS A COUNTER. Ordered, and the order is the content.
@@ -19028,6 +19034,47 @@ struct TownTripPlan
 TownTripPlan PlanTownTrip(std::vector<TownNeed> const& members,
                           TownTripLimits const& limits,
                           time_t secondsSinceLastTrip, bool busy);
+
+// A VENDOR VISIT THAT MADE NO BAG ROOM, REMEMBERED PER MEMBER (wow-overseer#1261).
+//
+// Measured on the dev realm 2026-11-24: both families stalled for over two hours
+// while the trip reopened every cooldown on "(bags)" and every visit ended
+// "NOTHING CHANGED - 0 free bag slot(s)". The stacks were kept, banked or
+// auctioned, never vendor goods, so the cooldown alone re-opened the identical
+// trip for ever, and each one took the leader off its walk to the raid door.
+struct FruitlessBagsMark
+{
+    bool set{false};
+    // The free slots the member had when the visit ended.
+    unsigned freeBagSlots{0};
+    time_t at{0};
+};
+
+// Is this member's bags reason one a vendor already failed to answer? True while
+// the mark is set, its free slots have not risen past the marked reading, and the
+// mark is younger than limits.fruitlessBagsSeconds. False for a present member
+// means the mark has ended, and the caller drops it, so room that rose and was
+// filled again does not bring an old mark back.
+bool TownTripBagsFruitless(TownNeed const& need, FruitlessBagsMark const& mark,
+                           TownTripLimits const& limits, time_t now);
+
+// The mark after one member's visit. Only a VENDOR visit by a member that wanted
+// bag room (at or under the floor before) and STOOD AT THE COUNTER proves
+// anything: then no rise in free slots and no rise in purse sets the mark, and
+// either rise clears it. Every other visit returns `previous` unchanged.
+FruitlessBagsMark NoteTownTripBags(TownNeed const& before, TownNeed const& after,
+                                   std::uint64_t copperBefore, std::uint64_t copperAfter,
+                                   CounterRole role, bool stoodAtCounter,
+                                   TownTripLimits const& limits, time_t now,
+                                   FruitlessBagsMark const& previous);
+
+// PlanTownTrip, with the members a vendor visit could not help (`bagsFruitless`,
+// parallel to `members`; missing entries are false) not counted for their bags.
+// Their broken gear still opens a repair trip and their worn gear is still owed.
+TownTripPlan PlanTownTrip(std::vector<TownNeed> const& members,
+                          TownTripLimits const& limits,
+                          time_t secondsSinceLastTrip, bool busy,
+                          std::vector<bool> const& bagsFruitless);
 
 // ONE DESTINATION, AND WHAT HAPPENS TO A MEMBER THAT CANNOT REACH IT.
 //
