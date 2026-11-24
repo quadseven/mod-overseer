@@ -31851,6 +31851,24 @@ private:
                 // clear it anyway, and only a person ends a guard.
                 bool const poisoned = !guarded &&
                     _travelAims.NoteUnresolvedAim(name, target, static_cast<uint32>(bot->GetMapId()));
+                // A SPAWN ON ANOTHER MAP IS CALLED OFF FOR THE COOL-OFF (#1711).
+                // Released alone, the quest drive picked the same quest and the
+                // bridge wrote the same bare spawn id again, every few minutes,
+                // for hours. The refusal row is what it reads to pick another
+                // quest (refused_until), and the reason is on the row and here.
+                // The route to the spawn's own map is #513's, not built here.
+                if (OverseerDecisions::UnresolvedSpawnIsRefused(target, guarded))
+                {
+                    std::string const why = OverseerDecisions::UnresolvedSpawnRefusal(
+                        static_cast<uint32>(bot->GetMapId()));
+                    _travelAims.Refuse(name, target, why);
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is refused the errand '{}' for {} minutes "
+                             "because {}",
+                             name, target,
+                             static_cast<uint32>(ERRAND_DEATH_LIMITS.cooloffSeconds / 60),
+                             why);
+                }
                 _travelAims.Release(name, "the travel drive (no such spawn on this map)");
                 // A KEYWORD OR AN ENTRY STANDS DOWN; A POINT IS COUNTED (#722).
                 // The release above leaves a landing for a foreign aim it could
