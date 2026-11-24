@@ -1642,10 +1642,17 @@ struct StallRecoveryLimits
     // The disconnected case and an impossible recovery are each said at most
     // this often per character.
     std::int64_t saySeconds{3600};
+    // A walker whose aims are refused as lethal this many times in a row,
+    // while within movedResetYards of one spot, takes the hearthstone rung.
+    std::uint32_t lethalRefusals{3};
 };
 
 struct StallRecoveryState
 {
+    // Lethal refusals in a row at one spot (LethalRefusalStep).
+    std::uint32_t lethalCount{0};
+    float lethalX{0.f};
+    float lethalY{0.f};
     std::uint32_t offMeshReleases{0};
     std::int64_t since{0};
     float anchorX{0.f};
@@ -1711,6 +1718,39 @@ struct StallRecoveryVerdict
 
 StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
                                        StallRecoveryFacts const& facts,
+                                       StallRecoveryLimits const& limits);
+
+// A WALKER WHOSE EVERY AIM IS REFUSED AS LETHAL. Each refusal is counted
+// while the walker stays within movedResetYards of the spot of the first; a
+// walker that moved starts afresh. At limits.lethalRefusals the verdict is
+// Hearth when the stone is ready, has a same-map bind and no cast is pending;
+// otherwise Keep, and the streak is kept for the next refusal. Hearth resets
+// the count.
+enum class LethalRefusalAction : std::uint8_t
+{
+    Count,
+    Hearth,
+    Keep,
+};
+
+struct LethalRefusalFacts
+{
+    float x{0.f};
+    float y{0.f};
+    bool hasStone{false};
+    bool stoneReady{false};
+    bool sameMapBind{false};
+    bool hearthPending{false};
+};
+
+struct LethalRefusalVerdict
+{
+    LethalRefusalAction action{LethalRefusalAction::Count};
+    std::uint32_t refusals{0};
+};
+
+LethalRefusalVerdict LethalRefusalStep(StallRecoveryState& state,
+                                       LethalRefusalFacts const& facts,
                                        StallRecoveryLimits const& limits);
 
 // DOES AN ARMED OFF-MESH STREAK HOLD THE WALKER OFF ERRANDS. True while the

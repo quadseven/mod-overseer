@@ -1595,6 +1595,34 @@ bool StallRecoveryIdleDue(StallRecoveryState& state, float x, float y, std::int6
     return true;
 }
 
+LethalRefusalVerdict LethalRefusalStep(StallRecoveryState& state,
+                                       LethalRefusalFacts const& facts,
+                                       StallRecoveryLimits const& limits)
+{
+    float const dx = facts.x - state.lethalX;
+    float const dy = facts.y - state.lethalY;
+    if (state.lethalCount == 0 ||
+        dx * dx + dy * dy > limits.movedResetYards * limits.movedResetYards)
+    {
+        state.lethalCount = 0;
+        state.lethalX = facts.x;
+        state.lethalY = facts.y;
+    }
+    ++state.lethalCount;
+    LethalRefusalVerdict verdict;
+    verdict.refusals = state.lethalCount;
+    if (state.lethalCount < limits.lethalRefusals)
+        return verdict;
+    if (!facts.hasStone || !facts.stoneReady || !facts.sameMapBind || facts.hearthPending)
+    {
+        verdict.action = LethalRefusalAction::Keep;
+        return verdict;
+    }
+    state.lethalCount = 0;
+    verdict.action = LethalRefusalAction::Hearth;
+    return verdict;
+}
+
 void StallRecoveryNotDone(StallRecoveryState& state)
 {
     state.escalated = false;
