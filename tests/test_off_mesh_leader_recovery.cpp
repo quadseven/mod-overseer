@@ -155,7 +155,7 @@ void AGuardedHeldWalkerIsReadLater()
         Check("held while guarded", StallRecoveryHoldsErrand(s, X, Y, p.t, LIM));
         if (!StallRecoveryMayRead(p.alive, p.combat))
         {
-            Check("no rung while guarded", p.t < 1520);
+            Check("no rung while guarded", rungs == 0);
             continue;
         }
         if (StallRecoveryIdleDue(s, X, Y, p.t, LIM, 60) &&
