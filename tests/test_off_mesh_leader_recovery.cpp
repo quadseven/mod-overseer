@@ -133,6 +133,43 @@ void TheHoldIsBoundedWhenNoRungCanBeTaken()
     StallRecoveryStep(s, on, LIM);
     Check("on the mesh: not held", !StallRecoveryHoldsErrand(s, X, Y, 1310, LIM));
 }
+// A held walker that is dead or in combat takes no rung on that poll, keeps
+// its streak, and takes rung 1 on a later poll once alive and out of combat
+// (mod-overseer#1705). Mirrors the hold block: guard first, then IdleDue.
+void AGuardedHeldWalkerIsReadLater()
+{
+    StallRecoveryState s;
+    for (int i = 0; i < 3; ++i)
+        StallRecoveryStep(s, Off(1000 + i * 60), LIM);
+    struct Poll
+    {
+        std::int64_t t;
+        bool alive;
+        bool combat;
+    };
+    Poll const polls[] = {{1400, false, false}, {1460, true, true}, {1520, true, false}};
+    int rungs = 0;
+    std::int64_t rungAt = 0;
+    for (Poll const& p : polls)
+    {
+        Check("held while guarded", StallRecoveryHoldsErrand(s, X, Y, p.t, LIM));
+        if (!StallRecoveryMayRead(p.alive, p.combat))
+        {
+            Check("no rung while guarded", rungs == 0);
+            continue;
+        }
+        if (StallRecoveryIdleDue(s, X, Y, p.t, LIM, 60) &&
+            StallRecoveryStep(s, Off(p.t), LIM).action == StallRecoveryAction::WalkToMesh)
+        {
+            ++rungs;
+            rungAt = p.t;
+        }
+    }
+    Check("rung 1 taken once, on the first unguarded poll", rungs == 1 && rungAt == 1520);
+    Check("dead is guarded", !StallRecoveryMayRead(false, false));
+    Check("in combat is guarded", !StallRecoveryMayRead(true, true));
+    Check("alive and calm may read", StallRecoveryMayRead(true, false));
+}
 }  // namespace
 
 int main()
@@ -142,6 +179,7 @@ int main()
     WithoutTheQuickRuleTheHourStands();
     AWalkerThatMovesIsNeitherHeldNorRecovered();
     TheHoldIsBoundedWhenNoRungCanBeTaken();
+    AGuardedHeldWalkerIsReadLater();
     if (failures == 0)
         std::printf("ok\n");
     return failures ? 1 : 0;

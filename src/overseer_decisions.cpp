@@ -1578,6 +1578,11 @@ bool StallRecoveryHoldsErrand(StallRecoveryState const& state, float x, float y,
     return now - state.stillSince < limits.stillSeconds + limits.holdGraceSeconds;
 }
 
+bool StallRecoveryMayRead(bool alive, bool inCombat)
+{
+    return alive && !inCombat;
+}
+
 bool StallRecoveryIdleDue(StallRecoveryState& state, float x, float y, std::int64_t now,
                           StallRecoveryLimits const& limits, std::int64_t intervalSeconds)
 {
