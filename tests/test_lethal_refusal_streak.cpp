@@ -73,6 +73,27 @@ int main()
         Check("other-map bind: no rung",
               LethalRefusalStep(s, f, LIM).action == LethalRefusalAction::Keep);
     }
+    {
+        StallRecoveryState s;
+        LethalRefusalFacts f = At(0.f);
+        f.hearthPending = true;
+        LethalRefusalStep(s, f, LIM);
+        LethalRefusalStep(s, f, LIM);
+        Check("cast pending: no rung",
+              LethalRefusalStep(s, f, LIM).action == LethalRefusalAction::Keep);
+        f.hearthPending = false;
+        Check("rung once the cast is done",
+              LethalRefusalStep(s, f, LIM).action == LethalRefusalAction::Hearth);
+    }
+    {
+        StallRecoveryState s;
+        LethalRefusalFacts f = At(0.f);
+        f.hasStone = false;
+        LethalRefusalStep(s, f, LIM);
+        LethalRefusalStep(s, f, LIM);
+        Check("no stone: no rung",
+              LethalRefusalStep(s, f, LIM).action == LethalRefusalAction::Keep);
+    }
     if (failures == 0)
         std::printf("ok\n");
     return failures ? 1 : 0;
