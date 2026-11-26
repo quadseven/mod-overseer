@@ -32679,6 +32679,7 @@ private:
                     _travelAims.Refuse(name, target, OverseerDecisions::ErrandLethalRoad);
                     _travelAims.Release(name, "the travel drive (the road crosses ground far "
                                               "above the family's level)");
+                    ReleaseLethalRefusalStreak(bot, name);
                     continue;
                 }
                 if (step == OverseerDecisions::ErrandRoadStep::Hearth ||
@@ -32925,6 +32926,7 @@ private:
                     _travelAims.Refuse(name, target, planned.zoneRefusal);
                     _travelAims.Release(name, "the travel drive (the only route crosses a "
                                               "zone flagged for the party's deaths)");
+                    ReleaseLethalRefusalStreak(bot, name);
                     continue;
                 }
             }
@@ -42067,6 +42069,44 @@ private:
         }
     }
     static constexpr std::int64_t STALL_IDLE_READ_SECONDS = 60;
+
+    // A LETHAL REFUSAL IS A RELEASE THE STREAK HEARS ABOUT. A walker whose aims
+    // are all refused as lethal never starts a walk, so the no-progress release
+    // never feeds its streak. Each lethal-refusal release feeds the same
+    // per-character state (_stallRecovery); at the limit, standing near one
+    // spot, it takes the hearthstone rung once, and a cooling stone keeps the
+    // streak.
+    void ReleaseLethalRefusalStreak(Player* bot, std::string const& name)
+    {
+        OverseerDecisions::LethalRefusalFacts facts;
+        facts.x = bot->GetPositionX();
+        facts.y = bot->GetPositionY();
+        uint32 const stone = HearthstoneSpellOf(bot);
+        facts.hasStone = stone != 0;
+        facts.stoneReady = stone && !bot->HasSpellCooldown(stone);
+        facts.sameMapBind = bot->m_homebindMapId == bot->GetMapId();
+        facts.hearthPending = HearthPendingFor(bot->GetName());
+        OverseerDecisions::LethalRefusalVerdict const verdict =
+            OverseerDecisions::LethalRefusalStep(_stallRecovery[LowerName(name)], facts,
+                                                 STALL_RECOVERY_LIMITS);
+        if (verdict.action != OverseerDecisions::LethalRefusalAction::Hearth)
+            return;
+        char const* status = "error";
+        std::string evidence;
+        char const* const refused = DoHearth(bot, "use", status, evidence, _pendingHearths, 0);
+        if (refused && *refused)
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' had {} aims refused as lethal in a row; the hearthstone "
+                     "rung was refused ({}) and is asked again on the next refusal",
+                     name, verdict.refusals, refused);
+            return;
+        }
+        LOG_WARN("module.overseer",
+                 "overseer: '{}' had {} aims refused as lethal in a row at one spot: RUNG 2, "
+                 "it uses its hearthstone to its bind on the same map",
+                 name, verdict.refusals);
+    }
 
     bool ReadStalledFooting(Player* bot, std::string const& name, WorldPosition const& aim,
                             bool groundRefused = false)
