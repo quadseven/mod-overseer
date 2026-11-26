@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -466,7 +467,8 @@ void AssembleWaitsForTheRaidThenForNobodyForever()
     facts.heldSeconds = 60;
     RaidRunStep const waiting = StepRaidRun(RaidRunPhase::Assemble, facts);
     CheckPhase("half the raid at the door waits", waiting.phase, RaidRunPhase::Assemble);
-    Check("with the head held on the staging point", waiting.aimStaging);
+    Check("with the head held where it stands, not walked again",
+          !waiting.aimStaging && waiting.headHolds);
 
     facts.headAssembled = false;
     facts.assembled = 38;
@@ -500,6 +502,51 @@ void AssembleWaitsForTheRaidThenForNobodyForever()
     Check("a seat that logged in during ASSEMBLE is still invited", latecomers.form);
 }
 
+// #1703: a head already at the staging point is not re-claimed every poll.
+void AHeadAtTheStagingPointIsNotWalkedAgain()
+{
+    RaidRunFacts facts = Ready();
+    facts.inWorld = 40;
+    facts.assembled = 6;
+    facts.headAssembled = true;
+    facts.heldSeconds = 60;
+    bool claimed = false;
+    bool holds = true;
+    for (int poll = 0; poll < 100; ++poll)
+    {
+        facts.heldSeconds = 60 + poll * 5;
+        RaidRunStep const step = StepRaidRun(RaidRunPhase::Assemble, facts);
+        claimed = claimed || step.aimStaging;
+        holds = holds && step.headHolds && step.phase == RaidRunPhase::Assemble;
+    }
+    Check("a head inside the radius is never claimed over 100 polls", !claimed);
+    Check("and the run says it holds for seats on each", holds);
+
+    facts.headAssembled = false;
+    facts.heldSeconds = 60;
+    RaidRunStep const away = StepRaidRun(RaidRunPhase::Assemble, facts);
+    Check("a head outside the radius is walked to the staging point",
+          away.aimStaging && !away.headHolds);
+    facts.headAssembled = true;
+    Check("and once arrived it is not claimed again",
+          !StepRaidRun(RaidRunPhase::Assemble, facts).aimStaging);
+    facts.headAssembled = false;
+    Check("and when it leaves the radius the aim is claimed again",
+          StepRaidRun(RaidRunPhase::Assemble, facts).aimStaging);
+
+    facts.headAssembled = true;
+    facts.heldSeconds = RAID_ASSEMBLE_WAIT_SECONDS;
+    RaidRunStep const late = StepRaidRun(RaidRunPhase::Assemble, facts);
+    Check("short of the quorum after the wait it still holds, unclaimed",
+          !late.aimStaging && late.headHolds);
+
+    std::ifstream source("src/mod_overseer.cpp");
+    std::string const text((std::istreambuf_iterator<char>(source)),
+                           std::istreambuf_iterator<char>());
+    Check("the adapter says the wait once, guarded by headHoldSaid",
+          text.find("if (!run.headHoldSaid)") != std::string::npos);
+}
+
 void TheRaidEntersOnlyWithAQuorumAtTheDoor()
 {
     RaidRunFacts facts = Ready();
@@ -512,7 +559,7 @@ void TheRaidEntersOnlyWithAQuorumAtTheDoor()
     RaidRunStep const few = StepRaidRun(RaidRunPhase::Assemble, facts);
     CheckPhase("12 at the door after the wait stays ASSEMBLE", few.phase,
                RaidRunPhase::Assemble);
-    Check("and holds the head on the staging point", few.aimStaging);
+    Check("and holds the head where it stands", !few.aimStaging && few.headHolds);
     Check("and does not knock anybody through", !few.knockMembers);
     CheckString("and names the shortfall by duty", few.shortfall.c_str(),
                 "12 of 40, short 24 seats, 1 tanks, 5 healers");
@@ -999,6 +1046,7 @@ int main()
     AnOrderFormsFirstAndKeepsFormingWhileSeatsCanJoin();
     AFormedRaidUnderTheQuorumHoldsInFormAndSaysSo();
     AssembleWaitsForTheRaidThenForNobodyForever();
+    AHeadAtTheStagingPointIsNotWalkedAgain();
     TheRaidEntersOnlyWithAQuorumAtTheDoor();
     TheHeadCrossesLast();
     InsideHoldsAndLetsStragglersThrough();

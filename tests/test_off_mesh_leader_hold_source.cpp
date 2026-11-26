@@ -21,5 +21,18 @@ int main()
         return std::cerr << "the hold is not asked before the leader claim\n", EXIT_FAILURE;
     if (text.find("facts.stillRule = true;") == std::string::npos)
         return std::cerr << "the recovery reading does not ask for the quick rule\n", EXIT_FAILURE;
+    // The hold block asks alive and not-in-combat before it reads footing,
+    // as RecoverIdleOffMesh does (mod-overseer#1705).
+    auto const guard = text.find("OverseerDecisions::StallRecoveryMayRead(bot->IsAlive(),");
+    auto const read = text.find("ReadStalledFooting(", hold);
+    if (guard == std::string::npos || guard < hold || guard > ask || read == std::string::npos ||
+        guard > read)
+        return std::cerr << "the hold block does not check alive and combat before reading\n",
+               EXIT_FAILURE;
+    auto const idle = text.find("void RecoverIdleOffMesh(");
+    auto const idleEnd = text.find("ReadStalledFooting(", idle);
+    auto const idleGuard = text.find("!bot->IsAlive() || bot->IsInCombat()", idle);
+    if (idle == std::string::npos || idleGuard == std::string::npos || idleGuard > idleEnd)
+        return std::cerr << "RecoverIdleOffMesh lost its alive and combat guard\n", EXIT_FAILURE;
     return EXIT_SUCCESS;
 }

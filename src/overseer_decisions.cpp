@@ -1586,6 +1586,11 @@ bool StallRecoveryHoldsErrand(StallRecoveryState const& state, float x, float y,
     return now - state.stillSince < limits.stillSeconds + limits.holdGraceSeconds;
 }
 
+bool StallRecoveryMayRead(bool alive, bool inCombat)
+{
+    return alive && !inCombat;
+}
+
 bool StallRecoveryIdleDue(StallRecoveryState& state, float x, float y, std::int64_t now,
                           StallRecoveryLimits const& limits, std::int64_t intervalSeconds)
 {
@@ -1601,6 +1606,34 @@ bool StallRecoveryIdleDue(StallRecoveryState& state, float x, float y, std::int6
         return false;
     state.idleReadAt = now;
     return true;
+}
+
+LethalRefusalVerdict LethalRefusalStep(StallRecoveryState& state,
+                                       LethalRefusalFacts const& facts,
+                                       StallRecoveryLimits const& limits)
+{
+    float const dx = facts.x - state.lethalX;
+    float const dy = facts.y - state.lethalY;
+    if (state.lethalCount == 0 ||
+        dx * dx + dy * dy > limits.movedResetYards * limits.movedResetYards)
+    {
+        state.lethalCount = 0;
+        state.lethalX = facts.x;
+        state.lethalY = facts.y;
+    }
+    ++state.lethalCount;
+    LethalRefusalVerdict verdict;
+    verdict.refusals = state.lethalCount;
+    if (state.lethalCount < limits.lethalRefusals)
+        return verdict;
+    if (!facts.hasStone || !facts.stoneReady || !facts.sameMapBind || facts.hearthPending)
+    {
+        verdict.action = LethalRefusalAction::Keep;
+        return verdict;
+    }
+    state.lethalCount = 0;
+    verdict.action = LethalRefusalAction::Hearth;
+    return verdict;
 }
 
 void StallRecoveryNotDone(StallRecoveryState& state)
@@ -4601,9 +4634,51 @@ bool ReleaseLandsAim(ReleaseLandingFacts const& facts)
     return !facts.anyClaim && !facts.standing.empty() && facts.driving == facts.standing;
 }
 
+void NoteCounterArrival(CounterArrivalMemory& memory, std::string const& aim)
+{
+    memory.aim = aim;
+    memory.said = false;
+}
+
+LandedErrand CounterArrivalMemoryStep(CounterArrivalMemory& memory,
+                                      std::string const& columnAim, bool counterHoldActive,
+                                      bool& sayIt)
+{
+    sayIt = false;
+    LandedErrand const step =
+        LandedErrandStep(memory.aim, columnAim, true, counterHoldActive, 0, 0);
+    if (step == LandedErrand::Resume)
+    {
+        memory = CounterArrivalMemory{};
+        return step;
+    }
+    if (step == LandedErrand::StandDown && !memory.said)
+    {
+        memory.said = true;
+        sayIt = true;
+    }
+    return step;
+}
+
 bool UnresolvedAimStandsDown(std::string const& aim)
 {
     return !aim.empty() && aim.rfind("at:", 0) != 0;
+}
+
+bool UnresolvedSpawnIsRefused(std::string const& aim, bool guarded)
+{
+    if (guarded || aim.empty())
+        return false;
+    for (char const ch : aim)
+        if (ch < '0' || ch > '9')
+            return false;
+    return true;
+}
+
+std::string UnresolvedSpawnRefusal(std::uint32_t leaderMap)
+{
+    return "its spawn is not on map " + std::to_string(leaderMap) +
+           ", where the character stands, and no route to its own map is built (#1711)";
 }
 
 TravelClaim ReadTravelClaim(TravelClaimFacts const& facts)
@@ -16177,6 +16252,41 @@ TownTripPlan PlanTownTrip(std::vector<TownNeed> const& members,
                           TownTripLimits const& limits,
                           time_t secondsSinceLastTrip, bool busy)
 {
+    return PlanTownTrip(members, limits, secondsSinceLastTrip, busy, std::vector<bool>{});
+}
+
+bool TownTripBagsFruitless(TownNeed const& need, FruitlessBagsMark const& mark,
+                           TownTripLimits const& limits, time_t now)
+{
+    if (!mark.set || !need.present)
+        return false;
+    if (now - mark.at >= limits.fruitlessBagsSeconds)
+        return false;
+    return need.freeBagSlots <= mark.freeBagSlots;
+}
+
+FruitlessBagsMark NoteTownTripBags(TownNeed const& before, TownNeed const& after,
+                                   std::uint64_t copperBefore, std::uint64_t copperAfter,
+                                   CounterRole role, bool stoodAtCounter,
+                                   TownTripLimits const& limits, time_t now,
+                                   FruitlessBagsMark const& previous)
+{
+    if (role != CounterRole::Vendor || !stoodAtCounter || !before.present || !after.present)
+        return previous;
+    if (before.freeBagSlots > limits.freeBagSlotsToGo)
+        return previous;
+    bool const madeRoom =
+        after.freeBagSlots > before.freeBagSlots || copperAfter > copperBefore;
+    if (madeRoom)
+        return FruitlessBagsMark{};
+    return FruitlessBagsMark{true, after.freeBagSlots, now};
+}
+
+TownTripPlan PlanTownTrip(std::vector<TownNeed> const& members,
+                          TownTripLimits const& limits,
+                          time_t secondsSinceLastTrip, bool busy,
+                          std::vector<bool> const& bagsFruitless)
+{
     TownTripPlan plan;
 
     if (busy)
@@ -16188,9 +16298,15 @@ TownTripPlan PlanTownTrip(std::vector<TownNeed> const& members,
     if (secondsSinceLastTrip < limits.cooldownSeconds)
         return plan;
 
-    for (TownNeed const& need : members)
+    for (size_t i = 0; i < members.size(); ++i)
     {
-        TownReason const reason = TownTripMemberReason(need, limits);
+        TownNeed const& need = members[i];
+        TownReason reason = TownTripMemberReason(need, limits);
+        // A VENDOR ALREADY FAILED THIS MEMBER'S BAGS (wow-overseer#1261): its
+        // bags are no reason, and what is left is its gear, read as if the bags
+        // had room.
+        if (reason == TownReason::Bags && i < bagsFruitless.size() && bagsFruitless[i])
+            reason = need.damagedItems ? TownReason::Worn : TownReason::None;
         if (reason == TownReason::None)
             continue;
 
@@ -18637,7 +18753,8 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
                     return step;
                 }
                 step.phase = RaidRunPhase::Assemble;
-                step.aimStaging = true;
+                step.aimStaging = !facts.headAssembled;
+                step.headHolds = facts.headAssembled;
                 step.aimSeats = true;
                 step.summonStragglers = true;
                 step.why = "the wait is over but the raid at the door is short of a "
@@ -18645,7 +18762,10 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
                 return step;
             }
             step.phase = RaidRunPhase::Assemble;
-            step.aimStaging = true;
+            // A head already inside the assemble radius is not walked again (#1703):
+            // the walk arrived, and re-claiming it every poll only churns.
+            step.aimStaging = !facts.headAssembled;
+            step.headHolds = facts.headAssembled;
             step.aimSeats = true;
             step.summonStragglers = facts.headAssembled &&
                                     facts.heldSeconds >= RAID_STONE_SUMMON_AFTER_SECONDS;
