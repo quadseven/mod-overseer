@@ -4024,33 +4024,32 @@ bool ItemKept(Player const* who, Item const* item)
 
 // READ, AND A FAILED READ IS NOT AN EMPTY TABLE. A reservation that vanished
 // for one poll because the database hiccuped would let the next sell row take
-// the item. So the count is asked first: a count that does not come back
-// (the table missing on a world that has not run the migration, or a failed
-// query) keeps whatever was read last; a count of 0 is a real empty table.
+// the item. A LEFT JOIN against a single-row sentinel returns null on a failed
+// query or missing table (keeping whatever was read last), one row with a NULL
+// character_name when the table is empty (clearing the cache), and N rows when
+// populated, in one round trip instead of a COUNT(*) pre-query plus a SELECT.
 void ReloadKeepReservations()
 {
-    QueryResult count = CharacterDatabase.Query("SELECT COUNT(*) FROM overseer_keep");
-    if (!count)
+    QueryResult rows = CharacterDatabase.Query(
+        "SELECT k.character_name, k.item_entry, k.item_guid, k.until_level, k.reason "
+        "FROM (SELECT 1) AS _sentinel "
+        "LEFT JOIN overseer_keep k ON 1=1");
+    if (!rows)
         return;
     std::vector<OverseerDecisions::KeepReservation> reservations;
-    if (count->Fetch()[0].Get<uint64>() > 0)
+    do
     {
-        QueryResult rows = CharacterDatabase.Query(
-            "SELECT character_name, item_entry, item_guid, until_level, reason FROM overseer_keep");
-        if (!rows)
-            return;
-        do
-        {
-            Field* f = rows->Fetch();
-            OverseerDecisions::KeepReservation r;
-            r.character = f[0].Get<std::string>();
-            r.itemEntry = f[1].Get<uint32>();
-            r.itemGuid = f[2].Get<uint32>();
-            r.untilLevel = f[3].Get<uint8>();
-            r.reason = f[4].Get<std::string>();
-            reservations.push_back(std::move(r));
-        } while (rows->NextRow());
-    }
+        Field* f = rows->Fetch();
+        if (f[0].IsNull())
+            continue;
+        OverseerDecisions::KeepReservation r;
+        r.character = f[0].Get<std::string>();
+        r.itemEntry = f[1].Get<uint32>();
+        r.itemGuid = f[2].Get<uint32>();
+        r.untilLevel = f[3].Get<uint8>();
+        r.reason = f[4].Get<std::string>();
+        reservations.push_back(std::move(r));
+    } while (rows->NextRow());
     SetKeepReservations(std::move(reservations));
 }
 
@@ -4062,6 +4061,7 @@ void ReloadKeepReservations()
 // is OverseerDecisions::SeatTalentVerdictFor, pinned by tests/test_seat_talents.cpp.
 std::mutex g_raidSpecMutex;
 std::vector<OverseerDecisions::RaidSpecTarget> g_raidSpec;
+bool g_raidSpecTablePresent = false;
 
 bool RaidSpecTargetOf(std::string const& name, OverseerDecisions::RaidSpecTarget& out)
 {
@@ -4075,33 +4075,39 @@ bool RaidSpecTargetOf(std::string const& name, OverseerDecisions::RaidSpecTarget
 
 // A world without the table (2026_09_25_10_overseer_raid_spec.sql not applied)
 // or a failed read keeps what was read last, as the keep reservations do. The
-// table is asked about first so a missing one costs no SQL error per minute.
+// table is asked about until found once, then cached so steady-state polls pay
+// no INFORMATION_SCHEMA.TABLES query. A LEFT JOIN against a single-row sentinel
+// distinguishes a failed read (null result) from an empty table (one NULL row)
+// in a single query.
 void ReloadRaidSpecTargets()
 {
-    QueryResult present = CharacterDatabase.Query(
-        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
-        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'overseer_raid_spec'");
-    if (!present || present->Fetch()[0].Get<uint64>() == 0)
-        return;
-    QueryResult count = CharacterDatabase.Query("SELECT COUNT(*) FROM overseer_raid_spec");
-    if (!count)
+    if (!g_raidSpecTablePresent)
+    {
+        QueryResult present = CharacterDatabase.Query(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'overseer_raid_spec'");
+        if (!present || present->Fetch()[0].Get<uint64>() == 0)
+            return;
+        g_raidSpecTablePresent = true;
+    }
+    QueryResult rows = CharacterDatabase.Query(
+        "SELECT r.name, r.class, r.tab "
+        "FROM (SELECT 1) AS _sentinel "
+        "LEFT JOIN overseer_raid_spec r ON 1=1");
+    if (!rows)
         return;
     std::vector<OverseerDecisions::RaidSpecTarget> targets;
-    if (count->Fetch()[0].Get<uint64>() > 0)
+    do
     {
-        QueryResult rows = CharacterDatabase.Query("SELECT name, class, tab FROM overseer_raid_spec");
-        if (!rows)
-            return;
-        do
-        {
-            Field* f = rows->Fetch();
-            OverseerDecisions::RaidSpecTarget t;
-            t.name = f[0].Get<std::string>();
-            t.classId = f[1].Get<uint8>();
-            t.tab = f[2].Get<uint8>();
-            targets.push_back(std::move(t));
-        } while (rows->NextRow());
-    }
+        Field* f = rows->Fetch();
+        if (f[0].IsNull())
+            continue;
+        OverseerDecisions::RaidSpecTarget t;
+        t.name = f[0].Get<std::string>();
+        t.classId = f[1].Get<uint8>();
+        t.tab = f[2].Get<uint8>();
+        targets.push_back(std::move(t));
+    } while (rows->NextRow());
     std::lock_guard<std::mutex> guard(g_raidSpecMutex);
     g_raidSpec.swap(targets);
 }
@@ -60287,24 +60293,25 @@ private:
     // A READ THAT FAILED IS NOT AN EMPTY TABLE. The core aborts on a parse error
     // or a missing table, but a lock-wait timeout returns no result without a
     // word, and taking that for "no stand-ins" would send every guest home
-    // mid-campaign. A COUNT always answers one row when the read works, so no
-    // row from it is a failed read: false, and the caller keeps what it has.
+    // mid-campaign. A LEFT JOIN against a single-row sentinel returns null on a
+    // failed read (false, so the caller keeps what it has) and one NULL row on
+    // an empty table (true with empty rows), avoiding a separate COUNT(*) round
+    // trip on every dungeon poll.
     bool LoadStandinRows(std::vector<OverseerDecisions::FamilyStandin>& rows)
     {
         rows.clear();
-        QueryResult counted = CharacterDatabase.Query("SELECT COUNT(*) FROM overseer_family_standin");
-        if (!counted)
-            return false;
-        if (counted->Fetch()[0].Get<uint64>() == 0)
-            return true;
         QueryResult result = CharacterDatabase.Query(
-            "SELECT `family`, out_name, in_name, seat, reason FROM overseer_family_standin "
-            "ORDER BY id");
+            "SELECT s.`family`, s.out_name, s.in_name, s.seat, s.reason "
+            "FROM (SELECT 1) AS _sentinel "
+            "LEFT JOIN overseer_family_standin s ON 1=1 "
+            "ORDER BY s.id");
         if (!result)
             return false;
         do
         {
             Field* f = result->Fetch();
+            if (f[0].IsNull())
+                continue;
             OverseerDecisions::FamilyStandin row;
             row.family = f[0].Get<std::string>();
             row.outName = f[1].Get<std::string>();
