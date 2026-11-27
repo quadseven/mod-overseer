@@ -5894,28 +5894,25 @@ struct TravelReleaseGateFacts
     uint32_t learnSkill{0};
     // The travel_npc column as the release read it.
     std::string standing;
-    // The drive has refused this aim as inert for INERT_FOLLOWER_AIM_SECONDS: a
-    // follower's counter keyword, which only the leader's `new rpg` could walk
-    // (#1610). Lets a counter keyword through the gate and nothing else.
+    // An exact-aim release after INERT_FOLLOWER_AIM_SECONDS of follower refusals.
+    // Only an unclaimed counter keyword or point can be retired this way.
     bool inertFollowerAim{false};
 };
 
-// HOW LONG A FOLLOWER'S COUNTER-KEYWORD AIM MAY STAND REFUSED AS INERT BEFORE IT
-// IS CLEARED (#1610). Long enough that a bridge pass writing a follower's aim and
+// HOW LONG A FOLLOWER'S AIM MAY STAND REFUSED AS INERT BEFORE IT IS CLEARED
+// (#1610, #1723). Long enough that a bridge pass writing a follower's aim and
 // a leader still on its way to the counter are not raced; short enough that the
 // catch-up walk, which refuses a member while an errand stands, is not kept
 // off it for minutes.
 constexpr int64_t INERT_FOLLOWER_AIM_SECONDS = 120;
 
-// Is this standing aim one the release may clear because nothing walks it? A
-// counter keyword only, no pending profession errand, refused as inert for the
-// bound. A positional aim, a guard and an empty column are never cleared here.
+// Is this aim eligible for inert release by type, pending skill and time?
+// TravelReleaseGate also checks whether the book holds a claim.
 bool InertFollowerAimMayBeCleared(std::string const& aim, uint32_t learnSkill,
                                   int64_t inertSeconds);
 
 // Empty means the column write goes through. Non-empty is the same whole
-// clause TravelReleaseFence returns, or "the column changed after this book's
-// claim" when the column moved.
+// clause TravelReleaseFence returns, or a reason the specific release is fenced.
 std::string TravelReleaseGate(TravelReleaseGateFacts const& facts);
 
 // May the dungeon coordinator clear this exact positional aim when its run
