@@ -390,6 +390,7 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <set>
 #include <sstream>
@@ -7404,6 +7405,12 @@ public:
         return _state[name];
     }
 
+    TravelState const* FindState(std::string const& name) const
+    {
+        auto const it = _state.find(name);
+        return it == _state.end() ? nullptr : &it->second;
+    }
+
     // WHAT THIS CHARACTER'S ERRAND IS, READ WITHOUT CREATING ONE (#289). The
     // same string as `_state[name].target`, which is the column as DriveTravel
     // last saw it, and empty for a character with no errand in flight.
@@ -7428,12 +7435,12 @@ public:
     // aim. False before the first send, which is "not measured yet".
     bool ResolvedPoint(std::string const& name, uint32& mapId, float& x, float& y) const
     {
-        auto const it = _state.find(name);
-        if (it == _state.end() || !it->second.pinned)
+        TravelState const* const state = FindState(name);
+        if (!state || !state->pinned)
             return false;
-        mapId = it->second.mapId;
-        x = it->second.x;
-        y = it->second.y;
+        mapId = state->mapId;
+        x = state->x;
+        y = state->y;
         return true;
     }
 
@@ -27358,8 +27365,63 @@ private:
     // EXCEPT WITH AN EMPTY COLUMN WHILE THE FAMILY WAITS IN TOWN (2026-09-24).
     // See OverseerDecisions::CutOffFollowerRoams: the grant is withheld there,
     // and this is the half that takes back a strategy granted before the wait.
-    // The job the town-hold decisions read for `name`: TOWN_HOLD_JOB while its
-    // family waits in town, and "" (questing) otherwise.
+
+    // Both travel polls share the taxi facts and the first-sighting latch.
+    void CheckErrandFlight(std::string const& name, std::string const& target,
+                           Player* bot, PlayerbotAI* ai, bool issued, WorldPosition const* goal)
+    {
+        bool const inFlight = bot->IsInFlight();
+        bool const statusIsFlight = ai->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT;
+        if (issued || (inFlight ? _errandFlightAirborneSaid.count(name) : !statusIsFlight))
+            return;
+
+        // The RPG route ends at its last node. In the air the core's remaining
+        // route also survives a change away from RPG_TRAVEL_FLIGHT.
+        auto const* const flight = std::get_if<NewRpgInfo::TravelFlight>(&ai->rpgInfo.data);
+        uint32 destinationNode = flight && !flight->path.empty() ? flight->path.back() : 0;
+        if (inFlight)
+        {
+            std::istringstream nodes(bot->m_taxi.SaveTaxiDestinationsToString());
+            for (uint32 node = 0; nodes >> node;)
+                destinationNode = node;
+        }
+
+        std::optional<float> goalYards;
+        std::optional<float> landingYards;
+        if (goal && goal->GetMapId() == bot->GetMapId())
+        {
+            float const goalX = goal->GetPositionX();
+            float const goalY = goal->GetPositionY();
+            goalYards = std::hypot(bot->GetPositionX() - goalX, bot->GetPositionY() - goalY);
+            if (!inFlight && destinationNode)
+            {
+                if (auto const* const landing = sTaxiNodesStore.LookupEntry(destinationNode))
+                {
+                    // Leaving the goal's map is farther than any walk on it.
+                    landingYards = landing->map_id == goal->GetMapId()
+                        ? std::hypot(landing->x - goalX, landing->y - goalY)
+                        : std::numeric_limits<float>::infinity();
+                }
+            }
+        }
+        auto const step = OverseerDecisions::ErrandLeaderUnissuedFlight(
+            statusIsFlight, issued, inFlight, goalYards, landingYards);
+        if (step == OverseerDecisions::UnissuedFlightStep::Cancel)
+            ai->rpgInfo.ChangeToIdle();
+        else if (step != OverseerDecisions::UnissuedFlightStep::Airborne ||
+                 !_errandFlightAirborneSaid.insert(name).second)
+            return;
+
+        LOG_WARN("module.overseer",
+                 "overseer: '{}' on errand '{}' has an unissued flight: starter {}, "
+                 "destination node {}, {} yards from goal - {} (#1542)",
+                 name, target, statusIsFlight ? "upstream RPG state" : "unattributed taxi",
+                 destinationNode ? std::to_string(destinationNode) : "unknown",
+                 goalYards ? std::to_string(std::lround(*goalYards)) : "unknown",
+                 inFlight ? "already airborne, leaving the taxi alone" :
+                            "landing is farther away, cancelled on the ground");
+    }
+
     // A FAMILY WAITING IN TOWN IS NOT FLOWN AWAY BY ITS LEADER (#697).
     //
     // The party poll takes `new rpg` off a town leader with no errand
@@ -27374,6 +27436,11 @@ private:
     // is said once and left: stopping a taxi mid-route is a teleport.
     void KeepTownLeadersGrounded()
     {
+        for (auto it = _errandFlightAirborneSaid.begin(); it != _errandFlightAirborneSaid.end();)
+        {
+            Player* const bot = ObjectAccessor::FindPlayerByName(*it);
+            it = bot && bot->IsInFlight() ? std::next(it) : _errandFlightAirborneSaid.erase(it);
+        }
         std::set<std::string> airborne;
         for (std::string const& name : _heldInTown)
         {
@@ -27396,22 +27463,21 @@ private:
             bool const issued = _travelAims.HoldsIssuedFlight(name);
             bool const statusIsFlight =
                 ai->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT;  // NewRpgInfo.h:99
-            OverseerDecisions::UnissuedFlightStep step =
+            OverseerDecisions::UnissuedFlightStep const step =
                 OverseerDecisions::TownLeaderUnissuedFlight(mayCarry, statusIsFlight, issued,
                                                             leader->IsInFlight());
-            if (onErrand)
+            if (onErrand && !issued && (statusIsFlight || leader->IsInFlight()))
             {
-                // An errand holder carries `new rpg`, so the town verdict leaves
-                // it. A goal this module would not fly to is still not flown to
-                // by a status upstream rolled (#1542). Unknown goal: left.
+                // Check the pinned goal on the faster town poll too. DriveTravel
+                // resolves new goals and shares the airborne log latch.
                 uint32 goalMap = 0;
                 float goalX = 0.f;
                 float goalY = 0.f;
-                if (_travelAims.ResolvedPoint(name, goalMap, goalX, goalY) &&
-                    goalMap == leader->GetMapId())
-                    step = OverseerDecisions::ErrandLeaderUnissuedFlight(
-                        statusIsFlight, issued, leader->IsInFlight(),
-                        leader->GetDistance2d(goalX, goalY), TRAVEL_FLIGHT_MIN_YARDS);
+                if (_travelAims.ResolvedPoint(name, goalMap, goalX, goalY))
+                {
+                    WorldPosition const goal(goalMap, goalX, goalY, 0.f);
+                    CheckErrandFlight(name, _travelAims.TargetFor(name), leader, ai, issued, &goal);
+                }
             }
             if (step == OverseerDecisions::UnissuedFlightStep::Cancel)
             {
@@ -27419,12 +27485,11 @@ private:
                 if (ai->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
                     ai->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
                 LOG_WARN("module.overseer",
-                         "overseer: '{}' leads a family waiting in town {} and "
+                         "overseer: '{}' leads a family waiting in town with no errand and "
                          "was walking to a flight master on a flight this module did not "
                          "issue - the flight is called off and `new rpg` taken off, so the "
-                         "family is not led to another zone by a random status (#697, #1542)",
-                         name, onErrand ? "holding an errand whose goal is on foot" :
-                                          "with no errand");
+                         "family is not led to another zone by a random status (#697)",
+                         name);
             }
             else if (step == OverseerDecisions::UnissuedFlightStep::Airborne)
             {
@@ -27442,7 +27507,11 @@ private:
     }
     // Said once per flight: the names the last poll found airborne.
     std::set<std::string> _townLeaderAirborneSaid;
+    // Cleared when the roster poll sees the taxi has landed.
+    std::set<std::string> _errandFlightAirborneSaid;
 
+    // The job the town-hold decisions read for `name`: TOWN_HOLD_JOB while its
+    // family waits in town, and "" (questing) otherwise.
     std::string TownJobFor(std::string const& name) const
     {
         return _heldInTown.count(name) ? std::string(OverseerDecisions::TOWN_HOLD_JOB)
@@ -31034,6 +31103,38 @@ private:
             std::string const target =
                 guarded ? GuardTarget(name, columnAim, aims)
                         : OverseerDecisions::TravelAimBesideBind(bindAim, columnAim);
+
+            // Read taxis before the movement gates, including the airborne
+            // return. The leg marker belongs to the flight already underway,
+            // so read it before a new aim can reset the errand state.
+            Player* bot = ObjectAccessor::FindPlayerByName(name);
+            PlayerbotAI* botAI = SteerableAI(bot);
+            auto const planIt = plans.find(name);
+            ProfessionPlan const* const plan =
+                planIt == plans.end() ? nullptr : &planIt->second;
+            uint32 const wantSkill = plan ? plan->learnSkill : 0;
+            bool const issued = _travelAims.HoldsIssuedFlight(name);
+            bool const inFlight = botAI && bot->IsInFlight();
+            if (botAI && !issued &&
+                (inFlight ? !_errandFlightAirborneSaid.count(name)
+                          : botAI->rpgInfo.GetStatus() == RPG_TRAVEL_FLIGHT))
+            {
+                auto const* const previous = _travelAims.FindState(name);
+                WorldPosition goal;
+                bool goalKnown = previous && previous->pinned && previous->target == target &&
+                                 previous->learn == wantSkill &&
+                                 (inFlight || previous->mapId == bot->GetMapId());
+                if (goalKnown)
+                    goal = WorldPosition(previous->mapId, previous->x, previous->y, previous->z);
+                else if (!target.empty())
+                {
+                    uint32 entry = 0;
+                    goalKnown = ResolveTravelTarget(bot, target, entry, goal, wantSkill);
+                }
+                CheckErrandFlight(name, target.empty() ? columnAim : target,
+                                  bot, botAI, issued, goalKnown ? &goal : nullptr);
+            }
+
             // A guard that names no place, or only a place on another map,
             // holds the character from questing and walks it nowhere;
             // NoteTravelGuards or GuardTarget has already said so.
@@ -31060,11 +31161,6 @@ private:
                 OverseerDecisions::LandedErrand::StandDown)
                 continue;
 
-            // SteerableAI, not a bare lookup: a name can resolve to a
-            // Player that is mid-login or mid-teardown, and its AI pointer is
-            // non-null right up until it is freed. See SteerableAI above.
-            Player* bot = ObjectAccessor::FindPlayerByName(name);
-            PlayerbotAI* botAI = SteerableAI(bot);
             if (!botAI)
                 continue;
 
@@ -31078,11 +31174,6 @@ private:
             if (_belowTerrain.count(LowerName(name)))
                 continue;
 
-            auto const planIt = plans.find(name);
-            ProfessionPlan const* const plan =
-                planIt == plans.end() ? nullptr : &planIt->second;
-            uint32 const wantSkill = plan ? plan->learnSkill : 0;
-
             TravelAimBook::TravelState& state = _travelAims.StateFor(name);
             if (state.target != target || state.learn != wantSkill)
             {
@@ -31093,12 +31184,12 @@ private:
                 state.arrived = false;
                 state.heldSaid = false;
                 state.inertSince = 0;
-                // A new errand is a new flight budget too, and a new leg. The
-                // old errand's flights are spent, its leg is over the moment
-                // its aim stops being the aim, and its refusal to fly was
-                // about a route nobody is taking any more (#68).
+                // A new errand is a new flight budget. Its issued-leg marker
+                // is reset too, unless the character is already on the taxi
+                // that leg issued (#68, #1542).
                 state.flights = 0;
-                state.flightSince = 0;
+                if (!inFlight)
+                    state.flightSince = 0;
                 state.flightSaid = false;
                 state.stuckSaid = false;
                 // A new errand has not held the wheel and has had nothing

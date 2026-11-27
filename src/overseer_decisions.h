@@ -9947,18 +9947,13 @@ enum class UnissuedFlightStep : std::uint8_t
 UnissuedFlightStep TownLeaderUnissuedFlight(bool mayCarryNewRpg, bool statusIsTravelFlight,
                                             bool moduleIssuedFlight, bool inFlight);
 
-// THE SAME GUARD FOR A LEADER THAT HOLDS AN ERRAND (#1542). The town guard above
-// lets an errand holder through, because holding an errand is not proof that
-// this module issued the flight: a leader that hearthed to a capital with a
-// goal 35 yards away was found in the air on a flight nobody issued. Keyed on
-// the flight leg's own marker (`moduleIssuedFlight`, the travel state's
-// flightSince), never on the errand. `goalYards` is how far the errand goal is
-// from where the leader stands; a goal nearer than `flightMinYards` is one this
-// module itself would never fly to, so an upstream flight status on the ground
-// is cancelled. A goal that is far is left: the flight may be a fair way there.
+// An upstream taxi status on the ground is cancelled when its landing is
+// farther from the errand goal than the character is now (#1542). Unknown
+// distances leave the status alone. Airborne taxis without a module-issued
+// leg (TravelState::flightSince) are reported regardless of their RPG status.
 UnissuedFlightStep ErrandLeaderUnissuedFlight(bool statusIsTravelFlight, bool moduleIssuedFlight,
-                                              bool inFlight, float goalYards,
-                                              float flightMinYards);
+                                              bool inFlight, std::optional<float> goalYards,
+                                              std::optional<float> landingYards);
 
 // SplitFollowerDrivesItself for a family in town. A cut-off follower on an
 // errand of its own still runs it; one with an empty column stands where it is
