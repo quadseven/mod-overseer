@@ -16,6 +16,25 @@ using namespace OverseerDecisions;
 constexpr ErrandDeathLimits ERRAND_DEATH_LIMITS{};
 constexpr time_t TRAVEL_LANDED_CEILING_SECONDS = 15 * 60;
 
+using ObjectGuid = uint64_t;
+using NPCFlags = uint32_t;
+constexpr NPCFlags UNIT_NPC_FLAG_NONE = 0;
+
+struct Player
+{
+    ObjectGuid reachableCounter;
+    NPCFlags reachableFlag;
+    bool alive{true}, inFlight{false}, teleporting{false};
+
+    bool IsAlive() const { return alive; }
+    bool IsInFlight() const { return inFlight; }
+    bool IsBeingTeleported() const { return teleporting; }
+    Player const* GetNPCIfCanInteractWith(ObjectGuid guid, NPCFlags flag) const
+    {
+        return guid == reachableCounter && flag == reachableFlag ? this : nullptr;
+    }
+};
+
 struct Book;
 Book* activeBook = nullptr;
 OverseerMovement::MovementOwnership& MovementOwner();
@@ -37,7 +56,7 @@ struct Book
     std::map<std::string, State> _state;
     std::map<std::string, ErrandEnd> _lastEnd;
     std::map<std::string, Landing> _landed;
-    std::map<std::string, OverseerDecisions::CounterArrivalMemory> _counterArrivals;
+    std::map<std::string, RememberedCounterArrival> _counterArrivals;
     std::map<std::string, LandedPointState> _landedPoints;
     uint64_t _endSerial{0};
     unsigned persisted{0};
@@ -189,13 +208,17 @@ int main()
     {
         Adapter a;
         auto& book = a._travelAims;
+        constexpr ObjectGuid counter = 1, anotherCounter = 2;
+        constexpr NPCFlags vendorFlag = 4;
+        Player bot{counter, vendorFlag};
         auto arrive = [&] {
+            bot.reachableCounter = counter;
             book.column.columns["Leader"].clear();
             Check(book.Claim("Leader", "vendor", TravelOwner::TownTrip),
                   "arrival claim accepted", TravelOwner::TownTrip, false);
             book._state["Leader"] = {"vendor"};
             book.Release("Leader", "the travel drive (arrived)");
-            book.MarkCounterLanding("Leader", "vendor");
+            book.MarkCounterLanding("Leader", "vendor", counter, vendorFlag);
         };
         arrive();
         Check(book.column.columns["Leader"].empty() && !book._landed.count("Leader"),
@@ -204,17 +227,27 @@ int main()
         book.column.columns["Leader"] = "vendor";
         unsigned standing = 0;
         for (unsigned poll = 0; poll < 100; ++poll)
-            standing += book.LandedStep("Leader", "vendor", true) == LandedErrand::StandDown;
+            standing += book.LandedStep("Leader", "vendor", true, &bot) == LandedErrand::StandDown;
         Check(standing == 100, "same counter under the hold: no re-claim over 100 polls",
               TravelOwner::TownTrip, false);
-        Check(book.LandedStep("Leader", "banker", true) != LandedErrand::StandDown,
+        Check(book.LandedStep("Leader", "banker", true, &bot) != LandedErrand::StandDown,
               "another aim is claimed as before", TravelOwner::TownTrip, false);
         arrive();
-        Check(book.LandedStep("Leader", "at:0:1,2,3", true) != LandedErrand::StandDown,
+        Check(book.LandedStep("Leader", "at:0:1,2,3", true, &bot) != LandedErrand::StandDown,
               "an at: aim is claimed as before", TravelOwner::TownTrip, false);
         arrive();
-        Check(book.LandedStep("Leader", "vendor", false) != LandedErrand::StandDown,
+        Check(book.LandedStep("Leader", "vendor", false, &bot) != LandedErrand::StandDown,
               "the hold ending claims the same aim again", TravelOwner::TownTrip, false);
+        arrive();
+        bot.reachableCounter = anotherCounter;
+        Check(book.LandedStep("Leader", "vendor", true, nullptr) == LandedErrand::StandDown,
+              "an unavailable player does not prove departure", TravelOwner::TownTrip, false);
+        bot.teleporting = true;
+        Check(book.LandedStep("Leader", "vendor", true, &bot) == LandedErrand::StandDown,
+              "transient teleport state does not prove departure", TravelOwner::TownTrip, false);
+        bot.teleporting = false;
+        Check(book.LandedStep("Leader", "vendor", true, &bot) != LandedErrand::StandDown,
+              "another reachable vendor does not keep the departed hold", TravelOwner::TownTrip, false);
     }
     if (!failures)
         std::cout << "PASS 16 owner/run combinations with guard, target, release and reissue controls\n";

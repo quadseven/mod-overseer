@@ -26,7 +26,7 @@ methods = [
     "    void Release(std::string const& name,",
 ]
 types = ["    struct Refusal\n", "    struct ErrandEnd\n", "    struct Landing\n",
-         "    struct LastWrite\n"]
+         "    struct RememberedCounterArrival\n", "    struct LastWrite\n"]
 harness = (ROOT / "tests/fixtures/errand_death_owner/replay.cpp").read_text()
 harness = harness.replace("// BOOK_TYPES", "\n".join(function(source, t) + ";" for t in types))
 harness = harness.replace("// BOOK_METHODS", "\n".join(function(source, m) for m in methods))

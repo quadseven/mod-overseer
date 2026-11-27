@@ -43,9 +43,10 @@ void Check(char const* what, bool ok)
     ++failures;
 }
 
-LandedErrand Poll(CounterArrivalMemory& memory, char const* aim, bool hold, bool& said)
+LandedErrand Poll(CounterArrivalMemory& memory, char const* aim, bool hold, bool& said,
+                  bool inReach = true)
 {
-    return CounterArrivalMemoryStep(memory, aim, hold, said);
+    return CounterArrivalMemoryStep(memory, aim, hold, inReach, said);
 }
 
 void TheSameCounterIsNotClaimedAgainWhileTheHoldStands()
@@ -85,9 +86,23 @@ void TheHoldEndingClaimsTheSameAimAgain()
     NoteCounterArrival(memory, "vendor");
     bool said = false;
     Check("held: stands down", Poll(memory, "vendor", true, said) == LandedErrand::StandDown);
-    Check("hold gone (ceiling or left): resumes",
+    Check("hold gone at its ceiling: resumes",
           Poll(memory, "vendor", false, said) == LandedErrand::Resume);
     Check("and nothing is remembered afterwards",
+          Poll(memory, "vendor", true, said) == LandedErrand::NotLanded);
+}
+
+void LeavingTheAcceptedCounterClaimsTheSameAimAgain()
+{
+    CounterArrivalMemory memory;
+    NoteCounterArrival(memory, "vendor");
+    bool said = false;
+    Check("the remembered counter still accepts the leader: stands down",
+          Poll(memory, "vendor", true, said) == LandedErrand::StandDown);
+    Check("outside that counter's gate with the hold still in force: resumes",
+          Poll(memory, "vendor", true, said, false) == LandedErrand::Resume);
+    Check("leaving does not log another counter hold", !said);
+    Check("the next poll treats the same aim as a normal errand",
           Poll(memory, "vendor", true, said) == LandedErrand::NotLanded);
 }
 
@@ -121,12 +136,42 @@ void TheAdapterRemembersTheArrivalEvenWhenTheColumnIsCleared()
                            std::istreambuf_iterator<char>());
     auto const mark = text.find("void MarkCounterLanding(");
     Check("MarkCounterLanding exists", mark != std::string::npos);
-    auto const note = text.find("NoteCounterArrival(_counterArrivals[name], target)", mark);
+    auto const note = text.find("NoteCounterArrival(arrival.memory, target)", mark);
     auto const landed = text.find("_landed.find(name)", mark);
     Check("the arrival is noted before the landing is looked for", note != std::string::npos &&
                                                                     note < landed);
-    Check("the drive asks the arrival memory",
-          text.find("CounterArrivalMemoryStep(arrival->second") != std::string::npos);
+    Check("the saved GUID and role do not depend on an unclaimed landing",
+          text.find("arrival.counterGuid = counterGuid", mark) < landed &&
+              text.find("arrival.npcFlag = npcFlag", mark) < landed);
+
+    auto const sweep = text.find("static bool CounterInReach(");
+    auto const accepted = text.find("who->GetNPCIfCanInteractWith(creature->GetGUID(), npcFlag)", sweep);
+    auto const saved = text.find("*outAcceptedCounter = creature->GetGUID()", accepted);
+    auto const flight = text.find("static bool FlightMasterInReach(", sweep);
+    Check("arrival records a creature accepted by the core's counter gate", saved < flight);
+
+    auto const step = text.find("OverseerDecisions::LandedErrand LandedStep(");
+    auto const recheck = text.find("bot->GetNPCIfCanInteractWith(remembered.counterGuid, remembered.npcFlag) != nullptr", step);
+    auto const decide = text.find("CounterArrivalMemoryStep(remembered.memory", step);
+    auto const observable = text.find("columnAim && bot &&\n"
+                                      "                bot->IsAlive() && !bot->IsInFlight() && !bot->IsBeingTeleported()",
+                                      step);
+    Check("an unobservable player state does not masquerade as counter departure", observable < recheck);
+    Check("the saved counter GUID and role flag are rechecked before the arrival decision",
+          recheck < decide &&
+              text.find("counterHoldActive, counterInReach, sayIt)", decide) != std::string::npos);
+    Check("a retained column landing also uses the gate outcome",
+          text.find("it->second.atCounter, counterHoldActive && counterInReach", decide) !=
+              std::string::npos);
+
+    auto const drive = text.find("void DriveTravel()");
+    auto const standDown = text.find("LandedStep(name, target, HasCounterHold(name), botAI ? bot : nullptr)", drive);
+    auto const claim = text.find("AskForLeader(name, kind, owner, about", drive);
+    Check("the drive checks the live gate before it can reclaim the leader", standDown < claim);
+    auto const reach = text.find("CounterInReach(bot, counter, oneIsNearby, nearestYards, &acceptedCounter)", claim);
+    auto const record = text.find("MarkCounterLanding(name, target, acceptedCounter,", reach);
+    Check("the drive records the accepted counter with the original role flag",
+          record != std::string::npos && text.find("NpcFlagForCounter(counter));", record) != std::string::npos);
 }
 
 }  // namespace
@@ -136,6 +181,7 @@ int main()
     TheSameCounterIsNotClaimedAgainWhileTheHoldStands();
     AnotherAimIsClaimedAsBefore();
     TheHoldEndingClaimsTheSameAimAgain();
+    LeavingTheAcceptedCounterClaimsTheSameAimAgain();
     ANewArrivalIsSaidAgain();
     NothingRememberedIsAnOrdinaryErrand();
     TheAdapterRemembersTheArrivalEvenWhenTheColumnIsCleared();
