@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <regex>
 #include <string>
 
 int main()
@@ -23,10 +24,20 @@ int main()
         return std::cerr << "the recovery reading does not ask for the quick rule\n", EXIT_FAILURE;
     // The hold block asks alive and not-in-combat before it reads footing,
     // as RecoverIdleOffMesh does (mod-overseer#1705).
-    auto const guard = text.find("OverseerDecisions::StallRecoveryMayRead(bot->IsAlive(),");
-    auto const read = text.find("ReadStalledFooting(", hold);
-    if (guard == std::string::npos || guard < hold || guard > ask || read == std::string::npos ||
-        guard > read)
+    std::regex const guard(
+        R"(\bif\s*\(\s*OverseerDecisions::StallRecoveryMayRead\(\s*bot->IsAlive\(\)\s*,)"
+        R"(\s*bot->IsInCombat\(\)\s*\)\s*&&\s*OverseerDecisions::StallRecoveryIdleDue\()"
+        R"([^;{}]*,\s*STALL_IDLE_READ_SECONDS\s*\)\s*\)\s*(?:\{\s*)?$)");
+    std::regex const readCall(R"(\bReadStalledFooting\s*\()");
+    auto const holdStart = text.cbegin() + hold;
+    auto const holdEnd = text.cbegin() + ask;
+    std::smatch read;
+    // AI-REVIEW 2026-11-27 [nemotron-3.5-super-vl] missing-test-coverage (Elder, PR #1729):
+    // A second footing read could bypass the alive and combat guard.
+    if (!std::regex_search(holdStart, holdEnd, read, readCall) ||
+        std::regex_search(read[0].second, holdEnd, readCall))
+        return std::cerr << "the hold block needs exactly one footing read\n", EXIT_FAILURE;
+    if (!std::regex_search(holdStart, read[0].first, guard))
         return std::cerr << "the hold block does not check alive and combat before reading\n",
                EXIT_FAILURE;
     auto const idle = text.find("void RecoverIdleOffMesh(");
