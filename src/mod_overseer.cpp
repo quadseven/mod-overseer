@@ -60323,9 +60323,10 @@ private:
                     LOG_INFO("module.overseer",
                              "overseer: raid run for family '{}' has its head at the {} door "
                              "and is waiting for seats: {} of {} in the world at the door, "
-                             "quorum {}",
+                             "quorum {} ({} seats, {} tanks, {} healers required)",
                              roster.family, door->name, facts.assembled, facts.inWorld,
-                             OverseerDecisions::RaidQuorumMet(facts) ? "met" : "not met");
+                             OverseerDecisions::RaidQuorumMet(facts) ? "met" : "not met",
+                             facts.quorumSeats, facts.quorumTanks, facts.quorumHealers);
                 run.headHoldSaid = true;
             }
             else

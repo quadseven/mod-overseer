@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -539,12 +540,30 @@ void AHeadAtTheStagingPointIsNotWalkedAgain()
     RaidRunStep const late = StepRaidRun(RaidRunPhase::Assemble, facts);
     Check("short of the quorum after the wait it still holds, unclaimed",
           !late.aimStaging && late.headHolds);
+}
 
+void TheHeadWaitLogNamesTheQuorumAndResetsAfterEachWait()
+{
     std::ifstream source("src/mod_overseer.cpp");
     std::string const text((std::istreambuf_iterator<char>(source)),
                            std::istreambuf_iterator<char>());
-    Check("the adapter says the wait once, guarded by headHoldSaid",
-          text.find("if (!run.headHoldSaid)") != std::string::npos);
+    std::regex const oncePerWait(
+        R"(if\s*\(\s*step\.headHolds\s*\)\s*\{\s*if\s*\(\s*!\s*run\.headHoldSaid\s*\)\s*)"
+        R"(LOG_INFO\s*\(([^;]*)\)\s*;\s*run\.headHoldSaid\s*=\s*true\s*;\s*\}\s*)"
+        R"(else\s*run\.headHoldSaid\s*=\s*false\s*;)");
+    std::size_t const start = text.find("if (step.headHolds)");
+    std::smatch notice;
+    bool const loggedOnce = start != std::string::npos &&
+        std::regex_search(text.cbegin() + start, text.cend(), notice, oncePerWait,
+                          std::regex_constants::match_continuous);
+    Check("the wait log is guarded and the guard resets when the head stops holding", loggedOnce);
+
+    std::string const message = loggedOnce ? notice[1].str() : "";
+    std::regex const quorumFloors(R"(facts\.quorumSeats\s*,\s*facts\.quorumTanks\s*,\s*facts\.quorumHealers)");
+    Check("the first wait log names the configured seat, tank, and healer floors",
+          message.find("and is waiting for seats:") != std::string::npos &&
+              message.find("{} seats, {} tanks, {} healers required") != std::string::npos &&
+              std::regex_search(message, quorumFloors));
 }
 
 void FarHeldSeatsDoNotKeepAnOtherwiseAssembledRaidWaiting()
@@ -1086,6 +1105,7 @@ int main()
     AFormedRaidUnderTheQuorumHoldsInFormAndSaysSo();
     AssembleWaitsForTheRaidThenForNobodyForever();
     AHeadAtTheStagingPointIsNotWalkedAgain();
+    TheHeadWaitLogNamesTheQuorumAndResetsAfterEachWait();
     FarHeldSeatsDoNotKeepAnOtherwiseAssembledRaidWaiting();
     TheRaidEntersOnlyWithAQuorumAtTheDoor();
     TheHeadCrossesLast();
