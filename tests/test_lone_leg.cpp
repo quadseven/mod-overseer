@@ -272,25 +272,48 @@ void AnUnissuedFlightIsCancelledOnATownLeader()
 // back to idle; the module's own leg is left; one in the air is said.
 void AnUnissuedFlightIsCancelledOnAnErrandLeader()
 {
-    float const minYards = 1500.f;
-    Check("35 yards from the goal, unissued, on the ground: cancelled",
-          ErrandLeaderUnissuedFlight(true, false, false, 35.f, minYards) ==
+    Check("35 yards from the goal, unissued, landing 12000 yards away: cancelled",
+          ErrandLeaderUnissuedFlight(true, false, false, 35.f, 12000.f) ==
               UnissuedFlightStep::Cancel,
           true);
     Check("the module's own flight leg (flightSince set) is left",
-          ErrandLeaderUnissuedFlight(true, true, false, 35.f, minYards) ==
+          ErrandLeaderUnissuedFlight(true, true, false, 35.f, 12000.f) ==
+              UnissuedFlightStep::Leave,
+          true);
+    Check("an airborne module flight needs no unissued flight warning",
+          ErrandLeaderUnissuedFlight(true, true, true, 35.f, 12000.f) ==
               UnissuedFlightStep::Leave,
           true);
     Check("already in the air is said, not stopped",
-          ErrandLeaderUnissuedFlight(true, false, true, 35.f, minYards) ==
+          ErrandLeaderUnissuedFlight(true, false, true, 35.f, 12000.f) ==
               UnissuedFlightStep::Airborne,
           true);
-    Check("a goal far enough to fly to is left",
-          ErrandLeaderUnissuedFlight(true, false, false, 4000.f, minYards) ==
+    Check("an airborne taxi is said even when the RPG status has changed",
+          ErrandLeaderUnissuedFlight(false, false, true, 35.f, 12000.f) ==
+              UnissuedFlightStep::Airborne,
+          true);
+    Check("an away flight is cancelled even when the goal is far away",
+          ErrandLeaderUnissuedFlight(true, false, false, 4000.f, 6000.f) ==
+              UnissuedFlightStep::Cancel,
+          true);
+    Check("a landing closer than the bot's position is left",
+          ErrandLeaderUnissuedFlight(true, false, false, 35.f, 20.f) ==
+              UnissuedFlightStep::Leave,
+          true);
+    Check("a landing equally far from the goal is left",
+          ErrandLeaderUnissuedFlight(true, false, false, 35.f, 35.f) ==
+              UnissuedFlightStep::Leave,
+          true);
+    Check("a missing destination leaves the ground status alone",
+          ErrandLeaderUnissuedFlight(true, false, false, 35.f, std::nullopt) ==
+              UnissuedFlightStep::Leave,
+          true);
+    Check("an unresolved goal leaves the ground status alone",
+          ErrandLeaderUnissuedFlight(true, false, false, std::nullopt, 12000.f) ==
               UnissuedFlightStep::Leave,
           true);
     Check("no flight status is left",
-          ErrandLeaderUnissuedFlight(false, false, false, 35.f, minYards) ==
+          ErrandLeaderUnissuedFlight(false, false, false, 35.f, 12000.f) ==
               UnissuedFlightStep::Leave,
           true);
 }
