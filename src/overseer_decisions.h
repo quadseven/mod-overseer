@@ -1738,8 +1738,8 @@ bool StallRecoveryLeaveBehind(StallRecoveryState const& state, std::int64_t now,
 // while the walker stays within movedResetYards of the spot of the first; a
 // walker that moved starts afresh. At limits.lethalRefusals the verdict is
 // Hearth when the stone is ready, has a same-map bind and no cast is pending;
-// otherwise Keep, and the streak is kept for the next refusal. Hearth resets
-// the count.
+// otherwise Keep. The caller clears the streak only after the hearth request
+// is accepted, so an immediate refusal can be retried on the next release.
 enum class LethalRefusalAction : std::uint8_t
 {
     Count,
@@ -1766,6 +1766,7 @@ struct LethalRefusalVerdict
 LethalRefusalVerdict LethalRefusalStep(StallRecoveryState& state,
                                        LethalRefusalFacts const& facts,
                                        StallRecoveryLimits const& limits);
+void LethalRefusalHearthAccepted(StallRecoveryState& state);
 
 // DOES AN ARMED OFF-MESH STREAK HOLD THE WALKER OFF ERRANDS. True while the
 // quick rule is on, the streak has its releases, no rung has been taken yet,

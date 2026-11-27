@@ -1632,9 +1632,13 @@ LethalRefusalVerdict LethalRefusalStep(StallRecoveryState& state,
         verdict.action = LethalRefusalAction::Keep;
         return verdict;
     }
-    state.lethalCount = 0;
     verdict.action = LethalRefusalAction::Hearth;
     return verdict;
+}
+
+void LethalRefusalHearthAccepted(StallRecoveryState& state)
+{
+    state.lethalCount = 0;
 }
 
 void StallRecoveryNotDone(StallRecoveryState& state)

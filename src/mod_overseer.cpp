@@ -42280,9 +42280,9 @@ private:
         facts.stoneReady = stone && !bot->HasSpellCooldown(stone);
         facts.sameMapBind = bot->m_homebindMapId == bot->GetMapId();
         facts.hearthPending = HearthPendingFor(bot->GetName());
+        auto& state = _stallRecovery[LowerName(name)];
         OverseerDecisions::LethalRefusalVerdict const verdict =
-            OverseerDecisions::LethalRefusalStep(_stallRecovery[LowerName(name)], facts,
-                                                 STALL_RECOVERY_LIMITS);
+            OverseerDecisions::LethalRefusalStep(state, facts, STALL_RECOVERY_LIMITS);
         if (verdict.action != OverseerDecisions::LethalRefusalAction::Hearth)
             return;
         char const* status = "error";
@@ -42296,6 +42296,7 @@ private:
                      name, verdict.refusals, refused);
             return;
         }
+        OverseerDecisions::LethalRefusalHearthAccepted(state);
         LOG_WARN("module.overseer",
                  "overseer: '{}' had {} aims refused as lethal in a row at one spot: RUNG 2, "
                  "it uses its hearthstone to its bind on the same map",
