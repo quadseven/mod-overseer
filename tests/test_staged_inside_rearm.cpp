@@ -50,6 +50,9 @@ int main()
 {
     Check("a party-wait stop with four alive inside is armed again",
           StagedInsideBrainRearms(WAIT, 0, BOUND, 4, GAP));
+    Check("a party-wait stop recorded only by another member still re-arms",
+          StagedInsideBrainRearms(OverseerDecisions::FirstDungeonStopReason({"", WAIT}),
+                                  0, BOUND, 4, GAP));
     Check("and with five", StagedInsideBrainRearms(WAIT, 0, BOUND, 5, GAP));
     Check("the last allowed re-arm still goes", StagedInsideBrainRearms(WAIT, BOUND - 1, BOUND, 4, GAP));
     Check("a spent bound does not", !StagedInsideBrainRearms(WAIT, BOUND, BOUND, 4, GAP));
@@ -78,6 +81,12 @@ int main()
           rearm != std::string::npos && ceiling != std::string::npos && rearm < ceiling);
     if (rearm != std::string::npos)
     {
+        std::size_t const stopRead = text.rfind("std::string const stopReason =", rearm);
+        std::string const before = stopRead == std::string::npos
+            ? std::string() : text.substr(stopRead, rearm - stopRead);
+        Check("reassembly reads the stop reason from the party",
+              before.find("PartyBrainStopReason(") != std::string::npos &&
+              before.find("states)") != std::string::npos);
         std::string const after = text.substr(rearm, 1600);
         Check("it shares the watchdog's re-arm counter",
               after.find("++coord.clearRearms") != std::string::npos);
