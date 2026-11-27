@@ -59415,6 +59415,7 @@ private:
             Group* group = head ? head->GetGroup() : nullptr;
             facts.raidFormed = group && group->isRaidGroup();
             facts.heldSeconds = run.phaseSince ? long(std::time(nullptr) - run.phaseSince) : 0;
+            facts.stoneSummonPending = !run.stoneRowSource.empty();
 
             std::map<std::string, unsigned> seats;
             if (facts.ordered)
@@ -59616,6 +59617,9 @@ private:
                     }
                     else if (member->GetMapId() != door->outsideMapId)
                         ++facts.awayOnOtherMap;
+                    else if (member != head && member->IsAlive() &&
+                             HeldWaitingForLeader(member->GetName()))
+                        ++facts.heldTooFar;
                 }
                 if (head && head->IsInWorld() && head->IsAlive() && head->IsSitState())
                     anyBusy = true;
