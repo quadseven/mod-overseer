@@ -249,9 +249,12 @@
 #    Overseer.Raid.QuorumTanks
 #    Overseer.Raid.QuorumHealers
 #        Description: The raid at the door must have at least this many members,
-#                     tanks and healers before ENTER. Short when the assemble
-#                     wait ends, the raid holds at the door and the log names the
-#                     shortfall; after a second bounded wait the order ends.
+#                     tanks and healers before ENTER. If all missing seats are
+#                     held too far from the head and no seat can still be
+#                     invited or has a summon in flight, the raid can enter
+#                     with a quorum or end when the assemble wait expires.
+#                     Otherwise a raid short of quorum holds for a second
+#                     bounded wait. The log names the shortfall by duty.
 #        Default:     36, 3, 8
 #
 #Overseer.Raid.QuorumSeats = 36
@@ -812,3 +815,32 @@
 #        Default:     2700 (45 minutes)
 #
 #Overseer.GuildRun.LendBoundSeconds = 2700
+
+#
+#    Overseer.DeathLoopHold.Enable
+#        Description: Hold a character the bridge has flagged as dying over and
+#                     over in one zone off its own wandering there: while it
+#                     stands in that zone, its `new rpg` strategy is off, so its
+#                     idle AI does not pick a grind spot, camp or wander that
+#                     walks it back to what keeps killing it. Ends when it leaves
+#                     the zone, when Overseer.DeathLoopHold.Seconds pass from the
+#                     flag, or when the bridge drops the flag. Grants, teleports
+#                     and writes nothing; walks and hearths still run. Never holds
+#                     a roster character (each has a job), a follower in a group,
+#                     or a family stand-in. The flag is the bridge's
+#                     `death_loop_zone` row in overseer_bridge_memo. 0 holds
+#                     nobody and hands back every hold it placed.
+#
+#        Default:     1
+#
+#Overseer.DeathLoopHold.Enable = 1
+
+#
+#    Overseer.DeathLoopHold.Seconds
+#        Description: The longest one flag holds a character, counted from the
+#                     time the bridge flagged the loop. 0 or less holds nobody;
+#                     anything over 43200 (12 hours) is read as 43200.
+#
+#        Default:     10800 (3 hours)
+#
+#Overseer.DeathLoopHold.Seconds = 10800

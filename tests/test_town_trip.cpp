@@ -414,6 +414,27 @@ void AMemberInsideItsStandDownIsNotWalked()
          TownStop::Trade);
 }
 
+// A MEMBER OFF THE MESH WHOSE AIM IS REFUSED RELEASE AFTER RELEASE IS LEFT
+// BEHIND, not re-armed every poll and waited for until the trip's bound.
+void AnOffMeshMemberIsLeftBehind()
+{
+    TownStopFacts held = Facts(true, true, false, false, true);
+    held.offMeshHeld = true;
+    Stop("an off-mesh follower, leader at the counter", held, TownStop::OffMesh);
+    held.leaderAtTheCounter = false;
+    Stop("an off-mesh follower, leader still travelling", held, TownStop::OffMesh);
+    held.yardsFromLeader = 11505.f;
+    Stop("an off-mesh follower, far away", held, TownStop::OffMesh);
+
+    TownStopFacts trading = Facts(true, true, true, false, true);
+    trading.offMeshHeld = true;
+    Stop("an off-mesh follower already at the counter trades", trading, TownStop::Trade);
+
+    TownStopFacts leader = Facts(true, true, false, true, false);
+    leader.offMeshHeld = true;
+    Stop("the leader is never left behind by its own trip", leader, TownStop::Walk);
+}
+
 // THE MEASUREMENT THIS RULE EXISTS FOR. Aiming the leader at a vendor 154 yards
 // away worked and the other four ended up 945 to 2184 yards behind. So on the
 // journey the leader is the only character this trip aims, and the family is
@@ -469,11 +490,12 @@ void TheCounterOutranksTheWalk()
 
 void EveryCombinationHasAnAnswer()
 {
-    for (int i = 0; i < 128; ++i)
+    for (int i = 0; i < 256; ++i)
     {
         TownStopFacts facts = Facts((i & 1) != 0, (i & 2) != 0, (i & 4) != 0,
                                     (i & 8) != 0, (i & 16) != 0);
         facts.stoodDown = (i & 32) != 0;
+        facts.offMeshHeld = (i & 128) != 0;
         facts.yardsFromLeader = (i & 64) != 0 ? 11505.f : 40.f;
         if (std::string(TownStopWord(TownTripMemberStop(facts))) == "unknown")
             Fail("a combination with no answer", "a word", "unknown");
@@ -670,6 +692,7 @@ int main()
     EverybodyWalksTheLastFewYards();
     AFollowerAContinentAwayIsNotWalkedToTheCounter();
     AMemberInsideItsStandDownIsNotWalked();
+    AnOffMeshMemberIsLeftBehind();
     AFollowerAlreadyAtTheCounterTradesAnyway();
     AnUnreadableMemberIsWaitedForRatherThanFinished();
     AMemberThatWantsNothingIsFinishedWhereverItStands();

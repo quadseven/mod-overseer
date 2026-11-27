@@ -1470,6 +1470,8 @@ StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
         state.since = 0;
         state.escalated = false;
         state.refusalSaidAt = 0;
+        state.stillSince = 0;
+        state.stillRule = false;
         if (facts.footing == StallFooting::OnMeshDisconnected &&
             (state.unreachableSaidAt == 0 ||
              facts.now - state.unreachableSaidAt >= limits.saySeconds))
@@ -1495,11 +1497,25 @@ StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
         state.anchorY = facts.y;
         state.escalated = false;
         state.refusalSaidAt = 0;
+        state.stillSince = 0;
+    }
+    state.stillRule = facts.stillRule;
+    {
+        float const sx = facts.x - state.stillX;
+        float const sy = facts.y - state.stillY;
+        if (state.stillSince == 0 || sx * sx + sy * sy > limits.stillYards * limits.stillYards)
+        {
+            state.stillSince = facts.now;
+            state.stillX = facts.x;
+            state.stillY = facts.y;
+        }
     }
     ++state.offMeshReleases;
+    state.lastReleaseAt = facts.now;
     verdict.releases = state.offMeshReleases;
+    bool const stoodStill = facts.stillRule && facts.now - state.stillSince >= limits.stillSeconds;
     if (state.escalated || state.offMeshReleases < limits.releases ||
-        facts.now - state.since < limits.seconds)
+        (facts.now - state.since < limits.seconds && !stoodStill))
         return verdict;
 
     if (facts.nearestPolygonYards >= 0.f && facts.nearestPolygonYards <= limits.nearestMeshYards &&
@@ -1539,11 +1555,48 @@ StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
     return verdict;
 }
 
+bool StallRecoveryLeaveBehind(StallRecoveryState const& state, std::int64_t now,
+                              StallRecoveryLimits const& limits)
+{
+    return state.offMeshReleases >= limits.leaveBehindReleases &&
+           now - state.lastReleaseAt <= limits.freshSeconds;
+}
+
+static bool StallRecoveryStood(StallRecoveryState const& state, float x, float y,
+                               std::int64_t now, StallRecoveryLimits const& limits)
+{
+    if (!state.stillRule || state.stillSince == 0)
+        return false;
+    float const dx = x - state.stillX;
+    float const dy = y - state.stillY;
+    return dx * dx + dy * dy <= limits.stillYards * limits.stillYards &&
+           now - state.stillSince >= limits.stillSeconds;
+}
+
+bool StallRecoveryHoldsErrand(StallRecoveryState const& state, float x, float y,
+                              std::int64_t now, StallRecoveryLimits const& limits)
+{
+    if (!state.stillRule || state.offMeshReleases < limits.releases || state.escalated ||
+        state.stillSince == 0)
+        return false;
+    float const dx = x - state.anchorX;
+    float const dy = y - state.anchorY;
+    if (dx * dx + dy * dy > limits.movedResetYards * limits.movedResetYards)
+        return false;
+    return now - state.stillSince < limits.stillSeconds + limits.holdGraceSeconds;
+}
+
+bool StallRecoveryMayRead(bool alive, bool inCombat)
+{
+    return alive && !inCombat;
+}
+
 bool StallRecoveryIdleDue(StallRecoveryState& state, float x, float y, std::int64_t now,
                           StallRecoveryLimits const& limits, std::int64_t intervalSeconds)
 {
     if (state.offMeshReleases == 0 || state.escalated ||
-        state.offMeshReleases < limits.releases || now - state.since < limits.seconds)
+        state.offMeshReleases < limits.releases ||
+        (now - state.since < limits.seconds && !StallRecoveryStood(state, x, y, now, limits)))
         return false;
     float const dx = x - state.anchorX;
     float const dy = y - state.anchorY;
@@ -1553,6 +1606,34 @@ bool StallRecoveryIdleDue(StallRecoveryState& state, float x, float y, std::int6
         return false;
     state.idleReadAt = now;
     return true;
+}
+
+LethalRefusalVerdict LethalRefusalStep(StallRecoveryState& state,
+                                       LethalRefusalFacts const& facts,
+                                       StallRecoveryLimits const& limits)
+{
+    float const dx = facts.x - state.lethalX;
+    float const dy = facts.y - state.lethalY;
+    if (state.lethalCount == 0 ||
+        dx * dx + dy * dy > limits.movedResetYards * limits.movedResetYards)
+    {
+        state.lethalCount = 0;
+        state.lethalX = facts.x;
+        state.lethalY = facts.y;
+    }
+    ++state.lethalCount;
+    LethalRefusalVerdict verdict;
+    verdict.refusals = state.lethalCount;
+    if (state.lethalCount < limits.lethalRefusals)
+        return verdict;
+    if (!facts.hasStone || !facts.stoneReady || !facts.sameMapBind || facts.hearthPending)
+    {
+        verdict.action = LethalRefusalAction::Keep;
+        return verdict;
+    }
+    state.lethalCount = 0;
+    verdict.action = LethalRefusalAction::Hearth;
+    return verdict;
 }
 
 void StallRecoveryNotDone(StallRecoveryState& state)
@@ -4553,9 +4634,51 @@ bool ReleaseLandsAim(ReleaseLandingFacts const& facts)
     return !facts.anyClaim && !facts.standing.empty() && facts.driving == facts.standing;
 }
 
+void NoteCounterArrival(CounterArrivalMemory& memory, std::string const& aim)
+{
+    memory.aim = aim;
+    memory.said = false;
+}
+
+LandedErrand CounterArrivalMemoryStep(CounterArrivalMemory& memory,
+                                      std::string const& columnAim, bool counterHoldActive,
+                                      bool& sayIt)
+{
+    sayIt = false;
+    LandedErrand const step =
+        LandedErrandStep(memory.aim, columnAim, true, counterHoldActive, 0, 0);
+    if (step == LandedErrand::Resume)
+    {
+        memory = CounterArrivalMemory{};
+        return step;
+    }
+    if (step == LandedErrand::StandDown && !memory.said)
+    {
+        memory.said = true;
+        sayIt = true;
+    }
+    return step;
+}
+
 bool UnresolvedAimStandsDown(std::string const& aim)
 {
     return !aim.empty() && aim.rfind("at:", 0) != 0;
+}
+
+bool UnresolvedSpawnIsRefused(std::string const& aim, bool guarded)
+{
+    if (guarded || aim.empty())
+        return false;
+    for (char const ch : aim)
+        if (ch < '0' || ch > '9')
+            return false;
+    return true;
+}
+
+std::string UnresolvedSpawnRefusal(std::uint32_t leaderMap)
+{
+    return "its spawn is not on map " + std::to_string(leaderMap) +
+           ", where the character stands, and no route to its own map is built (#1711)";
 }
 
 TravelClaim ReadTravelClaim(TravelClaimFacts const& facts)
@@ -4682,6 +4805,14 @@ std::string TravelReleaseGate(TravelReleaseGateFacts const& facts)
     // the book's own bookkeeping still ends, exactly as before.
     if (facts.changedSinceClaim)
         return "the column changed after this book's claim";
+    if (facts.inertFollowerAim)
+    {
+        if (facts.claimed)
+            return "this book holds a claim on the follower's aim";
+        if (InertFollowerAimMayBeCleared(facts.standing, facts.learnSkill, INERT_FOLLOWER_AIM_SECONDS))
+            return std::string();
+        return "the standing aim is protected from inert release";
+    }
     // A CLAIMED AIM IS THIS BOOK'S ERRAND ENDING (#822). The foreign-aim fence
     // exists for aims the book never claimed - a repair/vendor/banker/
     // auctioneer aim the bridge wrote, a positional aim another pass is
@@ -4693,20 +4824,14 @@ std::string TravelReleaseGate(TravelReleaseGateFacts const& facts)
     // skipped - reborn every poll.
     if (facts.claimed)
         return std::string();
-    // AN AIM NOTHING WALKS IS NOBODY'S ERRAND TO PROTECT (#1610). The fence
-    // exists so an economy pass's aim is not erased under it; a follower's
-    // counter keyword is refused every poll because only the leader walks, so
-    // the pass it protects is not running on it.
-    if (facts.inertFollowerAim &&
-        InertFollowerAimMayBeCleared(facts.standing, facts.learnSkill, INERT_FOLLOWER_AIM_SECONDS))
-        return std::string();
     return TravelReleaseFence(facts.learnSkill, facts.standing);
 }
 
 bool InertFollowerAimMayBeCleared(std::string const& aim, uint32_t learnSkill,
                                   int64_t inertSeconds)
 {
-    return learnSkill == 0 && IsMaintenanceErrand(aim) && inertSeconds >= INERT_FOLLOWER_AIM_SECONDS;
+    return learnSkill == 0 && inertSeconds >= INERT_FOLLOWER_AIM_SECONDS &&
+           (IsMaintenanceErrand(aim) || aim.rfind("at:", 0) == 0);
 }
 
 bool RunAimMayBeReleased(std::string const& current,
@@ -16129,6 +16254,41 @@ TownTripPlan PlanTownTrip(std::vector<TownNeed> const& members,
                           TownTripLimits const& limits,
                           time_t secondsSinceLastTrip, bool busy)
 {
+    return PlanTownTrip(members, limits, secondsSinceLastTrip, busy, std::vector<bool>{});
+}
+
+bool TownTripBagsFruitless(TownNeed const& need, FruitlessBagsMark const& mark,
+                           TownTripLimits const& limits, time_t now)
+{
+    if (!mark.set || !need.present)
+        return false;
+    if (now - mark.at >= limits.fruitlessBagsSeconds)
+        return false;
+    return need.freeBagSlots <= mark.freeBagSlots;
+}
+
+FruitlessBagsMark NoteTownTripBags(TownNeed const& before, TownNeed const& after,
+                                   std::uint64_t copperBefore, std::uint64_t copperAfter,
+                                   CounterRole role, bool stoodAtCounter,
+                                   TownTripLimits const& limits, time_t now,
+                                   FruitlessBagsMark const& previous)
+{
+    if (role != CounterRole::Vendor || !stoodAtCounter || !before.present || !after.present)
+        return previous;
+    if (before.freeBagSlots > limits.freeBagSlotsToGo)
+        return previous;
+    bool const madeRoom =
+        after.freeBagSlots > before.freeBagSlots || copperAfter > copperBefore;
+    if (madeRoom)
+        return FruitlessBagsMark{};
+    return FruitlessBagsMark{true, after.freeBagSlots, now};
+}
+
+TownTripPlan PlanTownTrip(std::vector<TownNeed> const& members,
+                          TownTripLimits const& limits,
+                          time_t secondsSinceLastTrip, bool busy,
+                          std::vector<bool> const& bagsFruitless)
+{
     TownTripPlan plan;
 
     if (busy)
@@ -16140,9 +16300,15 @@ TownTripPlan PlanTownTrip(std::vector<TownNeed> const& members,
     if (secondsSinceLastTrip < limits.cooldownSeconds)
         return plan;
 
-    for (TownNeed const& need : members)
+    for (size_t i = 0; i < members.size(); ++i)
     {
-        TownReason const reason = TownTripMemberReason(need, limits);
+        TownNeed const& need = members[i];
+        TownReason reason = TownTripMemberReason(need, limits);
+        // A VENDOR ALREADY FAILED THIS MEMBER'S BAGS (wow-overseer#1261): its
+        // bags are no reason, and what is left is its gear, read as if the bags
+        // had room.
+        if (reason == TownReason::Bags && i < bagsFruitless.size() && bagsFruitless[i])
+            reason = need.damagedItems ? TownReason::Worn : TownReason::None;
         if (reason == TownReason::None)
             continue;
 
@@ -16189,6 +16355,10 @@ TownStop TownTripMemberStop(TownStopFacts const& facts)
         return TownStop::Done;
     if (facts.atTheCounter)
         return TownStop::Trade;
+    // An off-mesh member whose aim keeps being refused is not waited for, at
+    // any distance and whether or not the leader is at the counter.
+    if (!facts.isLeader && facts.offMeshHeld)
+        return TownStop::OffMesh;
     // The journey is the leader's. A follower is brought by the catch-up walk
     // and the regroup wait (#404), not by an aim of this trip's own.
     if (!facts.isLeader && !facts.leaderAtTheCounter)
@@ -16236,6 +16406,7 @@ char const* TownStopWord(TownStop stop)
         case TownStop::Follow: return "follow";
         case TownStop::TooFar: return "too far";
         case TownStop::StoodDown: return "stood down";
+        case TownStop::OffMesh: return "off the mesh";
     }
     return "unknown";
 }
@@ -18560,31 +18731,43 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
             long const assembleWait = RaidAssembleWaitSeconds(facts.awayOnOtherMap);
             bool const waitOver = facts.heldSeconds >= assembleWait;
             bool const quorum = RaidQuorumMet(facts);
-            if (facts.headAssembled && quorum &&
-                (facts.assembled >= facts.inWorld || waitOver))
+            bool const allPresent = facts.assembled >= facts.inWorld;
+            // A far-held seat is waiting on the head. Keep the ordinary wait
+            // if a summon or a new invitation can still bring someone in.
+            bool const onlyFarHeldMissing =
+                !allPresent && facts.heldTooFar == facts.inWorld - facts.assembled &&
+                facts.addable == 0 && !facts.stoneSummonPending;
+            if (facts.headAssembled && quorum && (allPresent || onlyFarHeldMissing || waitOver))
             {
                 step.phase = RaidRunPhase::Enter;
                 step.aimDoor = true;
                 step.knockMembers = true;
-                step.why = facts.assembled >= facts.inWorld
-                               ? "every raid member in the world is at the door"
-                               : "the wait for stragglers is over; the raid goes "
-                                 "with whoever is at the door";
+                step.why = onlyFarHeldMissing
+                    ? "the raid has a quorum at the door and the remaining seats are held "
+                      "for the head"
+                    : allPresent ? "every raid member in the world is at the door"
+                                 : "the wait for stragglers is over; the raid goes "
+                                   "with whoever is at the door";
                 return step;
             }
             if (facts.headAssembled && waitOver && !quorum)
             {
                 step.shortfall = RaidQuorumShortfall(facts);
-                if (facts.heldSeconds >= assembleWait + RAID_QUORUM_EXTRA_WAIT_SECONDS)
+                if (onlyFarHeldMissing ||
+                    facts.heldSeconds >= assembleWait + RAID_QUORUM_EXTRA_WAIT_SECONDS)
                 {
                     step.phase = RaidRunPhase::Idle;
                     step.release = true;
                     step.quorumEnds = true;
-                    step.why = "the raid never reached a quorum at the door; the order ends";
+                    step.why = onlyFarHeldMissing
+                        ? "the raid never reached a quorum at the door; the remaining seats "
+                          "are held for the head and the order ends"
+                        : "the raid never reached a quorum at the door; the order ends";
                     return step;
                 }
                 step.phase = RaidRunPhase::Assemble;
-                step.aimStaging = true;
+                step.aimStaging = !facts.headAssembled;
+                step.headHolds = facts.headAssembled;
                 step.aimSeats = true;
                 step.summonStragglers = true;
                 step.why = "the wait is over but the raid at the door is short of a "
@@ -18592,7 +18775,10 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
                 return step;
             }
             step.phase = RaidRunPhase::Assemble;
-            step.aimStaging = true;
+            // A head already inside the assemble radius is not walked again (#1703):
+            // the walk arrived, and re-claiming it every poll only churns.
+            step.aimStaging = !facts.headAssembled;
+            step.headHolds = facts.headAssembled;
             step.aimSeats = true;
             step.summonStragglers = facts.headAssembled &&
                                     facts.heldSeconds >= RAID_STONE_SUMMON_AFTER_SECONDS;
@@ -19490,7 +19676,7 @@ TravelStuckAction TravelStuckDecision(uint32_t attempts, uint32_t limit,
 
 TravelNoProgressBackoffAction TravelNoProgressBackoffStep(
     TravelNoProgressBackoffState& state, time_t now, uint32_t releaseLimit,
-    time_t cooldownSeconds)
+    time_t cooldownSeconds, std::string const& urgency, TravelFeet const* feet)
 {
     if (releaseLimit == 0 || cooldownSeconds <= 0)
         return TravelNoProgressBackoffAction::Continue;
@@ -19498,13 +19684,30 @@ TravelNoProgressBackoffAction TravelNoProgressBackoffStep(
         return TravelNoProgressBackoffAction::Backoff;
     if (state.until != 0 && state.until <= now)
     {
-        state.releases = 0;
+        bool const sameUrgency = !urgency.empty() && urgency == state.urgency;
+        bool sameSpot = false;
+        if (feet && state.anchored)
+        {
+            float const dx = feet->x - state.anchorX;
+            float const dy = feet->y - state.anchorY;
+            sameSpot = dx * dx + dy * dy <=
+                       TRAVEL_BACKOFF_SAME_SPOT_YARDS * TRAVEL_BACKOFF_SAME_SPOT_YARDS;
+        }
+        state.releases = (sameUrgency || sameSpot) ? releaseLimit - 1 : 0;
+        state.anchored = false;
         state.until = 0;
     }
     ++state.releases;
     if (state.releases < releaseLimit)
         return TravelNoProgressBackoffAction::Continue;
     state.until = now + cooldownSeconds;
+    state.urgency = urgency;
+    state.anchored = feet != nullptr;
+    if (feet)
+    {
+        state.anchorX = feet->x;
+        state.anchorY = feet->y;
+    }
     return TravelNoProgressBackoffAction::Backoff;
 }
 
@@ -26143,6 +26346,7 @@ void ClearLeaderIntent(LeaderIntentState& state)
     state.since = 0;
     state.lastAsked = 0;
     state.dwellWaived = false;
+    state.leftMemberBehind = false;
 }
 
 std::string LowerTrimmed(std::string const& text)
@@ -26201,9 +26405,19 @@ bool LeaderIntentWalksUnderNewRpg(LeaderIntentKind kind)
 }
 
 int LeaderIntentRank(LeaderIntentKind kind, std::string const& target,
-                     LeaderIntentPreference const& preference, std::time_t now)
+                     LeaderIntentPreference const& preference, std::time_t now,
+                     bool leftMemberBehind)
 {
-    int const own = static_cast<int>(kind) * 10;
+    // A VENDOR ERRAND AFTER THE BRIDGE LEFT THE HELD MEMBER BEHIND OUTRANKS A
+    // FETCH AND A REGROUP. The bridge writes it only once the member passed its
+    // bound, so fetching that member again undoes the family's decision: the
+    // leader walked back for it, the errand ended, the bridge re-armed it, and
+    // nobody ever sold. Just above FetchMember, below the family's trip home.
+    bool const errandKind =
+        kind == LeaderIntentKind::EconomyErrand || kind == LeaderIntentKind::TownErrand;
+    int const own = leftMemberBehind && errandKind
+                        ? static_cast<int>(LeaderIntentKind::FetchMember) * 10 + 5
+                        : static_cast<int>(kind) * 10;
     bool const preferred = preference.kind != LeaderIntentKind::None &&
                            now < preference.until && kind == preference.kind &&
                            (preference.target.empty() || preference.target == target);
@@ -26255,6 +26469,7 @@ LeaderIntentVerdict AskLeaderIntent(LeaderIntentState& state,
         state.kind = request.kind;
         state.target = request.target;
         state.why = request.why;
+        state.leftMemberBehind = request.leftMemberBehind;
         state.lastAsked = now;
         state.deferralSaid.erase(request.owner);
         verdict.answer = LeaderIntentAnswer::Retargeted;
@@ -26270,6 +26485,7 @@ LeaderIntentVerdict AskLeaderIntent(LeaderIntentState& state,
         if (yielded != state.cooldownUntil.end() && now < yielded->second)
             yielded->second = std::max(yielded->second, now + limits.regroupYieldCooldownSeconds);
         state.lastAsked = now;
+        state.leftMemberBehind = request.leftMemberBehind;
         state.deferralSaid.erase(request.owner);
         if (state.target == request.target)
         {
@@ -26292,10 +26508,21 @@ LeaderIntentVerdict AskLeaderIntent(LeaderIntentState& state,
 
     if (live)
     {
-        int const held = LeaderIntentRank(state.kind, state.target, preference, now);
-        int const asked = LeaderIntentRank(request.kind, request.target, preference, now);
+        int const held = LeaderIntentRank(state.kind, state.target, preference, now,
+                                          state.leftMemberBehind);
+        int const asked = LeaderIntentRank(request.kind, request.target, preference, now,
+                                           request.leftMemberBehind);
         std::time_t const ran = now - state.since;
-        bool const dwellOver = state.dwellWaived || ran >= limits.dwellSeconds;
+        // The errand that outranks the fetch for a member left behind takes the
+        // leader at once: waiting out a dwell for a fetch it overrides is the
+        // loop this rule exists to end.
+        bool const overridesFetch =
+            request.leftMemberBehind &&
+            (state.kind == LeaderIntentKind::FetchMember ||
+             state.kind == LeaderIntentKind::Regroup) &&
+            (request.kind == LeaderIntentKind::EconomyErrand ||
+             request.kind == LeaderIntentKind::TownErrand);
+        bool const dwellOver = state.dwellWaived || overridesFetch || ran >= limits.dwellSeconds;
         bool const regroupYields = state.kind == LeaderIntentKind::Regroup &&
                                    (request.kind == LeaderIntentKind::EconomyErrand ||
                                     request.kind == LeaderIntentKind::TownErrand) &&
@@ -26325,6 +26552,7 @@ LeaderIntentVerdict AskLeaderIntent(LeaderIntentState& state,
     state.owner = request.owner;
     state.target = request.target;
     state.why = request.why;
+    state.leftMemberBehind = request.leftMemberBehind;
     state.since = now;
     state.lastAsked = now;
     state.dwellWaived = false;
@@ -29839,6 +30067,130 @@ bool FlightLegStrayed(float yardsNow, float yardsAtIssue)
     if (yardsAtIssue < 0.f)
         return false;
     return yardsNow > yardsAtIssue + FLIGHT_LEG_STRAY_YARDS;
+}
+
+// ------------------------------------------- a death loop holds the idle AI --
+
+int64_t DeathLoopHoldBound(int64_t configuredSeconds)
+{
+    if (configuredSeconds <= 0)
+        return 0;
+    return configuredSeconds > DEATH_LOOP_HOLD_MAX_SECONDS ? DEATH_LOOP_HOLD_MAX_SECONDS
+                                                           : configuredSeconds;
+}
+
+namespace
+{
+// The whole non-negative number after `"key"` and its colon, or false.
+bool DeathLoopFlagNumber(std::string const& value, char const* key, uint32_t& out)
+{
+    std::string const quoted = std::string("\"") + key + "\"";
+    std::size_t at = value.find(quoted);
+    if (at == std::string::npos)
+        return false;
+    at += quoted.size();
+    while (at < value.size() && (value[at] == ' ' || value[at] == '\t'))
+        ++at;
+    if (at >= value.size() || value[at] != ':')
+        return false;
+    ++at;
+    while (at < value.size() && (value[at] == ' ' || value[at] == '\t'))
+        ++at;
+    uint64_t number = 0;
+    std::size_t digits = 0;
+    while (at < value.size() && value[at] >= '0' && value[at] <= '9')
+    {
+        number = number * 10 + uint64_t(value[at] - '0');
+        if (number > 0xFFFFFFFFull)
+            return false;
+        ++at;
+        ++digits;
+    }
+    if (!digits)
+        return false;
+    if (at < value.size() && value[at] != ',' && value[at] != '}' && value[at] != ' ')
+        return false;
+    out = uint32_t(number);
+    return true;
+}
+}  // namespace
+
+DeathLoopFlag ParseDeathLoopFlag(std::string const& value)
+{
+    DeathLoopFlag flag;
+    std::size_t const open = value.find_first_not_of(" \t");
+    if (open == std::string::npos || value[open] != '{' || value.find('}') == std::string::npos)
+        return flag;
+    uint32_t mapId = 0;
+    uint32_t zoneId = 0;
+    if (!DeathLoopFlagNumber(value, "map", mapId) || !DeathLoopFlagNumber(value, "zone", zoneId) ||
+        zoneId == 0)
+        return flag;
+    flag.ok = true;
+    flag.mapId = mapId;
+    flag.zoneId = zoneId;
+    return flag;
+}
+
+DeathLoopHoldWhy DeathLoopHoldReason(DeathLoopHoldFacts const& facts)
+{
+    if (!facts.enabled || facts.boundSeconds <= 0)
+        return DeathLoopHoldWhy::SwitchOff;
+    // A flag time after now is a clock the module cannot read a bound off, so
+    // it holds nobody rather than holding for longer than the bound.
+    if (!facts.flagged || facts.flagZoneId == 0 || facts.flaggedAt <= 0 ||
+        facts.flaggedAt > facts.now)
+        return DeathLoopHoldWhy::NotFlagged;
+    if (facts.hasJob)
+        return DeathLoopHoldWhy::HasJob;
+    if (facts.follower)
+        return DeathLoopHoldWhy::Follower;
+    if (facts.mapId != facts.flagMapId || facts.zoneId != facts.flagZoneId)
+        return DeathLoopHoldWhy::LeftZone;
+    if (facts.now - facts.flaggedAt >= DeathLoopHoldBound(facts.boundSeconds))
+        return DeathLoopHoldWhy::BoundPassed;
+    return DeathLoopHoldWhy::Holds;
+}
+
+char const* DeathLoopHoldWhyName(DeathLoopHoldWhy why)
+{
+    switch (why)
+    {
+        case DeathLoopHoldWhy::Holds:
+            return "held in its death loop's zone";
+        case DeathLoopHoldWhy::SwitchOff:
+            return "the hold is switched off";
+        case DeathLoopHoldWhy::NotFlagged:
+            return "no death loop is flagged";
+        case DeathLoopHoldWhy::HasJob:
+            return "it has a job";
+        case DeathLoopHoldWhy::Follower:
+            return "it follows somebody";
+        case DeathLoopHoldWhy::LeftZone:
+            return "it left the loop's zone";
+        case DeathLoopHoldWhy::BoundPassed:
+            return "the hold's bound has passed";
+    }
+    return "unknown";
+}
+
+bool DeathLoopHolds(DeathLoopHoldFacts const& facts)
+{
+    return DeathLoopHoldReason(facts) == DeathLoopHoldWhy::Holds;
+}
+
+DeathLoopHoldStep DeathLoopHoldStepFor(DeathLoopHoldWhy why, bool tookItOff, bool carriesNewRpg,
+                                       bool otherHoldInForce)
+{
+    if (why == DeathLoopHoldWhy::HasJob || why == DeathLoopHoldWhy::Follower)
+        return tookItOff ? DeathLoopHoldStep::Forget : DeathLoopHoldStep::Nothing;
+    if (otherHoldInForce)
+        return DeathLoopHoldStep::Nothing;
+    if (why == DeathLoopHoldWhy::Holds)
+        return carriesNewRpg ? DeathLoopHoldStep::TakeOff : DeathLoopHoldStep::Nothing;
+    if (!tookItOff)
+        return DeathLoopHoldStep::Nothing;
+    return DeathLoopHoldStep::HandBack;
 }
 
 }  // namespace OverseerDecisions

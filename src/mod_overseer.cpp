@@ -4024,33 +4024,32 @@ bool ItemKept(Player const* who, Item const* item)
 
 // READ, AND A FAILED READ IS NOT AN EMPTY TABLE. A reservation that vanished
 // for one poll because the database hiccuped would let the next sell row take
-// the item. So the count is asked first: a count that does not come back
-// (the table missing on a world that has not run the migration, or a failed
-// query) keeps whatever was read last; a count of 0 is a real empty table.
+// the item. A LEFT JOIN against a single-row sentinel returns null on a failed
+// query or missing table (keeping whatever was read last), one row with a NULL
+// character_name when the table is empty (clearing the cache), and N rows when
+// populated, in one round trip instead of a COUNT(*) pre-query plus a SELECT.
 void ReloadKeepReservations()
 {
-    QueryResult count = CharacterDatabase.Query("SELECT COUNT(*) FROM overseer_keep");
-    if (!count)
+    QueryResult rows = CharacterDatabase.Query(
+        "SELECT k.character_name, k.item_entry, k.item_guid, k.until_level, k.reason "
+        "FROM (SELECT 1) AS _sentinel "
+        "LEFT JOIN overseer_keep k ON 1=1");
+    if (!rows)
         return;
     std::vector<OverseerDecisions::KeepReservation> reservations;
-    if (count->Fetch()[0].Get<uint64>() > 0)
+    do
     {
-        QueryResult rows = CharacterDatabase.Query(
-            "SELECT character_name, item_entry, item_guid, until_level, reason FROM overseer_keep");
-        if (!rows)
-            return;
-        do
-        {
-            Field* f = rows->Fetch();
-            OverseerDecisions::KeepReservation r;
-            r.character = f[0].Get<std::string>();
-            r.itemEntry = f[1].Get<uint32>();
-            r.itemGuid = f[2].Get<uint32>();
-            r.untilLevel = f[3].Get<uint8>();
-            r.reason = f[4].Get<std::string>();
-            reservations.push_back(std::move(r));
-        } while (rows->NextRow());
-    }
+        Field* f = rows->Fetch();
+        if (f[0].IsNull())
+            continue;
+        OverseerDecisions::KeepReservation r;
+        r.character = f[0].Get<std::string>();
+        r.itemEntry = f[1].Get<uint32>();
+        r.itemGuid = f[2].Get<uint32>();
+        r.untilLevel = f[3].Get<uint8>();
+        r.reason = f[4].Get<std::string>();
+        reservations.push_back(std::move(r));
+    } while (rows->NextRow());
     SetKeepReservations(std::move(reservations));
 }
 
@@ -4062,6 +4061,7 @@ void ReloadKeepReservations()
 // is OverseerDecisions::SeatTalentVerdictFor, pinned by tests/test_seat_talents.cpp.
 std::mutex g_raidSpecMutex;
 std::vector<OverseerDecisions::RaidSpecTarget> g_raidSpec;
+bool g_raidSpecTablePresent = false;
 
 bool RaidSpecTargetOf(std::string const& name, OverseerDecisions::RaidSpecTarget& out)
 {
@@ -4075,33 +4075,39 @@ bool RaidSpecTargetOf(std::string const& name, OverseerDecisions::RaidSpecTarget
 
 // A world without the table (2026_09_25_10_overseer_raid_spec.sql not applied)
 // or a failed read keeps what was read last, as the keep reservations do. The
-// table is asked about first so a missing one costs no SQL error per minute.
+// table is asked about until found once, then cached so steady-state polls pay
+// no INFORMATION_SCHEMA.TABLES query. A LEFT JOIN against a single-row sentinel
+// distinguishes a failed read (null result) from an empty table (one NULL row)
+// in a single query.
 void ReloadRaidSpecTargets()
 {
-    QueryResult present = CharacterDatabase.Query(
-        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
-        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'overseer_raid_spec'");
-    if (!present || present->Fetch()[0].Get<uint64>() == 0)
-        return;
-    QueryResult count = CharacterDatabase.Query("SELECT COUNT(*) FROM overseer_raid_spec");
-    if (!count)
+    if (!g_raidSpecTablePresent)
+    {
+        QueryResult present = CharacterDatabase.Query(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'overseer_raid_spec'");
+        if (!present || present->Fetch()[0].Get<uint64>() == 0)
+            return;
+        g_raidSpecTablePresent = true;
+    }
+    QueryResult rows = CharacterDatabase.Query(
+        "SELECT r.name, r.class, r.tab "
+        "FROM (SELECT 1) AS _sentinel "
+        "LEFT JOIN overseer_raid_spec r ON 1=1");
+    if (!rows)
         return;
     std::vector<OverseerDecisions::RaidSpecTarget> targets;
-    if (count->Fetch()[0].Get<uint64>() > 0)
+    do
     {
-        QueryResult rows = CharacterDatabase.Query("SELECT name, class, tab FROM overseer_raid_spec");
-        if (!rows)
-            return;
-        do
-        {
-            Field* f = rows->Fetch();
-            OverseerDecisions::RaidSpecTarget t;
-            t.name = f[0].Get<std::string>();
-            t.classId = f[1].Get<uint8>();
-            t.tab = f[2].Get<uint8>();
-            targets.push_back(std::move(t));
-        } while (rows->NextRow());
-    }
+        Field* f = rows->Fetch();
+        if (f[0].IsNull())
+            continue;
+        OverseerDecisions::RaidSpecTarget t;
+        t.name = f[0].Get<std::string>();
+        t.classId = f[1].Get<uint8>();
+        t.tab = f[2].Get<uint8>();
+        targets.push_back(std::move(t));
+    } while (rows->NextRow());
     std::lock_guard<std::mutex> guard(g_raidSpecMutex);
     g_raidSpec.swap(targets);
 }
@@ -6361,14 +6367,15 @@ void LogLeaderAsk(std::string const& name, OverseerDecisions::LeaderIntentKind k
 }
 
 bool AskForLeader(std::string const& name, OverseerDecisions::LeaderIntentKind kind,
-                  std::string const& owner, std::string const& target, std::string const& why)
+                  std::string const& owner, std::string const& target, std::string const& why,
+                  bool leftMemberBehind = false)
 {
     if (!LeaderIntentApplies(name))
         return true;
     time_t const now = std::time(nullptr);
     OverseerMovement::LeaderIntentSnapshot const before = MovementOwner().LeaderIntentStateFor(name);
     OverseerDecisions::LeaderIntentVerdict const verdict =
-        MovementOwner().AskForLeader(name, kind, owner, target, why, now);
+        MovementOwner().AskForLeader(name, kind, owner, target, why, now, leftMemberBehind);
     LogLeaderAsk(name, kind, owner, target, why, before, verdict, now);
     return verdict.answer != OverseerDecisions::LeaderIntentAnswer::Deferred;
 }
@@ -6584,9 +6591,9 @@ public:
         // it: a member carrying an aim nobody walks is still behind its leader,
         // not off on an errand of its own. See MemberFollowsForFlight.
         bool inertFollowerAim{false};
-        // When the aim began to be refused as inert (#1610), or 0. Cleared with
-        // the flag, so a walked aim starts the count again.
+        // Refusal window for the same aim in consecutive travel polls.
         time_t inertSince{0};
+        uint64_t inertPoll{0};
         // Said once per HOLD, not once per errand, which is why it is not
         // `arrived` (#311). The post-revival hold takes `new rpg` off on purpose
         // for a few seconds and gives it back itself, so the line about it is
@@ -7018,6 +7025,13 @@ public:
         // run's own errand from anybody else's (the death breaker reads it).
         _state.erase(name);
         _landed.erase(name);
+        {
+            // The same counter written again is not another errand while its
+            // hold stands (#1708); only a different aim forgets the arrival.
+            auto const arrived = _counterArrivals.find(name);
+            if (arrived != _counterArrivals.end() && arrived->second.aim != target)
+                _counterArrivals.erase(arrived);
+        }
         // AND WHAT IT WROTE, KEPT PAST THE CLAIM (#824). The claim ends with
         // the errand; this does not, so a poisoned aim found later can be told
         // apart: one this module wrote and lost the claim on, or one a writer
@@ -7085,14 +7099,18 @@ public:
     // the claim and stamps the hand-back clock that keeps the quest drive off
     // the wheel (see TravelHoldsTheWheel, case 2); this book ends the errand
     // memory around it.
-    // `inertFollowerAim` is the drive saying the aim in the column is one nothing
-    // walks and has not for INERT_FOLLOWER_AIM_SECONDS (#1610): the gate then lets
-    // a counter keyword be cleared, which it fences when the book never claimed it.
-    void Release(std::string const& name, std::string const& why = std::string(),
-                 bool inertFollowerAim = false)
+    void Release(std::string const& name, std::string const& why = std::string())
     {
-        ReleaseImpl(name, why,
-                    MovementOwner().Release(name, std::time(nullptr), inertFollowerAim));
+        ReleaseImpl(name, why, MovementOwner().Release(name, std::time(nullptr)));
+    }
+
+    bool ReleaseInertFollowerAim(std::string const& name, std::string const& aim)
+    {
+        auto const released = MovementOwner().ReleaseInertFollowerAim(name, aim, std::time(nullptr));
+        if (released.leftNewerAim || !released.fence.empty())
+            return false;
+        ReleaseImpl(name, "an aim nothing walks (inert follower)", released);
+        return true;
     }
 
     // Close a dungeon coordinator's travel state without giving back a newer
@@ -7153,6 +7171,7 @@ public:
         // reads as a new errand. The landing recorded below is what stops
         // that; see LandedStep and OverseerDecisions::LandedErrandStep.
         _landed.erase(name);
+        _counterArrivals.erase(name);
         // ONLY AN AIM THIS BOOK WAS DRIVING LANDS. A release that finds an aim
         // in the column the travel drive was not walking has not walked it at
         // all, and must not stop the travel drive from starting it. AND ONLY AN
@@ -7222,6 +7241,10 @@ public:
     // there is then no landing to mark.
     void MarkCounterLanding(std::string const& name, std::string const& target)
     {
+        // REMEMBERED WHETHER OR NOT THE RELEASE LEFT A LANDING (#1708): a claimed
+        // aim's release clears the column, and the writer then writes the same
+        // counter again with nothing here to say the character is already at it.
+        OverseerDecisions::NoteCounterArrival(_counterArrivals[name], target);
         auto const it = _landed.find(name);
         if (it == _landed.end() || it->second.aim != target)
             return;
@@ -7252,6 +7275,26 @@ public:
                                                std::string const& columnAim,
                                                bool counterHoldActive)
     {
+        auto const arrival = _counterArrivals.find(name);
+        if (arrival != _counterArrivals.end())
+        {
+            bool sayIt = false;
+            OverseerDecisions::LandedErrand const arrived =
+                OverseerDecisions::CounterArrivalMemoryStep(arrival->second, columnAim,
+                                                            counterHoldActive, sayIt);
+            if (arrived == OverseerDecisions::LandedErrand::Resume)
+                _counterArrivals.erase(arrival);
+            else if (arrived == OverseerDecisions::LandedErrand::StandDown)
+            {
+                if (sayIt)
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is at '{}' with its counter hold in force and "
+                             "the same aim is up again - not walked or claimed again while "
+                             "the hold stands (#1708). Said once per arrival",
+                             name, columnAim);
+                return arrived;
+            }
+        }
         auto const it = _landed.find(name);
         if (it == _landed.end())
             return OverseerDecisions::LandedErrand::NotLanded;
@@ -7451,6 +7494,7 @@ public:
         _lastEnd[name] = ErrandEnd{"a point aim left from before this worldserver started (#658)",
                                    false};
         _landed.erase(name);
+        _counterArrivals.erase(name);
         EndLeaderColumnIntent(name, "a point aim left from before this worldserver started");
         _state.erase(name);
     }
@@ -7686,7 +7730,9 @@ public:
         return true;
     }
 
-    bool NoteNoProgressRelease(std::string const& name, std::string const& target)
+    // The leader intent that last held `target` off this character.
+    void NoteUrgency(std::string const& name, std::string const& target,
+                     std::string const& urgency)
     {
         NoProgressBackoff& backoff = _noProgressBackoff[name];
         if (backoff.target != target)
@@ -7694,9 +7740,23 @@ public:
             backoff.target = target;
             backoff.state = OverseerDecisions::TravelNoProgressBackoffState{};
         }
+        backoff.urgency = urgency;
+    }
+
+    bool NoteNoProgressRelease(std::string const& name, std::string const& target,
+                               float x, float y)
+    {
+        NoProgressBackoff& backoff = _noProgressBackoff[name];
+        if (backoff.target != target)
+        {
+            backoff.target = target;
+            backoff.state = OverseerDecisions::TravelNoProgressBackoffState{};
+            backoff.urgency.clear();
+        }
+        OverseerDecisions::TravelFeet const feet{x, y};
         return OverseerDecisions::TravelNoProgressBackoffStep(
                    backoff.state, std::time(nullptr), TRAVEL_STUCK_BACKOFF_RELEASES,
-                   TRAVEL_STUCK_BACKOFF_SECONDS) ==
+                   TRAVEL_STUCK_BACKOFF_SECONDS, backoff.urgency, &feet) ==
                OverseerDecisions::TravelNoProgressBackoffAction::Backoff;
     }
 
@@ -7782,6 +7842,7 @@ private:
     struct NoProgressBackoff
     {
         std::string target;
+        std::string urgency;
         OverseerDecisions::TravelNoProgressBackoffState state;
     };
 
@@ -7802,6 +7863,11 @@ private:
         bool said{false};
     };
     std::map<std::string, Landing> _landed;
+    // An arrival at a counter that took the counter hold, kept even when the
+    // release cleared the column and so left no landing above (#1708). Written
+    // by MarkCounterLanding, erased by Release, a Claim of another aim,
+    // ForgetLeftover and CounterArrivalMemoryStep. World thread only.
+    std::map<std::string, OverseerDecisions::CounterArrivalMemory> _counterArrivals;
     // Which errand each character was last called off, so a re-aim at it is
     // refused rather than walked. Deliberately outlives the errand it ended; see
     // Refuse. World thread only, like everything else on this loop.
@@ -9177,6 +9243,13 @@ public:
     {
         _shareSweepQuery.ProcessReadyCallbacks();
         _disenchantQueries.ProcessReadyCallbacks();
+        _deathLoopQuery.ProcessReadyCallbacks();
+        _deathLoopTimer += diff;
+        if (_deathLoopTimer >= DEATH_LOOP_HOLD_POLL_MS)
+        {
+            _deathLoopTimer = 0;
+            DriveDeathLoopHold();
+        }
         _disenchantTimer += diff;
         if (_disenchantTimer >= 1000)
         {
@@ -30699,6 +30772,7 @@ private:
 
     void DriveTravel()
     {
+        uint64_t const previousTravelPoll = _travelPollSerial++;
         // Before anything else, so a death is read against the route the walker
         // was on whether or not it still holds an errand this poll (#502).
         NoteDeathsOnRoutes();
@@ -30861,6 +30935,7 @@ private:
                 state.pinned = false;
                 state.arrived = false;
                 state.heldSaid = false;
+                state.inertSince = 0;
                 // A new errand is a new flight budget too, and a new leg. The
                 // old errand's flights are spent, its leg is over the moment
                 // its aim stops being the aim, and its refusal to fly was
@@ -30963,10 +31038,55 @@ private:
                             !FetchTargetOf(name).empty()
                         ? FetchTargetOf(name)
                         : target;
-                if (!AskForLeader(name, kind, owner, about, "walks to '" + target + "'"))
+                // A MAINTENANCE ERRAND THE BRIDGE WROTE IS ITS DECISION TO GO WITHOUT
+                // ANY HELD MEMBER: it writes the aim only once vendor_stall's
+                // held_fetch_bound has left them behind, so a fetch or regroup
+                // for one does not take the leader off it again.
+                bool const bridgeErrand = kind == OverseerDecisions::LeaderIntentKind::EconomyErrand &&
+                                          OverseerDecisions::IsMaintenanceErrand(target) &&
+                                          !MovementOwner().HoldsClaim(name, columnAim);
+                // A WALKER STANDING STILL OFF THE MESH IS NOT CLAIMED FOR AN ERRAND
+                // until the bounded recovery has taken it off (mod-overseer#1698):
+                // its walk never paths, and claiming it again only re-armed that
+                // walk. The recovery is read here, at the idle interval, since
+                // no release comes while it is not walking.
+                {
+                    auto const stall = _stallRecovery.find(LowerName(name));
+                    std::int64_t const stallNow = static_cast<std::int64_t>(std::time(nullptr));
+                    if (stall != _stallRecovery.end() &&
+                        OverseerDecisions::StallRecoveryHoldsErrand(
+                            stall->second, bot->GetPositionX(), bot->GetPositionY(), stallNow,
+                            STALL_RECOVERY_LIMITS))
+                    {
+                        // ALIVE AND OUT OF COMBAT, as RecoverIdleOffMesh asks: a
+                        // guarded walker is left alone this poll, streak kept.
+                        if (OverseerDecisions::StallRecoveryMayRead(bot->IsAlive(),
+                                                                    bot->IsInCombat()) &&
+                            OverseerDecisions::StallRecoveryIdleDue(
+                                stall->second, bot->GetPositionX(), bot->GetPositionY(), stallNow,
+                                STALL_RECOVERY_LIMITS, STALL_IDLE_READ_SECONDS))
+                            ReadStalledFooting(
+                                bot, name,
+                                WorldPosition(bot->GetMapId(), bot->GetPositionX(),
+                                              bot->GetPositionY(), bot->GetPositionZ()));
+                        state.progress.since = std::time(nullptr);
+                        state.progressWindow = OverseerDecisions::ErrandProgressWindow{};
+                        continue;
+                    }
+                }
+                if (!AskForLeader(name, kind, owner, about, "walks to '" + target + "'",
+                                  bridgeErrand))
                 {
                     state.progress.since = std::time(nullptr);
                     state.progressWindow = OverseerDecisions::ErrandProgressWindow{};
+                    // WHO HOLDS HIM, remembered, so a no-progress backoff that
+                    // lapses while the same holder stands does not start again.
+                    OverseerMovement::LeaderIntentSnapshot const holder =
+                        MovementOwner().LeaderIntentStateFor(name);
+                    _travelAims.NoteUrgency(
+                        name, target,
+                        std::to_string(static_cast<int>(holder.kind)) + "|" + holder.owner + "|" +
+                            holder.target);
                     continue;
                 }
                 if (!bot->IsAlive() || bot->IsInCombat())
@@ -31397,28 +31517,30 @@ private:
                 state.inertSince = 0;
             if (state.inertFollowerAim)
             {
-                // AN AIM NOTHING WALKS IS CLEARED AFTER A BOUND (#1610). Only for
-                // a follower in formation, where "aim the leader instead" is the
-                // whole remedy, and only for a counter keyword: the release gate
-                // would otherwise fence it as the bridge's and the column would
-                // keep blocking the catch-up walk and billing the errand budget.
-                if (!state.inertSince)
-                    state.inertSince = std::time(nullptr);
-                if (mover == OverseerDecisions::AimedMover::RefuseInFormation &&
-                    OverseerDecisions::InertFollowerAimMayBeCleared(
-                        target, state.learn,
-                        std::time(nullptr) - state.inertSince))
+                // Count only refusals of the column itself. A hold, a missing
+                // poll or a substitute aim breaks the window. Counter keywords
+                // keep the formation rule from #1610, while a cut-off follower
+                // can also be refused a point it has no strategy to walk.
+                if (columnAim == target && !bot->IsInFlight() &&
+                    !_travelAims.RunOwns(name, columnAim) &&
+                    (mover == OverseerDecisions::AimedMover::RefuseInFormation ||
+                     target.rfind("at:", 0) == 0))
                 {
-                    LOG_INFO("module.overseer",
-                             "overseer: '{}' has carried the aim '{}' for {}s and nothing "
-                             "walks it - only its leader carries `new rpg` - so the aim is "
-                             "cleared from its column (#1610)",
-                             name, target,
-                             static_cast<uint32>(std::time(nullptr) - state.inertSince));
-                    // `state` IS DEAD AFTER THIS: Release erases the record.
-                    _travelAims.Release(name, "an aim nothing walks (a follower's counter keyword)",
-                                        true);
-                    continue;
+                    time_t const now = std::time(nullptr);
+                    if (!state.inertSince || state.inertPoll != previousTravelPoll)
+                        state.inertSince = now;
+                    state.inertPoll = _travelPollSerial;
+                    time_t const inertSeconds = now - state.inertSince;
+                    if (OverseerDecisions::InertFollowerAimMayBeCleared(target, state.learn, inertSeconds) &&
+                        _travelAims.ReleaseInertFollowerAim(name, columnAim))
+                    {
+                        // The release erased `state`.
+                        LOG_INFO("module.overseer",
+                                 "overseer: cleared unclaimed aim '{}' for '{}' after {}s of "
+                                 "follower refusals (#1723)", target, name,
+                                 static_cast<uint32>(inertSeconds));
+                        continue;
+                    }
                 }
                 if (!state.arrived)
                 {
@@ -31747,6 +31869,24 @@ private:
                 // clear it anyway, and only a person ends a guard.
                 bool const poisoned = !guarded &&
                     _travelAims.NoteUnresolvedAim(name, target, static_cast<uint32>(bot->GetMapId()));
+                // A SPAWN ON ANOTHER MAP IS CALLED OFF FOR THE COOL-OFF (#1711).
+                // Released alone, the quest drive picked the same quest and the
+                // bridge wrote the same bare spawn id again, every few minutes,
+                // for hours. The refusal row is what it reads to pick another
+                // quest (refused_until), and the reason is on the row and here.
+                // The route to the spawn's own map is #513's, not built here.
+                if (OverseerDecisions::UnresolvedSpawnIsRefused(target, guarded))
+                {
+                    std::string const why = OverseerDecisions::UnresolvedSpawnRefusal(
+                        static_cast<uint32>(bot->GetMapId()));
+                    _travelAims.Refuse(name, target, why);
+                    LOG_INFO("module.overseer",
+                             "overseer: '{}' is refused the errand '{}' for {} minutes "
+                             "because {}",
+                             name, target,
+                             static_cast<uint32>(ERRAND_DEATH_LIMITS.cooloffSeconds / 60),
+                             why);
+                }
                 _travelAims.Release(name, "the travel drive (no such spawn on this map)");
                 // A KEYWORD OR AN ENTRY STANDS DOWN; A POINT IS COUNTED (#722).
                 // The release above leaves a landing for a foreign aim it could
@@ -32553,6 +32693,7 @@ private:
                     _travelAims.Refuse(name, target, OverseerDecisions::ErrandLethalRoad);
                     _travelAims.Release(name, "the travel drive (the road crosses ground far "
                                               "above the family's level)");
+                    ReleaseLethalRefusalStreak(bot, name);
                     continue;
                 }
                 if (step == OverseerDecisions::ErrandRoadStep::Hearth ||
@@ -32629,7 +32770,8 @@ private:
                     // when the recovery took the place of the backoff.
                     bool const recovered = ReadStalledFooting(bot, name, pos);
                     bool const backoff =
-                        _travelAims.NoteNoProgressRelease(name, target) && !recovered;
+                        _travelAims.NoteNoProgressRelease(name, target, reading.x, reading.y) &&
+                        !recovered;
                     if (backoff)
                     {
                         LOG_WARN("module.overseer",
@@ -32798,6 +32940,7 @@ private:
                     _travelAims.Refuse(name, target, planned.zoneRefusal);
                     _travelAims.Release(name, "the travel drive (the only route crosses a "
                                               "zone flagged for the party's deaths)");
+                    ReleaseLethalRefusalStreak(bot, name);
                     continue;
                 }
             }
@@ -41941,6 +42084,44 @@ private:
     }
     static constexpr std::int64_t STALL_IDLE_READ_SECONDS = 60;
 
+    // A LETHAL REFUSAL IS A RELEASE THE STREAK HEARS ABOUT. A walker whose aims
+    // are all refused as lethal never starts a walk, so the no-progress release
+    // never feeds its streak. Each lethal-refusal release feeds the same
+    // per-character state (_stallRecovery); at the limit, standing near one
+    // spot, it takes the hearthstone rung once, and a cooling stone keeps the
+    // streak.
+    void ReleaseLethalRefusalStreak(Player* bot, std::string const& name)
+    {
+        OverseerDecisions::LethalRefusalFacts facts;
+        facts.x = bot->GetPositionX();
+        facts.y = bot->GetPositionY();
+        uint32 const stone = HearthstoneSpellOf(bot);
+        facts.hasStone = stone != 0;
+        facts.stoneReady = stone && !bot->HasSpellCooldown(stone);
+        facts.sameMapBind = bot->m_homebindMapId == bot->GetMapId();
+        facts.hearthPending = HearthPendingFor(bot->GetName());
+        OverseerDecisions::LethalRefusalVerdict const verdict =
+            OverseerDecisions::LethalRefusalStep(_stallRecovery[LowerName(name)], facts,
+                                                 STALL_RECOVERY_LIMITS);
+        if (verdict.action != OverseerDecisions::LethalRefusalAction::Hearth)
+            return;
+        char const* status = "error";
+        std::string evidence;
+        char const* const refused = DoHearth(bot, "use", status, evidence, _pendingHearths, 0);
+        if (refused && *refused)
+        {
+            LOG_WARN("module.overseer",
+                     "overseer: '{}' had {} aims refused as lethal in a row; the hearthstone "
+                     "rung was refused ({}) and is asked again on the next refusal",
+                     name, verdict.refusals, refused);
+            return;
+        }
+        LOG_WARN("module.overseer",
+                 "overseer: '{}' had {} aims refused as lethal in a row at one spot: RUNG 2, "
+                 "it uses its hearthstone to its bind on the same map",
+                 name, verdict.refusals);
+    }
+
     bool ReadStalledFooting(Player* bot, std::string const& name, WorldPosition const& aim,
                             bool groundRefused = false)
     {
@@ -42009,6 +42190,7 @@ private:
         facts.bindMap = bot->m_homebindMapId;
         facts.currentMap = bot->GetMapId();
         facts.hearthPending = HearthPendingFor(bot->GetName());
+        facts.stillRule = true;
         OverseerDecisions::StallRecoveryState& state = _stallRecovery[LowerName(name)];
         OverseerDecisions::StallRecoveryVerdict const verdict =
             OverseerDecisions::StallRecoveryStep(state, facts, limits);
@@ -56365,11 +56547,12 @@ private:
     static constexpr float TOWN_TRIP_WALK_LIMIT_YARDS = TRAVEL_FLIGHT_MIN_YARDS;
 
     static constexpr OverseerDecisions::TownTripLimits TOWN_TRIP_LIMITS{
-        // freeBagSlotsToGo, brokenToGo, cooldownSeconds, boundSeconds, dwellSeconds
+        // freeBagSlotsToGo, brokenToGo, cooldownSeconds, boundSeconds, dwellSeconds,
+        // fruitlessBagsSeconds
         // The bridge's vendor pass defaults to 300s. Keep the family at the
         // counter for one complete pass so the leader-arrival queue can be
         // observed before the world releases the trip.
-        3, 1, 15 * 60, 20 * 60, 6 * 60};
+        3, 1, 15 * 60, 20 * 60, 6 * 60, 2 * 60 * 60};
 
     // The role keyword ResolveTravelTarget takes for the counter this trip is
     // going to. Role aims remain preferable here because the trip already
@@ -56456,6 +56639,9 @@ private:
         OverseerDecisions::DoorWalkRestarts doorWalk;
         std::string deferredAim;
         time_t deferredSince{0};
+        // MEMBERS A VENDOR VISIT LEFT NO ROOMIER (wow-overseer#1261). Kept
+        // across trips on purpose: the mark is what stops the next trip.
+        std::map<std::string, OverseerDecisions::FruitlessBagsMark> fruitlessBags;
     };
     std::map<std::string, TownTripState> _townTrips;   // keyed by family
 
@@ -56583,6 +56769,31 @@ private:
                << after.freeBagSlots << " after; purse " << copperBefore << " to "
                << copperAfter;
         RecordEvent(bot, "town_trip", uint32(proof), name, detail.str());
+
+        // A VENDOR VISIT THAT MADE NO BAG ROOM IS REMEMBERED (wow-overseer#1261),
+        // so the next trip is not opened for this member's bags. Only a member
+        // that stood at the counter proves anything about the counter.
+        {
+            auto const markIt = trip.fruitlessBags.find(name);
+            OverseerDecisions::FruitlessBagsMark const previous =
+                markIt != trip.fruitlessBags.end() ? markIt->second
+                                                   : OverseerDecisions::FruitlessBagsMark{};
+            OverseerDecisions::FruitlessBagsMark const mark = OverseerDecisions::NoteTownTripBags(
+                beforeIt->second, after, copperBefore, copperAfter, trip.role,
+                trip.stoodSince.count(name) > 0, TOWN_TRIP_LIMITS, std::time(nullptr),
+                previous);
+            if (mark.set && !previous.set)
+                LOG_INFO("module.overseer",
+                         "overseer: '{}' stood at a vendor at {} free bag slot(s) and the "
+                         "visit made no room, so its bags open no town trip until it has "
+                         "more room than that or {} minutes pass (wow-overseer#1261)",
+                         name, mark.freeBagSlots,
+                         uint32(TOWN_TRIP_LIMITS.fruitlessBagsSeconds / 60));
+            if (mark.set)
+                trip.fruitlessBags[name] = mark;
+            else
+                trip.fruitlessBags.erase(name);
+        }
 
         // THE ACCEPTANCE LINE, AND IT IS ASKED OF THE GEAR THAT CAN WEAR. "No
         // item at durability 0" is a criterion that can never pass, because four
@@ -57092,13 +57303,41 @@ private:
                 }
             }
 
+            // THE MEMBERS A VENDOR ALREADY FAILED (wow-overseer#1261) do not open
+            // a trip for their bags; see OverseerDecisions::FruitlessBagsMark.
+            time_t const planNow = std::time(nullptr);
+            std::vector<bool> bagsFruitless(members.size(), false);
+            for (size_t i = 0; i < members.size(); ++i)
+            {
+                auto const markIt = trip.fruitlessBags.find(members[i]);
+                if (markIt == trip.fruitlessBags.end())
+                    continue;
+                bagsFruitless[i] = OverseerDecisions::TownTripBagsFruitless(
+                    needs[i], markIt->second, TOWN_TRIP_LIMITS, planNow);
+                // A MARK THAT HAS ENDED IS GONE FOR GOOD: room that rose past it,
+                // or the bound, ends it, so a member that fills up again is asked
+                // again. An unreadable member keeps its mark until it is read.
+                if (!bagsFruitless[i] && needs[i].present)
+                    trip.fruitlessBags.erase(markIt);
+            }
+            time_t const sinceLastTrip = trip.endedAt ? planNow - trip.endedAt
+                                                      : TOWN_TRIP_LIMITS.cooldownSeconds;
             OverseerDecisions::TownTripPlan const plan = OverseerDecisions::PlanTownTrip(
-                needs, TOWN_TRIP_LIMITS,
-                trip.endedAt ? std::time(nullptr) - trip.endedAt
-                                 : TOWN_TRIP_LIMITS.cooldownSeconds,
-                busy);
+                needs, TOWN_TRIP_LIMITS, sinceLastTrip, busy, bagsFruitless);
             if (!plan.go)
+            {
+                if (OverseerDecisions::PlanTownTrip(needs, TOWN_TRIP_LIMITS, sinceLastTrip,
+                                                    busy).go &&
+                    SayTownTripOnce(trip, leaderName, "bags fruitless"))
+                    LOG_INFO("module.overseer",
+                             "overseer: no town trip for '{}''s family: every member short of "
+                             "bag room stood at a vendor that made it none, so a walk there "
+                             "would change nothing. Asked again when a member's bags rise or "
+                             "after {} minutes (wow-overseer#1261)",
+                             leaderName,
+                             uint32(TOWN_TRIP_LIMITS.fruitlessBagsSeconds / 60));
                 return;
+            }
 
             // THE DESTINATION IS RESOLVED ONCE, FROM THE LEADER, BEFORE ANYBODY
             // WALKS. Not to write a coordinate down - every member is aimed with
@@ -57264,6 +57503,14 @@ private:
                     leader ? bot->GetDistance2d(leader) : 0.f;
                 facts.walkLimitYards = TOWN_TRIP_WALK_LIMIT_YARDS;
                 facts.stoodDown = WithinCatchUpStandDown(name);
+                {
+                    auto const held = _stallRecovery.find(LowerName(name));
+                    facts.offMeshHeld =
+                        held != _stallRecovery.end() &&
+                        OverseerDecisions::StallRecoveryLeaveBehind(
+                            held->second, static_cast<std::int64_t>(std::time(nullptr)),
+                            STALL_RECOVERY_LIMITS);
+                }
             }
 
             switch (OverseerDecisions::TownTripMemberStop(facts))
@@ -57386,6 +57633,18 @@ private:
                                  "together again",
                                  name, static_cast<uint32>(facts.yardsFromLeader), aim,
                                  static_cast<uint32>(TOWN_TRIP_WALK_LIMIT_YARDS));
+                    SettleTownTripMember(trip, name);
+                    break;
+
+                case OverseerDecisions::TownStop::OffMesh:
+                    if (SayTownTripOnce(trip, name, "off the mesh"))
+                        LOG_WARN("module.overseer",
+                                 "overseer: '{}' stands off the mesh and its aim has been "
+                                 "refused release after release, so the trip does not wait "
+                                 "for it or re-arm the same aim to the '{}'. It is left where "
+                                 "it is and the trip carries on without it; the off-mesh "
+                                 "recovery keeps its own clock (#188)",
+                                 name, aim);
                     SettleTownTripMember(trip, name);
                     break;
 
@@ -57756,6 +58015,8 @@ private:
         // that group and never one the family formed afterwards.
         uint64 groupId{0};
         std::string lastWhy;
+        // The wait-for-seats line was said for this wait (#1703).
+        bool headHoldSaid{false};
 
         // -- inside (#640) --
         // What the timeline counts, for the whole order.
@@ -59162,6 +59423,7 @@ private:
             Group* group = head ? head->GetGroup() : nullptr;
             facts.raidFormed = group && group->isRaidGroup();
             facts.heldSeconds = run.phaseSince ? long(std::time(nullptr) - run.phaseSince) : 0;
+            facts.stoneSummonPending = !run.stoneRowSource.empty();
 
             std::map<std::string, unsigned> seats;
             if (facts.ordered)
@@ -59363,6 +59625,9 @@ private:
                     }
                     else if (member->GetMapId() != door->outsideMapId)
                         ++facts.awayOnOtherMap;
+                    else if (member != head && member->IsAlive() &&
+                             HeldWaitingForLeader(member->GetName()))
+                        ++facts.heldTooFar;
                 }
                 if (head && head->IsInWorld() && head->IsAlive() && head->IsSitState())
                     anyBusy = true;
@@ -59902,6 +60167,20 @@ private:
             if (step.form)
                 FormRaidFromSeats(roster.family, head, seats, run);
 
+            if (step.headHolds)
+            {
+                if (!run.headHoldSaid)
+                    LOG_INFO("module.overseer",
+                             "overseer: raid run for family '{}' has its head at the {} door "
+                             "and is waiting for seats: {} of {} in the world at the door, "
+                             "quorum {}",
+                             roster.family, door->name, facts.assembled, facts.inWorld,
+                             OverseerDecisions::RaidQuorumMet(facts) ? "met" : "not met");
+                run.headHoldSaid = true;
+            }
+            else
+                run.headHoldSaid = false;
+
             if (step.aimStaging || step.aimDoor)
             {
                 float x = door->stageX;
@@ -60046,24 +60325,25 @@ private:
     // A READ THAT FAILED IS NOT AN EMPTY TABLE. The core aborts on a parse error
     // or a missing table, but a lock-wait timeout returns no result without a
     // word, and taking that for "no stand-ins" would send every guest home
-    // mid-campaign. A COUNT always answers one row when the read works, so no
-    // row from it is a failed read: false, and the caller keeps what it has.
+    // mid-campaign. A LEFT JOIN against a single-row sentinel returns null on a
+    // failed read (false, so the caller keeps what it has) and one NULL row on
+    // an empty table (true with empty rows), avoiding a separate COUNT(*) round
+    // trip on every dungeon poll.
     bool LoadStandinRows(std::vector<OverseerDecisions::FamilyStandin>& rows)
     {
         rows.clear();
-        QueryResult counted = CharacterDatabase.Query("SELECT COUNT(*) FROM overseer_family_standin");
-        if (!counted)
-            return false;
-        if (counted->Fetch()[0].Get<uint64>() == 0)
-            return true;
         QueryResult result = CharacterDatabase.Query(
-            "SELECT `family`, out_name, in_name, seat, reason FROM overseer_family_standin "
-            "ORDER BY id");
+            "SELECT s.`family`, s.out_name, s.in_name, s.seat, s.reason "
+            "FROM (SELECT 1) AS _sentinel "
+            "LEFT JOIN overseer_family_standin s ON 1=1 "
+            "ORDER BY s.id");
         if (!result)
             return false;
         do
         {
             Field* f = result->Fetch();
+            if (f[0].IsNull())
+                continue;
             OverseerDecisions::FamilyStandin row;
             row.family = f[0].Get<std::string>();
             row.outName = f[1].Get<std::string>();
@@ -91694,6 +91974,227 @@ private:
     }
 
 
+    // ------------------------------------------- a death loop holds the idle AI --
+    //
+    // A CHARACTER THE BRIDGE FLAGGED AS DYING OVER AND OVER IN ONE ZONE IS HELD
+    // OFF ITS OWN WANDERING THERE (wow-overseer#2152). The rule, its bound and
+    // every refusal are OverseerDecisions::DeathLoopHoldReason; what a poll
+    // does about it is DeathLoopHoldStepFor. The lever is `new rpg`, the
+    // strategy whose status picks the bot's next grind spot, camp or wander,
+    // taken off with its status set idle as the dungeon run's hold does it.
+    // Strategies are not saved across a logout at the pinned playerbots
+    // (PlayerbotAI::ResetStrategies leaves the load commented out), so a roll
+    // or a relog can only ever hand the strategy back, never keep it off.
+    //
+    // The flag rows are read off overseer_bridge_memo every poll, async; the
+    // hold is applied when they arrive. A world whose bridge has not created
+    // the table yet holds nobody and is asked again next poll.
+    static constexpr uint32 DEATH_LOOP_HOLD_POLL_MS = 30000;
+
+    struct DeathLoopFlagRow
+    {
+        uint32 mapId{0};
+        uint32 zoneId{0};
+        int64 since{0};
+    };
+
+    bool DeathLoopHoldEnabled() const
+    {
+        return sConfigMgr->GetOption<bool>("Overseer.DeathLoopHold.Enable", true, false);
+    }
+
+    void DriveDeathLoopHold()
+    {
+        if (_deathLoopBusy)
+            return;
+        if (!DeathLoopHoldEnabled())
+        {
+            // Off: nothing is read, and every hold this rule placed is handed back.
+            _deathLoopFlags.clear();
+            ApplyDeathLoopHolds();
+            return;
+        }
+        if (!_deathLoopTablePresent)
+        {
+            QueryResult present = CharacterDatabase.Query(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'overseer_bridge_memo'");
+            _deathLoopTablePresent = present && present->Fetch()[0].Get<uint64>() > 0;
+            if (!_deathLoopTablePresent)
+            {
+                if (!_deathLoopTableSaid)
+                    LOG_INFO("module.overseer",
+                             "overseer: death loop hold: overseer_bridge_memo is not there yet, so "
+                             "no death loop is flagged and nobody is held; asked again each poll");
+                _deathLoopTableSaid = true;
+                _deathLoopFlags.clear();
+                ApplyDeathLoopHolds();
+                return;
+            }
+        }
+        _deathLoopBusy = true;
+        _deathLoopQuery.AddCallback(
+            CharacterDatabase.AsyncQuery(
+                std::string("SELECT subject, value, since FROM overseer_bridge_memo WHERE kind = '") +
+                OverseerDecisions::DEATH_LOOP_FLAG_KIND + "' AND expires > UNIX_TIMESTAMP()")
+                .WithCallback([this](QueryResult result) { ReadDeathLoopFlags(std::move(result)); }));
+    }
+
+    void ReadDeathLoopFlags(QueryResult result)
+    {
+        _deathLoopBusy = false;
+        std::map<std::string, DeathLoopFlagRow> flags;
+        if (result)
+        {
+            do
+            {
+                Field* f = result->Fetch();
+                OverseerDecisions::DeathLoopFlag const flag =
+                    OverseerDecisions::ParseDeathLoopFlag(f[1].Get<std::string>());
+                if (!flag.ok)
+                    continue;
+                DeathLoopFlagRow row;
+                row.mapId = flag.mapId;
+                row.zoneId = flag.zoneId;
+                row.since = static_cast<int64>(f[2].Get<double>());
+                flags[f[0].Get<std::string>()] = row;
+            } while (result->NextRow());
+        }
+        _deathLoopFlags.swap(flags);
+        ApplyDeathLoopHolds();
+    }
+
+    bool HuntsNow(std::string const& name) const
+    {
+        for (HuntState const& hunt : _hunts)
+            if (hunt.character == name)
+                return true;
+        return false;
+    }
+
+    void ApplyDeathLoopHolds()
+    {
+        namespace D = OverseerDecisions;
+        std::set<std::string> names(_deathLoopHeld.begin(), _deathLoopHeld.end());
+        for (auto const& flag : _deathLoopFlags)
+            names.insert(flag.first);
+        bool const enabled = DeathLoopHoldEnabled();
+        int64 const bound = D::DeathLoopHoldBound(sConfigMgr->GetOption<int64>(
+            "Overseer.DeathLoopHold.Seconds", D::DEATH_LOOP_HOLD_DEFAULT_SECONDS, false));
+        int64 const now = int64(std::time(nullptr));
+        for (std::string const& name : names)
+        {
+            bool const tookItOff = _deathLoopHeld.count(name) != 0;
+            Player* const p = ObjectAccessor::FindPlayerByName(name, false);
+            if (!p)
+            {
+                // Logged out: the next login starts from the default strategies.
+                _deathLoopHeld.erase(name);
+                _deathLoopSaid.erase(name);
+                continue;
+            }
+            // Between maps: asked again next poll, the record kept.
+            if (!p->IsInWorld())
+                continue;
+            PlayerbotAI* const ai = GET_PLAYERBOT_AI(p);
+            if (!ai || ClientAttached(p))
+            {
+                _deathLoopHeld.erase(name);
+                continue;
+            }
+            D::DeathLoopHoldFacts facts;
+            facts.enabled = enabled;
+            auto const flag = _deathLoopFlags.find(name);
+            facts.flagged = flag != _deathLoopFlags.end();
+            if (facts.flagged)
+            {
+                facts.flagMapId = flag->second.mapId;
+                facts.flagZoneId = flag->second.zoneId;
+                facts.flaggedAt = flag->second.since;
+            }
+            facts.mapId = p->GetMapId();
+            facts.zoneId = p->GetZoneId();
+            facts.now = now;
+            facts.boundSeconds = bound;
+            // Every roster row carries a job (`quest` by default), and a
+            // family is roster rows, so the roster is the job and family test.
+            facts.hasJob = OnRoster(name);
+            facts.follower = !LeadsItsParty(p) || IsStandinGuest(name);
+            D::DeathLoopHoldWhy const why = D::DeathLoopHoldReason(facts);
+            bool const carries = ai->HasStrategy("new rpg", BOT_STATE_NON_COMBAT);
+            bool const otherHold = HeldStill(name) || HeldAfterRevival(name) || HuntsNow(name);
+            switch (D::DeathLoopHoldStepFor(why, tookItOff, carries, otherHold))
+            {
+                case D::DeathLoopHoldStep::TakeOff:
+                    ai->rpgInfo.ChangeToIdle();
+                    ai->ChangeStrategy("-new rpg", BOT_STATE_NON_COMBAT);
+                    if (ai->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+                    {
+                        LOG_ERROR("module.overseer",
+                                  "overseer: death loop hold: '{}' still carries `new rpg` after "
+                                  "being told to drop it - it can still walk back into zone {}",
+                                  name, facts.zoneId);
+                        break;
+                    }
+                    _deathLoopHeld.insert(name);
+                    if (!tookItOff)
+                        LOG_INFO("module.overseer",
+                                 "overseer: death loop hold: '{}' is flagged as dying over and over "
+                                 "in zone {} and stands in it - taking `new rpg` off so its own AI "
+                                 "does not walk it back to what keeps killing it; handed back when "
+                                 "it leaves the zone or after {} minutes at most",
+                                 name, facts.zoneId,
+                                 (facts.flaggedAt + bound - now + 59) / 60);
+                    break;
+                case D::DeathLoopHoldStep::HandBack:
+                    if (!carries)
+                        ai->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+                    _deathLoopHeld.erase(name);
+                    LOG_INFO("module.overseer",
+                             "overseer: death loop hold: '{}' is handed `new rpg` back: {}",
+                             name, D::DeathLoopHoldWhyName(why));
+                    if (!ai->HasStrategy("new rpg", BOT_STATE_NON_COMBAT))
+                        LOG_ERROR("module.overseer",
+                                  "overseer: death loop hold: '{}' was handed `new rpg` back and "
+                                  "does not carry it", name);
+                    break;
+                case D::DeathLoopHoldStep::Forget:
+                    _deathLoopHeld.erase(name);
+                    LOG_INFO("module.overseer",
+                             "overseer: death loop hold: '{}' is let go without `new rpg`: {}, "
+                             "and that owner decides its strategies",
+                             name, D::DeathLoopHoldWhyName(why));
+                    break;
+                case D::DeathLoopHoldStep::Nothing:
+                    break;
+            }
+            // Said once per change of reason, for a flagged character only.
+            if (facts.flagged && why != D::DeathLoopHoldWhy::Holds)
+            {
+                auto const said = _deathLoopSaid.find(name);
+                if (said == _deathLoopSaid.end() || said->second != why)
+                    LOG_INFO("module.overseer",
+                             "overseer: death loop hold: '{}' is flagged in zone {} and not held: {}",
+                             name, facts.flagZoneId, D::DeathLoopHoldWhyName(why));
+            }
+            if (facts.flagged)
+                _deathLoopSaid[name] = why;
+            else
+                _deathLoopSaid.erase(name);
+        }
+    }
+
+    QueryCallbackProcessor _deathLoopQuery;
+    uint32 _deathLoopTimer = 0;
+    bool _deathLoopBusy = false;
+    bool _deathLoopTablePresent = false;
+    bool _deathLoopTableSaid = false;
+    std::map<std::string, DeathLoopFlagRow> _deathLoopFlags;
+    // The characters this rule took `new rpg` off, and so the only ones it
+    // ever hands it back to.
+    std::set<std::string> _deathLoopHeld;
+    std::map<std::string, OverseerDecisions::DeathLoopHoldWhy> _deathLoopSaid;
+
     void SampleFallMovement()
     {
         for (auto const& itr : ObjectAccessor::GetPlayers())
@@ -91716,6 +92217,8 @@ private:
 
         std::ostringstream ss;
         bool first = true;
+        std::ostringstream dangerSs;
+        bool firstDanger = true;
         for (auto const& itr : allPlayers)
         {
             Player* p = itr.second;
@@ -91761,9 +92264,13 @@ private:
             // alongside a walk that was happening anyway costs nothing extra.
             if (OnRoster(p->GetName()))
             {
-                CharacterDatabase.Execute(
-                    "REPLACE INTO overseer_zone_danger (name, result) VALUES ('{}', '{}')",
-                    Esc(p->GetName()), EscLong(ZoneDangerFor(p, std::time(nullptr))));
+                if (firstDanger)
+                    dangerSs << "REPLACE INTO overseer_zone_danger (name, result) VALUES ";
+                else
+                    dangerSs << ',';
+                firstDanger = false;
+                dangerSs << "('" << Esc(p->GetName()) << "','"
+                         << EscLong(ZoneDangerFor(p, std::time(nullptr))) << "')";
                 RememberHealth(p->GetName(), p->GetHealth(), p->GetMaxHealth());
                 // #188: the same argument, for the same walk. What had hold of
                 // this character and whether it was fighting are both gone by
@@ -91785,6 +92292,8 @@ private:
 
         if (!first)
             CharacterDatabase.Execute(ss.str().c_str());
+        if (!firstDanger)
+            CharacterDatabase.Execute(dangerSs.str().c_str());
 
         // Logged-out characters age out rather than being tracked explicitly:
         // one sweep interval of grace, then the map stops drawing them.
@@ -91979,6 +92488,7 @@ private:
     std::set<std::string> _heldInTown;
 
     uint32 _travelTimer = 0;
+    uint64_t _travelPollSerial = 0;
     uint32 _professionTimer = 0;
     uint32 _gearTimer = 0;
     uint32 _councilTimer = 0;

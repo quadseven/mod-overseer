@@ -50,8 +50,8 @@ public:
     // Queued in production, as every ordinary release always was.
     virtual void ClearIfStill(std::string const& name, std::string const& expected) = 0;
     // The same compare-and-swap, synchronous and for an enabled row only, so
-    // the read that follows sees the blank. For a leftover, a poisoned aim and
-    // a finished run's exact leg.
+    // the read that follows sees the blank. For a leftover, a poisoned or inert
+    // aim and a finished run's exact leg.
     virtual void ClearNowIfStill(std::string const& name, std::string const& expected) = 0;
 };
 
@@ -144,17 +144,16 @@ struct ClaimResult
 
 struct ReleaseResult
 {
-    // An exact-aim release found a newer aim, or a newer owner's claim, and
-    // did nothing: no write, no claim forgotten, no clock stamped. The newer
-    // owner will release it.
+    // An exact-aim release found a replacement before it could retire the
+    // requested aim. Leave the claim and hand-back clock alone.
     bool leftNewerAim{false};
     std::string standing;  // the column as read
     bool anyClaim{false};  // a claim was held when the release began
     // The aim that ended: the claimed aim when there was a claim, else the
     // standing column.
     std::string endedAim;
-    // Non-empty when the gate kept the column write from erasing an aim this
-    // module did not claim (TravelReleaseGate's clause).
+    // TravelReleaseGate's reason for declining a clear, or the reason an
+    // exact inert release could not confirm the clear.
     std::string fence;
 };
 
@@ -281,7 +280,8 @@ public:
 
     OverseerDecisions::LeaderIntentVerdict AskForLeader(
         std::string const& name, OverseerDecisions::LeaderIntentKind kind,
-        std::string const& owner, std::string const& target, std::string const& why, time_t now)
+        std::string const& owner, std::string const& target, std::string const& why, time_t now,
+        bool leftMemberBehind = false)
     {
         OverseerDecisions::LeaderIntentVerdict verdict;
         if (!LeaderIntentApplies(name))
@@ -294,6 +294,7 @@ public:
         request.owner = owner;
         request.target = target;
         request.why = why;
+        request.leftMemberBehind = leftMemberBehind;
         return OverseerDecisions::AskLeaderIntent(_leaderStates[name], request, now, _leaderLimits,
                                                    LeaderPreferenceFor(name));
     }
@@ -452,9 +453,16 @@ public:
     // blanked only by compare-and-swap on what was read, and only when the
     // gate says the aim is this module's to erase; the claim is forgotten and
     // the hand-back clock stamped either way.
-    ReleaseResult Release(std::string const& name, time_t now, bool inertFollowerAim = false)
+    ReleaseResult Release(std::string const& name, time_t now)
     {
-        return ReleaseImpl(name, nullptr, now, inertFollowerAim);
+        return ReleaseImpl(name, nullptr, now);
+    }
+
+    // Retire only the exact, unclaimed aim observed through the refusal bound.
+    ReleaseResult ReleaseInertFollowerAim(std::string const& name, std::string const& expectedAim,
+                                          time_t now)
+    {
+        return ReleaseImpl(name, nullptr, now, &expectedAim);
     }
 
     // A DUNGEON RUN ENDING. Ends only the run's own claim on exactly
@@ -615,7 +623,7 @@ private:
     }
 
     ReleaseResult ReleaseImpl(std::string const& name, std::string const* expectedRunAim,
-                              time_t now, bool inertFollowerAim = false)
+                              time_t now, std::string const* expectedInertAim = nullptr)
     {
         ReleaseResult result;
         result.standing = _column.Read(name);
@@ -625,8 +633,9 @@ private:
         bool const changedSinceClaim = result.anyClaim && !claimed;
         bool const claimedByRun =
             claimed && OverseerDecisions::TravelOwnerIsALiveRun(held->second.owner);
-        if (expectedRunAim &&
-            (*expectedRunAim != result.standing || (result.anyClaim && !claimedByRun)))
+        if ((expectedRunAim &&
+             (*expectedRunAim != result.standing || (result.anyClaim && !claimedByRun))) ||
+            (expectedInertAim && *expectedInertAim != result.standing))
         {
             result.leftNewerAim = true;
             return result;
@@ -640,9 +649,20 @@ private:
         gate.changedSinceClaim = changedSinceClaim;
         gate.learnSkill = claimed ? 0 : _column.PendingLearnSkill(name);
         gate.standing = result.standing;
-        gate.inertFollowerAim = inertFollowerAim;
+        gate.inertFollowerAim = expectedInertAim != nullptr;
         result.fence = OverseerDecisions::TravelReleaseGate(gate);
-        if (result.fence.empty())
+        if (expectedInertAim)
+        {
+            if (!result.fence.empty())
+                return result;
+            _column.ClearNowIfStill(name, *expectedInertAim);
+            if (!_column.Read(name).empty())
+            {
+                result.fence = "the column still holds an aim after inert release";
+                return result;
+            }
+        }
+        else if (result.fence.empty())
             _column.ClearIfStill(name, result.standing);
         _claims.erase(name);
         // STAMPED WHETHER OR NOT ANYTHING WAS OUTSTANDING: unconditional is
