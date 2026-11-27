@@ -6591,9 +6591,9 @@ public:
         // it: a member carrying an aim nobody walks is still behind its leader,
         // not off on an errand of its own. See MemberFollowsForFlight.
         bool inertFollowerAim{false};
-        // When the aim began to be refused as inert (#1610), or 0. Cleared with
-        // the flag, so a walked aim starts the count again.
+        // Refusal window for the same aim in consecutive travel polls.
         time_t inertSince{0};
+        uint64_t inertPoll{0};
         // Said once per HOLD, not once per errand, which is why it is not
         // `arrived` (#311). The post-revival hold takes `new rpg` off on purpose
         // for a few seconds and gives it back itself, so the line about it is
@@ -7099,14 +7099,18 @@ public:
     // the claim and stamps the hand-back clock that keeps the quest drive off
     // the wheel (see TravelHoldsTheWheel, case 2); this book ends the errand
     // memory around it.
-    // `inertFollowerAim` is the drive saying the aim in the column is one nothing
-    // walks and has not for INERT_FOLLOWER_AIM_SECONDS (#1610): the gate then lets
-    // a counter keyword be cleared, which it fences when the book never claimed it.
-    void Release(std::string const& name, std::string const& why = std::string(),
-                 bool inertFollowerAim = false)
+    void Release(std::string const& name, std::string const& why = std::string())
     {
-        ReleaseImpl(name, why,
-                    MovementOwner().Release(name, std::time(nullptr), inertFollowerAim));
+        ReleaseImpl(name, why, MovementOwner().Release(name, std::time(nullptr)));
+    }
+
+    bool ReleaseInertFollowerAim(std::string const& name, std::string const& aim)
+    {
+        auto const released = MovementOwner().ReleaseInertFollowerAim(name, aim, std::time(nullptr));
+        if (released.leftNewerAim || !released.fence.empty())
+            return false;
+        ReleaseImpl(name, "an aim nothing walks (inert follower)", released);
+        return true;
     }
 
     // Close a dungeon coordinator's travel state without giving back a newer
@@ -30768,6 +30772,7 @@ private:
 
     void DriveTravel()
     {
+        uint64_t const previousTravelPoll = _travelPollSerial++;
         // Before anything else, so a death is read against the route the walker
         // was on whether or not it still holds an errand this poll (#502).
         NoteDeathsOnRoutes();
@@ -30930,6 +30935,7 @@ private:
                 state.pinned = false;
                 state.arrived = false;
                 state.heldSaid = false;
+                state.inertSince = 0;
                 // A new errand is a new flight budget too, and a new leg. The
                 // old errand's flights are spent, its leg is over the moment
                 // its aim stops being the aim, and its refusal to fly was
@@ -31511,28 +31517,30 @@ private:
                 state.inertSince = 0;
             if (state.inertFollowerAim)
             {
-                // AN AIM NOTHING WALKS IS CLEARED AFTER A BOUND (#1610). Only for
-                // a follower in formation, where "aim the leader instead" is the
-                // whole remedy, and only for a counter keyword: the release gate
-                // would otherwise fence it as the bridge's and the column would
-                // keep blocking the catch-up walk and billing the errand budget.
-                if (!state.inertSince)
-                    state.inertSince = std::time(nullptr);
-                if (mover == OverseerDecisions::AimedMover::RefuseInFormation &&
-                    OverseerDecisions::InertFollowerAimMayBeCleared(
-                        target, state.learn,
-                        std::time(nullptr) - state.inertSince))
+                // Count only refusals of the column itself. A hold, a missing
+                // poll or a substitute aim breaks the window. Counter keywords
+                // keep the formation rule from #1610, while a cut-off follower
+                // can also be refused a point it has no strategy to walk.
+                if (columnAim == target && !bot->IsInFlight() &&
+                    !_travelAims.RunOwns(name, columnAim) &&
+                    (mover == OverseerDecisions::AimedMover::RefuseInFormation ||
+                     target.rfind("at:", 0) == 0))
                 {
-                    LOG_INFO("module.overseer",
-                             "overseer: '{}' has carried the aim '{}' for {}s and nothing "
-                             "walks it - only its leader carries `new rpg` - so the aim is "
-                             "cleared from its column (#1610)",
-                             name, target,
-                             static_cast<uint32>(std::time(nullptr) - state.inertSince));
-                    // `state` IS DEAD AFTER THIS: Release erases the record.
-                    _travelAims.Release(name, "an aim nothing walks (a follower's counter keyword)",
-                                        true);
-                    continue;
+                    time_t const now = std::time(nullptr);
+                    if (!state.inertSince || state.inertPoll != previousTravelPoll)
+                        state.inertSince = now;
+                    state.inertPoll = _travelPollSerial;
+                    time_t const inertSeconds = now - state.inertSince;
+                    if (OverseerDecisions::InertFollowerAimMayBeCleared(target, state.learn, inertSeconds) &&
+                        _travelAims.ReleaseInertFollowerAim(name, columnAim))
+                    {
+                        // The release erased `state`.
+                        LOG_INFO("module.overseer",
+                                 "overseer: cleared unclaimed aim '{}' for '{}' after {}s of "
+                                 "follower refusals (#1723)", target, name,
+                                 static_cast<uint32>(inertSeconds));
+                        continue;
+                    }
                 }
                 if (!state.arrived)
                 {
@@ -92480,6 +92488,7 @@ private:
     std::set<std::string> _heldInTown;
 
     uint32 _travelTimer = 0;
+    uint64_t _travelPollSerial = 0;
     uint32 _professionTimer = 0;
     uint32 _gearTimer = 0;
     uint32 _councilTimer = 0;

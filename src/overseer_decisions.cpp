@@ -4805,6 +4805,14 @@ std::string TravelReleaseGate(TravelReleaseGateFacts const& facts)
     // the book's own bookkeeping still ends, exactly as before.
     if (facts.changedSinceClaim)
         return "the column changed after this book's claim";
+    if (facts.inertFollowerAim)
+    {
+        if (facts.claimed)
+            return "this book holds a claim on the follower's aim";
+        if (InertFollowerAimMayBeCleared(facts.standing, facts.learnSkill, INERT_FOLLOWER_AIM_SECONDS))
+            return std::string();
+        return "the standing aim is protected from inert release";
+    }
     // A CLAIMED AIM IS THIS BOOK'S ERRAND ENDING (#822). The foreign-aim fence
     // exists for aims the book never claimed - a repair/vendor/banker/
     // auctioneer aim the bridge wrote, a positional aim another pass is
@@ -4816,20 +4824,14 @@ std::string TravelReleaseGate(TravelReleaseGateFacts const& facts)
     // skipped - reborn every poll.
     if (facts.claimed)
         return std::string();
-    // AN AIM NOTHING WALKS IS NOBODY'S ERRAND TO PROTECT (#1610). The fence
-    // exists so an economy pass's aim is not erased under it; a follower's
-    // counter keyword is refused every poll because only the leader walks, so
-    // the pass it protects is not running on it.
-    if (facts.inertFollowerAim &&
-        InertFollowerAimMayBeCleared(facts.standing, facts.learnSkill, INERT_FOLLOWER_AIM_SECONDS))
-        return std::string();
     return TravelReleaseFence(facts.learnSkill, facts.standing);
 }
 
 bool InertFollowerAimMayBeCleared(std::string const& aim, uint32_t learnSkill,
                                   int64_t inertSeconds)
 {
-    return learnSkill == 0 && IsMaintenanceErrand(aim) && inertSeconds >= INERT_FOLLOWER_AIM_SECONDS;
+    return learnSkill == 0 && inertSeconds >= INERT_FOLLOWER_AIM_SECONDS &&
+           (IsMaintenanceErrand(aim) || aim.rfind("at:", 0) == 0);
 }
 
 bool RunAimMayBeReleased(std::string const& current,
