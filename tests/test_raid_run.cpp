@@ -547,6 +547,45 @@ void AHeadAtTheStagingPointIsNotWalkedAgain()
           text.find("if (!run.headHoldSaid)") != std::string::npos);
 }
 
+void FarHeldSeatsDoNotKeepAnOtherwiseAssembledRaidWaiting()
+{
+    RaidRunFacts facts = Ready();
+    facts.inWorld = 40;
+    facts.assembled = 36;
+    facts.heldTooFar = 4;
+    facts.heldSeconds = RAID_STONE_SUMMON_AFTER_SECONDS;
+    RaidRunStep const enter = StepRaidRun(RaidRunPhase::Assemble, facts);
+    CheckPhase("the quorum enters when every missing seat is far-held", enter.phase,
+               RaidRunPhase::Enter);
+    Check("the assembled raid uses the usual entry path", enter.aimDoor && enter.knockMembers);
+
+    facts.heldTooFar = 3;
+    CheckPhase("a seat whose walk is still possible keeps its assembly window",
+               StepRaidRun(RaidRunPhase::Assemble, facts).phase, RaidRunPhase::Assemble);
+
+    facts.heldTooFar = 4;
+    facts.assembledHealers = 7;
+    RaidRunStep const waiting = StepRaidRun(RaidRunPhase::Assemble, facts);
+    CheckPhase("a held healer cannot satisfy the floor", waiting.phase, RaidRunPhase::Assemble);
+    Check("the ordinary wait can still summon a held seat", waiting.summonStragglers);
+
+    facts.heldSeconds = RAID_ASSEMBLE_WAIT_SECONDS;
+    RaidRunStep const ended = StepRaidRun(RaidRunPhase::Assemble, facts);
+    CheckPhase("only far-held seats are missing at the deadline", ended.phase, RaidRunPhase::Idle);
+    Check("the attempt ends for want of a quorum", ended.release && ended.quorumEnds);
+    CheckString("the shortfall still names the missing duty", ended.shortfall.c_str(),
+                "36 of 40, short 1 healers");
+
+    facts.stoneSummonPending = true;
+    CheckPhase("an in-flight summon keeps its chance to arrive",
+               StepRaidRun(RaidRunPhase::Assemble, facts).phase, RaidRunPhase::Assemble);
+    facts.stoneSummonPending = false;
+    facts.addable = 1;
+    RaidRunStep const addable = StepRaidRun(RaidRunPhase::Assemble, facts);
+    Check("an addable seat still gets its invitation",
+          addable.phase == RaidRunPhase::Assemble && addable.form);
+}
+
 void TheRaidEntersOnlyWithAQuorumAtTheDoor()
 {
     RaidRunFacts facts = Ready();
@@ -1047,6 +1086,7 @@ int main()
     AFormedRaidUnderTheQuorumHoldsInFormAndSaysSo();
     AssembleWaitsForTheRaidThenForNobodyForever();
     AHeadAtTheStagingPointIsNotWalkedAgain();
+    FarHeldSeatsDoNotKeepAnOtherwiseAssembledRaidWaiting();
     TheRaidEntersOnlyWithAQuorumAtTheDoor();
     TheHeadCrossesLast();
     InsideHoldsAndLetsStragglersThrough();
