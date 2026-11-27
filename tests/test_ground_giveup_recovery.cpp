@@ -83,6 +83,27 @@ int main()
         Check(last == StallRecoveryAction::Backoff, "too few releases never escalate");
     }
 
+    // A member released again and again at one spot is left behind by an
+    // errand well before the hour, and only while the streak is fresh.
+    {
+        StallRecoveryState s;
+        for (unsigned i = 0; i < lim.leaveBehindReleases; ++i)
+        {
+            Check(!StallRecoveryLeaveBehind(s, 1000 + static_cast<std::int64_t>(i) * 30, lim),
+                  "fewer than the bound is still waited for");
+            StallRecoveryStep(s, Off(1000 + static_cast<std::int64_t>(i) * 30), lim);
+        }
+        std::int64_t const last = 1000 + (lim.leaveBehindReleases - 1) * 30;
+        Check(last - 1000 < lim.seconds, "the hour has not elapsed");
+        Check(StallRecoveryLeaveBehind(s, last, lim), "the bound of releases leaves it behind");
+        Check(!StallRecoveryLeaveBehind(s, last + lim.freshSeconds + 1, lim),
+              "a streak nobody released lately is history");
+        StallRecoveryFacts moved = Off(last + 30);
+        moved.x += lim.movedResetYards + 5.f;
+        StallRecoveryStep(s, moved, lim);
+        Check(!StallRecoveryLeaveBehind(s, last + 30, lim), "moving away starts the streak over");
+    }
+
     // The adapter has to ask: DriveTravel's give-up branch reads the footing.
     std::ifstream in("src/mod_overseer.cpp");
     if (!in)

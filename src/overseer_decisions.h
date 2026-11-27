@@ -1642,12 +1642,26 @@ struct StallRecoveryLimits
     // The disconnected case and an impossible recovery are each said at most
     // this often per character.
     std::int64_t saySeconds{3600};
+    // A member this many releases into one off-mesh streak is left behind by
+    // an errand that waits for it, without waiting for the hour. The releases
+    // must also be recent: a streak nobody has released for `freshSeconds` is
+    // history, not a member that is stuck now.
+    std::uint32_t leaveBehindReleases{6};
+    std::int64_t freshSeconds{300};
+    // A walker whose aims are refused as lethal this many times in a row,
+    // while within movedResetYards of one spot, takes the hearthstone rung.
+    std::uint32_t lethalRefusals{3};
 };
 
 struct StallRecoveryState
 {
+    // Lethal refusals in a row at one spot (LethalRefusalStep).
+    std::uint32_t lethalCount{0};
+    float lethalX{0.f};
+    float lethalY{0.f};
     std::uint32_t offMeshReleases{0};
     std::int64_t since{0};
+    std::int64_t lastReleaseAt{0};
     float anchorX{0.f};
     float anchorY{0.f};
     bool escalated{false};
@@ -1713,6 +1727,46 @@ StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
                                        StallRecoveryFacts const& facts,
                                        StallRecoveryLimits const& limits);
 
+// IS THIS MEMBER ONE AN ERRAND SHOULD STOP WAITING FOR? True when it is in an
+// off-mesh streak of at least `leaveBehindReleases` releases at one spot, the
+// latest of them within `freshSeconds` of `now`. Independent of the hour the
+// recovery rungs wait for: the errand leaves the member where it is and the
+// recovery runs on its own clock.
+bool StallRecoveryLeaveBehind(StallRecoveryState const& state, std::int64_t now,
+                              StallRecoveryLimits const& limits);
+// A WALKER WHOSE EVERY AIM IS REFUSED AS LETHAL. Each refusal is counted
+// while the walker stays within movedResetYards of the spot of the first; a
+// walker that moved starts afresh. At limits.lethalRefusals the verdict is
+// Hearth when the stone is ready, has a same-map bind and no cast is pending;
+// otherwise Keep, and the streak is kept for the next refusal. Hearth resets
+// the count.
+enum class LethalRefusalAction : std::uint8_t
+{
+    Count,
+    Hearth,
+    Keep,
+};
+
+struct LethalRefusalFacts
+{
+    float x{0.f};
+    float y{0.f};
+    bool hasStone{false};
+    bool stoneReady{false};
+    bool sameMapBind{false};
+    bool hearthPending{false};
+};
+
+struct LethalRefusalVerdict
+{
+    LethalRefusalAction action{LethalRefusalAction::Count};
+    std::uint32_t refusals{0};
+};
+
+LethalRefusalVerdict LethalRefusalStep(StallRecoveryState& state,
+                                       LethalRefusalFacts const& facts,
+                                       StallRecoveryLimits const& limits);
+
 // DOES AN ARMED OFF-MESH STREAK HOLD THE WALKER OFF ERRANDS. True while the
 // quick rule is on, the streak has its releases, no rung has been taken yet,
 // the walker is still within the moved-reset distance of where it began, and
@@ -1734,6 +1788,13 @@ bool StallRecoveryHoldsErrand(StallRecoveryState const& state, float x, float y,
 // release. False for a character with no streak.
 bool StallRecoveryIdleDue(StallRecoveryState& state, float x, float y, std::int64_t now,
                           StallRecoveryLimits const& limits, std::int64_t intervalSeconds);
+
+// MAY THE FOOTING BE READ AND A RUNG TAKEN THIS POLL (mod-overseer#1705). Only
+// a living character out of combat: a rung walks it to a polygon, which must
+// not happen mid-fight or to a ghost. Asked BEFORE StallRecoveryIdleDue, which
+// records the time on a yes, so a guarded character keeps its streak and is
+// read on the next poll.
+bool StallRecoveryMayRead(bool alive, bool inCombat);
 
 // THE ADAPTER COULD NOT DO WHAT THE VERDICT ASKED (a hearth cast refused for a
 // reason that clears itself): the escalation is not spent, and the next
@@ -5591,6 +5652,39 @@ struct ReleaseLandingFacts
 
 bool ReleaseLandsAim(ReleaseLandingFacts const& facts);
 
+// AN ARRIVAL AT A COUNTER IS REMEMBERED ON ITS OWN, NOT AS A LANDING (#1708).
+//
+// The landing above is remembered only when the release left the aim standing
+// in the column. A release that cleared the column (a claimed aim) leaves no
+// landing, and the writer of the aim then writes the same counter again a few
+// seconds later: the drive reads it as a new errand, asks for the leader, and
+// takes down the counter hold the arrival had just put up, every poll the aim
+// is up. The hold is taken and the errand released on one statement, so the
+// hold's own presence is the visit, and this memory says WHICH counter the
+// hold is for.
+//
+// The same rule as a counter landing, minus the column: the same aim written
+// again while the hold stands is not walked; another aim, or the hold gone
+// (its ceiling, or the character let go of it) forgets the arrival and the aim
+// is an ordinary errand again. The stand-down is said once per arrival.
+struct CounterArrivalMemory
+{
+    std::string aim;   // the counter aim the character arrived at, empty when none
+    bool said{false};  // the stand-down was said for this arrival
+};
+
+// Remember an arrival at `aim` that took the counter hold. Replaces any earlier
+// one, and is said again for it.
+void NoteCounterArrival(CounterArrivalMemory& memory, std::string const& aim);
+
+// What the drive does with `columnAim` read now. NotLanded when no arrival is
+// remembered; StandDown while the same aim stands and the hold is in force;
+// Resume (and the memory forgotten) otherwise. `sayIt` is set on the first
+// StandDown of an arrival only.
+LandedErrand CounterArrivalMemoryStep(CounterArrivalMemory& memory,
+                                      std::string const& columnAim, bool counterHoldActive,
+                                      bool& sayIt);
+
 // AN UNRESOLVABLE AIM STANDS DOWN AFTER ITS RELEASE, EXCEPT A POINT (#722).
 // The travel drive refuses an aim it cannot resolve from where the character
 // stands (no spawn of that role on the map, or none within the town-service
@@ -5601,6 +5695,23 @@ bool ReleaseLandsAim(ReleaseLandingFacts const& facts);
 // not stand down: the poison-aim breaker (#824) counts its refusals poll by
 // poll and clears it, and a landing would starve that count.
 bool UnresolvedAimStandsDown(std::string const& aim);
+
+// A BARE SPAWN ID THAT IS NOT ON THE LEADER'S MAP IS REFUSED FOR THE COOL-OFF
+// (#1711). A quest pick whose giver or objective is a creature spawn on another
+// continent reaches the travel drive as a bare spawn id with no map. The drive
+// resolves it on the leader's current map, finds nothing and releases the
+// errand in the same second, and the quest drive picked the same quest again:
+// no walk, no hold, no progress, for hours. A release alone records nothing the
+// next pick reads, so the aim is also marked refused for this character, the
+// same bounded refusal row the bridge reads (refused_until) to pick another
+// quest. Only a bare number is a spawn id; a counter keyword stands down by its
+// landing (#722), a point by the poison-aim breaker (#824), and an operator's
+// guard is never called off (#163).
+bool UnresolvedSpawnIsRefused(std::string const& aim, bool guarded);
+
+// The reason carried on the refusal row and in the log: which map the leader
+// stands on and that no route to the spawn's own map is built here (#513).
+std::string UnresolvedSpawnRefusal(std::uint32_t leaderMap);
 
 // MAY TravelAimBook::Claim WRITE THIS AIM (#560)?
 //
@@ -5783,28 +5894,25 @@ struct TravelReleaseGateFacts
     uint32_t learnSkill{0};
     // The travel_npc column as the release read it.
     std::string standing;
-    // The drive has refused this aim as inert for INERT_FOLLOWER_AIM_SECONDS: a
-    // follower's counter keyword, which only the leader's `new rpg` could walk
-    // (#1610). Lets a counter keyword through the gate and nothing else.
+    // An exact-aim release after INERT_FOLLOWER_AIM_SECONDS of follower refusals.
+    // Only an unclaimed counter keyword or point can be retired this way.
     bool inertFollowerAim{false};
 };
 
-// HOW LONG A FOLLOWER'S COUNTER-KEYWORD AIM MAY STAND REFUSED AS INERT BEFORE IT
-// IS CLEARED (#1610). Long enough that a bridge pass writing a follower's aim and
+// HOW LONG A FOLLOWER'S AIM MAY STAND REFUSED AS INERT BEFORE IT IS CLEARED
+// (#1610, #1723). Long enough that a bridge pass writing a follower's aim and
 // a leader still on its way to the counter are not raced; short enough that the
 // catch-up walk, which refuses a member while an errand stands, is not kept
 // off it for minutes.
 constexpr int64_t INERT_FOLLOWER_AIM_SECONDS = 120;
 
-// Is this standing aim one the release may clear because nothing walks it? A
-// counter keyword only, no pending profession errand, refused as inert for the
-// bound. A positional aim, a guard and an empty column are never cleared here.
+// Is this aim eligible for inert release by type, pending skill and time?
+// TravelReleaseGate also checks whether the book holds a claim.
 bool InertFollowerAimMayBeCleared(std::string const& aim, uint32_t learnSkill,
                                   int64_t inertSeconds);
 
 // Empty means the column write goes through. Non-empty is the same whole
-// clause TravelReleaseFence returns, or "the column changed after this book's
-// claim" when the column moved.
+// clause TravelReleaseFence returns, or a reason the specific release is fenced.
 std::string TravelReleaseGate(TravelReleaseGateFacts const& facts);
 
 // May the dungeon coordinator clear this exact positional aim when its run
@@ -18876,6 +18984,12 @@ struct TownTripLimits
     // dwell lets a family arrive, wait, and leave before the bridge can write
     // the commands that make the visit useful.
     time_t dwellSeconds{6 * 60};
+    // HOW LONG A VENDOR VISIT THAT MADE NO BAG ROOM KEEPS ITS MEMBER OUT OF THE
+    // BAGS REASON (wow-overseer#1261). Such a member carries only stacks a
+    // vendor will not buy, so the next visit changes nothing either; after this
+    // long the visit is tried once more. The bridge's profession loop uses the
+    // same two hours for the same visits.
+    time_t fruitlessBagsSeconds{2 * 60 * 60};
 };
 
 // WHY THIS MEMBER WANTS A COUNTER. Ordered, and the order is the content.
@@ -18979,6 +19093,47 @@ TownTripPlan PlanTownTrip(std::vector<TownNeed> const& members,
                           TownTripLimits const& limits,
                           time_t secondsSinceLastTrip, bool busy);
 
+// A VENDOR VISIT THAT MADE NO BAG ROOM, REMEMBERED PER MEMBER (wow-overseer#1261).
+//
+// Measured on the dev realm 2026-11-24: both families stalled for over two hours
+// while the trip reopened every cooldown on "(bags)" and every visit ended
+// "NOTHING CHANGED - 0 free bag slot(s)". The stacks were kept, banked or
+// auctioned, never vendor goods, so the cooldown alone re-opened the identical
+// trip for ever, and each one took the leader off its walk to the raid door.
+struct FruitlessBagsMark
+{
+    bool set{false};
+    // The free slots the member had when the visit ended.
+    unsigned freeBagSlots{0};
+    time_t at{0};
+};
+
+// Is this member's bags reason one a vendor already failed to answer? True while
+// the mark is set, its free slots have not risen past the marked reading, and the
+// mark is younger than limits.fruitlessBagsSeconds. False for a present member
+// means the mark has ended, and the caller drops it, so room that rose and was
+// filled again does not bring an old mark back.
+bool TownTripBagsFruitless(TownNeed const& need, FruitlessBagsMark const& mark,
+                           TownTripLimits const& limits, time_t now);
+
+// The mark after one member's visit. Only a VENDOR visit by a member that wanted
+// bag room (at or under the floor before) and STOOD AT THE COUNTER proves
+// anything: then no rise in free slots and no rise in purse sets the mark, and
+// either rise clears it. Every other visit returns `previous` unchanged.
+FruitlessBagsMark NoteTownTripBags(TownNeed const& before, TownNeed const& after,
+                                   std::uint64_t copperBefore, std::uint64_t copperAfter,
+                                   CounterRole role, bool stoodAtCounter,
+                                   TownTripLimits const& limits, time_t now,
+                                   FruitlessBagsMark const& previous);
+
+// PlanTownTrip, with the members a vendor visit could not help (`bagsFruitless`,
+// parallel to `members`; missing entries are false) not counted for their bags.
+// Their broken gear still opens a repair trip and their worn gear is still owed.
+TownTripPlan PlanTownTrip(std::vector<TownNeed> const& members,
+                          TownTripLimits const& limits,
+                          time_t secondsSinceLastTrip, bool busy,
+                          std::vector<bool> const& bagsFruitless);
+
 // ONE DESTINATION, AND WHAT HAPPENS TO A MEMBER THAT CANNOT REACH IT.
 //
 // The family walks to a counter the LEADER resolved, once, rather than five
@@ -19060,6 +19215,10 @@ struct TownStopFacts
     // the stand-down that death opened (#298). The catch-up walk already
     // honors it; the trip's own walk took the catch-up over and did not.
     bool stoodDown{false};
+    // THIS MEMBER STANDS OFF THE MESH AND ITS AIM HAS BEEN REFUSED RELEASE
+    // AFTER RELEASE (StallRecoveryLeaveBehind). Walking it again is re-arming
+    // the same aim every poll, so the trip leaves it where it is.
+    bool offMeshHeld{false};
 };
 
 enum class TownStop : std::uint8_t
@@ -19071,6 +19230,7 @@ enum class TownStop : std::uint8_t
     Follow,     // do NOT aim it: the journey is the leader's and follow brings this one
     TooFar,     // do NOT aim it: the counter is a journey away, not the last few yards
     StoodDown,  // do NOT aim it: its last walk toward the family killed it (#298)
+    OffMesh,    // do NOT aim or wait for it: off the mesh, its aim refused again and again
 };
 
 // THE ORDER OF THE FIVE TESTS IS THE MEANING, and each one makes the ones below
@@ -21169,6 +21329,10 @@ struct RaidRunFacts
     // Raid members in the world on a map that is neither the door's outside
     // map nor its inside map: they still have a crossing to make (#765).
     unsigned awayOnOtherMap{0};
+    // Living followers on the door map outside staging, actively held for their leader.
+    unsigned heldTooFar{0};
+    // A meeting stone summon has been requested and is still being read back.
+    bool stoneSummonPending{false};
     // Raid members on the inside map.
     unsigned inside{0};
     bool headAssembled{false};

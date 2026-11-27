@@ -1511,6 +1511,7 @@ StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
         }
     }
     ++state.offMeshReleases;
+    state.lastReleaseAt = facts.now;
     verdict.releases = state.offMeshReleases;
     bool const stoodStill = facts.stillRule && facts.now - state.stillSince >= limits.stillSeconds;
     if (state.escalated || state.offMeshReleases < limits.releases ||
@@ -1554,6 +1555,13 @@ StallRecoveryVerdict StallRecoveryStep(StallRecoveryState& state,
     return verdict;
 }
 
+bool StallRecoveryLeaveBehind(StallRecoveryState const& state, std::int64_t now,
+                              StallRecoveryLimits const& limits)
+{
+    return state.offMeshReleases >= limits.leaveBehindReleases &&
+           now - state.lastReleaseAt <= limits.freshSeconds;
+}
+
 static bool StallRecoveryStood(StallRecoveryState const& state, float x, float y,
                                std::int64_t now, StallRecoveryLimits const& limits)
 {
@@ -1578,6 +1586,11 @@ bool StallRecoveryHoldsErrand(StallRecoveryState const& state, float x, float y,
     return now - state.stillSince < limits.stillSeconds + limits.holdGraceSeconds;
 }
 
+bool StallRecoveryMayRead(bool alive, bool inCombat)
+{
+    return alive && !inCombat;
+}
+
 bool StallRecoveryIdleDue(StallRecoveryState& state, float x, float y, std::int64_t now,
                           StallRecoveryLimits const& limits, std::int64_t intervalSeconds)
 {
@@ -1593,6 +1606,34 @@ bool StallRecoveryIdleDue(StallRecoveryState& state, float x, float y, std::int6
         return false;
     state.idleReadAt = now;
     return true;
+}
+
+LethalRefusalVerdict LethalRefusalStep(StallRecoveryState& state,
+                                       LethalRefusalFacts const& facts,
+                                       StallRecoveryLimits const& limits)
+{
+    float const dx = facts.x - state.lethalX;
+    float const dy = facts.y - state.lethalY;
+    if (state.lethalCount == 0 ||
+        dx * dx + dy * dy > limits.movedResetYards * limits.movedResetYards)
+    {
+        state.lethalCount = 0;
+        state.lethalX = facts.x;
+        state.lethalY = facts.y;
+    }
+    ++state.lethalCount;
+    LethalRefusalVerdict verdict;
+    verdict.refusals = state.lethalCount;
+    if (state.lethalCount < limits.lethalRefusals)
+        return verdict;
+    if (!facts.hasStone || !facts.stoneReady || !facts.sameMapBind || facts.hearthPending)
+    {
+        verdict.action = LethalRefusalAction::Keep;
+        return verdict;
+    }
+    state.lethalCount = 0;
+    verdict.action = LethalRefusalAction::Hearth;
+    return verdict;
 }
 
 void StallRecoveryNotDone(StallRecoveryState& state)
@@ -4593,9 +4634,51 @@ bool ReleaseLandsAim(ReleaseLandingFacts const& facts)
     return !facts.anyClaim && !facts.standing.empty() && facts.driving == facts.standing;
 }
 
+void NoteCounterArrival(CounterArrivalMemory& memory, std::string const& aim)
+{
+    memory.aim = aim;
+    memory.said = false;
+}
+
+LandedErrand CounterArrivalMemoryStep(CounterArrivalMemory& memory,
+                                      std::string const& columnAim, bool counterHoldActive,
+                                      bool& sayIt)
+{
+    sayIt = false;
+    LandedErrand const step =
+        LandedErrandStep(memory.aim, columnAim, true, counterHoldActive, 0, 0);
+    if (step == LandedErrand::Resume)
+    {
+        memory = CounterArrivalMemory{};
+        return step;
+    }
+    if (step == LandedErrand::StandDown && !memory.said)
+    {
+        memory.said = true;
+        sayIt = true;
+    }
+    return step;
+}
+
 bool UnresolvedAimStandsDown(std::string const& aim)
 {
     return !aim.empty() && aim.rfind("at:", 0) != 0;
+}
+
+bool UnresolvedSpawnIsRefused(std::string const& aim, bool guarded)
+{
+    if (guarded || aim.empty())
+        return false;
+    for (char const ch : aim)
+        if (ch < '0' || ch > '9')
+            return false;
+    return true;
+}
+
+std::string UnresolvedSpawnRefusal(std::uint32_t leaderMap)
+{
+    return "its spawn is not on map " + std::to_string(leaderMap) +
+           ", where the character stands, and no route to its own map is built (#1711)";
 }
 
 TravelClaim ReadTravelClaim(TravelClaimFacts const& facts)
@@ -4722,6 +4805,14 @@ std::string TravelReleaseGate(TravelReleaseGateFacts const& facts)
     // the book's own bookkeeping still ends, exactly as before.
     if (facts.changedSinceClaim)
         return "the column changed after this book's claim";
+    if (facts.inertFollowerAim)
+    {
+        if (facts.claimed)
+            return "this book holds a claim on the follower's aim";
+        if (InertFollowerAimMayBeCleared(facts.standing, facts.learnSkill, INERT_FOLLOWER_AIM_SECONDS))
+            return std::string();
+        return "the standing aim is protected from inert release";
+    }
     // A CLAIMED AIM IS THIS BOOK'S ERRAND ENDING (#822). The foreign-aim fence
     // exists for aims the book never claimed - a repair/vendor/banker/
     // auctioneer aim the bridge wrote, a positional aim another pass is
@@ -4733,20 +4824,14 @@ std::string TravelReleaseGate(TravelReleaseGateFacts const& facts)
     // skipped - reborn every poll.
     if (facts.claimed)
         return std::string();
-    // AN AIM NOTHING WALKS IS NOBODY'S ERRAND TO PROTECT (#1610). The fence
-    // exists so an economy pass's aim is not erased under it; a follower's
-    // counter keyword is refused every poll because only the leader walks, so
-    // the pass it protects is not running on it.
-    if (facts.inertFollowerAim &&
-        InertFollowerAimMayBeCleared(facts.standing, facts.learnSkill, INERT_FOLLOWER_AIM_SECONDS))
-        return std::string();
     return TravelReleaseFence(facts.learnSkill, facts.standing);
 }
 
 bool InertFollowerAimMayBeCleared(std::string const& aim, uint32_t learnSkill,
                                   int64_t inertSeconds)
 {
-    return learnSkill == 0 && IsMaintenanceErrand(aim) && inertSeconds >= INERT_FOLLOWER_AIM_SECONDS;
+    return learnSkill == 0 && inertSeconds >= INERT_FOLLOWER_AIM_SECONDS &&
+           (IsMaintenanceErrand(aim) || aim.rfind("at:", 0) == 0);
 }
 
 bool RunAimMayBeReleased(std::string const& current,
@@ -16169,6 +16254,41 @@ TownTripPlan PlanTownTrip(std::vector<TownNeed> const& members,
                           TownTripLimits const& limits,
                           time_t secondsSinceLastTrip, bool busy)
 {
+    return PlanTownTrip(members, limits, secondsSinceLastTrip, busy, std::vector<bool>{});
+}
+
+bool TownTripBagsFruitless(TownNeed const& need, FruitlessBagsMark const& mark,
+                           TownTripLimits const& limits, time_t now)
+{
+    if (!mark.set || !need.present)
+        return false;
+    if (now - mark.at >= limits.fruitlessBagsSeconds)
+        return false;
+    return need.freeBagSlots <= mark.freeBagSlots;
+}
+
+FruitlessBagsMark NoteTownTripBags(TownNeed const& before, TownNeed const& after,
+                                   std::uint64_t copperBefore, std::uint64_t copperAfter,
+                                   CounterRole role, bool stoodAtCounter,
+                                   TownTripLimits const& limits, time_t now,
+                                   FruitlessBagsMark const& previous)
+{
+    if (role != CounterRole::Vendor || !stoodAtCounter || !before.present || !after.present)
+        return previous;
+    if (before.freeBagSlots > limits.freeBagSlotsToGo)
+        return previous;
+    bool const madeRoom =
+        after.freeBagSlots > before.freeBagSlots || copperAfter > copperBefore;
+    if (madeRoom)
+        return FruitlessBagsMark{};
+    return FruitlessBagsMark{true, after.freeBagSlots, now};
+}
+
+TownTripPlan PlanTownTrip(std::vector<TownNeed> const& members,
+                          TownTripLimits const& limits,
+                          time_t secondsSinceLastTrip, bool busy,
+                          std::vector<bool> const& bagsFruitless)
+{
     TownTripPlan plan;
 
     if (busy)
@@ -16180,9 +16300,15 @@ TownTripPlan PlanTownTrip(std::vector<TownNeed> const& members,
     if (secondsSinceLastTrip < limits.cooldownSeconds)
         return plan;
 
-    for (TownNeed const& need : members)
+    for (size_t i = 0; i < members.size(); ++i)
     {
-        TownReason const reason = TownTripMemberReason(need, limits);
+        TownNeed const& need = members[i];
+        TownReason reason = TownTripMemberReason(need, limits);
+        // A VENDOR ALREADY FAILED THIS MEMBER'S BAGS (wow-overseer#1261): its
+        // bags are no reason, and what is left is its gear, read as if the bags
+        // had room.
+        if (reason == TownReason::Bags && i < bagsFruitless.size() && bagsFruitless[i])
+            reason = need.damagedItems ? TownReason::Worn : TownReason::None;
         if (reason == TownReason::None)
             continue;
 
@@ -16229,6 +16355,10 @@ TownStop TownTripMemberStop(TownStopFacts const& facts)
         return TownStop::Done;
     if (facts.atTheCounter)
         return TownStop::Trade;
+    // An off-mesh member whose aim keeps being refused is not waited for, at
+    // any distance and whether or not the leader is at the counter.
+    if (!facts.isLeader && facts.offMeshHeld)
+        return TownStop::OffMesh;
     // The journey is the leader's. A follower is brought by the catch-up walk
     // and the regroup wait (#404), not by an aim of this trip's own.
     if (!facts.isLeader && !facts.leaderAtTheCounter)
@@ -16276,6 +16406,7 @@ char const* TownStopWord(TownStop stop)
         case TownStop::Follow: return "follow";
         case TownStop::TooFar: return "too far";
         case TownStop::StoodDown: return "stood down";
+        case TownStop::OffMesh: return "off the mesh";
     }
     return "unknown";
 }
@@ -18600,27 +18731,38 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
             long const assembleWait = RaidAssembleWaitSeconds(facts.awayOnOtherMap);
             bool const waitOver = facts.heldSeconds >= assembleWait;
             bool const quorum = RaidQuorumMet(facts);
-            if (facts.headAssembled && quorum &&
-                (facts.assembled >= facts.inWorld || waitOver))
+            bool const allPresent = facts.assembled >= facts.inWorld;
+            // A far-held seat is waiting on the head. Keep the ordinary wait
+            // if a summon or a new invitation can still bring someone in.
+            bool const onlyFarHeldMissing =
+                !allPresent && facts.heldTooFar == facts.inWorld - facts.assembled &&
+                facts.addable == 0 && !facts.stoneSummonPending;
+            if (facts.headAssembled && quorum && (allPresent || onlyFarHeldMissing || waitOver))
             {
                 step.phase = RaidRunPhase::Enter;
                 step.aimDoor = true;
                 step.knockMembers = true;
-                step.why = facts.assembled >= facts.inWorld
-                               ? "every raid member in the world is at the door"
-                               : "the wait for stragglers is over; the raid goes "
-                                 "with whoever is at the door";
+                step.why = onlyFarHeldMissing
+                    ? "the raid has a quorum at the door and the remaining seats are held "
+                      "for the head"
+                    : allPresent ? "every raid member in the world is at the door"
+                                 : "the wait for stragglers is over; the raid goes "
+                                   "with whoever is at the door";
                 return step;
             }
             if (facts.headAssembled && waitOver && !quorum)
             {
                 step.shortfall = RaidQuorumShortfall(facts);
-                if (facts.heldSeconds >= assembleWait + RAID_QUORUM_EXTRA_WAIT_SECONDS)
+                if (onlyFarHeldMissing ||
+                    facts.heldSeconds >= assembleWait + RAID_QUORUM_EXTRA_WAIT_SECONDS)
                 {
                     step.phase = RaidRunPhase::Idle;
                     step.release = true;
                     step.quorumEnds = true;
-                    step.why = "the raid never reached a quorum at the door; the order ends";
+                    step.why = onlyFarHeldMissing
+                        ? "the raid never reached a quorum at the door; the remaining seats "
+                          "are held for the head and the order ends"
+                        : "the raid never reached a quorum at the door; the order ends";
                     return step;
                 }
                 step.phase = RaidRunPhase::Assemble;

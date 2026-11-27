@@ -249,9 +249,12 @@
 #    Overseer.Raid.QuorumTanks
 #    Overseer.Raid.QuorumHealers
 #        Description: The raid at the door must have at least this many members,
-#                     tanks and healers before ENTER. Short when the assemble
-#                     wait ends, the raid holds at the door and the log names the
-#                     shortfall; after a second bounded wait the order ends.
+#                     tanks and healers before ENTER. If all missing seats are
+#                     held too far from the head and no seat can still be
+#                     invited or has a summon in flight, the raid can enter
+#                     with a quorum or end when the assemble wait expires.
+#                     Otherwise a raid short of quorum holds for a second
+#                     bounded wait. The log names the shortfall by duty.
 #        Default:     36, 3, 8
 #
 #Overseer.Raid.QuorumSeats = 36

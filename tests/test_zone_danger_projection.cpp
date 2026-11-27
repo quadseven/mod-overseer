@@ -38,9 +38,21 @@ int main()
     auto const routeEnd = source.find("static OverseerDecisions::RouteLegLimits RouteLimitsFor(", routeBegin);
     if (source.substr(routeBegin, routeEnd - routeBegin).find("DangerZonesFor(bot, plannedAt)") == std::string::npos)
         return 4;
-    auto const snapshot = source.substr(source.find("void WriteSnapshot()"));
-    if (snapshot.find("REPLACE INTO overseer_zone_danger (name, result)") == std::string::npos ||
+    auto const snapshotStart = source.find("void WriteSnapshot()");
+    auto const snapshotEnd = source.find("QueryCallbackProcessor _shareSweepQuery;", snapshotStart);
+    if (snapshotStart == std::string::npos || snapshotEnd == std::string::npos)
+        return 5;
+    auto const snapshot = source.substr(snapshotStart, snapshotEnd - snapshotStart);
+    auto const loopStart = snapshot.find("for (auto const& itr : allPlayers)");
+    auto const afterLoop = snapshot.find("if (!first)", loopStart);
+    if (loopStart == std::string::npos || afterLoop == std::string::npos)
+        return 5;
+    auto const loopBody = snapshot.substr(loopStart, afterLoop - loopStart);
+    auto const tail = snapshot.substr(afterLoop);
+    if (snapshot.find("REPLACE INTO overseer_zone_danger (name, result) VALUES ") == std::string::npos ||
         snapshot.find("EscLong(ZoneDangerFor(p, std::time(nullptr)))") == std::string::npos ||
+        loopBody.find("CharacterDatabase.Execute") != std::string::npos ||
+        tail.find("dangerSs.str().c_str()") == std::string::npos ||
         snapshot.find("DELETE FROM overseer_zone_danger WHERE updated_at < NOW() - INTERVAL 60 SECOND") == std::string::npos)
         return 5;
     std::cout << "zone danger projection: canonical route result, context, escaping and empty state passed\n";

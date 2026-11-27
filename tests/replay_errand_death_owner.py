@@ -20,6 +20,8 @@ methods = [
     "    bool ClaimedBy(std::string const& name,",
     "    void Refuse(std::string const& name,",
     "    int64_t SecondsSinceRefused(std::string const& name,",
+    "    void MarkCounterLanding(std::string const& name,",
+    "    OverseerDecisions::LandedErrand LandedStep(std::string const& name,",
     "    void ReleaseImpl(std::string const& name,",
     "    void Release(std::string const& name,",
 ]
