@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <regex>
 #include <string>
 
 int main()
@@ -23,10 +24,12 @@ int main()
         return std::cerr << "the recovery reading does not ask for the quick rule\n", EXIT_FAILURE;
     // The hold block asks alive and not-in-combat before it reads footing,
     // as RecoverIdleOffMesh does (mod-overseer#1705).
-    auto const guard = text.find("OverseerDecisions::StallRecoveryMayRead(bot->IsAlive(),");
+    std::regex const guard(
+        R"(\bif\s*\(\s*OverseerDecisions::StallRecoveryMayRead\(\s*bot->IsAlive\(\)\s*,)"
+        R"(\s*bot->IsInCombat\(\)\s*\)\s*&&)");
     auto const read = text.find("ReadStalledFooting(", hold);
-    if (guard == std::string::npos || guard < hold || guard > ask || read == std::string::npos ||
-        guard > read)
+    if (read == std::string::npos || read > ask ||
+        !std::regex_search(text.cbegin() + hold, text.cbegin() + read, guard))
         return std::cerr << "the hold block does not check alive and combat before reading\n",
                EXIT_FAILURE;
     auto const idle = text.find("void RecoverIdleOffMesh(");
