@@ -93,7 +93,8 @@ void EverySpawnSearchAsks()
         return n;
     };
     Check("the index records each spawn's event",
-          source.find("spawn.gameEvent = GameEventOfSpawn(itr.first);") != std::string::npos);
+          source.find("ReadTravelSpawn(data, *creatureTemplate, itr.first)") != std::string::npos &&
+          source.find("creature.faction, GameEventOfSpawn(spawnId)}") != std::string::npos);
     Check("both index searches skip a spawn out of the world",
           count("if (!SpawnInWorldNow(spawn.gameEvent))") == 2);
     // Three: the two hostile-ground sweeps, plus the route's guarded-ground

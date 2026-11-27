@@ -7109,6 +7109,12 @@ public:
                     MovementOwner().Release(name, std::time(nullptr), inertFollowerAim));
     }
 
+    void ReleaseIfCurrent(std::string const& name, std::string const& target,
+                          std::string const& why)
+    {
+        ReleaseImpl(name, why, MovementOwner().ReleaseIfCurrent(name, target, std::time(nullptr)));
+    }
+
     // Close a dungeon coordinator's travel state without giving back a newer
     // route this same book may have claimed for another owner. True when the
     // run's recorded leg is still its to retire with RetireRunAim: a claim lost
@@ -7140,10 +7146,10 @@ public:
         std::string const& standing = released.standing;
         if (released.leftNewerAim)
         {
-            // The old coordinator must not end, reset or forget a newer
-            // errand's intent and drive state. That owner will release it.
+            // A stale poll must leave the newer errand's intent and drive
+            // state with its owner.
             LOG_INFO("module.overseer",
-                     "overseer: dungeon run release for '{}' left newer aim '{}' "
+                     "overseer: travel release for '{}' left newer aim '{}' "
                      "and its travel owner state in place",
                      name, standing);
             return;
@@ -7554,13 +7560,14 @@ public:
     // something it did not observe, which is the one thing this drive's comments
     // have been unanimous about since the backstop.
     void Refuse(std::string const& name, std::string const& target,
-                std::string const& reason)
+                std::string const& reason, std::optional<std::uint32_t> fromMap = std::nullopt)
     {
         Refusal& refusal = _refused[name];
         refusal.target = target;
         refusal.reason = reason;
         refusal.at = std::time(nullptr);
         refusal.said = 0;
+        refusal.fromMap = fromMap;
         KeepRefusal(name);
     }
 
@@ -7704,10 +7711,12 @@ public:
     // when it never has. Whether that is still inside the cool-off is
     // ErrandDeathBreaker's to decide and not this one's, so the rule lives in
     // exactly one place and a reader is never asked which copy is the real one.
-    int64_t SecondsSinceRefused(std::string const& name, std::string const& target) const
+    int64_t SecondsSinceRefused(std::string const& name, std::string const& target,
+                                std::optional<std::uint32_t> map = std::nullopt) const
     {
         auto const it = _refused.find(name);
-        if (it == _refused.end() || it->second.target != target)
+        if (it == _refused.end() || it->second.target != target ||
+            (map && it->second.fromMap && map != it->second.fromMap))
             return -1;
         return static_cast<int64_t>(std::time(nullptr) - it->second.at);
     }
@@ -7813,6 +7822,7 @@ private:
         std::string reason;
         time_t at{0};
         time_t said{0};  // when the re-issue was last reported, 0 = never
+        std::optional<std::uint32_t> fromMap;
     };
 
     // The planned walk's length over the straight line to the aim, kept with the
@@ -15289,7 +15299,7 @@ private:
             // does not know this drive exists and must not learn: two functions
             // each deferring to the other is how the next oscillation gets
             // built.
-            if (TravelHoldsTheWheel(name, travelTarget, botAI))
+            if (TravelHoldsTheWheel(name, travelTarget, botAI, bot->GetMapId()))
             {
                 if (!state.travelHeld)
                 {
@@ -15445,7 +15455,15 @@ private:
                 }
             }
 
-            if (stillAimed)
+            auto const refused = _crossMapTravelRefusals.find(leaderName);
+            time_t const questPollAt = std::time(nullptr);
+            auto const QuestCoolingOff = [&](uint32 questId)
+            {
+                return refused != _crossMapTravelRefusals.end() &&
+                       refused->second.BlocksQuest(questId, bot->GetMapId(), questPollAt);
+            };
+
+            if (stillAimed && !QuestCoolingOff(aim))
             {
                 if (DriveChosenQuest(name, bot, botAI, aim, working, aimChanged))
                     continue;
@@ -15474,8 +15492,11 @@ private:
             // being handed in), and only when a strictly better candidate
             // exists - after which the leader is on a youngest-held quest and
             // this cannot fire again until the youngest changes.
+            bool const blockedWorking = QuestCoolingOff(working);
+            if (blockedWorking)
+                botAI->rpgInfo.ChangeToIdle();
             bool preempted = false;
-            if (onQuest && isLead && youngest && youngest != bot && working &&
+            if (onQuest && !blockedWorking && isLead && youngest && youngest != bot && working &&
                 working == state.repick.lastPicked &&
                 bot->GetQuestStatus(working) == QUEST_STATUS_INCOMPLETE &&  // Player.h:1492
                 !HoldsUnfinished(youngest, working))
@@ -15487,7 +15508,7 @@ private:
                         !HoldsUnfinished(youngest, questId))
                         continue;
                     if (botAI->lowPriorityQuest.count(questId) ||  // PlayerbotAI.h:605
-                        state.repick.givenUp.count(questId))
+                        state.repick.givenUp.count(questId) || QuestCoolingOff(questId))
                         continue;
                     preempted = true;
                 }
@@ -15506,7 +15527,7 @@ private:
                     state.repick.lastPicked = 0;
                 }
             }
-            if (onQuest && !preempted)
+            if (onQuest && !blockedWorking && !preempted)
                 continue;
 
             // AN UNAIMED FOLLOWER STAYS PUT. Everything below picks a quest out
@@ -15534,6 +15555,11 @@ private:
             // struct is ever moved or renamed.
             auto& repick = state.repick;
             uint32 justFailed = 0;
+            if (QuestCoolingOff(repick.lastPicked))
+            {
+                repick.lastPicked = 0;
+                repick.strikes = 0;
+            }
             if (repick.lastPicked)
             {
                 // A quest that has left the log is not a wedge and must not be
@@ -15659,7 +15685,7 @@ private:
                 }
 
                 // Ours, for the failure upstream never records.
-                if (repick.givenUp.count(questId))
+                if (QuestCoolingOff(questId) || repick.givenUp.count(questId))
                 {
                     skipped = true;
                     continue;
@@ -16107,6 +16133,140 @@ private:
         return SpawnEventIsActive(gameEvent);
     }
 
+    struct TravelSpawn;
+
+    static TravelSpawn ReadTravelSpawn(CreatureData const& data,
+                                       CreatureTemplate const& creature,
+                                       ObjectGuid::LowType spawnId)
+    {
+        return TravelSpawn{data.id, creature.Name, data.mapid, data.posX, data.posY, data.posZ,
+                           data.npcflag ? data.npcflag : creature.npcflag,
+                           creature.faction, GameEventOfSpawn(spawnId)};
+    }
+
+    static bool ExcludedTravelVendor(CreatureData const& data,
+                                     CreatureTemplate const& creature, uint32 npcFlags)
+    {
+        if (!(npcFlags & UNIT_NPC_FLAG_VENDOR))
+            return false;
+        // The dungeon finder pedestals are synthetic vendors. The canal
+        // spawns have invalid footing below the city.
+        bool const badCanalCluster = data.mapid == 0 &&
+            data.posX > -9050.f && data.posX < -8750.f &&
+            data.posY > -200.f && data.posY < 0.f;
+        return data.id == 958 || data.id == 959 || badCanalCluster ||
+               std::string(creature.Name).rfind("[DND] TAR Pedestal", 0) == 0;
+    }
+
+    struct CrossMapTravelSpawn
+    {
+        uint32 entry;
+        uint32 map;
+    };
+
+    // Keep the column's existing creature-entry meaning when the number is
+    // also a spawn ID. Check the full spawn data because the travel index
+    // contains service NPCs and can omit quest givers and objectives.
+    static std::optional<CrossMapTravelSpawn> FindCrossMapTravelSpawn(
+        std::string const& target, uint32 currentMap)
+    {
+        uint32 const id = OverseerDecisions::NumericTravelTarget(target);
+        if (!id)
+            return std::nullopt;
+        if (!sObjectMgr->GetCreatureTemplate(id))
+        {
+            CreatureData const* data = sObjectMgr->GetCreatureData(id);
+            if (data && data->mapid != currentMap && SpawnInWorldNow(GameEventOfSpawn(id)))
+                return CrossMapTravelSpawn{data->id, data->mapid};
+            return std::nullopt;
+        }
+
+        std::optional<CrossMapTravelSpawn> elsewhere;
+        for (auto const& [spawnId, data] : sObjectMgr->GetAllCreatureData())
+        {
+            if (data.id != id || !SpawnInWorldNow(GameEventOfSpawn(spawnId)))
+                continue;
+            if (data.mapid == currentMap)
+                return std::nullopt;
+            if (!elsewhere || data.mapid < elsewhere->map)
+                elsewhere = CrossMapTravelSpawn{id, data.mapid};
+        }
+        return elsewhere;
+    }
+
+    bool CrossMapAimCoolingOff(std::string const& name, std::string const& aim, uint32 map) const
+    {
+        auto const it = _crossMapTravelRefusals.find(name);
+        return it != _crossMapTravelRefusals.end() &&
+               it->second.BlocksAim(aim, map, std::time(nullptr));
+    }
+
+    void RecordCrossMapTravelRefusal(Player* bot, std::string const& name,
+                                     std::string const& target, CrossMapTravelSpawn const& spawn)
+    {
+        std::vector<uint32> quests;
+        auto const addRelations = [&](QuestRelations const* relations, QuestStatus status)
+        {
+            if (!relations)
+                return;
+            auto const range = relations->equal_range(spawn.entry);
+            for (auto it = range.first; it != range.second; ++it)
+                if (bot->GetQuestStatus(it->second) == status)
+                    quests.push_back(it->second);
+        };
+        addRelations(sObjectMgr->GetCreatureQuestRelationMap(), QUEST_STATUS_NONE);
+        addRelations(sObjectMgr->GetCreatureQuestInvolvedRelationMap(), QUEST_STATUS_COMPLETE);
+        // Use the creature's loot list for item objectives, as the dungeon
+        // quest drive does. This lookup runs only when releasing the errand.
+        std::set<uint32> drops;
+        CreatureTemplate const* creature = sObjectMgr->GetCreatureTemplate(spawn.entry);
+        if (creature && creature->lootid)
+            if (QueryResult rows = WorldDatabase.Query(
+                    "SELECT Item FROM creature_loot_template WHERE Entry = {}", creature->lootid))
+                do
+                {
+                    drops.insert(rows->Fetch()[0].Get<uint32>());
+                } while (rows->NextRow());
+
+        for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 const questId = bot->GetQuestSlotQuestId(slot);
+            if (!questId || bot->GetQuestStatus(questId) != QUEST_STATUS_INCOMPLETE)
+                continue;
+            Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+            if (!quest)
+                continue;
+            for (uint8 i = 0; i < QUEST_OBJECTIVES_COUNT; ++i)
+                if (quest->RequiredNpcOrGo[i] > 0 &&
+                    static_cast<uint32>(quest->RequiredNpcOrGo[i]) == spawn.entry)
+                    quests.push_back(questId);
+            for (uint8 i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT; ++i)
+                if (quest->RequiredItemId[i] && drops.count(quest->RequiredItemId[i]))
+                    quests.push_back(questId);
+        }
+
+        uint32 const map = bot->GetMapId();
+        int64_t const seconds = ERRAND_DEATH_LIMITS.cooloffSeconds;
+        _crossMapTravelRefusals[name].Record(target, map, std::move(quests),
+                                             std::time(nullptr), seconds);
+        std::string const why = OverseerDecisions::UnresolvedSpawnRefusal(map, spawn.map);
+        _travelAims.Refuse(name, target, why, map);
+        std::string const step = "Released errand '" + target + "' because " + why +
+                                 ". Retry after " + std::to_string(seconds) + "s";
+        LOG_INFO("module.overseer", "overseer: '{}' {} (#1711)", name, step);
+
+        // This table is created by the bridge, which may start after the
+        // worldserver. A historical intent step leaves current work visible.
+        if (!_nowStepColumnsPresent)
+            _nowStepColumnsPresent = SchemaHasColumns(
+                "overseer_now_step", "'subject','scope','kind','doing'", 4);
+        if (_nowStepColumnsPresent)
+            CharacterDatabase.Execute(
+                "INSERT INTO overseer_now_step (subject, scope, kind, doing) "
+                "VALUES ('{}', 'character', 'intent_end', '{}')",
+                Esc(name), Esc(step));
+    }
+
     // WHY AN INDEX AND NOT A QUERY, and why it is built here rather than in
     // Python. Three reasons, in order of how much they matter:
     //
@@ -16147,39 +16307,10 @@ private:
             // guard that read only the template would index a spawn that is
             // deliberately NOT a vendor as one, and send somebody to it.
             uint32 const npcFlags = data.npcflag ? data.npcflag : creatureTemplate->npcflag;
-            if (!(npcFlags & wanted))
+            if (!(npcFlags & wanted) || ExcludedTravelVendor(data, *creatureTemplate, npcFlags))
                 continue;
 
-            // The world database marks the Dungeon Finder TAR pedestals as
-            // vendors so the client can open their synthetic menus. They are
-            // not physical shops and have no sale interaction. Indexing one
-            // sends a travel errand onto the broken pedestal geometry instead
-            // of to a real town vendor.
-            if ((npcFlags & UNIT_NPC_FLAG_VENDOR) &&
-                std::string(creatureTemplate->Name).rfind("[DND] TAR Pedestal", 0) == 0)
-                continue;
-
-            // Morley Eberlein's only map-0 spawn is stored at z=90.5 while
-            // the local surface is about z=109.6. It is a real vendor, but
-            // routing a travel errand to that row drops the family into the
-            // Stormwind/Elwynn hole before the sale can happen.
-            bool const badCanalCluster = data.mapid == 0 &&
-                data.posX > -9050.f && data.posX < -8750.f &&
-                data.posY > -200.f && data.posY < 0.f;
-            if ((npcFlags & UNIT_NPC_FLAG_VENDOR) &&
-                ((data.id == 958 || data.id == 959) || badCanalCluster))
-                continue;
-
-            TravelSpawn spawn;
-            spawn.entry = data.id;
-            spawn.name = creatureTemplate->Name;
-            spawn.mapId = data.mapid;
-            spawn.x = data.posX;
-            spawn.y = data.posY;
-            spawn.z = data.posZ;
-            spawn.npcFlags = npcFlags;
-            spawn.faction = creatureTemplate->faction;
-            spawn.gameEvent = GameEventOfSpawn(itr.first);
+            TravelSpawn const spawn = ReadTravelSpawn(data, *creatureTemplate, itr.first);
             if (spawn.gameEvent)
                 ++seasonal;
             _travelSpawns.push_back(spawn);
@@ -16462,7 +16593,7 @@ private:
                              entryText.find_first_not_of("0123456789") == std::string::npos;
         if (numeric)
         {
-            wantedEntry = static_cast<uint32>(std::strtoul(entryText.c_str(), nullptr, 10));
+            wantedEntry = OverseerDecisions::NumericTravelTarget(entryText);
             if (!wantedEntry)
                 return false;
         }
@@ -16517,37 +16648,53 @@ private:
         std::map<uint32, bool> mayDealWith;
         std::vector<OverseerDecisions::TravelTargetCandidate> candidates;
         std::vector<TravelSpawn const*> spawns;
+        std::optional<TravelSpawn> exactSpawn;
+        if (wantedEntry && !explicitTrainer && !sObjectMgr->GetCreatureTemplate(wantedEntry))
+        {
+            // An unambiguous spawn ID may name a creature outside the
+            // service index. It still goes through the normal travel gates.
+            CreatureData const* data = sObjectMgr->GetCreatureData(wantedEntry);
+            if (!data || data->mapid != mapId)
+                return false;
+            CreatureTemplate const* creature = sObjectMgr->GetCreatureTemplate(data->id);
+            if (!creature)
+                return false;
+            exactSpawn = ReadTravelSpawn(*data, *creature, wantedEntry);
+            if (ExcludedTravelVendor(*data, *creature, exactSpawn->npcFlags))
+                return false;
+            wantedEntry = data->id;
+        }
         unsigned distantUsableCounters = 0;
         float nearestDistantCounterYards = -1.f;
         bool const townCounterRole =
             (wantedFlag & (UNIT_NPC_FLAG_VENDOR | UNIT_NPC_FLAG_REPAIR |
                            UNIT_NPC_FLAG_BANKER | UNIT_NPC_FLAG_AUCTIONEER)) != 0;
-        for (TravelSpawn const& spawn : _travelSpawns)
+        auto const consider = [&](TravelSpawn const& spawn)
         {
             if (spawn.mapId != mapId)
-                continue;
+                return;
             // A SEASONAL SPAWN OUT OF SEASON IS NOBODY (#686): the walk would
             // end on an empty spot and give the errand up.
             if (!SpawnInWorldNow(spawn.gameEvent))
-                continue;
+                return;
             if (wantedEntry)
             {
                 if (spawn.entry != wantedEntry)
-                    continue;
+                    return;
             }
             else if (!wantedName.empty())
             {
                 if (spawn.name != wantedName)
-                    continue;
+                    return;
             }
             // Every bit the role names, not any one of them (#544): a `guild
             // petitioner` aim must not stop at an Arena Organizer.
             else if (!OverseerDecisions::SpawnFillsTravelRole(spawn.npcFlags, wantedFlag))
-                continue;
+                return;
             if (narrowToSkill && !TrainerStartedSkills(spawn.entry).count(wantSkill))
-                continue;
+                return;
             if (narrowToClass && !TrainerServesClassOf(spawn.entry, bot))
-                continue;
+                return;
 
             auto known = mayDealWith.find(spawn.faction);
             if (known == mayDealWith.end())
@@ -16569,11 +16716,16 @@ private:
                 if (nearestDistantCounterYards < 0.f ||
                     candidate.distance < nearestDistantCounterYards)
                     nearestDistantCounterYards = candidate.distance;
-                continue;
+                return;
             }
             candidates.push_back(candidate);
             spawns.push_back(&spawn);
-        }
+        };
+        if (exactSpawn)
+            consider(*exactSpawn);
+        else
+            for (TravelSpawn const& spawn : _travelSpawns)
+                consider(spawn);
 
         if (townCounterRole && candidates.empty() && distantUsableCounters)
         {
@@ -29999,7 +30151,7 @@ private:
     // is the only caller and carries the argument for the direction; what is
     // here is the two ways travel holds the wheel.
     bool TravelHoldsTheWheel(std::string const& name, std::string const& travelTarget,
-                             PlayerbotAI* botAI)
+                             PlayerbotAI* botAI, uint32 map)
     {
         // Terrain recovery owns a character proven below the world. Keep the
         // other drives from relabelling that state as an unreachable route
@@ -30038,7 +30190,8 @@ private:
         //    the wheel there would aim it at a quest objective instead of the
         //    innkeeper it was sent to, which for a split follower is the one
         //    errand that would end the split.
-        if (!travelTarget.empty() && (CanBeSentToNpc(botAI) || MaySteerItself(name)))
+        if (!travelTarget.empty() && !CrossMapAimCoolingOff(name, travelTarget, map) &&
+            (CanBeSentToNpc(botAI) || MaySteerItself(name)))
             return true;
 
         // 2. THE ERRAND HAS JUST ENDED, and the hand-back must not land on the
@@ -30910,6 +31063,10 @@ private:
             if (!botAI)
                 continue;
 
+            // A stale rewrite cannot take the leader back from another job.
+            if (!guarded && CrossMapAimCoolingOff(name, target, bot->GetMapId()))
+                continue;
+
             // GroundedStep cannot produce a safe horizontal step from below
             // the world. The terrain drive is the sole owner until a later
             // probe clears this publication.
@@ -31228,7 +31385,7 @@ private:
                                        "economy errands had taken more than their share "
                                        "of this character's time");
 
-                toll.sinceRefused = _travelAims.SecondsSinceRefused(name, target);
+                toll.sinceRefused = _travelAims.SecondsSinceRefused(name, target, bot->GetMapId());
 
                 // THE ONLY STRETCH OF THE TABLE THIS ERRAND ANSWERS FOR. Zero
                 // for an errand with no age yet, which is a poll with nothing
@@ -31835,6 +31992,17 @@ private:
             }
             else if (!ResolveTravelTarget(bot, target, entry, pos, wantSkill, &said))
             {
+                if (!guarded && target == columnAim && said.empty())
+                {
+                    if (auto const spawn = FindCrossMapTravelSpawn(target, bot->GetMapId()))
+                    {
+                        RecordCrossMapTravelRefusal(bot, name, target, *spawn);
+                        _travelAims.ReleaseIfCurrent(name, target,
+                                                     "the travel drive (spawn on another map)");
+                        continue;
+                    }
+                }
+
                 // Said unconditionally: the errand is released on this line and
                 // its state erased with it, so there is no second poll of this
                 // errand to repeat it.
@@ -31861,24 +32029,6 @@ private:
                 // clear it anyway, and only a person ends a guard.
                 bool const poisoned = !guarded &&
                     _travelAims.NoteUnresolvedAim(name, target, static_cast<uint32>(bot->GetMapId()));
-                // A SPAWN ON ANOTHER MAP IS CALLED OFF FOR THE COOL-OFF (#1711).
-                // Released alone, the quest drive picked the same quest and the
-                // bridge wrote the same bare spawn id again, every few minutes,
-                // for hours. The refusal row is what it reads to pick another
-                // quest (refused_until), and the reason is on the row and here.
-                // The route to the spawn's own map is #513's, not built here.
-                if (OverseerDecisions::UnresolvedSpawnIsRefused(target, guarded))
-                {
-                    std::string const why = OverseerDecisions::UnresolvedSpawnRefusal(
-                        static_cast<uint32>(bot->GetMapId()));
-                    _travelAims.Refuse(name, target, why);
-                    LOG_INFO("module.overseer",
-                             "overseer: '{}' is refused the errand '{}' for {} minutes "
-                             "because {}",
-                             name, target,
-                             static_cast<uint32>(ERRAND_DEATH_LIMITS.cooloffSeconds / 60),
-                             why);
-                }
                 _travelAims.Release(name, "the travel drive (no such spawn on this map)");
                 // A KEYWORD OR AN ENTRY STANDS DOWN; A POINT IS COUNTED (#722).
                 // The release above leaves a landing for a foreign aim it could
@@ -92551,6 +92701,8 @@ private:
     };
     std::vector<TravelSpawn> _travelSpawns;
     bool _travelIndexBuilt = false;
+    std::map<std::string, OverseerDecisions::QuestTravelCooldown> _crossMapTravelRefusals;
+    bool _nowStepColumnsPresent{false};
 
     // Which primary professions each trainer ENTRY can start somebody in
     // (infra#2757). Keyed by creature entry, not by spawn: the same trainer is

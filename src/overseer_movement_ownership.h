@@ -459,6 +459,12 @@ public:
         return ReleaseImpl(name, nullptr, now, inertFollowerAim);
     }
 
+    ReleaseResult ReleaseIfCurrent(std::string const& name, std::string const& expectedAim,
+                                   time_t now)
+    {
+        return ReleaseImpl(name, &expectedAim, now);
+    }
+
     // A DUNGEON RUN ENDING. Ends only the run's own claim on exactly
     // `expectedAim`: a newer aim, or a newer owner's claim on the same aim,
     // is left with its owner. `mayClearRecordedAim` says whether the run's
@@ -473,7 +479,7 @@ public:
         if (held != _claims.end())
             mayClearRecordedAim = OverseerDecisions::TravelOwnerIsALiveRun(held->second.owner) &&
                                   held->second.aim == expectedAim;
-        return ReleaseImpl(name, &expectedAim, now);
+        return ReleaseImpl(name, &expectedAim, now, false, true);
     }
 
     // THE RUN'S EXACT FINAL LEG. Release protects every foreign `at:` aim, so
@@ -616,8 +622,9 @@ private:
         return facts;
     }
 
-    ReleaseResult ReleaseImpl(std::string const& name, std::string const* expectedRunAim,
-                              time_t now, bool inertFollowerAim = false)
+    ReleaseResult ReleaseImpl(std::string const& name, std::string const* expectedAim,
+                              time_t now, bool inertFollowerAim = false,
+                              bool requireRunClaim = false)
     {
         ReleaseResult result;
         result.standing = _column.Read(name);
@@ -625,10 +632,9 @@ private:
         result.anyClaim = held != _claims.end();
         bool const claimed = result.anyClaim && held->second.aim == result.standing;
         bool const changedSinceClaim = result.anyClaim && !claimed;
-        bool const claimedByRun =
-            claimed && OverseerDecisions::TravelOwnerIsALiveRun(held->second.owner);
-        if (expectedRunAim &&
-            (*expectedRunAim != result.standing || (result.anyClaim && !claimedByRun)))
+        if (expectedAim &&
+            (*expectedAim != result.standing || changedSinceClaim ||
+             (requireRunClaim && claimed && !OverseerDecisions::TravelOwnerIsALiveRun(held->second.owner))))
         {
             result.leftNewerAim = true;
             return result;
