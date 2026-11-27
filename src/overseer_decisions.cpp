@@ -18731,27 +18731,38 @@ RaidRunStep StepRaidRun(RaidRunPhase current, RaidRunFacts const& facts)
             long const assembleWait = RaidAssembleWaitSeconds(facts.awayOnOtherMap);
             bool const waitOver = facts.heldSeconds >= assembleWait;
             bool const quorum = RaidQuorumMet(facts);
-            if (facts.headAssembled && quorum &&
-                (facts.assembled >= facts.inWorld || waitOver))
+            bool const allPresent = facts.assembled >= facts.inWorld;
+            // A far-held seat is waiting on the head. Keep the ordinary wait
+            // if a summon or a new invitation can still bring someone in.
+            bool const onlyFarHeldMissing =
+                !allPresent && facts.heldTooFar == facts.inWorld - facts.assembled &&
+                facts.addable == 0 && !facts.stoneSummonPending;
+            if (facts.headAssembled && quorum && (allPresent || onlyFarHeldMissing || waitOver))
             {
                 step.phase = RaidRunPhase::Enter;
                 step.aimDoor = true;
                 step.knockMembers = true;
-                step.why = facts.assembled >= facts.inWorld
-                               ? "every raid member in the world is at the door"
-                               : "the wait for stragglers is over; the raid goes "
-                                 "with whoever is at the door";
+                step.why = onlyFarHeldMissing
+                    ? "the raid has a quorum at the door and the remaining seats are held "
+                      "for the head"
+                    : allPresent ? "every raid member in the world is at the door"
+                                 : "the wait for stragglers is over; the raid goes "
+                                   "with whoever is at the door";
                 return step;
             }
             if (facts.headAssembled && waitOver && !quorum)
             {
                 step.shortfall = RaidQuorumShortfall(facts);
-                if (facts.heldSeconds >= assembleWait + RAID_QUORUM_EXTRA_WAIT_SECONDS)
+                if (onlyFarHeldMissing ||
+                    facts.heldSeconds >= assembleWait + RAID_QUORUM_EXTRA_WAIT_SECONDS)
                 {
                     step.phase = RaidRunPhase::Idle;
                     step.release = true;
                     step.quorumEnds = true;
-                    step.why = "the raid never reached a quorum at the door; the order ends";
+                    step.why = onlyFarHeldMissing
+                        ? "the raid never reached a quorum at the door; the remaining seats "
+                          "are held for the head and the order ends"
+                        : "the raid never reached a quorum at the door; the order ends";
                     return step;
                 }
                 step.phase = RaidRunPhase::Assemble;

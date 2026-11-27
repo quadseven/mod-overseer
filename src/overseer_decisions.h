@@ -21329,6 +21329,10 @@ struct RaidRunFacts
     // Raid members in the world on a map that is neither the door's outside
     // map nor its inside map: they still have a crossing to make (#765).
     unsigned awayOnOtherMap{0};
+    // Living followers on the door map outside staging, actively held for their leader.
+    unsigned heldTooFar{0};
+    // A meeting stone summon has been requested and is still being read back.
+    bool stoneSummonPending{false};
     // Raid members on the inside map.
     unsigned inside{0};
     bool headAssembled{false};
