@@ -45,7 +45,22 @@ int main()
         LethalRefusalVerdict const v = LethalRefusalStep(s, At(2.f), LIM);
         Check("3rd hearths", v.action == LethalRefusalAction::Hearth);
         Check("count is 3", v.refusals == 3);
-        Check("count restarts", LethalRefusalStep(s, At(2.f), LIM).refusals == 1);
+        LethalRefusalHearthAccepted(s);
+        LethalRefusalVerdict const afterCast = LethalRefusalStep(s, At(2.f), LIM);
+        Check("an accepted cast ends the streak",
+              afterCast.action == LethalRefusalAction::Count && afterCast.refusals == 1);
+    }
+    {
+        StallRecoveryState s;
+        LethalRefusalStep(s, At(0.f), LIM);
+        LethalRefusalStep(s, At(0.f), LIM);
+        Check("third refusal asks to hearth",
+              LethalRefusalStep(s, At(0.f), LIM).action == LethalRefusalAction::Hearth);
+        // The cast is immediately refused, so no hearth started.
+        LethalRefusalVerdict const retry = LethalRefusalStep(s, At(0.f), LIM);
+        Check("the next refusal retries the blocked cast",
+              retry.action == LethalRefusalAction::Hearth);
+        Check("the retry keeps the refusal count", retry.refusals == 4);
     }
     {
         StallRecoveryState s;
