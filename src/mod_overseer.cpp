@@ -65305,8 +65305,8 @@ private:
                             if (state.through && state.alive)
                                 ++aliveInside;
                         time_t const rearmNow = std::time(nullptr);
-                        std::string const stopReason = DungeonBrainStopReason(
-                            ObjectAccessor::FindPlayerByName(leaderName));
+                        std::string const stopReason = PartyBrainStopReason(
+                            ObjectAccessor::FindPlayerByName(leaderName), states);
                         if (OverseerDecisions::StagedInsideBrainRearms(
                                 stopReason, coord.clearRearms, DUNGEON_CLEAR_WAIT_REARMS,
                                 aliveInside, rearmNow - coord.stagedRearmAt))
