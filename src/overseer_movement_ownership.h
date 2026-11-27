@@ -465,6 +465,15 @@ public:
         return ReleaseImpl(name, nullptr, now, &expectedAim);
     }
 
+    // Release only while the column still holds exactly `expectedAim` and no
+    // claim has moved off it: a newer aim, or a claim on another aim, is left
+    // with its owner.
+    ReleaseResult ReleaseIfCurrent(std::string const& name, std::string const& expectedAim,
+                                   time_t now)
+    {
+        return ReleaseImpl(name, nullptr, now, nullptr, &expectedAim);
+    }
+
     // A DUNGEON RUN ENDING. Ends only the run's own claim on exactly
     // `expectedAim`: a newer aim, or a newer owner's claim on the same aim,
     // is left with its owner. `mayClearRecordedAim` says whether the run's
@@ -623,7 +632,8 @@ private:
     }
 
     ReleaseResult ReleaseImpl(std::string const& name, std::string const* expectedRunAim,
-                              time_t now, std::string const* expectedInertAim = nullptr)
+                              time_t now, std::string const* expectedInertAim = nullptr,
+                              std::string const* expectedCurrentAim = nullptr)
     {
         ReleaseResult result;
         result.standing = _column.Read(name);
@@ -635,7 +645,9 @@ private:
             claimed && OverseerDecisions::TravelOwnerIsALiveRun(held->second.owner);
         if ((expectedRunAim &&
              (*expectedRunAim != result.standing || (result.anyClaim && !claimedByRun))) ||
-            (expectedInertAim && *expectedInertAim != result.standing))
+            (expectedInertAim && *expectedInertAim != result.standing) ||
+            (expectedCurrentAim &&
+             (*expectedCurrentAim != result.standing || changedSinceClaim)))
         {
             result.leftNewerAim = true;
             return result;

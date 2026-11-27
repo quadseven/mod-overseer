@@ -19,6 +19,7 @@
 #include <iomanip>
 
 #include <iterator>
+#include <limits>
 #include <sstream>
 #include <utility>
 
@@ -4665,20 +4666,53 @@ bool UnresolvedAimStandsDown(std::string const& aim)
     return !aim.empty() && aim.rfind("at:", 0) != 0;
 }
 
-bool UnresolvedSpawnIsRefused(std::string const& aim, bool guarded)
+std::uint32_t NumericTravelTarget(std::string const& aim)
 {
-    if (guarded || aim.empty())
-        return false;
+    std::uint32_t value = 0;
     for (char const ch : aim)
-        if (ch < '0' || ch > '9')
-            return false;
-    return true;
+    {
+        if (ch < '0' || ch > '9' ||
+            value > (std::numeric_limits<std::uint32_t>::max() - (ch - '0')) / 10)
+            return 0;
+        value = value * 10 + (ch - '0');
+    }
+    return value;
 }
 
-std::string UnresolvedSpawnRefusal(std::uint32_t leaderMap)
+std::string UnresolvedSpawnRefusal(std::uint32_t leaderMap, std::uint32_t spawnMap)
 {
-    return "its spawn is not on map " + std::to_string(leaderMap) +
-           ", where the character stands, and no route to its own map is built (#1711)";
+    return "the spawn is on map " + std::to_string(spawnMap) +
+           " and there is no route from map " + std::to_string(leaderMap);
+}
+
+void QuestTravelCooldown::Record(std::string const& aim, std::uint32_t map,
+                                 std::vector<std::uint32_t> quests,
+                                 int64_t now, int64_t seconds)
+{
+    _refusals.erase(std::remove_if(_refusals.begin(), _refusals.end(),
+                                   [now](Refusal const& r) { return now >= r.until; }),
+                    _refusals.end());
+    if (!BlocksAim(aim, map, now))
+        _refusals.push_back({aim, map, std::move(quests), now + seconds});
+}
+
+bool QuestTravelCooldown::BlocksAim(std::string const& aim, std::uint32_t map,
+                                    int64_t now) const
+{
+    return std::any_of(_refusals.begin(), _refusals.end(), [&](Refusal const& r)
+    {
+        return r.map == map && now < r.until && r.aim == aim;
+    });
+}
+
+bool QuestTravelCooldown::BlocksQuest(std::uint32_t quest, std::uint32_t map,
+                                      int64_t now) const
+{
+    return std::any_of(_refusals.begin(), _refusals.end(), [&](Refusal const& r)
+    {
+        return r.map == map && now < r.until &&
+               std::find(r.quests.begin(), r.quests.end(), quest) != r.quests.end();
+    });
 }
 
 TravelClaim ReadTravelClaim(TravelClaimFacts const& facts)
