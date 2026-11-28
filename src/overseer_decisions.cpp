@@ -4647,11 +4647,11 @@ void NoteCounterArrival(CounterArrivalMemory& memory, std::string const& aim)
 
 LandedErrand CounterArrivalMemoryStep(CounterArrivalMemory& memory,
                                       std::string const& columnAim, bool counterHoldActive,
-                                      bool& sayIt)
+                                      bool counterInReach, bool& sayIt)
 {
     sayIt = false;
     LandedErrand const step =
-        LandedErrandStep(memory.aim, columnAim, true, counterHoldActive, 0, 0);
+        LandedErrandStep(memory.aim, columnAim, true, counterHoldActive && counterInReach, 0, 0);
     if (step == LandedErrand::Resume)
     {
         memory = CounterArrivalMemory{};

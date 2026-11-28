@@ -5679,12 +5679,13 @@ struct CounterArrivalMemory
 void NoteCounterArrival(CounterArrivalMemory& memory, std::string const& aim);
 
 // What the drive does with `columnAim` read now. NotLanded when no arrival is
-// remembered; StandDown while the same aim stands and the hold is in force;
+// remembered; StandDown while the same aim stands, the hold is in force, and
+// the accepted counter is still in reach;
 // Resume (and the memory forgotten) otherwise. `sayIt` is set on the first
 // StandDown of an arrival only.
 LandedErrand CounterArrivalMemoryStep(CounterArrivalMemory& memory,
                                       std::string const& columnAim, bool counterHoldActive,
-                                      bool& sayIt);
+                                      bool counterInReach, bool& sayIt);
 
 // AN UNRESOLVABLE AIM STANDS DOWN AFTER ITS RELEASE, EXCEPT A POINT (#722).
 // The travel drive refuses an aim it cannot resolve from where the character

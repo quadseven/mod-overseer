@@ -7030,7 +7030,7 @@ public:
             // The same counter written again is not another errand while its
             // hold stands (#1708); only a different aim forgets the arrival.
             auto const arrived = _counterArrivals.find(name);
-            if (arrived != _counterArrivals.end() && arrived->second.aim != target)
+            if (arrived != _counterArrivals.end() && arrived->second.memory.aim != target)
                 _counterArrivals.erase(arrived);
         }
         // AND WHAT IT WROTE, KEPT PAST THE CLAIM (#824). The claim ends with
@@ -7244,14 +7244,18 @@ public:
     // counter hold. The hold is then the landing's bound instead of the
     // ceiling: the aim is walked again as soon as the hold is gone, so a
     // character that drifted off the counter with sales still outstanding is
-    // walked back to it. A no-op when the release cleared the column, since
-    // there is then no landing to mark.
-    void MarkCounterLanding(std::string const& name, std::string const& target)
+    // walked back to it. Remember the core-accepted counter even if the
+    // release cleared the column and left no landing to mark.
+    void MarkCounterLanding(std::string const& name, std::string const& target,
+                            ObjectGuid counterGuid, NPCFlags npcFlag)
     {
         // REMEMBERED WHETHER OR NOT THE RELEASE LEFT A LANDING (#1708): a claimed
         // aim's release clears the column, and the writer then writes the same
         // counter again with nothing here to say the character is already at it.
-        OverseerDecisions::NoteCounterArrival(_counterArrivals[name], target);
+        auto& arrival = _counterArrivals[name];
+        OverseerDecisions::NoteCounterArrival(arrival.memory, target);
+        arrival.counterGuid = counterGuid;
+        arrival.npcFlag = npcFlag;
         auto const it = _landed.find(name);
         if (it == _landed.end() || it->second.aim != target)
             return;
@@ -7280,15 +7284,23 @@ public:
 
     OverseerDecisions::LandedErrand LandedStep(std::string const& name,
                                                std::string const& columnAim,
-                                               bool counterHoldActive)
+                                               bool counterHoldActive, Player* bot)
     {
+        bool counterInReach = true;
         auto const arrival = _counterArrivals.find(name);
         if (arrival != _counterArrivals.end())
         {
+            auto& remembered = arrival->second;
+            // Observe the gate only while the player can stand at a counter.
+            // Recheck the exact NPC that the core accepted on arrival.
+            if (counterHoldActive && remembered.memory.aim == columnAim && bot &&
+                bot->IsAlive() && !bot->IsInFlight() && !bot->IsBeingTeleported())
+                counterInReach =
+                    bot->GetNPCIfCanInteractWith(remembered.counterGuid, remembered.npcFlag) != nullptr;
             bool sayIt = false;
             OverseerDecisions::LandedErrand const arrived =
-                OverseerDecisions::CounterArrivalMemoryStep(arrival->second, columnAim,
-                                                            counterHoldActive, sayIt);
+                OverseerDecisions::CounterArrivalMemoryStep(remembered.memory, columnAim,
+                                                            counterHoldActive, counterInReach, sayIt);
             if (arrived == OverseerDecisions::LandedErrand::Resume)
                 _counterArrivals.erase(arrival);
             else if (arrived == OverseerDecisions::LandedErrand::StandDown)
@@ -7306,7 +7318,7 @@ public:
         if (it == _landed.end())
             return OverseerDecisions::LandedErrand::NotLanded;
         OverseerDecisions::LandedErrand const step = OverseerDecisions::LandedErrandStep(
-            it->second.aim, columnAim, it->second.atCounter, counterHoldActive,
+            it->second.aim, columnAim, it->second.atCounter, counterHoldActive && counterInReach,
             static_cast<int64_t>(std::time(nullptr) - it->second.since),
             static_cast<int64_t>(TRAVEL_LANDED_CEILING_SECONDS));
         if (step == OverseerDecisions::LandedErrand::StandDown && !it->second.said)
@@ -7884,7 +7896,13 @@ private:
     // release cleared the column and so left no landing above (#1708). Written
     // by MarkCounterLanding, erased by Release, a Claim of another aim,
     // ForgetLeftover and CounterArrivalMemoryStep. World thread only.
-    std::map<std::string, OverseerDecisions::CounterArrivalMemory> _counterArrivals;
+    struct RememberedCounterArrival
+    {
+        OverseerDecisions::CounterArrivalMemory memory;
+        ObjectGuid counterGuid;
+        NPCFlags npcFlag{UNIT_NPC_FLAG_NONE};
+    };
+    std::map<std::string, RememberedCounterArrival> _counterArrivals;
     // Which errand each character was last called off, so a re-aim at it is
     // refused rather than walked. Deliberately outlives the errand it ended; see
     // Refuse. World thread only, like everything else on this loop.
@@ -12774,10 +12792,13 @@ private:
     }
 
     static bool CounterInReach(Player* who, OverseerDecisions::CounterRole role,
-                               bool& outOneIsNearby, float& outNearestYards)
+                               bool& outOneIsNearby, float& outNearestYards,
+                               ObjectGuid* outAcceptedCounter = nullptr)
     {
         outOneIsNearby = false;
         outNearestYards = -1.f;
+        if (outAcceptedCounter)
+            *outAcceptedCounter = ObjectGuid::Empty;
 
         NPCFlags const npcFlag = NpcFlagForCounter(role);
         if (!who || npcFlag == UNIT_NPC_FLAG_NONE)
@@ -12790,13 +12811,21 @@ private:
         Cell::VisitObjects(who, searcher, SWEEP_YARDS);
 
         bool inReach = false;
+        float nearestAcceptedYards = -1.f;
         for (Creature* creature : nearby)
         {
             float const yards = who->GetDistance(creature);
             if (outNearestYards < 0.f || yards < outNearestYards)
                 outNearestYards = yards;
             if (who->GetNPCIfCanInteractWith(creature->GetGUID(), npcFlag))
+            {
                 inReach = true;
+                if (outAcceptedCounter && (nearestAcceptedYards < 0.f || yards < nearestAcceptedYards))
+                {
+                    *outAcceptedCounter = creature->GetGUID();
+                    nearestAcceptedYards = yards;
+                }
+            }
         }
 
         // "NEARBY" MEANS A GAP UPSTREAM WILL ACTUALLY CLOSE, NOT ONE THIS SWEEP
@@ -31157,7 +31186,7 @@ private:
             // queued; on an `at:` aim it walked a given-up walk again at once,
             // nine times in ten minutes. Asked before StateFor, because
             // StateFor is what would start the new errand.
-            if (_travelAims.LandedStep(name, target, HasCounterHold(name)) ==
+            if (_travelAims.LandedStep(name, target, HasCounterHold(name), botAI ? bot : nullptr) ==
                 OverseerDecisions::LandedErrand::StandDown)
                 continue;
 
@@ -32527,6 +32556,7 @@ private:
                             : OverseerDecisions::CounterRoleForNpcFlags(arrivedFlags);
                     bool oneIsNearby = false;
                     float nearestYards = -1.f;
+                    ObjectGuid acceptedCounter;
                     // NOT ASKED AT ALL FOR AN AIM THAT IS NOT A COUNTER, which
                     // is what keeps a cell sweep off the arrival of every
                     // trainer and flight master this module has ever sent
@@ -32536,7 +32566,7 @@ private:
                     bool const inReach =
                         counter == OverseerDecisions::CounterRole::None
                             ? false
-                            : CounterInReach(bot, counter, oneIsNearby, nearestYards);
+                            : CounterInReach(bot, counter, oneIsNearby, nearestYards, &acceptedCounter);
 
                     OverseerDecisions::CounterArrival const arrival =
                         OverseerDecisions::CounterArrivalStep(counter, inReach,
@@ -32651,7 +32681,8 @@ private:
                                  "releasing", name, target, entry);
                         _travelAims.Release(name, "the travel drive (arrived)");
                         if (arrival == OverseerDecisions::CounterArrival::StandAndTrade)
-                            _travelAims.MarkCounterLanding(name, target);
+                            _travelAims.MarkCounterLanding(name, target, acceptedCounter,
+                                                           NpcFlagForCounter(counter));
                         continue;
                     }
                 }
