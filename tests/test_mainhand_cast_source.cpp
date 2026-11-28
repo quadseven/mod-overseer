@@ -1,5 +1,5 @@
 /*
- * Source contract for the main-hand cast's target (#1304).
+ * Source contract for the main-hand cast's gate and target (#1304).
  *
  * `cast-spell-on-mainhand` (#1264) casts a known spell at the equipped weapon.
  * It sends CMSG_CAST_SPELL with TARGET_FLAG_ITEM, and the core reads the target
@@ -39,6 +39,12 @@ int main()
         return Fail("the main-hand cast must send TARGET_FLAG_ITEM");
     if (text.find(flag, flagAt + flag.size()) != std::string::npos)
         return Fail("TARGET_FLAG_ITEM must appear once: the main-hand cast");
+
+    std::string const gate = "if (char const* wall = D::MainHandSpellGate(facts)";
+    std::string const refusal = gate + "; *wall)\n                return refuse(wall);";
+    std::size_t const gateAt = text.rfind(gate, flagAt);
+    if (gateAt == std::string::npos || text.compare(gateAt, refusal.size(), refusal) != 0)
+        return Fail("the main-hand cast must continue on an empty refusal and return a named refusal");
 
     std::size_t const sentAt = text.find("session->HandleCastSpellOpcode(raw);", flagAt);
     if (sentAt == std::string::npos)

@@ -91512,7 +91512,7 @@ private:
                                                  info->GetMaxRange(false, who)))
                     { facts.focusInRange = true; break; }
                 }
-            if (char const* wall = D::MainHandSpellGate(facts))
+            if (char const* wall = D::MainHandSpellGate(facts); *wall)
                 return refuse(wall);
         }
         else if (request.spell)
